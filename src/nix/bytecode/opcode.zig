@@ -167,16 +167,6 @@ pub const OpCode = enum(u8) {
     /// Wide-chunk-id form of thunk.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
     thunk_w,
-    /// Same as `thunk` but submits the thunk to the urgent
-    /// scheduler queue at creation time. Emitted by the compiler when
-    /// strictness analysis says the surrounding chunk's body will
-    /// unconditionally force this binding — turns the chunk-size
-    /// speculation heuristic into a deterministic decision and
-    /// bypasses the speculation backlog cap.
-    thunk_eag,
-    /// Wide-chunk-id form of thunk_eag.
-    thunk_eag_w,
-
     /// Fused `thunk + cell_set`. Creates the thunk
     /// from the chunk-id + descriptors, then `publishCellBinding`s it
     /// into the cell-thunk at frame_base + slot (skipping the
@@ -187,10 +177,6 @@ pub const OpCode = enum(u8) {
     thunk_st_cell,
     /// Fused `thunk + loc_set`.
     thunk_st,
-    /// Fused `thunk_eag + cell_set`.
-    thunk_eag_st_cell,
-    /// Fused `thunk_eag + loc_set`.
-    thunk_eag_st,
     /// Wide-chunk-id forms of the fused thunk+store family. Past 65,536
     /// registered chunks (any real NixOS eval) every later chunk reference
     /// uses the wide encoding, so these carry the fusion win to the dominant
@@ -198,10 +184,6 @@ pub const OpCode = enum(u8) {
     thunk_w_st_cell,
     /// Fused `thunk_w + loc_set`.
     thunk_w_st,
-    /// Fused `thunk_eag_w + cell_set`.
-    thunk_eag_w_st_cell,
-    /// Fused `thunk_eag_w + loc_set`.
-    thunk_eag_w_st,
     /// Create a frameless attr-access thunk directly: resolve ONE capture
     /// descriptor (kind:1 + index:2) to a base value and wrap it in an
     /// attr-access thunk over the 2-byte attr name. The compile-time twin of
@@ -496,10 +478,10 @@ pub fn layout(op: OpCode) []const Operand {
         // Closures / thunks (chunk id + captures).
         .closure => comptime &[_]Operand{ .{ .chunk_id = .b2 }, cnt(.b2, "upvalues") },
         .closure_w => comptime &[_]Operand{ .{ .chunk_id = .b4 }, cnt(.b2, "upvalues") },
-        .closure_cap, .thunk, .thunk_eag => comptime &[_]Operand{ .{ .chunk_id = .b2 }, .captures },
-        .closure_cap_w, .thunk_w, .thunk_eag_w, .thunk_arg => comptime &[_]Operand{ .{ .chunk_id = .b4 }, .captures },
-        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell => comptime &[_]Operand{ .{ .chunk_id = .b2 }, .captures_slot },
-        .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => comptime &[_]Operand{ .{ .chunk_id = .b4 }, .captures_slot },
+        .closure_cap, .thunk => comptime &[_]Operand{ .{ .chunk_id = .b2 }, .captures },
+        .closure_cap_w, .thunk_w, .thunk_arg => comptime &[_]Operand{ .{ .chunk_id = .b4 }, .captures },
+        .thunk_st, .thunk_st_cell => comptime &[_]Operand{ .{ .chunk_id = .b2 }, .captures_slot },
+        .thunk_w_st, .thunk_w_st_cell => comptime &[_]Operand{ .{ .chunk_id = .b4 }, .captures_slot },
         .thunk_attr => comptime &[_]Operand{ .cap1, .{ .intern = .b2 } },
 
         // Fused slot/upvalue + attribute.

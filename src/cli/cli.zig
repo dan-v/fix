@@ -229,15 +229,13 @@ pub const EvalProgress = struct {
     /// Live-counter node scaffold: a `stats` umbrella with one row per
     /// subsystem, each row carrying that section's whole compact readout. Every
     /// node is created up front in `Stats.build` and lives for the session; the
-    /// sampler only mutates names. The gc row only exists under `-Dgc` (its type
-    /// collapses to `void` otherwise), since a non-collecting build has no
-    /// collector to report on. Future work will add sibling sections for the
-    /// eval phases (eval / force / render / builds).
+    /// sampler only mutates names. Future work will add sibling sections for
+    /// the eval phases (eval / force / render / builds).
     const Stats = struct {
         node: std.Progress.Node, // "stats" umbrella
         heap: std.Progress.Node,
         sched: std.Progress.Node,
-        gc: if (gc.enabled) std.Progress.Node else void,
+        gc: std.Progress.Node,
 
         fn build(parent: std.Progress.Node) Stats {
             var buf: [std.Progress.Node.max_name_len]u8 = undefined;
@@ -248,7 +246,7 @@ pub const EvalProgress = struct {
                 .heap = node.start(fmtHeap(&buf, m), 0),
                 .sched = node.start(fmtSched(&buf, m), 0),
                 // Last child, so it sorts below the always-present sections.
-                .gc = if (comptime gc.enabled) node.start(fmtGc(&buf, m), 0) else {},
+                .gc = node.start(fmtGc(&buf, m), 0),
             };
         }
 
@@ -257,14 +255,14 @@ pub const EvalProgress = struct {
             var buf: [std.Progress.Node.max_name_len]u8 = undefined;
             self.heap.setName(fmtHeap(&buf, m));
             self.sched.setName(fmtSched(&buf, m));
-            if (comptime gc.enabled) self.gc.setName(fmtGc(&buf, m));
+            self.gc.setName(fmtGc(&buf, m));
         }
 
         /// End the rows before their `stats` parent (mirror of `build` order).
         fn deinit(self: *Stats) void {
             self.heap.end();
             self.sched.end();
-            if (comptime gc.enabled) self.gc.end();
+            self.gc.end();
             self.node.end();
         }
     };
@@ -301,11 +299,23 @@ pub const EvalProgress = struct {
             self.active_len -= 1;
             self.active[self.active_len].node.end();
         }
-        if (self.waiting) |n| { n.end(); self.waiting = null; }
-        if (self.stats) |*s| { s.deinit(); self.stats = null; }
+        if (self.waiting) |n| {
+            n.end();
+            self.waiting = null;
+        }
+        if (self.stats) |*s| {
+            s.deinit();
+            self.stats = null;
+        }
         // Span group nodes (all children long since ended by their owners).
-        for (&self.span_groups) |*g| if (g.*) |n| { n.end(); g.* = null; };
-        if (self.run_node) |n| { n.end(); self.run_node = null; }
+        for (&self.span_groups) |*g| if (g.*) |n| {
+            n.end();
+            g.* = null;
+        };
+        if (self.run_node) |n| {
+            n.end();
+            self.run_node = null;
+        }
     }
 
     pub fn sink(self: *EvalProgress) eval_progress.Sink {
@@ -612,7 +622,7 @@ fn fmtSched(buf: []u8, m: eval_progress.Metrics) []const u8 {
     }) catch "";
 }
 
-/// The gc row (`-Dgc` only).
+/// The GC row.
 fn fmtGc(buf: []u8, m: eval_progress.Metrics) []const u8 {
     var live: [16]u8 = undefined;
     var freed: [16]u8 = undefined;

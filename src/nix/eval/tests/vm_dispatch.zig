@@ -64,7 +64,6 @@ const Harness = struct {
             .derivations = &ev.store.derivations,
             .scheduler = &ev.scheduler,
             .builtins_value = ev.builtins_value.?,
-            .opcode_profile_sink = if (vm_mod.opcode_profile_enabled) unreachable else {},
         });
         return .{ .ev = ev, .scratch = scratch, .vm = vm };
     }

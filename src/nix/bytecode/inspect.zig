@@ -126,8 +126,8 @@ pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk) !Capture
         const op: opcode.OpCode = @enumFromInt(op_byte);
         ip += 1;
         const list_start: ?usize = switch (op) {
-            .thunk, .thunk_eag, .closure_cap => ip + 2,
-            .thunk_w, .thunk_eag_w, .closure_cap_w, .thunk_arg => ip + 4,
+            .thunk, .closure_cap => ip + 2,
+            .thunk_w, .closure_cap_w, .thunk_arg => ip + 4,
             else => null,
         };
         const next = ip + opcode.operandLen(op, chunk.code, ip);

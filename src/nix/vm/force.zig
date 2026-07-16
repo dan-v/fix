@@ -1,12 +1,11 @@
 //! The thunk force protocol: the claim/busy/resolved/errored state machine that
-//! drives lazy evaluation, plus speculative (demand-invisible) forcing, work-first
+//! drives lazy evaluation, plus speculative (demand-invisible) forcing,
 //! collection fan-out, and the GC safepoints — the VM's hot serial path.
 //! Concurrency: a demander CAS-claims a thunk and spins then enrolls as a waiter
-//! on a peer-owned `.busy` one; the per-worker thunk-result memo, scavenge cost
-//! tables, and cache registries are thread-local, published for the STW collector to mark.
+//! on a peer-owned `.busy` one; the per-worker thunk-result memo and cache
+//! registries are thread-local, published for the STW collector to mark.
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
@@ -97,7 +96,7 @@ const MemoSlot = struct {
 };
 threadlocal var thunk_memo: [MEMO_SIZE]MemoSlot = @splat(.{});
 
-/// GC (`-Dgc`): the thunk-result memo holds Values keyed by heap token. An
+/// GC: the thunk-result memo holds Values keyed by heap token. An
 /// entry can be the momentary sole reference to a shared result, so valid
 /// entries (token match) are roots. The memo is thread-local (per worker),
 /// so each worker publishes the address of *its* memo into a registry the
@@ -109,14 +108,12 @@ var thunk_memo_registry: [GC_MAX_WORKERS]?*[MEMO_SIZE]MemoSlot = @splat(null);
 /// Called by each worker (on its own thread) before it can allocate, so the
 /// collector can mark this worker's memo entries.
 pub fn gcRegisterThunkMemo(worker_id: u8) void {
-    if (comptime !gc.enabled) return;
     thunk_memo_registry[worker_id] = &thunk_memo;
 }
 
 /// Register this worker's thread-local GC caches (thunk memo + attr cache)
 /// so the collector can mark them. Called once per worker before it runs.
 pub fn gcRegisterWorkerCaches(worker_id: u8) void {
-    if (comptime !gc.enabled) return;
     gcRegisterThunkMemo(worker_id);
     access.gcRegisterAttrCache(worker_id);
 }
@@ -124,14 +121,12 @@ pub fn gcRegisterWorkerCaches(worker_id: u8) void {
 /// Remove cache pointers before a helper thread exits; its TLS storage becomes
 /// invalid immediately afterward and must not remain visible to a later GC.
 pub fn gcUnregisterWorkerCaches(worker_id: u8) void {
-    if (comptime !gc.enabled) return;
     thunk_memo_registry[worker_id] = null;
     access.gcUnregisterAttrCache(worker_id);
 }
 
 /// Mark every registered worker's live memo entries. STW-only (peers parked).
 pub fn gcMarkThunkMemo(tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
-    if (comptime !gc.enabled) return;
     for (thunk_memo_registry) |maybe| {
         const memo = maybe orelse continue;
         for (memo) |*slot| {
@@ -161,7 +156,7 @@ inline fn memoKeyForBytecode(b: *const thunk_mod.BytecodeThunk) ?MemoKey {
 
 // ---- thunk management ----
 
-// ---- GC roots for native code (`-Dgc`) ----
+// ---- GC roots for native code ----
 //
 // The collector is fully PRECISE: it never scans raw C-stacks or registers.
 // Every live heap `Value` must therefore be reachable from an enumerable root
@@ -190,41 +185,21 @@ inline fn memoKeyForBytecode(b: *const thunk_mod.BytecodeThunk) ?MemoKey {
 //        ...
 //        force.rootKeep(self, produced); // keep `produced` alive across later forces
 //
-// All of this compiles to nothing without `-Dgc` (`self: anytype` so builtins
-// taking a test mock still compile). It never costs the normal build a thing.
 pub const RootScope = usize;
 
 pub inline fn rootsBegin(self: anytype) RootScope {
-    return if (comptime build_options.gc) self.gc_temp_roots.items.len else 0;
+    return self.gc_temp_roots.items.len;
 }
 pub inline fn rootsEnd(self: anytype, scope: RootScope) void {
-    if (comptime build_options.gc) self.gc_temp_roots.items.len = scope;
+    self.gc_temp_roots.items.len = scope;
 }
 pub inline fn rootKeep(self: anytype, v: Value) void {
-    if (comptime build_options.gc) {
-        // DORMANT GATE (the temp-root flavor of forceThunkImpl's force-chain
-        // gate — see the soundness argument there): while collection is
-        // DORMANT (`gc_collect_enabled == false`), `v` was allocated before
-        // any future `gc_track_from` could be set (arming only becomes
-        // visible after an STW this worker was parked in), so `v` is OLD at
-        // every young-gated minor and rooting it would be a no-op — skip the
-        // append. If arming lands mid-scope, later rootKeeps in the same
-        // scope see `true` and append normally; `rootsEnd`'s truncate-to-
-        // scope-start is agnostic to how many pushes actually happened.
-        // This was ~146 call sites of unconditional ArrayList appends on the
-        // hottest call/builtin paths — a measurable slice of the default
-        // build's GC tax (`-Dgc=false` measured −5.3% instructions).
-        //
-        // Gate on `gc_root_active` (= `gc_root_always OR armed`), not
-        // `gc_collect_enabled`: the "dormant ⇒ old ⇒ no-op" argument holds ONLY
-        // when the pre-arming region is never swept. In CONSTRAINED mode a major
-        // reclaims it, so a pre-arming temp value spanning the arming boundary
-        // must be rooted from eval start — `gc_root_active` is true from
-        // gcEnableBudget there. When not constrained it matches `gc_collect_
-        // enabled` exactly (false until arming), so this stays free.
-        if (!self.heap.gc_root_active) return;
-        self.gc_temp_roots.append(self.allocator, v) catch @panic("gc temp root oom");
-    }
+    // DORMANT GATE (the temp-root flavor of forceThunkImpl's force-chain
+    // gate — see the soundness argument there): while collection is
+    // unarmed these roots cannot be observed, so skip the append. Once
+    // armed (or constrained from eval start), root the value normally.
+    if (!self.heap.gc_root_active) return;
+    self.gc_temp_roots.append(self.allocator, v) catch @panic("gc temp root oom");
 }
 
 pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
@@ -271,7 +246,7 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
 }
 
 pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
-    // Bounded speculation (`FIX_SIBLING` / `FIX_SPEC_CREATE_BUDGET`): a
+    // Bounded speculation (`FIX_SIBLING` / band budget): a
     // speculative task's cascade is abandoned once it has created more
     // thunks than its budget. Checked here (not just at claimed forces)
     // because creation-heavy builtins force sub-values far more often
@@ -441,18 +416,18 @@ const fan_out_min_items: usize = 4;
 /// Items-per-batch when submitting `force_list_range` /
 /// `force_attrs_range` tasks. The scheduler queue is sized in tasks,
 /// not items, so batching also lets a fixed-cap queue describe much
-/// more pending work. `var` so `FIX_FANOUT_BATCH` can sweep it.
+/// more pending work.
 ///
 /// Batch-size history: a 2026-07 census-driven re-derivation moved the
-/// default to 8 on the pre-scan-summary scheduler (interleaved w=8: 8
+/// value to 8 on the pre-scan-summary scheduler (interleaved w=8: 8
 /// beat 16 in both series, median 0.894 vs 0.907 and 0.886 vs 0.935,
 /// n=10 pairs each; batch 32 regressed hard). Re-measured while porting
 /// onto the per-lane scan-summary scheduler (413fc60/556af1a): the w=8
 /// win did not survive (neutral, 10 interleaved pairs), and 8 REGRESSED
 /// w=16 (wall median 0.905 vs 0.825, max-RSS 2.9-3.5GB vs 2.2GB —
-/// finer urgent batches feed the spec churn there). Default stays 16;
-/// `FIX_FANOUT_BATCH` remains for re-sweeps.
-pub var fan_out_batch_items: u8 = 16;
+/// finer urgent batches feed the spec churn there). Sixteen remains the
+/// measured production choice.
+const fan_out_batch_items: u8 = 16;
 
 pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) void {
     // Allow helpers running speculative tasks to fan out further list
@@ -621,62 +596,6 @@ pub inline fn forceTop(self: *VM) anyerror!Value {
 // `Evaluator.evaluateSource`), so a top-level import still collects (depth 0)
 // while an import nested inside a builtin stays gated at that builtin's depth.
 
-// ---- idle-scavenger support (FIX_SCAVENGE) ----
-//
-// Learned per-chunk cost filter. Worker 0 times the bytecode thunks it
-// claims on its demand path (two rdtscs per claimed force, gated on the
-// scavenger being enabled); a chunk whose single force exceeds
-// `scav_hot_threshold_cy` is marked HOT. Idle helpers then scavenge ONLY
-// ring thunks whose body chunk is hot (see `Worker.scavengeStep`):
-// repeated expensive bodies — option merges, module machinery, drv
-// builds — qualify after main pays for a few instances, while the
-// millions of cheap or never-demanded thunks stay untouched. Racy-benign
-// plain u8 stores (0→1, idempotent).
-pub const SCAV_CHUNK_CAP: usize = 1 << 20;
-var scav_hot_chunks: [SCAV_CHUNK_CAP]u8 = @splat(0);
-/// Single-force cost (cycles) above which a chunk is marked hot.
-/// `FIX_SCAV_HOT` overrides.
-pub var scav_hot_threshold_cy: u64 = 100_000;
-
-/// Admission governor tunables (`FIX_SCAV_MULT` / `FIX_SCAV_SLACK`):
-/// the scavenger may take at most `demand * mult + slack` instances of a
-/// hot chunk. Junk volume (never-demanded whole-graph eval, the RSS
-/// blowup) scales with these; wins come from tightening them.
-pub var scav_take_mult: u32 = 2;
-pub var scav_take_slack: u32 = 16;
-/// Minimum observed demand count before a hot chunk is scavengeable at
-/// all (`FIX_SCAV_MINDEM`). Single-demand chunks are the junk-diversity
-/// source: their remaining instances are usually never demanded, and one
-/// take can force a whole never-demanded subgraph. Repeat-demanded
-/// chunks (module merges, byName bodies) are where conversion happens.
-pub var scav_min_demand: u32 = 0;
-
-/// Feedback governor: per chunk, how many instances MAIN has demanded
-/// vs how many the scavenger has taken. A chunk shared between demanded
-/// and junk instances (make-derivation bodies!) would otherwise let the
-/// scavenger evaluate the junk wholesale; capping takes at ~2× observed
-/// demand keeps waste proportional to usefulness. Saturating, racy-
-/// benign (a few extra takes are harmless).
-var scav_demand_n: [SCAV_CHUNK_CAP]u16 = @splat(0);
-var scav_taken_n: [SCAV_CHUNK_CAP]u16 = @splat(0);
-
-pub inline fn scavChunkHot(chunk_id: u32) bool {
-    return chunk_id < SCAV_CHUNK_CAP and scav_hot_chunks[chunk_id] != 0;
-}
-
-/// Scavenger-side admission check; bumps the take counter on success.
-pub inline fn scavShouldTake(chunk_id: u32) bool {
-    if (chunk_id >= SCAV_CHUNK_CAP) return false;
-    if (scav_hot_chunks[chunk_id] == 0) return false;
-    const taken = scav_taken_n[chunk_id];
-    const demand = scav_demand_n[chunk_id];
-    if (demand < scav_min_demand) return false;
-    if (taken == std.math.maxInt(u16)) return false;
-    if (@as(u32, taken) >= @as(u32, demand) * scav_take_mult + scav_take_slack) return false;
-    scav_taken_n[chunk_id] = taken + 1;
-    return true;
-}
-
 /// Demand-sibling prefetch (`FIX_SIBLING`) member admission: skip
 /// members whose speculative force is known to wander into unbounded
 /// package evaluation. The sweep-log diagnosis showed the RSS blowups
@@ -684,7 +603,7 @@ pub inline fn scavShouldTake(chunk_id: u32) bool {
 /// `derivationLazyAttr` builtin closures, the one builtin the creation-
 /// time speculation policy also refuses (forcing one recursively
 /// evaluates arbitrary package inputs). Racy-benign union read, same as
-/// `scavengeStep`: the thunk may resolve concurrently; a torn read at
+/// the thunk may resolve concurrently; a torn read at
 /// worst misclassifies, the claim CAS inside the force is authoritative.
 pub fn sweepMemberAdmissible(self: *VM, thunk_id: ObjectId) bool {
     const th = self.heap.getThunkAssumeValid(thunk_id);
@@ -707,18 +626,6 @@ pub fn sweepMemberAdmissible(self: *VM, thunk_id: ObjectId) bool {
     }
 }
 
-inline fn scavRdtsc() u64 {
-    if (comptime builtin.cpu.arch != .x86_64) return 0;
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        :
-        : .{ .memory = true });
-    return (@as(u64, high) << 32) | @as(u64, low);
-}
-
 // ---- temp diagnosis probe: claim-time touch logging ----
 
 /// Monotonic microseconds for diagnosis log lines (same clock domain as
@@ -730,50 +637,6 @@ pub fn diagNowUs() u64 {
     const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
     const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
     return sec * 1_000_000 + nsec / 1_000;
-}
-
-/// Cold: log a claim of a thunk whose source file basename contains the
-/// `FIX_TOUCH_LOG` substring. Safe here — the caller just claimed the
-/// thunk, so its target union is readable.
-noinline fn logTouch(self: *VM, thunk_id: ObjectId, demand: bool) void {
-    const filt = self.scheduler.touch_log orelse return;
-    var buf: [160]u8 = undefined;
-    const subj = thunkLabel(self, thunk_id, &buf);
-    if (subj.file == 0) return;
-    const base = std.fs.path.basename(self.intern.get(subj.file));
-    if (std.mem.indexOf(u8, base, filt) == null) return;
-    std.debug.print("touch {s}:{d} id={d} t_us={d} worker={d} spec={} demand={} claimer={d}\n", .{
-        base,
-        subj.line,
-        thunk_id,
-        diagNowUs(),
-        self.workerId(),
-        self.in_speculation,
-        demand,
-        self.ctx.claimer_id,
-    });
-}
-
-/// Cold: log a creation-time speculative SUBMIT of a thunk whose source file
-/// basename matches the `FIX_TOUCH_LOG` substring. Paired with `logTouch`
-/// (claims) so a probe run shows the full submit→claim latency of the seed
-/// tasks and whether the submit was accepted or dropped (queue/cap full).
-pub noinline fn logSpawn(self: *VM, thunk_id: ObjectId, accepted: bool) void {
-    const filt = self.scheduler.touch_log orelse return;
-    var buf: [160]u8 = undefined;
-    const subj = thunkLabel(self, thunk_id, &buf);
-    if (subj.file == 0) return;
-    const base = std.fs.path.basename(self.intern.get(subj.file));
-    if (std.mem.indexOf(u8, base, filt) == null) return;
-    std.debug.print("spawn {s}:{d} id={d} t_us={d} worker={d} spec={} ok={}\n", .{
-        base,
-        subj.line,
-        thunk_id,
-        diagNowUs(),
-        self.workerId(),
-        self.in_speculation,
-        accepted,
-    });
 }
 
 /// Claim dispatch: the solo (plain load/store) protocol at `--workers=1`,
@@ -795,11 +658,11 @@ inline fn resolveDispatch(self: *VM, thunk: *Thunk, value: Value) void {
 }
 
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
-    // GC safepoint (`-Dgc`, --workers=1). forceThunk is a clean unit
+    // GC safepoint. forceThunk is a clean unit
     // boundary; collect here, never mid-allocation. The value being forced
     // may be off the VM stack (passed by value), so root it explicitly
     // across the collection. See docs/plans/gc-plan.md.
-    if (comptime build_options.gc) {
+    {
         // Peer stop-the-world response (w>1): only park at native depth 0,
         // where this fiber holds no builtin Zig locals a peer collector would
         // need but can't precisely see. (The w>1 collector is dormant today;
@@ -855,12 +718,6 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return info.*.err;
             },
             .claimed => {
-                // Temp diagnosis probe (`FIX_TOUCH_LOG=<file substring>`):
-                // log every CLAIM of a thunk whose source file matches, with
-                // timestamp/worker/spec-vs-demand — who first computes the
-                // etc.nix-style tail chains, and when. Off = one branch on a
-                // lazily-initialized global.
-                if (self.scheduler.touch_log != null) logTouch(self, thunk_id, demand);
                 // Discovery probe: main out-ran the helpers — this thunk was
                 // not resolved ahead of demand, so main must compute it itself.
                 // The age probe additionally buckets how long the thunk sat
@@ -1010,25 +867,10 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // Captured ONCE so push and pop agree even if a peer arms
                 // mid-body. Once armed (`--max-memory` small), this is true
                 // forever and the chain is maintained exactly as before.
-                const gc_root_chain: bool = if (comptime build_options.gc) self.heap.gc_root_active else false;
-                if (comptime build_options.gc) {
-                    if (gc_root_chain) self.gc_force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
-                }
-                defer if (comptime build_options.gc) {
+                const gc_root_chain = self.heap.gc_root_active;
+                if (gc_root_chain) self.gc_force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
+                defer {
                     if (gc_root_chain) _ = self.gc_force_chain.pop();
-                };
-                // Scavenger cost-learning: time this force on main's
-                // demand path so repeat-expensive chunks become
-                // scavengeable (see scavChunkHot). Off unless FIX_SCAVENGE.
-                var scav_t0: u64 = 0;
-                var scav_chunk: u32 = 0;
-                if (demand and thunk.targetKind() == .bytecode and
-                    self.scheduler.scavengeEnabled() and self.workerId() == 0)
-                {
-                    scav_chunk = thunk.payload.target.bytecode.chunk_id;
-                    scav_t0 = scavRdtsc();
-                    if (scav_chunk < SCAV_CHUNK_CAP and scav_demand_n[scav_chunk] != std.math.maxInt(u16))
-                        scav_demand_n[scav_chunk] += 1;
                 }
                 // Native-stack guard, checked right before we run the body (the
                 // recursion point). Forcing recurses on the fiber's fixed stack
@@ -1058,11 +900,6 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // read a `payload.result` a concurrent `publishCellBinding` can
                 // flip). The forwarding chain is followed safely on the read
                 // path instead, via `derefForwarder`.
-                if (scav_t0 != 0 and scav_chunk < SCAV_CHUNK_CAP and
-                    scavRdtsc() - scav_t0 > scav_hot_threshold_cy)
-                {
-                    scav_hot_chunks[scav_chunk] = 1;
-                }
                 resolveDispatch(self, thunk, result);
                 self.heap.gcRecordEdge(thunk_id, result); // old→young barrier
                 // If a tail call/functor/builtin left a *forwarding* thunk as
@@ -1289,7 +1126,6 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
             self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
         else
             self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
-        if (self.scheduler.touch_log != null) logSpawn(self, id, ok);
         // Coverage census (`-Dprof-main`): stamp whether this thunk was
         // aimed at by speculation (and admitted), so the `claimed_by_main`
         // site can tell a targeting miss from a lost race.

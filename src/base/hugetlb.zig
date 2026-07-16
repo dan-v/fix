@@ -31,7 +31,7 @@
 //! Accounting: hugetlb pages are invisible to VmRSS/VmHWM/statm, so every
 //! byte mapped through here is counted in `mapped_bytes`/`peak_mapped_bytes`
 //! for the RSS-adjacent reporters (`runtime/gc.zig` footprint helpers,
-//! `FIX_MEM_REPORT`, the progress/timeline memory counters).
+//! `--mem-report`, the progress/timeline memory counters).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -76,15 +76,11 @@ pub fn getMode() ?Mode {
     return @enumFromInt(s - 1);
 }
 
-/// Parse a mode from CLI/env text. Bare truthy/falsy spellings are accepted
-/// so the experiment-era `FIX_HUGETLB=1` keeps working; an *empty* value
-/// (env var set to nothing) also means `on`, matching the original
-/// presence-only gate.
+/// Parse a mode from CLI text.
 pub fn parseMode(text: []const u8) ?Mode {
-    if (text.len == 0) return .on;
     if (std.mem.eql(u8, text, "auto")) return .auto;
-    if (std.mem.eql(u8, text, "on") or std.mem.eql(u8, text, "1") or std.mem.eql(u8, text, "true")) return .on;
-    if (std.mem.eql(u8, text, "off") or std.mem.eql(u8, text, "0") or std.mem.eql(u8, text, "false")) return .off;
+    if (std.mem.eql(u8, text, "on")) return .on;
+    if (std.mem.eql(u8, text, "off")) return .off;
     return null;
 }
 
@@ -298,17 +294,13 @@ fn noteFallback() void {
     );
 }
 
-test "parseMode accepts mode names and truthy/falsy spellings" {
+test "parseMode accepts CLI mode names" {
     try std.testing.expectEqual(@as(?Mode, .auto), parseMode("auto"));
     try std.testing.expectEqual(@as(?Mode, .on), parseMode("on"));
-    try std.testing.expectEqual(@as(?Mode, .on), parseMode("1"));
-    try std.testing.expectEqual(@as(?Mode, .on), parseMode("true"));
-    try std.testing.expectEqual(@as(?Mode, .on), parseMode("")); // env set-but-empty
     try std.testing.expectEqual(@as(?Mode, .off), parseMode("off"));
-    try std.testing.expectEqual(@as(?Mode, .off), parseMode("0"));
-    try std.testing.expectEqual(@as(?Mode, .off), parseMode("false"));
+    try std.testing.expectEqual(@as(?Mode, null), parseMode(""));
+    try std.testing.expectEqual(@as(?Mode, null), parseMode("1"));
     try std.testing.expectEqual(@as(?Mode, null), parseMode("yes"));
-    try std.testing.expectEqual(@as(?Mode, null), parseMode("2"));
 }
 
 test "mode state: unconfigured is off; setMode round-trips" {

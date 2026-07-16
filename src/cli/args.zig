@@ -251,13 +251,13 @@ pub const Options = struct {
     vm_trace_main_only: bool = false,
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
-    /// GC (`-Dgc`) collection-line override in bytes (`--max-memory`); see
+    /// GC collection-line override in bytes (`--max-memory`); see
     /// `eval/gc.zig:memoryBudget`. `null` = the automatic RAM-scaled line;
     /// `0` = never collect.
     max_memory: ?u64 = null,
     /// `--hugetlb auto|on|off`: back the evaluation heap with explicit 2 MB
-    /// huge pages. `null` = not given; resolution (CLI > `FIX_HUGETLB` env >
-    /// `auto`) happens in `setup.applyMemoryBacking`, BEFORE the heap maps.
+    /// huge pages. `null` selects `auto`; resolution happens in
+    /// `setup.applyMemoryBacking`, before the heap maps.
     hugetlb: ?hugetlb.Mode = null,
     /// Speculation (eager background thunk forcing) is ON by default: it is
     /// worth ~20-32% wall at --workers>1 (spec-off→on: 2.62→2.11s with GC,
@@ -269,6 +269,10 @@ pub const Options = struct {
     disable_spec_thunks: bool = false,
     disable_fanout: bool = false,
     print_sched_stats: bool = false,
+    /// `--mem-report[=dump]`: peak memory attribution at evaluator teardown.
+    mem_report: ?[]const u8 = null,
+    /// `--gc-report`: collection summary at evaluator teardown.
+    gc_report: bool = false,
     timeline_path: ?[]const u8 = null,
     /// `--timeline-flows`: steal-arrow flow-event volume. 0 = off, 1 = all
     /// (default), N>1 = keep 1/N (flows are ~half the trace by event count).
@@ -388,10 +392,11 @@ const Opt = enum {
     vm_trace_max_events,
     vm_trace_main_only,
     thunks_log,
-    speculate,
     no_spec_thunks,
     no_fanout,
     print_sched_stats,
+    mem_report,
+    gc_report,
     timeline,
     timeline_flows,
 };
@@ -496,7 +501,7 @@ const specs = [_]Spec{
     .{ .id = .debug_derivation_filter, .long = "--debug-derivation-filter", .arg = .req, .metavar = "TEXT", .help = "only show derivations mentioning TEXT", .show_in = derivation_debug_cmds },
     .{ .id = .debug_derivation_name, .long = "--debug-derivation-name", .arg = .req, .metavar = "NAME", .help = "only show derivations with exactly NAME", .show_in = derivation_debug_cmds },
     .{ .id = .debug_derivation_drv, .long = "--debug-derivation-drv", .arg = .req, .metavar = "PATH", .help = "only show the derivation with exactly PATH", .show_in = derivation_debug_cmds },
-    .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC line (MiB, or with a\nk/m/g suffix; 0 = never collect). Default: auto,\nscaled to RAM. -Dgc builds only.", .show_in = eval_cmds },
+    .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC line (MiB, or with a\nk/m/g suffix; 0 = never collect). Default: auto,\nscaled to RAM.", .show_in = eval_cmds },
     .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
@@ -529,10 +534,11 @@ const specs = [_]Spec{
     .{ .id = .vm_trace_max_events, .long = "--vm-trace-max-events", .arg = .req, .metavar = "N", .hidden = true },
     .{ .id = .vm_trace_main_only, .long = "--vm-trace-main-only", .hidden = true },
     .{ .id = .thunks_log, .long = "--thunks-log", .arg = .req, .metavar = "PATH", .hidden = true },
-    .{ .id = .speculate, .long = "--speculate", .hidden = true },
     .{ .id = .no_spec_thunks, .long = "--no-spec-thunks", .hidden = true },
     .{ .id = .no_fanout, .long = "--no-fanout", .hidden = true },
     .{ .id = .print_sched_stats, .long = "--print-sched-stats", .hidden = true },
+    .{ .id = .mem_report, .long = "--mem-report", .arg = .opt, .metavar = "dump", .hidden = true },
+    .{ .id = .gc_report, .long = "--gc-report", .hidden = true },
     .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .hidden = true },
     .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "N", .hidden = true },
 };
@@ -735,10 +741,11 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .vm_trace_max_events => options.vm_trace_max_events = std.fmt.parseInt(u64, v0.?, 10) catch return error.InvalidVmTraceMaxEvents,
         .vm_trace_main_only => options.vm_trace_main_only = true,
         .thunks_log => options.thunks_log_path = v0.?,
-        .speculate => options.disable_spec_thunks = false,
-        .no_spec_thunks => options.disable_spec_thunks = true, // now the default; kept for A/B
+        .no_spec_thunks => options.disable_spec_thunks = true,
         .no_fanout => options.disable_fanout = true,
         .print_sched_stats => options.print_sched_stats = true,
+        .mem_report => options.mem_report = v0 orelse "",
+        .gc_report => options.gc_report = true,
         .timeline => options.timeline_path = v0 orelse "fix-timeline.json",
         .timeline_flows => {
             const v = v0.?;

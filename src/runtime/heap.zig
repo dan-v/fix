@@ -18,19 +18,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const types = @import("types.zig");
 
-/// Deterministic use-after-free detector (ReleaseSafe `-Dgc` only): when
+/// Deterministic use-after-free detector (ReleaseSafe only): when
 /// on, freed object slots are NOT reused and every object read asserts the
 /// slot's alloc-bit is set — so a collection that frees a still-live object
 /// traps at the first stale read with a stack trace, instead of a
 /// nondeterministic segfault much later. Off in ReleaseFast (production).
-pub const gc_debug = build_options.gc and builtin.mode == .ReleaseSafe;
+pub const gc_debug = builtin.mode == .ReleaseSafe;
 const stable = @import("base").segments;
 const sync = @import("base").sync;
 const worker_id_mod = @import("base").worker_id;
-/// GC (`-Dgc`) collector driver: the non-inline mark/sweep/evac/minor-collect
+/// GC collector driver: the non-inline mark/sweep/evac/minor-collect
 /// machinery, extracted to keep this file from being a god-file. Free
 /// functions over `*ObjectHeap`; the hot inline alloc-path helpers stay here.
 /// Re-exported (`pub`) so out-of-module callers reach it as
@@ -83,7 +82,7 @@ const ObjectStore = stable.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS, .
 // segment against the pool: ~340 MB of mapped-never-faulted slack across
 // the three stores on a NixOS toplevel. All three stores move their
 // cursors under `write_mu` only (no `appendAtomic`), which the overlay
-// requires. 64 MB keeps the (-Dgc) nursery segments allocator-backed.
+// requires. 64 MB keeps the (GC) nursery segments allocator-backed.
 const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024, .vma_tag = .values, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
@@ -229,12 +228,7 @@ const VALUE_CHUNK_SIZE: u32 = 1024;
 const ATTR_CHUNK_SIZE: u32 = 512;
 const ATTR_POS_CHUNK_SIZE: u32 = 256;
 
-/// Scavenger ring capacity (power of two). Each worker records the ids
-/// of thunks it creates; idle peers (FIX_SCAVENGE) force the oldest
-/// still-unresolved ones speculatively. 64K ids = 256KB per worker.
-pub const SCAV_RING_SIZE: u32 = 1 << 16;
-
-// Copying nursery (`-Dgc`): the low `NURSERY_SEGS_*` segments of each range
+// Copying nursery: the low `NURSERY_SEGS_*` segments of each range
 // store are the resettable young generation; the rest is tenured. Capacity =
 // first_segment_size * (2^N - 1) slots. With first_segment_size {values 1024,
 // attrs 512, attr_pos 512} and N below the nursery is ~16 MB for values and
@@ -267,16 +261,6 @@ pub const HeapLocal = struct {
     value: LocalChunk = .{},
     attr: LocalChunk = .{},
     attr_pos: LocalChunk = .{},
-    /// Scavenger ring (FIX_SCAVENGE, see `Worker.scavengeStep`): ids of
-    /// thunks this worker created, in creation order. Single-writer (the
-    /// owning worker); idle helpers scan worker 0's ring for old,
-    /// still-unresolved thunks with proven-expensive bodies. `scav_head`
-    /// is the monotonic count of entries written, release-published
-    /// after each ring store; `scav_head_local` is the writer's
-    /// non-atomic mirror (avoids an RMW on the hot path).
-    scav_ring: [SCAV_RING_SIZE]ObjectId = undefined,
-    scav_head_local: u64 = 0,
-    scav_head: std.atomic.Value(u64) = .init(0),
     /// Monotonic count of thunks this worker has created. One plain add
     /// on a cache line the allocation already touches; used by the
     /// sibling-sweep diagnostics (`FIX_SIBLING_LOG`) to attribute
@@ -289,9 +273,9 @@ pub const HeapLocal = struct {
     /// the resumed fiber's `vm.in_speculation`) and toggled by
     /// `forceValueSpeculative` itself. Single-writer (the owning thread);
     /// read at thunk creation to tag demand-created thunks for the
-    /// scavenger / `-Dprof-main` creation-context probe.
+    /// `-Dprof-main` creation-context probe.
     spec_ctx: bool = false,
-    // GC per-worker free lists (`-Dgc`): reclaim reuse. The sweep (STW, single
+    // GC per-worker free lists: reclaim reuse. The sweep (STW, single
     // collector) distributes freed slots/ranges round-robin across every
     // worker's shard; each worker's allocation hot path pops from its OWN shard,
     // and WORK-STEALS from a peer's shard when its own runs dry — so a
@@ -300,25 +284,24 @@ pub const HeapLocal = struct {
     // worker's four free lists; a stealer locks the victim's. Only engaged while
     // collection is armed (`gc_collect_enabled`) — zero cost otherwise. STW
     // writers (sweep/evac) don't lock: the world is stopped, no eval allocates.
-    gc_free_mu: if (build_options.gc) sync.SpinMutex else void = if (build_options.gc) .{} else {},
-    gc_free_objects: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
-    gc_free_values: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
-    gc_free_attrs: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
-    gc_free_attr_pos: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
+    gc_free_mu: sync.SpinMutex = .{},
+    gc_free_objects: std.ArrayListUnmanaged(ObjectId) = .empty,
+    gc_free_values: RangeFreeList = .{},
+    gc_free_attrs: RangeFreeList = .{},
+    gc_free_attr_pos: RangeFreeList = .{},
     /// Copying-nursery remembered set: `source` object ids (already old) that
     /// were written a pointer to a young object since the last minor. Per-worker
     /// and single-owner, so the write barrier (`gcRecordEdge`) appends without a
     /// lock. Drained (STW) at the next minor to seed the young referents that
     /// only an old object keeps alive; cleared after.
-    gc_remset: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
+    gc_remset: std.ArrayListUnmanaged(ObjectId) = .empty,
     /// This worker's young objects since the last minor (every id from
     /// `reserveObjectSlot`, including reused slots). The STW minor iterates
     /// exactly these — O(young) — and clears the list. Reuse- and TLAB-tail-
     /// safe, unlike an id-range frontier.
-    gc_young_slots: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
+    gc_young_slots: std.ArrayListUnmanaged(ObjectId) = .empty,
 
     fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
-        if (comptime !build_options.gc) return;
         self.gc_free_objects.deinit(allocator);
         self.gc_free_values.deinit(allocator);
         self.gc_free_attrs.deinit(allocator);
@@ -328,7 +311,7 @@ pub const HeapLocal = struct {
     }
 };
 
-/// GC collect hook (gated behind `-Dgc`). The heap can't reach the
+/// GC collect hook. The heap can't reach the
 /// evaluator's roots, so the evaluator registers a mark+sweep callback the
 /// heap fires from `gcRunCollect` at a safepoint. Type-erased to keep the
 /// heap free of an `eval`/`gc` import cycle. `collector_id` is the worker
@@ -395,9 +378,6 @@ pub const ObjectHeap = struct {
     /// allocator can reuse heap addresses, so a stale slot would match
     /// pointer equality even though it refers to a freed heap.
     token: u64,
-    /// Record thunk creations into the per-worker scavenger rings
-    /// (FIX_SCAVENGE). Set once before helpers start; read-only after.
-    scav_record: bool = false,
     /// Object-store pre-toucher: a background thread that keeps the flat
     /// reservation populated (`MADV_POPULATE_WRITE`) a few MB ahead of
     /// the bump cursor, absorbing the store's first-touch minor faults
@@ -409,30 +389,27 @@ pub const ObjectHeap = struct {
     toucher: ?std.Thread = null,
     toucher_state: std.atomic.Value(u8) = .init(0), // 0 = not started, 1 = running
     toucher_stop: std.atomic.Value(bool) = .init(false),
-    /// GC Phase 0 (`-Dgc`): periodic live-set sampler. `void` in normal
-    /// builds so there is zero footprint.
-    gc_hook: if (build_options.gc) ?GcHook else void = if (build_options.gc) null else {},
+    /// Evaluator callback used to enumerate roots and drive collection.
+    gc_hook: ?GcHook = null,
     /// Set by the allocation path when total reserved bytes cross
     /// `gc_threshold_bytes`; consumed at the next safepoint poll.
-    gc_collect_requested: if (build_options.gc) bool else void = if (build_options.gc) false else {},
-    gc_threshold_bytes: if (build_options.gc) u64 else void = if (build_options.gc) std.math.maxInt(u64) else {},
+    gc_collect_requested: bool = false,
+    gc_threshold_bytes: u64 = std.math.maxInt(u64),
     /// Major-collection policy: minors only reclaim young survivors and tenure
     /// the rest, so tenured garbage accumulates in the old generation. Count the
     /// objects promoted (tenured) since the last major; once it crosses
     /// `gc_major_gate` (roughly "the old gen has grown by a live-set's worth"),
     /// the next in-eval collection runs a MAJOR (full mark/sweep) instead of a
     /// minor. Reset after each major.
-    gc_promoted_since_major: if (build_options.gc) u64 else void = if (build_options.gc) 0 else {},
-    gc_major_gate: if (build_options.gc) u64 else void = if (build_options.gc) GC_MAJOR_GATE_FLOOR else {},
-    /// GC reclaim state (`-Dgc`). Inert until `gc_collect_enabled` is set
-    /// (the evaluator turns it on only at `--workers=1` for now — the
-    /// alloc-bitmap maintenance is not yet thread-safe). When off, the
-    /// allocator hot path is exactly as in a non-`-Dgc` build.
-    gc_collect_enabled: if (build_options.gc) bool else void = if (build_options.gc) false else {},
+    gc_promoted_since_major: u64 = 0,
+    gc_major_gate: u64 = GC_MAJOR_GATE_FLOOR,
+    /// GC reclaim state. Inert until `gc_collect_enabled` is set. Before lazy
+    /// arming, the allocator hot path remains bump-only.
+    gc_collect_enabled: bool = false,
     /// First ObjectId tracked by the alloc-bitmap (set at gcEnableCollect).
     /// Objects created before collection was enabled aren't tracked/swept,
     /// so the detector's assert skips them.
-    gc_track_from: if (build_options.gc) ObjectId else void = if (build_options.gc) 0 else {},
+    gc_track_from: ObjectId = 0,
     /// CONSTRAINED-MODE pre-arming reclaim boundary: the first ObjectId a major
     /// may sweep. Below it is true bootstrap (interns/builtins/chunk constants),
     /// pinned forever. On a tight machine (`gc_root_always`) a major also
@@ -440,31 +417,31 @@ pub const ObjectHeap = struct {
     /// drops toward bootstrap size. Captured at gcEnableBudget/gcEnableCollect.
     /// When `gc_root_always` is false this is unused: the sweep floor stays at
     /// `gc_track_from` (today's behavior, pre-arming pinned).
-    gc_bootstrap_end: if (build_options.gc) ObjectId else void = if (build_options.gc) 0 else {},
+    gc_bootstrap_end: ObjectId = 0,
     /// Constrained mode: reclaim the pre-arming region AND (the price) keep the
     /// force-chain + temp-root gates live even while collection is DORMANT, so
     /// an in-flight thunk / builtin temp value that predates arming is still
     /// rooted when the pre-arming major sweeps it. Off on roomy machines (they
     /// never arm ⇒ pinning is free and the reclaim is moot). Set once at
     /// gcEnableBudget from the collection policy (`eval_gc.constrainedMode`).
-    gc_root_always: if (build_options.gc) bool else void = if (build_options.gc) false else {},
+    gc_root_always: bool = false,
     /// Hot-path rooting gate for the transient-root appends (force chain,
     /// rootKeep): `gc_root_always OR armed`. Read in place of
     /// `gc_collect_enabled` by those two appends only. When NOT constrained it
     /// is false until arming and true after — byte-identical to gating on
     /// `gc_collect_enabled` (zero added cost). When constrained it is true from
     /// eval start so pre-arming transients are rooted before the first major.
-    gc_root_active: if (build_options.gc) bool else void = if (build_options.gc) false else {},
+    gc_root_active: bool = false,
     /// One bit per ObjectId: set when a slot is *filled* (a real object),
     /// cleared when swept. Lets `sweep` tell live objects from TLAB-
     /// reserved-but-unfilled slots and already-freed slots.
-    gc_alloc_bits: if (build_options.gc) []u64 else void = if (build_options.gc) &.{} else {},
+    gc_alloc_bits: []u64 = &.{},
     /// Copying-nursery generation bitmap: one bit per ObjectId, set ⇒ **old**
     /// (tenured). Clear (or beyond the array) ⇒ **young**. Written ONLY at a
     /// stop-the-world minor (promote sets it; a future major clears it on
     /// free), so there is NO allocation-path barrier — a freshly bumped slot is
     /// young by default. Grown (zeroed) at each minor to cover the object count.
-    gc_old_bits: if (build_options.gc) []u64 else void = if (build_options.gc) &.{} else {},
+    gc_old_bits: []u64 = &.{},
     /// Parallel non-moving SWEEP coordination (`--workers>1`; the `gc_evac_*`
     /// names are historical — the minor no longer evacuates). The young-object
     /// lists (`worker_locals[*].gc_young_slots`) form a work queue: each helping
@@ -473,36 +450,36 @@ pub const ObjectHeap = struct {
     /// shard), then bumps `gc_evac_done`. The collector opens the phase via
     /// `gc_evac_open` (after verifying mark closure) and waits until
     /// `gc_evac_done == gc_evac_count`.
-    gc_evac_open: if (build_options.gc) std.atomic.Value(bool) else void = if (build_options.gc) .init(false) else {},
-    gc_evac_next: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
-    gc_evac_done: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
-    gc_evac_count: if (build_options.gc) u32 else void = if (build_options.gc) 0 else {},
+    gc_evac_open: std.atomic.Value(bool) = .init(false),
+    gc_evac_next: std.atomic.Value(u32) = .init(0),
+    gc_evac_done: std.atomic.Value(u32) = .init(0),
+    gc_evac_count: u32 = 0,
     /// Dynamic marker-slot dispenser. The parallel collection is CAPPED at
     /// `min(worker_count, GC_PAR_CAP)` participants because the mark+evac is
     /// contention-bound: it bottoms out around 8 workers and gets *worse* past
     /// that (shared mark bitmap + old-bits + TLAB-refill cache-line bouncing).
     /// Each helping worker grabs the next slot; a worker whose slot is beyond
     /// the cap parks idle rather than piling on. Reset per collection.
-    gc_mark_slot: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
+    gc_mark_slot: std.atomic.Value(u32) = .init(0),
     /// True while a MAJOR is marking: parked peers that help the parallel mark
     /// (`helpMark`) then skip `evacClaimLoop` — a major sweeps the whole heap
     /// serially rather than evacuating the young lists. Published before
     /// `gcOpenMark` (release) and read after it (acquire), so peers see it; kept
     /// set until after the sweep, long past any peer's evac-phase check.
-    gc_collecting_major: if (build_options.gc) bool else void = if (build_options.gc) false else {},
-    gc_evac_promoted: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
-    gc_evac_freed: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
+    gc_collecting_major: bool = false,
+    gc_evac_promoted: std.atomic.Value(u64) = .init(0),
+    gc_evac_freed: std.atomic.Value(u64) = .init(0),
     /// Parallel MAJOR sweep coordination (`--workers>1`). The full sweep walks
     /// the whole id range `[0, count)`, so it's partitioned into word-aligned
     /// chunks the mark participants claim (`gc_sweep_next`) and sweep into their
     /// OWN free-list shard (word-disjoint ⇒ no alloc-bit races). `gc_sweep_open`
     /// gates the phase (the collector reconstructs the alloc bitmap serially
     /// first); `gc_sweep_done` counts finishers against `gc_sweep_count`.
-    gc_sweep_next: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
-    gc_sweep_done: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
-    gc_sweep_freed: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
-    gc_sweep_open: if (build_options.gc) std.atomic.Value(bool) else void = if (build_options.gc) .init(false) else {},
-    gc_sweep_count: if (build_options.gc) u32 else void = if (build_options.gc) 0 else {},
+    gc_sweep_next: std.atomic.Value(u32) = .init(0),
+    gc_sweep_done: std.atomic.Value(u32) = .init(0),
+    gc_sweep_freed: std.atomic.Value(u64) = .init(0),
+    gc_sweep_open: std.atomic.Value(bool) = .init(false),
+    gc_sweep_count: u32 = 0,
     // Free lists are PER-WORKER (`HeapLocal.gc_free_*`) so the allocation hot
     // path reuses without a lock — a single shared free list + mutex
     // serialized all allocation across workers and was the entire w>1 wall
@@ -512,16 +489,7 @@ pub const ObjectHeap = struct {
     /// Nursery size (segments) for a range store. Scales with worker count:
     /// each STW minor stalls ALL workers, so at higher parallelism we amortize
     /// over a bigger nursery (fewer collections). `+1 segment` ≈ doubles the
-    /// capacity; capped so it doesn't overshoot to zero collections (no
-    /// reclaim). `FIX_GC_NURSERY_SEGS` overrides the per-store base for tuning.
-    /// Optional compile-time-set override for the nursery base (set once from
-    /// the evaluator, which can read env). 0 = use the passed base.
-    var gc_nursery_base_override: u32 = 0;
-    pub fn gcSetNurseryBase(n: u32) void {
-        if (comptime !build_options.gc) return;
-        if (n > 0 and n < 26) gc_nursery_base_override = n;
-    }
-
+    /// capacity; capped so it doesn't overshoot to zero collections.
     fn gcNurserySegs(base: u32, worker_count: u8) u32 {
         _ = worker_count;
         // Worker-count scaling was measured net-negative with the current
@@ -529,7 +497,7 @@ pub const ObjectHeap = struct {
         // raises RSS and each collection still does O(count) reconstruct+walk,
         // so wall barely moves. Making w>1 fast needs parallel + O(young)
         // minors first (then revisit scaling). For now: fixed base.
-        return if (gc_nursery_base_override != 0) gc_nursery_base_override else base;
+        return base;
     }
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
@@ -543,12 +511,10 @@ pub const ObjectHeap = struct {
         // Partition each range store into a young nursery (low segments) +
         // tenured region. Done here, before any allocation, so pre-collect
         // bootstrap (builtins) tenures directly and post-collect allocations
-        // bump the nursery. Zero-cost in non-`-Dgc` builds.
-        if (comptime build_options.gc) {
-            values.enableNursery(gcNurserySegs(NURSERY_SEGS_VALUES, worker_count));
-            attrs.enableNursery(gcNurserySegs(NURSERY_SEGS_ATTRS, worker_count));
-            attr_positions.enableNursery(gcNurserySegs(NURSERY_SEGS_ATTR_POS, worker_count));
-        }
+        // bump the nursery.
+        values.enableNursery(gcNurserySegs(NURSERY_SEGS_VALUES, worker_count));
+        attrs.enableNursery(gcNurserySegs(NURSERY_SEGS_ATTRS, worker_count));
+        attr_positions.enableNursery(gcNurserySegs(NURSERY_SEGS_ATTR_POS, worker_count));
         return .{
             .allocator = allocator,
             .objects = objects,
@@ -569,11 +535,9 @@ pub const ObjectHeap = struct {
             self.toucher = null;
         }
         self.freeErroredInfos();
-        if (comptime build_options.gc) {
-            self.allocator.free(self.gc_alloc_bits);
-            self.allocator.free(self.gc_old_bits);
-            for (self.worker_locals) |*l| l.deinit(self.allocator);
-        }
+        self.allocator.free(self.gc_alloc_bits);
+        self.allocator.free(self.gc_old_bits);
+        for (self.worker_locals) |*l| l.deinit(self.allocator);
         self.allocator.free(self.worker_locals);
         self.attr_positions.deinit(self.allocator);
         self.attrs.deinit(self.allocator);
@@ -738,7 +702,7 @@ pub const ObjectHeap = struct {
         // attrset values live in `attrs`. These two cover every place an
         // int Value can be heap-resident — the VM stack contains transient
         // ints during execution but is empty by the time stats() runs.
-        // `getIfAllocated`: with `-Dgc` the low nursery segments stay
+        // `getIfAllocated`: with the collector the low nursery segments stay
         // null until arming, so the linear id walk crosses a hole of
         // never-allocated id space — skip whole segments there.
         var vid: u32 = 0;
@@ -776,7 +740,7 @@ pub const ObjectHeap = struct {
     // ratio of two candidate prefetch mechanisms BEFORE building them:
     //   - creation census: thunks by creation context (demand chain vs.
     //     speculative work) × final observation state — the selection
-    //     precision of a "scavenge only demand-fiber creations" policy.
+    //     precision of creation-context speculation policy.
     //   - sibling census: for attrsets with >= 1 demanded member, what
     //     fraction of their thunk members is ever demanded — the junk
     //     ratio of a "first member access sweeps the siblings" prefetch.
@@ -824,10 +788,14 @@ pub const ObjectHeap = struct {
                 .{
                     if (i == 0) "demand-created" else "spec-created",
                     c.n,
-                    c.dem_old,             profPct(c.dem_old, c.n),
-                    c.dem_young,           profPct(c.dem_young, c.n),
-                    c.never_resolved_spec, profPct(c.never_resolved_spec, c.n),
-                    c.never_unresolved,    profPct(c.never_unresolved, c.n),
+                    c.dem_old,
+                    profPct(c.dem_old, c.n),
+                    c.dem_young,
+                    profPct(c.dem_young, c.n),
+                    c.never_resolved_spec,
+                    profPct(c.never_resolved_spec, c.n),
+                    c.never_unresolved,
+                    profPct(c.never_unresolved, c.n),
                     c.errored,
                 },
             );
@@ -917,22 +885,18 @@ pub const ObjectHeap = struct {
             std.debug.print(
                 "  size>={d:<3}: sets={d} touched={d} all_dem={d} members={d} dem_old={d} ({d:.1}%) dem_young={d} ({d:.1}%) spec_res={d} ({d:.1}%) unres={d} ({d:.1}%)\n",
                 .{
-                    bucket_lo[i], b.sets, b.touched, b.all_demanded_sets, b.members,
-                    b.dem_old,       profPct(b.dem_old, b.members),
-                    b.dem_young,     profPct(b.dem_young, b.members),
-                    b.spec_resolved, profPct(b.spec_resolved, b.members),
-                    b.unresolved,    profPct(b.unresolved, b.members),
+                    bucket_lo[i],                        b.sets,                        b.touched,                        b.all_demanded_sets,             b.members,
+                    b.dem_old,                           profPct(b.dem_old, b.members), b.dem_young,                      profPct(b.dem_young, b.members), b.spec_resolved,
+                    profPct(b.spec_resolved, b.members), b.unresolved,                  profPct(b.unresolved, b.members),
                 },
             );
         }
         std.debug.print(
             "  TOTAL     : sets={d} touched={d} all_dem={d} members={d} dem_old={d} ({d:.1}%) dem_young={d} ({d:.1}%) spec_res={d} ({d:.1}%) unres={d} ({d:.1}%)\n",
             .{
-                tot.sets, tot.touched, tot.all_demanded_sets, tot.members,
-                tot.dem_old,       profPct(tot.dem_old, tot.members),
-                tot.dem_young,     profPct(tot.dem_young, tot.members),
-                tot.spec_resolved, profPct(tot.spec_resolved, tot.members),
-                tot.unresolved,    profPct(tot.unresolved, tot.members),
+                tot.sets,          tot.touched,                             tot.all_demanded_sets, tot.members,
+                tot.dem_old,       profPct(tot.dem_old, tot.members),       tot.dem_young,         profPct(tot.dem_young, tot.members),
+                tot.spec_resolved, profPct(tot.spec_resolved, tot.members), tot.unresolved,        profPct(tot.unresolved, tot.members),
             },
         );
     }
@@ -1031,8 +995,8 @@ pub const ObjectHeap = struct {
     /// allocation always succeeds, and — past the reserved-bytes threshold — a
     /// collection is requested (`gcNurseryFull`). Non-moving: nothing is reset
     /// or relocated; the minor frees dead ranges to the free lists in place.
-    /// Otherwise it is the ordinary tenured bump (identical to a non-`-Dgc`
-    /// build). A returned range is young iff `segment < nursery_segs`.
+    /// Otherwise it is the ordinary tenured bump used before lazy arming. A
+    /// returned range is young iff `segment < nursery_segs`.
     inline fn reserveRangeLocal(
         self: *ObjectHeap,
         comptime StoreT: type,
@@ -1045,28 +1009,26 @@ pub const ObjectHeap = struct {
             const r = chunk.take(n);
             return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
         }
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled) {
-                if (n > chunk_size) {
-                    // Oversized reservations bypass the TLAB; tenure directly
-                    // if they don't fit a nursery segment.
-                    if (try store.reserveYoung(self.allocator, n)) |yr| return yr;
-                } else if (try store.reserveYoung(self.allocator, chunk_size)) |cr| {
-                    chunk.segment = cr.segment;
-                    chunk.cursor = cr.offset;
-                    chunk.end = cr.offset + cr.len;
-                    const r = chunk.take(n);
-                    return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
-                }
-                // Nursery full: request a minor and spill to tenured below.
-                self.gcNurseryFull();
-            } else {
-                // Lazy policy, not yet armed (`gcEnableBudget`): poll the
-                // arming threshold (budget/2) on the same once-per-TLAB-refill
-                // cadence. One compare on a cold path — the whole pre-arming
-                // tracking cost of a `-Dgc` build.
-                self.gcNurseryFull();
+        if (self.gc_collect_enabled) {
+            if (n > chunk_size) {
+                // Oversized reservations bypass the TLAB; tenure directly
+                // if they don't fit a nursery segment.
+                if (try store.reserveYoung(self.allocator, n)) |yr| return yr;
+            } else if (try store.reserveYoung(self.allocator, chunk_size)) |cr| {
+                chunk.segment = cr.segment;
+                chunk.cursor = cr.offset;
+                chunk.end = cr.offset + cr.len;
+                const r = chunk.take(n);
+                return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
             }
+            // Nursery full: request a minor and spill to tenured below.
+            self.gcNurseryFull();
+        } else {
+            // Lazy policy, not yet armed (`gcEnableBudget`): poll the
+            // arming threshold (budget/2) on the same once-per-TLAB-refill
+            // cadence. One compare on a cold path — the whole pre-arming
+            // tracking cost of an always-available collector.
+            self.gcNurseryFull();
         }
         if (n > chunk_size) return store.reserve(self.allocator, n);
         const refilled = try store.reserve(self.allocator, chunk_size);
@@ -1119,10 +1081,8 @@ pub const ObjectHeap = struct {
         // NON-MOVING reuse: a swept dead range of exactly `n` is reused in
         // place before touching the bump cursor. Ranges never relocate, so the
         // returned slice is stable across forces (no re-fetch needed).
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled) {
-                if (self.gcReuseRange(local, "gc_free_values", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
-            }
+        if (self.gc_collect_enabled) {
+            if (self.gcReuseRange(local, "gc_free_values", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
         return self.reserveRangeLocal(ValueStore, &self.values, &local.value, VALUE_CHUNK_SIZE, n);
     }
@@ -1138,9 +1098,7 @@ pub const ObjectHeap = struct {
         // young reservation would be reclaimed out from under `dst` by a minor's
         // nursery reset. Tenured slots are never reset/evacuated, so `dst` stays
         // valid. (The published object's slot is still young/reclaimable.)
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled) return self.attrs.reserve(self.allocator, n);
-        }
+        if (self.gc_collect_enabled) return self.attrs.reserve(self.allocator, n);
         return self.reserveAttrsLocal(n);
     }
 
@@ -1164,20 +1122,16 @@ pub const ObjectHeap = struct {
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
         const local = self.currentLocal();
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled) {
-                if (self.gcReuseRange(local, "gc_free_attrs", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
-            }
+        if (self.gc_collect_enabled) {
+            if (self.gcReuseRange(local, "gc_free_attrs", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
         return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, ATTR_CHUNK_SIZE, n);
     }
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
         const local = self.currentLocal();
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled) {
-                if (self.gcReuseRange(local, "gc_free_attr_pos", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
-            }
+        if (self.gc_collect_enabled) {
+            if (self.gcReuseRange(local, "gc_free_attr_pos", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
         return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, ATTR_POS_CHUNK_SIZE, n);
     }
@@ -1189,33 +1143,21 @@ pub const ObjectHeap = struct {
     /// region so the allocation succeeds now; the spill window (until the
     /// safepoint) is small because forces are frequent.
     inline fn gcNurseryFull(self: *ObjectHeap) void {
-        if (comptime !build_options.gc) return;
         // NON-MOVING: request a collect only once reserved bytes cross the
         // threshold (re-armed to cursor+headroom after each collect). Called
         // frequently (every young-full TLAB refill), so it polls the threshold.
         if (self.totalReservedBytes() >= self.gc_threshold_bytes) self.gc_collect_requested = true;
     }
 
-    /// Register the collect callback (no-op in non-`-Dgc` builds). Fired at
+    /// Register the collect callback. Fired at
     /// a safepoint via `gcRunCollect` when a collection has been requested.
     pub fn setGcHook(self: *ObjectHeap, hook: GcHook) void {
-        if (comptime !build_options.gc) return;
         self.gc_hook = hook;
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
         const id = try self.reserveObjectSlot();
         self.fillObjectSlot(id, object);
-        // Scavenger ring (FIX_SCAVENGE): record thunk creations, in
-        // order, for idle peers to pre-force. Three stores to this
-        // worker's own cache lines; a single predictable branch when off.
-        if (self.scav_record and object == .thunk) {
-            const local = self.currentLocal();
-            const slot = &local.scav_ring[@intCast(local.scav_head_local & (SCAV_RING_SIZE - 1))];
-            @atomicStore(ObjectId, slot, id, .release);
-            local.scav_head_local += 1;
-            local.scav_head.store(local.scav_head_local, .release);
-        }
         if (object == .thunk) self.currentLocal().thunks_created += 1;
         // `-Dprof-main` creation-context probe: tag the thunk with whether
         // it was created on the demand chain (vs. inside speculative work).
@@ -1270,13 +1212,11 @@ pub const ObjectHeap = struct {
     pub fn reserveObjectSlot(self: *ObjectHeap) !ObjectId {
         const local = self.currentLocal();
         const id = blk: {
-            if (comptime build_options.gc) {
-                // Reuse a slot freed by a prior collection (own shard, else
-                // work-steal from a peer). Detector leaves freed slots unused so
-                // use-after-free is caught.
-                if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug) {
-                    if (self.gcReuseObject(local)) |rid| break :blk rid;
-                }
+            // Reuse a slot freed by a prior collection (own shard, else
+            // work-steal from a peer). Detector leaves freed slots unused so
+            // use-after-free is caught.
+            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug) {
+                if (self.gcReuseObject(local)) |rid| break :blk rid;
             }
             const chunk = &local.object;
             if (chunk.cursor < chunk.end) {
@@ -1302,9 +1242,7 @@ pub const ObjectHeap = struct {
         // Record the id in this worker's young-slot list: the minor iterates
         // exactly these (O(young)), and it's robust to slot reuse and the
         // reserved-vs-filled TLAB tail (both of which broke an id-range frontier).
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled) local.gc_young_slots.append(self.allocator, id) catch {};
-        }
+        if (self.gc_collect_enabled) local.gc_young_slots.append(self.allocator, id) catch {};
         return id;
     }
 
@@ -1324,7 +1262,7 @@ pub const ObjectHeap = struct {
         }
     }
 
-    // --- GC reclaim (`-Dgc`, single-threaded for now) ---
+    // --- GC reclaim (collector, single-threaded for now) ---
 
     /// Floor on the collection threshold.
     pub const GC_MIN_THRESHOLD: u64 = 256 << 20;
@@ -1338,14 +1276,14 @@ pub const ObjectHeap = struct {
     /// `gcAfterCollect`). Keeps peak RSS near live + a constant.
     pub const GC_HEADROOM: u64 = 1024 << 20;
 
-    /// Validation knob (`FIX_GC_STEP_MB`, `-Dgc` only): when > 0, collect
+    /// Validation knob (`FIX_GC_STEP_MB`): when > 0, collect
     /// every this-many MB of fresh allocation instead of the normal additive-
     /// headroom policy. Drives many collections so the detector exercises
     /// every builtin loop. 0 = normal policy. Set from the evaluator (which
     /// owns the env map) via the `step_bytes` arg to `gcEnableCollect`.
     pub var gc_step_bytes: u64 = 0;
 
-    /// Memory budget (`--max-memory` / `FIX_MAX_MEMORY`, `-Dgc` only): the
+    /// Memory budget (`--max-memory`): the
     /// heap-reserved-bytes ceiling the collector defends. No collection runs
     /// until reserved bytes cross it, so on a machine whose budget exceeds
     /// the eval's total allocation the collector never fires (zero pauses);
@@ -1359,7 +1297,6 @@ pub const ObjectHeap = struct {
     /// Lets us isolate reclaim's reuse cost/benefit. Set from the evaluator.
     var gc_disable_reuse: bool = false;
     pub fn gcSetDisableReuse(v: bool) void {
-        if (comptime !build_options.gc) return;
         gc_disable_reuse = v;
     }
 
@@ -1374,9 +1311,9 @@ pub const ObjectHeap = struct {
     }
 
     /// Test-only liveness observation after an explicit collection. The GC
-    /// bitmap access is compile-time absent from non-test and non-GC builds.
+    /// bitmap access is compile-time absent from non-test builds.
     pub fn isObjectAllocatedForTest(self: *const ObjectHeap, id: ObjectId) bool {
-        if (comptime !builtin.is_test or !build_options.gc) return false;
+        if (comptime !builtin.is_test) return false;
         if (id < self.gcSweepFloor()) return true;
         return self.gcAllocBitSet(id);
     }
@@ -1403,7 +1340,6 @@ pub const ObjectHeap = struct {
     }
 
     pub fn gcCollectRequested(self: *const ObjectHeap) bool {
-        if (comptime !build_options.gc) return false;
         return self.gc_collect_requested;
     }
 
@@ -1488,13 +1424,12 @@ pub const ObjectHeap = struct {
     }
 
     // ===================================================================
-    // Copying nursery — minor collection (`-Dgc`)
+    // Copying nursery — minor collection
     // ===================================================================
 
     /// Is object `id` young? Old ⇒ its bit is set (promoted in a prior minor);
     /// young ⇒ clear or beyond the (STW-grown) bitmap. No allocation barrier.
     pub inline fn gcIsYoung(self: *const ObjectHeap, id: ObjectId) bool {
-        if (comptime !build_options.gc) return false;
         // Pre-collection (bootstrap) objects are permanent — always old. Never
         // evacuated/reclaimed, and the write barrier MUST treat them as old so
         // an old→young edge they gain (e.g. a bootstrap thunk resolving to a
@@ -1539,7 +1474,6 @@ pub const ObjectHeap = struct {
     /// other case bails cheaply. Fired at the write-once mutation sites (thunk
     /// resolve, merge flatten, cell bind).
     pub inline fn gcRecordEdge(self: *ObjectHeap, source: ObjectId, referent: Value) void {
-        if (comptime !build_options.gc) return;
         if (!self.gc_collect_enabled) return;
         const ref_id = gcHeapId(referent) orelse return;
         if (!self.gcIsYoung(ref_id)) return; // referent already old
@@ -1547,7 +1481,7 @@ pub const ObjectHeap = struct {
         self.currentLocal().gc_remset.append(self.allocator, source) catch {};
     }
 
-    /// GC minor-collect statistics (`-Dgc`); populated by the collector
+    /// GC minor-collect statistics; populated by the collector
     /// driver in `heap/gc.zig`.
     pub const MinorStats = struct { promoted: u64 = 0, freed: u64 = 0 };
 
@@ -1565,7 +1499,6 @@ pub const ObjectHeap = struct {
     /// phase — beginEvac/openEvac/evacClaimLoop/waitEvacDone/finishEvac — lives
     /// in the collector driver, `heap/gc.zig`.)
     pub fn gcMarkSlotGrab(self: *ObjectHeap) u32 {
-        if (comptime !build_options.gc) return 0;
         return self.gc_mark_slot.fetchAdd(1, .acq_rel);
     }
 
@@ -1576,7 +1509,6 @@ pub const ObjectHeap = struct {
     /// tracer. Must run at a safepoint with no concurrent allocation.
     pub fn sweep(self: *ObjectHeap, mark_bits: []const u64) SweepStats {
         var st: SweepStats = .{};
-        if (comptime !build_options.gc) return st;
         // Release builds don't maintain the alloc bitmap incrementally —
         // rebuild it here from the live id range minus the free lists.
         if (comptime !gc_debug) self.gcReconstructAllocBits();
@@ -1614,7 +1546,6 @@ pub const ObjectHeap = struct {
     /// the caller can drop the remembered set. The next minor then works from a
     /// clean nursery. STW-only (the collector alone touches these).
     pub fn gcMajorReconcile(self: *ObjectHeap, mark_bits: []const u64) void {
-        if (comptime !build_options.gc) return;
         const n = self.objects.count();
         self.gcGrowOldBits(n);
         // Clear the whole generation bitmap first, THEN re-tenure survivors: a
@@ -1643,18 +1574,15 @@ pub const ObjectHeap = struct {
     }
 
     /// Major-collection policy hooks (see `gc_major_gate`). ---
-
     /// Should the next in-eval collection be a MAJOR? True once enough objects
     /// have tenured since the last major that the old generation likely holds a
     /// live-set's worth of reclaimable garbage.
     pub fn gcShouldMajor(self: *const ObjectHeap) bool {
-        if (comptime !build_options.gc) return false;
         return self.gc_promoted_since_major >= self.gc_major_gate;
     }
 
     /// A minor tenured `promoted` objects; charge them against the major gate.
     pub fn gcNoteMinorPromoted(self: *ObjectHeap, promoted: u64) void {
-        if (comptime !build_options.gc) return;
         self.gc_promoted_since_major += promoted;
     }
 
@@ -1662,7 +1590,6 @@ pub const ObjectHeap = struct {
     /// the promotion counter and re-arm the gate to the new live set (floored),
     /// so the next major fires once the old gen has ~doubled again.
     pub fn gcNoteMajor(self: *ObjectHeap, live_objects: u64) void {
-        if (comptime !build_options.gc) return;
         self.gc_promoted_since_major = 0;
         self.gc_major_gate = @max(GC_MAJOR_GATE_FLOOR, live_objects);
     }
@@ -2326,12 +2253,10 @@ pub const ObjectHeap = struct {
         // must be copied to the tenured region so it never moves. Inline (<=2)
         // upvalues are copied into the thunk, so the young pending range is
         // harmless (reclaimed by the next nursery reset).
-        if (comptime build_options.gc) {
-            if (pending.range.len > BytecodeThunk.INLINE_CAP and self.values.isYoung(pending.range)) {
-                const t = try self.values.reserve(self.allocator, pending.range.len);
-                @memcpy(self.values.sliceMut(t), self.values.slice(pending.range));
-                return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.values.slice(t)) });
-            }
+        if (pending.range.len > BytecodeThunk.INLINE_CAP and self.values.isYoung(pending.range)) {
+            const t = try self.values.reserve(self.allocator, pending.range.len);
+            @memcpy(self.values.sliceMut(t), self.values.slice(pending.range));
+            return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.values.slice(t)) });
         }
         return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.values.slice(pending.range)) });
     }
@@ -2358,7 +2283,6 @@ pub const ObjectHeap = struct {
         // wider than INLINE_CAP), so at high worker counts the direct
         // `values.reserve` was a spinlock convoy dominating the profile.
         // Mirrors `appendAttrEntriesTenured`'s guard.
-        if (comptime !build_options.gc) return self.appendValues(items);
         if (!self.gc_collect_enabled) return self.appendValues(items);
         const range = try self.values.reserve(self.allocator, @intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);
@@ -2375,7 +2299,6 @@ pub const ObjectHeap = struct {
     /// (`contextEntriesForValue`) is held across forces in string builtins and
     /// would dangle if evacuated. See `addContextString`.
     fn appendAttrEntriesTenured(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
-        if (comptime !build_options.gc) return self.appendAttrEntries(entries);
         if (!self.gc_collect_enabled) return self.appendAttrEntries(entries);
         const range = try self.attrs.reserve(self.allocator, @intCast(entries.len));
         @memcpy(self.attrs.sliceMut(range), entries);

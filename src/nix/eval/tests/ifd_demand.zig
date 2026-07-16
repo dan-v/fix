@@ -1,5 +1,4 @@
 const std = @import("std");
-const build_options = @import("build_options");
 const eval_mod = @import("../../eval.zig");
 const Evaluator = eval_mod.Evaluator;
 const Value = @import("runtime").value.Value;
@@ -242,7 +241,7 @@ test "cold output demand survives a major GC with only output context rooted" {
         // the second major can prove this exact ObjectId was reclaimed.
         _ = try fixture.ev.evaluate("1");
         const armed = fixture.ev.collectMajorNow();
-        if (comptime build_options.gc) try std.testing.expect(armed.ran);
+        try std.testing.expect(armed.ran);
 
         const produced = try fixture.makeDerivationAndOutput();
         const output = produced.output;
@@ -253,10 +252,8 @@ test "cold output demand survives a major GC with only output context rooted" {
         try fixture.ev.gcSetExternalRoots(&.{output});
         defer fixture.ev.gcSetExternalRoots(&.{}) catch {};
         const collected = fixture.ev.collectMajorNow();
-        if (comptime build_options.gc) {
-            try std.testing.expect(collected.ran);
-            try std.testing.expect(!fixture.ev.heap.isObjectAllocatedForTest(produced.derivation_id));
-        }
+        try std.testing.expect(collected.ran);
+        try std.testing.expect(!fixture.ev.heap.isObjectAllocatedForTest(produced.derivation_id));
 
         const scope = try fixture.scopeWithOutput(output);
         const result = try fixture.ev.evaluateWithScope("builtins.readFile (p + \"/payload.txt\")", scope);
@@ -275,11 +272,7 @@ test "concurrent cold output demands issue exactly one daemon build" {
         const scope = try fixture.scopeWithOutput(output);
 
         // Eight top-level attr thunks cross forceAttrsAccelerate's guaranteed
-        // fan-out threshold. One-item test batches deterministically expose all
-        // eight independent demands to helpers before the strict walk joins.
-        const saved_batch = vm_force.fan_out_batch_items;
-        vm_force.fan_out_batch_items = 1;
-        defer vm_force.fan_out_batch_items = saved_batch;
+        // fan-out threshold and exercise the scheduled strict walk.
         const demands = try fixture.ev.evaluateWithScope(
             \\{
             \\  d0 = builtins.readFile (p + "/payload.txt");

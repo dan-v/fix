@@ -16,7 +16,7 @@ const pct = prof.pct;
 /// fields) and flush here via `fiberFlush`; `fib_live*` is the one
 /// shared-atomic piece (a concurrent gauge can't be thread-local).
 pub const FiberLocal = struct {
-    /// Tasks started on a freshly-reset fiber (slot/cont/scavenge/top-level).
+    /// Tasks started on a freshly-reset fiber (slot/top-level).
     tasks: u64 = 0,
     /// Tasks that ran to completion (fiber reached `.finished`).
     finished: u64 = 0,
@@ -123,8 +123,12 @@ pub fn report() void {
             "prof fibers: cy_dispatch={d} cy_in={d} (n={d} avg={d}) cy_out={d} (n={d} avg={d}) total_overhead_cy={d}\n",
             .{
                 f.cy_dispatch,
-                f.cy_in,  f.n_in,  if (f.n_in == 0) 0 else f.cy_in / f.n_in,
-                f.cy_out, f.n_out, if (f.n_out == 0) 0 else f.cy_out / f.n_out,
+                f.cy_in,
+                f.n_in,
+                if (f.n_in == 0) 0 else f.cy_in / f.n_in,
+                f.cy_out,
+                f.n_out,
+                if (f.n_out == 0) 0 else f.cy_out / f.n_out,
                 total_over,
             },
         );

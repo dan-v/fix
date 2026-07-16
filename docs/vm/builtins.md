@@ -33,12 +33,12 @@ Two constructors in `shared.zig`, both keyed off a `BuiltinId` + captured args:
 
 ## GC safety
 
-Arguments live in Zig locals / a C-stack slice, never on the VM operand stack, so a force mid-body could otherwise sweep them (and their reachable graph). Two overlapping guards make builtins correct-by-default under [`-Dgc`](../gc.md):
+Arguments live in Zig locals / a C-stack slice, never on the VM operand stack, so a force mid-body could otherwise sweep them (and their reachable graph). Two overlapping guards make builtins correct across [collection](../gc.md):
 
 - **Native-depth gate**: `access.applyBuiltin` raises the per-thread native depth for the whole call; collections only fire at depth 0, so no builtin's Zig-local heap refs are observable mid-call. (`import`/`scopedImport` drop back to the caller's depth for the nested eval so it can still collect.) This is why the switch arms need no rooting of their own.
 - **Caller-side arg rooting**: the calling convention already roots the arguments before entry — `doCall`/`doTailCall`/`callValue` `rootKeep` their arg, `doCallN` leaves the args on the operand stack, and an in-flight `builtin_closure` force keeps them on the force chain. So a builtin's arguments survive any force it performs, and the arm only has to manage the intermediates *it* freshly produces.
 
-Builtins that merge [string context](../derivation/context.md) or build large intermediates (`toJSON` in `serial`, `derivationStrict` in `derivation`, the `fetch*` family, string ops in `strings`/`string_context`) open their own `rootsBegin`/`rootKeep`/`rootsEnd` scope around those intermediates. All of this compiles away without `-Dgc`.
+Builtins that merge [string context](../derivation/context.md) or build large intermediates (`toJSON` in `serial`, `derivationStrict` in `derivation`, the `fetch*` family, string ops in `strings`/`string_context`) open their own `rootsBegin`/`rootKeep`/`rootsEnd` scope around those intermediates.
 
 ## File-group split (`src/nix/vm/builtins/`)
 

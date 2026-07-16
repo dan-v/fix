@@ -20,7 +20,7 @@ Attrsets are stored as arrays of `(InternId, Value)` entries kept **sorted by na
 | `attr_check` (`_w`) | `[attrs]`, expected ids | attrset-pattern arg check; `allow_extra` flag governs `UnexpectedAttribute`. |
 | `with_lookup` (`_w`) | `[scope1…scopeN]`, name id | resolve a name through active `with`-scopes, nearest first; `UndefinedVariable` if none has it. |
 
-Each path walk keeps the root attrs value (and the default) on the operand stack for the whole helper (`getAttrPathOrValue` and siblings); intermediate path nodes are not separately rooted — they are transitively reachable from that on-stack root (attr thunks memoise in place), which is what keeps the walk correct under [-Dgc](../gc.md). The walk itself goes through `cachedAttrLookup`, not the forcing `getAttrValue` wrapper: it forces each intermediate node explicitly between segments.
+Each path walk keeps the root attrs value (and the default) on the operand stack for the whole helper (`getAttrPathOrValue` and siblings); intermediate path nodes are not separately rooted — they are transitively reachable from that on-stack root (attr thunks memoise in place), which is what keeps the walk correct across a [collection](../gc.md). The walk itself goes through `cachedAttrLookup`, not the forcing `getAttrValue` wrapper: it forces each intermediate node explicitly between segments.
 
 ### Attr inline cache
 

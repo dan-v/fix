@@ -8,7 +8,7 @@
 
 Each worker `i` owns (see [scheduler](scheduler.md) for the queue internals):
 
-- its lane of the scheduler queues — `ready_queues[i]`, `urgent_queues[i]`, `novel_queues[i]`, `spec_queues[i]`, `cont_queues[i]`, and `wake_words[i]`
+- its lane of the scheduler queues — `ready_queues[i]`, `urgent_queues[i]`, `novel_queues[i]`, `spec_queues[i]`, and `wake_words[i]`
 - a **fiber free-list** of recyclable [fiber](fibers.md) slots.
 
 ### The fiber free-list
@@ -36,16 +36,14 @@ while not shutdown:
 drainStep():                      # returns true if it did work
     pick a ready fiber   (own queue, else steal)   → resume it
     else pick a task     (own queues, else steal)  → wrap in a fiber, resume
-    else steal a cont    (work-first, others only) → wrap in a fiber, resume
-    else scavengeStep    (idle-only pre-forcing)
     else return false             # caller parks
 ```
 
-Priority within `drainStep` mirrors the scheduler's discipline: **ready fibers → demand/speculation tasks → work-first continuations → scavenge**, and within the task pick, own queues before stealing and urgent before novel before spec. A dequeued task runs by resetting a free-list fiber to `slotEntry` (which reads the task off the slot and forces it); a dequeued ready fiber is resumed directly. A worker steals *other* workers' continuations only — its own are reclaimed inline by the work-first walk's pop-back, never through the drain loop.
+Priority within `drainStep` mirrors the scheduler's discipline: **ready fibers → demand/speculation tasks**, and within the task pick, own queues before stealing and urgent before novel before spec. A dequeued task runs by resetting a free-list fiber to `slotEntry` (which reads the task off the slot and forces it); a dequeued ready fiber is resumed directly.
 
 `runFiber` takes the slot's `run_mu` around the resume (serializing a stealer that pops the same ready node against the current owner) and holds `in_runfiber` at 1 across the resume, clearing it to 0 after, so teardown can tell when the fiber is truly idle. It also refreshes the heap's per-thread speculation-context flag from the fiber's VM state on every resume, buckets the elapsed wall into `busy_ns`, and recycles or accounts the fiber based on whether it finished or yielded.
 
-**`gcSafepoint`** is a per-loop-iteration poll: if a [GC](../gc.md) stop is requested the worker parks at the safepoint until released. This is how the (opt-in) collector reaches a stop-the-world barrier without preempting mid-op. **`scavengeStep`** is the lowest-priority idle work (`FIX_SCAVENGE`, off by default): a helper pre-forces aged still-unresolved thunks from main's creation ring whose body chunk has proven expensive on the demand path.
+**`gcSafepoint`** is a per-loop-iteration poll: if a [GC](../gc.md) stop is requested the worker parks at the safepoint until released. This is how the collector reaches a stop-the-world barrier without preempting mid-op.
 
 ## The Evaluator
 

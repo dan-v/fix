@@ -1,4 +1,4 @@
-//! `FIX_MEM_REPORT` peak-RSS attribution.
+//! `--mem-report` peak-RSS attribution.
 //!
 //! Decomposes the process's memory across every subsystem (object stores,
 //! interned strings, bytecode, retained AST arenas) alongside a kernel-truth
@@ -19,7 +19,7 @@ const base_hugetlb = @import("base").hugetlb;
 const bytecode = @import("../bytecode.zig");
 const ast = @import("syntax").ast;
 
-/// `FIX_MEM_REPORT`: attribute peak RSS across every subsystem so we can see
+/// `--mem-report`: attribute peak RSS across every subsystem so we can see
 /// where the memory actually goes (the tracked object stores are only part
 /// of it — interned strings, bytecode, and AST arenas are large and the GC
 /// never sees them). Printed at deinit, before any teardown frees state.
@@ -29,10 +29,9 @@ pub fn report(
     intern: *intern_mod.InternTable,
     registry: *bytecode.ChunkRegistry,
     retained_arenas: []const ast.AstArena,
-    env: ?*const std.process.Environ.Map,
+    mode: ?[]const u8,
 ) void {
-    const on = if (env) |em| em.get("FIX_MEM_REPORT") != null else false;
-    if (!on) return;
+    if (mode == null) return;
     const mb = struct {
         fn f(bytes: u64) f64 {
             return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
@@ -40,7 +39,7 @@ pub fn report(
     }.f;
     const p = std.debug.print;
 
-    // `reservedSlots`, not `count`: with `-Dgc` the segmented stores'
+    // `reservedSlots`, not `count`: with the collector the segmented stores'
     // cursor starts past the (possibly never-armed) nursery gap, and
     // `count()` would bill those phantom slots as used (~175 MB of
     // pages that don't exist on a dormant-GC run).
@@ -68,7 +67,7 @@ pub fn report(
     const huge_peak = base_hugetlb.peakMappedBytes();
     const footprint = rss + huge_peak;
 
-    p("\n=== MEM REPORT (FIX_MEM_REPORT) — peak RSS attribution ===\n", .{});
+    p("\n=== MEM REPORT — peak RSS attribution ===\n", .{});
     p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), heap.objects.count() });
     p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), heap.values.reservedSlots() });
     p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), heap.attrs.reservedSlots() });
@@ -116,8 +115,7 @@ pub fn report(
         p("  {s:<16}{d:>8.1} MB  (small-alloc slabs, thread stacks, binary)\n", .{ "untracked", mb(cur_foot - tracked_total) });
     if (res.dropped > 0)
         p("  WARNING: {d} region registrations dropped (table full) — undercount\n", .{res.dropped});
-    const dump = if (env) |em| em.get("FIX_MEM_REPORT") else null;
-    if (dump != null and std.mem.eql(u8, dump.?, "dump")) vma_mod.dumpRegions();
+    if (std.mem.eql(u8, mode.?, "dump")) vma_mod.dumpRegions();
 
     // Decompose the "untracked" bucket above via /proc/self/smaps:
     // split current RSS into file-backed (binary + shared libs), the

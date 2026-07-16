@@ -34,7 +34,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
     if (args.len < arity) return shared.makeBuiltinClosure(self, builtin_id, args);
     if (args.len > arity) return error.TooManyArguments;
 
-    // GC (`-Dgc`): args need no rooting here — every caller keeps them rooted
+    // GC: args need no rooting here — every caller keeps them rooted
     // for the builtin's whole duration (doCall/doTailCall/callValue rootKeep
     // their arg; doCallN leaves args on the operand stack; evalThunkClosure's
     // builtin_closure is on the in-flight force chain). See docs/plans/

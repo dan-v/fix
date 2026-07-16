@@ -1,4 +1,4 @@
-//! GC (`-Dgc`) collector driver for `ObjectHeap`: the non-inline mark/sweep/
+//! GC collector driver for `ObjectHeap`: the non-inline mark/sweep/
 //! evac/minor-collect machinery. Extracted out of the `heap.zig` god-file.
 //!
 //! These are free functions over `heap: *ObjectHeap` rather than methods (Zig
@@ -11,11 +11,8 @@
 //! deliberately STAY in `ObjectHeap` so they keep inlining into the alloc
 //! path; the collector here calls them through `heap`.
 //!
-//! Every entry point is comptime-guarded (`if (comptime !build_options.gc)
-//! return;`) so the whole file compiles to nothing in a default build.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const heap_mod = @import("../heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const HeapLocal = heap_mod.HeapLocal;
@@ -31,7 +28,6 @@ const gc_debug = heap_mod.gc_debug;
 /// validation override: collect every that-many bytes of fresh allocation
 /// from a low starting threshold, ignoring the budget.
 pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
-    if (comptime !build_options.gc) return;
     ObjectHeap.gc_step_bytes = step_bytes;
     ObjectHeap.gc_budget_bytes = budget;
     // NON-MOVING: collect on the reserved-bytes threshold (survivors stay
@@ -60,7 +56,7 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
 /// watch the reserved-bytes cursor. At half the line the safepoint driver arms
 /// tracking (STW, `armTracking`); at the line it collects. A run that never
 /// reaches line/2 pays ZERO tracking cost (no young-slot appends, no write
-/// barrier, no free-list probes) — below the line a `-Dgc` build stays at
+/// barrier, no free-list probes) — below the line the evaluator stays at
 /// rooting-tax-only. The price: objects allocated before arming are permanently
 /// old (unreclaimable floor ≈ reserved at line/2 — half the line, by
 /// construction) UNLESS `root_always` (constrained mode): then a major also
@@ -68,7 +64,6 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
 /// gates live from here (`gc_root_active`). `gc_bootstrap_end` is captured now
 /// as the reclaim boundary (bootstrap below it stays pinned).
 pub fn enableBudget(heap: *ObjectHeap, budget: u64, root_always: bool) void {
-    if (comptime !build_options.gc) return;
     ObjectHeap.gc_step_bytes = 0;
     ObjectHeap.gc_budget_bytes = budget;
     heap.gc_threshold_bytes = budget / 2;
@@ -89,7 +84,6 @@ pub fn enableBudget(heap: *ObjectHeap, budget: u64, root_always: bool) void {
 /// stopped: the TLAB flush and `gc_collect_enabled` publication race
 /// mutators otherwise.
 pub fn armTracking(heap: *ObjectHeap) void {
-    if (comptime !build_options.gc) return;
     heap.gc_collect_enabled = true;
     heap.gc_root_active = true; // arming turns rooting on (already on if constrained)
     heap.gc_track_from = heap.objects.count();
@@ -125,7 +119,6 @@ pub fn armTracking(heap: *ObjectHeap) void {
 /// bump — nothing allocated so far is tracked, so there is nothing to
 /// reclaim yet.
 pub fn armLazy(heap: *ObjectHeap) void {
-    if (comptime !build_options.gc) return;
     armTracking(heap);
     heap.gc_collect_requested = false;
     const budget = ObjectHeap.gc_budget_bytes;
@@ -137,7 +130,6 @@ pub fn armLazy(heap: *ObjectHeap) void {
 /// mark+sweep). Caller must be at a safepoint. `collector_id` is the
 /// worker driving the collection (its slot in the parallel mark).
 pub fn runCollect(heap: *ObjectHeap, collector_id: u8) void {
-    if (comptime !build_options.gc) return;
     if (heap.gc_hook) |h| h.sample(h.ctx, collector_id);
 }
 
@@ -151,7 +143,6 @@ pub fn runCollect(heap: *ObjectHeap, collector_id: u8) void {
 /// the threshold permanently below the cursor → collect every safepoint
 /// (livelock). `live_bytes` is accepted for stats only.
 pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
-    if (comptime !build_options.gc) return;
     _ = live_bytes;
     heap.gc_collect_requested = false;
     // Post-collect headroom scales with the budget (an eighth, clamped to
@@ -174,7 +165,6 @@ pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
 
 /// Visit every remembered old source (STW). `cb(ctx, source_id)`.
 pub fn forEachRemsetSource(heap: *ObjectHeap, ctx: anytype, comptime cb: fn (@TypeOf(ctx), ObjectId) void) void {
-    if (comptime !build_options.gc) return;
     for (heap.worker_locals) |*wl| for (wl.gc_remset.items) |sid| cb(ctx, sid);
 }
 
@@ -276,7 +266,6 @@ pub fn verifyMinorClosure(heap: *ObjectHeap, mark_bits: []const u64) void {
 /// `gcReconstructAllocBits`, no O(count) walk.
 pub fn minorCollect(heap: *ObjectHeap, mark_bits: []const u64) ObjectHeap.MinorStats {
     var st: ObjectHeap.MinorStats = .{};
-    if (comptime !build_options.gc) return st;
     heap.gcGrowOldBits(heap.objects.count());
     verifyMinorClosure(heap, mark_bits);
     // Iterate exactly this cycle's young objects (per-worker lists), all into
@@ -338,7 +327,6 @@ pub fn evacListInto(heap: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLoca
 /// generation bitmap while the object count is quiescent; the phase stays
 /// closed until `openEvac`).
 pub fn beginEvac(heap: *ObjectHeap, worker_count: u8) void {
-    if (comptime !build_options.gc) return;
     heap.gcGrowOldBits(heap.objects.count());
     heap.gc_mark_slot.store(0, .release);
     heap.gc_evac_count = worker_count;
@@ -353,14 +341,12 @@ pub fn beginEvac(heap: *ObjectHeap, worker_count: u8) void {
 /// closure is verified, so no worker moves a range the collector is still
 /// reading.
 pub fn openEvac(heap: *ObjectHeap) void {
-    if (comptime !build_options.gc) return;
     heap.gc_evac_open.store(true, .release);
 }
 
 /// Any worker (collector or parked peer): claim + evacuate young-object
 /// lists until the queue drains. Spins until the collector opens the phase.
 pub fn evacClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
-    if (comptime !build_options.gc) return;
     while (!heap.gc_evac_open.load(.acquire)) std.atomic.spinLoopHint();
     const dst = heap.currentLocal();
     var local_st: ObjectHeap.MinorStats = .{};
@@ -377,13 +363,11 @@ pub fn evacClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
 
 /// Collector: block until every young-object list has been evacuated.
 pub fn waitEvacDone(heap: *ObjectHeap) void {
-    if (comptime !build_options.gc) return;
     while (heap.gc_evac_done.load(.acquire) < heap.gc_evac_count) std.atomic.spinLoopHint();
 }
 
 /// Collector: post-evac finish (all lists drained). Verify + reset nursery.
 pub fn finishEvac(heap: *ObjectHeap) ObjectHeap.MinorStats {
-    if (comptime !build_options.gc) return .{};
     // NON-MOVING: survivors were promoted in place (not evacuated) and dead
     // ranges freed to the free lists individually — do NOT reset the
     // nursery (that would discard the live survivors' ranges).
@@ -405,7 +389,6 @@ const SWEEP_CHUNK: usize = 1 << 15; // 32768 ids = 512 alloc-bit words
 /// (debug) — so the parallel sweep reads a valid filled-set. Call after the
 /// mark terminates, before opening the sweep.
 pub fn sweepPrep(heap: *ObjectHeap, mark_bits: []const u64) void {
-    if (comptime !build_options.gc) return;
     if (comptime !gc_debug) heap.gcReconstructAllocBits();
     if (comptime gc_debug) verifyMarkClosed(heap, mark_bits);
 }
@@ -414,7 +397,6 @@ pub fn sweepPrep(heap: *ObjectHeap, mark_bits: []const u64) void {
 /// every unmarked filled slot in them to THIS worker's shard, until the range
 /// is exhausted. Spins until the collector opens the phase.
 pub fn sweepClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
-    if (comptime !build_options.gc) return;
     while (!heap.gc_sweep_open.load(.acquire)) std.atomic.spinLoopHint();
     const local = heap.currentLocal();
     const n: usize = heap.objects.count();
@@ -443,7 +425,6 @@ pub fn sweepClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
 
 /// Collector: block until every participant finished sweeping.
 pub fn sweepWaitDone(heap: *ObjectHeap) void {
-    if (comptime !build_options.gc) return;
     while (heap.gc_sweep_done.load(.acquire) < heap.gc_sweep_count) std.atomic.spinLoopHint();
 }
 

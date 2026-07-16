@@ -9,7 +9,6 @@ const runtime = @import("runtime");
 const host = @import("host.zig");
 const types = @import("runtime").types;
 const bytecode = @import("bytecode.zig");
-const opcode = bytecode.opcode;
 const InternTable = @import("runtime").intern.InternTable;
 const ChunkRegistry = bytecode.ChunkRegistry;
 const ChunkBuilder = bytecode.ChunkBuilder;
@@ -46,7 +45,6 @@ const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
 const mem_report = @import("eval/mem_report.zig");
 const tuning = @import("eval/tuning.zig");
-const eval_diagnostics = @import("eval/diagnostics.zig");
 
 const worker_mod = @import("vm.zig").worker;
 const io_offload = @import("vm.zig").io_offload;
@@ -548,7 +546,6 @@ pub const Evaluator = struct {
     /// at the start of each `evaluate()`; helpers writing diagnostics from
     /// import error paths serialize on `run.mu`.
     run: Run,
-    vm_opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
     /// Lazy per-attr compilation: deferred attrset value bodies, compiled
     /// on first force. See `compiler/deferred_table.zig`.
     deferred_table: deferred_mod.Table,
@@ -558,41 +555,42 @@ pub const Evaluator = struct {
     /// concurrently by helper-thread import compiles, hence the mutex.
     retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena),
     retained_arenas_mu: SpinMutex,
-    /// GC (`-Dgc`): reusable live-set marker driven at collection safepoints.
-    /// `void` in normal builds.
-    gc_tracer: if (gc.enabled) gc.Tracer else void,
-    /// GC (`-Dgc`): fresh VMs for in-flight imports/scoped-imports. These
+    /// Reusable live-set marker driven at collection safepoints.
+    gc_tracer: gc.Tracer,
+    /// Fresh VMs for in-flight imports/scoped-imports. These
     /// run on transient stack-local VMs NOT in a worker's `fibers` list, so
     /// the collector must scan them explicitly or their live values are
     /// missed. Guarded by `gc_import_vms_mu` — imports run concurrently at
     /// --workers>1.
-    gc_import_vms: if (gc.enabled) std.ArrayListUnmanaged(*VM) else void,
-    gc_import_vms_mu: if (gc.enabled) SpinMutex else void,
-    /// GC (`-Dgc`): every live `Worker` by id (0 = main, 1.. = helpers).
+    gc_import_vms: std.ArrayListUnmanaged(*VM),
+    gc_import_vms_mu: SpinMutex,
+    /// Every live `Worker` by id (0 = main, 1.. = helpers).
     /// The collector walks each worker's fibers for roots. A worker
     /// registers itself before it can allocate user objects and unregisters
     /// after it's quiesced, and during a stop-the-world all live workers are
     /// parked — so the collector reads a stable set.
-    gc_workers: if (gc.enabled) []std.atomic.Value(?*worker_mod.Worker) else void,
-    /// GC (`-Dgc`): chunk-constant root scan is INCREMENTAL across minors. A
+    gc_workers: []std.atomic.Value(?*worker_mod.Worker),
+    /// Chunk-constant root scan is INCREMENTAL across minors. A
     /// chunk constant's referent is promoted to old at the first minor that
     /// scans it and stays old (a later young reference it gains is caught by
     /// the remembered-set barrier, not the constant). So each minor scans only
     /// chunks `[gc_chunks_scanned, registry.count())`; re-scanning all of them
     /// every minor was ~77% of the serial root-scan. A future MAJOR resets this
     /// to 0 (a full mark re-scans every constant).
-    gc_chunks_scanned: if (gc.enabled) ChunkId else void = if (gc.enabled) 0 else {},
-    /// GC (`-Dgc`): `--max-memory` override for the collector's memory
+    gc_chunks_scanned: ChunkId = 0,
+    /// `--max-memory` override for the collector's memory
     /// budget, in bytes (0 = never collect). `null` = resolve the default
-    /// (`FIX_MAX_MEMORY`, else half of MemAvailable) — see
-    /// `eval/gc.zig:memoryBudget`. Set by the CLI before evaluation;
-    /// ignored by non-`-Dgc` builds.
+    /// (otherwise half of MemAvailable) — see `eval/gc.zig:memoryBudget`.
+    /// Set by the CLI before evaluation.
     max_memory_bytes: ?u64 = null,
-    /// GC (`-Dgc`): caller-held root values (the repl's scope bindings and
+    /// Optional teardown memory report (`"dump"` also lists registered VMAs).
+    mem_report_mode: ?[]const u8 = null,
+    /// Print the collector summary during teardown.
+    gc_report_on: bool = false,
+    /// Caller-held root values (the repl's scope bindings and
     /// last results live outside any VM between evaluations). Marked by
     /// `markRoots`; replaced wholesale via `gcSetExternalRoots`.
-    gc_extra_roots: if (gc.enabled) std.ArrayListUnmanaged(Value) else void =
-        if (gc.enabled) .empty else {},
+    gc_extra_roots: std.ArrayListUnmanaged(Value) = .empty,
     /// Speculative import prefetch state (`FIX_IMPORT_PREFETCH`).
     prefetch: Prefetch = .{},
     /// Whether `releaseEvalState` already ran (the build-phase memory
@@ -635,12 +633,9 @@ pub const Evaluator = struct {
             registry.solo = true;
         }
 
-        const gc_workers = if (gc.enabled) blk: {
-            const ws = try allocator.alloc(std.atomic.Value(?*worker_mod.Worker), worker_count);
-            for (ws) |*w| w.* = .init(null);
-            break :blk ws;
-        } else {};
-        errdefer if (gc.enabled) allocator.free(gc_workers);
+        const gc_workers = try allocator.alloc(std.atomic.Value(?*worker_mod.Worker), worker_count);
+        for (gc_workers) |*w| w.* = .init(null);
+        errdefer allocator.free(gc_workers);
 
         var store = try StoreState.init(allocator);
         errdefer store.deinit();
@@ -667,13 +662,12 @@ pub const Evaluator = struct {
             .worker_count = worker_count,
             .main_worker = null,
             .run = Run.init(allocator),
-            .vm_opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
             .deferred_table = deferred_mod.Table.init(allocator),
             .retained_arenas = .empty,
             .retained_arenas_mu = .{},
-            .gc_tracer = if (gc.enabled) gc.Tracer.init(allocator) else {},
-            .gc_import_vms = if (gc.enabled) .empty else {},
-            .gc_import_vms_mu = if (gc.enabled) .{} else {},
+            .gc_tracer = gc.Tracer.init(allocator),
+            .gc_import_vms = .empty,
+            .gc_import_vms_mu = .{},
             .gc_workers = gc_workers,
         };
         return ev;
@@ -709,21 +703,15 @@ pub const Evaluator = struct {
         // The sampler reads the heap + scheduler; callers stop it before the
         // build phase already, but be structural about it.
         self.stopProgressSampler();
-        mem_report.report(&self.heap, &self.intern, &self.registry, self.retained_arenas.items, self.env_map);
+        mem_report.report(&self.heap, &self.intern, &self.registry, self.retained_arenas.items, self.mem_report_mode);
         // Detach the import-prefetch sink before teardown (module-level
         // global; only clear it if it still points at THIS evaluator).
         if (ChunkRegistry.path_const_sink) |sink| {
             if (sink.ctx == @as(*anyopaque, @ptrCast(self))) ChunkRegistry.path_const_sink = null;
         }
         self.prefetch.seen.deinit(self.allocator);
-        if (comptime vm_mod.opcode_profile_enabled) eval_diagnostics.printVmOpcodeProfile(&self.vm_opcode_counts);
-        if (comptime gc.enabled) {
-            gc.recordFinalTotal(self.heap.totalReservedBytes());
-            // Off by default: the report is a diagnostic, not something every
-            // `-Dgc` run should dump to stderr. Gate it like `FIX_MEM_REPORT`.
-            const gc_report_on = if (self.env_map) |em| em.get("FIX_GC_REPORT") != null else false;
-            if (gc_report_on) gc.report();
-        }
+        gc.recordFinalTotal(self.heap.totalReservedBytes());
+        if (self.gc_report_on) gc.report();
         // Shut helpers down (which joins on `defer vm.deinit()` inside
         // helperLoop) before tearing down state their VMs borrow.
         self.scheduler.deinit();
@@ -744,12 +732,10 @@ pub const Evaluator = struct {
         // fiber-stack `*VM` into whatever recycled the freed buffer — the
         // observed victim was a freshly registered Chunk whose stomped
         // `code.ptr` detonated at `registry.deinit` (teardown SIGSEGV).
-        if (comptime gc.enabled) {
-            self.gc_tracer.deinit();
-            self.gc_import_vms.deinit(self.allocator);
-            self.gc_extra_roots.deinit(self.allocator);
-            self.allocator.free(self.gc_workers);
-        }
+        self.gc_tracer.deinit();
+        self.gc_import_vms.deinit(self.allocator);
+        self.gc_extra_roots.deinit(self.allocator);
+        self.allocator.free(self.gc_workers);
         self.run.deinit();
         self.imports.deinit(self.allocator);
         self.search_paths.deinit(self.allocator);
@@ -1283,7 +1269,7 @@ pub const Evaluator = struct {
         // the self-reference `builtins.builtins`; that prediction is only
         // safe when no other thread is allocating objects.
         _ = try self.ensureBuiltins();
-        tuning.apply(&self.scheduler, &self.heap, self.env_map, self.worker_count);
+        tuning.apply(&self.scheduler, self.env_map, self.worker_count);
         // Speculative import prefetch: `.nix` path constants of freshly
         // compiled chunks are parse+compile+evaluated ahead of demand on
         // the spec lane (the braid-window perf decomposition measured
@@ -1398,17 +1384,15 @@ pub const Evaluator = struct {
         // top-level import evaluates at depth 0 (collects) while a nested one
         // stays gated at the enclosing builtin's depth. native_depth lives on
         // the VM (fiber-local), so no threadlocal dance is needed.
-        if (comptime gc.enabled) vm.native_depth = parent_depth -| 1;
+        vm.native_depth = parent_depth -| 1;
         // This VM isn't in any worker's `fibers`, so the collector can't find
         // its roots on its own — register it for the duration of the import.
         // Concurrent imports at --workers>1 interleave, so guard the list and
         // remove by value (not LIFO pop).
-        if (comptime gc.enabled) {
-            self.gc_import_vms_mu.lock();
-            self.gc_import_vms.append(self.allocator, &vm) catch {};
-            self.gc_import_vms_mu.unlock();
-        }
-        defer if (comptime gc.enabled) {
+        self.gc_import_vms_mu.lock();
+        self.gc_import_vms.append(self.allocator, &vm) catch {};
+        self.gc_import_vms_mu.unlock();
+        defer {
             self.gc_import_vms_mu.lock();
             for (self.gc_import_vms.items, 0..) |ivm, i| {
                 if (ivm == &vm) {
@@ -1417,7 +1401,7 @@ pub const Evaluator = struct {
                 }
             }
             self.gc_import_vms_mu.unlock();
-        };
+        }
         return vm.eval(chunk_id);
     }
 
@@ -1469,7 +1453,6 @@ pub const Evaluator = struct {
             .thunk_trace = self.thunk_trace,
             .import_host = .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             .builtins_value = try self.ensureBuiltins(),
-            .opcode_profile_sink = if (comptime vm_mod.opcode_profile_enabled) &self.vm_opcode_counts else {},
             .deferred_table = &self.deferred_table,
             .regexes = &self.regexes,
             .break_sink = if (self.debug_ui != null) .{ .ctx = self, .fire = fireBreak } else null,
@@ -1655,8 +1638,8 @@ pub const Evaluator = struct {
             defer scratch.deinit();
             var vm = try self.initVm(0, scratch.allocator());
             defer vm.deinit();
-            if (comptime gc.enabled) eval_gc.registerVm(self, &vm);
-            defer if (comptime gc.enabled) eval_gc.unregisterVm(self, &vm);
+            eval_gc.registerVm(self, &vm);
+            defer eval_gc.unregisterVm(self, &vm);
             return @call(.auto, body, .{&vm} ++ args);
         }
         const Args = @TypeOf(args);
@@ -1676,8 +1659,8 @@ pub const Evaluator = struct {
                     return;
                 };
                 defer vm.deinit();
-                if (comptime gc.enabled) eval_gc.registerVm(ctx.ev, &vm);
-                defer if (comptime gc.enabled) eval_gc.unregisterVm(ctx.ev, &vm);
+                eval_gc.registerVm(ctx.ev, &vm);
+                defer eval_gc.unregisterVm(ctx.ev, &vm);
                 const result = @call(.auto, body, .{&vm} ++ ctx.body_args) catch |e| {
                     ctx.err = e;
                     return;
@@ -1710,57 +1693,46 @@ pub const Evaluator = struct {
             initVmForWorkerSlot,
         );
         self.main_worker = w;
-        // GC (`-Dgc`): register the collect callback now that `self` is at
+        // Register the collect callback now that `self` is at
         // its final address (init returns by value), and enable reclaim. The
         // collect runs at the forceThunk safepoint when allocation crosses
         // the byte threshold; at --workers>1 it stops the world (all workers
         // park at safepoints) before marking. Register worker 0 so the
         // collector can walk its fibers for roots.
-        if (comptime gc.enabled) {
-            self.gc_workers[0].store(w, .release);
-            self.heap.setGcHook(.{ .ctx = self, .sample = gcCollectThunk });
-            // Parallel STW mark (--workers>1): parked peers call this to help
-            // drain the graph. Inert at --workers=1 (no peer ever parks).
-            self.scheduler.gcSetMarkHook(.{ .ctx = self, .help = gcHelpMarkThunk });
-            // The copying nursery collector runs at ALL worker counts by
-            // default: minor pauses are short (~ms) and it bounds RSS. It pairs
-            // with speculation being opt-in (default off) — speculation is the
-            // dominant source of young garbage, so with it off the nursery sees
-            // mostly real work and collects a handful of times. `FIX_GC_OFF`
-            // opts out (measurement / bump-only A-B).
-            const gc_off = if (self.env_map) |em| em.get("FIX_GC_OFF") != null else false;
-            if (self.env_map) |em|
-                if (em.get("FIX_GC_NOREUSE") != null) ObjectHeap.gcSetDisableReuse(true);
-            if (self.env_map) |em|
-                if (em.get("FIX_GC_PAR_CAP")) |s| {
-                    if (std.fmt.parseInt(u32, s, 10)) |c| {
-                        if (c >= 1) eval_gc.gc_par_cap = c;
-                    } else |_| {}
-                };
-            if (!gc_off) {
-                // FIX_GC_STEP_MB (validation): collect every N MB of fresh
-                // allocation so the detector exercises every builtin loop.
-                var step_bytes: u64 = 0;
-                if (self.env_map) |em| {
-                    if (em.get("FIX_GC_STEP_MB")) |s| {
-                        if (std.fmt.parseInt(u64, s, 10)) |mb| step_bytes = mb << 20 else |_| {}
-                    }
-                }
-                // Collection line: no collection runs until heap-reserved bytes
-                // cross it (automatic `clamp(½·MemTotal, 256MB, 8GB)`, overridable
-                // via `--max-memory` / `FIX_MAX_MEMORY`; see `eval_gc.memoryBudget`).
-                // On a roomy machine that line dwarfs the eval → never fires: zero
-                // pauses AND zero tracking (lazy arming at line/2, see
-                // `heap_gc.enableBudget`); on a tight machine it fires before the
-                // eval OOMs. Override 0 = never collect (bump-only). FIX_GC_STEP_MB
-                // keeps the eager validation path (tracking from the start).
-                const budget = eval_gc.memoryBudget(self);
-                if (step_bytes > 0)
-                    heap_gc.enableCollect(&self.heap, budget, step_bytes)
-                else if (budget > 0)
-                    heap_gc.enableBudget(&self.heap, budget, eval_gc.constrainedMode(self, budget));
+        self.gc_workers[0].store(w, .release);
+        self.heap.setGcHook(.{ .ctx = self, .sample = gcCollectThunk });
+        // Parallel STW mark (--workers>1): parked peers call this to help
+        // drain the graph. Inert at --workers=1 (no peer ever parks).
+        self.scheduler.gcSetMarkHook(.{ .ctx = self, .help = gcHelpMarkThunk });
+        if (self.env_map) |em|
+            if (em.get("FIX_GC_NOREUSE") != null) ObjectHeap.gcSetDisableReuse(true);
+        if (self.env_map) |em|
+            if (em.get("FIX_GC_PAR_CAP")) |s| {
+                if (std.fmt.parseInt(u32, s, 10)) |c| {
+                    if (c >= 1) eval_gc.gc_par_cap = c;
+                } else |_| {}
+            };
+        // FIX_GC_STEP_MB (validation): collect every N MB of fresh
+        // allocation so the detector exercises every builtin loop.
+        var step_bytes: u64 = 0;
+        if (self.env_map) |em| {
+            if (em.get("FIX_GC_STEP_MB")) |s| {
+                if (std.fmt.parseInt(u64, s, 10)) |mb| step_bytes = mb << 20 else |_| {}
             }
         }
+        // Collection line: no collection runs until heap-reserved bytes
+        // cross it (automatic `clamp(½·MemTotal, 256MB, 8GB)`, overridable
+        // via `--max-memory`; see `eval_gc.memoryBudget`).
+        // On a roomy machine that line dwarfs the eval → never fires: zero
+        // pauses AND zero tracking (lazy arming at line/2, see
+        // `heap_gc.enableBudget`); on a tight machine it fires before the
+        // eval OOMs. Override 0 = never collect (bump-only). FIX_GC_STEP_MB
+        // keeps the eager validation path (tracking from the start).
+        const budget = eval_gc.memoryBudget(self);
+        if (step_bytes > 0)
+            heap_gc.enableCollect(&self.heap, budget, step_bytes)
+        else if (budget > 0)
+            heap_gc.enableBudget(&self.heap, budget, eval_gc.constrainedMode(self, budget));
         return w;
     }
 
@@ -1773,25 +1745,23 @@ pub const Evaluator = struct {
         eval_gc.collect(self, collector_id);
     }
 
-    /// GC (`-Dgc`): replace the caller-held external root set (see
+    /// Replace the caller-held external root set (see
     /// `gc_extra_roots`). The repl passes its scope attrset + loose values
-    /// here whenever they change; they stay rooted until replaced. No-op
-    /// (and no allocation) in non-gc builds.
+    /// here whenever they change; they stay rooted until replaced.
     pub fn gcSetExternalRoots(self: *Evaluator, roots: []const Value) !void {
-        if (comptime !gc.enabled) return;
         self.gc_extra_roots.clearRetainingCapacity();
         try self.gc_extra_roots.appendSlice(self.allocator, roots);
     }
 
     pub const CollectNowResult = struct {
-        /// False when the collector is compiled out, disabled by policy
-        /// (`--max-memory=0` / `FIX_GC_OFF`), or nothing has run yet.
+        /// False when collection is disabled by policy (`--max-memory=0`)
+        /// or nothing has run yet.
         ran: bool,
         reserved_before: u64,
         reserved_after: u64,
     };
 
-    /// GC (`-Dgc`): run a stop-the-world collection right now, from outside
+    /// GC: run a stop-the-world collection right now, from outside
     /// any evaluation — the repl's between-inputs reclaim. Drives the same
     /// barrier + hook sequence as the in-eval safepoint (vm/force.zig): win
     /// the collector race, park every worker, collect, release. The first
@@ -1806,7 +1776,6 @@ pub const Evaluator = struct {
             .reserved_before = self.heap.totalReservedBytes(),
             .reserved_after = self.heap.totalReservedBytes(),
         };
-        if (comptime !gc.enabled) return result;
         // No hook yet (nothing evaluated) or reclaim disabled by policy
         // (threshold never armed): nothing to do.
         if (self.main_worker == null) return result;
@@ -1840,7 +1809,6 @@ pub const Evaluator = struct {
             .reserved_before = self.heap.totalReservedBytes(),
             .reserved_after = self.heap.totalReservedBytes(),
         };
-        if (comptime !gc.enabled) return result;
         if (self.main_worker == null) return result;
         if (self.heap.gc_threshold_bytes == std.math.maxInt(u64)) return result;
         if (!self.scheduler.gcTryBeginCollection()) return result;
@@ -2090,11 +2058,11 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
         sched.awaitHelpersQuiescent();
         return;
     };
-    // GC (`-Dgc`): register this helper so the collector can walk its fibers
+    // GC: register this helper so the collector can walk its fibers
     // for roots. Registration happens before `run()` (before any user-object
     // allocation), and the collector only reads the registry at a stop-the-
     // world where this worker is parked.
-    if (comptime gc.enabled) ev.gc_workers[worker_id].store(worker, .release);
+    ev.gc_workers[worker_id].store(worker, .release);
     worker.run();
     // Wait until ALL helpers have stopped forcing before destroying any
     // fibers — a still-running helper could resolve a thunk and wake a
@@ -2103,7 +2071,7 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
     // Unregister before deinit so a late collection never scans freed fibers.
     // (After awaitHelpersQuiescent no helper is still forcing, so no
     // collection can be triggered past this point, but keep the invariant.)
-    if (comptime gc.enabled) ev.gc_workers[worker_id].store(null, .release);
+    ev.gc_workers[worker_id].store(null, .release);
     worker.deinit();
 }
 

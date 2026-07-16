@@ -59,7 +59,6 @@ const timeline = @import("../probe.zig").timeline;
 const bytecode = @import("../bytecode.zig");
 const InternTable = @import("runtime").intern.InternTable;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
-const heap_ring_size = @import("runtime").heap.SCAV_RING_SIZE;
 const FileCache = @import("../host.zig").FileCache;
 const FetchCache = @import("../host.zig").FetchCache;
 const DerivationStore = @import("../realization.zig").DerivationStore;
@@ -78,14 +77,10 @@ pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, fiber_id: u32, s
 /// flight than the prewarm count.
 pub const prewarm_fiber_count: u8 = 4;
 
-/// Overflow-fiber stack release flavor: true = MADV_FREE (default),
-/// false = MADV_DONTNEED. Process-wide; set from `FIX_FIBER_MADV`
-/// before workers spawn (eval.zig `evaluate`).
-pub var stack_release_lazy: bool = true;
-
-/// `FIX_SPIN_ITERS`: pre-park spin duration in `parkAndAccount`, in
-/// spin-loop iterations (probe knob; default 1024 = the historical value).
-pub var spin_iterations: u32 = 1024;
+/// Pre-park spin duration in `parkAndAccount`. This is the measured production
+/// value; keeping it fixed avoids turning a scheduler invariant into a runtime
+/// experiment surface.
+const spin_iterations: u32 = 1024;
 
 /// Fiber cost/benefit census (piggybacks on `-Dprof-main`; see
 /// `prof.FiberLocal`). Comptime-gated so the default build's structs
@@ -161,13 +156,12 @@ pub const WorkerFiber = struct {
     /// the fiber is recycled.
     census_suspends: if (census_on) u32 else void = if (census_on) 0 else {},
     /// Task census: submission class of `current_task`/`current_cont`
-    /// (spec/novel/urgent force_thunk, scavenge, range, sweep, cont).
+    /// (spec/novel/urgent force_thunk, range, sweep, cont).
     /// Set alongside the task assignment; read by the fiber entry.
     census_class: if (census_on) prof.TaskClass else void = if (census_on) .spec_thunk else {},
     /// Which queue `current_task` came from. Set alongside the task
-    /// assignment; the fiber entry uses it to arm the spec-lane creation
-    /// budget (`FIX_SPEC_CREATE_BUDGET`) — urgent tasks are never
-    /// budgeted.
+    /// assignment; the fiber entry uses it to arm the band-scoped creation
+    /// budget — urgent tasks are never budgeted.
     current_lane: scheduler_mod.Lane = .spec,
     /// Free-list link. Only the owning worker manipulates this.
     next_free: ?*WorkerFiber,
@@ -198,23 +192,7 @@ pub const WorkerFiber = struct {
 
     fn wakeImpl(w: *thunk_mod.Waiter) void {
         const self: *WorkerFiber = @fieldParentPtr("waiter", w);
-        // Resolver affinity (`FIX_WAKE_AFFINITY`): prefer to resume the woken
-        // fiber on the core that just published the value it was blocked on.
-        // That core holds the freshly-written result — and much of the
-        // dependency's touched graph — cache-hot, so resuming there avoids a
-        // cross-core miss on the very data the fiber is about to read; the
-        // default (home-worker) routing scatters woken fibers onto their
-        // allocator worker regardless of where the value was produced. Gated
-        // on the waker being a compute worker: IO/daemon/fetch threads publish
-        // an `io_future` with no useful locality and a meaningless
-        // `worker_id.current`, so those keep the home-worker fallback. The
-        // target is only a ready-queue hint — an idle worker can still steal
-        // the fiber — so a mis-routed wake costs at most one extra steal.
-        const target = if (self.worker.scheduler.wake_resolver_affinity and worker_id_mod.is_worker)
-            worker_id_mod.current
-        else
-            self.worker.worker_id;
-        self.worker.scheduler.enqueueReady(target, &self.ready_node);
+        self.worker.scheduler.enqueueReady(self.worker.worker_id, &self.ready_node);
     }
 
     /// Sweep the per-fiber scratch arena when the fiber goes back on the
@@ -266,11 +244,6 @@ pub const Worker = struct {
     /// `inner.resume_`). Excludes the brief pop-ready / pick-task probing
     /// — that bookkeeping is negligible relative to either bucket.
     busy_ns: u64,
-
-    /// Scavenger scan position within main's creation ring, and the
-    /// ring head observed at the last completed lap (see scavengeStep).
-    scav_pos: u64 = 0,
-    scav_lap_head: u64 = 0,
 
     /// Fiber cost/benefit census accumulator (`-Dprof-main` only; see
     /// `prof.FiberLocal`). Owner-thread writes only; flushed to the
@@ -333,11 +306,8 @@ pub const Worker = struct {
         for (self.fibers.items) |f| {
             while (f.in_runfiber.load(.acquire) != 0) std.atomic.spinLoopHint();
         }
-        var max_fiber_stack: u64 = 0;
         var max_vm_sp: u64 = 0;
         for (self.fibers.items) |f| {
-            const stack_used = f.inner.maxStackUsedBytes();
-            if (stack_used > max_fiber_stack) max_fiber_stack = @intCast(stack_used);
             if (f.vm.sp_high_water > max_vm_sp) max_vm_sp = f.vm.sp_high_water;
             mem_tag.vma.unregisterRegion(f.inner.stack.ptr);
             f.inner.deinit(self.allocator);
@@ -347,7 +317,7 @@ pub const Worker = struct {
             self.allocator.destroy(f);
         }
         self.fibers.deinit(self.allocator);
-        self.scheduler.reportFiberHighWater(max_fiber_stack, max_vm_sp);
+        self.scheduler.reportVmStackHighWater(max_vm_sp);
         self.flushTimingToScheduler();
         self.allocator.destroy(self);
     }
@@ -379,12 +349,11 @@ pub const Worker = struct {
         return self.scheduler.isShutdown() or self.shutdown_requested.load(.acquire) != 0;
     }
 
-    /// GC (`-Dgc`): if a collection is in progress on another worker, park
+    /// GC: if a collection is in progress on another worker, park
     /// in the stop-the-world barrier. Called between fibers (depth 0), where
     /// this worker holds no in-flight allocation and its fibers are the only
     /// roots the collector needs from it.
     inline fn gcSafepoint(self: *Worker) void {
-        if (comptime !gc.enabled) return;
         if (self.scheduler.gcStopRequested()) self.scheduler.gcSafepointPark(self.worker_id);
     }
 
@@ -392,8 +361,8 @@ pub const Worker = struct {
     pub fn run(self: *Worker) void {
         worker_id_mod.current = self.worker_id;
         worker_id_mod.is_worker = true;
-        if (comptime gc.enabled) vm_force.gcRegisterWorkerCaches(self.worker_id);
-        defer if (comptime gc.enabled) vm_force.gcUnregisterWorkerCaches(self.worker_id);
+        vm_force.gcRegisterWorkerCaches(self.worker_id);
+        defer vm_force.gcUnregisterWorkerCaches(self.worker_id);
         while (!self.shouldStop()) {
             self.gcSafepoint();
             if (self.drainStep() catch |err| {
@@ -426,7 +395,7 @@ pub const Worker = struct {
     ) !void {
         worker_id_mod.current = self.worker_id;
         worker_id_mod.is_worker = true;
-        if (comptime gc.enabled) vm_force.gcRegisterWorkerCaches(self.worker_id);
+        vm_force.gcRegisterWorkerCaches(self.worker_id);
         // Each top-level entry begins able to start background work.
         self.scheduler.setSuppressBackground(false);
         const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
@@ -524,81 +493,6 @@ pub const Worker = struct {
             self.runFiber(f);
             return true;
         }
-        if (try self.scavengeStep()) return true;
-        return false;
-    }
-
-    /// Lowest-priority idle work (`FIX_SCAVENGE`): pre-force old, still-
-    /// unresolved thunks from MAIN's creation ring whose body chunk has
-    /// PROVEN expensive on main's demand path (`vm_force.scavChunkHot`).
-    /// Mechanizes the age-at-force probe finding (~half of main's
-    /// on-chain cycles sit in thunks that existed ≥0.6ms before main
-    /// demanded them) without evaluating the whole lazy graph: cheap and
-    /// never-demanded thunks fail the hot-chunk filter. The scan re-laps
-    /// the ring window as new chunks turn hot. Worker 0 never scavenges —
-    /// a long speculative force there would add latency to the demand
-    /// fiber's wakes.
-    fn scavengeStep(self: *Worker) !bool {
-        if (self.worker_id == 0) return false;
-        const sched = self.scheduler;
-        // Cap the scavenging helpers (FIX_SCAV_WORKERS): at w=16/32,
-        // letting every idle helper scavenge amplifies wasted work and
-        // allocator contention into a large regression; at w=8 all 7
-        // helpers scavenging measured best.
-        if (self.worker_id > sched.scav_workers) return false;
-        if (!sched.scavengeEnabled()) return false;
-        if (sched.backgroundSuppressed()) return false;
-        if (self.fibers.items.len == 0) return false;
-        const heap = self.fibers.items[0].vm.heap;
-        const local = &heap.worker_locals[0];
-        const head = local.scav_head.load(.acquire);
-        const margin = sched.scav_margin;
-        if (head <= margin) return false;
-        const hi = head - margin;
-        const window_lo = head -| (heap_ring_size - 1024);
-        var pos = @max(self.scav_pos, window_lo);
-        if (pos >= hi) {
-            // Lap complete. Restart only after meaningful ring growth
-            // (new thunks and possibly newly-hot chunks) — re-lapping on
-            // every single creation would busy-spin the scan.
-            if (head < self.scav_lap_head + 8192) return false;
-            self.scav_lap_head = head;
-            pos = window_lo;
-        }
-        // Bound the skip scan per drain step so a cold backlog can't
-        // starve the park path.
-        var budget: u32 = 2048;
-        while (pos < hi and budget > 0) : ({
-            pos += 1;
-            budget -= 1;
-        }) {
-            const id = @atomicLoad(types.ObjectId, &local.scav_ring[@intCast(pos & (heap_ring_size - 1))], .acquire);
-            const th = heap.getThunkAssumeValid(id);
-            if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) continue;
-            if (th.targetKind() != .bytecode) continue;
-            // Racy read of the target union (the thunk may resolve
-            // concurrently): a torn chunk_id at worst misclassifies
-            // hotness; the claim CAS inside the force is authoritative.
-            if (!vm_force.scavShouldTake(th.payload.target.bytecode.chunk_id)) continue;
-            self.scav_pos = pos + 1;
-            const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
-            const f = try self.acquireFreeFiber();
-            f.current_task = .{ .force_thunk = id };
-            f.current_lane = .spec;
-            if (comptime census_on) f.census_class = .scav_thunk;
-            f.flow_in_id = 0;
-            f.inner.reset(slotEntry, @ptrCast(f));
-            if (comptime census_on) {
-                self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
-                self.census.tasks += 1;
-                prof.fiberLiveInc();
-            }
-            f.state = .running;
-            sched.bumpScavenges(self.worker_id);
-            self.runFiber(f);
-            return true;
-        }
-        self.scav_pos = pos;
         return false;
     }
 
@@ -614,7 +508,7 @@ pub const Worker = struct {
     /// so `resume_` never overlaps with another `resume_` on the same
     /// fiber. In normal (uncontended) execution the lock/unlock is
     /// two atomic ops.
-    /// Timeline (`-Dtimeline`): open the run quantum labelled with the task it
+    /// Timeline (`--timeline`): open the run quantum labelled with the task it
     /// processes, so worker 0's track shows WHAT each quantum computes (not just
     /// "run"). Rich `args` carry the thunk/list id for click-through.
     fn timelineQuantumBegin(f: *WorkerFiber) void {
@@ -815,17 +709,8 @@ pub const Worker = struct {
                 // available work and busy-spin on it.
                 if (!self.scheduler.backgroundSuppressed() and
                     self.scheduler.takableWork(self.worker_id)) return;
-                // Un-scanned scavengeable ring backlog counts as available
-                // work for a scavenging helper (see scavengeStep's cap).
-                if (self.worker_id != 0 and self.worker_id <= self.scheduler.scav_workers and self.scheduler.scavengeEnabled() and
-                    !self.scheduler.backgroundSuppressed() and self.fibers.items.len > 0)
-                {
-                    const head = self.fibers.items[0].vm.heap.worker_locals[0].scav_head.load(.monotonic);
-                    if (head > self.scheduler.scav_margin and
-                        (self.scav_pos < head - self.scheduler.scav_margin or head >= self.scav_lap_head + 8192)) return;
-                }
                 if (self.shouldStop()) return;
-                if (comptime gc.enabled) if (self.scheduler.gcStopRequested()) return; // park in GC barrier via run loop
+                if (self.scheduler.gcStopRequested()) return; // park in GC barrier via run loop
                 std.atomic.spinLoopHint();
             }
         }
@@ -871,7 +756,9 @@ pub const Worker = struct {
         }
         self.free_mu.unlock();
         for (batch[0..n]) |f| {
-            f.inner.releaseStackPages(retained_stack_bytes, stack_release_lazy);
+            // MADV_FREE won the release-policy experiment: it avoids eagerly
+            // faulting zero pages back in when an overflow fiber is reused.
+            f.inner.releaseStackPages(retained_stack_bytes, true);
         }
     }
 
@@ -1153,31 +1040,22 @@ fn specRootBandSmall(f: *WorkerFiber, thunk_id: types.ObjectId) bool {
 fn runTask(f: *WorkerFiber, task: Task) void {
     switch (task) {
         .force_thunk => |thunk_id| {
-            // Bounded spec-lane cascade: arm the per-task creation (and
-            // optionally claimed-force) budgets for speculative/novel
-            // force_thunk tasks, so one wrong creation-time guess can't
+            // Bounded spec-lane cascade: arm the per-task creation budget for
+            // speculative/novel force_thunk tasks, so one wrong guess can't
             // evaluate an unbounded never-demanded subgraph (the sub-256-
             // combinator junk cascade). Bail is a transient thunk reset;
             // resolved sub-thunks are kept — same semantics the sibling
             // sweeps have shipped with. Urgent (demand-adjacent) tasks
-            // stay unbounded. Two tiers:
-            //  - band budget (`FIX_SPEC_BAND_BUDGET`, default ON): only
+            // stay unbounded. The band budget applies only to
             //    tasks whose ROOT chunk is below the trusted size
             //    (`spec_band_small`) — the family whose execution
             //    cascades. Trusted (≥256) roots run unbudgeted: bailing
-            //    useful deep speculation discards its claim spine, and
-            //    the demand-side redo measured +12% w=8 wall.
-            //  - uniform budget (`FIX_SPEC_CREATE_BUDGET`, default OFF):
-            //    every non-urgent task; kept as the RSS-vs-wall A/B knob.
+            //    useful deep speculation discards its claim spine, and the
+            //    demand-side redo measured +12% w=8 wall.
             if (f.current_lane != .urgent) {
                 const band = f.vm.scheduler.spec_band_budget;
-                const uniform = f.vm.scheduler.spec_task_create_budget;
                 if (band != 0 and specRootBandSmall(f, thunk_id))
-                    vm_force.specCreateArm(&f.vm, band)
-                else if (uniform != 0)
-                    vm_force.specCreateArm(&f.vm, uniform);
-                const claims = f.vm.scheduler.spec_task_claim_budget;
-                if (claims != 0) f.vm.spec_budget = claims;
+                    vm_force.specCreateArm(&f.vm, band);
             }
             defer {
                 f.vm.spec_create_left = vm_mod.NO_SPEC_BUDGET;
@@ -1198,7 +1076,7 @@ fn runTask(f: *WorkerFiber, task: Task) void {
             // slice captured before the force dangles even though the object
             // survives. Re-fetch each element from the id per iteration
             // (`getListItem` re-derives the range from the moved object) so we
-            // always read the live copy. Zero cost without -Dgc.
+            // always read the live copy.
             // NON-MOVING GC: `rootKeep` keeps the list live and ranges never
             // relocate/are-swept while rooted, so the slice is stable across the
             // element forces — hold it, no per-element re-fetch.
@@ -1364,7 +1242,6 @@ test "Worker basic init/deinit" {
         derivations: DerivationStore,
         sched: *Scheduler,
         arena: arena_mod.ArenaAllocator,
-        opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
 
         fn initVm(ctx: *anyopaque, _: u8, _: u32, scratch: std.mem.Allocator) anyerror!VM {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -1377,7 +1254,6 @@ test "Worker basic init/deinit" {
                 .fetchers = &self.fetchers,
                 .derivations = &self.derivations,
                 .scheduler = self.sched,
-                .opcode_profile_sink = if (comptime vm_mod.opcode_profile_enabled) &self.opcode_counts else {},
             });
         }
     };
@@ -1391,7 +1267,6 @@ test "Worker basic init/deinit" {
         .derivations = DerivationStore.init(testing.allocator),
         .sched = &sched,
         .arena = arena_mod.ArenaAllocator.init(testing.allocator),
-        .opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** bytecode.opcode.count else {},
     };
     defer {
         ctx.registry.deinit();

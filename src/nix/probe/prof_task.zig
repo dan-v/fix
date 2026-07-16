@@ -13,8 +13,7 @@ const pct = prof.pct;
 /// fiber acquire/reset/swap) before any useful work; this census sizes
 /// what each task CLASS actually delivers per item:
 ///   - counts per class (creation-spec / novel-lane / urgent fan-out
-///     force_thunk, scavenged force_thunk, list ranges, attr sweeps,
-///     work-first continuations);
+///     force_thunk, list ranges, and attr sweeps);
 ///   - the no-op rate: tasks whose target was ALREADY fully resolved on
 ///     arrival (pure scheduling overhead);
 ///   - the useful-work cycle distribution (log2 buckets) for the rest.
@@ -31,8 +30,6 @@ pub const TaskClass = enum(u8) {
     /// Demand fan-out `force_thunk` (urgent lane: fanOutAttrsShallow,
     /// drv-attr fan-out, strictness-driven submits).
     urgent_thunk,
-    /// Idle-scavenger `force_thunk` (FIX_SCAVENGE; default off).
-    scav_thunk,
     /// `force_list_range` batch (urgent lane).
     list_range,
     /// `force_attrs_sweep` whole-set sweep (FIX_SIBLING).
@@ -105,9 +102,17 @@ pub fn report() void {
                 "  {s}: n={d} noop={d} ({d:.1}%) busy_arrival={d} items={d} live_items={d} ({d:.1}%) useful_cy={d} (avg={d}) noop_cy={d} (avg={d})\n",
                 .{
                     @tagName(@as(TaskClass, @enumFromInt(ci))),
-                    n,    noop, pct(noop, n), busy, items, live, pct(live, items),
-                    cy_u, if (useful_n == 0) 0 else cy_u / useful_n,
-                    cy_n, if (noop == 0) 0 else cy_n / noop,
+                    n,
+                    noop,
+                    pct(noop, n),
+                    busy,
+                    items,
+                    live,
+                    pct(live, items),
+                    cy_u,
+                    if (useful_n == 0) 0 else cy_u / useful_n,
+                    cy_n,
+                    if (noop == 0) 0 else cy_n / noop,
                 },
             );
             std.debug.print("    cy-hist:", .{});

@@ -2,19 +2,19 @@
 
 *The cross-cutting rules a change must not break. Each links to the doc that explains it.*
 
-These span subsystems, so they're collected here. Violating one usually shows up as a wrong `.drv`, a data race under `--workers>1`, or a use-after-free under `-Dgc` — rarely as an obvious local bug.
+These span subsystems, so they're collected here. Violating one usually shows up as a wrong `.drv`, a data race under `--workers>1`, or a GC use-after-free — rarely as an obvious local bug.
 
 ## Correctness oracle
 
 - **Byte-identical `.drv`.** Evaluation must produce the exact store paths `nix-instantiate` does. It's the ground-truth test for every change — a perf win that alters a store path is a bug. What must match exactly (ATerm ordering & escaping, `hashModuloInputs`, nixBase32, fixed-output `r:` logic) is enumerated in [derivation/hashing](derivation/hashing.md).
-- **The interpreter is the sole engine and is canonical.** The [GC](gc.md) (`-Dgc`) and the [probes](perf/probes.md) (`-D…`) must never change output or behavior — only speed, memory, or measurement. Output is byte-identical whether the collector is dormant, collecting, or absent; a diagnostic path must never become load-bearing.
+- **The interpreter is the sole engine and is canonical.** The [GC](gc.md) and the [probes](perf/probes.md) must never change output or behavior — only speed, memory, or measurement. Output is byte-identical whether the collector is dormant or collecting; a diagnostic path must never become load-bearing.
 - **Determinism.** Everything that feeds a hash is canonically sorted (attrset entries, drv outputs/inputs/srcs/env, path refs). [String context](derivation/context.md) must propagate through every string op, or a derivation loses inputs.
 
 ## Values & memory
 
 - **Canonical-NaN scrub.** Every `f64` entering a `Value` goes through `float()`, which scrubs any NaN to one canonical positive NaN. Never hand-construct a NaN into a `Value`, and never assume an arbitrary NaN bit pattern is a float — a stray sign=1 NaN aliases the tagged-value prefix. → [runtime/values](runtime/values.md)
 - **Boxed integers.** i64 outside i48 range lives in a heap `boxed_int`. Use `isAnyInt`/`int.get`, never branch on `isInt` alone where a big integer is possible. → [runtime/values](runtime/values.md)
-- **IDs never move; a *reachable* object's ID stays valid.** `ObjectId` and `InternId` index segmented stores whose backing pages are never relocated, so a value copied by bits keeps addressing the same slot — the [GC](gc.md) is non-moving *because* suspended fibers hold `ObjectId`s that can't be rewritten. `InternId`s are append-only and never reclaimed. But under `-Dgc` a swept object's slot is reclaimed onto a free list and reused for a later allocation, so a stale (unrooted) `ObjectId` can silently alias a *different* object — which is exactly why rooting (below) is load-bearing. → [runtime/heap](runtime/heap.md)
+- **IDs never move; a *reachable* object's ID stays valid.** `ObjectId` and `InternId` index segmented stores whose backing pages are never relocated, so a value copied by bits keeps addressing the same slot — the [GC](gc.md) is non-moving *because* suspended fibers hold `ObjectId`s that can't be rewritten. `InternId`s are append-only and never reclaimed. But a swept object's slot is reclaimed onto a free list and reused for a later allocation, so a stale (unrooted) `ObjectId` can silently alias a *different* object — which is exactly why rooting (below) is load-bearing. → [runtime/heap](runtime/heap.md)
 - **Attrsets are sorted by `InternId`.** Construction sorts and rejects duplicates; lookup binary-searches. Don't build an attrset object out of order. → [runtime/heap](runtime/heap.md)
 
 ## Thunks & the `Future` protocol
@@ -24,7 +24,7 @@ These span subsystems, so they're collected here. Violating one usually shows up
 - **Terminal states never revert** — the one exception is a binding cell's deliberate `.evaluating → .unresolved` publish. Recursive `let` cells are **born `.evaluating`/claimed** so a racing fiber parks instead of freezing the binding to a placeholder. → [runtime/thunks](runtime/thunks.md)
 - **Publish ordering.** Write the result (plain) *before* the release-store of the terminal state; readers acquire-load the state to observe it. Re-check waiter state under `waiters_mu` on enroll; call wake callbacks *outside* the lock. → [runtime/thunks](runtime/thunks.md)
 
-## GC rooting (matters even with `-Dgc` off — it's the reachability model)
+## GC rooting
 
 - **The operand stack is a precise root; force in place.** Ops force with `forceAt`/`forceTop` and write back — never pop-then-force — so a value stays rooted across a possibly-collecting force. → [runtime/thunks](runtime/thunks.md), [vm/dispatch](vm/dispatch.md)
 - **In-flight thunks are rooted by the force chain.** An `.evaluating` thunk is off the stack; `vm.gc_force_chain` roots its target/upvalues for the body's duration. Loop-based builtins root accumulators via `gc_temp_roots`. → [gc](gc.md)

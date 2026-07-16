@@ -169,7 +169,6 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
             self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
         else
             self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
-        if (self.scheduler.touch_log != null) force.logSpawn(self, id, ok);
         // Coverage census (`-Dprof-main`): this bytecode-thunk submit path is
         // ON (gated on body_is_substantial, not eager) — stamp it so the
         // `claimed_by_main` disposition split isn't mis-attributed as
@@ -329,67 +328,6 @@ inline fn shortCircuitClosureCaptures(
     return makeClosure(self, cl_chunk_id, @intCast(k));
 }
 
-/// Like `makeBytecodeThunkFromCaptures` but submits the thunk to the
-/// urgent queue at creation time. Used by `thunk_eag` —
-/// the compiler emits that op when strictness analysis confirms the
-/// surrounding chunk's body forces this binding.
-///
-/// `in_speculation` brake: if a helper is currently running a force
-/// task (set by `forceValueSpeculative`), we skip the urgent submit
-/// — otherwise the cascade is unbounded. The thunk is still created
-/// (so subsequent code sees it), it just doesn't fan out further. The
-/// helper finishes its current force, then any consumer that forces
-/// this thunk gets normal demand-driven handling.
-pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
-    const slot = self.registry.slot(chunk_id) orelse return error.InvalidChunk;
-    switch (slot.trivial) {
-        .identity_upvalue => |idx| {
-            return shortCircuitIdentityUpvalue(self, descriptors, frame, idx);
-        },
-        .closure_zero => |cl_id| {
-            return makeClosure(self, cl_id, 0);
-        },
-        .closure_captures => |info| {
-            const inner = slot.ptr.code[info.inner_descriptors_offset..][0..info.inner_descriptors_len];
-            return shortCircuitClosureCaptures(self, info.closure_chunk_id, inner, descriptors, frame);
-        },
-        .builtins => {
-            return stack.push(self, self.builtins);
-        },
-        .literal => |val| {
-            return stack.push(self, val);
-        },
-        .attr_access => |aa| {
-            return shortCircuitAttrAccess(self, descriptors, frame, aa, chunk_id);
-        },
-        .none => {},
-    }
-    const id = try captureBytecodeThunk(self, chunk_id, descriptors, frame);
-    recordBytecodeThunkCreate(self, id, frame, chunk_id);
-    if (!self.solo and !self.in_speculation and eager_submit_enabled) {
-        const ok = self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId());
-        if (comptime prof.enabled) self.heap.getThunkAssumeValid(id).future.noteSpecSubmitted(ok);
-    }
-    try stack.push(self, Value.thunk(id));
-}
-
-/// OFF BY DEFAULT. The strictness-driven eager submit triggers a
-/// `--workers>1` GC use-after-free: it force-resolves a binding's thunk on a
-/// PEER concurrently with the creating worker still building the surrounding
-/// `rec`/let fixpoint, and under memory pressure the minor collector frees a
-/// still-live young object produced by that interleaving (reproduced on the
-/// NixOS / home-manager module eval; a live attrs/closure/thunk swept, its
-/// slot reused → segv in the mutator or in the mark itself). Empirically,
-/// disabling the submit eliminates it (35+ runs clean vs ~1/6 with it on),
-/// while gating the collector to depth 0 only halved the rate — so the submit
-/// is the trigger, not just an amplifier. It is also a marginal-to-negative
-/// optimization to begin with: the w=8 task census measured 81% of these
-/// tasks arriving at an ALREADY-resolved thunk and a useful-work median of
-/// ~2K cycles, below the per-task scheduling round-trip. So it earns its
-/// keep neither in wall time nor in correctness. `FIX_NO_EAGER=0` re-enables
-/// it for A/B measurement (see `eval/tuning.zig`).
-pub var eager_submit_enabled: bool = false;
-
 inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const Frame, chunk_id: ChunkId) void {
     if (comptime !vm_mod.thunks_log_enabled) return;
     if (self.thunk_trace) |tt| {
@@ -476,9 +414,9 @@ inline fn forceStrictArgs(self: *VM, ch: *const Chunk, args_base: u32, n: u16) !
 pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
     const t = prof.start(.do_call);
     defer prof.end(.do_call, t);
-    // GC (`-Dgc`): root callee+arg for the call — they were popped off the
+    // GC: root callee+arg for the call — they were popped off the
     // operand stack into Zig locals, so a force inside the call must not sweep
-    // them. See callValue / force.RootScope. Compiles away w/o -Dgc.
+    // them. See callValue / force.RootScope. Compiles away w/o GC.
     const gc_roots = force.rootsBegin(self);
     defer force.rootsEnd(self, gc_roots);
     force.rootKeep(self, callee);
@@ -536,10 +474,10 @@ fn applyToPartial(self: *VM, pap: Value, arg: Value) !void {
 pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
     const t = prof.start(.do_tail_call);
     defer prof.end(.do_tail_call, t);
-    // GC (`-Dgc`): `arg` and the walked `current` are held in Zig locals across
+    // GC: `arg` and the walked `current` are held in Zig locals across
     // forcing calls (applyToPartial/applyBuiltin*/callAttrFunctor) — none are on
     // the operand stack here — so root them. `current` is re-rooted after each
-    // functor hop. Compiles away w/o -Dgc.
+    // functor hop. Compiles away w/o GC.
     const gc_roots = force.rootsBegin(self);
     defer force.rootsEnd(self, gc_roots);
     force.rootKeep(self, arg);
@@ -679,12 +617,12 @@ pub fn doCallN(self: *VM, n: u16) !void {
         if (ch.arity == n) {
             // Saturated: drop the callee from below the args (shift the
             // args down one slot), then push one frame over the n args.
-            // GC (`-Dgc`): the shift overwrites the callee's stack slot at
+            // GC: the shift overwrites the callee's stack slot at
             // `base-1`, so once `sp` drops it is no longer a stack root — yet
             // `closure.upvalues` (a raw slice owned by that closure object) is
             // read by `pushFrame` AFTER `forceStrictArgs` forces. Root the
             // callee across the force so the closure (and its upvalue range)
-            // survives. Compiles away w/o -Dgc.
+            // survives. Compiles away w/o GC.
             const gc_roots = force.rootsBegin(self);
             defer force.rootsEnd(self, gc_roots);
             force.rootKeep(self, callee);
@@ -764,11 +702,11 @@ pub fn doTailCallN(self: *VM, n: u16) !void {
 pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
     const t = prof.start(.call_value);
     defer prof.end(.call_value, t);
-    // GC (`-Dgc`): root callee+arg for the call's duration — they arrive in Zig
+    // GC: root callee+arg for the call's duration — they arrive in Zig
     // locals, so a force inside the call would otherwise sweep them. This is
     // what lets a builtin pass a freshly-produced value (e.g. a partial
     // application, or a user-fn result) into callValue without rooting it
-    // itself. Precise; compiles away w/o -Dgc.
+    // itself. Precise.
     const gc_roots = force.rootsBegin(self);
     defer force.rootsEnd(self, gc_roots);
     force.rootKeep(self, callee);

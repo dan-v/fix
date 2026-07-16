@@ -117,17 +117,9 @@ fn fuseStoreToSlot(self: *Compiler, slot: u16, target: StoreTarget) !bool {
             .narrow_local => .thunk_st,
             .narrow_cell => .thunk_st_cell,
         },
-        .thunk_eag => switch (target) {
-            .narrow_local => .thunk_eag_st,
-            .narrow_cell => .thunk_eag_st_cell,
-        },
         .thunk_w => switch (target) {
             .narrow_local => .thunk_w_st,
             .narrow_cell => .thunk_w_st_cell,
-        },
-        .thunk_eag_w => switch (target) {
-            .narrow_local => .thunk_eag_w_st,
-            .narrow_cell => .thunk_eag_w_st_cell,
         },
         else => return false,
     };
@@ -280,14 +272,6 @@ pub fn emitClosureWithCaptures(self: *Compiler, chunk_id: types.ChunkId, capture
 
 pub fn emitThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
     return emitCaptureOp(self, .thunk, .thunk_w, chunk_id, captures);
-}
-
-/// Same as `emitThunkWithCaptures` but emits the `thunk_eag`
-/// variant — runtime will submit the thunk to the urgent scheduler
-/// queue at creation. Called by `compileThunk` when the surrounding
-/// chunk's strictness signature says this binding will be forced.
-pub fn emitEagerThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
-    return emitCaptureOp(self, .thunk_eag, .thunk_eag_w, chunk_id, captures);
 }
 
 /// Emit `thunk_arg` — a function argument whose laziness is decided at

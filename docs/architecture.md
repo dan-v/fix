@@ -76,7 +76,7 @@ Measured on the NixOS toplevel at `--workers=32`, the main worker runs the **ser
 ## Correctness posture
 
 - **Byte-identical `.drv`** vs Nix C++ is the oracle for every change. See [invariants](invariants.md).
-- **The interpreter is the sole execution engine and is canonical.** The [GC](gc.md) is an optional subsystem (`-Dgc`, compiled into the default build; `-Dgc=false` builds the collector-free evaluator) that bounds RSS and never changes output — evaluation is byte-identical whether it is dormant, collecting, or absent.
+- **The interpreter is the sole execution engine and is canonical.** The [GC](gc.md) is part of every supported build; it bounds RSS and never changes output — evaluation is byte-identical whether it stays dormant or collects.
 - **Headroom is measured before it's built.** A suite of [probes](perf/probes.md) (compile-time `-D` flags) quantifies each lever's ceiling first.
 
 ## Reading order

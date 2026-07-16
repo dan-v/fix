@@ -79,7 +79,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     // The debugger needs a deterministic pause point: one worker, no
     // speculation. Same posture as `fix eval --debugger`.
     const worker_count = if (options.debugger) 1 else try setup.workerCount(options);
-    setup.applyMemoryBacking(options.hugetlb, init);
+    setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);

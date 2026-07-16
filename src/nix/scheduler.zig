@@ -114,10 +114,9 @@ pub fn reportScanCensus() void {
         const calls = @field(t, name ++ "_calls");
         const hits = @field(t, name ++ "_hits");
         std.debug.print("  {s}: cy={d} ({d:.1}%) calls={d} hits={d} ({d:.2}% hit) avg_cy={d}\n", .{
-            name,                cy,
-            if (total == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(cy)) / @as(f64, @floatFromInt(total)),
-            calls,               hits,
-            if (calls == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(calls)),
+            name,                                                                                                  cy,
+            if (total == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(cy)) / @as(f64, @floatFromInt(total)), calls,
+            hits,                                                                                                  if (calls == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(calls)),
             if (calls == 0) 0 else cy / calls,
         });
     }
@@ -324,15 +323,9 @@ const TaskQueue = containers.Deque(TracedTask);
 /// Mutex-protected bounded ring of speculative tasks. Replaces the Chase-Lev
 /// deque for the SPEC lane only (urgent stays lock-free): speculation is
 /// low-volume (~20-50K submissions per NixOS eval, vs millions of forces), so
-/// a SpinMutex ring is affordable, and it buys the two behaviors Chase-Lev
-/// cannot express:
-///   - ring overwrite (`FIX_SPEC_EVICT`): when full, drop the OLDEST queued
-///     task to admit the fresh one (freshest ≈ nearest the demand head);
-///   - newest-first stealing (`FIX_SPEC_LIFO`): stealers take the newest
-///     task instead of Chase-Lev's oldest-first FIFO, so a just-submitted
-///     seed is picked up in microseconds even under a saturated backlog.
-/// With both knobs off it reproduces the old semantics exactly: owner pops
-/// newest, stealers take oldest, full push rejects.
+/// a SpinMutex ring is affordable. The bulk lane preserves the established
+/// policy (owner pops newest, stealers take oldest, full push rejects), while
+/// the novel lane overwrites its oldest entry and is consumed newest-first.
 ///
 /// `head` is one past the newest slot; `tail` is the oldest. Both wrap; the
 /// occupancy is `head -% tail`. All mutation is under `mu`; the GC mark walk
@@ -437,8 +430,7 @@ const SpecQueue = struct {
     }
 };
 
-
-/// GC (`-Dgc`): mark the objects referenced by pending tasks. A queued
+/// GC: mark the objects referenced by pending tasks. A queued
 /// `force_thunk`/`force_list_range` is a live reference (a helper — or,
 /// after this collection, demand — may still force it). Called only at
 /// the STW safepoint, so `top..bottom` is stable.
@@ -457,7 +449,7 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
     }
 }
 
-/// GC (`-Dgc`): same, for the mutexed spec ring. STW-only — no mutator holds
+/// GC: same, for the mutexed spec ring. STW-only — no mutator holds
 /// `mu`, so a plain `tail..head` walk is stable.
 fn specQueueGcMark(q: *const SpecQueue, tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
     var i = q.tail;
@@ -504,15 +496,10 @@ const burst_wake_budget: u32 = 4;
 /// measured-optimal behavior there); past that, only a core's worth of
 /// helpers keep scanning while the rest park until a submit wake.
 inline fn maxSpinners(worker_count: u8) u32 {
-    if (max_spinners_override != 0) return max_spinners_override;
     return @max(7, @as(u32, worker_count) / 4);
 }
 
-/// `FIX_MAX_SPINNERS`: overrides the `maxSpinners` idle-spinner quota when
-/// nonzero (probe knob; 0 = the default worker-count formula).
-pub var max_spinners_override: u32 = 0;
-
-/// GC parallel-mark hook (`-Dgc`): the Evaluator installs this so a parked
+/// GC parallel-mark hook: the Evaluator installs this so a parked
 /// peer can help drain the mark graph. Type-erased to keep `parallel` free of
 /// an `eval`/`runtime.gc` import (mirrors the heap's `GcHook`).
 pub const GcMarkHook = struct {
@@ -538,7 +525,6 @@ pub const Scheduler = struct {
         pops: u64 = 0,
         steals: u64 = 0,
         parks: u64 = 0,
-        scavenges: u64 = 0,
         sweeps: u64 = 0,
         evicts: u64 = 0,
         novel_ok: u64 = 0,
@@ -578,12 +564,10 @@ pub const Scheduler = struct {
         cont_steals: u64 = 0,
         cont_pushes: u64 = 0,
         parks: u64,
-        /// Thunks pre-forced by the idle scavenger (FIX_SCAVENGE).
-        scavenges: u64 = 0,
         /// Attrset sibling sweeps submitted (FIX_SIBLING).
         sweeps: u64 = 0,
-        /// Oldest-first spec-backlog evictions (FIX_SPEC_EVICT): queued
-        /// speculative tasks dropped unrun to admit a fresher submission.
+        /// Novel-lane ring evictions: queued speculative tasks dropped unrun
+        /// to admit a fresher first-seen chunk.
         evicts: u64 = 0,
         /// Novel-chunk speculative submissions (FIX_SPEC_NOVEL) — first-
         /// ever creation-time speculation of a code region, routed to the
@@ -593,10 +577,6 @@ pub const Scheduler = struct {
         /// `error.SpeculativeBail` (create/claim budget exhausted, or the
         /// demanded result arrived mid-task).
         spec_bails: u64 = 0,
-        /// Deepest fiber native stack high-water seen across all workers
-        /// since startup. Use to size `Fiber.min_stack_bytes` against a
-        /// representative workload.
-        max_fiber_stack_used_bytes: u64,
         /// Deepest VM value-stack sp seen across all workers, in Values.
         /// Multiply by `@sizeOf(Value)` (= 8) for a byte count.
         max_vm_sp: u64,
@@ -631,9 +611,8 @@ pub const Scheduler = struct {
     /// `submit` when `makeThunk`'s heuristic suggests the body is
     /// substantial enough to pre-run. Drained only when there's no
     /// ready fiber or urgent task to handle. A mutexed ring (see
-    /// `SpecQueue`) rather than Chase-Lev, so the backlog can ring-
-    /// overwrite (`FIX_SPEC_EVICT`) and stealers can take newest-first
-    /// (`FIX_SPEC_LIFO`).
+    /// `SpecQueue`) rather than Chase-Lev. Bulk submissions reject at the
+    /// cap; owners pop newest and stealers take oldest.
     spec_queues: []SpecQueue,
     /// Per-worker high-priority speculative lane (`FIX_SPEC_NOVEL`):
     /// first-ever creation-time speculation of each chunk lands here (see
@@ -718,7 +697,6 @@ pub const Scheduler = struct {
     /// slot is padded to a cache line so adjacent workers never share
     /// one (no false sharing).
     worker_counters: []Counters,
-    n_max_fiber_stack: std.atomic.Value(u64),
     n_max_vm_sp: std.atomic.Value(u64),
     n_idle_ns: std.atomic.Value(u64),
     n_busy_ns: std.atomic.Value(u64),
@@ -729,17 +707,6 @@ pub const Scheduler = struct {
     /// work contributes how much to wall time.
     disable_speculation: bool,
     disable_fanout: bool,
-
-    /// `FIX_SCAVENGE`: idle helpers pre-force old unresolved thunks from
-    /// the per-worker creation rings (`ObjectHeap.scavengeSteal`) —
-    /// lowest-priority work, after ready fibers / tasks / continuations.
-    /// Set once before helpers start, read-only during eval.
-    scavenge_enabled: bool = false,
-    /// Skip the newest N ring entries when scavenging (see
-    /// `scavengeSteal`). `FIX_SCAV_MARGIN` overrides.
-    scav_margin: u64 = 4096,
-    /// Highest worker id allowed to scavenge. `FIX_SCAV_WORKERS` overrides.
-    scav_workers: u8 = 7,
 
     /// Demand-sibling prefetch. On a demand fiber's inline-cache MISS
     /// landing on a still-unresolved thunk member of a plain attrset
@@ -780,13 +747,6 @@ pub const Scheduler = struct {
     /// on a spec-owned thunk, promote the fiber computing it (see
     /// `promoteFiber` / `VM.demand_rescue`). Default off pending A/B.
     spec_rescue: bool = false,
-    /// `FIX_WAKE_AFFINITY`: route a woken fiber onto the ready queue of the
-    /// worker that resolved its awaited future (the resolver's core is
-    /// cache-hot for the just-published value) instead of the fiber's
-    /// allocator ("home") worker. Only applies when the waker is a compute
-    /// worker — see `WorkerFiber.wakeImpl`. Read-mostly, checked once per
-    /// wake. Default off pending A/B.
-    wake_resolver_affinity: bool = false,
     /// Priority-inheritance registry: `fiber_id -> &VM.demand_rescue`, so a
     /// blocking fiber can flip its blocker's flag without the scheduler
     /// importing the vm layer. Indexed by fiber id (monotonic from 0, bounded
@@ -809,22 +769,6 @@ pub const Scheduler = struct {
     /// fan-out can't flood the queues. Atomic — any worker's readDir
     /// may submit.
     readdir_prefetch_budget: containers.Isolated(u32) = .init(0),
-    /// `FIX_SPEC_CREATE_BUDGET`: per-task thunk-CREATION budget for
-    /// spec-lane `force_thunk` tasks (creation-time speculation + the
-    /// novel lane), reusing the sweep-task bounded-speculation machinery
-    /// (`VM.spec_create_left`; bail = transient reset, resolved
-    /// sub-thunks kept). 0 = unbounded (historical behavior). Motivation:
-    /// at w=32, spec-created thunks reach 10-13M/eval with ~49% never
-    /// demanded — junk VOLUME, not discovery, is the residual w=32
-    /// regression; a creation budget caps each wrong guess's cascade.
-    /// Urgent-lane tasks are never budgeted (they're demand-adjacent).
-    spec_task_create_budget: u64 = 0,
-    /// `FIX_SPEC_CLAIMS`: per-task CLAIMED-force budget for spec-lane
-    /// `force_thunk` tasks — the claims analogue of
-    /// `spec_task_create_budget` (see `VM.spec_budget`; the sibling
-    /// sweeps' per-member claim budget is separate,
-    /// `sibling_claim_budget`). 0 = unbounded (default).
-    spec_task_claim_budget: u64 = 0,
     /// `FIX_SPEC_BAND_BUDGET`: hard per-task creation budget for
     /// speculative `force_thunk` tasks whose ROOT chunk is below the
     /// trusted size (`ChunkSlot.spec_band_small`, effective size <
@@ -837,26 +781,6 @@ pub const Scheduler = struct {
     /// (2026-07: gate 192 unbudgeted +15-52% w=8 wall; under this budget
     /// = baseline). 0 disables.
     spec_band_budget: u64 = 512,
-    /// `FIX_SPEC_EVICT`: ring semantics for the speculation backlog. When
-    /// the global backlog cap (or the submitter's own ring) is full, DROP
-    /// THE OLDEST queued spec task and admit the fresh submission, instead
-    /// of rejecting the newest. The newest submission was created nearest
-    /// the demand head; the oldest queued task is the stalest bet. Measured
-    /// motivation: the /etc per-file chain's seed thunk is submitted ONCE
-    /// (creation-time speculation) ~40ms into a NixOS toplevel eval — when
-    /// the cap-rejection lottery drops it, the whole ~300ms serial chain
-    /// starts ~250ms later and w=8 wall goes 0.95 → 1.05-1.12s. Eviction
-    /// is semantics-safe: a dropped spec task leaves its thunk unresolved
-    /// for demand to force later (same as a rejected submit).
-    spec_evict: bool = false,
-    /// `FIX_SPEC_LIFO`: stealers take the NEWEST speculative task instead
-    /// of the oldest. The owner already pops its own spec queue newest-
-    /// first; oldest-first stealing handed helpers the STALEST bets — the
-    /// exact inverse of demand-head adjacency. With this on, a fresh seed
-    /// submission is picked up almost immediately even under a saturated
-    /// backlog, instead of waiting behind (or being evicted with) hundreds
-    /// of stale speculations.
-    spec_lifo: bool = false,
     /// `FIX_SPEC_NOVEL`: route the FIRST-ever creation-time speculation of
     /// each chunk (a new code region — potential subsystem/chain root) to
     /// the high-priority `novel_queues` lane, drained before the bulk spec
@@ -877,12 +801,6 @@ pub const Scheduler = struct {
     /// probe (`takableWork`) so they never busy-spin on a backlog they
     /// are not allowed to touch.
     spec_helper_cap: u8 = 255,
-    /// `FIX_TOUCH_LOG=<file substring>`: diagnosis probe — log every thunk
-    /// CLAIM whose source file basename matches, with timestamp, worker,
-    /// and spec/demand context (see `vm/force.zig logTouch`). Debug-only;
-    /// one null-check on the claim slow path when off.
-    touch_log: ?[]const u8 = null,
-
     /// When set (by `setTraceFlows`, driven by `--timeline`), `pushOwn` stamps
     /// each task with its push time so the timeline can anchor the steal arrow
     /// to the producing quantum. Off by default — one dead branch per push.
@@ -900,7 +818,7 @@ pub const Scheduler = struct {
     /// unaffected; only un-started backlog work is skipped.
     suppress_background: std.atomic.Value(bool),
 
-    /// GC stop-the-world barrier (`-Dgc`). When a worker crosses the
+    /// GC stop-the-world barrier. When a worker crosses the
     /// collection threshold at a safepoint it CASes `gc_stop_requested`
     /// true and becomes the sole collector. Every other worker, on seeing
     /// the flag at its own safepoint, sets its per-worker `gc_worker_parked`
@@ -909,22 +827,22 @@ pub const Scheduler = struct {
     /// mutation), clears the stop flag, then waits for all peers' flags to
     /// clear before returning — a full two-phase barrier, so a slow peer can
     /// never carry a stale parked state into the next collection (which a
-    /// shared counter + epoch could). `void`-free but inert in non-`-Dgc`.
-    gc_stop_requested: if (gc.enabled) std.atomic.Value(bool) else void,
-    gc_worker_parked: if (gc.enabled) []std.atomic.Value(bool) else void,
+    /// shared counter + epoch could).
+    gc_stop_requested: std.atomic.Value(bool),
+    gc_worker_parked: []std.atomic.Value(bool),
 
-    /// Parallel-mark phase gate (`-Dgc`, `--workers>1`). Once every peer is
+    /// Parallel-mark phase gate (collector, `--workers>1`). Once every peer is
     /// parked (`gcWaitAllParked`), the collector seeds the roots and then
     /// opens this flag; each parked peer, seeing it, calls the mark hook to
     /// help drain the graph (marker slot == its worker id) instead of merely
     /// spinning. It stays open for the whole mark and is closed only AFTER
     /// termination (when every marker has provably entered and returned), so
     /// no peer can miss the mark and hang the work-stealing terminator.
-    gc_mark_open: if (gc.enabled) std.atomic.Value(bool) else void,
+    gc_mark_open: std.atomic.Value(bool),
     /// Installed by the Evaluator: runs `Tracer.drainParallel(worker_id)` to
     /// termination. Lets the scheduler drive the marker without importing
     /// `eval`/`gc` (same type-erasure as the heap's collect hook).
-    gc_mark_hook: if (gc.enabled) ?GcMarkHook else void,
+    gc_mark_hook: ?GcMarkHook,
 
     /// `worker_count` includes the main thread (worker 0). The
     /// scheduler spawns `worker_count - 1` helper threads in `start()`;
@@ -985,12 +903,9 @@ pub const Scheduler = struct {
         errdefer allocator.free(fiber_rescue);
         @memset(fiber_rescue, null);
 
-        const gc_worker_parked = if (gc.enabled) blk: {
-            const ws = try allocator.alloc(std.atomic.Value(bool), safe_worker_count);
-            for (ws) |*w| w.* = .init(false);
-            break :blk ws;
-        } else {};
-        errdefer if (gc.enabled) allocator.free(gc_worker_parked);
+        const gc_worker_parked = try allocator.alloc(std.atomic.Value(bool), safe_worker_count);
+        for (gc_worker_parked) |*w| w.* = .init(false);
+        errdefer allocator.free(gc_worker_parked);
 
         return .{
             .allocator = allocator,
@@ -1013,17 +928,16 @@ pub const Scheduler = struct {
             .spec_mask = .init(0),
             .worker_counters = worker_counters,
             .fiber_rescue = fiber_rescue,
-            .n_max_fiber_stack = .init(0),
             .n_max_vm_sp = .init(0),
             .n_idle_ns = .init(0),
             .n_busy_ns = .init(0),
             .disable_speculation = false,
             .disable_fanout = false,
             .suppress_background = .init(false),
-            .gc_stop_requested = if (gc.enabled) .init(false) else {},
+            .gc_stop_requested = .init(false),
             .gc_worker_parked = gc_worker_parked,
-            .gc_mark_open = if (gc.enabled) .init(false) else {},
-            .gc_mark_hook = if (gc.enabled) null else {},
+            .gc_mark_open = .init(false),
+            .gc_mark_hook = null,
         };
     }
 
@@ -1075,7 +989,6 @@ pub const Scheduler = struct {
             c.pops += w.pops;
             c.steals += w.steals;
             c.parks += w.parks;
-            c.scavenges += w.scavenges;
             c.sweeps += w.sweeps;
             c.evicts += w.evicts;
             c.novel_ok += w.novel_ok;
@@ -1089,12 +1002,10 @@ pub const Scheduler = struct {
             .pops = c.pops,
             .steals = c.steals,
             .parks = c.parks,
-            .scavenges = c.scavenges,
             .sweeps = c.sweeps,
             .evicts = c.evicts,
             .novel_ok = c.novel_ok,
             .spec_bails = c.spec_bails,
-            .max_fiber_stack_used_bytes = self.n_max_fiber_stack.load(.monotonic),
             .max_vm_sp = self.n_max_vm_sp.load(.monotonic),
             .idle_ns = self.n_idle_ns.load(.monotonic),
             .busy_ns = self.n_busy_ns.load(.monotonic),
@@ -1104,8 +1015,7 @@ pub const Scheduler = struct {
     /// Worker shutdown reports the deepest fiber stack and VM sp it
     /// observed. We monotonically max into the scheduler counters so
     /// `fix inspect` can show the high-water across the whole eval.
-    pub fn reportFiberHighWater(self: *Scheduler, max_fiber_stack: u64, max_vm_sp: u64) void {
-        atomicMax(&self.n_max_fiber_stack, max_fiber_stack);
+    pub fn reportVmStackHighWater(self: *Scheduler, max_vm_sp: u64) void {
         atomicMax(&self.n_max_vm_sp, max_vm_sp);
     }
 
@@ -1125,11 +1035,10 @@ pub const Scheduler = struct {
         }
     }
 
-    /// GC (`-Dgc`): mark all objects referenced by pending tasks across
+    /// GC: mark all objects referenced by pending tasks across
     /// every worker's urgent + spec queues. Roots for the collector — a
     /// queued task will still be forced. STW-only.
     pub fn gcMarkPendingTasks(self: *const Scheduler, tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
-        if (comptime !gc.enabled) return;
         for (self.urgent_queues) |*q| taskQueueGcMark(q, tr, heap);
         for (self.spec_queues) |*q| specQueueGcMark(q, tr, heap);
         for (self.novel_queues) |*q| specQueueGcMark(q, tr, heap);
@@ -1148,7 +1057,7 @@ pub const Scheduler = struct {
         self.allocator.free(self.ready_queues);
         self.allocator.free(self.threads);
         self.allocator.free(self.worker_counters);
-        if (comptime gc.enabled) self.allocator.free(self.gc_worker_parked);
+        self.allocator.free(self.gc_worker_parked);
     }
 
     /// Push a woken fiber's ReadyNode onto the target worker's
@@ -1267,19 +1176,6 @@ pub const Scheduler = struct {
         self.trace_flows = on;
     }
 
-    /// Enable/configure the idle-helper thunk scavenger. Set once before
-    /// helpers start (from `FIX_SCAVENGE` / `FIX_SCAV_MARGIN`).
-    pub fn setScavenge(self: *Scheduler, on: bool, margin: u64) void {
-        self.scavenge_enabled = on;
-        self.scav_margin = margin;
-    }
-    pub inline fn scavengeEnabled(self: *const Scheduler) bool {
-        return self.scavenge_enabled;
-    }
-    pub inline fn bumpScavenges(self: *Scheduler, id: u8) void {
-        self.bump(id, "scavenges");
-    }
-
     /// Enable/configure demand-sibling prefetch. Set once before helpers
     /// start (from `FIX_SIBLING` / `FIX_SIBLING_MIN` / `FIX_SIBLING_MAX`).
     pub fn setSiblingPrefetch(self: *Scheduler, on: bool, min: u32, max: u32) void {
@@ -1341,18 +1237,13 @@ pub const Scheduler = struct {
         if (submitter_id >= self.worker_count) return false;
         const cap: u32 = @as(u32, self.worker_count - 1) * spec_backlog_per_helper;
         if (self.pending_tasks.v.load(.monotonic) >= cap) {
-            // At the cap: with `FIX_SPEC_EVICT`, make room by dropping the
-            // oldest queued spec task (ring semantics — see `spec_evict`);
-            // otherwise reject the fresh submission (historical behavior).
-            if (!self.evictOldestSpec(submitter_id)) {
-                self.bump(submitter_id, "spec_rej");
-                return false;
-            }
+            self.bump(submitter_id, "spec_rej");
+            return false;
         }
         const push_ts: u64 = if (self.trace_flows) monotonicNs() else 0;
         const prev: u32 = switch (self.spec_queues[submitter_id].push(
             .{ .task = task, .push_ts = push_ts },
-            self.spec_evict,
+            false,
             &self.spec_mask.v,
         )) {
             .full => {
@@ -1408,34 +1299,6 @@ pub const Scheduler = struct {
         }
         self.bump(submitter_id, "novel_ok");
         return true;
-    }
-
-    /// Ring-overwrite the speculation backlog (`FIX_SPEC_EVICT`): drop the
-    /// OLDEST queued spec task — the submitter's own queue first (usually
-    /// where its backlog lives, and the cheapest probe), then any peer's —
-    /// so a fresh submission can take its place. Returns false when
-    /// eviction is off or every spec queue is empty (the standing
-    /// `pending_tasks` are all urgent — never evict demand work for
-    /// speculation).
-    fn evictOldestSpec(self: *Scheduler, submitter_id: u8) bool {
-        if (!self.spec_evict) return false;
-        if (self.spec_queues[submitter_id].evictOldest(&self.spec_mask.v)) {
-            _ = self.pending_tasks.v.fetchSub(1, .monotonic);
-            self.bump(submitter_id, "evicts");
-            return true;
-        }
-        const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
-        var i: u8 = 0;
-        while (i < self.worker_count) : (i += 1) {
-            const idx = (start_idx + i) % self.worker_count;
-            if (idx == submitter_id) continue;
-            if (self.spec_queues[idx].evictOldest(&self.spec_mask.v)) {
-                _ = self.pending_tasks.v.fetchSub(1, .monotonic);
-                self.bump(submitter_id, "evicts");
-                return true;
-            }
-        }
-        return false;
     }
 
     /// Submit a *demand-driven* task. Goes to the urgent queue —
@@ -1593,7 +1456,7 @@ pub const Scheduler = struct {
             (self.spec_mask.v.load(.monotonic) != 0 or self.worker_count > 64))
         {
             const t2 = rdtscScan();
-            if (self.stealSpecExcluding(self.spec_queues, &self.spec_mask.v, worker_id, self.spec_lifo, victim, push_ts)) |t| {
+            if (self.stealSpecExcluding(self.spec_queues, &self.spec_mask.v, worker_id, false, victim, push_ts)) |t| {
                 scanEnd("spec_steal", t2, true);
                 if (lane) |l| l.* = .spec;
                 return t;
@@ -1703,18 +1566,16 @@ pub const Scheduler = struct {
         self.wakeWorker(worker_id);
     }
 
-    // --- GC stop-the-world barrier (`-Dgc`) ---
+    // --- GC stop-the-world barrier ---
 
     /// Fast check: has a collection been requested? Called at safepoints.
     pub inline fn gcStopRequested(self: *const Scheduler) bool {
-        if (comptime !gc.enabled) return false;
         return self.gc_stop_requested.load(.acquire);
     }
 
     /// Try to become the sole collector for this cycle. Returns true to
     /// exactly one worker (the CAS winner); losers should `gcSafepointPark`.
     pub fn gcTryBeginCollection(self: *Scheduler) bool {
-        if (comptime !gc.enabled) return false;
         return self.gc_stop_requested.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null;
     }
 
@@ -1723,7 +1584,6 @@ pub const Scheduler = struct {
     /// flag. On return the caller is the only running mutator — safe to mark
     /// and sweep.
     pub fn gcWaitAllParked(self: *Scheduler, collector_id: u8) void {
-        if (comptime !gc.enabled) return;
         var id: u8 = 0;
         while (id < self.worker_count) : (id += 1) self.wakeWorker(id);
         id = 0;
@@ -1739,7 +1599,6 @@ pub const Scheduler = struct {
     /// parked (or about to re-park with a stale flag) when the next
     /// collection begins.
     pub fn gcEndCollection(self: *Scheduler, collector_id: u8) void {
-        if (comptime !gc.enabled) return;
         self.gc_stop_requested.store(false, .release);
         var id: u8 = 0;
         while (id < self.worker_count) : (id += 1) {
@@ -1751,14 +1610,12 @@ pub const Scheduler = struct {
     /// Evaluator installs the parallel-mark hook (see `GcMarkHook`) once, at
     /// startup, so parked peers can help drain the mark.
     pub fn gcSetMarkHook(self: *Scheduler, hook: GcMarkHook) void {
-        if (comptime !gc.enabled) return;
         self.gc_mark_hook = hook;
     }
 
     /// Collector: the roots are seeded — release the parked peers to help
     /// mark. Paired with `gcCloseMark` after the mark terminates.
     pub fn gcOpenMark(self: *Scheduler) void {
-        if (comptime !gc.enabled) return;
         self.gc_mark_open.store(true, .release);
     }
 
@@ -1766,7 +1623,6 @@ pub const Scheduler = struct {
     /// Close the phase so the next collection starts from a clean gate — must
     /// happen before `gcEndCollection` releases the peers.
     pub fn gcCloseMark(self: *Scheduler) void {
-        if (comptime !gc.enabled) return;
         self.gc_mark_open.store(false, .release);
     }
 
@@ -1778,7 +1634,6 @@ pub const Scheduler = struct {
     /// idle; the mark stays open until termination so no peer can miss it (a
     /// missed marker would hang the work-stealing terminator).
     pub fn gcSafepointPark(self: *Scheduler, worker_id: u8) void {
-        if (comptime !gc.enabled) return;
         self.gc_worker_parked[worker_id].store(true, .release);
         if (self.gc_mark_hook) |hook| {
             while (self.gc_stop_requested.load(.acquire) and
@@ -1882,8 +1737,12 @@ test "submitUrgent bypasses the speculation backlog cap" {
     try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 101 }, 0));
 
     var drained: u32 = 0;
-    for (sched.urgent_queues) |*q| while (q.steal()) |_| { drained += 1; };
-    for (sched.spec_queues) |*q| while (q.steal(false, &sched.spec_mask.v)) |_| { drained += 1; };
+    for (sched.urgent_queues) |*q| while (q.steal()) |_| {
+        drained += 1;
+    };
+    for (sched.spec_queues) |*q| while (q.steal(false, &sched.spec_mask.v)) |_| {
+        drained += 1;
+    };
     // spec_backlog_per_helper (128) speculative tasks + 2 urgent tasks
     // that bypassed the cap. This was 66 (64 + 2) back when the cap was
     // helper_count * 64; when the cap was raised to 128 (commit
@@ -1893,7 +1752,7 @@ test "submitUrgent bypasses the speculation backlog cap" {
     try std.testing.expectEqual(spec_backlog_per_helper + 2, drained);
 }
 
-test "spec ring: LIFO owner pop, FIFO steal, reject when full (knobs off)" {
+test "spec ring: LIFO owner pop and FIFO steal" {
     var sched = try Scheduler.init(std.testing.allocator, 2);
     defer sched.deinit();
 
@@ -1908,27 +1767,6 @@ test "spec ring: LIFO owner pop, FIFO steal, reject when full (knobs off)" {
     // LIFO steal takes newest.
     try std.testing.expectEqual(@as(types.ObjectId, 2), sched.spec_queues[0].steal(true, &sched.spec_mask.v).?.task.force_thunk);
     try std.testing.expectEqual(@as(?TracedTask, null), sched.spec_queues[0].steal(false, &sched.spec_mask.v));
-}
-
-test "spec ring: FIX_SPEC_EVICT admits at the cap by dropping the oldest" {
-    var sched = try Scheduler.init(std.testing.allocator, 2);
-    defer sched.deinit();
-    sched.spec_evict = true;
-
-    // Fill to the backlog cap.
-    var i: types.ObjectId = 0;
-    while (i < spec_backlog_per_helper) : (i += 1)
-        try std.testing.expect(sched.submit(.{ .force_thunk = i }, 0));
-
-    // At the cap the submit must still succeed (ring semantics), dropping
-    // the oldest (id 0) and keeping the count at the cap.
-    try std.testing.expect(sched.submit(.{ .force_thunk = 999 }, 0));
-    try std.testing.expectEqual(spec_backlog_per_helper, sched.pending_tasks.v.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), sched.stats().evicts);
-
-    // The oldest remaining is now id 1; the newest is the fresh 999.
-    try std.testing.expectEqual(@as(types.ObjectId, 1), sched.spec_queues[0].steal(false, &sched.spec_mask.v).?.task.force_thunk);
-    try std.testing.expectEqual(@as(types.ObjectId, 999), sched.spec_queues[0].steal(true, &sched.spec_mask.v).?.task.force_thunk);
 }
 
 test "spec ring: push evict wraps correctly at ring capacity" {

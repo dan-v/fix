@@ -51,9 +51,9 @@ part of the win.
 | `on` | always attempt hugetlb; warn once if the pool can't serve a mapping, then fall back. |
 | `off` | never. |
 
-Precedence: `--hugetlb MODE` > `FIX_HUGETLB` env (`auto`/`on`/`off`; bare
-`1`/`true`/empty = `on`, `0`/`false` = `off`) > `auto`. Resolved in
-`cli/setup.zig:applyMemoryBacking` **before** `Evaluator.init` maps the heap
+`--hugetlb MODE` accepts `auto`, `on`, or `off`; when omitted it defaults to
+`auto`. It is resolved in `cli/setup.zig:applyMemoryBacking` **before**
+`Evaluator.init` maps the heap
 — deliberately not a `nix.conf`/`--option` setting, since config loads after
 the flat store already picked its mapping.
 
@@ -94,7 +94,7 @@ consumers fold them in:
 
 - `runtime/gc.zig` exposes `currentFootprintBytes`/`peakFootprintBytes`
   (= RSS + hugetlb); the progress "rss" counter and `readMetrics` use them.
-- `FIX_MEM_REPORT` prints the hugetlb peak, a combined footprint line, and
+- `--mem-report` prints the hugetlb peak, a combined footprint line, and
   the kernel-truth faulted figure from smaps (`Private_Hugetlb`).
 - the `--timeline` `rss_mb` counter carries a separate `hugetlb` series.
 - the **GC budget needs no fix**: it gates on internal

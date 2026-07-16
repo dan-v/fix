@@ -153,7 +153,7 @@ fn buildAndSwitch(allocator: std.mem.Allocator, init: std.process.Init, target: 
     };
 
     const worker_count = try setup.workerCount(options.*);
-    setup.applyMemoryBacking(options.hugetlb, init);
+    setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options.*);
@@ -283,7 +283,7 @@ fn sudoReexec(allocator: std.mem.Allocator, init: std.process.Init, target: Targ
     defer allocator.free(self);
 
     const argv = [_][]const u8{
-        "sudo",             self,          "switch", action.word(),
+        "sudo",             self,                  "switch", action.word(),
         targetFlag(target), "--activate-toplevel", top,
     };
     var child = std.process.spawn(init.io, .{ .argv = &argv, .environ_map = init.environ_map }) catch |err| {

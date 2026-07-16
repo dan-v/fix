@@ -1,4 +1,4 @@
-//! `-Dtimeline`: a wall-clock event timeline of the evaluator's serial
+//! `--timeline`: a wall-clock event timeline of the evaluator's serial
 //! path, emitted as a Perfetto / Chrome-trace JSON (one track per worker).
 //!
 //! Motivation: at `--workers=N` the wall-time floor is the *serial

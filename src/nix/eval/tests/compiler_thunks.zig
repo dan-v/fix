@@ -12,8 +12,8 @@ test "an unforced let binding thunk never evaluates its erroring body" {
 }
 
 test "a strict let binding is still forced exactly to its value" {
-    // Exercises the eager-thunk path (`compileThunkEager`) taken when
-    // strictness analysis shows the binding is used unconditionally.
+    // Strictness analysis shows the binding is used unconditionally, while
+    // the materialized thunk remains lazy until demand.
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 

@@ -1462,7 +1462,7 @@ pub const DerivationStore = struct {
         // The key is a raw ObjectId; after a GC the attrs may be swept and its
         // id reused for a different attrs. `token` bumps every collection, so a
         // stale entry must miss — else we'd return another derivation's value
-        // for a reused id (a reuse-only bug the -Dgc detector can't see).
+        // for a reused id (a reuse-only bug the GC detector can't see).
         if (entry.token != token) return null;
         return entry.bits;
     }

@@ -1,16 +1,14 @@
 # GC
 
-*A non-moving, precise, generational collector (`-Dgc`). It is compiled into the default build and runs at all worker counts; `-Dgc=false` builds the collector-free evaluator. A run that never crosses half its memory budget stays dormant and pays only the mutator rooting tax (~2–2.5% wall, measured), because reclaim tracking is armed lazily at the first budget/2 safepoint. Enabling collection never changes output — the [interpreter](vm/dispatch.md) is canonical and evaluation is byte-identical with the collector dormant, collecting, or absent.*
+*A non-moving, precise, generational collector. It is part of every supported build and runs at all worker counts. A run that never crosses half its memory budget stays dormant and pays only the mutator rooting tax (~2–2.5% wall, measured), because reclaim tracking is armed lazily at the first budget/2 safepoint. Collection never changes output — the [interpreter](vm/dispatch.md) is canonical and evaluation is byte-identical whether the collector stays dormant or collects.*
 
 **Why a collector at all.** `fix`'s object stores are append-only bump allocators (see [heap](runtime/heap.md)), so without reclamation peak RSS tracks *total* allocation, not the live set — and the live set plateaus (~228 MB on nixos_toplevel) while total allocation grows linearly (~1.2 GB). The collector's job is to bound RSS on memory-constrained machines; it is not a throughput lever (mark is a wall tax — see [perf/model](perf/model.md)).
-
-**Zero-cost when absent.** `build_options.gc` is a comptime flag. Every root-enumeration, safepoint, and bitmap path is `comptime`-guarded and compiles to nothing under `-Dgc=false`.
 
 ## Memory budget (the collection policy)
 
 One number decides when the collector runs: a heap-reserved-bytes budget, defended against.
 
-- Resolution order: `--max-memory=N` (MiB, or `Nk`/`Nm`/`Ng`) → `FIX_MAX_MEMORY` (same format) → **half of `/proc/meminfo` MemAvailable** (fallbacks: half MemTotal, then 2 GiB). Half, because the budget bounds only the four heap stores — side allocations (chunks, interner, strings, thread stacks) ride on top, and other processes need headroom. `0` = never collect (reclaim machinery never enabled — bump-only, like `FIX_GC_OFF`).
+- Resolution order: `--max-memory=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemAvailable** (fallbacks: half MemTotal, then 2 GiB). Half, because the budget bounds only the four heap stores — side allocations (chunks, interner, strings, thread stacks) ride on top, and other processes need headroom. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
 - **Lazy arming**: below budget/2 the heap only compares its reserved-bytes cursor against the threshold once per TLAB refill — no young-slot tracking, no write barrier, no free-list probes. The first budget/2 crossing runs an arming stop-the-world safepoint (`armLazy`): everything allocated so far becomes untracked/old (the unreclaimable floor, ≈ reserved at budget/2 by construction), and real collections start at the full budget, re-armed to `max(budget, reserved + clamp(budget/8, 64MB, 1GB))` after each.
 - Consequence: on a big-RAM machine the default budget dwarfs any eval → **zero collections, zero arming, rooting-tax only**; on a small-RAM device collections start well before OOM and peak reserved stays bounded near the budget (measured: `--max-memory=512m` holds nixos_toplevel at ~850 MB reserved vs ~1.4 GB unbounded, byte-identical).
 
@@ -85,17 +83,17 @@ At `--workers=1` a minor is serial on the lone mutator. At `--workers>1` every l
 
 | Mode | State |
 |------|-------|
-| w=1 | **Fully working, byte-identical** (incl. ReleaseSafe UAF-detector gauntlet under `FIX_GC_STEP_MB=64`). Minor pause ~48ms (mark ~33ms — ~94% of it the young-survivor transitive drain; roots + remset are single-digit ms thanks to the incremental chunk-constant scan — plus sweep ~15ms). Dormant (budget never crossed): **+2.5% wall vs collector-free, no RSS delta**. |
-| w>1 | **Fully working, byte-identical** (validated w=8: 512m/768m budgets, `FIX_GC_STEP_MB=64` ×13–28 collections, detector build). Mark + evac are parallel across parked peers (see above); free lists are per-worker sharded. Barrier spin ~4–11ms/collection at w=8. Dormant: **+2.2% wall vs collector-free**. |
+| w=1 | **Fully working, byte-identical** (incl. ReleaseSafe UAF-detector gauntlet under `FIX_GC_STEP_MB=64`). Minor pause ~48ms (mark ~33ms — ~94% of it the young-survivor transitive drain; roots + remset are single-digit ms thanks to the incremental chunk-constant scan — plus sweep ~15ms). |
+| w>1 | **Fully working, byte-identical** (validated w=8: 512m/768m budgets, `FIX_GC_STEP_MB=64` ×13–28 collections, detector build). Mark + evac are parallel across parked peers (see above); free lists are per-worker sharded. Barrier spin ~4–11ms/collection at w=8. |
 
-**Net verdict on time:** the dormant cost is the comptime rooting tax only (~2–2.5%): force-chain / temp-root maintenance must stay complete from process start (entries live across the arming boundary), so it cannot be runtime-gated. When collecting, the pause is the young-survivor drain + young-slot sweep; frequency is budget-driven, so total GC wall scales with allocation-past-budget, not run length. The RSS bound is real; `madvise` page-return recovers only ~32 MB (scattered non-moving death). The end goal is concurrent SATB, for which the parallel mark is the substrate.
+**Net verdict on time:** the dormant cost is the rooting tax only (~2–2.5%): force-chain / temp-root maintenance must stay complete from process start (entries live across the arming boundary), so it cannot be runtime-gated. When collecting, the pause is the young-survivor drain + young-slot sweep; frequency is budget-driven, so total GC wall scales with allocation-past-budget, not run length. The RSS bound is real; `madvise` page-return recovers only ~32 MB (scattered non-moving death). The end goal is concurrent SATB, for which the parallel mark is the substrate.
 
 ## Correctness tooling
 
-- **UAF detector** (ReleaseSafe + `-Dgc`): freed slots are *not reused* and every read asserts the alloc bit is set — surfaces dangling ObjectIds at the read, at their source. A companion closure check verifies the minor mark is closed (every young child of a live parent is marked) before the sweep, panicking with the offending parent→child edge so a missed barrier/root is caught at its source.
+- **UAF detector** (ReleaseSafe): freed slots are *not reused* and every read asserts the alloc bit is set — surfaces dangling ObjectIds at the read, at their source. A companion closure check verifies the minor mark is closed (every young child of a live parent is marked) before the sweep, panicking with the offending parent→child edge so a missed barrier/root is caught at its source.
 - **Swept-range poisoning**: freed ranges are overwritten with an invalid thunk so any stale reader trips immediately.
 - **`FIX_GC_STEP_MB`**: collect every N MB of fresh allocation from a low start threshold (eager tracking, ignores the budget) to shake out rooting gaps.
-- **`FIX_GC_OFF`** (never enable reclaim — bump-only), **`FIX_GC_NOREUSE`** (skip free-list reuse; A/B the reuse path), **`FIX_GC_PAR_CAP`** (mark/evac participant cap), **`FIX_MAX_MEMORY`** (budget override) — measurement/tuning knobs.
-- **`FIX_GC_REPORT`**: dump the per-run collection report (pauses, promoted/freed, live vs reserved breakdown) to stderr; off by default so ordinary `-Dgc` runs stay quiet.
+- **`FIX_GC_NOREUSE`** (skip free-list reuse; validate the reuse path) and **`FIX_GC_PAR_CAP`** (mark/evac participant cap) are validation/tuning knobs.
+- **`--gc-report`** dumps the per-run collection report (pauses, promoted/freed, live vs reserved breakdown) to stderr.
 
 Code: `src/runtime/gc.zig` (the precise `Tracer` / marker), `src/runtime/heap/gc.zig` (collector driver: arm / evac / sweep / threshold), `src/nix/eval/gc.zig` (root enumeration, stop-the-world glue, budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).

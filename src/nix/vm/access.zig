@@ -4,7 +4,6 @@
 //! prefetches the set's other members.
 //! Concurrency: the attr cache is per-worker thread-local, registered so the STW collector marks its live entries.
 const std = @import("std");
-const build_options = @import("build_options");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
 const thunk_mod = @import("runtime").thunk;
@@ -28,9 +27,9 @@ const readU32 = vm_mod.readU32;
 const readInternId = vm_mod.readInternId;
 
 pub fn callAttrFunctor(self: *VM, callee: Value) !Value {
-    // GC (`-Dgc`): `callee` (the functor attrset) is held in a Zig local across
+    // GC: `callee` (the functor attrset) is held in a Zig local across
     // `forceValue(functor)` — and callers reach here off the operand stack
-    // (e.g. doTailCall's `current`) — so root it. Compiles away w/o -Dgc.
+    // (e.g. doTailCall's `current`) — so root it. Compiles away w/o GC.
     const gc_roots = force.rootsBegin(self);
     defer force.rootsEnd(self, gc_roots);
     force.rootKeep(self, callee);
@@ -43,7 +42,7 @@ pub fn callAttrFunctor(self: *VM, callee: Value) !Value {
 }
 
 pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
-    // GC (`-Dgc`): raise the per-thread native depth for the duration of the
+    // GC: raise the per-thread native depth for the duration of the
     // builtin. This gates only the PEER stop-the-world park (`force.zig`,
     // `native_depth == 0`), NOT collection initiation: a demand `forceValue`
     // that resolves a thunk runs mark+sweep at ANY native depth (the RSS
@@ -57,10 +56,10 @@ pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
     // (w>1 UAF). See concatMap/foldl'/mergeAttrLiteralObjects for the pattern.
     // `import`/`scopedImport` drop back to the caller's depth for the imported
     // eval (see `Evaluator.evaluateSource`).
-    if (comptime build_options.gc) self.native_depth += 1;
-    defer if (comptime build_options.gc) {
+    self.native_depth += 1;
+    defer {
         self.native_depth -= 1;
-    };
+    }
     return vm_builtins.applyBuiltin(self, builtin_id, args);
 }
 
@@ -181,7 +180,7 @@ const AttrCacheSlot = struct {
 
 threadlocal var attr_cache: [attr_cache_size]AttrCacheSlot = @splat(.{});
 
-/// GC (`-Dgc`): the attr cache holds attr Values keyed by heap token. Its
+/// GC: the attr cache holds attr Values keyed by heap token. Its
 /// entries can be the momentary sole reference to a shared attr value, so
 /// valid entries (token match) are roots. Thread-local (per worker), so each
 /// worker publishes its cache address into a registry the stop-the-world
@@ -191,18 +190,15 @@ var attr_cache_registry: [GC_MAX_WORKERS]?*[attr_cache_size]AttrCacheSlot = @spl
 
 /// Called by each worker (on its own thread) before it can allocate.
 pub fn gcRegisterAttrCache(worker_id: u8) void {
-    if (comptime !gc.enabled) return;
     attr_cache_registry[worker_id] = &attr_cache;
 }
 
 pub fn gcUnregisterAttrCache(worker_id: u8) void {
-    if (comptime !gc.enabled) return;
     attr_cache_registry[worker_id] = null;
 }
 
 /// Mark every registered worker's live attr-cache entries. STW-only.
 pub fn gcMarkAttrCache(tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
-    if (comptime !gc.enabled) return;
     for (attr_cache_registry) |maybe| {
         const cache = maybe orelse continue;
         for (cache) |*slot| {

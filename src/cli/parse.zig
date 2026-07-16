@@ -78,7 +78,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     // exactly as `fix eval` would report them. `source_path = null` forces
     // eager, whole-expression compilation (no lazy body deferral), so an
     // unbound variable in any position is caught, matching `bindVars`.
-    setup.applyMemoryBacking(null, init);
+    setup.applyMemoryBacking(null);
     var ev = try Evaluator.init(allocator, 1);
     defer ev.deinit();
     _ = setup.configure(&ev, init, options) catch |err| {

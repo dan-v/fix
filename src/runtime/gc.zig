@@ -1,5 +1,4 @@
-//! Garbage collector (gated behind `-Dgc`, off by default; zero cost in
-//! normal builds). Non-moving, stop-the-world mark-sweep — see
+//! Garbage collector. Non-moving, stop-the-world mark-sweep — see
 //! docs/plans/gc-plan.md for the architecture (and why moving / refcounting are
 //! ruled out, and why the end goal is concurrent SATB).
 //!
@@ -17,7 +16,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const containers = @import("base");
 const heap_mod = @import("heap.zig");
 const value_mod = @import("value.zig");
@@ -28,8 +26,6 @@ const ObjectHeap = heap_mod.ObjectHeap;
 const Value = value_mod.Value;
 const ObjectId = types.ObjectId;
 const FutureState = thunk_mod.FutureState;
-
-pub const enabled: bool = build_options.gc;
 
 /// A `attrs_merge` whose `flattened` memo equals this has no flattened
 /// object to follow. Single source of truth in `heap.zig`.
@@ -432,7 +428,6 @@ pub const Tracer = struct {
         }
         return list.toOwnedSlice(allocator);
     }
-
 };
 
 /// Serial-mark sink (`--workers=1`): the `scanObject` counterpart of `Marker`.
@@ -583,7 +578,6 @@ pub const Breakdown = struct {
 var last_breakdown: Breakdown = std.mem.zeroes(Breakdown);
 
 pub fn recordTiming(mark_ns: u64, sweep_ns: u64) void {
-    if (comptime !enabled) return;
     mark_ns_total += mark_ns;
     sweep_ns_total += sweep_ns;
 }
@@ -598,7 +592,6 @@ var drain_ns_total: u64 = 0;
 var remset_sources_total: u64 = 0;
 
 pub fn recordMarkPhases(reset_ns: u64, roots_ns: u64, remset_ns: u64, drain_ns: u64, remset_sources: u64) void {
-    if (comptime !enabled) return;
     reset_ns_total += reset_ns;
     roots_ns_total += roots_ns;
     remset_ns_total += remset_ns;
@@ -608,19 +601,16 @@ pub fn recordMarkPhases(reset_ns: u64, roots_ns: u64, remset_ns: u64, drain_ns: 
 
 /// Record barrier wall time (time-to-safepoint + release) for one collection.
 pub fn recordBarrier(ns: u64) void {
-    if (comptime !enabled) return;
     barrier_ns_total += ns;
 }
 
 pub fn recordBreakdown(b: Breakdown) void {
-    if (comptime !enabled) return;
     last_breakdown = b;
 }
 
 /// Record one completed collection: objects freed, surviving live bytes,
 /// and total reserved bytes (the committed-RSS high-water for this cycle).
 pub fn recordCollection(objects_freed: u64, live_bytes: u64, total_after: u64) void {
-    if (comptime !enabled) return;
     collections += 1;
     objects_freed_total += objects_freed;
     last_live_bytes = live_bytes;
@@ -646,7 +636,6 @@ pub fn liveReport() LiveReport {
 }
 
 pub fn recordFinalTotal(total: u64) void {
-    if (comptime !enabled) return;
     final_total_bytes = total;
     if (total > peak_total_bytes) peak_total_bytes = total;
 }
@@ -715,11 +704,10 @@ pub fn currentRssBytes() u64 {
 }
 
 pub fn report() void {
-    if (comptime !enabled) return;
     // Diagnostic stderr during `zig build test --listen=-` corrupts the
     // runner. Stay silent under the test runner.
     if (builtin.is_test) return;
-    std.debug.print("\n=== GC (-Dgc, stop-the-world mark-sweep; parallel mark at --workers>1) ===\n", .{});
+    std.debug.print("\n=== GC (stop-the-world mark-sweep; parallel mark at --workers>1) ===\n", .{});
     std.debug.print("memory budget (reserved-bytes ceiling): {d:.1} MB\n", .{mb(heap_mod.ObjectHeap.gc_budget_bytes)});
     std.debug.print("collections: {d}\n", .{collections});
     std.debug.print("objects freed (total): {d}\n", .{objects_freed_total});
@@ -753,7 +741,6 @@ pub fn report() void {
 }
 
 test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses them" {
-    if (comptime !enabled) return; // reclaim machinery is `-Dgc`-gated
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
@@ -903,8 +890,6 @@ test "tracer: parallel mark reaches exactly the live set (K markers, stealing)" 
 }
 
 test "gc stat recorders accumulate observable deltas" {
-    if (comptime !enabled) return; // recorders are no-ops without -Dgc
-
     const timing_before = mark_ns_total;
     const sweep_before = sweep_ns_total;
     recordTiming(100, 50);

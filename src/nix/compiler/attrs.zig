@@ -205,7 +205,7 @@ fn appendWithSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)) !b
 }
 
 /// A value body is deferrable iff it is NOT an immediate/trivial shape —
-/// i.e. iff it would otherwise go through `compileThunkEager`. Deferring
+/// i.e. iff it would otherwise go through the ordinary thunk compiler. Deferring
 /// exactly replaces that thunk, so output stays byte-identical. (The
 /// immediate set mirrors `access.compileImmediateContainerValue`.)
 ///

@@ -92,7 +92,7 @@ fn elideTrivialChild(self: *Compiler, child: *Compiler, ch: *const chunk.Chunk) 
 }
 
 pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
-    return compileThunkEager(self, expr, false);
+    return compileThunkContext(self, expr);
 }
 
 /// Compile a list element into a genuine, unforced, lazy thunk — never
@@ -127,12 +127,10 @@ pub fn compileListElementThunk(self: *Compiler, expr: *const Node) !void {
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
 
-/// Same as `compileThunk`, but emits the eager-spawn variant if
-/// `eager` is true — the resulting thunk gets submitted to the
-/// scheduler's urgent queue at creation. Called from let-binding
-/// compile when strictness analysis on the let-body confirms the
-/// binding will be forced.
-pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void {
+/// Shared thunk compiler for ordinary expressions and strictness-informed
+/// container bindings. Strictness may still inline safe immediate values, but
+/// every materialized thunk remains lazy.
+pub fn compileThunkContext(self: *Compiler, expr: *const Node) !void {
     self.armNodeTagName(expr);
     var child_builder = try self.acquireBuilder();
     defer self.releaseBuilder(&child_builder);
@@ -158,11 +156,7 @@ pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void 
         return;
     }
     const child_id = try child.registerChunk(child_chunk);
-    if (eager) {
-        try emit.emitEagerThunkWithCaptures(self, child_id, child.captures.items);
-    } else {
-        try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
-    }
+    try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
 
 /// Compile a function argument as a runtime-adaptive `thunk_arg` (the

@@ -66,7 +66,7 @@ fn classOf(len: usize) ?usize {
 }
 
 /// Bytes currently parked on the free stacks, across instances (in
-/// practice there is one, created in main). Read by `FIX_MEM_REPORT` to
+/// practice there is one, created in main). Read by `--mem-report` to
 /// split "retained by the cache" from "in use by a live allocation"
 /// inside the `fix:bigblock` smaps bucket.
 pub var retained_bytes: std.atomic.Value(usize) = .init(0);
@@ -86,7 +86,7 @@ pub fn trimGlobal() void {
 
 /// The reuse cache is generic over an instantiated `Vma` region-tracker
 /// (see runtime/vma.zig): it registers/retags/unregisters its backing
-/// mappings through `Vma.*` so `FIX_MEM_REPORT` can attribute them, but
+/// mappings through `Vma.*` so `--mem-report` can attribute them, but
 /// carries no knowledge of the app's tag taxonomy itself. Instantiate with
 /// the shared `mem_tag.vma`.
 pub fn BlockCacheAllocator(comptime Vma: type) type {

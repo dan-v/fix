@@ -12,7 +12,6 @@ Neither changes results. Both are pure earliness: the [claim/waiter protocol](..
 |---|---|---|
 | **Speculation** | creating a thunk whose body is *substantial* | submit the body-force to the speculation [queue](scheduler.md); continue with a lazy thunk |
 | **Fan-out (consumer)** | strict-forcing a list/attrset | submit batched range tasks so its elements resolve in parallel |
-| **Fan-out (producer)** | creating a binding the body provably forces | submit its force urgently at creation time |
 | **Sibling prefetch** | a demand attr lookup missing on an unresolved member of a mid-sized attrset | sweep the whole attrset's still-unresolved members |
 
 ---
@@ -41,10 +40,7 @@ Strict-forcing a **list or attrset** with ≥ `fan_out_min_items` = **4** elemen
 
 Helpers running these urgent tasks **fan out recursively** — forcing a list of imported modules fans out to each module, which fans out to its contents. The cascade is bounded by the urgent-[queue](scheduler.md) cap (`urgent_queue_capacity` = 4096 per worker; a rejected push falls back to serial forcing) and by the finite structure sizes.
 
-When `FIX_WORK_FIRST` is set, the same accelerate sites instead expose the tail of each range as a single stealable **work-first continuation** on the per-worker [cont deque](scheduler.md) and descend the head inline — idle peers steal and re-split the tail. Unstolen it degrades to an inline recursive walk; the caller's own strict loop stays the authoritative demand walk, so a stranded or stolen continuation never loses work and the result is byte-identical. This lane defaults off.
-
-### Producer strict-eager
-Not a guess: [strictness analysis](../compiler/strictness.md) proves which bindings a chunk's body **must force**, and the compiler emits `thunk_eag` for them. `makeBytecodeThunkFromCapturesEager` submits that thunk's force **urgently at creation time** so its production overlaps whatever the body does next. This eager *submit* is gated by `!in_speculation` (a helper already running spec work does not fan out further) and by `eager_submit_enabled`; `FIX_NO_EAGER=1` clears that flag and disables it. Saturated uncurried calls get related treatment through the chunk's `strict_params` mask (`forceStrictArgs`), which forces the must-force argument positions to WHNF **in place** on the stack before the body runs — a plain demand force (`forceValue`), not a scheduler submit, so it is neither `in_speculation`-gated nor governed by `FIX_NO_EAGER`. Both touch only WHNF (**shallow**): the strictness proof guarantees the body forces these anyway, so doing it first is value-preserving.
+Saturated uncurried calls also use the chunk's strictness-derived `strict_params` mask (`forceStrictArgs`) to force must-force argument positions to WHNF in place on the stack. This is ordinary demand evaluation, not a scheduler submission.
 
 ### Sibling prefetch
 On a **demand** fiber's inline-cache miss that lands on a still-unresolved thunk member of a plain attrset whose entry count is in `[sibling_min, sibling_max)` = **[16, 64)**, `maybeSiblingSweep` submits one `force_attrs_sweep` task for the whole set (`FIX_SIBLING`, on by default at `2..16` workers; past 16 the urgent-priority sweeps fanned across that many helpers measured as a net loss at w=32, so it defaults off there). Reading one member of such a set strongly predicts reading its siblings; the size gate excludes big pkgs-like sets, where sweeping would evaluate all of nixpkgs. The sweep is deduped once-per-set, submitted urgently by default (`FIX_SIBLING_URGENT`), and each swept member runs under bounded per-member claim/creation budgets so a mispredicted member's cascade is abandoned rather than run to completion.
@@ -76,7 +72,7 @@ specBailRequested(vm)  ==  vm.in_speculation and
 `SpeculativeBail` is a **transient** error: it resets the thunk to unresolved so it is simply recomputed if *real* demand ever arrives (never cached as a sticky error). Nothing observable is lost. Long-running builtins poll too: `genList` calls `specBailRequested` every 8192 iterations.
 
 ### Per-task creation budgets
-`specBailRequested` also fires when a spec task exceeds a **thunk-creation budget** — `FIX_SPEC_CREATE_BUDGET` for spec/novel `force_thunk` tasks, and the sibling sweep's per-member claim/creation budgets. A wrong creation-time guess's cascade is abandoned once it has created its budget of new thunks (the junk-*volume* pathology at high worker counts), while urgent, demand-adjacent tasks stay unbounded. Bailing here is likewise a transient reset — resolved sub-thunks are kept.
+`specBailRequested` also fires when an untrusted-band spec task exceeds its creation budget (`FIX_SPEC_BAND_BUDGET`), or a sibling sweep exceeds its per-member claim/creation budgets. A wrong guess's cascade is abandoned once it reaches its budget, while urgent, demand-adjacent tasks stay unbounded. Bailing here is likewise a transient reset — resolved sub-thunks are kept.
 
 ### Why byte-identity is free here
 Bail fires **only after** the demanded result already exists (or a bounded budget is blown) — so whatever a bailed speculation would have produced is either already computed or genuinely undemanded. The `.drv` is byte-identical regardless of how aggressively we bail. **There is no correctness knob to tune.**

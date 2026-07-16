@@ -41,20 +41,13 @@ pub const Terminal = struct {
 
 /// Resolve process-level memory-backing policy that must be decided BEFORE
 /// `Evaluator.init` maps the heap (the flat object store picks its mapping
-/// at init): hugetlb mode, precedence `--hugetlb` (`cli_mode`, null for
-/// subcommands without the shared parser) > `FIX_HUGETLB` env > `auto`.
+/// at init): `--hugetlb` (`cli_mode`, null for subcommands without the shared
+/// parser), defaulting to `auto`.
 /// Deliberately NOT a nix.conf setting: config loads in `configure`, after
 /// the heap already exists, so a config-sourced value could only half-apply.
 /// Call before `Evaluator.init` in every eval-producing subcommand.
-pub fn applyMemoryBacking(cli_mode: ?hugetlb.Mode, init: std.process.Init) void {
-    const mode = cli_mode orelse blk: {
-        if (init.environ_map.get("FIX_HUGETLB")) |v| {
-            if (hugetlb.parseMode(v)) |m| break :blk m;
-            std.debug.print("fix: warning: ignoring invalid FIX_HUGETLB value '{s}' (expected auto, on, or off)\n", .{v});
-        }
-        break :blk .auto;
-    };
-    hugetlb.setMode(mode);
+pub fn applyMemoryBacking(cli_mode: ?hugetlb.Mode) void {
+    hugetlb.setMode(cli_mode orelse .auto);
 }
 
 /// Apply the shared `Options → Evaluator` configuration (feature toggles,
@@ -67,6 +60,8 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.max_memory_bytes = options.max_memory;
+    ev.mem_report_mode = options.mem_report;
+    ev.gc_report_on = options.gc_report;
     ev.setEnvironment(init.environ_map);
 
     // Experimental features and the concurrent-fetch cap both come from

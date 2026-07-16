@@ -44,13 +44,6 @@ comptime {
     }
 }
 
-/// Sentinel-fill the stack at init so `maxStackUsedBytes` can find the
-/// deepest byte the fiber ever touched. Off by default: the fill forces
-/// the OS to commit every page eagerly, which defeats the lazy-commit
-/// model `init` relies on. Turn on with `-Dfiber-stack-probe` when you
-/// want to size stacks against a representative workload.
-pub const stack_probe_enabled: bool = base_options.fiber_stack_probe;
-
 /// Fiber cost census (piggybacks on `-Dprof-main`): rdtsc bracketing of
 /// the swap-in (dispatcher → fiber body) and swap-out (fiber body →
 /// dispatcher) paths, threadlocal so the accumulation itself is free of
@@ -255,27 +248,6 @@ pub const Fiber = struct {
     /// costs virtual address space × peak fiber count, not memory.
     pub const min_stack_bytes: usize = 16 * 1024 * 1024;
 
-    /// Sentinel byte pattern written to a freshly-allocated stack when
-    /// `-Dfiber-stack-probe` is on so `maxStackUsedBytes` can find the
-    /// deepest byte the fiber ever touched. 0xAA chosen because it's
-    /// distinctive in hex dumps and doesn't match common ASCII or
-    /// zero-initialised data.
-    pub const stack_sentinel: u8 = 0xAA;
-
-    /// Scan the stack for the first non-sentinel byte starting from the
-    /// low (deep) end. Returns the number of bytes between that byte and
-    /// the high (top) end — the high-water mark across every task the
-    /// fiber has run on this stack. Returns 0 unless built with
-    /// `-Dfiber-stack-probe` (without the sentinel-fill, "non-zero" is
-    /// not a reliable signal that the byte was touched by the fiber).
-    pub fn maxStackUsedBytes(self: *const Fiber) usize {
-        if (comptime !stack_probe_enabled) return 0;
-        for (self.stack, 0..) |b, i| {
-            if (b != stack_sentinel) return self.stack.len - i;
-        }
-        return 0;
-    }
-
     /// Allocate a fiber with its own stack and prepare it to invoke
     /// `entry(arg)` on first resume.
     ///
@@ -303,12 +275,6 @@ pub const Fiber = struct {
         // numerous big mappings) is done by the *owner* that creates/destroys
         // fibers — see src/vm/worker.zig — not here, so the fiber primitive
         // stays free of the app's tag taxonomy.
-        if (comptime stack_probe_enabled) {
-            // Probe mode: pay the eager-commit cost so the watermark
-            // scan in `maxStackUsedBytes` can identify untouched pages.
-            @memset(stack, stack_sentinel);
-        }
-
         var fiber: Fiber = .{
             .ctx = .{},
             .stack = stack,
@@ -350,9 +316,6 @@ pub const Fiber = struct {
         // MADV_FREE / MADV_DONTNEED are available on Linux and Darwin; a
         // no-op on any other OS.
         if (comptime builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return;
-        // The stack-probe watermark scan reads the whole stack; reclaimed
-        // pages would zero the sentinel pattern and skew it.
-        if (comptime stack_probe_enabled) return;
         const page = std.heap.pageSize();
         const keep = std.mem.alignForward(usize, retain_top, page);
         if (self.stack.len <= keep) return;

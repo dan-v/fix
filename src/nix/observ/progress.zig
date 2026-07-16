@@ -26,7 +26,7 @@ pub const Step = struct {
 /// bag of numbers with no formatting knowledge — the producer (a worker-0
 /// safepoint sampler, reusing the same reads that feed the `--timeline`
 /// counter tracks) fills it, and the CLI decides how to render it. GC
-/// fields are 0 in a non-`-Dgc` build (and until the first collection).
+/// fields are 0 until the first collection.
 pub const Metrics = struct {
     // Heap object stores (live slot counts + committed bytes).
     objects: u64 = 0,
@@ -44,7 +44,7 @@ pub const Metrics = struct {
     steals: u64 = 0,
     spec_submitted: u64 = 0,
     spec_rejected: u64 = 0,
-    // Collector (`-Dgc`).
+    // Collector.
     gc_collections: u64 = 0,
     gc_live_bytes: u64 = 0,
     gc_freed_objects: u64 = 0,

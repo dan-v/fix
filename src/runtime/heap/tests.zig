@@ -207,9 +207,6 @@ test "object heap supports a single-entry attrs object" {
 }
 
 test "object heap sweep frees unmarked objects and lets ids be reused" {
-    const build_options = @import("build_options");
-    if (comptime !build_options.gc) return; // sweep only reclaims under -Dgc
-
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();
     heap_mod.heap_gc.enableCollect(&heap, 64 << 20, 0);
@@ -246,4 +243,3 @@ test "object heap sweep frees unmarked objects and lets ids be reused" {
     try std.testing.expectEqual(@as(usize, 1), reused_entries.len);
     try std.testing.expectEqual(@as(i64, 7), (try heap.getAttrValue(reused_attrs, 1)).asInt());
 }
-

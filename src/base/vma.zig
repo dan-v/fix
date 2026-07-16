@@ -1,7 +1,7 @@
 //! Big-mapping registry: RSS attribution for the process's large
 //! anonymous regions (store segments, fiber stacks, block-cache blocks).
 //!
-//! `FIX_MEM_REPORT`'s slot-count table can't see segment-capacity slack,
+//! `--mem-report`'s slot-count table can't see segment-capacity slack,
 //! pre-touch-ahead pages, fiber stacks, or allocator blocks — the
 //! "unaccounted" RSS. Every large mapping registers here at its true
 //! mmap boundary (and re-tags when a subsystem claims it), so the report
@@ -13,7 +13,7 @@
 //!     tags the VMA in /proc/self/smaps for external profilers. Silently
 //!     unavailable on kernels without the config (EINVAL) — best-effort.
 //!   - The in-process table + `mincore`: works everywhere, powers the
-//!     `FIX_MEM_REPORT` decomposition.
+//!     `--mem-report` decomposition.
 //!
 //! Cost: one prctl + one O(1) hash insert per *backing* mmap (block-cache
 //! reuse hits skip it), zero on the hot allocation path.
@@ -185,7 +185,7 @@ pub fn Vma(
         }
 
         /// Debug: print every registered region (addr, len, tag, resident MB).
-        /// Used by `FIX_MEM_REPORT=dump` to cross-check attribution against
+        /// Used by `--mem-report=dump` to cross-check attribution against
         /// /proc/self/maps when a subsystem's numbers look off.
         pub fn dumpRegions() void {
             mu.lock();

@@ -46,8 +46,6 @@ Each fiber reserves an **8 MiB** anonymous mapping (`mmap` with `PROT_READ|PROT_
 
 `releaseStackPages(retain_top, lazy)` gives a dead fiber's stack pages back to the OS — `MADV_FREE` (reclaimed only under pressure) or `MADV_DONTNEED` (immediate). It is only ever called on a `.finished`/`.ready` fiber, whose frames are garbage by definition: a later re-fault reading zeros is indistinguishable from a fresh stack (`reset` reseeds the trampoline address into the context, and running code always writes a frame before reading it). The [worker](workers.md) uses this to trim spike-overflow fibers when it parks.
 
-Sentinel-fill high-water tracking (`maxStackUsedBytes`) exists under `-Dfiber-stack-probe`; off by default because the fill forces eager commit and defeats lazy paging.
-
 ## Lifecycle
 
 ```

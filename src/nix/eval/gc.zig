@@ -1,4 +1,4 @@
-//! GC (`-Dgc`) collector glue for the Evaluator: VM-root registration and
+//! GC collector glue for the Evaluator: VM-root registration and
 //! the stop-the-world minor-collect driver (mark roots, drive the parallel
 //! evac, record stats). These are the Evaluator-side halves of the copying
 //! nursery; the heap-side machinery lives in `runtime/heap` and the marking
@@ -11,8 +11,6 @@
 //! `setGcHook`/`gcSetMarkHook` registration; they delegate to `collect` and
 //! `helpMark` here.
 //!
-//! Guarded by `if (comptime !gc.enabled) return;` / `comptime gc.enabled`
-//! so the whole cluster compiles to nothing in a default (non-`-Dgc`) build.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -30,20 +28,18 @@ const timeline = @import("../probe.zig").timeline;
 /// throttled (contention-bound past ~8). Set from `FIX_GC_PAR_CAP`.
 pub var gc_par_cap: u32 = 8;
 
-/// GC (`-Dgc`): register a stack-local VM (the top-level entry's VM, a
+/// GC: register a stack-local VM (the top-level entry's VM, a
 /// nested-eval VM, or an import VM) so the collector scans its roots.
 /// These VMs are NOT in any worker's `fibers` list, so without this their
 /// operand stack / frames / force-chain / temp-roots are invisible and
 /// their live objects get swept. Concurrent imports at --workers>1
 /// interleave, hence the mutex + remove-by-value.
 pub fn registerVm(ev: anytype, vm: anytype) void {
-    if (comptime !gc.enabled) return;
     ev.gc_import_vms_mu.lock();
     defer ev.gc_import_vms_mu.unlock();
     ev.gc_import_vms.append(ev.allocator, vm) catch {};
 }
 pub fn unregisterVm(ev: anytype, vm: anytype) void {
-    if (comptime !gc.enabled) return;
     ev.gc_import_vms_mu.lock();
     defer ev.gc_import_vms_mu.unlock();
     for (ev.gc_import_vms.items, 0..) |ivm, i| {
@@ -76,12 +72,11 @@ pub fn helpMark(ev: anytype, worker_id: u8) void {
         heap_gc.evacClaimLoop(&ev.heap, ev.gc_tracer.mark_bits);
 }
 
-/// GC (`-Dgc`): one stop-the-world mark-sweep at a safepoint. Mark the
+/// GC: one stop-the-world mark-sweep at a safepoint. Mark the
 /// live graph from roots, sweep dead objects/ranges into the free
 /// lists, set the next threshold from the surviving live set. Runs on
 /// the lone mutator at --workers=1; see docs/plans/gc-plan.md for the roots.
 pub fn collect(ev: anytype, collector_id: u8) void {
-    if (comptime !gc.enabled) return;
     // Lazy policy (`enableBudget`): the first threshold (budget/2) crossing
     // arms tracking instead of collecting — everything allocated so far
     // becomes untracked/old, and the real collections start at the budget.
@@ -205,14 +200,13 @@ pub fn collect(ev: anytype, collector_id: u8) void {
     });
 }
 
-/// GC (`-Dgc`): one stop-the-world MAJOR (full) collection at a safepoint.
+/// GC: one stop-the-world MAJOR (full) collection at a safepoint.
 /// Unlike `collect` (the young-gated minor), this marks the whole reachable
 /// graph from roots and sweeps EVERY unmarked object — reclaiming the tenured
 /// old-generation garbage a minor can't. Serial mark+sweep; gated to
 /// `--workers=1` by the caller (see `collect` — the w>1 full mark has an
 /// unresolved missing-root bug).
 pub fn collectMajor(ev: anytype, collector_id: u8) void {
-    if (comptime !gc.enabled) return;
     _ = collector_id; // marker slot grabbed dynamically, like the minor
     // Same lazy-arm as the minor: the first crossing arms tracking (everything
     // so far becomes untracked/old) rather than collecting.
@@ -304,7 +298,7 @@ pub const GC_LINE_DEN: u64 = 2; // half of RAM
 pub const GC_LINE_FLOOR: u64 = 256 << 20; // 256 MB — below this, don't bother
 pub const GC_LINE_CEILING: u64 = 8 << 30; // 8 GB — cap absolute garbage on big boxes
 
-/// Parse a `--max-memory` / `FIX_MAX_MEMORY` size: a decimal integer with an
+/// Parse a `--max-memory` size: a decimal integer with an
 /// optional k/m/g (KiB/MiB/GiB) suffix; a bare integer is MiB. Returns bytes,
 /// or null if malformed.
 pub fn parseMemorySize(text: []const u8) ?u64 {
@@ -330,13 +324,12 @@ pub fn parseMemorySize(text: []const u8) ?u64 {
     return n *| mult;
 }
 
-/// Resolve the collection line: `--max-memory` if given, else `FIX_MAX_MEMORY`,
-/// else the automatic `clamp(fraction × MemTotal, floor, ceiling)`. An explicit
+/// Resolve the collection line: `--max-memory` if given, else the automatic
+/// `clamp(fraction × MemTotal, floor, ceiling)`. An explicit
 /// value is taken verbatim (including `0` = never collect) — a hard override of
 /// the auto policy; the auto path never returns `0`.
 pub fn memoryBudget(ev: anytype) u64 {
     if (ev.max_memory_bytes) |b| return b;
-    if (envSize(ev, "FIX_MAX_MEMORY")) |b| return b;
     return autoCollectLine(ev);
 }
 
@@ -344,13 +337,12 @@ pub fn memoryBudget(ev: anytype) u64 {
 /// ARM (cross budget/2 during a real eval)? Only then does the pre-arming
 /// reclaim matter — and only then is it worth keeping the transient-root gates
 /// live from eval start (~1.9%, `heap.gc_root_active`) to make that reclaim
-/// sound. True iff an explicit `--max-memory`/`FIX_MAX_MEMORY` was given (the
+/// sound. True iff an explicit `--max-memory` was given (the
 /// user opted into a limit), OR the auto line came in below the default ceiling
 /// (a RAM-limited box). A roomy auto machine (line clamped to the ceiling) never
 /// arms → stays exactly zero-cost with the reclaim off (moot there anyway).
 pub fn constrainedMode(ev: anytype, budget: u64) bool {
-    if (comptime !gc.enabled) return false;
-    const explicit = ev.max_memory_bytes != null or envSize(ev, "FIX_MAX_MEMORY") != null;
+    const explicit = ev.max_memory_bytes != null;
     const ceiling = envSize(ev, "FIX_GC_CEILING") orelse GC_LINE_CEILING;
     return constrainedFor(budget, explicit, ceiling);
 }
@@ -542,7 +534,6 @@ pub fn markRoots(ev: anytype, tr: *gc.Tracer) void {
 }
 
 pub fn markVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: anytype) void {
-    if (comptime !gc.enabled) return;
     tr.markValue(heap, vm.builtins);
     tr.markValue(heap, vm.gc_extra_root); // value in-flight at the safepoint
     for (vm.gc_force_chain.items) |id| tr.markObject(heap, id); // in-flight force chain

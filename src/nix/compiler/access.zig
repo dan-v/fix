@@ -262,7 +262,7 @@ pub fn compileContainerValue(self: *Compiler, node: *const Node, options: Contai
     // literal) can't leak the name onto a later sibling or the enclosing body.
     defer self.name_hint = null;
     if (try compileImmediateContainerValue(self, node, options)) return;
-    try thunks.compileThunkEager(self, node, options.eager);
+    try thunks.compileThunkContext(self, node);
 }
 
 /// Predicate version of `compileImmediateContainerValue` for the

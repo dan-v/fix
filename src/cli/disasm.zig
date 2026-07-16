@@ -51,8 +51,8 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     const worker_count: u8 = if (options.disasm_eval) 1 else try setup.workerCount(options);
 
     // Resolve heap backing before the evaluator maps its stores
-    // (`--hugetlb` > `FIX_HUGETLB` > auto).
-    setup.applyMemoryBacking(options.hugetlb, init);
+    // (`--hugetlb`, otherwise auto).
+    setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     // Configure features (pipe-operators/flakes), base path, and NIX_PATH so the

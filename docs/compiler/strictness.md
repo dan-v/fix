@@ -46,7 +46,7 @@ Notes:
 
 ## Products & consumers
 
-A single analyzer walk produces all three sets together; the compiler drives it from three entry points (`analyzeChunkBody`, `analyzeLetBindings`, `bodyMustForceName`) feeding four consumers:
+A single analyzer walk produces all three sets together; the compiler drives it from three entry points (`analyzeChunkBody`, `analyzeLetBindings`, `bodyMustForceName`) feeding three consumers:
 
 **1. Per-chunk upvalue masks (`stampOnBuilder`).** At the end of compiling a chunk body, the `shallow` and `deep` name-sets are lowered against the chunk's capture list into `ChunkStrictness`:
 
@@ -59,11 +59,9 @@ ChunkStrictness {
 
 Bit `i` corresponds to the chunk-relative [upvalue index](scopes.md) `i`. **Chunks with more than 64 upvalue slots degrade coverage** — slots ≥ 64 are dropped from the masks (still safe: a missed bit only loses information, never forces anything wrongly). These masks are stamped onto `SchedulingHints.strictness` and read by the [disassembler](../vm/dispatch.md) and by the chunk-registry statistics (`speculatable_with_strictness`, surfaced in `fix inspect`) — they are informational, not consulted on the force path.
 
-**2. Eager `let`-binding submission (`analyzeLetBindings`).** For a `let`, the same walk over the body yields, per binding, its `shallow` (may) and `shallow_must` (must) membership. A binding the body **may-forces** is emitted as a `thunk_eag` thunk — at creation the runtime calls `scheduler.submitUrgent(.force_thunk)`, so a helper races it ahead of demand instead of waiting for the `body_is_substantial` size heuristic, and it bypasses the speculation backlog cap. The submit is skipped when the creating worker is itself running speculatively (`in_speculation`) or when `FIX_NO_EAGER` clears `eager_submit_enabled`. See [lazy-compile.md](lazy-compile.md) and [parallel/speculation.md](../parallel/speculation.md).
+**2. Eager `let`-binding elision (`analyzeLetBindings` + `firstForcedName`).** A binding the body **must-forces**, that is non-recursive and forward-reference-free, is compiled straight into its slot with **no thunk at all**. Restricted to the single binding the body demands *first* (`firstForcedName`) so eager order equals lazy order and no error is reordered.
 
-**3. Eager `let`-binding elision (`analyzeLetBindings` + `firstForcedName`).** A binding the body **must-forces**, that is non-recursive and forward-reference-free, is compiled straight into its slot with **no thunk at all**. Restricted to the single binding the body demands *first* (`firstForcedName`) so eager order equals lazy order and no error is reordered.
-
-**4. Per-parameter strictness (`bodyMustForceName` / `forwardingUpvalue`).** A single-parameter lambda whose body must-forces its parameter (`bodyMustForceName`) sets `SchedulingHints.strict_param` — a caller holding the closure passes its argument eagerly. Only when that fails, a structural check (`forwardingUpvalue`) matches the forwarder shape `x: f x` and records `f`'s upvalue index in `strict_via_upvalue`, so the lambda forces its parameter iff `f` does. An uncurried (arity > 1) lambda instead records a per-parameter `strict_params` bitmask (bit *i* = param *i* must-forced), which the saturated [`call_n`](pipeline.md) path (`vm/closures.zig forceStrictArgs`) forces eagerly in place. A directly-applied strict lambda `(x: body) arg` (`directlyAppliedStrictLambda`, also `bodyMustForceName`) likewise lets the caller pass `arg` eagerly instead of thunking it. `strict_param` and `strict_via_upvalue` are gated to `local_count == 1` at `ChunkBuilder.finish`.
+**3. Per-parameter strictness (`bodyMustForceName` / `forwardingUpvalue`).** A single-parameter lambda whose body must-forces its parameter (`bodyMustForceName`) sets `SchedulingHints.strict_param` — a caller holding the closure passes its argument eagerly. Only when that fails, a structural check (`forwardingUpvalue`) matches the forwarder shape `x: f x` and records `f`'s upvalue index in `strict_via_upvalue`, so the lambda forces its parameter iff `f` does. An uncurried (arity > 1) lambda instead records a per-parameter `strict_params` bitmask (bit *i* = param *i* must-forced), which the saturated [`call_n`](pipeline.md) path (`vm/closures.zig forceStrictArgs`) forces eagerly in place. A directly-applied strict lambda `(x: body) arg` (`directlyAppliedStrictLambda`, also `bodyMustForceName`) likewise lets the caller pass `arg` eagerly instead of thunking it. `strict_param` and `strict_via_upvalue` are gated to `local_count == 1` at `ChunkBuilder.finish`.
 
 The **zero-capture case is elided**: `stampOnBuilder` returns early for a capture-free body, since its mask would be all-zero anyway — the whole analysis walk is skipped, byte-identically.
 
@@ -74,7 +72,7 @@ The **zero-capture case is elided**: `stampOnBuilder` returns early for a captur
 - **> 64 upvalue slots degrade, never break.** Dropping high slots loses information, not correctness.
 - **Hint- and reorder-only.** Strictness influences *when* and *how urgently* a value is computed (and lets already-inevitable forces happen without a thunk) — never *whether* a value is computed or *what* it is. Removing all strictness signals leaves output byte-identical (modulo which error surfaces first in a failing eval).
 
-Out of scope: how the scheduler acts on eager submissions (urgency, fan-out interaction) → [parallel/speculation.md](../parallel/speculation.md); thunk representation → [runtime/thunks.md](../runtime/thunks.md); the stamp site in the pipeline → [pipeline.md](pipeline.md).
+Out of scope: scheduler speculation and fan-out → [parallel/speculation.md](../parallel/speculation.md); thunk representation → [runtime/thunks.md](../runtime/thunks.md); the stamp site in the pipeline → [pipeline.md](pipeline.md).
 
 Code: `src/nix/compiler/strictness.zig`
 </content>

@@ -45,7 +45,6 @@ const trace_log = @import("trace_log.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
-const opcode_profile_enabled = vm_mod.opcode_profile_enabled;
 const readU16 = vm_mod.readU16;
 const readU32 = vm_mod.readU32;
 
@@ -95,7 +94,6 @@ inline fn dispatch(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dep
         debug.checkFrameSync(vm, frame, code, "dispatch");
     }
     const op: OpCode = @enumFromInt(code[ip]);
-    if (comptime opcode_profile_enabled) vm.opcode_counts[@intFromEnum(op)] += 1;
     if (comptime trace_log.enabled) {
         trace_log.op(vm.vm_trace, vm.workerId(), vm.frames_len, frame.chunk_id, @intCast(ip), op, vm.sp);
     }
@@ -239,7 +237,7 @@ fn opAddInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usi
         // getAttrValue on a `__toString`/`outPath` attrset — GC safepoints)
         // while the other operand is held only in a Zig local. Keep both on
         // the operand stack across the concat so they stay precise roots;
-        // drop only after. Compiles away without -Dgc.
+        // drop only after.
         const result = if (a.isPath())
             try strings.concatPathLike(vm, a, b)
         else
@@ -629,8 +627,6 @@ const CapCfg = struct {
     kind: enum { thunk, closure, arg },
     /// Wide (u32) vs narrow (u16) chunk id.
     wide: bool,
-    /// Thunk only: submit to the urgent queue at creation.
-    eager: bool = false,
     /// Fused thunk+store (`_st`): bind the new thunk into a slot directly
     /// (`local`) or through the slot's cell (`cell`). Thunk-only.
     store: ?enum { local, cell } = null,
@@ -648,10 +644,7 @@ fn capOp(comptime cfg: CapCfg) fn (*VM, *Frame, []const u8, usize, usize) anyerr
             if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
             const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
             switch (cfg.kind) {
-                .thunk => if (cfg.eager)
-                    try closures.makeBytecodeThunkFromCapturesEager(vm, ch_id, descriptors, frame)
-                else
-                    try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame),
+                .thunk => try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame),
                 .closure => try closures.makeClosureFromCaptures(vm, ch_id, descriptors, frame),
                 .arg => {
                     // The callee sits just below the arg slot; if it forces its
@@ -1133,16 +1126,10 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .thunk_arg => capOp(.{ .kind = .arg, .wide = true }),
         .thunk => capOp(.{ .kind = .thunk, .wide = false }),
         .thunk_w => capOp(.{ .kind = .thunk, .wide = true }),
-        .thunk_eag => capOp(.{ .kind = .thunk, .wide = false, .eager = true }),
-        .thunk_eag_w => capOp(.{ .kind = .thunk, .wide = true, .eager = true }),
         .thunk_st_cell => capOp(.{ .kind = .thunk, .wide = false, .store = .cell }),
         .thunk_st => capOp(.{ .kind = .thunk, .wide = false, .store = .local }),
-        .thunk_eag_st_cell => capOp(.{ .kind = .thunk, .wide = false, .eager = true, .store = .cell }),
-        .thunk_eag_st => capOp(.{ .kind = .thunk, .wide = false, .eager = true, .store = .local }),
         .thunk_w_st_cell => capOp(.{ .kind = .thunk, .wide = true, .store = .cell }),
         .thunk_w_st => capOp(.{ .kind = .thunk, .wide = true, .store = .local }),
-        .thunk_eag_w_st_cell => capOp(.{ .kind = .thunk, .wide = true, .eager = true, .store = .cell }),
-        .thunk_eag_w_st => capOp(.{ .kind = .thunk, .wide = true, .eager = true, .store = .local }),
         .call => opCall,
         .call_tail => opTailCall,
         .call_n => opCallN,

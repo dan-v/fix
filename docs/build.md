@@ -26,7 +26,7 @@ The LALR parser tables are expensive to construct at comptime, so a standalone c
 
 ## Build options
 
-Evaluator-specific `-D` flags are folded into one shared `build_options` module and injected only where they are used. Generic `base` does not see that application-wide option surface. It receives a separate, narrow `base_options` module containing `fiber_stack_probe` and `fiber_census`; `build.zig` maps the relevant application probes onto those generic capabilities.
+Evaluator-specific `-D` flags are folded into one shared `build_options` module and injected only where they are used. Generic `base` does not see that application-wide option surface. It receives a separate, narrow `base_options` module containing only the profiler-backed fiber census.
 
 ### `-D` flag surface
 
@@ -34,15 +34,11 @@ All are `bool` and off unless noted. These are exactly the flags `build.zig` def
 
 | Group | Flag | Effect |
 |---|---|---|
-| diagnostics | `vm-opcode-profile` | collect + print VM opcode execution counts |
-| | `debug-checks` | VM dispatch invariant assertions (**defaults on** in Debug builds) |
+| diagnostics | `debug-checks` | VM dispatch invariant assertions (**defaults on** in Debug builds) |
 | | `vm-trace` | enable VM execution tracing (surfaced by `--vm-trace`) → [cli.md](cli.md) |
 | | `thunks-log` | per-thunk lifecycle event log (surfaced by `--thunks-log`) → [cli.md](cli.md) |
-| | `fiber-stack-probe` | sentinel-fill fiber stacks for `maxStackUsedBytes`; forces full RSS commit |
 | profiling | `prof-main` | rdtsc-time the main thread's hot serial paths; reported via `--print-sched-stats` → [perf/probes.md](perf/probes.md) |
 | | `prof-path` | record the force-call tree + critical path (workers=1); reported via `--print-sched-stats` → [perf/probes.md](perf/probes.md) |
-| | `timeline` | wall-clock per-worker event timeline; Perfetto JSON via `--timeline` → [perf/probes.md](perf/probes.md) |
-| memory | `gc` | include the generational collector (`--max-memory`-budgeted; dormant below half-budget, ~2% rooting tax). **Defaults on**; `-Dgc=false` builds the collector-free evaluator → [gc.md](gc.md) |
 | compilation | `profile` | keep symbols + frame pointers (sets `strip=false`, `omit_frame_pointer=false`) |
 
 Standard `zig build` options apply too: `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall` and `-Dtarget=…`. Perf numbers assume `ReleaseFast` (or `ReleaseSafe`); `-Dprofile` only flips symbol/frame-pointer stripping, it does not change the optimize mode.
@@ -67,6 +63,6 @@ Evaluator integration tests live under `src/nix/root/tests` and `src/nix/eval/te
 
 ## The correctness gate
 
-The oracle for every change is a **byte-identical `.drv`**: the emitted derivation must match Nix C++ exactly, and the interpreter is canonical. Any build option, module split, or optimization that perturbs `.drv` output is wrong regardless of speed — including `-Dgc`, whose collection must leave output bit-for-bit identical. See [invariants.md](invariants.md).
+The oracle for every change is a **byte-identical `.drv`**: the emitted derivation must match Nix C++ exactly, and the interpreter is canonical. Any build option, module split, collector run, or optimization that perturbs `.drv` output is wrong regardless of speed. See [invariants.md](invariants.md).
 
 Code: `build.zig`

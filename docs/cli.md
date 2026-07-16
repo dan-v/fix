@@ -45,7 +45,7 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 **Scope.** `name = expr` binds; the last printed value is `it`; `:l PATH` merges a file's attrset into scope (auto-calling a top-level function with `{}`); `:r` reloads. Inputs compile inside an ambient scope attrset (the `scopedImport` mechanism), so bound values are *shared*, never re-evaluated.
 
-**GC.** On a `-Dgc` build, a collection runs between inputs (`Evaluator.collectNow`: the standard STW barrier driven from outside an evaluation), so session memory tracks the live bindings rather than accreting. Repl-held values are precise GC roots (`Evaluator.gcSetExternalRoots` → `gc_extra_roots` in the root set). `:gc` collects on demand and reports reserved bytes.
+**GC.** A collection runs between inputs (`Evaluator.collectNow`: the standard STW barrier driven from outside an evaluation), so session memory tracks the live bindings rather than accreting. Repl-held values are precise GC roots (`Evaluator.gcSetExternalRoots` → `gc_extra_roots` in the root set). `:gc` collects on demand and reports reserved bytes.
 
 **Commands** (`:?` shows this table in-repl): `:?`/`:help`, `:q`/`:quit`/`:exit`, `:l`/`:load PATH`, `:r`/`:reload`, `:t`/`:type EXPR`, `:p`/`:print EXPR` (deep-force), `:i`/`:inspect EXPR` (kind, thunk state + backing chunk, closure chunk/arity), `:d`/`:disasm EXPR`, `:env`, `:gc`.
 
@@ -125,8 +125,8 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 | `--strict` | recursively force attr values + list items before writing |
 | `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call; `flakes` — gates the flake builtins (`getFlake`, `parseFlakeRef`, `flakeRefToString`) and the `--flake` installable, and implies `fetch-tree`. All off by default; a disabled builtin raises a hard (tryEval-uncatchable) error. |
 | `--workers N` | worker threads; default `min(8, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |
-| `--max-memory SIZE` | GC budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default half of `MemAvailable`). Effective only on a `-Dgc` build → [gc.md](gc.md) |
-| `--hugetlb auto\|on\|off` | back the evaluation heap with explicit 2 MB huge pages (default `auto`: only when the kernel pool has ≥256 MB unreserved capacity). `FIX_HUGETLB` env is the fallback when the flag is absent. Provision the pool with `sysctl vm.nr_hugepages=N` → [perf/hugetlb.md](perf/hugetlb.md) |
+| `--max-memory SIZE` | GC budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default half of `MemAvailable`) → [gc.md](gc.md) |
+| `--hugetlb auto\|on\|off` | back the evaluation heap with explicit 2 MB huge pages (default `auto`: only when the kernel pool has ≥256 MB unreserved capacity). Provision the pool with `sysctl vm.nr_hugepages=N` → [perf/hugetlb.md](perf/hugetlb.md) |
 | `--show-trace` | full evaluation traces on error |
 | `--debugger` (eval, repl) | pause into the interactive debug console at `builtins.break` and on evaluation errors; forces `--workers=1`. See [The debugger](#the-debugger). |
 | `--color[=auto\|always\|never]` / `--no-color` | color diagnostics |
@@ -161,8 +161,10 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 | `--vm-trace-max-events N` | cap recorded events (default `0` = unlimited) |
 | `--vm-trace-main-only` | record only the main thread's fiber |
 | `--thunks-log PATH` | per-thunk lifecycle log (PATH required — `--thunks-log PATH` or `=PATH`; needs a `-Dthunks-log` build) |
-| `--timeline[=PATH]` | Perfetto wall-clock timeline (default `fix-timeline.json`); needs a `-Dtimeline` build |
+| `--timeline[=PATH]` | Perfetto wall-clock timeline (default `fix-timeline.json`) |
 | `--print-sched-stats` | after eval, print scheduler / chunk-registry / deferred-table / speculation-census counters, plus worker busy/idle time summed across all workers and the resulting average utilisation, plus any `-Dprof-main` / `-Dprof-path` reports |
+| `--mem-report[=dump]` | print peak-RSS attribution at teardown; `dump` also lists registered VMAs |
+| `--gc-report` | print the collection/pause/live-set summary at teardown |
 
 ### Parallelism debug toggles
 
@@ -171,7 +173,6 @@ Speculation and fan-out are **on by default** (worth ~20–32% wall at `--worker
 | Flag | Meaning |
 |---|---|
 | `--no-spec-thunks` | disable speculative thunk evaluation → [parallel/speculation.md](parallel/speculation.md) |
-| `--speculate` | force speculation back on (it is the default; kept for explicit A/B) |
 | `--no-fanout` | disable strict-argument fan-out → [parallel/speculation.md](parallel/speculation.md) |
 | `--timeline-flows=N\|off\|all` | steal-arrow flow-event density in the `--timeline` trace (default `all`; `off` drops flows; `N` keeps 1/N) |
 

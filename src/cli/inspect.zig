@@ -57,8 +57,8 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     else
         options.workers orelse @intCast(@min(@as(u32, 8), @as(u32, @intCast(try std.Thread.getCpuCount()))));
 
-    // No `--hugetlb` in this command's parser; env (`FIX_HUGETLB`) > auto.
-    @import("setup.zig").applyMemoryBacking(null, init);
+    // No `--hugetlb` in this command's parser; use automatic selection.
+    @import("setup.zig").applyMemoryBacking(null);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     ev.setEnvironment(init.environ_map);
@@ -318,7 +318,6 @@ fn writeSchedulerStats(writer: *std.Io.Writer, workers: u8, s: anytype) !void {
     try writer.print("  cont pushes:       {d:>8}\n", .{s.cont_pushes});
     try writer.print("  cont steals:       {d:>8}\n", .{s.cont_steals});
     try writer.print("  parks:             {d:>8}\n", .{s.parks});
-    try writer.print("  max fiber stack:   {d:>8} bytes  (peak depth touched)\n", .{s.max_fiber_stack_used_bytes});
     try writer.print("  max VM sp:         {d:>8}        (peak value-stack depth)\n", .{s.max_vm_sp});
     try writer.writeAll("  worker time (summed across all workers including main):\n");
     try writer.print("    busy:            {d:>8.3} s   (inside fiber.resume)\n", .{

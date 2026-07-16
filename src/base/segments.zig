@@ -33,7 +33,7 @@ pub fn Params(comptime Vma: type) type {
         /// RSS-attribution tag for this store's segments (see
         /// runtime/vma.zig): a claimed segment is re-tagged from the
         /// allocator's generic "bigblock" bucket to the store's own, so
-        /// `FIX_MEM_REPORT` can tell the stores apart. Only segments big
+        /// `--mem-report` can tell the stores apart. Only segments big
         /// enough to be dedicated mappings (≥64 KB) are tagged; smaller
         /// early segments ride allocator slabs and keep the slab's identity.
         vma_tag: ?Vma.Tag = null,
@@ -437,7 +437,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         }
 
         /// `get`, tolerating id space whose segment was never allocated —
-        /// with `-Dgc` the low nursery segments stay null until arming, so
+        /// with the collector the low nursery segments stay null until arming, so
         /// a linear id walk (diagnostics/stats) crosses a hole. Returns
         /// null there and sets `next_id.*` to the first id of the next
         /// segment so walkers skip the hole in O(1).

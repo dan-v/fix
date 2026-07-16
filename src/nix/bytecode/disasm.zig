@@ -791,7 +791,7 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
 /// Whether a chunk-id-carrying op uses the wide (u32) id form.
 fn chunkIdWide(op: OpCode) bool {
     return switch (op) {
-        .closure_w, .closure_cap_w, .thunk_w, .thunk_eag_w, .thunk_arg, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => true,
+        .closure_w, .closure_cap_w, .thunk_w, .thunk_arg, .thunk_w_st, .thunk_w_st_cell => true,
         else => false,
     };
 }
@@ -1278,14 +1278,14 @@ fn writeOperandTail(
             // remains — the block's only (and thus last) row.
             try emitCountLine(writer, code, &off, "upvalues (from stack)", seq, g[0..1], 0b01, stripe, env);
         },
-        .thunk, .thunk_eag, .thunk_w, .thunk_eag_w, .thunk_arg, .closure_cap, .closure_cap_w => {
+        .thunk, .thunk_w, .thunk_arg, .closure_cap, .closure_cap_w => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*); // the "captures" count line's color
             try emitCountLine(writer, code, &off, "captures", seq, g[0..1], if (n == 0) 0b01 else 0, stripe, env);
             // The last descriptor closes both the list (level 1) and the block.
             try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], 0b11, up_names, symbols, stripe, env);
         },
-        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => {
+        .thunk_st, .thunk_st_cell, .thunk_w_st, .thunk_w_st_cell => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*);
             try emitCountLine(writer, code, &off, "captures", seq, g[0..1], 0, stripe, env);
@@ -1401,20 +1401,14 @@ fn isMultiline(op: OpCode) bool {
         .closure,
         .closure_w,
         .thunk,
-        .thunk_eag,
         .thunk_w,
-        .thunk_eag_w,
         .thunk_arg,
         .closure_cap,
         .closure_cap_w,
         .thunk_st,
         .thunk_st_cell,
-        .thunk_eag_st,
-        .thunk_eag_st_cell,
         .thunk_w_st,
         .thunk_w_st_cell,
-        .thunk_eag_w_st,
-        .thunk_eag_w_st_cell,
         .attrs_new_named_srt,
         .attrs_new_named_pos_srt,
         // .thunk_defer is now single-line: its captures are interned in the
@@ -1976,7 +1970,7 @@ fn isAggregateOp(op: OpCode) bool {
 
 fn isThunkFamilyOp(op: OpCode) bool {
     return switch (op) {
-        .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_shell, .thunk_defer, .thunk_attr, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell, .closure, .closure_w, .closure_cap, .closure_cap_w => true,
+        .thunk, .thunk_w, .thunk_arg, .thunk_shell, .thunk_defer, .thunk_attr, .thunk_st, .thunk_st_cell, .thunk_w_st, .thunk_w_st_cell, .closure, .closure_w, .closure_cap, .closure_cap_w => true,
         else => false,
     };
 }

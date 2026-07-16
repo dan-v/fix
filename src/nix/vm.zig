@@ -16,7 +16,6 @@ const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
 const bytecode_mod = @import("bytecode.zig");
-const opcode = bytecode_mod.opcode;
 const build_options = @import("build_options");
 const chunk = bytecode_mod.chunk;
 const Chunk = chunk.Chunk;
@@ -55,11 +54,7 @@ pub const trace_log = @import("vm/trace_log.zig");
 pub const worker = @import("vm/worker.zig");
 pub const io_offload = @import("vm/io_offload.zig");
 
-pub const opcode_profile_enabled = build_options.vm_opcode_profile;
 pub const thunks_log_enabled = build_options.thunks_log;
-pub const OpcodeCounts = [opcode.count]u64;
-const OpcodeProfileSink = if (opcode_profile_enabled) *OpcodeCounts else void;
-const OpcodeProfileState = if (opcode_profile_enabled) OpcodeCounts else void;
 const SpinMutex = @import("base").sync.SpinMutex;
 const vma = @import("runtime").mem_tag.vma;
 const PatternCache = @import("base").regex.PatternCache;
@@ -255,7 +250,7 @@ pub const VM = struct {
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
-    /// GC native-builtin call depth (`-Dgc`): incremented
+    /// GC native-builtin call depth: incremented
     /// around each native builtin, so `native_depth == 0` marks a clean
     /// safepoint where no builtin holds un-rooted Zig locals. On the VM (not a
     /// threadlocal) so it's fiber-local — a yielded fiber resuming on another
@@ -281,9 +276,6 @@ pub const VM = struct {
     /// logical count.
     frames: []Frame,
     frames_len: u32,
-    opcode_counts: OpcodeProfileState,
-    opcode_profile_sink: OpcodeProfileSink,
-
     /// Demand-carrier: when this VM is currently running speculative work
     /// (a helper forcing a thunk on its own initiative), new thunks
     /// created during that run should NOT submit themselves for further
@@ -330,8 +322,8 @@ pub const VM = struct {
     /// fiber across yields/steals).
     spec_budget: u64,
 
-    /// Bounded speculation, creation side (`FIX_SIBLING` /
-    /// `FIX_SPEC_CREATE_BUDGET`): REMAINING thunk-creation budget for the
+    /// Bounded speculation, creation side (`FIX_SIBLING` / band budget):
+    /// REMAINING thunk-creation budget for the
     /// current speculative task. The claimed-force budget above cannot
     /// bound creation-heavy builtins (one claimed force through
     /// zipAttrsWith/mapAttrs can materialize 100Ks of thunks); this
@@ -372,27 +364,27 @@ pub const VM = struct {
     /// The same compatibility policy used to parse and compile this code.
     policy: LanguagePolicy,
 
-    /// GC (`-Dgc`): the value currently being forced, rooted across a
+    /// GC: the value currently being forced, rooted across a
     /// safepoint collection because it may be off the VM stack. `null_val`
-    /// outside a collection; `void` in normal builds.
-    gc_extra_root: if (build_options.gc) Value else void = if (build_options.gc) Value.null_val else {},
+    /// outside a collection.
+    gc_extra_root: Value = Value.null_val,
 
-    /// GC (`-Dgc`): the chain of thunks currently being forced on this
+    /// GC: the chain of thunks currently being forced on this
     /// fiber (A forces B forces C …). Each is claimed/`.evaluating` and off
     /// the operand stack while its body runs, so without this a collection
     /// triggered by a nested force would sweep the outer in-flight thunks
-    /// (and their target closures). Marked as roots. `void` in normal builds.
-    gc_force_chain: if (build_options.gc) std.ArrayListUnmanaged(types.ObjectId) else void = if (build_options.gc) .empty else {},
+    /// (and their target closures). Marked as roots.
+    gc_force_chain: std.ArrayListUnmanaged(types.ObjectId) = .empty,
 
-    /// GC (`-Dgc`): heap containers a native builtin holds as a raw store
+    /// GC: heap containers a native builtin holds as a raw store
     /// slice across a force (e.g. `heap.getList(id)` after the list `Value`
     /// goes dead). The conservative running-fiber scan sees `Value`-shaped
     /// locals but cannot recover an object from a raw interior pointer, so an
     /// iterating builtin pushes the container here for its loop's duration —
     /// keeping it, and thus its not-yet-visited elements, alive across a
     /// collection triggered mid-loop. Marked as roots; scoped via
-    /// `force.gcRootsMark`/`gcRootsRestore`. `void` in normal builds.
-    gc_temp_roots: if (build_options.gc) std.ArrayListUnmanaged(Value) else void = if (build_options.gc) .empty else {},
+    /// `force.gcRootsMark`/`gcRootsRestore`.
+    gc_temp_roots: std.ArrayListUnmanaged(Value) = .empty,
 
     pub const Init = struct {
         allocator: std.mem.Allocator,
@@ -410,7 +402,6 @@ pub const VM = struct {
         thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void = if (thunks_log_enabled) null else {},
         import_host: ?ImportHost = null,
         builtins_value: Value = Value.null_val,
-        opcode_profile_sink: OpcodeProfileSink,
         deferred_table: ?*DeferredTable = null,
         regexes: ?*PatternCache = null,
         break_sink: ?BreakSink = null,
@@ -459,8 +450,6 @@ pub const VM = struct {
             .sp_high_water = 0,
             .frames = frames,
             .frames_len = 0,
-            .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
-            .opcode_profile_sink = options.opcode_profile_sink,
             .in_speculation = false,
             .solo = options.scheduler.worker_count == 1,
             .spec_budget = NO_SPEC_BUDGET,
@@ -486,12 +475,10 @@ pub const VM = struct {
     /// VM retains there. The lists are logically empty between tasks
     /// (roots/chains are scoped to a force); only their capacity lives on.
     pub fn onScratchReset(self: *VM) void {
-        if (comptime build_options.gc) {
-            std.debug.assert(self.gc_force_chain.items.len == 0);
-            std.debug.assert(self.gc_temp_roots.items.len == 0);
-            self.gc_force_chain = .empty;
-            self.gc_temp_roots = .empty;
-        }
+        std.debug.assert(self.gc_force_chain.items.len == 0);
+        std.debug.assert(self.gc_temp_roots.items.len == 0);
+        self.gc_force_chain = .empty;
+        self.gc_temp_roots = .empty;
     }
 
     /// Report `[completed/total]` on the current render/stage node. Demand
@@ -505,9 +492,8 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
-        if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
-        if (comptime build_options.gc) self.gc_force_chain.deinit(self.allocator);
-        if (comptime build_options.gc) self.gc_temp_roots.deinit(self.allocator);
+        self.gc_force_chain.deinit(self.allocator);
+        self.gc_temp_roots.deinit(self.allocator);
         if (self.buffer_pool) |bp| {
             bp.release(.{ .stack = self.stack, .frames = self.frames });
         } else {
@@ -529,14 +515,6 @@ pub const VM = struct {
         };
     }
 };
-
-fn flushOpcodeProfile(self: *VM) void {
-    if (comptime opcode_profile_enabled) {
-        for (&self.opcode_profile_sink.*, self.opcode_counts) |*total, count| {
-            total.* += count;
-        }
-    }
-}
 
 // ---- free functions (don't take self) ----
 
