@@ -25,6 +25,7 @@
 //! safepoint, sampler thread reads lock-free). Not built yet — add it here
 //! when needed, not on the VM.
 
+const std = @import("std");
 const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
 const eval_progress = @import("../observ.zig").progress;
@@ -69,6 +70,11 @@ pub const ExecutionContext = struct {
     /// construction — no compensating `is_demand` gate needed at the use
     /// site, and it stays with the fiber across a steal.
     progress_wait: ?*eval_progress.ProgressWait = null,
+    /// Head of the in-progress `builtins.scopedImport` path chain. Unlike an
+    /// OS-thread-local, this travels with the fiber when work stealing resumes
+    /// it on another worker. Frames themselves live on the suspended fiber's
+    /// stack and are popped before that stack can be recycled.
+    scoped_import_top: ?*const ScopedImportFrame = null,
 
     /// Neutral identity for VMs not bound to any fiber (standalone test
     /// VMs, tools). Static and immutable — never dressed.
@@ -78,10 +84,21 @@ pub const ExecutionContext = struct {
     /// list (a reused fiber must not mislabel its next task as demand).
     /// The claim id is permanent and survives.
     pub fn resetRole(self: *ExecutionContext) void {
+        // A scoped-import frame is stack-scoped and must have unwound before
+        // the fiber can finish and return to the recycle list.
+        std.debug.assert(self.scoped_import_top == null);
         self.is_demand = false;
         self.progress_stage = null;
         self.progress_wait = null;
     }
+};
+
+/// One node in a fiber's active scoped-import chain. Kept here, beside the
+/// owning head pointer, so import coordination does not smuggle fiber-local
+/// state through OS-thread-local storage.
+pub const ScopedImportFrame = struct {
+    path: []const u8,
+    next: ?*const ScopedImportFrame,
 };
 
 /// The demand-role half of an `ExecutionContext` — what `Worker.runTopLevel`

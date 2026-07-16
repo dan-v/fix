@@ -13,8 +13,8 @@
 //! translate to `error.ImportCycle`.
 //!
 //! Scoped imports skip this dedup — each call carries a distinct scope
-//! Value — so cycle detection for them is a thread-local linked list
-//! threaded through the import call stack.
+//! Value — so cycle detection for them is a fiber-owned linked list threaded
+//! through the import call stack. It must travel with a stolen fiber.
 //!
 //! The top-level functions (importPath, forceEntry, scopedImportPath) are
 //! The explicit `Host` below is the narrow evaluator capability surface this
@@ -26,6 +26,7 @@ const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
 const fiber_mod = @import("base").fiber;
 const worker_mod = @import("../vm.zig").worker;
+const exec_context = @import("../vm.zig").exec_context;
 const SpinMutex = @import("base").sync.SpinMutex;
 const timeline = @import("../probe.zig").timeline;
 const FileCache = @import("../host.zig").FileCache;
@@ -111,33 +112,32 @@ pub const ImportEntry = struct {
     error_info: ?*thunk_mod.ErrorInfo = null,
 };
 
-/// Per-thread linked list of in-progress *scoped* import paths.
+/// Per-fiber linked list of in-progress *scoped* import paths.
 /// `pushFrame` returns the prior top so the caller can restore it on
 /// scope exit; `checkCycle` walks the chain looking for `path`.
-pub const ScopedFrame = struct {
-    path: []const u8,
-    next: ?*const ScopedFrame,
-};
+pub const ScopedFrame = exec_context.ScopedImportFrame;
 
-threadlocal var scoped_stack_top: ?*const ScopedFrame = null;
-
-pub fn scopedStackTop() ?*const ScopedFrame {
-    return scoped_stack_top;
+fn currentExecutionContext() *exec_context.ExecutionContext {
+    const inner = fiber_mod.currentFiber() orelse
+        @panic("scoped import ran outside an evaluator fiber");
+    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
+    return &wf.ctx;
 }
 
 pub fn pushScopedFrame(frame: *ScopedFrame) ?*const ScopedFrame {
-    const prev = scoped_stack_top;
+    const ctx = currentExecutionContext();
+    const prev = ctx.scoped_import_top;
     frame.next = prev;
-    scoped_stack_top = frame;
+    ctx.scoped_import_top = frame;
     return prev;
 }
 
 pub fn popScopedFrame(prev: ?*const ScopedFrame) void {
-    scoped_stack_top = prev;
+    currentExecutionContext().scoped_import_top = prev;
 }
 
 pub fn checkScopedCycle(path: []const u8) !void {
-    var cursor = scoped_stack_top;
+    var cursor = currentExecutionContext().scoped_import_top;
     while (cursor) |node| {
         if (std.mem.eql(u8, node.path, path)) return error.ImportCycle;
         cursor = node.next;

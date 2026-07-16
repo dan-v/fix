@@ -910,6 +910,39 @@ test "evaluate scopedImport through ambient scope" {
     try std.testing.expectEqual(@as(i64, 3), imported.asInt());
 }
 
+test "detect recursive scoped imports with migratable workers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "cycle.nix",
+        .data = "builtins.scopedImport {} ./cycle.nix\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "cycle.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.scopedImport {{}} {s}",
+        .{file_path},
+    );
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 4);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    try std.testing.expectError(error.ImportCycle, ev.evaluate(source));
+}
+
 test "detect recursive imports" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
