@@ -18,6 +18,7 @@ const DaemonRuntime = host.DaemonRuntime;
 const Future = runtime.thunk.Future;
 const Waiter = runtime.thunk.Waiter;
 const owned_strings = @import("base").owned_strings;
+const eval_memo = @import("eval_memo.zig");
 
 /// Injected `vm.io_offload.runOnPool`: submit `work(conn)` to the pool and park
 /// the caller. `ctx` is the `*DaemonPool`; `conn` is the worker's connection.
@@ -69,9 +70,6 @@ const HashModuloView = types.HashModuloView;
 /// The name portion of a store path: `/nix/store/<hash>-<name>` -> `<name>`.
 /// Store hashes are 32 base32 chars followed by `-`. Used as the `name` arg to
 /// `addTextToStore`, which recomputes the full path from name+content+refs.
-/// Stripe count for `source_ingest_locks` (unfiltered-ingest single-flight).
-const source_ingest_stripes = 64;
-
 fn storePathName(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
     if (base.len > 33 and base[32] == '-') return base[33..];
@@ -82,44 +80,7 @@ pub const DerivationStore = struct {
     allocator: std.mem.Allocator,
     store_dir: []const u8 = "/nix/store",
     registry: derivation.Registry,
-    /// Cache of fully-built lazy derivation values keyed by the
-    /// input `attrs_id` to `buildForcedDerivationValue(.lazy)`. The
-    /// `builtinDerivationLazyAttr` path was rebuilding the entire
-    /// derivation on every per-attr access (drvPath, outPath,
-    /// outputName, named outputs, ...) — the cache deduplicates so
-    /// the first access pays and the rest just look the result up.
-    ///
-    /// `u64` storage instead of `Value` to keep this header from having to
-    /// know about the runtime Value type; the caller round-trips through the
-    /// `Value.bits` field. Keyed by attrs ObjectId; the `token` guards against
-    /// GC id-reuse (see `lookupLazyDerivation`).
-    lazy_drv_cache: std.AutoHashMapUnmanaged(u32, LazyDrvEntry) = .empty,
-    lazy_drv_mu: stable.SpinMutex = .{},
-
-    /// In-eval source-copy memo — fix's analogue of Nix's `EvalState::srcToStore`.
-    /// Maps an *unfiltered* source ingestion (keyed by `<r|f><name>\x00<abs-path>`)
-    /// to its computed store path + NAR hash, so repeatedly coercing the same
-    /// source (`src = ./.` referenced many times) NAR-serializes + hashes the tree
-    /// once instead of on every coercion. Only unfiltered ingests are memoized: a
-    /// `filter` makes the result depend on a Nix predicate whose behavior can't be
-    /// keyed cheaply (and would need the GC-id-reuse guard `lazy_drv_cache` uses).
-    /// The source content is frozen for the eval by `FileCache`, so this makes the
-    /// same immutability assumption Nix's `srcToStore` does. Guarded by
-    /// `source_memo_mu`. Both the key and the stored slices are owned by
-    /// `allocator`, freed in `deinit`.
-    source_memo: std.StringHashMapUnmanaged(SourceMemoEntry) = .empty,
-    source_memo_mu: stable.SpinMutex = .{},
-
-    /// Per-key single-flight locks for UNFILTERED source ingests. The lock-free
-    /// memo check races: parallel workers coercing the same source all miss and
-    /// each re-serializes (benign — content-addressed, so identical result — but
-    /// wasted CPU). A worker takes the key's stripe, re-checks the memo, and only
-    /// the first serializes; the rest reuse its entry. Unfiltered ingests only:
-    /// their serialize has no predicate callback and no fiber-park point, so a
-    /// blocking mutex held across it can't reenter or deadlock the scheduler.
-    /// Striped (not per-key) to bound memory; collisions just serialize two
-    /// distinct sources, still correct. Filtered ingests keep the lock-free path.
-    source_ingest_locks: [source_ingest_stripes]stable.BlockingMutex = @splat(.{}),
+    memo: eval_memo.EvalMemo,
 
     /// Guards the small shared state every pool worker touches: the `instantiated`
     /// cache and `last_error_msg`. Held only for brief in-memory updates, never
@@ -314,17 +275,9 @@ pub const DerivationStore = struct {
         } else return null;
     }
 
-    const LazyDrvEntry = struct { token: u64, bits: u64 };
-
-    /// A memoized source ingestion. Both slices are owned by the
-    /// `DerivationStore.allocator` and freed in `deinit`. `token` is the heap GC
-    /// token at store time — only meaningful for filtered entries (whose key
-    /// includes a reusable ObjectId); unfiltered entries ignore it.
-    const SourceMemoEntry = struct { store_path: []u8, nar_hash: []u8, token: u64 };
-
     /// A source-memo hit, with slices duplicated into the *caller's* allocator
     /// so it can be dropped into an `Ingested` (which is caller-owned).
-    pub const SourceMemoHit = struct { store_path: []u8, nar_hash: []u8 };
+    pub const SourceMemoHit = eval_memo.SourceMemoHit;
 
     /// A deferred `fetchurl`/`fetchTarball`: the download spec plus the expected
     /// content hash, materialized on demand. `recursive` distinguishes a flat
@@ -499,7 +452,11 @@ pub const DerivationStore = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) DerivationStore {
-        return .{ .allocator = allocator, .registry = derivation.Registry.init(allocator) };
+        return .{
+            .allocator = allocator,
+            .registry = derivation.Registry.init(allocator),
+            .memo = eval_memo.EvalMemo.init(allocator),
+        };
     }
 
     pub fn deinit(self: *DerivationStore) void {
@@ -540,14 +497,7 @@ pub const DerivationStore = struct {
         }
         self.recipe_mu.unlock();
         self.registry.deinit();
-        self.lazy_drv_cache.deinit(self.allocator);
-        var src_memo = self.source_memo.iterator();
-        while (src_memo.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.store_path);
-            self.allocator.free(entry.value_ptr.nar_hash);
-        }
-        self.source_memo.deinit(self.allocator);
+        self.memo.deinit();
         var inst = self.instantiated.keyIterator();
         while (inst.next()) |key| self.allocator.free(key.*);
         self.instantiated.deinit(self.allocator);
@@ -1336,26 +1286,6 @@ pub const DerivationStore = struct {
         };
     }
 
-    /// Build the composite source-memo key, owned by `key_allocator`.
-    /// Unfiltered: `<r|f><name>\x00<abs-path>`. Filtered: the same, plus
-    /// `\x00<filter-object-id>` — so a filtered ingest can never collide with the
-    /// unfiltered one (or a different filter) for the same path+name. `name` is a
-    /// validated store-path name (no NUL) and `path` is a filesystem path (no
-    /// NUL), so the NUL separators are unambiguous.
-    fn sourceMemoKey(
-        key_allocator: std.mem.Allocator,
-        path: []const u8,
-        name: []const u8,
-        recursive: bool,
-        filter_id: ?u32,
-    ) ![]u8 {
-        const rf: u8 = if (recursive) 'r' else 'f';
-        if (filter_id) |fid| {
-            return std.fmt.allocPrint(key_allocator, "{c}{s}\x00{s}\x00{d}", .{ rf, name, path, fid });
-        }
-        return std.fmt.allocPrint(key_allocator, "{c}{s}\x00{s}", .{ rf, name, path });
-    }
-
     /// Look up a memoized ingestion. On a hit, the store path + NAR hash are
     /// duplicated into `out_allocator` (caller-owned, for an `Ingested`).
     ///
@@ -1369,11 +1299,7 @@ pub const DerivationStore = struct {
     /// concurrent coercers of the same source don't each re-serialize. See
     /// `source_ingest_locks`.
     pub fn sourceIngestLock(self: *DerivationStore, path: []const u8, name: []const u8) *stable.BlockingMutex {
-        var h = std.hash.Wyhash.init(0);
-        h.update(path);
-        h.update(&[_]u8{0});
-        h.update(name);
-        return &self.source_ingest_locks[h.final() % source_ingest_stripes];
+        return self.memo.sourceIngestLock(path, name);
     }
 
     pub fn lookupSourceMemo(
@@ -1385,16 +1311,7 @@ pub const DerivationStore = struct {
         filter_id: ?u32,
         token: ?u64,
     ) !?SourceMemoHit {
-        const key = try sourceMemoKey(self.allocator, path, name, recursive, filter_id);
-        defer self.allocator.free(key);
-        self.source_memo_mu.lock();
-        defer self.source_memo_mu.unlock();
-        const entry = self.source_memo.get(key) orelse return null;
-        if (token) |t| if (entry.token != t) return null; // filter-id reused after GC
-        const store_path = try out_allocator.dupe(u8, entry.store_path);
-        errdefer out_allocator.free(store_path);
-        const nar_hash = try out_allocator.dupe(u8, entry.nar_hash);
-        return SourceMemoHit{ .store_path = store_path, .nar_hash = nar_hash };
+        return self.memo.lookupSource(out_allocator, path, name, recursive, filter_id, token);
     }
 
     /// Record a computed ingestion for reuse this eval. Dupes the key and both
@@ -1412,50 +1329,23 @@ pub const DerivationStore = struct {
         store_path: []const u8,
         nar_hash: []const u8,
     ) !void {
-        const key = try sourceMemoKey(self.allocator, path, name, recursive, filter_id);
-        errdefer self.allocator.free(key);
-        const owned_store_path = try self.allocator.dupe(u8, store_path);
-        errdefer self.allocator.free(owned_store_path);
-        const owned_nar_hash = try self.allocator.dupe(u8, nar_hash);
-        errdefer self.allocator.free(owned_nar_hash);
-
-        self.source_memo_mu.lock();
-        defer self.source_memo_mu.unlock();
-        const gop = try self.source_memo.getOrPut(self.allocator, key);
-        if (gop.found_existing) {
-            self.allocator.free(key);
-            const stale = filter_id != null and gop.value_ptr.token != token;
-            if (!stale) {
-                self.allocator.free(owned_store_path);
-                self.allocator.free(owned_nar_hash);
-                return;
-            }
-            self.allocator.free(gop.value_ptr.store_path);
-            self.allocator.free(gop.value_ptr.nar_hash);
-        }
-        gop.value_ptr.* = .{ .store_path = owned_store_path, .nar_hash = owned_nar_hash, .token = token };
+        return self.memo.storeSource(path, name, recursive, filter_id, token, store_path, nar_hash);
     }
 
     /// Look up a cached `buildForcedDerivationValue(.lazy)` result.
     /// Returns the cached `Value.bits` if present, `null` otherwise.
     pub fn lookupLazyDerivation(self: *DerivationStore, attrs_id: u32, token: u64) ?u64 {
-        self.lazy_drv_mu.lock();
-        defer self.lazy_drv_mu.unlock();
-        const entry = self.lazy_drv_cache.get(attrs_id) orelse return null;
-        // The key is a raw ObjectId; after a GC the attrs may be swept and its
-        // id reused for a different attrs. `token` bumps every collection, so a
-        // stale entry must miss — else we'd return another derivation's value
-        // for a reused id (a reuse-only bug the GC detector can't see).
-        if (entry.token != token) return null;
-        return entry.bits;
+        return self.memo.lookupLazyDerivation(attrs_id, token);
     }
 
     /// Cache the result of `buildForcedDerivationValue(.lazy)` for
     /// future per-attr lookups against the same input attrs.
     pub fn cacheLazyDerivation(self: *DerivationStore, attrs_id: u32, token: u64, value_bits: u64) !void {
-        self.lazy_drv_mu.lock();
-        defer self.lazy_drv_mu.unlock();
-        try self.lazy_drv_cache.put(self.allocator, attrs_id, .{ .token = token, .bits = value_bits });
+        return self.memo.cacheLazyDerivation(attrs_id, token, value_bits);
+    }
+
+    pub fn visitLiveLazyDerivations(self: *DerivationStore, token: u64, context: anytype, comptime visit: anytype) void {
+        self.memo.visitLiveLazyValues(token, context, visit);
     }
 
     pub fn setDebugEnabled(self: *DerivationStore, enabled: bool) void {

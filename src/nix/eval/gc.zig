@@ -525,9 +525,16 @@ pub fn markRoots(ev: anytype, tr: *gc.Tracer) void {
     // Lazy-derivation cache (Value bits keyed by attrs id). Only current-
     // token entries are live roots; stale ones (pre-GC id, now reused) are
     // dead and will miss on lookup, so don't retain them.
-    var dit = ev.store.derivations.lazy_drv_cache.iterator();
-    while (dit.next()) |e| if (e.value_ptr.token == ev.heap.token)
-        tr.markValue(&ev.heap, .{ .bits = e.value_ptr.bits });
+    const LazyRootContext = struct { tracer: *gc.Tracer, heap: *ObjectHeap };
+    ev.store.derivations.visitLiveLazyDerivations(
+        ev.heap.token,
+        LazyRootContext{ .tracer = tr, .heap = &ev.heap },
+        struct {
+            fn mark(context: LazyRootContext, bits: u64) void {
+                context.tracer.markValue(context.heap, .{ .bits = bits });
+            }
+        }.mark,
+    );
 }
 
 pub fn markVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: anytype) void {
