@@ -58,6 +58,27 @@ pub const AttrPosEntry = struct {
     pos: SourcePos,
 };
 
+/// Per-heap collector diagnostics. These counters used to be process globals,
+/// which made independently configured Evaluators overwrite one another's
+/// policy and reports. Atomics keep the progress sampler's advisory reads
+/// data-race-free while the collection coordinator updates them.
+pub const GcReportState = struct {
+    collections: std.atomic.Value(u64) = .init(0),
+    objects_freed_total: std.atomic.Value(u64) = .init(0),
+    last_live_bytes: std.atomic.Value(u64) = .init(0),
+    peak_total_bytes: std.atomic.Value(u64) = .init(0),
+    final_total_bytes: std.atomic.Value(u64) = .init(0),
+    mark_ns_total: std.atomic.Value(u64) = .init(0),
+    sweep_ns_total: std.atomic.Value(u64) = .init(0),
+    barrier_ns_total: std.atomic.Value(u64) = .init(0),
+    reset_ns_total: std.atomic.Value(u64) = .init(0),
+    roots_ns_total: std.atomic.Value(u64) = .init(0),
+    remset_ns_total: std.atomic.Value(u64) = .init(0),
+    drain_ns_total: std.atomic.Value(u64) = .init(0),
+    remset_sources_total: std.atomic.Value(u64) = .init(0),
+    breakdown: [6]std.atomic.Value(u64) = @splat(.init(0)),
+};
+
 /// The object store is backed by a single mmap-reserved contiguous
 /// region rather than geometric segments: it is referenced *only* by
 /// flat ObjectId (never via an externally-handed-out `Range`/`slice`,
@@ -384,6 +405,13 @@ pub const ObjectHeap = struct {
     /// `gc_threshold_bytes`; consumed at the next safepoint poll.
     gc_collect_requested: bool = false,
     gc_threshold_bytes: u64 = std.math.maxInt(u64),
+    /// Per-heap collection policy. Kept beside the threshold because later
+    /// re-arming reads it; sharing these values across heaps lets one Evaluator
+    /// silently change another's collection cadence.
+    gc_step_bytes: u64 = 0,
+    gc_budget_bytes: u64 = 0,
+    gc_disable_reuse: bool = false,
+    gc_report: GcReportState = .{},
     /// Major-collection policy: minors only reclaim young survivors and tenure
     /// the rest, so tenured garbage accumulates in the old generation. Count the
     /// objects promoted (tenured) since the last major; once it crosses
@@ -1204,7 +1232,7 @@ pub const ObjectHeap = struct {
             // Reuse a slot freed by a prior collection (own shard, else
             // work-steal from a peer). Detector leaves freed slots unused so
             // use-after-free is caught.
-            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug) {
+            if (self.gc_collect_enabled and !self.gc_disable_reuse and !gc_debug) {
                 if (self.gcReuseObject(local)) |rid| break :blk rid;
             }
             const chunk = &local.object;
@@ -1265,28 +1293,11 @@ pub const ObjectHeap = struct {
     /// `gcAfterCollect`). Keeps peak RSS near live + a constant.
     pub const gc_headroom: u64 = 1024 << 20;
 
-    /// Validation knob (`FIX_GC_STEP_MB`): when > 0, collect
-    /// every this-many MB of fresh allocation instead of the normal additive-
-    /// headroom policy. Drives many collections so the detector exercises
-    /// every builtin loop. 0 = normal policy. Set from the evaluator (which
-    /// owns the env map) via the `step_bytes` arg to `gcEnableCollect`.
-    pub var gc_step_bytes: u64 = 0;
-
-    /// Memory budget (`--max-memory`): the
-    /// heap-reserved-bytes ceiling the collector defends. No collection runs
-    /// until reserved bytes cross it, so on a machine whose budget exceeds
-    /// the eval's total allocation the collector never fires (zero pauses);
-    /// on a small-RAM device it kicks in before the eval OOMs. Defaults to
-    /// half of `MemAvailable` (see `eval/gc_controller.zig:memoryBudget`). Set via the
-    /// `budget` arg to `gcEnableCollect`.
-    pub var gc_budget_bytes: u64 = 0;
-
     /// A/B knob (`FIX_GC_NOREUSE`): skip free-list reuse on the allocation hot
     /// paths (bump-allocate instead). Measurement only — loses the RSS bound.
     /// Lets us isolate reclaim's reuse cost/benefit. Set from the evaluator.
-    var gc_disable_reuse: bool = false;
-    pub fn gcSetDisableReuse(v: bool) void {
-        gc_disable_reuse = v;
+    pub fn gcSetDisableReuse(self: *ObjectHeap, v: bool) void {
+        self.gc_disable_reuse = v;
     }
 
     /// Is the alloc-bit set for `id`? (Detector helper.) Atomic load — the

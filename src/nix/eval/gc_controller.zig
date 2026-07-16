@@ -47,12 +47,13 @@ pub const Context = struct {
     workers: []std.atomic.Value(?*Worker),
     chunks_scanned: *types.ChunkId,
     extra_roots: *std.ArrayListUnmanaged(Value),
+    parallel_cap: u32,
 };
 
 /// Cap on the number of participants in a single collection's mark+evac.
 /// The eval still runs `worker_count`-wide; only the STW mark/evac is
 /// throttled (contention-bound past ~8). Set from `FIX_GC_PAR_CAP`.
-pub var gc_par_cap: u32 = 8;
+pub const default_parallel_cap: u32 = 8;
 
 /// GC: register a stack-local VM (the top-level entry's VM, a
 /// nested-eval VM, or an import VM) so the collector scans its roots.
@@ -84,7 +85,7 @@ pub fn helpMark(ev: Context, worker_id: u8) void {
     // Grab a marker slot. The collection is capped at GC_PAR_CAP
     // participants (contention-bound past ~8); a peer over the cap parks
     // idle rather than piling on. The collector already grabbed slot 0.
-    const marker_count = @min(@as(u32, ev.worker_count), gc_par_cap);
+    const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
     const slot = ev.heap.gcMarkSlotGrab();
     if (slot >= marker_count) return;
     // Drain the mark to global termination, then help the second phase: a MINOR
@@ -156,7 +157,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
         // Cap the collection's participants (contention-bound past ~8) —
         // the eval still runs `worker_count`-wide; only the mark+evac is
         // throttled. Peers over the cap park idle (see gcHelpMarkThunk).
-        const marker_count = @min(@as(u32, ev.worker_count), gc_par_cap);
+        const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
         tr.resetParallelMinor(ev.heap.objects.count(), marker_count) catch {
             heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
             return;
@@ -199,7 +200,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
         const p2 = nowNs();
         tr.drainMinor(ev.heap);
         const p3 = nowNs();
-        gc.recordMarkPhases(p0 - t0, p1 - p0, p2 - p1, p3 - p2, remset_sources);
+        gc.recordMarkPhases(&ev.heap.gc_report, p0 - t0, p1 - p0, p2 - p1, p3 - p2, remset_sources);
     }
     const t1 = nowNs();
     // w>1 already evacuated in parallel (claim loop); just finish (verify +
@@ -214,9 +215,9 @@ pub fn collect(ev: Context, collector_id: u8) void {
     // accumulated in the old generation, the next collection escalates.
     ev.heap.gcNoteMinorPromoted(st.promoted);
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
-    gc.recordCollection(st.freed, tr.stats.bytes, ev.heap.totalReservedBytes());
-    gc.recordTiming(t1 - t0, t2 - t1);
-    gc.recordBreakdown(.{
+    gc.recordCollection(&ev.heap.gc_report, st.freed, tr.stats.bytes, ev.heap.totalReservedBytes());
+    gc.recordTiming(&ev.heap.gc_report, t1 - t0, t2 - t1);
+    gc.recordBreakdown(&ev.heap.gc_report, .{
         .obj_live = tr.stats.objects,
         .obj_reserved = ev.heap.objects.count(),
         .val_live = tr.stats.values,
@@ -286,8 +287,8 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     ev.heap.gcNoteMajor(tr.stats.objects);
     const t2 = nowNs();
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
-    gc.recordCollection(st.objects_freed, tr.stats.bytes, ev.heap.totalReservedBytes());
-    gc.recordTiming(t1 - t0, t2 - t1);
+    gc.recordCollection(&ev.heap.gc_report, st.objects_freed, tr.stats.bytes, ev.heap.totalReservedBytes());
+    gc.recordTiming(&ev.heap.gc_report, t1 - t0, t2 - t1);
 }
 
 pub const nowNs = clock.monotonicNs;

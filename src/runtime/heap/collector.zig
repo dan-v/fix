@@ -60,8 +60,8 @@ pub fn sweep(heap: *ObjectHeap, mark_bits: []const u64) SweepStats {
 /// validation override: collect every that-many bytes of fresh allocation
 /// from a low starting threshold, ignoring the budget.
 pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
-    ObjectHeap.gc_step_bytes = step_bytes;
-    ObjectHeap.gc_budget_bytes = budget;
+    heap.gc_step_bytes = step_bytes;
+    heap.gc_budget_bytes = budget;
     // NON-MOVING: collect on the reserved-bytes threshold (survivors stay
     // in place; there is no nursery to fill/reset). `gcNurseryFull` now only
     // requests a collect once the cursor has grown a headroom past the last
@@ -96,8 +96,8 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
 /// gates live from here (`gc_root_active`). `gc_bootstrap_end` is captured now
 /// as the reclaim boundary (bootstrap below it stays pinned).
 pub fn enableBudget(heap: *ObjectHeap, budget: u64, root_always: bool) void {
-    ObjectHeap.gc_step_bytes = 0;
-    ObjectHeap.gc_budget_bytes = budget;
+    heap.gc_step_bytes = 0;
+    heap.gc_budget_bytes = budget;
     heap.gc_threshold_bytes = budget / 2;
     heap.gc_bootstrap_end = heap.objects.count();
     heap.gc_root_always = root_always;
@@ -153,7 +153,7 @@ pub fn armTracking(heap: *ObjectHeap) void {
 pub fn armLazy(heap: *ObjectHeap) void {
     armTracking(heap);
     heap.gc_collect_requested = false;
-    const budget = ObjectHeap.gc_budget_bytes;
+    const budget = heap.gc_budget_bytes;
     const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.gc_headroom);
     heap.gc_threshold_bytes = @max(budget, heap.totalReservedBytes() + headroom);
 }
@@ -181,10 +181,10 @@ pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
     // [64 MB, gc_headroom]): a small-RAM budget must not grant itself a
     // flat 1 GB of growth per cycle, and a huge budget needn't collect
     // every 64 MB once it has (somehow) been crossed.
-    const budget = ObjectHeap.gc_budget_bytes;
+    const budget = heap.gc_budget_bytes;
     const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.gc_headroom);
-    heap.gc_threshold_bytes = if (ObjectHeap.gc_step_bytes > 0)
-        heap.totalReservedBytes() + ObjectHeap.gc_step_bytes
+    heap.gc_threshold_bytes = if (heap.gc_step_bytes > 0)
+        heap.totalReservedBytes() + heap.gc_step_bytes
     else
         @max(budget, heap.totalReservedBytes() + headroom);
     // Invalidate all thread-local caches (thunk memo, attr IC, call IC)

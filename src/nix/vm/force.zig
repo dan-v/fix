@@ -688,7 +688,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 @import("runtime").heap_collector.runCollect(self.heap, self.workerId());
                 const b2 = gc.nowNs();
                 self.scheduler.gcEndCollection(self.workerId());
-                gc.recordBarrier((b1 - b0) + (gc.nowNs() - b2));
+                gc.recordBarrier(&self.heap.gc_report, (b1 - b0) + (gc.nowNs() - b2));
             } else {
                 self.scheduler.gcSafepointPark(self.workerId());
             }

@@ -543,21 +543,13 @@ pub inline fn hasObjectRef(v: Value) bool {
         v.isPartialApp();
 }
 
-// --- collection stats (written by the single collection coordinator) ---
+// --- per-heap collection stats (written by the collection coordinator) ---
 
-var collections: u64 = 0;
-var objects_freed_total: u64 = 0;
-var last_live_bytes: u64 = 0;
-var peak_total_bytes: u64 = 0;
-var final_total_bytes: u64 = 0;
-var mark_ns_total: u64 = 0;
-var sweep_ns_total: u64 = 0;
+const ReportState = heap_mod.GcReportState;
 /// Wall time the collector spends in the STW barrier NOT marking/sweeping:
 /// waiting for every worker to reach a safepoint (time-to-safepoint) plus the
 /// post-collection release handshake. At --workers>1 this busy-spins, so it is
 /// the dominant cost of a w>1 collection — see docs/gc.md.
-var barrier_ns_total: u64 = 0;
-
 /// Monotonic nanosecond clock for GC timing (collector + barrier).
 pub const nowNs = clock.monotonicNs;
 
@@ -569,46 +561,50 @@ pub const Breakdown = struct {
     attr_live: u64,
     attr_reserved: u64,
 };
-var last_breakdown: Breakdown = std.mem.zeroes(Breakdown);
-
-pub fn recordTiming(mark_ns: u64, sweep_ns: u64) void {
-    mark_ns_total += mark_ns;
-    sweep_ns_total += sweep_ns;
+pub fn recordTiming(state: *ReportState, mark_ns: u64, sweep_ns: u64) void {
+    _ = state.mark_ns_total.fetchAdd(mark_ns, .monotonic);
+    _ = state.sweep_ns_total.fetchAdd(sweep_ns, .monotonic);
 }
 
 // Mark-phase breakdown (w=1 serial path): bitmap reset / root scan /
 // remembered-set seeding / transitive drain. Answers "where does the
 // pause go" without a profiler run.
-var reset_ns_total: u64 = 0;
-var roots_ns_total: u64 = 0;
-var remset_ns_total: u64 = 0;
-var drain_ns_total: u64 = 0;
-var remset_sources_total: u64 = 0;
-
-pub fn recordMarkPhases(reset_ns: u64, roots_ns: u64, remset_ns: u64, drain_ns: u64, remset_sources: u64) void {
-    reset_ns_total += reset_ns;
-    roots_ns_total += roots_ns;
-    remset_ns_total += remset_ns;
-    drain_ns_total += drain_ns;
-    remset_sources_total += remset_sources;
+pub fn recordMarkPhases(state: *ReportState, reset_ns: u64, roots_ns: u64, remset_ns: u64, drain_ns: u64, remset_sources: u64) void {
+    _ = state.reset_ns_total.fetchAdd(reset_ns, .monotonic);
+    _ = state.roots_ns_total.fetchAdd(roots_ns, .monotonic);
+    _ = state.remset_ns_total.fetchAdd(remset_ns, .monotonic);
+    _ = state.drain_ns_total.fetchAdd(drain_ns, .monotonic);
+    _ = state.remset_sources_total.fetchAdd(remset_sources, .monotonic);
 }
 
 /// Record barrier wall time (time-to-safepoint + release) for one collection.
-pub fn recordBarrier(ns: u64) void {
-    barrier_ns_total += ns;
+pub fn recordBarrier(state: *ReportState, ns: u64) void {
+    _ = state.barrier_ns_total.fetchAdd(ns, .monotonic);
 }
 
-pub fn recordBreakdown(b: Breakdown) void {
-    last_breakdown = b;
+pub fn recordBreakdown(state: *ReportState, b: Breakdown) void {
+    const values = [_]u64{ b.obj_live, b.obj_reserved, b.val_live, b.val_reserved, b.attr_live, b.attr_reserved };
+    for (&state.breakdown, values) |*slot, value| slot.store(value, .monotonic);
+}
+
+fn loadBreakdown(state: *const ReportState) Breakdown {
+    return .{
+        .obj_live = state.breakdown[0].load(.monotonic),
+        .obj_reserved = state.breakdown[1].load(.monotonic),
+        .val_live = state.breakdown[2].load(.monotonic),
+        .val_reserved = state.breakdown[3].load(.monotonic),
+        .attr_live = state.breakdown[4].load(.monotonic),
+        .attr_reserved = state.breakdown[5].load(.monotonic),
+    };
 }
 
 /// Record one completed collection: objects freed, surviving live bytes,
 /// and total reserved bytes (the committed-RSS high-water for this cycle).
-pub fn recordCollection(objects_freed: u64, live_bytes: u64, total_after: u64) void {
-    collections += 1;
-    objects_freed_total += objects_freed;
-    last_live_bytes = live_bytes;
-    if (total_after > peak_total_bytes) peak_total_bytes = total_after;
+pub fn recordCollection(state: *ReportState, objects_freed: u64, live_bytes: u64, total_after: u64) void {
+    _ = state.collections.fetchAdd(1, .monotonic);
+    _ = state.objects_freed_total.fetchAdd(objects_freed, .monotonic);
+    state.last_live_bytes.store(live_bytes, .monotonic);
+    _ = state.peak_total_bytes.fetchMax(total_after, .monotonic);
 }
 
 /// Live collector counters for the progress indicator: how many collections
@@ -621,17 +617,17 @@ pub const LiveReport = struct {
     freed_objects: u64,
 };
 
-pub fn liveReport() LiveReport {
+pub fn liveReport(state: *const ReportState) LiveReport {
     return .{
-        .collections = collections,
-        .live_bytes = last_live_bytes,
-        .freed_objects = objects_freed_total,
+        .collections = state.collections.load(.monotonic),
+        .live_bytes = state.last_live_bytes.load(.monotonic),
+        .freed_objects = state.objects_freed_total.load(.monotonic),
     };
 }
 
-pub fn recordFinalTotal(total: u64) void {
-    final_total_bytes = total;
-    if (total > peak_total_bytes) peak_total_bytes = total;
+pub fn recordFinalTotal(state: *ReportState, total: u64) void {
+    state.final_total_bytes.store(total, .monotonic);
+    _ = state.peak_total_bytes.fetchMax(total, .monotonic);
 }
 
 fn mb(bytes: u64) f64 {
@@ -697,24 +693,31 @@ pub fn currentRssBytes() u64 {
     return pages * std.heap.pageSize();
 }
 
-pub fn report() void {
+pub fn report(state: *const ReportState, budget_bytes: u64) void {
     // Diagnostic stderr during `zig build test --listen=-` corrupts the
     // runner. Stay silent under the test runner.
     if (builtin.is_test) return;
     std.debug.print("\n=== GC (stop-the-world mark-sweep; parallel mark at --workers>1) ===\n", .{});
-    std.debug.print("memory budget (reserved-bytes ceiling): {d:.1} MB\n", .{mb(heap_mod.ObjectHeap.gc_budget_bytes)});
-    std.debug.print("collections: {d}\n", .{collections});
-    std.debug.print("objects freed (total): {d}\n", .{objects_freed_total});
-    std.debug.print("live after last collect: {d:.1} MB\n", .{mb(last_live_bytes)});
+    const live = liveReport(state);
+    const peak_total_bytes = state.peak_total_bytes.load(.monotonic);
+    const final_total_bytes = state.final_total_bytes.load(.monotonic);
+    const mark_ns_total = state.mark_ns_total.load(.monotonic);
+    const sweep_ns_total = state.sweep_ns_total.load(.monotonic);
+    const barrier_ns_total = state.barrier_ns_total.load(.monotonic);
+    const drain_ns_total = state.drain_ns_total.load(.monotonic);
+    std.debug.print("memory budget (reserved-bytes ceiling): {d:.1} MB\n", .{mb(budget_bytes)});
+    std.debug.print("collections: {d}\n", .{live.collections});
+    std.debug.print("objects freed (total): {d}\n", .{live.freed_objects});
+    std.debug.print("live after last collect: {d:.1} MB\n", .{mb(live.live_bytes)});
     std.debug.print("peak reserved (RSS ceiling held): {d:.1} MB\n", .{mb(peak_total_bytes)});
     std.debug.print("final reserved: {d:.1} MB\n", .{mb(final_total_bytes)});
     std.debug.print("mark time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(mark_ns_total)) / 1e6});
     if (drain_ns_total > 0)
         std.debug.print("  mark phases: reset {d:.1} / roots {d:.1} / remset {d:.1} ms ({d} sources) / drain {d:.1} ms\n", .{
-            @as(f64, @floatFromInt(reset_ns_total)) / 1e6,
-            @as(f64, @floatFromInt(roots_ns_total)) / 1e6,
-            @as(f64, @floatFromInt(remset_ns_total)) / 1e6,
-            remset_sources_total,
+            @as(f64, @floatFromInt(state.reset_ns_total.load(.monotonic))) / 1e6,
+            @as(f64, @floatFromInt(state.roots_ns_total.load(.monotonic))) / 1e6,
+            @as(f64, @floatFromInt(state.remset_ns_total.load(.monotonic))) / 1e6,
+            state.remset_sources_total.load(.monotonic),
             @as(f64, @floatFromInt(drain_ns_total)) / 1e6,
         });
     std.debug.print("sweep time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(sweep_ns_total)) / 1e6});
@@ -725,12 +728,12 @@ pub fn report() void {
         std.debug.print("hugetlb mapped (now / peak): {d:.1} / {d:.1} MB (excluded from RSS lines above)\n", .{
             mb(containers.hugetlb.mappedBytes()), mb(containers.hugetlb.peakMappedBytes()),
         });
-    const b = last_breakdown;
+    const b = loadBreakdown(state);
     std.debug.print("last-collect per-store (live / reserved):\n", .{});
     std.debug.print("  objects: {d} / {d} ({d:.0}% live)\n", .{ b.obj_live, b.obj_reserved, pct(b.obj_live, b.obj_reserved) });
     std.debug.print("  values:  {d} / {d} ({d:.0}% live)\n", .{ b.val_live, b.val_reserved, pct(b.val_live, b.val_reserved) });
     std.debug.print("  attrs:   {d} / {d} ({d:.0}% live)\n", .{ b.attr_live, b.attr_reserved, pct(b.attr_live, b.attr_reserved) });
-    if (collections == 0)
+    if (live.collections == 0)
         std.debug.print("(no collection — eval stayed under the threshold)\n", .{});
 }
 
@@ -884,11 +887,10 @@ test "tracer: parallel mark reaches exactly the live set (marker_count markers, 
 }
 
 test "gc stat recorders accumulate observable deltas" {
-    const timing_before = mark_ns_total;
-    const sweep_before = sweep_ns_total;
-    recordTiming(100, 50);
-    try std.testing.expectEqual(timing_before + 100, mark_ns_total);
-    try std.testing.expectEqual(sweep_before + 50, sweep_ns_total);
+    var state: ReportState = .{};
+    recordTiming(&state, 100, 50);
+    try std.testing.expectEqual(@as(u64, 100), state.mark_ns_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 50), state.sweep_ns_total.load(.monotonic));
 
     const breakdown: Breakdown = .{
         .obj_live = 3,
@@ -898,27 +900,46 @@ test "gc stat recorders accumulate observable deltas" {
         .attr_live = 5,
         .attr_reserved = 14,
     };
-    recordBreakdown(breakdown);
-    try std.testing.expectEqual(breakdown, last_breakdown);
+    recordBreakdown(&state, breakdown);
+    try std.testing.expectEqual(breakdown, loadBreakdown(&state));
 
-    const collections_before = collections;
-    const freed_before = objects_freed_total;
-    const peak_before = peak_total_bytes;
-    recordCollection(7, 1234, peak_before + 999);
-    try std.testing.expectEqual(collections_before + 1, collections);
-    try std.testing.expectEqual(freed_before + 7, objects_freed_total);
-    try std.testing.expectEqual(@as(u64, 1234), last_live_bytes);
-    try std.testing.expectEqual(peak_before + 999, peak_total_bytes);
+    recordCollection(&state, 7, 1234, 999);
+    try std.testing.expectEqual(@as(u64, 1), state.collections.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 7), state.objects_freed_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1234), state.last_live_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 999), state.peak_total_bytes.load(.monotonic));
 
     // A smaller total-after must not lower the running peak.
-    recordCollection(0, 1234, peak_before + 1);
-    try std.testing.expectEqual(peak_before + 999, peak_total_bytes);
+    recordCollection(&state, 0, 1234, 1);
+    try std.testing.expectEqual(@as(u64, 999), state.peak_total_bytes.load(.monotonic));
 
-    recordFinalTotal(peak_before + 999);
-    try std.testing.expectEqual(peak_before + 999, final_total_bytes);
+    recordFinalTotal(&state, 999);
+    try std.testing.expectEqual(@as(u64, 999), state.final_total_bytes.load(.monotonic));
 
     // recordFinalTotal also raises the peak if the final total exceeds it.
-    recordFinalTotal(peak_before + 2000);
-    try std.testing.expectEqual(peak_before + 2000, peak_total_bytes);
-    try std.testing.expectEqual(peak_before + 2000, final_total_bytes);
+    recordFinalTotal(&state, 2000);
+    try std.testing.expectEqual(@as(u64, 2000), state.peak_total_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2000), state.final_total_bytes.load(.monotonic));
+}
+
+test "gc policy and reports are isolated per heap" {
+    var left = try ObjectHeap.init(std.testing.allocator, 1);
+    defer left.deinit();
+    var right = try ObjectHeap.init(std.testing.allocator, 1);
+    defer right.deinit();
+
+    heap_collector.enableCollect(&left, 128 << 20, 4 << 20);
+    heap_collector.enableBudget(&right, 2 << 30, false);
+    left.gcSetDisableReuse(true);
+
+    try std.testing.expectEqual(@as(u64, 128 << 20), left.gc_budget_bytes);
+    try std.testing.expectEqual(@as(u64, 4 << 20), left.gc_step_bytes);
+    try std.testing.expect(left.gc_disable_reuse);
+    try std.testing.expectEqual(@as(u64, 2 << 30), right.gc_budget_bytes);
+    try std.testing.expectEqual(@as(u64, 0), right.gc_step_bytes);
+    try std.testing.expect(!right.gc_disable_reuse);
+
+    recordCollection(&left.gc_report, 3, 4096, 8192);
+    try std.testing.expectEqual(@as(u64, 1), liveReport(&left.gc_report).collections);
+    try std.testing.expectEqual(@as(u64, 0), liveReport(&right.gc_report).collections);
 }

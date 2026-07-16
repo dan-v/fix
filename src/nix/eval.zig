@@ -569,6 +569,9 @@ pub const Evaluator = struct {
     mem_report_mode: ?[]const u8 = null,
     /// Print the collector summary during teardown.
     gc_report_on: bool = false,
+    /// Evaluator-local cap on parallel GC participants. Environment tuning of
+    /// one evaluator must not alter another evaluator in the same process.
+    gc_parallel_cap: u32 = gc_controller.default_parallel_cap,
     /// Caller-held root values (the repl's scope bindings and
     /// last results live outside any VM between evaluations). Marked by
     /// `markRoots`; replaced wholesale via `gcSetExternalRoots`.
@@ -690,8 +693,8 @@ pub const Evaluator = struct {
         // begins. The hook is instance-owned, so other evaluators are untouched.
         self.registry.path_const_sink = null;
         self.prefetch.seen.deinit(self.allocator);
-        gc.recordFinalTotal(self.heap.totalReservedBytes());
-        if (self.gc_report_on) gc.report();
+        gc.recordFinalTotal(&self.heap.gc_report, self.heap.totalReservedBytes());
+        if (self.gc_report_on) gc.report(&self.heap.gc_report, self.heap.gc_budget_bytes);
         // Shut helpers down (which joins on `defer vm.deinit()` inside
         // helperLoop) before tearing down state their VMs borrow.
         self.scheduler.deinit();
@@ -1683,11 +1686,11 @@ pub const Evaluator = struct {
         // drain the graph. Inert at --workers=1 (no peer ever parks).
         self.scheduler.gcSetMarkHook(.{ .ctx = self, .help = gcHelpMarkThunk });
         if (self.env_map) |em|
-            if (em.get("FIX_GC_NOREUSE") != null) ObjectHeap.gcSetDisableReuse(true);
+            if (em.get("FIX_GC_NOREUSE") != null) self.heap.gcSetDisableReuse(true);
         if (self.env_map) |em|
             if (em.get("FIX_GC_PAR_CAP")) |s| {
                 if (std.fmt.parseInt(u32, s, 10)) |c| {
-                    if (c >= 1) gc_controller.gc_par_cap = c;
+                    if (c >= 1) self.gc_parallel_cap = c;
                 } else |_| {}
             };
         // FIX_GC_STEP_MB (validation): collect every N MB of fresh
@@ -1922,7 +1925,7 @@ pub const Evaluator = struct {
     /// sampler thread; every read here is advisory, so no locking.
     fn readMetrics(self: *Evaluator) eval_progress.Metrics {
         const st = self.scheduler.stats();
-        const g = gc.liveReport();
+        const g = gc.liveReport(&self.heap.gc_report);
         var m: eval_progress.Metrics = .{
             .objects = self.heap.objects.count(),
             .values = self.heap.values.count(),
@@ -2122,6 +2125,7 @@ fn gcContext(ev: *Evaluator) gc_controller.Context {
         .workers = ev.gc_workers,
         .chunks_scanned = &ev.gc_chunks_scanned,
         .extra_roots = &ev.gc_extra_roots,
+        .parallel_cap = ev.gc_parallel_cap,
     };
 }
 
