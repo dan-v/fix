@@ -15,7 +15,7 @@ const setup = @import("setup.zig");
 const runner = @import("eval_support.zig");
 
 const Evaluator = engine.Evaluator;
-const ChunkId = engine.types.ChunkId;
+const ChunkId = engine.runtime.types.ChunkId;
 
 pub const synopsis =
     \\usage: fix disasm [options] [path | -e <expression>]

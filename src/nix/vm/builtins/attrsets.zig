@@ -2,6 +2,7 @@
 //! mapAttrs, removeAttrs, intersectAttrs, catAttrs, and zipAttrsWith.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
@@ -17,7 +18,7 @@ const makeBuiltinThunk = shared.makeBuiltinThunk;
 const isPlainString = strings.isPlainString;
 const stringTextInternId = strings.stringTextInternId;
 
-pub fn builtinCatAttrs(self: anytype, name_arg: Value, list_arg: Value) !Value {
+pub fn builtinCatAttrs(self: *VM, name_arg: Value, list_arg: Value) !Value {
     const name = try vm_force.forceValue(self, name_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!isPlainString(name) or !list.isList()) return error.TypeError;
@@ -43,7 +44,7 @@ pub fn builtinCatAttrs(self: anytype, name_arg: Value, list_arg: Value) !Value {
     return Value.list(try self.heap.addList(values.items));
 }
 
-pub fn builtinZipAttrsWith(self: anytype, func_arg: Value, list_arg: Value) !Value {
+pub fn builtinZipAttrsWith(self: *VM, func_arg: Value, list_arg: Value) !Value {
     const func = try vm_force.forceValue(self, func_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
@@ -92,7 +93,7 @@ pub fn builtinZipAttrsWith(self: anytype, func_arg: Value, list_arg: Value) !Val
     return Value.attrs(try self.heap.addAttrs(entries));
 }
 
-pub fn builtinZipAttrsValue(self: anytype, func_arg: Value, name_arg: Value, values_arg: Value) !Value {
+pub fn builtinZipAttrsValue(self: *VM, func_arg: Value, name_arg: Value, values_arg: Value) !Value {
     const partial = try vm_closures.callValue(self, func_arg, name_arg);
     return vm_closures.callValue(self, partial, values_arg);
 }
@@ -104,7 +105,7 @@ pub fn attrEntryNameIndex(entries: []const heap_mod.AttrEntry, name: InternId) ?
     return null;
 }
 
-pub fn builtinAttrNames(self: anytype, arg: Value) !Value {
+pub fn builtinAttrNames(self: *VM, arg: Value) !Value {
     const entries = try sortedAttrEntries(self, arg);
     defer self.allocator.free(entries);
 
@@ -117,7 +118,7 @@ pub fn builtinAttrNames(self: anytype, arg: Value) !Value {
     return Value.list(try self.heap.addList(values));
 }
 
-pub fn builtinAttrValues(self: anytype, arg: Value) !Value {
+pub fn builtinAttrValues(self: *VM, arg: Value) !Value {
     const entries = try sortedAttrEntries(self, arg);
     defer self.allocator.free(entries);
 
@@ -130,7 +131,7 @@ pub fn builtinAttrValues(self: anytype, arg: Value) !Value {
     return Value.list(try self.heap.addList(values));
 }
 
-pub fn sortedAttrEntries(self: anytype, arg: Value) ![]heap_mod.AttrEntry {
+pub fn sortedAttrEntries(self: *VM, arg: Value) ![]heap_mod.AttrEntry {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) return error.TypeError;
 
@@ -145,7 +146,7 @@ pub fn sortedAttrEntries(self: anytype, arg: Value) ![]heap_mod.AttrEntry {
     return sorted;
 }
 
-pub fn builtinHasAttr(self: anytype, name_arg: Value, attrs_arg: Value) !Value {
+pub fn builtinHasAttr(self: *VM, name_arg: Value, attrs_arg: Value) !Value {
     const name = try vm_force.forceValue(self, name_arg);
     const attrs = try vm_force.forceValue(self, attrs_arg);
     if (!name.isString() or !attrs.isAttrs()) return error.TypeError;
@@ -157,7 +158,7 @@ pub fn builtinHasAttr(self: anytype, name_arg: Value, attrs_arg: Value) !Value {
     return Value.boolVal(true);
 }
 
-pub fn builtinGetAttr(self: anytype, name_arg: Value, attrs_arg: Value) !Value {
+pub fn builtinGetAttr(self: *VM, name_arg: Value, attrs_arg: Value) !Value {
     const name = try vm_force.forceValue(self, name_arg);
     const attrs = try vm_force.forceValue(self, attrs_arg);
     if (!name.isString() or !attrs.isAttrs()) return error.TypeError;
@@ -165,7 +166,7 @@ pub fn builtinGetAttr(self: anytype, name_arg: Value, attrs_arg: Value) !Value {
     return vm_force.forceValue(self, try self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()));
 }
 
-pub fn builtinMapAttrs(self: anytype, fn_arg: Value, attrs_arg: Value) !Value {
+pub fn builtinMapAttrs(self: *VM, fn_arg: Value, attrs_arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, attrs_arg);
     if (!attrs.isAttrs()) return error.TypeError;
 
@@ -208,13 +209,13 @@ pub fn builtinMapAttrs(self: anytype, fn_arg: Value, attrs_arg: Value) !Value {
     return Value.attrs(try self.heap.addAttrsSorted(out));
 }
 
-pub fn builtinMapAttrValue(self: anytype, func_arg: Value, name_arg: Value, value_arg: Value) !Value {
+pub fn builtinMapAttrValue(self: *VM, func_arg: Value, name_arg: Value, value_arg: Value) !Value {
     const func = try vm_force.forceValue(self, func_arg);
     const partial = try vm_closures.callValue(self, func, name_arg);
     return vm_closures.callValue(self, partial, value_arg);
 }
 
-pub fn builtinFunctionArgs(self: anytype, arg: Value) !Value {
+pub fn builtinFunctionArgs(self: *VM, arg: Value) !Value {
     const func = try vm_force.forceValue(self, arg);
     // PAPs wrap merged *value*-lambda chunks, which carry no formal-arg
     // metadata — `functionArgs` of a simple-param lambda is `{}`, same as
@@ -234,7 +235,7 @@ pub fn builtinFunctionArgs(self: anytype, arg: Value) !Value {
     return Value.attrs(try self.heap.addAttrs(ch.function_args));
 }
 
-pub fn builtinUnsafeGetAttrPos(self: anytype, name_arg: Value, attrs_arg: Value) !Value {
+pub fn builtinUnsafeGetAttrPos(self: *VM, name_arg: Value, attrs_arg: Value) !Value {
     const name = try vm_force.forceValue(self, name_arg);
     const attrs = try vm_force.forceValue(self, attrs_arg);
     if (!isPlainString(name) or !attrs.isAttrs()) return error.TypeError;
@@ -263,7 +264,7 @@ pub fn builtinUnsafeGetAttrPos(self: anytype, name_arg: Value, attrs_arg: Value)
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-pub fn builtinRemoveAttrs(self: anytype, attrs_arg: Value, names_arg: Value) !Value {
+pub fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, attrs_arg);
     const names = try vm_force.forceValue(self, names_arg);
     if (!attrs.isAttrs() or !names.isList()) return error.TypeError;
@@ -338,7 +339,7 @@ fn sortedEntryIndex(entries: []const heap_mod.AttrEntry, name: InternId) ?usize 
 /// ~12K cycles per call scanning entries the small side can never match.
 const INTERSECT_SKEW = 8;
 
-pub fn builtinIntersectAttrs(self: anytype, left_arg: Value, right_arg: Value) !Value {
+pub fn builtinIntersectAttrs(self: *VM, left_arg: Value, right_arg: Value) !Value {
     const left = try vm_force.forceValue(self, left_arg);
     const right = try vm_force.forceValue(self, right_arg);
     if (!left.isAttrs() or !right.isAttrs()) return error.TypeError;

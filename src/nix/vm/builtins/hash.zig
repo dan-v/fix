@@ -1,6 +1,7 @@
 //! Nix hashing builtins: hashString and hashFile.
 
 const Value = @import("runtime").value.Value;
+const VM = @import("../context.zig").VM;
 const nix_hash = @import("runtime").hash;
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
@@ -10,7 +11,7 @@ const pathArg = strings.pathArg;
 const stringTextInternId = strings.stringTextInternId;
 const isPlainString = strings.isPlainString;
 
-pub fn builtinHashString(self: anytype, algorithm_arg: Value, string_arg: Value) !Value {
+pub fn builtinHashString(self: *VM, algorithm_arg: Value, string_arg: Value) !Value {
     const algorithm_value = try vm_force.forceValue(self, algorithm_arg);
     const string_value = try vm_force.forceValue(self, string_arg);
     if (!isPlainString(algorithm_value) or !isPlainString(string_value)) return error.TypeError;
@@ -21,7 +22,7 @@ pub fn builtinHashString(self: anytype, algorithm_arg: Value, string_arg: Value)
     return Value.string(try self.intern.intern(digest));
 }
 
-pub fn builtinHashFile(self: anytype, algorithm_arg: Value, path_arg: Value) !Value {
+pub fn builtinHashFile(self: *VM, algorithm_arg: Value, path_arg: Value) !Value {
     const algorithm = try stringArg(self, algorithm_arg);
     const contents = try self.files.readFile(try pathArg(self, path_arg));
     const digest = try nix_hash.hashBytes(self.allocator, algorithm, contents);

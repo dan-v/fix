@@ -24,10 +24,10 @@ const setup = @import("setup.zig");
 const debugger = @import("debugger.zig");
 const render_err = @import("render.zig");
 const engine = @import("nix");
-const runtime_value = engine.value;
-const thunk_mod = engine.thunk;
+const runtime_value = engine.runtime.value;
+const thunk_mod = engine.runtime.thunk;
 const future_mod = engine.runtime.future;
-const types = engine.types;
+const types = engine.runtime.types;
 
 const commands = @import("repl/commands.zig");
 const check = @import("repl/check.zig");
@@ -629,7 +629,7 @@ const Repl = struct {
     /// external roots (every bound value + the attrset itself, so nothing
     /// is ever reachable only through a swept object).
     fn rebuildScope(self: *Repl) !void {
-        var entries: std.ArrayListUnmanaged(engine.heap.AttrEntry) = .empty;
+        var entries: std.ArrayListUnmanaged(engine.runtime.heap.AttrEntry) = .empty;
         defer entries.deinit(self.allocator);
         var roots: std.ArrayListUnmanaged(Value) = .empty;
         defer roots.deinit(self.allocator);

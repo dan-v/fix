@@ -7,10 +7,10 @@
 //! insertion/merge, `outputs` union/dedup/sort, GC rooting, and post-force slice
 //! re-fetching — means the rooting and set rules stay in lock-step.
 //!
-//! Every function takes `self: anytype` so a concrete `*VM` and the generic
-//! builtin receivers share one implementation without a wrapper layer.
+//! Every operation takes the concrete `*VM` interface used by the builtins.
 
 const std = @import("std");
+const VM = @import("context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
@@ -20,7 +20,7 @@ const vm_force = @import("force.zig");
 const strings = @import("strings.zig");
 
 /// Insert `value` under `name`, merging into any existing entry for `name`.
-pub fn appendContextEntry(self: anytype, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), name: InternId, value: Value) !void {
+pub fn appendContextEntry(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), name: InternId, value: Value) !void {
     for (context.items) |*entry| {
         if (entry.name == name) {
             // GC: mergeContextValues forces; the already-accumulated entries in
@@ -37,7 +37,7 @@ pub fn appendContextEntry(self: anytype, context: *std.ArrayListUnmanaged(heap_m
     try context.append(self.allocator, .{ .name = name, .value = value });
 }
 
-pub fn mergeContextValues(self: anytype, left: Value, right: Value) !Value {
+pub fn mergeContextValues(self: *VM, left: Value, right: Value) !Value {
     // GC: `left` is held across the force of `right`, and both forced ids are
     // held across mergeContextAttrs (which forces). Root both across the walk.
     const gc_roots = vm_force.rootsBegin(self);
@@ -52,7 +52,7 @@ pub fn mergeContextValues(self: anytype, left: Value, right: Value) !Value {
     return right;
 }
 
-pub fn mergeContextAttrs(self: anytype, left_id: ObjectId, right_id: ObjectId) !ObjectId {
+pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !ObjectId {
     // GC: `left`/`right` are raw attr slices held across mergeContextAttrValue
     // -> mergeContextOutputs forces; keep their owner objects live.
     const gc_roots = vm_force.rootsBegin(self);
@@ -101,12 +101,12 @@ pub fn mergeContextAttrs(self: anytype, left_id: ObjectId, right_id: ObjectId) !
     return self.heap.addAttrsSorted(merged.items);
 }
 
-pub fn mergeContextAttrValue(self: anytype, name: InternId, left: Value, right: Value) !Value {
+pub fn mergeContextAttrValue(self: *VM, name: InternId, left: Value, right: Value) !Value {
     if (name == try self.intern.intern("outputs")) return mergeContextOutputs(self, left, right);
     return right;
 }
 
-pub fn mergeContextOutputs(self: anytype, left: Value, right: Value) !Value {
+pub fn mergeContextOutputs(self: *VM, left: Value, right: Value) !Value {
     // GC: `left`/`right` (and their forced list slices) are held across the
     // per-item forces in appendUniqueContextOutput; keep the lists live.
     const gc_roots = vm_force.rootsBegin(self);
@@ -142,7 +142,7 @@ pub fn mergeContextOutputs(self: anytype, left: Value, right: Value) !Value {
     return Value.list(try self.heap.addList(outputs.items));
 }
 
-pub fn appendUniqueContextOutput(self: anytype, outputs: *std.ArrayListUnmanaged(Value), item: Value) !void {
+pub fn appendUniqueContextOutput(self: *VM, outputs: *std.ArrayListUnmanaged(Value), item: Value) !void {
     const value = try vm_force.forceValue(self, item);
     if (!strings.isPlainString(value)) return error.TypeError;
     const text = try strings.stringTextInternId(self, value);

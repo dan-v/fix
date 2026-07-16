@@ -7,7 +7,7 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const derivation_debug = @import("derivation_debug.zig");
-const eval_gc = @import("nix").eval_gc;
+const eval_memory = @import("nix").eval.memory;
 const hugetlb = @import("nix").process_support.memory_backing;
 
 pub const OutputFormat = enum {
@@ -252,7 +252,7 @@ pub const Options = struct {
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
     /// GC collection-line override in bytes (`--max-memory`); see
-    /// `eval/gc.zig:memoryBudget`. `null` = the automatic RAM-scaled line;
+    /// `eval/gc_controller.zig:memoryBudget`. `null` = the automatic RAM-scaled line;
     /// `0` = never collect.
     max_memory: ?u64 = null,
     /// `--hugetlb auto|on|off`: back the evaluation heap with explicit 2 MB
@@ -710,7 +710,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .debug_derivation_filter => options.derivation_debug.filter = v0.?,
         .debug_derivation_name => options.derivation_debug.name = v0.?,
         .debug_derivation_drv => options.derivation_debug.drv_path = v0.?,
-        .max_memory => options.max_memory = eval_gc.parseMemorySize(v0.?) orelse return error.InvalidMaxMemory,
+        .max_memory => options.max_memory = eval_memory.parseSize(v0.?) orelse return error.InvalidMaxMemory,
         .hugetlb => options.hugetlb = hugetlb.parseMode(v0.?) orelse return error.InvalidHugetlbMode,
         .help => return error.Help,
 

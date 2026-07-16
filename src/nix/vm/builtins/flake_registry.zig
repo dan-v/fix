@@ -10,10 +10,11 @@
 //! works wherever a flake builtin runs, independent of the CLI.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 
 /// Resolve indirect `ref` (`id` or `id/refOrRev`) to a concrete flakeref string
 /// owned by `self.allocator`, or null when it isn't a known indirect id.
-pub fn resolve(self: anytype, ref: []const u8) !?[]u8 {
+pub fn resolve(self: *VM, ref: []const u8) !?[]u8 {
     const slash = std.mem.indexOfScalar(u8, ref, '/');
     const id = if (slash) |i| ref[0..i] else ref;
     if (id.len == 0) return null;
@@ -26,14 +27,14 @@ pub fn resolve(self: anytype, ref: []const u8) !?[]u8 {
     return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base, ref[slash.? + 1 ..] });
 }
 
-fn envVar(self: anytype, name: []const u8) !?[]const u8 {
+fn envVar(self: *VM, name: []const u8) !?[]const u8 {
     const host = self.import_host orelse return null;
     const v = try host.get_env(host.context, name);
     return if (v.len == 0) null else v;
 }
 
 /// `$<xdg>/<tail>`, else `$HOME/<home_prefix>/<tail>`. Owned; null if neither.
-fn xdgPath(self: anytype, xdg: []const u8, home_prefix: []const u8, tail: []const u8) !?[]u8 {
+fn xdgPath(self: *VM, xdg: []const u8, home_prefix: []const u8, tail: []const u8) !?[]u8 {
     if (try envVar(self, xdg)) |dir| {
         return try std.fs.path.join(self.allocator, &.{ dir, tail });
     }
@@ -41,7 +42,7 @@ fn xdgPath(self: anytype, xdg: []const u8, home_prefix: []const u8, tail: []cons
     return try std.fs.path.join(self.allocator, &.{ home, home_prefix, tail });
 }
 
-fn lookupId(self: anytype, id: []const u8) !?[]u8 {
+fn lookupId(self: *VM, id: []const u8) !?[]u8 {
     if (try xdgPath(self, "XDG_CONFIG_HOME", ".config", "nix/registry.json")) |path| {
         defer self.allocator.free(path);
         if (try lookupIn(self, path, id)) |r| return r;
@@ -54,7 +55,7 @@ fn lookupId(self: anytype, id: []const u8) !?[]u8 {
     return null;
 }
 
-fn lookupIn(self: anytype, path: []const u8, id: []const u8) !?[]u8 {
+fn lookupIn(self: *VM, path: []const u8, id: []const u8) !?[]u8 {
     const data = self.files.readFile(path) catch return null;
     var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return null;
     defer parsed.deinit();

@@ -17,10 +17,8 @@
 //! threaded through the import call stack.
 //!
 //! The top-level functions (importPath, forceEntry, scopedImportPath) are
-//! Evaluator methods split into this file to keep eval.zig manageable — they
-//! re-enter the Evaluator (evaluateSource, resolveHostPath, progress). `ev:
-//! anytype` isn't loose coupling; it's how a method body in a sibling file
-//! names its receiver without a *file*-level @import cycle with eval.zig.
+//! The explicit `Host` below is the narrow evaluator capability surface this
+//! subsystem needs; it keeps import coordination independent of `Evaluator`.
 
 const std = @import("std");
 const Value = @import("runtime").value.Value;
@@ -30,6 +28,36 @@ const fiber_mod = @import("base").fiber;
 const worker_mod = @import("../vm.zig").worker;
 const SpinMutex = @import("base").sync.SpinMutex;
 const timeline = @import("../probe.zig").timeline;
+const FileCache = @import("../host.zig").FileCache;
+const ResolvedPath = @import("search_path.zig").ResolvedPath;
+const Stage = @import("../observ.zig").progress.Stage;
+
+pub const Host = struct {
+    allocator: std.mem.Allocator,
+    imports: *Registry,
+    files: *FileCache,
+    context: *anyopaque,
+    resolve_host_path: *const fn (*anyopaque, []const u8) anyerror!ResolvedPath,
+    evaluate_source: *const fn (*anyopaque, []const u8, ?[]const u8, ?[]const u8, ?Value, u32) anyerror!Value,
+    progress_begin: *const fn (*anyopaque, Stage, []const u8) void,
+    progress_end: *const fn (*anyopaque, Stage, []const u8) void,
+
+    fn resolveHostPath(self: Host, path: []const u8) !ResolvedPath {
+        return self.resolve_host_path(self.context, path);
+    }
+
+    fn evaluateSource(self: Host, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value, parent_depth: u32) !Value {
+        return self.evaluate_source(self.context, source, base_path, source_path, scope, parent_depth);
+    }
+
+    fn progressBegin(self: Host, stage: Stage, subject: []const u8) void {
+        self.progress_begin(self.context, stage, subject);
+    }
+
+    fn progressEnd(self: Host, stage: Stage, subject: []const u8) void {
+        self.progress_end(self.context, stage, subject);
+    }
+};
 
 /// Path → in-flight `ImportEntry`. The mutex is held only briefly
 /// during lookup/insert; the entry's own `Future` coordinates the
@@ -122,13 +150,13 @@ pub fn checkScopedCycle(path: []const u8) !void {
 /// with eval.zig (this is an extracted Evaluator method, not loose coupling);
 /// it must expose `allocator`, `imports`, `files`, `progress*`,
 /// `evaluateSource`, and `resolveHostPath`.
-pub fn importPath(ev: anytype, path: []const u8, parent_depth: u32) !Value {
+pub fn importPath(ev: Host, path: []const u8, parent_depth: u32) !Value {
     const resolved = try ev.resolveHostPath(path);
     defer if (resolved.owned) ev.allocator.free(resolved.text);
     return importResolvedPath(ev, resolved.text, parent_depth);
 }
 
-pub fn importResolvedPath(ev: anytype, path: []const u8, parent_depth: u32) anyerror!Value {
+pub fn importResolvedPath(ev: Host, path: []const u8, parent_depth: u32) anyerror!Value {
     const entry = try ev.imports.lookupOrCreate(ev.allocator, path);
     return forceEntry(ev, path, entry, parent_depth);
 }
@@ -139,7 +167,7 @@ pub fn importResolvedPath(ev: anytype, path: []const u8, parent_depth: u32) anye
 /// terminal state. Cycle detection comes for free from `Future`:
 /// same-claimer recursion returns `.blackhole`, which we translate
 /// to `error.ImportCycle`.
-pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry, parent_depth: u32) anyerror!Value {
+pub fn forceEntry(ev: Host, path: []const u8, entry: *ImportEntry, parent_depth: u32) anyerror!Value {
     const me = currentClaimer();
     while (true) {
         switch (entry.future.tryClaim(me)) {
@@ -176,7 +204,7 @@ pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry, parent_dep
 /// always fail deterministically. If allocation itself fails, we
 /// fall back to `Future.reset` (transient), so the next caller
 /// retries.
-fn publishCompileFailure(ev: anytype, entry: *ImportEntry, err: anyerror) void {
+fn publishCompileFailure(ev: Host, entry: *ImportEntry, err: anyerror) void {
     // Resource-pressure failures may not repeat on a later force —
     // NEVER cache them as the import's deterministic result (a
     // speculative prefetch fiber hitting fiber-stack/memory limits
@@ -206,7 +234,7 @@ fn currentClaimer() future_mod.ClaimerId {
 
 /// Caller has already claimed the `ImportEntry`. Reads the source
 /// (or returns the synthetic corepkgs string), then evaluates.
-pub fn compileImportPath(ev: anytype, path: []const u8, parent_depth: u32) anyerror!Value {
+pub fn compileImportPath(ev: Host, path: []const u8, parent_depth: u32) anyerror!Value {
     const stable_path = try ev.allocator.dupe(u8, path);
     defer ev.allocator.free(stable_path);
 
@@ -225,13 +253,13 @@ pub fn compileImportPath(ev: anytype, path: []const u8, parent_depth: u32) anyer
     return ev.evaluateSource(source, source_base, stable_path, null, parent_depth);
 }
 
-pub fn scopedImportPath(ev: anytype, scope: Value, path: []const u8, parent_depth: u32) !Value {
+pub fn scopedImportPath(ev: Host, scope: Value, path: []const u8, parent_depth: u32) !Value {
     const resolved = try ev.resolveHostPath(path);
     defer if (resolved.owned) ev.allocator.free(resolved.text);
     return scopedImportResolvedPath(ev, scope, resolved.text, parent_depth);
 }
 
-pub fn scopedImportResolvedPath(ev: anytype, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
+pub fn scopedImportResolvedPath(ev: Host, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
     const stable_path = try ev.allocator.dupe(u8, path);
     defer ev.allocator.free(stable_path);
 
@@ -255,13 +283,13 @@ pub fn scopedImportResolvedPath(ev: anytype, scope: Value, path: []const u8, par
     return ev.evaluateSource(source, source_base, stable_path, scope, parent_depth);
 }
 
-pub fn importDirectory(ev: anytype, path: []const u8, parent_depth: u32) anyerror!Value {
+pub fn importDirectory(ev: Host, path: []const u8, parent_depth: u32) anyerror!Value {
     const default_path = try std.fs.path.resolve(ev.allocator, &.{ path, "default.nix" });
     defer ev.allocator.free(default_path);
     return importResolvedPath(ev, default_path, parent_depth);
 }
 
-pub fn scopedImportDirectory(ev: anytype, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
+pub fn scopedImportDirectory(ev: Host, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
     const default_path = try std.fs.path.resolve(ev.allocator, &.{ path, "default.nix" });
     defer ev.allocator.free(default_path);
     return scopedImportResolvedPath(ev, scope, default_path, parent_depth);

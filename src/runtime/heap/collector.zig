@@ -84,7 +84,7 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
 }
 
 /// Lazy variant (the production collection-line policy, see
-/// `eval_gc.memoryBudget`): don't start any per-allocation tracking yet — just
+/// `gc_controller.memoryBudget`): don't start any per-allocation tracking yet — just
 /// watch the reserved-bytes cursor. At half the line the safepoint driver arms
 /// tracking (STW, `armTracking`); at the line it collects. A run that never
 /// reaches line/2 pays ZERO tracking cost (no young-slot appends, no write

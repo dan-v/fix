@@ -1,6 +1,7 @@
 //! Source and store builtins that operate on local paths and evaluator state.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
@@ -23,14 +24,14 @@ const pathArg = strings.pathArg;
 const stringArg = strings.stringArg;
 const stringTextInternId = strings.stringTextInternId;
 
-pub fn builtinGetEnv(self: anytype, name_arg: Value) !Value {
+pub fn builtinGetEnv(self: *VM, name_arg: Value) !Value {
     const name = try stringArg(self, name_arg);
     const host = self.import_host orelse return Value.string(try self.intern.intern(""));
     const value = try host.get_env(host.context, name);
     return Value.string(try self.intern.intern(value));
 }
 
-pub fn builtinToPath(self: anytype, arg: Value) !Value {
+pub fn builtinToPath(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     const text_id: InternId = switch (value.kind()) {
         .path, .string, .string_context => try stringTextInternId(self, value),
@@ -41,7 +42,7 @@ pub fn builtinToPath(self: anytype, arg: Value) !Value {
     return Value.string(text_id);
 }
 
-pub fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value {
+pub fn builtinToFile(self: *VM, name_arg: Value, contents_arg: Value) !Value {
     const name_value = try vm_force.forceValue(self, name_arg);
     if (!isStringLike(name_value)) return error.TypeError;
 
@@ -87,14 +88,14 @@ fn validateStorePathName(name: []const u8) !void {
 /// stable ObjectId to key on; a bare primop has no GC identity, so it returns
 /// `null` and its filtered ingest is never memoized (recomputed each time). The
 /// GC token pins the id against post-collection reuse (see `FilterKey`).
-pub fn filterKeyOf(self: anytype, pred: Value) ?source_paths.FilterKey {
+pub fn filterKeyOf(self: *VM, pred: Value) ?source_paths.FilterKey {
     if (pred.isClosure() or pred.isBuiltinClosure() or pred.isPartialApp()) {
         return .{ .object_id = pred.asObjectId(), .token = self.heap.token };
     }
     return null;
 }
 
-pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Value {
+pub fn builtinFilterSource(self: *VM, pred_arg: Value, path_arg: Value) !Value {
     const pred = try vm_force.forceValue(self, pred_arg);
     const root_arg = try pathArg(self, path_arg);
     const root = try self.allocator.dupe(u8, root_arg);
@@ -125,7 +126,7 @@ pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Val
 /// `file '<path>' has an unsupported type` message (using the path the
 /// serializer recorded) before re-raising. Shared by the `path`/`filterSource`
 /// copy-to-store builtins.
-pub fn reportUnsupportedType(self: anytype, unsupported: *const nar.Unsupported, err: anyerror) anyerror {
+pub fn reportUnsupportedType(self: *VM, unsupported: *const nar.Unsupported, err: anyerror) anyerror {
     if (err == error.UnsupportedPathType) {
         if (unsupported.path) |p| {
             const msg = std.fmt.allocPrint(self.allocator, "file '{s}' has an unsupported type", .{p}) catch return err;
@@ -136,7 +137,7 @@ pub fn reportUnsupportedType(self: anytype, unsupported: *const nar.Unsupported,
     return err;
 }
 
-pub fn filterSourceAccepts(self: anytype, pred: Value, path: []const u8, kind: file_cache.FileCache.FileKind) !bool {
+pub fn filterSourceAccepts(self: *VM, pred: Value, path: []const u8, kind: file_cache.FileCache.FileKind) !bool {
     const path_value = Value.string(try self.intern.intern(path));
     const kind_value = Value.string(try self.intern.intern(kind.nixTypeName()));
     const partial = try vm_closures.callValue(self, pred, path_value);

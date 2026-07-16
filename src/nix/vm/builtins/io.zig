@@ -4,6 +4,7 @@
 //! to warm the FileCache ahead of the demand walk (cache-only, demand-invisible).
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const Value = @import("runtime").value.Value;
 const heap_mod = @import("runtime").heap;
 const path_ops = @import("runtime").paths;
@@ -18,7 +19,7 @@ const pathArg = strings.pathArg;
 const stringTextInternId = strings.stringTextInternId;
 const isPlainString = strings.isPlainString;
 
-pub fn builtinPathExists(self: anytype, arg: Value) !Value {
+pub fn builtinPathExists(self: *VM, arg: Value) !Value {
     const path = try demandPathArg(self, arg);
     if (!try self.files.pathExists(path)) return Value.boolVal(false);
     // A trailing `/` or `/.` requires the target to be a directory (Nix): the
@@ -30,12 +31,12 @@ pub fn builtinPathExists(self: anytype, arg: Value) !Value {
     return Value.boolVal(true);
 }
 
-pub fn builtinReadFile(self: anytype, arg: Value) !Value {
+pub fn builtinReadFile(self: *VM, arg: Value) !Value {
     const contents = try self.files.readFile(try demandPathArg(self, arg));
     return Value.string(try self.intern.intern(contents));
 }
 
-pub fn builtinReadFileType(self: anytype, arg: Value) !Value {
+pub fn builtinReadFileType(self: *VM, arg: Value) !Value {
     const kind = try self.files.fileType(try demandPathArg(self, arg));
     return Value.string(try self.intern.intern(kind.nixTypeName()));
 }
@@ -53,7 +54,7 @@ const DemandContext = struct {
 /// paths return after one uncached filesystem probe and never touch realization
 /// state. A missing derivation output is reconstructed solely from the store's
 /// owned recipes and the output descriptor in the context string.
-pub fn demandPathArg(self: anytype, arg: Value) ![]const u8 {
+pub fn demandPathArg(self: *VM, arg: Value) ![]const u8 {
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, arg);
@@ -97,7 +98,7 @@ fn isStorePath(path: []const u8, store_dir: []const u8) bool {
         path.len > store_dir.len and path[store_dir.len] == '/';
 }
 
-fn demandContext(self: anytype, value: Value) !?DemandContext {
+fn demandContext(self: *VM, value: Value) !?DemandContext {
     if (!value.isContextString()) return null;
     const context_entries = (try self.heap.getContextString(value.asObjectId())).context;
     var drv_name: ?@import("runtime").types.InternId = null;
@@ -146,7 +147,7 @@ fn demandContext(self: anytype, value: Value) !?DemandContext {
     return .{ .drv_path = self.intern.get(name), .outputs = try self.allocator.alloc([]const u8, 0) };
 }
 
-pub fn builtinImport(self: anytype, arg: Value) !Value {
+pub fn builtinImport(self: *VM, arg: Value) !Value {
     const host = self.import_host orelse return error.ImportUnavailable;
     // `import drv` is import-from-derivation: realize the output first so the
     // file to import exists on disk.
@@ -154,7 +155,7 @@ pub fn builtinImport(self: anytype, arg: Value) !Value {
     return host.import_value(host.context, path, self.native_depth);
 }
 
-pub fn builtinScopedImport(self: anytype, scope_arg: Value, path_arg: Value) !Value {
+pub fn builtinScopedImport(self: *VM, scope_arg: Value, path_arg: Value) !Value {
     const scope = try vm_force.forceValue(self, scope_arg);
     if (!scope.isAttrs()) return vm_trace.typeErrorExpected(self, "attrs", scope);
     const host = self.import_host orelse return error.ImportUnavailable;
@@ -162,7 +163,7 @@ pub fn builtinScopedImport(self: anytype, scope_arg: Value, path_arg: Value) !Va
     return host.scoped_import(host.context, scope, path, self.native_depth);
 }
 
-pub fn builtinReadDir(self: anytype, arg: Value) !Value {
+pub fn builtinReadDir(self: *VM, arg: Value) !Value {
     const dir_path = try demandPathArg(self, arg);
     var cold = false;
     const dir_entries = try self.files.readDirCold(dir_path, &cold);
@@ -207,7 +208,7 @@ const FileKindCount = @typeInfo(@import("../../host.zig").FileCache.FileKind).@"
 const readdir_prefetch_batch = 32;
 
 fn maybePrefetchChildDirs(
-    self: anytype,
+    self: *VM,
     dir_path: []const u8,
     dir_entries: []const FileCache.DirEntry,
 ) void {
@@ -251,7 +252,7 @@ fn maybePrefetchChildDirs(
     }
 }
 
-pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !Value {
+pub fn builtinFindFile(self: *VM, search_path_arg: Value, name_arg: Value) !Value {
     const search_path = try vm_force.forceValue(self, search_path_arg);
     if (!search_path.isList()) return error.TypeError;
     const name = try pathArg(self, name_arg);
@@ -318,7 +319,7 @@ pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !
     return error.FileNotFound;
 }
 
-pub fn findFileCandidate(self: anytype, base: []const u8, prefix: []const u8, name: []const u8) !?[]u8 {
+pub fn findFileCandidate(self: *VM, base: []const u8, prefix: []const u8, name: []const u8) !?[]u8 {
     const suffix = path_ops.searchPathSuffix(prefix, name) orelse return null;
     const candidate = try std.fs.path.resolve(self.allocator, &.{ base, suffix });
     errdefer self.allocator.free(candidate);

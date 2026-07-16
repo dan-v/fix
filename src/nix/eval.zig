@@ -38,7 +38,7 @@ const eval_progress = @import("observ.zig").progress;
 const timeline = @import("probe.zig").timeline;
 const ast_mod = @import("syntax").ast;
 const deferred_mod = @import("compiler.zig").deferred_table;
-const Run = @import("eval/run.zig").Run;
+const EvaluationReport = @import("eval/evaluation_report.zig").EvaluationReport;
 const path_ops = @import("runtime").paths;
 const eval_print = @import("eval/print.zig");
 const search_path_mod = @import("eval/search_path.zig");
@@ -51,7 +51,8 @@ const debugger_state = @import("eval/debugger_state.zig");
 const worker_mod = @import("vm.zig").worker;
 const io_offload = @import("vm.zig").io_offload;
 const daemon_runtime_mod = host.daemon_runtime;
-const eval_gc = @import("eval/gc.zig");
+const gc_controller = @import("eval/gc_controller.zig");
+pub const memory = @import("eval/memory.zig");
 const fiber_mod = @import("base").fiber;
 const prof = @import("probe.zig").prof;
 const compiler_mod = @import("compiler.zig");
@@ -197,7 +198,7 @@ pub const DebugSession = struct {
     /// Render `v` for display (forces thunks as needed), same formatting as the
     /// repl. Runs on the paused fiber's VM.
     pub fn writeValue(self: *DebugSession, writer: *std.Io.Writer, v: Value) !void {
-        return eval_print.writeValue(self.ev, writer, v);
+        return eval_print.writeValue(valuePrintHost(self.ev), writer, v);
     }
 
     /// Look up interned text (e.g. a source file id).
@@ -525,8 +526,8 @@ pub const Evaluator = struct {
     main_worker: ?*worker_mod.Worker,
     /// Per-evaluation state (diagnostics + trace + string arena). Cleared
     /// at the start of each `evaluate()`; helpers writing diagnostics from
-    /// import error paths serialize on `run.mu`.
-    run: Run,
+    /// import error paths serialize on `report.mu`.
+    report: EvaluationReport,
     /// Lazy per-attr compilation: deferred attrset value bodies, compiled
     /// on first force. See `compiler/deferred_table.zig`.
     deferred_table: deferred_mod.Table,
@@ -561,7 +562,7 @@ pub const Evaluator = struct {
     gc_chunks_scanned: ChunkId = 0,
     /// `--max-memory` override for the collector's memory
     /// budget, in bytes (0 = never collect). `null` = resolve the default
-    /// (otherwise half of MemAvailable) — see `eval/gc.zig:memoryBudget`.
+    /// (otherwise half of MemAvailable) — see `eval/gc_controller.zig:memoryBudget`.
     /// Set by the CLI before evaluation.
     max_memory_bytes: ?u64 = null,
     /// Optional teardown memory report (`"dump"` also lists registered VMAs).
@@ -642,7 +643,7 @@ pub const Evaluator = struct {
             .thunk_trace = if (vm_mod.thunks_log_enabled) null else {},
             .worker_count = worker_count,
             .main_worker = null,
-            .run = Run.init(allocator),
+            .report = EvaluationReport.init(allocator),
             .deferred_table = deferred_mod.Table.init(allocator),
             .retained_arenas = .empty,
             .retained_arenas_mu = .{},
@@ -715,7 +716,7 @@ pub const Evaluator = struct {
         self.gc_import_vms.deinit(self.allocator);
         self.gc_extra_roots.deinit(self.allocator);
         self.allocator.free(self.gc_workers);
-        self.run.deinit();
+        self.report.deinit();
         self.imports.deinit(self.allocator);
         self.search_paths.deinit(self.allocator);
         self.fetchers.deinit();
@@ -743,11 +744,11 @@ pub const Evaluator = struct {
     }
 
     pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {
-        return self.run.diagnosticsView();
+        return self.report.diagnosticsView();
     }
 
     pub fn getTrace(self: *const Evaluator) *const EvalTrace {
-        return self.run.traceView();
+        return self.report.traceView();
     }
 
     pub fn setDerivationDebug(self: *Evaluator, enabled: bool) void {
@@ -902,11 +903,11 @@ pub const Evaluator = struct {
     }
 
     fn clearDiagnostics(self: *Evaluator) void {
-        self.run.clear();
+        self.report.clear();
     }
 
     fn copyDiagnostics(self: *Evaluator, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
-        try self.run.replaceDiagnostics(diagnostics, source, source_path);
+        try self.report.replaceDiagnostics(diagnostics, source, source_path);
     }
 
     /// Parse and compile source text into a registered chunk id. Used by
@@ -1376,8 +1377,8 @@ pub const Evaluator = struct {
         // the VM (fiber-local), so no threadlocal dance is needed.
         vm.native_depth = parent_depth -| 1;
         // This VM isn't in a Worker's fiber list; make its roots visible to GC.
-        eval_gc.registerVm(self, &vm);
-        defer eval_gc.unregisterVm(self, &vm);
+        gc_controller.registerVm(gcContext(self), &vm);
+        defer gc_controller.unregisterVm(gcContext(self), &vm);
         return vm.eval(chunk_id);
     }
 
@@ -1412,7 +1413,7 @@ pub const Evaluator = struct {
             // Helpers (worker_id != 0) don't write to the shared trace —
             // it's a side effect of *real* evaluation, so speculative force
             // stays invisible to it.
-            .trace_sink = if (worker_id == 0) &self.run.trace else null,
+            .trace_sink = if (worker_id == 0) &self.report.trace else null,
             // All workers get the *concurrent span* half of the progress
             // protocol (`beginSpan`/`endSpan` — store writes, fetches), whose
             // std.Progress nodes are independent and lock-free-safe from any
@@ -1460,7 +1461,7 @@ pub const Evaluator = struct {
         self.progressBegin(.render, "result");
         timeline.instant(.render, "result");
         defer self.progressEnd(.render, "result");
-        self.run.trace.clear();
+        self.report.trace.clear();
         return self.runWithVm(vm_builtins.writeJsonValue, .{ writer, value });
     }
 
@@ -1468,12 +1469,12 @@ pub const Evaluator = struct {
         self.progressBegin(.render, "result");
         timeline.instant(.render, "result");
         defer self.progressEnd(.render, "result");
-        self.run.trace.clear();
+        self.report.trace.clear();
         return self.runWithVm(vm_builtins.writeLazyXmlValue, .{ writer, value });
     }
 
     pub fn forceValue(self: *Evaluator, value: Value) !Value {
-        self.run.trace.clear();
+        self.report.trace.clear();
         return self.runWithVm(vm_force.forceValue, .{value});
     }
 
@@ -1598,7 +1599,7 @@ pub const Evaluator = struct {
         self.progressBegin(.render, "strict result");
         defer self.progressEnd(.render, "strict result");
         timeline.instant(.render, "strict result");
-        self.run.trace.clear();
+        self.report.trace.clear();
         return self.runWithVm(vm_force.forceDeepCounted, .{value});
     }
 
@@ -1615,8 +1616,8 @@ pub const Evaluator = struct {
             defer scratch.deinit();
             var vm = try self.initVm(0, scratch.allocator());
             defer vm.deinit();
-            eval_gc.registerVm(self, &vm);
-            defer eval_gc.unregisterVm(self, &vm);
+            gc_controller.registerVm(gcContext(self), &vm);
+            defer gc_controller.unregisterVm(gcContext(self), &vm);
             return @call(.auto, body, .{&vm} ++ args);
         }
         const Args = @TypeOf(args);
@@ -1636,8 +1637,8 @@ pub const Evaluator = struct {
                     return;
                 };
                 defer vm.deinit();
-                eval_gc.registerVm(ctx.ev, &vm);
-                defer eval_gc.unregisterVm(ctx.ev, &vm);
+                gc_controller.registerVm(gcContext(ctx.ev), &vm);
+                defer gc_controller.unregisterVm(gcContext(ctx.ev), &vm);
                 const result = @call(.auto, body, .{&vm} ++ ctx.body_args) catch |e| {
                     ctx.err = e;
                     return;
@@ -1686,7 +1687,7 @@ pub const Evaluator = struct {
         if (self.env_map) |em|
             if (em.get("FIX_GC_PAR_CAP")) |s| {
                 if (std.fmt.parseInt(u32, s, 10)) |c| {
-                    if (c >= 1) eval_gc.gc_par_cap = c;
+                    if (c >= 1) gc_controller.gc_par_cap = c;
                 } else |_| {}
             };
         // FIX_GC_STEP_MB (validation): collect every N MB of fresh
@@ -1699,27 +1700,27 @@ pub const Evaluator = struct {
         }
         // Collection line: no collection runs until heap-reserved bytes
         // cross it (automatic `clamp(½·MemTotal, 256MB, 8GB)`, overridable
-        // via `--max-memory`; see `eval_gc.memoryBudget`).
+        // via `--max-memory`; see `gc_controller.memoryBudget`).
         // On a roomy machine that line dwarfs the eval → never fires: zero
         // pauses AND zero tracking (lazy arming at line/2, see
         // `heap_collector.enableBudget`); on a tight machine it fires before the
         // eval OOMs. Override 0 = never collect (bump-only). FIX_GC_STEP_MB
         // keeps the eager validation path (tracking from the start).
-        const budget = eval_gc.memoryBudget(self);
+        const budget = gc_controller.memoryBudget(gcContext(self));
         if (step_bytes > 0)
             heap_collector.enableCollect(&self.heap, budget, step_bytes)
         else if (budget > 0)
-            heap_collector.enableBudget(&self.heap, budget, eval_gc.constrainedMode(self, budget));
+            heap_collector.enableBudget(&self.heap, budget, gc_controller.constrainedMode(gcContext(self), budget));
         return w;
     }
 
     /// Type-erased trampoline for the heap's collect callback. Kept here
     /// (next to `setGcHook`) so the `*const fn(*anyopaque, u8) void` ABI
-    /// stays exact; the body lives in `eval/gc.zig`. `collector_id` is the
+    /// stays exact; the body lives in `eval/gc_controller.zig`. `collector_id` is the
     /// worker that won the collection (its parallel-mark slot).
     fn gcCollectThunk(ctx: *anyopaque, collector_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        eval_gc.collect(self, collector_id);
+        gc_controller.collect(gcContext(self), collector_id);
     }
 
     /// Replace the caller-held external root set (see
@@ -1791,7 +1792,7 @@ pub const Evaluator = struct {
         if (!self.scheduler.gcTryBeginCollection()) return result;
         self.scheduler.gcWaitAllParked(0);
         self.heap.token = runtime.heap.next_heap_token.fetchAdd(1, .monotonic);
-        eval_gc.collectMajor(self, 0);
+        gc_controller.collectMajor(gcContext(self), 0);
         self.scheduler.gcEndCollection(0);
         result.ran = true;
         result.reserved_after = self.heap.totalReservedBytes();
@@ -1800,15 +1801,15 @@ pub const Evaluator = struct {
 
     /// Type-erased trampoline for the scheduler's parallel-mark hook: a parked
     /// peer helps drain marker slot `worker_id` to termination. Kept here for
-    /// the exact fn-pointer ABI; the body lives in `eval/gc.zig`.
+    /// the exact fn-pointer ABI; the body lives in `eval/gc_controller.zig`.
     fn gcHelpMarkThunk(ctx: *anyopaque, worker_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        eval_gc.helpMark(self, worker_id);
+        gc_controller.helpMark(gcContext(self), worker_id);
     }
 
     fn importValue(context: *anyopaque, path: []const u8, parent_depth: u32) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return imports_mod.importPath(self, path, parent_depth);
+        return imports_mod.importPath(importHost(self), path, parent_depth);
     }
 
     /// This Evaluator's `ChunkRegistry.path_const_sink` target
@@ -1836,7 +1837,7 @@ pub const Evaluator = struct {
 
     fn scopedImportValue(context: *anyopaque, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return imports_mod.scopedImportPath(self, scope, path, parent_depth);
+        return imports_mod.scopedImportPath(importHost(self), scope, path, parent_depth);
     }
 
     fn findFile(context: *anyopaque, name: []const u8) anyerror!Value {
@@ -2039,7 +2040,89 @@ fn ReturnPayload(comptime F: type) type {
 /// fiber's identity threads through via initVm, so we don't need a
 /// fresh VM here ourselves.
 fn writeValueBody(_: *VM, ev: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
-    return eval_print.writeValue(ev, writer, value);
+    return eval_print.writeValue(valuePrintHost(ev), writer, value);
+}
+
+fn valuePrintHost(ev: *Evaluator) eval_print.Host {
+    return .{
+        .allocator = ev.allocator,
+        .heap = &ev.heap,
+        .intern = &ev.intern,
+        .value_color = ev.value_color,
+        .context = ev,
+        .force_value = printForceValue,
+        .progress_count_begin = printProgressCountBegin,
+        .progress_step = printProgressStep,
+    };
+}
+
+fn printForceValue(context: *anyopaque, value: Value) anyerror!Value {
+    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    return ev.forceValue(value);
+}
+
+fn printProgressCountBegin(context: *anyopaque, total: usize) bool {
+    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    return ev.progressCountBegin(total);
+}
+
+fn printProgressStep(context: *anyopaque, completed: usize, total: usize) void {
+    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    ev.progressStep(completed, total);
+}
+
+fn importHost(ev: *Evaluator) imports_mod.Host {
+    return .{
+        .allocator = ev.allocator,
+        .imports = &ev.imports,
+        .files = &ev.files,
+        .context = ev,
+        .resolve_host_path = importResolveHostPath,
+        .evaluate_source = importEvaluateSource,
+        .progress_begin = importProgressBegin,
+        .progress_end = importProgressEnd,
+    };
+}
+
+fn importResolveHostPath(context: *anyopaque, path: []const u8) anyerror!search_path_mod.ResolvedPath {
+    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    return ev.resolveHostPath(path);
+}
+
+fn importEvaluateSource(context: *anyopaque, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value, parent_depth: u32) anyerror!Value {
+    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    return ev.evaluateSource(source, base_path, source_path, scope, parent_depth);
+}
+
+fn importProgressBegin(context: *anyopaque, stage: eval_progress.Stage, subject: []const u8) void {
+    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    ev.progressBegin(stage, subject);
+}
+
+fn importProgressEnd(context: *anyopaque, stage: eval_progress.Stage, subject: []const u8) void {
+    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    ev.progressEnd(stage, subject);
+}
+
+fn gcContext(ev: *Evaluator) gc_controller.Context {
+    return .{
+        .allocator = ev.allocator,
+        .heap = &ev.heap,
+        .registry = &ev.registry,
+        .scheduler = &ev.scheduler,
+        .realization = &ev.store.realization,
+        .imports = &ev.imports,
+        .builtins_value = &ev.builtins_value,
+        .env_map = ev.env_map,
+        .worker_count = ev.worker_count,
+        .max_memory_bytes = ev.max_memory_bytes,
+        .tracer = &ev.gc_tracer,
+        .import_vms = &ev.gc_import_vms,
+        .import_vms_mu = &ev.gc_import_vms_mu,
+        .workers = ev.gc_workers,
+        .chunks_scanned = &ev.gc_chunks_scanned,
+        .extra_roots = &ev.gc_extra_roots,
+    };
 }
 
 test {

@@ -17,7 +17,7 @@ const sync = @import("base").sync;
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const Trace = trace_mod.Trace;
 
-pub const Run = struct {
+pub const EvaluationReport = struct {
     /// Parent allocator. Used for `diagnostics` (which doesn't store strings)
     /// and for the trace's internal allocations.
     allocator: std.mem.Allocator,
@@ -28,7 +28,7 @@ pub const Run = struct {
     trace: Trace,
     mu: sync.SpinMutex,
 
-    pub fn init(allocator: std.mem.Allocator) Run {
+    pub fn init(allocator: std.mem.Allocator) EvaluationReport {
         return .{
             .allocator = allocator,
             .string_arena = @import("base").arena.ArenaAllocator.init(allocator),
@@ -38,19 +38,19 @@ pub const Run = struct {
         };
     }
 
-    pub fn deinit(self: *Run) void {
+    pub fn deinit(self: *EvaluationReport) void {
         self.trace.deinit();
         self.diagnostics.deinit(self.allocator);
         self.string_arena.deinit();
     }
 
-    pub fn clear(self: *Run) void {
+    pub fn clear(self: *EvaluationReport) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.clearLocked();
     }
 
-    fn clearLocked(self: *Run) void {
+    fn clearLocked(self: *EvaluationReport) void {
         self.diagnostics.clearRetainingCapacity();
         _ = self.string_arena.reset(.retain_capacity);
         self.trace.clear();
@@ -61,7 +61,7 @@ pub const Run = struct {
     /// `fallback_source_path` are used for diagnostics that don't carry
     /// their own.
     pub fn replaceDiagnostics(
-        self: *Run,
+        self: *EvaluationReport,
         incoming: []const Diagnostic,
         fallback_source: []const u8,
         fallback_source_path: ?[]const u8,
@@ -85,11 +85,11 @@ pub const Run = struct {
     }
 
     /// Borrowed slice; safe to read after helpers have quiesced.
-    pub fn diagnosticsView(self: *const Run) []const Diagnostic {
+    pub fn diagnosticsView(self: *const EvaluationReport) []const Diagnostic {
         return self.diagnostics.items;
     }
 
-    pub fn traceView(self: *const Run) *const Trace {
+    pub fn traceView(self: *const EvaluationReport) *const Trace {
         return &self.trace;
     }
 };

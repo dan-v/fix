@@ -56,7 +56,7 @@ pub const Driver = struct {
 /// at the max-concurrent-VM high-water instead, and stops the re-fault
 /// churn. Buffers come back dirty; that's fine — every consumer is
 /// bounded by `sp`/`frames_len`, including the GC's stack scan
-/// (eval/gc.zig marks `stack[0..sp]`).
+/// (eval/gc_controller.zig marks `stack[0..sp]`).
 pub const BufferPool = struct {
     allocator: std.mem.Allocator,
     mu: SpinMutex = .{},

@@ -5,6 +5,7 @@
 //! parallel evaluation (speculative and demand-safe).
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
@@ -22,13 +23,13 @@ const isCallable = strings.isCallable;
 const isPlainString = strings.isPlainString;
 const stringTextInternId = strings.stringTextInternId;
 
-pub fn builtinLength(self: anytype, arg: Value) !Value {
+pub fn builtinLength(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isList()) return error.TypeError;
     return Value.int(@intCast(try self.heap.getListLen(value.asObjectId())));
 }
 
-pub fn builtinHead(self: anytype, arg: Value) !Value {
+pub fn builtinHead(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isList()) return error.TypeError;
     const items = try self.heap.getList(value.asObjectId());
@@ -36,7 +37,7 @@ pub fn builtinHead(self: anytype, arg: Value) !Value {
     return vm_force.forceValue(self, items[0]);
 }
 
-pub fn builtinTail(self: anytype, arg: Value) !Value {
+pub fn builtinTail(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isList()) return error.TypeError;
     const items = try self.heap.getList(value.asObjectId());
@@ -44,7 +45,7 @@ pub fn builtinTail(self: anytype, arg: Value) !Value {
     return Value.list(try self.heap.addList(items[1..]));
 }
 
-pub fn builtinConcatLists(self: anytype, arg: Value) !Value {
+pub fn builtinConcatLists(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isList()) return error.TypeError;
 
@@ -67,7 +68,7 @@ pub fn builtinConcatLists(self: anytype, arg: Value) !Value {
     return Value.list(try self.heap.addList(out.items));
 }
 
-pub fn builtinListToAttrs(self: anytype, arg: Value) !Value {
+pub fn builtinListToAttrs(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isList()) return error.TypeError;
 
@@ -110,7 +111,7 @@ pub fn builtinListToAttrs(self: anytype, arg: Value) !Value {
     return Value.attrs(try self.heap.addAttrsWithPositions(entries.items, positions.items));
 }
 
-pub fn callComparator(self: anytype, cmp: Value, left: Value, right: Value) !bool {
+pub fn callComparator(self: *VM, cmp: Value, left: Value, right: Value) !bool {
     const partial = try vm_closures.callValue(self, cmp, left);
     const result = try vm_force.forceValue(self, try vm_closures.callValue(self, partial, right));
     if (!result.isBool()) return error.TypeError;
@@ -132,7 +133,7 @@ fn gcKeyMix(tag: u64, x: u64) u64 {
     return h ^ (h >> 31);
 }
 
-fn gcKeyHashCode(self: anytype, key: Value) !u64 {
+fn gcKeyHashCode(self: *VM, key: Value) !u64 {
     if (numeric.isNumeric(key)) {
         const f = try numeric.toFloat(key, self.heap);
         const norm: f64 = if (f == 0.0) 0.0 else f; // collapse -0.0 -> 0.0
@@ -183,7 +184,7 @@ pub const GcKeySet = struct {
 };
 
 pub fn genericClosureAppend(
-    self: anytype,
+    self: *VM,
     key_name: InternId,
     item: Value,
     result: *std.ArrayListUnmanaged(Value),
@@ -196,7 +197,7 @@ pub fn genericClosureAppend(
     try result.append(self.allocator, item);
 }
 
-pub fn builtinElemAt(self: anytype, list_arg: Value, index_arg: Value) !Value {
+pub fn builtinElemAt(self: *VM, list_arg: Value, index_arg: Value) !Value {
     const list = try vm_force.forceValue(self, list_arg);
     const index = try vm_force.forceValue(self, index_arg);
     if (!list.isList() or !int_mod.isAnyInt(index)) return error.TypeError;
@@ -210,7 +211,7 @@ pub fn builtinElemAt(self: anytype, list_arg: Value, index_arg: Value) !Value {
     return vm_force.forceValue(self, items[i]);
 }
 
-pub fn builtinElem(self: anytype, needle: Value, list_arg: Value) !Value {
+pub fn builtinElem(self: *VM, needle: Value, list_arg: Value) !Value {
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
 
@@ -221,17 +222,17 @@ pub fn builtinElem(self: anytype, needle: Value, list_arg: Value) !Value {
 
 // seq/deepSeq are general forcing operations, not list-specific, but they
 // live here grouped as sequence operations.
-pub fn builtinSeq(self: anytype, first: Value, second: Value) !Value {
+pub fn builtinSeq(self: *VM, first: Value, second: Value) !Value {
     _ = try vm_force.forceValue(self, first);
     return vm_force.forceValue(self, second);
 }
 
-pub fn builtinDeepSeq(self: anytype, first: Value, second: Value) !Value {
+pub fn builtinDeepSeq(self: *VM, first: Value, second: Value) !Value {
     try vm_force.forceDeep(self, first);
     return vm_force.forceValue(self, second);
 }
 
-pub fn builtinAll(self: anytype, pred_arg: Value, list_arg: Value) !Value {
+pub fn builtinAll(self: *VM, pred_arg: Value, list_arg: Value) !Value {
     const pred = try vm_force.forceValue(self, pred_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
@@ -249,7 +250,7 @@ pub fn builtinAll(self: anytype, pred_arg: Value, list_arg: Value) !Value {
     return Value.boolVal(true);
 }
 
-pub fn builtinAny(self: anytype, pred_arg: Value, list_arg: Value) !Value {
+pub fn builtinAny(self: *VM, pred_arg: Value, list_arg: Value) !Value {
     const pred = try vm_force.forceValue(self, pred_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
@@ -267,7 +268,7 @@ pub fn builtinAny(self: anytype, pred_arg: Value, list_arg: Value) !Value {
     return Value.boolVal(false);
 }
 
-pub fn builtinFilter(self: anytype, pred_arg: Value, list_arg: Value) !Value {
+pub fn builtinFilter(self: *VM, pred_arg: Value, list_arg: Value) !Value {
     const pred = try vm_force.forceValue(self, pred_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
@@ -292,7 +293,7 @@ pub fn builtinFilter(self: anytype, pred_arg: Value, list_arg: Value) !Value {
     return Value.list(try self.heap.addList(out.items));
 }
 
-pub fn builtinMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
+pub fn builtinMap(self: *VM, fn_arg: Value, list_arg: Value) !Value {
     const func = try vm_force.forceValue(self, fn_arg);
     if (!try isCallable(self, func)) return error.NotCallable;
     const list = try vm_force.forceValue(self, list_arg);
@@ -318,12 +319,12 @@ pub fn builtinMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     return Value.list(try self.heap.addList(out));
 }
 
-pub fn builtinMapValue(self: anytype, func_arg: Value, item_arg: Value) !Value {
+pub fn builtinMapValue(self: *VM, func_arg: Value, item_arg: Value) !Value {
     const func = try vm_force.forceValue(self, func_arg);
     return vm_closures.callValue(self, func, item_arg);
 }
 
-pub fn builtinConcatMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
+pub fn builtinConcatMap(self: *VM, fn_arg: Value, list_arg: Value) !Value {
     const func = try vm_force.forceValue(self, fn_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
@@ -353,7 +354,7 @@ pub fn builtinConcatMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     return Value.list(try self.heap.addList(out.items));
 }
 
-pub fn builtinGenList(self: anytype, fn_arg: Value, count_arg: Value) !Value {
+pub fn builtinGenList(self: *VM, fn_arg: Value, count_arg: Value) !Value {
     const func = try vm_force.forceValue(self, fn_arg);
     const count = try vm_force.forceValue(self, count_arg);
     if (!int_mod.isAnyInt(count)) return error.TypeError;
@@ -387,7 +388,7 @@ pub fn builtinGenList(self: anytype, fn_arg: Value, count_arg: Value) !Value {
     return Value.list(try self.heap.addList(out));
 }
 
-pub fn builtinSort(self: anytype, cmp_arg: Value, list_arg: Value) !Value {
+pub fn builtinSort(self: *VM, cmp_arg: Value, list_arg: Value) !Value {
     const cmp = try vm_force.forceValue(self, cmp_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
@@ -409,7 +410,7 @@ pub fn builtinSort(self: anytype, cmp_arg: Value, list_arg: Value) !Value {
     return Value.list(try self.heap.addList(sorted));
 }
 
-pub fn builtinPartition(self: anytype, pred_arg: Value, list_arg: Value) !Value {
+pub fn builtinPartition(self: *VM, pred_arg: Value, list_arg: Value) !Value {
     const pred = try vm_force.forceValue(self, pred_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
@@ -443,7 +444,7 @@ pub fn builtinPartition(self: anytype, pred_arg: Value, list_arg: Value) !Value 
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-pub fn builtinGroupBy(self: anytype, fn_arg: Value, list_arg: Value) !Value {
+pub fn builtinGroupBy(self: *VM, fn_arg: Value, list_arg: Value) !Value {
     const func = try vm_force.forceValue(self, fn_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
@@ -491,7 +492,7 @@ pub fn builtinGroupBy(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     return Value.attrs(try self.heap.addAttrs(entries));
 }
 
-pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
+pub fn builtinGenericClosure(self: *VM, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
     if (!attrs.isAttrs()) return error.TypeError;
 
@@ -539,7 +540,7 @@ pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
     return Value.list(try self.heap.addList(result.items));
 }
 
-pub fn builtinFoldlStrict(self: anytype, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {
+pub fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {
     const op = try vm_force.forceValue(self, op_arg);
     // The initial accumulator stays lazy — Nix's foldl' is not strict in the
     // seed, so `foldl' (_: x: x) (throw "…") xs` never forces the throw. Only

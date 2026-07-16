@@ -1,6 +1,7 @@
 //! Builtin dispatch and builtin implementations for the bytecode VM.
 
 const Value = @import("runtime").value.Value;
+const VM = @import("context.zig").VM;
 const builtins_mod = @import("runtime").builtins;
 const BuiltinId = builtins_mod.BuiltinId;
 const shared = @import("builtins/shared.zig");
@@ -26,7 +27,7 @@ pub const writeJsonValue = serial.writeJsonValue;
 pub const writeLazyXmlValue = serial.writeLazyXmlValue;
 pub const demandPathArg = io.demandPathArg;
 
-pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value {
+pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
     const t = prof.startBuiltin(builtin_id);
     defer prof.end(.apply_builtin, t);
     const id: BuiltinId = @enumFromInt(builtin_id);

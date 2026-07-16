@@ -1,6 +1,7 @@
 //! Structured tree fetches and flake graph evaluation.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const ObjectId = types.ObjectId;
@@ -46,7 +47,7 @@ const fetchSpanEnd = fetch.fetchSpanEnd;
 /// `fetch-tree` experimental feature (Nix parity). `getFlake` bypasses this by
 /// calling `builtinFetchTree` directly, matching Nix where flake fetching does
 /// not additionally require the user to enable `fetch-tree`.
-pub fn builtinFetchTreeEntry(self: anytype, arg: Value) !Value {
+pub fn builtinFetchTreeEntry(self: *VM, arg: Value) !Value {
     if (!self.policy.fetch_tree_enabled) {
         // A hard eval error, like Nix: not catchable by `builtins.tryEval`
         // (which only intercepts NixThrow/NixAbort/AssertionFailed/FileNotFound).
@@ -56,7 +57,7 @@ pub fn builtinFetchTreeEntry(self: anytype, arg: Value) !Value {
     return builtinFetchTree(self, arg);
 }
 
-pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
+pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
     if (attrs.isPath()) {
         const path = self.intern.get(attrs.asInternId());
@@ -154,29 +155,29 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
 /// parity). A hard eval error, like the `fetch-tree` gate: not catchable by
 /// `builtins.tryEval`. `getFlake`/`parseFlakeRef` call each other and the
 /// fetcher via their un-suffixed impls, so those internal calls bypass this.
-fn requireFlakes(self: anytype) !void {
+fn requireFlakes(self: *VM) !void {
     if (!self.policy.flakes_enabled) {
         try vm_trace.setErrorMessage(self, "flakes are disabled; pass --extra-experimental-features flakes to enable them");
         return error.MissingExperimentalFeature;
     }
 }
 
-pub fn builtinGetFlakeEntry(self: anytype, arg: Value) !Value {
+pub fn builtinGetFlakeEntry(self: *VM, arg: Value) !Value {
     try requireFlakes(self);
     return builtinGetFlake(self, arg);
 }
 
-pub fn builtinParseFlakeRefEntry(self: anytype, arg: Value) !Value {
+pub fn builtinParseFlakeRefEntry(self: *VM, arg: Value) !Value {
     try requireFlakes(self);
     return builtinParseFlakeRef(self, arg);
 }
 
-pub fn builtinFlakeRefToStringEntry(self: anytype, arg: Value) !Value {
+pub fn builtinFlakeRefToStringEntry(self: *VM, arg: Value) !Value {
     try requireFlakes(self);
     return builtinFlakeRefToString(self, arg);
 }
 
-pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
+pub fn builtinGetFlake(self: *VM, arg: Value) !Value {
     const ref = try stringArg(self, arg);
     const ref_value = Value.string(try self.intern.intern(ref));
     // GC: many intermediate flake values are held live across fetches / output
@@ -217,7 +218,7 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
 }
 
 /// Import + force the flake.nix attrset at `<out_path>[/dir]`.
-fn importFlakeValue(self: anytype, out_path: []const u8, dir: ?[]const u8) !Value {
+fn importFlakeValue(self: *VM, out_path: []const u8, dir: ?[]const u8) !Value {
     const flake_path = if (dir) |d|
         try std.fs.path.join(self.allocator, &.{ out_path, d, "flake.nix" })
     else
@@ -230,13 +231,13 @@ fn importFlakeValue(self: anytype, out_path: []const u8, dir: ?[]const u8) !Valu
 }
 
 /// The (forced) `outputs` function of an imported flake attrset.
-fn flakeOutputs(self: anytype, flake_value: Value) !Value {
+fn flakeOutputs(self: *VM, flake_value: Value) !Value {
     const outputs_id = try self.intern.intern("outputs");
     return vm_force.forceValue(self, try self.heap.getAttrValue(flake_value.asObjectId(), outputs_id));
 }
 
 /// Import the flake.nix at `<out_path>[/dir]` and return its (forced) `outputs`.
-fn flakeOutputsFunc(self: anytype, out_path: []const u8, dir: ?[]const u8) !Value {
+fn flakeOutputsFunc(self: *VM, out_path: []const u8, dir: ?[]const u8) !Value {
     return flakeOutputs(self, try importFlakeValue(self, out_path, dir));
 }
 
@@ -244,7 +245,7 @@ fn flakeOutputsFunc(self: anytype, out_path: []const u8, dir: ?[]const u8) !Valu
 /// inputs into `out_entries` (each a fetched, evaluated input flake). Returns
 /// false (leaving `out_entries` untouched) when there is no lock file, so the
 /// caller can fall back to the flake.nix `inputs` declarations.
-fn resolveRootInputs(self: anytype, out_path: []const u8, dir: ?[]const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !bool {
+fn resolveRootInputs(self: *VM, out_path: []const u8, dir: ?[]const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !bool {
     const lock_path = if (dir) |d|
         try std.fs.path.join(self.allocator, &.{ out_path, d, "flake.lock" })
     else
@@ -287,7 +288,7 @@ fn resolveRootInputs(self: anytype, out_path: []const u8, dir: ?[]const u8, out_
 /// as null so `resolveFlakeNode`, on force, builds the input flake's own
 /// sub-inputs from its flake.nix (recursively, also lazily). Because each input
 /// is a thunk, an input an output never touches is never fetched.
-fn buildFlakeNixInputThunks(self: anytype, flake_value: Value, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !void {
+fn buildFlakeNixInputThunks(self: *VM, flake_value: Value, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !void {
     const inputs_id = try self.intern.intern("inputs");
     const inputs_v = (self.heap.getAttrValueOpt(flake_value.asObjectId(), inputs_id) catch return) orelse return;
     const inputs = try vm_force.forceValue(self, inputs_v);
@@ -319,7 +320,7 @@ fn buildFlakeNixInputThunks(self: anytype, flake_value: Value, out_entries: *std
 /// `ref_attrs` and, if it's a flake, evaluates its outputs. `sub_inputs` is the
 /// pre-built input thunks from the lock, or null — in which case the input
 /// flake's own sub-inputs are built (lazily) from its fetched flake.nix.
-pub fn resolveFlakeNode(self: anytype, ref_attrs: Value, sub_inputs: Value, is_flake: Value) anyerror!Value {
+pub fn resolveFlakeNode(self: *VM, ref_attrs: Value, sub_inputs: Value, is_flake: Value) anyerror!Value {
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, ref_attrs);
@@ -392,7 +393,7 @@ fn followInput(nodes: std.json.ObjectMap, root_name: []const u8, input_target: s
 /// Its own inputs are pre-built as thunks — cheap, no fetching — and handed to
 /// `resolveFlakeNode`, so the whole lock graph is lazy. Memoized by node name so
 /// a shared node (a diamond) is a single thunk, forced at most once.
-fn buildNodeThunk(self: anytype, nodes: std.json.ObjectMap, node_name: []const u8, root_name: []const u8, memo: *std.StringHashMapUnmanaged(Value), depth: u32) !Value {
+fn buildNodeThunk(self: *VM, nodes: std.json.ObjectMap, node_name: []const u8, root_name: []const u8, memo: *std.StringHashMapUnmanaged(Value), depth: u32) !Value {
     if (memo.get(node_name)) |t| return t;
     if (depth > 256) return error.InvalidFlakeLock; // runaway / cyclic lock guard
 
@@ -435,7 +436,7 @@ fn buildNodeThunk(self: anytype, nodes: std.json.ObjectMap, node_name: []const u
 /// Only under store writes, where fix computes the real NAR hash (plain eval
 /// uses an offline synthetic), and only for the tree types whose NAR hash is
 /// confirmed to match Nix (forges/tarball/path); git/mercurial/file are skipped.
-fn verifyLockedNarHash(self: anytype, ref_attrs: Value, src_info: Value) !void {
+fn verifyLockedNarHash(self: *VM, ref_attrs: Value, src_info: Value) !void {
     if (!self.realization.storeWritesEnabled()) return;
     if (!ref_attrs.isAttrs()) return;
     const ty = (try optionalStringAttr(self, ref_attrs.asObjectId(), "type")) orelse return;
@@ -460,7 +461,7 @@ fn verifyLockedNarHash(self: anytype, ref_attrs: Value, src_info: Value) !void {
 /// unparseable hash, path not valid) returns null and the caller fetches.
 /// Reuses the same store-path scheme (`sourcePath`) and value constructors the
 /// real fetch would, so a skipped fetch is indistinguishable from a real one.
-fn flakeInputFromStore(self: anytype, attrs: Value) !?Value {
+fn flakeInputFromStore(self: *VM, attrs: Value) !?Value {
     if (!self.realization.storeWritesEnabled()) return null;
     if (!attrs.isAttrs()) return null;
     const id = attrs.asObjectId();
@@ -503,7 +504,7 @@ fn flakeInputFromStore(self: anytype, attrs: Value) !?Value {
 /// Build a Nix attrset from a flake.lock `locked` node's JSON (string + integer
 /// fields — type/owner/repo/rev/url/path/narHash/lastModified/...), suitable as
 /// input to `builtinFetchTree`.
-fn jsonObjectToAttrs(self: anytype, obj: std.json.ObjectMap) !Value {
+fn jsonObjectToAttrs(self: *VM, obj: std.json.ObjectMap) !Value {
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
     var it = obj.iterator();
@@ -518,7 +519,7 @@ fn jsonObjectToAttrs(self: anytype, obj: std.json.ObjectMap) !Value {
     return Value.attrs(try self.heap.addAttrs(entries.items));
 }
 
-fn flakeSelfInput(self: anytype, source_info: Value) !Value {
+fn flakeSelfInput(self: *VM, source_info: Value) !Value {
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
     try entries.append(self.allocator, .{ .name = try self.intern.intern("_type"), .value = Value.string(try self.intern.intern("flake")) });
@@ -532,7 +533,7 @@ fn flakeSelfInput(self: anytype, source_info: Value) !Value {
     return Value.attrs(try self.heap.addAttrs(entries.items));
 }
 
-fn flakeResultValue(self: anytype, source_info: Value, inputs: Value, outputs: Value) !Value {
+fn flakeResultValue(self: *VM, source_info: Value, inputs: Value, outputs: Value) !Value {
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
 
@@ -557,7 +558,7 @@ fn flakeResultValue(self: anytype, source_info: Value, inputs: Value, outputs: V
     return Value.attrs(try self.heap.addAttrs(entries.items));
 }
 
-fn appendExistingAttr(self: anytype, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), attrs_id: ObjectId, name: []const u8) !void {
+fn appendExistingAttr(self: *VM, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), attrs_id: ObjectId, name: []const u8) !void {
     const name_id = try self.intern.intern(name);
     const value = self.heap.getAttrValue(attrs_id, name_id) catch |err| switch (err) {
         error.MissingAttribute => return,
@@ -573,7 +574,7 @@ fn looksLikeGitRev(s: []const u8) bool {
     return true;
 }
 
-pub fn builtinParseFlakeRef(self: anytype, arg: Value) !Value {
+pub fn builtinParseFlakeRef(self: *VM, arg: Value) !Value {
     const ref = try stringArg(self, arg);
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
@@ -657,7 +658,7 @@ pub fn builtinParseFlakeRef(self: anytype, arg: Value) !Value {
     return error.InvalidFlakeRef;
 }
 
-pub fn builtinFlakeRefToString(self: anytype, arg: Value) !Value {
+pub fn builtinFlakeRefToString(self: *VM, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
     if (!attrs.isAttrs()) return error.TypeError;
 
@@ -702,7 +703,7 @@ pub fn builtinFlakeRefToString(self: anytype, arg: Value) !Value {
     return error.InvalidFlakeRef;
 }
 
-fn appendFlakeQueryAttrs(self: anytype, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), query: []const u8) !void {
+fn appendFlakeQueryAttrs(self: *VM, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), query: []const u8) !void {
     var parts = std.mem.splitScalar(u8, query, '&');
     while (parts.next()) |part| {
         if (part.len == 0) continue;
@@ -718,7 +719,7 @@ fn appendFlakeQueryAttrs(self: anytype, entries: *std.ArrayListUnmanaged(heap_mo
     }
 }
 
-fn appendFlakeQueryString(self: anytype, attrs_id: ObjectId, name: []const u8, out: *std.ArrayListUnmanaged(u8), first: *bool) !void {
+fn appendFlakeQueryString(self: *VM, attrs_id: ObjectId, name: []const u8, out: *std.ArrayListUnmanaged(u8), first: *bool) !void {
     const value = try optionalStringAttr(self, attrs_id, name) orelse return;
     defer self.allocator.free(value);
     try out.append(self.allocator, if (first.*) '?' else '&');

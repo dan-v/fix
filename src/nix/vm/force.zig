@@ -189,13 +189,13 @@ inline fn memoKeyForBytecode(b: *const thunk_mod.BytecodeThunk) ?MemoKey {
 //
 pub const RootScope = usize;
 
-pub inline fn rootsBegin(self: anytype) RootScope {
+pub inline fn rootsBegin(self: *VM) RootScope {
     return self.gc_temp_roots.items.len;
 }
-pub inline fn rootsEnd(self: anytype, scope: RootScope) void {
+pub inline fn rootsEnd(self: *VM, scope: RootScope) void {
     self.gc_temp_roots.items.len = scope;
 }
-pub inline fn rootKeep(self: anytype, v: Value) void {
+pub inline fn rootKeep(self: *VM, v: Value) void {
     // DORMANT GATE (the temp-root flavor of forceThunkImpl's force-chain
     // gate — see the soundness argument there): while collection is
     // unarmed these roots cannot be observed, so skip the append. Once

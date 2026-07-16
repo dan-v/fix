@@ -3,6 +3,7 @@
 //! context-entry helpers those and other builtin families share.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
@@ -18,7 +19,7 @@ const vm_trace = @import("../trace.zig");
 /// file's own builtins) share the one canonical, GC-safe implementation.
 pub const appendContextEntry = context_merge.appendContextEntry;
 
-pub fn builtinGetContext(self: anytype, arg: Value) !Value {
+pub fn builtinGetContext(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     // getContext does not coerce — a path or derivation is a type error (unlike
     // string concatenation, which coerces them).
@@ -28,12 +29,12 @@ pub fn builtinGetContext(self: anytype, arg: Value) !Value {
     return Value.attrs(try self.heap.addAttrs(try contextEntriesForValue(self, value)));
 }
 
-pub fn builtinHasContext(self: anytype, arg: Value) !Value {
+pub fn builtinHasContext(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     return Value.boolVal((try contextEntriesForValue(self, value)).len != 0);
 }
 
-pub fn builtinAppendContext(self: anytype, string_arg: Value, context_arg: Value) !Value {
+pub fn builtinAppendContext(self: *VM, string_arg: Value, context_arg: Value) !Value {
     const string_value = try vm_force.forceValue(self, string_arg);
     if (!strings.isStringLike(string_value)) return error.TypeError;
     const context_value = try vm_force.forceValue(self, context_arg);
@@ -48,14 +49,14 @@ pub fn builtinAppendContext(self: anytype, string_arg: Value, context_arg: Value
     return Value.contextString(try self.heap.addContextString(try strings.stringTextInternId(self, string_value), entries.items));
 }
 
-pub fn builtinUnsafeDiscardStringContext(self: anytype, arg: Value) !Value {
+pub fn builtinUnsafeDiscardStringContext(self: *VM, arg: Value) !Value {
     // Nix coerces the argument to a string first (paths, derivations, and
     // `__toString` attrsets are accepted), then drops the context.
     const value = try strings.coerceStringContextValue(self, arg);
     return Value.string(try strings.stringTextInternId(self, value));
 }
 
-pub fn builtinUnsafeDiscardOutputDependency(self: anytype, arg: Value) !Value {
+pub fn builtinUnsafeDiscardOutputDependency(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!strings.isStringLike(value)) return error.TypeError;
     const text_id = try strings.stringTextInternId(self, value);
@@ -68,7 +69,7 @@ pub fn builtinUnsafeDiscardOutputDependency(self: anytype, arg: Value) !Value {
     return Value.contextString(try self.heap.addContextString(text_id, entries.items));
 }
 
-pub fn builtinAddDrvOutputDependencies(self: anytype, arg: Value) !Value {
+pub fn builtinAddDrvOutputDependencies(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!strings.isStringLike(value)) return vm_trace.typeErrorExpected(self, "a string", value);
     const text_id = try strings.stringTextInternId(self, value);
@@ -105,7 +106,7 @@ pub fn builtinAddDrvOutputDependencies(self: anytype, arg: Value) !Value {
     return Value.contextString(try self.heap.addContextString(text_id, entries.items));
 }
 
-pub fn contextEntriesForValue(self: anytype, value: Value) ![]const heap_mod.AttrEntry {
+pub fn contextEntriesForValue(self: *VM, value: Value) ![]const heap_mod.AttrEntry {
     return switch (value.kind()) {
         .string => &.{},
         .path => try singleContextEntry(self, value.asInternId(), try pathContextValue(self)),
@@ -114,27 +115,27 @@ pub fn contextEntriesForValue(self: anytype, value: Value) ![]const heap_mod.Att
     };
 }
 
-pub fn singleContextEntry(self: anytype, name: InternId, value: Value) ![]const heap_mod.AttrEntry {
+pub fn singleContextEntry(self: *VM, name: InternId, value: Value) ![]const heap_mod.AttrEntry {
     const entries = try self.allocator.alloc(heap_mod.AttrEntry, 1);
     entries[0] = .{ .name = name, .value = value };
     return entries;
 }
 
-pub fn pathContextValue(self: anytype) !Value {
+pub fn pathContextValue(self: *VM) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("path"), .value = Value.boolVal(true) },
     };
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-pub fn allOutputsContextValue(self: anytype) !Value {
+pub fn allOutputsContextValue(self: *VM) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("allOutputs"), .value = Value.boolVal(true) },
     };
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-pub fn contextStringWithPath(self: anytype, text_id: InternId) !Value {
+pub fn contextStringWithPath(self: *VM, text_id: InternId) !Value {
     return contextStringTextWithPath(self, text_id, text_id);
 }
 
@@ -143,7 +144,7 @@ pub fn contextStringWithPath(self: anytype, text_id: InternId) !Value {
 /// uses this: its text is a readable download-cache path while its context
 /// references the real fixed-output store path (so `builtins.getContext`
 /// matches Nix even though there is no store to materialize the path).
-pub fn contextStringTextWithPath(self: anytype, text_id: InternId, path_id: InternId) !Value {
+pub fn contextStringTextWithPath(self: *VM, text_id: InternId, path_id: InternId) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = path_id, .value = try pathContextValue(self) },
     };

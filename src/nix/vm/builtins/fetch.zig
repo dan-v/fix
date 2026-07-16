@@ -1,6 +1,7 @@
 //! Network fetch builtins and fetched-source realization.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
@@ -70,7 +71,7 @@ pub const FetchedOut = struct {
     }
 };
 
-pub fn ingestFetchedTree(self: anytype, cache_path: []const u8, name: []const u8, rev: []const u8, filter: ?nar.Filter) !FetchedOut {
+pub fn ingestFetchedTree(self: *VM, cache_path: []const u8, name: []const u8, rev: []const u8, filter: ?nar.Filter) !FetchedOut {
     _ = rev;
     if (self.realization.storeWritesEnabled()) {
         // Fetched trees carry no user-lambda filter identity, so they are never
@@ -91,7 +92,7 @@ pub fn ingestFetchedTree(self: anytype, cache_path: []const u8, name: []const u8
 /// store it carries string context referencing that store path, so using it as
 /// a derivation `src` records it in `inputSrcs` (like Nix). Off-store (plain
 /// eval) it is a bare string of the download-cache path.
-fn fetchedPathValue(self: anytype, path: []const u8) !Value {
+fn fetchedPathValue(self: *VM, path: []const u8) !Value {
     const id = try self.intern.intern(path);
     return if (self.realization.storeWritesEnabled())
         contextStringWithPath(self, id)
@@ -114,7 +115,7 @@ fn hgFilterAccept(_: *anyopaque, path: []const u8, _: file_cache.FileCache.FileK
 var hg_filter_ctx: u8 = 0;
 const hg_filter = nar.Filter{ .context = &hg_filter_ctx, .accept = hgFilterAccept };
 
-pub fn mercurialResultValue(self: anytype, name: []const u8, result: fetch_cache.FetchCache.MercurialResult) !Value {
+pub fn mercurialResultValue(self: *VM, name: []const u8, result: fetch_cache.FetchCache.MercurialResult) !Value {
     const out = try ingestFetchedTree(self, result.out_path, name, result.rev, hg_filter);
     defer out.deinit(self.allocator);
     const entries = [_]heap_mod.AttrEntry{
@@ -130,12 +131,12 @@ pub fn mercurialResultValue(self: anytype, name: []const u8, result: fetch_cache
 /// whatever fiber forces them (often off the demand path), so this uses the
 /// thread-safe concurrent-span channel — its node is independent of the demand
 /// LIFO stage stack. Null (and a no-op `end`) when progress isn't drawn.
-pub fn fetchSpanBegin(self: anytype, subject: []const u8) ?eval_progress.Span {
+pub fn fetchSpanBegin(self: *VM, subject: []const u8) ?eval_progress.Span {
     const spans = self.progress_spans orelse return null;
     return spans.beginSpan(.fetch, subject);
 }
 
-pub fn fetchSpanEnd(self: anytype, span: ?eval_progress.Span) void {
+pub fn fetchSpanEnd(self: *VM, span: ?eval_progress.Span) void {
     if (span) |sp| if (self.progress_spans) |spans| spans.endSpan(sp);
 }
 
@@ -162,7 +163,7 @@ const FetchReport = struct {
 /// fetch's borrowed args stay valid because the fiber stays parked for the whole
 /// call. `call` is a `FetchCache` method, e.g. `FetchCache.fetchUrl`; `span` is
 /// this fetch's progress span (download bytes are reported onto it).
-pub fn offloadFetch(self: anytype, comptime call: anytype, spec: anytype, span: ?eval_progress.Span) anyerror!@typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload {
+pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype, span: ?eval_progress.Span) anyerror!@typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload {
     const Res = @typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload;
     const Cell = struct {
         fetchers: *FetchCache,
@@ -193,7 +194,7 @@ pub fn offloadFetch(self: anytype, comptime call: anytype, spec: anytype, span: 
     return cell.res;
 }
 
-pub fn builtinFetchGit(self: anytype, arg: Value) !Value {
+pub fn builtinFetchGit(self: *VM, arg: Value) !Value {
     const spec = try fetchGitSpec(self, arg);
     defer spec.deinit(self.allocator);
 
@@ -204,7 +205,7 @@ pub fn builtinFetchGit(self: anytype, arg: Value) !Value {
     return gitResultValue(self, spec.name, result);
 }
 
-pub fn gitResultValue(self: anytype, name: []const u8, result: fetch_cache.FetchCache.GitResult) !Value {
+pub fn gitResultValue(self: *VM, name: []const u8, result: fetch_cache.FetchCache.GitResult) !Value {
     const out = try ingestFetchedTree(self, result.out_path, name, result.rev, git_filter);
     defer out.deinit(self.allocator);
     const entries = [_]heap_mod.AttrEntry{
@@ -226,7 +227,7 @@ pub fn gitResultValue(self: anytype, name: []const u8, result: fetch_cache.Fetch
 /// if it's accessed, matching Nix (which never hashes a tree eagerly here).
 /// `exclude` is a basename dropped from the NAR (".git"/".hg" for VCS checkouts,
 /// "" otherwise) so the lazy hash matches what `ingestFetchedTree` serialized.
-fn treeNarHashValue(self: anytype, path: []const u8, nar_hash: []const u8, exclude: []const u8) !Value {
+fn treeNarHashValue(self: *VM, path: []const u8, nar_hash: []const u8, exclude: []const u8) !Value {
     if (nar_hash.len != 0) return Value.string(try self.intern.intern(nar_hash));
     return shared.makeBuiltinThunk(self, .compute_nar_hash, &.{
         Value.string(try self.intern.intern(path)),
@@ -243,7 +244,7 @@ fn excludeAccept(context: *anyopaque, path: []const u8, _: file_cache.FileCache.
 /// Compute a fetched tree's NAR hash in Nix SRI form (`sha256-<base64>`),
 /// optionally excluding a basename (e.g. ".git"). Backs the lazy `narHash`
 /// thunk (see `treeNarHashValue`).
-pub fn computeNarHash(self: anytype, path_value: Value, exclude_value: Value) !Value {
+pub fn computeNarHash(self: *VM, path_value: Value, exclude_value: Value) !Value {
     const path = self.intern.get(path_value.asInternId());
     const exclude = self.intern.get(exclude_value.asInternId());
     var ctx = ExcludeCtx{ .name = exclude };
@@ -259,7 +260,7 @@ pub fn computeNarHash(self: anytype, path_value: Value, exclude_value: Value) !V
     return Value.string(try self.intern.intern(buf[0 .. 7 + encoded.len]));
 }
 
-pub fn pathTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
+pub fn pathTreeValue(self: *VM, path: []const u8, nar_hash: []const u8) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
@@ -269,7 +270,7 @@ pub fn pathTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Val
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-pub fn fileTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
+pub fn fileTreeValue(self: *VM, path: []const u8, nar_hash: []const u8) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(nar_hash)) },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
@@ -277,7 +278,7 @@ pub fn fileTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Val
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-fn fetchGitSpec(self: anytype, arg: Value) !FetchGitSpec {
+fn fetchGitSpec(self: *VM, arg: Value) !FetchGitSpec {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) {
         const url = try self.allocator.dupe(u8, try pathArg(self, value));
@@ -294,7 +295,7 @@ fn fetchGitSpec(self: anytype, arg: Value) !FetchGitSpec {
     return fetchGitSpecFromAttrs(self, value.asObjectId());
 }
 
-pub fn fetchGitSpecFromAttrs(self: anytype, attrs_id: ObjectId) !FetchGitSpec {
+pub fn fetchGitSpecFromAttrs(self: *VM, attrs_id: ObjectId) !FetchGitSpec {
     const url = try dupPathAttr(self, attrs_id, "url");
     errdefer self.allocator.free(url);
     const name = try optionalStringAttr(self, attrs_id, "name") orelse try self.allocator.dupe(u8, "source");
@@ -328,7 +329,7 @@ pub const FetchUrlSpec = struct {
     }
 };
 
-pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
+pub fn builtinFetchurl(self: *VM, arg: Value) !Value {
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
     const expected_hash = try expectedFetchSha256Hex(self, arg);
@@ -361,7 +362,7 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
-fn expectedFetchSha256Hex(self: anytype, arg: Value) !?[]u8 {
+fn expectedFetchSha256Hex(self: *VM, arg: Value) !?[]u8 {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) return null;
     const expected = (try optionalStringAttr(self, value.asObjectId(), "sha256")) orelse return null;
@@ -374,7 +375,7 @@ fn expectedFetchSha256Hex(self: anytype, arg: Value) !?[]u8 {
     };
 }
 
-fn validateFetchedSha256(self: anytype, noun: []const u8, url: []const u8, expected_hex: ?[]const u8, actual_hex: []const u8) !void {
+fn validateFetchedSha256(self: *VM, noun: []const u8, url: []const u8, expected_hex: ?[]const u8, actual_hex: []const u8) !void {
     const expected = expected_hex orelse return;
     if (std.ascii.eqlIgnoreCase(expected, actual_hex)) return;
     const message = try std.fmt.allocPrint(
@@ -392,7 +393,7 @@ fn validateFetchedSha256(self: anytype, noun: []const u8, url: []const u8, expec
 /// the real store; in plain eval the store path is still returned, with the
 /// fetched content seeded into the file cache so reads of it succeed.
 /// Returns the store path (owned by `self.allocator`).
-pub fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const u8, name: []const u8) ![]u8 {
+pub fn flatFetchOutPath(self: *VM, cache_path: []const u8, hash_hex: []const u8, name: []const u8) ![]u8 {
     // The flat store path is determined by the content hash regardless of store
     // writes; only the store instantiation is gated on them.
     const store_path = try derivation.fixedOutputPath(self.allocator, self.realization.store_dir, name, "out", "sha256", hash_hex);
@@ -411,7 +412,7 @@ pub fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const
 
 /// Reject any attr not in `allowed`, matching Nix's argument validation for
 /// the simple fetchers.
-fn rejectUnknownFetchAttrs(self: anytype, attrs_id: ObjectId, comptime allowed: []const []const u8) !void {
+fn rejectUnknownFetchAttrs(self: *VM, attrs_id: ObjectId, comptime allowed: []const []const u8) !void {
     const entries = try self.heap.getAttrs(attrs_id);
     outer: for (entries) |entry| {
         const name = self.intern.get(entry.name);
@@ -425,7 +426,7 @@ fn rejectUnknownFetchAttrs(self: anytype, attrs_id: ObjectId, comptime allowed: 
     }
 }
 
-fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
+fn fetchUrlSpec(self: *VM, arg: Value) !FetchUrlSpec {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) {
         // fetchurl/fetchTarball take a string URL (or an attrset); a path is a
@@ -445,7 +446,7 @@ fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
     return fetchUrlSpecFromAttrs(self, value.asObjectId(), null);
 }
 
-pub fn fetchUrlSpecFromAttrs(self: anytype, attrs_id: ObjectId, default_name: ?[]const u8) !FetchUrlSpec {
+pub fn fetchUrlSpecFromAttrs(self: *VM, attrs_id: ObjectId, default_name: ?[]const u8) !FetchUrlSpec {
     const url = try dupPathAttr(self, attrs_id, "url");
     errdefer self.allocator.free(url);
     const name = try optionalStringAttr(self, attrs_id, "name") orelse if (default_name) |name|
@@ -455,7 +456,7 @@ pub fn fetchUrlSpecFromAttrs(self: anytype, attrs_id: ObjectId, default_name: ?[
     return .{ .url = url, .name = name };
 }
 
-pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
+pub fn builtinFetchTarball(self: *VM, arg: Value) !Value {
     const tree_name = try tarballTreeName(self, arg);
     defer self.allocator.free(tree_name);
     const spec = try fetchUrlSpec(self, arg);
@@ -522,7 +523,7 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
 /// against the recorded hash, and seeds the file cache so the read succeeds.
 /// Returns true iff a pending fetch was found and materialized. Called from the
 /// path-demand seam so path-only uses never reach here (and never fetch).
-pub fn materializePendingFetch(self: anytype, demanded_path: []const u8) !bool {
+pub fn materializePendingFetch(self: *VM, demanded_path: []const u8) !bool {
     const store_root = storeRootOf(demanded_path, self.realization.store_dir) orelse return false;
     // `peekPendingFetch` clones with the store's allocator; free with the same.
     var pending = (try self.realization.peekPendingFetch(store_root)) orelse return false;
@@ -579,7 +580,7 @@ fn storeRootOf(path: []const u8, store_dir: []const u8) ?[]const u8 {
 
 /// The store name for a `fetchTarball` unpacked tree: an explicit `name` attr,
 /// else "source" (matching Nix — not the archive's URL basename).
-fn tarballTreeName(self: anytype, arg: Value) ![]u8 {
+fn tarballTreeName(self: *VM, arg: Value) ![]u8 {
     const value = try vm_force.forceValue(self, arg);
     if (value.isAttrs()) {
         if (try optionalStringAttr(self, value.asObjectId(), "name")) |name| return name;
@@ -603,7 +604,7 @@ pub const FetchMercurialSpec = struct {
     }
 };
 
-pub fn builtinFetchMercurial(self: anytype, arg: Value) !Value {
+pub fn builtinFetchMercurial(self: *VM, arg: Value) !Value {
     const spec = try fetchMercurialSpec(self, arg);
     defer spec.deinit(self.allocator);
 
@@ -614,7 +615,7 @@ pub fn builtinFetchMercurial(self: anytype, arg: Value) !Value {
     return mercurialResultValue(self, spec.name, result);
 }
 
-fn fetchMercurialSpec(self: anytype, arg: Value) !FetchMercurialSpec {
+fn fetchMercurialSpec(self: *VM, arg: Value) !FetchMercurialSpec {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) {
         const url = try self.allocator.dupe(u8, try pathArg(self, value));
@@ -629,7 +630,7 @@ fn fetchMercurialSpec(self: anytype, arg: Value) !FetchMercurialSpec {
     return fetchMercurialSpecFromAttrs(self, value.asObjectId());
 }
 
-pub fn fetchMercurialSpecFromAttrs(self: anytype, attrs_id: ObjectId) !FetchMercurialSpec {
+pub fn fetchMercurialSpecFromAttrs(self: *VM, attrs_id: ObjectId) !FetchMercurialSpec {
     const url = try dupPathAttr(self, attrs_id, "url");
     errdefer self.allocator.free(url);
     const name = try optionalStringAttr(self, attrs_id, "name") orelse try self.allocator.dupe(u8, "source");
@@ -654,7 +655,7 @@ pub const GithubTreeSpec = struct {
 
 /// Build the codeload archive URL for github/gitlab/sourcehut, honoring a
 /// `host` override (self-hosted forges) and pinning `rev`/`ref` (else HEAD).
-pub fn forgeTreeSpec(self: anytype, attrs_id: ObjectId, forge: []const u8) !GithubTreeSpec {
+pub fn forgeTreeSpec(self: *VM, attrs_id: ObjectId, forge: []const u8) !GithubTreeSpec {
     const owner = try requiredStringAttr(self, attrs_id, "owner");
     defer self.allocator.free(owner);
     const repo = try requiredStringAttr(self, attrs_id, "repo");
@@ -684,7 +685,7 @@ pub fn forgeTreeSpec(self: anytype, attrs_id: ObjectId, forge: []const u8) !Gith
     return .{ .url = url, .name = name, .rev = rev };
 }
 
-pub fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, rev: ?[]const u8) !Value {
+pub fn githubTreeValue(self: *VM, path: []const u8, nar_hash: []const u8, rev: ?[]const u8) !Value {
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
     try entries.appendSlice(self.allocator, &.{
@@ -700,7 +701,7 @@ pub fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, re
     return Value.attrs(try self.heap.addAttrs(entries.items));
 }
 
-fn defaultFetchName(self: anytype, url: []const u8) ![]u8 {
+fn defaultFetchName(self: *VM, url: []const u8) ![]u8 {
     const basename = path_ops.baseName(url);
     if (basename.len != 0) return self.allocator.dupe(u8, basename);
     return self.allocator.dupe(u8, "source");

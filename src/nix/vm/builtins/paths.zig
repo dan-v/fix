@@ -2,6 +2,7 @@
 //! `path` copy-to-store builtin.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const Value = @import("runtime").value.Value;
 const file_cache = @import("../../host.zig").file_cache;
 const derivation = @import("../../derivation.zig");
@@ -21,7 +22,7 @@ const isPlainString = strings.isPlainString;
 const contextStringWithPath = string_context.contextStringWithPath;
 const filterSourceAccepts = source_store.filterSourceAccepts;
 
-pub fn builtinBaseNameOf(self: anytype, arg: Value) !Value {
+pub fn builtinBaseNameOf(self: *VM, arg: Value) !Value {
     // Coerce like Nix (copyToStore = false): a raw path keeps its text without a
     // store copy; a string/derivation keeps its context.
     const forced = try vm_force.forceValue(self, arg);
@@ -38,7 +39,7 @@ pub fn builtinBaseNameOf(self: anytype, arg: Value) !Value {
     return Value.string(base_id);
 }
 
-pub fn builtinDirOf(self: anytype, arg: Value) !Value {
+pub fn builtinDirOf(self: *VM, arg: Value) !Value {
     const forced = try vm_force.forceValue(self, arg);
     const value = switch (forced.kind()) {
         .path, .string, .string_context => forced,
@@ -54,7 +55,7 @@ pub fn builtinDirOf(self: anytype, arg: Value) !Value {
     return Value.string(dir_id);
 }
 
-pub fn builtinPlaceholder(self: anytype, arg: Value) !Value {
+pub fn builtinPlaceholder(self: *VM, arg: Value) !Value {
     const output = try stringArg(self, arg);
     const fingerprint = try std.fmt.allocPrint(self.allocator, "nix-output:{s}", .{output});
     defer self.allocator.free(fingerprint);
@@ -65,13 +66,13 @@ pub fn builtinPlaceholder(self: anytype, arg: Value) !Value {
     return Value.string(try self.intern.intern(text));
 }
 
-pub fn builtinStorePath(self: anytype, arg: Value) !Value {
+pub fn builtinStorePath(self: *VM, arg: Value) !Value {
     const path = try strings.pathArg(self, arg);
     if (!std.fs.path.isAbsolute(path)) return error.RelativePath;
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
-fn optionalAttr(self: anytype, attrs_id: anytype, name: []const u8) !Value {
+fn optionalAttr(self: *VM, attrs_id: anytype, name: []const u8) !Value {
     const id = try self.intern.intern(name);
     return self.heap.getAttrValue(attrs_id, id) catch |err| switch (err) {
         error.MissingAttribute => Value.null_val,
@@ -82,7 +83,7 @@ fn optionalAttr(self: anytype, attrs_id: anytype, name: []const u8) !Value {
 /// Validate a store-path name (mirrors Nix `checkName`): non-empty, ≤211 bytes,
 /// not `.`/`..`, and only `[A-Za-z0-9+._?=-]`. On failure sets an error trace
 /// message containing "is not a valid store path" and returns the error.
-fn validateStorePathName(self: anytype, name: []const u8) !void {
+fn validateStorePathName(self: *VM, name: []const u8) !void {
     if (derivation.store_name.isValid(name)) return;
     const message = try std.fmt.allocPrint(
         self.allocator,
@@ -97,7 +98,7 @@ fn validateStorePathName(self: anytype, name: []const u8) !void {
 /// Compare a FOD-locking `sha256`/`hash` attr (`expected`, in SRI/base32/base16)
 /// against the `actual_hex` content hash for the chosen ingestion mode. On a
 /// mismatch sets an error trace message containing "hash mismatch" and errors.
-fn checkFodHash(self: anytype, expected: []const u8, actual_hex: []const u8) !void {
+fn checkFodHash(self: *VM, expected: []const u8, actual_hex: []const u8) !void {
     const expected_hex = derivation.hashToBase16(self.allocator, "sha256", expected) catch {
         const message = try std.fmt.allocPrint(self.allocator, "invalid sha256 hash '{s}'", .{expected});
         defer self.allocator.free(message);
@@ -116,7 +117,7 @@ fn checkFodHash(self: anytype, expected: []const u8, actual_hex: []const u8) !vo
     return error.HashMismatch;
 }
 
-pub fn builtinPath(self: anytype, arg: Value) !Value {
+pub fn builtinPath(self: *VM, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
     if (!attrs.isAttrs()) return error.TypeError;
     const attrs_id = attrs.asObjectId();
@@ -191,7 +192,7 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
 /// the store path and NAR hash. Split out so the closure-holding `Context`
 /// lives on this frame for the duration of `ingest`. Records the offending path
 /// in `unsupported` when the source contains an unsupported node (fifo/socket).
-fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filter_value: Value, unsupported: *nar.Unsupported) !source_paths.Ingested {
+fn recursiveIngest(self: *VM, path: []const u8, store_name: []const u8, filter_value: Value, unsupported: *nar.Unsupported) !source_paths.Ingested {
     if (filter_value.isNull()) {
         return source_paths.ingestReport(self.allocator, self.realization, self.files, path, store_name, null, null, unsupported);
     }

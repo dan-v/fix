@@ -3,6 +3,7 @@
 //! adaptive name->index lookup (NameIndex) for accumulate-by-name builtins.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const Value = @import("runtime").value.Value;
 const BuiltinId = @import("runtime").builtins.BuiltinId;
 const InternId = @import("runtime").types.InternId;
@@ -47,7 +48,7 @@ pub const SeenJsonObject = struct {
     id: ObjectId,
 };
 
-pub fn enterJsonObject(self: anytype, kind: SeenJsonKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !bool {
+pub fn enterJsonObject(self: *VM, kind: SeenJsonKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !bool {
     for (seen.items) |item| {
         if (item.kind == kind and item.id == id) return false;
     }
@@ -55,11 +56,11 @@ pub fn enterJsonObject(self: anytype, kind: SeenJsonKind, id: ObjectId, seen: *s
     return true;
 }
 
-pub fn makeBuiltinClosure(self: anytype, builtin_id: u16, args: []const Value) !Value {
+pub fn makeBuiltinClosure(self: *VM, builtin_id: u16, args: []const Value) !Value {
     return Value.builtinClosure(try self.heap.addBuiltinClosure(builtin_id, args));
 }
 
-pub fn makeBuiltinThunk(self: anytype, id: BuiltinId, args: []const Value) !Value {
+pub fn makeBuiltinThunk(self: *VM, id: BuiltinId, args: []const Value) !Value {
     return vm_force.makeThunk(self, try makeBuiltinClosure(self, @intFromEnum(id), args));
 }
 
@@ -117,7 +118,7 @@ pub const NameIndex = struct {
 /// branch also speculates on expensive builtins via `isSpeculatableMapFunc`;
 /// this fast path only handles the closure case.) Used by `map`/`genList`
 /// (lists) and `mapAttrs` (attrsets).
-pub fn isSpeculatableUserFunc(self: anytype, func: Value) bool {
+pub fn isSpeculatableUserFunc(self: *VM, func: Value) bool {
     if (!func.isClosure()) return false;
     const closure = self.heap.getClosure(func.asObjectId()) catch return false;
     const slot = self.registry.slot(closure.chunk_id) orelse return false;

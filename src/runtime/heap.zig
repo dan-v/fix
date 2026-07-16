@@ -412,7 +412,7 @@ pub const ObjectHeap = struct {
     /// an in-flight thunk / builtin temp value that predates arming is still
     /// rooted when the pre-arming major sweeps it. Off on roomy machines (they
     /// never arm ⇒ pinning is free and the reclaim is moot). Set once at
-    /// gcEnableBudget from the collection policy (`eval_gc.constrainedMode`).
+    /// gcEnableBudget from the collection policy (`gc_controller.constrainedMode`).
     gc_root_always: bool = false,
     /// Hot-path rooting gate for the transient-root appends (force chain,
     /// rootKeep): `gc_root_always OR armed`. Read in place of
@@ -1277,7 +1277,7 @@ pub const ObjectHeap = struct {
     /// until reserved bytes cross it, so on a machine whose budget exceeds
     /// the eval's total allocation the collector never fires (zero pauses);
     /// on a small-RAM device it kicks in before the eval OOMs. Defaults to
-    /// half of `MemAvailable` (see `eval/gc.zig:memoryBudget`). Set via the
+    /// half of `MemAvailable` (see `eval/gc_controller.zig:memoryBudget`). Set via the
     /// `budget` arg to `gcEnableCollect`.
     pub var gc_budget_bytes: u64 = 0;
 

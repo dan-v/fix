@@ -3,6 +3,7 @@
 //! builtins, and parseDrvName.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const ObjectId = types.ObjectId;
@@ -29,7 +30,7 @@ const stringArg = strings.stringArg;
 const stringTextInternId = strings.stringTextInternId;
 const sortedAttrEntries = attrsets.sortedAttrEntries;
 
-pub fn builtinToJSON(self: anytype, arg: Value) !Value {
+pub fn builtinToJSON(self: *VM, arg: Value) !Value {
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
 
@@ -44,14 +45,14 @@ pub fn builtinToJSON(self: anytype, arg: Value) !Value {
     return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
 
-pub fn writeJsonValue(self: anytype, writer: *std.Io.Writer, value: Value) !void {
+pub fn writeJsonValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
     try writeJsonValueWithPathMode(self, writer, value, .raw, null);
 }
 
 const JsonPathMode = enum { raw, source };
 
 fn writeJsonValueWithPathMode(
-    self: anytype,
+    self: *VM,
     writer: *std.Io.Writer,
     value: Value,
     path_mode: JsonPathMode,
@@ -66,7 +67,7 @@ fn writeJsonValueWithPathMode(
 const SeenJsonObject = shared.SeenJsonObject;
 
 fn writeJsonValueInner(
-    self: anytype,
+    self: *VM,
     writer: *std.Io.Writer,
     value: Value,
     seen: *std.ArrayListUnmanaged(SeenJsonObject),
@@ -116,7 +117,7 @@ fn writeJsonValueInner(
 }
 
 fn writeJsonStringValue(
-    self: anytype,
+    self: *VM,
     writer: *std.Io.Writer,
     value: Value,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
@@ -139,7 +140,7 @@ fn writeJsonStringValue(
     }
 }
 
-fn jsonAttrsStringValue(self: anytype, attrs: Value, path_mode: JsonPathMode) !?Value {
+fn jsonAttrsStringValue(self: *VM, attrs: Value, path_mode: JsonPathMode) !?Value {
     const attrs_id = attrs.asObjectId();
 
     const to_string_id = try self.intern.intern("__toString");
@@ -165,12 +166,12 @@ fn jsonAttrsStringValue(self: anytype, attrs: Value, path_mode: JsonPathMode) !?
     }
 }
 
-pub fn jsonAttrsSourceStringValue(self: anytype, attrs: Value) !?Value {
+pub fn jsonAttrsSourceStringValue(self: *VM, attrs: Value) !?Value {
     return jsonAttrsStringValue(self, attrs, .source);
 }
 
 fn writeJsonList(
-    self: anytype,
+    self: *VM,
     writer: *std.Io.Writer,
     id: ObjectId,
     seen: *std.ArrayListUnmanaged(SeenJsonObject),
@@ -198,7 +199,7 @@ fn writeJsonList(
 }
 
 fn writeJsonAttrs(
-    self: anytype,
+    self: *VM,
     writer: *std.Io.Writer,
     id: ObjectId,
     seen: *std.ArrayListUnmanaged(SeenJsonObject),
@@ -228,7 +229,7 @@ fn writeJsonAttrs(
     try writer.writeByte('}');
 }
 
-pub fn builtinToXML(self: anytype, arg: Value) !Value {
+pub fn builtinToXML(self: *VM, arg: Value) !Value {
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
 
@@ -245,12 +246,12 @@ pub fn builtinToXML(self: anytype, arg: Value) !Value {
     return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
 
-pub fn writeLazyXmlValue(self: anytype, writer: *std.Io.Writer, value: Value) !void {
+pub fn writeLazyXmlValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
     try writeXmlDocument(self, writer, try vm_force.forceValue(self, value), null);
 }
 
 fn writeXmlDocument(
-    self: anytype,
+    self: *VM,
     writer: *std.Io.Writer,
     value: Value,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
@@ -261,7 +262,7 @@ fn writeXmlDocument(
 }
 
 fn writeXmlValue(
-    self: anytype,
+    self: *VM,
     writer: *std.Io.Writer,
     value: Value,
     depth: usize,
@@ -310,14 +311,14 @@ fn writeXmlValue(
     }
 }
 
-fn xmlVisibleValue(self: anytype, value: Value) anyerror!?Value {
+fn xmlVisibleValue(self: *VM, value: Value) anyerror!?Value {
     return switch (value.kind()) {
         .thunk => xmlThunkValue(self, value.asObjectId()),
         else => value,
     };
 }
 
-fn xmlThunkValue(self: anytype, id: ObjectId) anyerror!?Value {
+fn xmlThunkValue(self: *VM, id: ObjectId) anyerror!?Value {
     const thunk = try self.heap.getThunk(id);
     const state: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
     if (state != .resolved) return null;
@@ -329,7 +330,7 @@ fn xmlThunkValue(self: anytype, id: ObjectId) anyerror!?Value {
 }
 
 fn writeXmlList(
-    self: anytype,
+    self: *VM,
     writer: *std.Io.Writer,
     id: ObjectId,
     depth: usize,
@@ -352,7 +353,7 @@ fn writeXmlList(
 }
 
 fn writeXmlAttrs(
-    self: anytype,
+    self: *VM,
     writer: *std.Io.Writer,
     id: ObjectId,
     depth: usize,
@@ -388,7 +389,7 @@ fn writeXmlAttrs(
 /// opening `<function>`'s indent is already emitted by the caller. Falls back
 /// to a self-closing `<function />` when the chunk carries no pattern (never
 /// happens for real lambdas, but keeps non-lambda closures well-formed).
-fn writeXmlFunction(self: anytype, writer: *std.Io.Writer, value: Value, depth: usize) !void {
+fn writeXmlFunction(self: *VM, writer: *std.Io.Writer, value: Value, depth: usize) !void {
     const closure = try self.heap.getClosure(value.asObjectId());
     const ch = self.registry.get(closure.chunk_id) orelse {
         try writer.writeAll("<function />\n");
@@ -456,7 +457,7 @@ fn writeXmlEscaped(writer: *std.Io.Writer, text: []const u8) !void {
     };
 }
 
-pub fn builtinFromJSON(self: anytype, arg: Value) !Value {
+pub fn builtinFromJSON(self: *VM, arg: Value) !Value {
     const text = try stringArg(self, arg);
     // Duplicate object keys keep the last value, matching Nix (`{"k":1,"k":2}`
     // → `{ k = 2; }`) rather than erroring.
@@ -467,7 +468,7 @@ pub fn builtinFromJSON(self: anytype, arg: Value) !Value {
     return valueFromJson(self, parsed.value);
 }
 
-fn valueFromJson(self: anytype, value: std.json.Value) anyerror!Value {
+fn valueFromJson(self: *VM, value: std.json.Value) anyerror!Value {
     return switch (value) {
         .null => Value.null_val,
         .bool => |b| Value.boolVal(b),
@@ -480,19 +481,19 @@ fn valueFromJson(self: anytype, value: std.json.Value) anyerror!Value {
     };
 }
 
-fn numberStringFromJson(self: anytype, text: []const u8) !Value {
+fn numberStringFromJson(self: *VM, text: []const u8) !Value {
     if (std.fmt.parseInt(i64, text, 10)) |i| return int_mod.make(self.heap, i) else |_| {}
     return Value.float(std.fmt.parseFloat(f64, text) catch return error.TypeError);
 }
 
-fn listFromJson(self: anytype, values: []const std.json.Value) !Value {
+fn listFromJson(self: *VM, values: []const std.json.Value) !Value {
     const items = try self.allocator.alloc(Value, values.len);
     defer self.allocator.free(items);
     for (values, items) |item, *out| out.* = try valueFromJson(self, item);
     return Value.list(try self.heap.addList(items));
 }
 
-fn attrsFromJson(self: anytype, object: anytype) !Value {
+fn attrsFromJson(self: *VM, object: anytype) !Value {
     const entries = try self.allocator.alloc(heap_mod.AttrEntry, object.count());
     defer self.allocator.free(entries);
 
@@ -507,14 +508,14 @@ fn attrsFromJson(self: anytype, object: anytype) !Value {
     return Value.attrs(try self.heap.addAttrs(entries));
 }
 
-pub fn builtinFromTOML(self: anytype, arg: Value) !Value {
+pub fn builtinFromTOML(self: *VM, arg: Value) !Value {
     const text = try stringArg(self, arg);
     var parsed = try toml.parse(self.allocator, text);
     defer parsed.deinit();
     return valueFromToml(self, .{ .table = parsed.root });
 }
 
-fn valueFromToml(self: anytype, value: toml.Value) anyerror!Value {
+fn valueFromToml(self: *VM, value: toml.Value) anyerror!Value {
     return switch (value) {
         .boolean => |b| Value.boolVal(b),
         .integer => |i| int_mod.make(self.heap, i),
@@ -525,14 +526,14 @@ fn valueFromToml(self: anytype, value: toml.Value) anyerror!Value {
     };
 }
 
-fn listFromToml(self: anytype, values: []const toml.Value) !Value {
+fn listFromToml(self: *VM, values: []const toml.Value) !Value {
     const items = try self.allocator.alloc(Value, values.len);
     defer self.allocator.free(items);
     for (values, items) |item, *out| out.* = try valueFromToml(self, item);
     return Value.list(try self.heap.addList(items));
 }
 
-fn attrsFromToml(self: anytype, table: *toml.Table) !Value {
+fn attrsFromToml(self: *VM, table: *toml.Table) !Value {
     const entries = try self.allocator.alloc(heap_mod.AttrEntry, table.entries.items.len);
     defer self.allocator.free(entries);
     for (table.entries.items, entries) |entry, *out| {
@@ -544,7 +545,7 @@ fn attrsFromToml(self: anytype, table: *toml.Table) !Value {
     return Value.attrs(try self.heap.addAttrs(entries));
 }
 
-pub fn builtinCompareVersions(self: anytype, left_arg: Value, right_arg: Value) !Value {
+pub fn builtinCompareVersions(self: *VM, left_arg: Value, right_arg: Value) !Value {
     const left_value = try vm_force.forceValue(self, left_arg);
     const right_value = try vm_force.forceValue(self, right_arg);
     if (!isPlainString(left_value) or !isPlainString(right_value)) return error.TypeError;
@@ -553,7 +554,7 @@ pub fn builtinCompareVersions(self: anytype, left_arg: Value, right_arg: Value) 
     return Value.int(try version.compareVersions(self.allocator, left, right));
 }
 
-pub fn builtinSplitVersion(self: anytype, arg: Value) !Value {
+pub fn builtinSplitVersion(self: *VM, arg: Value) !Value {
     const text = try stringArg(self, arg);
     const parts = try version.splitVersion(self.allocator, text);
     defer self.allocator.free(parts);
@@ -570,13 +571,13 @@ pub fn builtinSplitVersion(self: anytype, arg: Value) !Value {
 /// evaluator's shared `PatternCache` when wired (`owned` stays null),
 /// else compiled locally into `owned` (standalone test VMs), which the
 /// caller deinits via `defer`.
-fn resolvePattern(self: anytype, pattern_id: InternId, owned: *?regex.Pattern) !*const regex.Pattern {
+fn resolvePattern(self: *VM, pattern_id: InternId, owned: *?regex.Pattern) !*const regex.Pattern {
     if (self.regexes) |cache| return cache.get(pattern_id, self.intern.get(pattern_id));
     owned.* = try regex.Pattern.compile(self.allocator, self.intern.get(pattern_id));
     return &owned.*.?;
 }
 
-pub fn builtinMatch(self: anytype, regex_arg: Value, text_arg: Value) !Value {
+pub fn builtinMatch(self: *VM, regex_arg: Value, text_arg: Value) !Value {
     const pattern_value = try vm_force.forceValue(self, regex_arg);
     const text_value = try vm_force.forceValue(self, text_arg);
     if (!isPlainString(pattern_value) or !isPlainString(text_value)) return error.TypeError;
@@ -592,7 +593,7 @@ pub fn builtinMatch(self: anytype, regex_arg: Value, text_arg: Value) !Value {
     return regexCapturesValue(self, matched.captures);
 }
 
-pub fn builtinSplit(self: anytype, regex_arg: Value, text_arg: Value) !Value {
+pub fn builtinSplit(self: *VM, regex_arg: Value, text_arg: Value) !Value {
     const pattern_value = try vm_force.forceValue(self, regex_arg);
     const text_value = try vm_force.forceValue(self, text_arg);
     if (!isPlainString(pattern_value) or !isPlainString(text_value)) return error.TypeError;
@@ -633,7 +634,7 @@ pub fn builtinSplit(self: anytype, regex_arg: Value, text_arg: Value) !Value {
     return Value.list(try self.heap.addList(out.items));
 }
 
-fn regexCapturesValue(self: anytype, captures: []const ?[]const u8) !Value {
+fn regexCapturesValue(self: *VM, captures: []const ?[]const u8) !Value {
     const values = try self.allocator.alloc(Value, captures.len);
     defer self.allocator.free(values);
 
@@ -646,7 +647,7 @@ fn regexCapturesValue(self: anytype, captures: []const ?[]const u8) !Value {
     return Value.list(try self.heap.addList(values));
 }
 
-pub fn builtinParseDrvName(self: anytype, arg: Value) !Value {
+pub fn builtinParseDrvName(self: *VM, arg: Value) !Value {
     const parsed = version.parseDrvName(try stringArg(self, arg));
     const entries = [_]heap_mod.AttrEntry{
         .{

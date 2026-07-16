@@ -4,6 +4,7 @@
 //! families.
 
 const std = @import("std");
+const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
@@ -17,14 +18,14 @@ const vm_strings = @import("../strings.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
 
-pub fn firstReplacementIdAt(self: anytype, input: []const u8, needles: []const InternId) ?usize {
+pub fn firstReplacementIdAt(self: *VM, input: []const u8, needles: []const InternId) ?usize {
     for (needles, 0..) |needle_id, i| {
         if (std.mem.startsWith(u8, input, self.intern.get(needle_id))) return i;
     }
     return null;
 }
 
-pub fn pathArg(self: anytype, arg: Value) ![]const u8 {
+pub fn pathArg(self: *VM, arg: Value) ![]const u8 {
     const value = try vm_strings.stringLikeValue(self, arg);
     return switch (value.kind()) {
         .path, .string => self.intern.get(value.asInternId()),
@@ -33,11 +34,11 @@ pub fn pathArg(self: anytype, arg: Value) ![]const u8 {
     };
 }
 
-pub fn builtinStringLength(self: anytype, arg: Value) !Value {
+pub fn builtinStringLength(self: *VM, arg: Value) !Value {
     return Value.int(@intCast(self.intern.get(try coerceStringContextId(self, arg)).len));
 }
 
-pub fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !Value {
+pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Value {
     const sep_value = try vm_force.forceValue(self, sep_arg);
     const list = try vm_force.forceValue(self, list_arg);
     if (!isPlainString(sep_value) or !list.isList()) return error.TypeError;
@@ -85,11 +86,11 @@ pub fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !
     return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
 }
 
-pub fn coerceStringContextId(self: anytype, arg: Value) !InternId {
+pub fn coerceStringContextId(self: *VM, arg: Value) !InternId {
     return stringTextInternId(self, try coerceStringContextValue(self, arg));
 }
 
-pub fn coerceStringContextValue(self: anytype, arg: Value) !Value {
+pub fn coerceStringContextValue(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     return switch (value.kind()) {
         .string, .string_context => value,
@@ -99,7 +100,7 @@ pub fn coerceStringContextValue(self: anytype, arg: Value) !Value {
     };
 }
 
-pub fn coerceAttrsStringContextValue(self: anytype, attrs: Value) !Value {
+pub fn coerceAttrsStringContextValue(self: *VM, attrs: Value) !Value {
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, attrs); // held across getAttrValue + callValue + coerce
@@ -120,7 +121,7 @@ pub fn coerceAttrsStringContextValue(self: anytype, attrs: Value) !Value {
     return coerceStringContextValue(self, out_path);
 }
 
-pub fn sourcePathStringValue(self: anytype, path_id: InternId) !Value {
+pub fn sourcePathStringValue(self: *VM, path_id: InternId) !Value {
     const path = self.intern.get(path_id);
     if (!std.fs.path.isAbsolute(path)) return string_context.contextStringWithPath(self, path_id);
     if (!try self.files.pathExists(path)) return error.FileNotFound;
@@ -129,7 +130,7 @@ pub fn sourcePathStringValue(self: anytype, path_id: InternId) !Value {
     return string_context.contextStringWithPath(self, try self.intern.intern(store_path));
 }
 
-pub fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_arg: Value) !Value {
+pub fn builtinSubstring(self: *VM, start_arg: Value, len_arg: Value, string_arg: Value) !Value {
     const start_value = try vm_force.forceValue(self, start_arg);
     const len_value = try vm_force.forceValue(self, len_arg);
     if (!int_mod.isAnyInt(start_value) or !int_mod.isAnyInt(len_value)) return error.TypeError;
@@ -155,14 +156,14 @@ pub fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_
     return substringResult(self, string[start..end], string_value);
 }
 
-fn substringResult(self: anytype, text: []const u8, source: Value) !Value {
+fn substringResult(self: *VM, text: []const u8, source: Value) !Value {
     const text_id = try self.intern.intern(text);
     const ctx = try string_context.contextEntriesForValue(self, source);
     if (ctx.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, ctx));
 }
 
-pub fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, string_arg: Value) !Value {
+pub fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_arg: Value) !Value {
     const from_ids = try stringListInternIdsArg(self, from_arg);
     defer self.allocator.free(from_ids);
     // `to` stays lazy: Nix forces `to[i]` only when `from[i]` actually matches,
@@ -220,7 +221,7 @@ pub fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, stri
     return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
 }
 
-pub fn stringArg(self: anytype, arg: Value) ![]const u8 {
+pub fn stringArg(self: *VM, arg: Value) ![]const u8 {
     const value = try vm_force.forceValue(self, arg);
     if (!isStringLike(value) or value.isPath()) return vm_trace.typeErrorExpected(self, "a string", value);
     return self.intern.get(try stringTextInternId(self, value));
@@ -234,7 +235,7 @@ pub fn isPlainString(value: Value) bool {
     return value.isString() or value.isContextString();
 }
 
-pub fn isCallable(self: anytype, value: Value) !bool {
+pub fn isCallable(self: *VM, value: Value) !bool {
     return switch (value.kind()) {
         .closure, .builtin, .builtin_closure, .partial_app => true,
         .attrs => blk: {
@@ -248,7 +249,7 @@ pub fn isCallable(self: anytype, value: Value) !bool {
     };
 }
 
-pub fn stringTextInternId(self: anytype, value: Value) !InternId {
+pub fn stringTextInternId(self: *VM, value: Value) !InternId {
     return switch (value.kind()) {
         .string, .path => value.asInternId(),
         .string_context => (try self.heap.getContextString(value.asObjectId())).text,
@@ -256,7 +257,7 @@ pub fn stringTextInternId(self: anytype, value: Value) !InternId {
     };
 }
 
-pub fn stringListArg(self: anytype, arg: Value) ![][]const u8 {
+pub fn stringListArg(self: *VM, arg: Value) ![][]const u8 {
     const list = try vm_force.forceValue(self, arg);
     if (!list.isList()) return error.TypeError;
 
@@ -269,7 +270,7 @@ pub fn stringListArg(self: anytype, arg: Value) ![][]const u8 {
     return out;
 }
 
-pub fn stringListInternIdsArg(self: anytype, arg: Value) ![]InternId {
+pub fn stringListInternIdsArg(self: *VM, arg: Value) ![]InternId {
     const list = try vm_force.forceValue(self, arg);
     if (!list.isList()) return error.TypeError;
 
@@ -286,15 +287,15 @@ pub fn stringListInternIdsArg(self: anytype, arg: Value) ![]InternId {
     return ids;
 }
 
-pub fn builtinToString(self: anytype, arg: Value) !Value {
+pub fn builtinToString(self: *VM, arg: Value) !Value {
     return coerceToStringValue(self, arg);
 }
 
-pub fn coerceToStringId(self: anytype, arg: Value) !InternId {
+pub fn coerceToStringId(self: *VM, arg: Value) !InternId {
     return stringTextInternId(self, try coerceToStringValue(self, arg));
 }
 
-pub fn coerceToStringValue(self: anytype, arg: Value) !Value {
+pub fn coerceToStringValue(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     switch (value.kind()) {
         .string, .string_context => return value,
@@ -320,11 +321,11 @@ pub fn coerceToStringValue(self: anytype, arg: Value) !Value {
     }
 }
 
-pub fn coerceListToStringId(self: anytype, list_id: ObjectId) !InternId {
+pub fn coerceListToStringId(self: *VM, list_id: ObjectId) !InternId {
     return stringTextInternId(self, try coerceListToStringValue(self, list_id));
 }
 
-pub fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
+pub fn coerceListToStringValue(self: *VM, list_id: ObjectId) !Value {
     // GC: `list_id` is a bare id and we force-walk the list (recursively for
     // nested lists/attrs); root the container across the walk.
     const gc_roots = vm_force.rootsBegin(self);
@@ -374,11 +375,11 @@ pub fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
     return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
 }
 
-pub fn isEmptyListStringItem(self: anytype, value: Value) !bool {
+pub fn isEmptyListStringItem(self: *VM, value: Value) !bool {
     return value.isList() and (try self.heap.getList(value.asObjectId())).len == 0;
 }
 
-pub fn coerceAttrsToStringValue(self: anytype, attrs: Value) !Value {
+pub fn coerceAttrsToStringValue(self: *VM, attrs: Value) !Value {
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, attrs); // held across getAttrValue + callValue + coerce
@@ -399,7 +400,7 @@ pub fn coerceAttrsToStringValue(self: anytype, attrs: Value) !Value {
     return coerceToStringValue(self, out_path);
 }
 
-pub fn coerceDerivationStringValue(self: anytype, arg: Value) !Value {
+pub fn coerceDerivationStringValue(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     switch (value.kind()) {
         .string, .string_context => return value,
@@ -425,7 +426,7 @@ pub fn coerceDerivationStringValue(self: anytype, arg: Value) !Value {
     }
 }
 
-pub fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Value {
+pub fn coerceDerivationListToStringValue(self: *VM, list_id: ObjectId) !Value {
     // GC: root the (bare-id) list across the recursive force-walk.
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
@@ -475,7 +476,7 @@ pub fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Valu
     return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
 }
 
-pub fn coerceDerivationAttrsToStringValue(self: anytype, attrs: Value) !Value {
+pub fn coerceDerivationAttrsToStringValue(self: *VM, attrs: Value) !Value {
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, attrs); // held across getAttrValue + callValue + coerce
