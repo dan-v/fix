@@ -20,18 +20,6 @@ const SpanHooks = struct {
     end: SpanEndFn,
 };
 
-threadlocal var active_connection: ?*rstore.DaemonStore = null;
-
-pub fn installActiveConnection(conn: ?*anyopaque) ?*rstore.DaemonStore {
-    const previous = active_connection;
-    active_connection = if (conn) |raw| @ptrCast(@alignCast(raw)) else null;
-    return previous;
-}
-
-pub fn restoreActiveConnection(previous: ?*rstore.DaemonStore) void {
-    active_connection = previous;
-}
-
 pub const Client = struct {
     allocator: std.mem.Allocator,
     mu: sync.BlockingMutex = .{},
@@ -167,10 +155,6 @@ pub const Client = struct {
         const pool = try runtime.ensurePool(self.allocator, io, self.socket, self.options, self.writes_enabled);
         self.pool = pool;
         return pool;
-    }
-
-    pub fn currentConnection(_: *Client) !*rstore.DaemonStore {
-        return active_connection orelse error.StoreUnavailable;
     }
 
     pub fn run(self: *Client, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) !void {

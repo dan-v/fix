@@ -292,16 +292,15 @@ pub const RealizationStore = struct {
         self.daemon.setTestRuntime(rt);
     }
 
-    /// The connection the current op runs against (see `active_conn`). A null
-    /// means the pool worker could not open a connection — surface it as the
-    /// store being unavailable rather than dereferencing null.
-    fn currentConn(self: *RealizationStore) !*rstore.DaemonStore {
-        return self.daemon.currentConnection();
+    /// Recover the concrete daemon connection handed to a pool callback. Keep
+    /// it explicit through the operation instead of installing ambient TLS.
+    fn daemonConn(raw: ?*anyopaque) !*rstore.DaemonStore {
+        return if (raw) |conn| @ptrCast(@alignCast(conn)) else error.StoreUnavailable;
     }
 
     /// Run one daemon op: submit it to the pool and park the caller (a compute
-    /// fiber yields; the main thread / tests block). `work(conn)` reads its
-    /// connection through `active_conn`, set by whichever pool worker runs it.
+    /// fiber yields; the main thread / tests block). The pool hands its worker's
+    /// connection directly to `work(conn)`.
     fn runOnDaemon(self: *RealizationStore, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) !void {
         return self.daemon.run(work, work_ctx);
     }
@@ -377,22 +376,23 @@ pub const RealizationStore = struct {
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const c: *QueryCell = @ptrCast(@alignCast(p));
-            const previous = daemon_client.installActiveConnection(conn);
-            defer daemon_client.restoreActiveConnection(previous);
-            c.valid = c.store.applyIsValid(c.store_path) catch |e| {
+            const daemon = daemonConn(conn) catch |e| {
+                c.err = e;
+                return;
+            };
+            c.valid = c.store.applyIsValid(daemon, c.store_path) catch |e| {
                 c.err = e;
                 return;
             };
         }
     };
 
-    /// `isValidPath` against the current connection (`active_conn`), consulting +
+    /// `isValidPath` against the supplied connection, consulting +
     /// populating the `instantiated` cache. The daemon round-trip runs without
     /// `daemon_mu` held (it guards only the brief cache touches), so concurrent
     /// pool workers don't serialize on it.
-    fn applyIsValid(self: *RealizationStore, store_path: []const u8) !bool {
+    fn applyIsValid(self: *RealizationStore, conn: *rstore.DaemonStore, store_path: []const u8) !bool {
         if (self.cacheContains(store_path)) return true;
-        const conn = try self.currentConn();
         const valid = try conn.isValidPath(store_path);
         // A path valid now stays valid for the eval (same assumption the cache
         // already makes for writes), so a later demand skips the round-trip.
@@ -416,10 +416,8 @@ pub const RealizationStore = struct {
         return self.buildPaths(derived_paths, null, mode);
     }
 
-    /// Build against the current connection (used both by `BuildCell` and, inside
-    /// an already-active op, by `realizeOutputInline`'s build step).
-    fn buildOnConn(self: *RealizationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
-        const conn = try self.currentConn();
+    /// Build against the connection supplied by the pool worker.
+    fn buildOnConn(self: *RealizationStore, conn: *rstore.DaemonStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
         conn.buildPaths(derived_paths, sink, mode) catch |err| {
             self.captureDaemonError(conn);
             return err;
@@ -435,9 +433,11 @@ pub const RealizationStore = struct {
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *BuildCell = @ptrCast(@alignCast(p));
-            const previous = daemon_client.installActiveConnection(conn);
-            defer daemon_client.restoreActiveConnection(previous);
-            self.err = self.store.buildOnConn(self.paths, self.sink, self.mode);
+            const daemon = daemonConn(conn) catch |e| {
+                self.err = e;
+                return;
+            };
+            self.err = self.store.buildOnConn(daemon, self.paths, self.sink, self.mode);
         }
     };
 
@@ -456,10 +456,8 @@ pub const RealizationStore = struct {
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *RootCell = @ptrCast(@alignCast(p));
-            const previous = daemon_client.installActiveConnection(conn);
-            defer daemon_client.restoreActiveConnection(previous);
             self.err = blk: {
-                const c = self.store.currentConn() catch |e| break :blk e;
+                const c = daemonConn(conn) catch |e| break :blk e;
                 break :blk c.addIndirectRoot(self.link_path);
             };
         }
@@ -490,21 +488,22 @@ pub const RealizationStore = struct {
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *OpCell = @ptrCast(@alignCast(p));
-            const previous = daemon_client.installActiveConnection(conn);
-            defer daemon_client.restoreActiveConnection(previous);
-            self.err = self.store.applyDaemonOp(self.op, self.span_group);
+            const daemon = daemonConn(conn) catch |e| {
+                self.err = e;
+                return;
+            };
+            self.err = self.store.applyDaemonOp(daemon, self.op, self.span_group);
         }
     };
 
-    /// Perform a store write against the current connection. Skips the transfer
+    /// Perform a store write against the supplied connection. Skips the transfer
     /// when the path is already valid (cache or a daemon check). Cache touches are
     /// briefly guarded; the daemon round-trips run without `daemon_mu`.
-    fn applyDaemonOp(self: *RealizationStore, op: DaemonOp, span_group: ?SpanGroup) !void {
+    fn applyDaemonOp(self: *RealizationStore, daemon: *rstore.DaemonStore, op: DaemonOp, span_group: ?SpanGroup) !void {
         const store_path = switch (op) {
             inline else => |o| o.store_path,
         };
         if (self.cacheContains(store_path)) return;
-        const daemon = try self.currentConn();
         if (try daemon.isValidPath(store_path)) return self.cacheMark(store_path);
         // Report a progress span around the actual transfer, under the caller's
         // group: `.store` for a `.drv`, `.source` for a local source copy, null for
