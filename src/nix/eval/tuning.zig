@@ -92,6 +92,13 @@ pub fn apply(
     if (env) |em| if (em.get("FIX_RESCUE")) |s| {
         sched.spec_rescue = worker_count > 1 and !std.mem.eql(u8, s, "0");
     };
+    // FIX_WAKE_AFFINITY: resume a woken fiber on the core that resolved its
+    // awaited future (cache-hot for the value) instead of the fiber's home
+    // worker (see scheduler.wake_resolver_affinity). Needs helpers; default
+    // off pending A/B.
+    if (env) |em| if (em.get("FIX_WAKE_AFFINITY")) |s| {
+        sched.wake_resolver_affinity = worker_count > 1 and !std.mem.eql(u8, s, "0");
+    };
     // FIX_FIBER_MADV=dontneed: eager (visible-RSS) comparator for the
     // overflow-fiber stack release; default is MADV_FREE (lazy reclaim).
     if (env) |em| if (em.get("FIX_FIBER_MADV")) |s| {

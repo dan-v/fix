@@ -198,7 +198,23 @@ pub const WorkerFiber = struct {
 
     fn wakeImpl(w: *thunk_mod.Waiter) void {
         const self: *WorkerFiber = @fieldParentPtr("waiter", w);
-        self.worker.scheduler.enqueueReady(self.worker.worker_id, &self.ready_node);
+        // Resolver affinity (`FIX_WAKE_AFFINITY`): prefer to resume the woken
+        // fiber on the core that just published the value it was blocked on.
+        // That core holds the freshly-written result — and much of the
+        // dependency's touched graph — cache-hot, so resuming there avoids a
+        // cross-core miss on the very data the fiber is about to read; the
+        // default (home-worker) routing scatters woken fibers onto their
+        // allocator worker regardless of where the value was produced. Gated
+        // on the waker being a compute worker: IO/daemon/fetch threads publish
+        // an `io_future` with no useful locality and a meaningless
+        // `worker_id.current`, so those keep the home-worker fallback. The
+        // target is only a ready-queue hint — an idle worker can still steal
+        // the fiber — so a mis-routed wake costs at most one extra steal.
+        const target = if (self.worker.scheduler.wake_resolver_affinity and worker_id_mod.is_worker)
+            worker_id_mod.current
+        else
+            self.worker.worker_id;
+        self.worker.scheduler.enqueueReady(target, &self.ready_node);
     }
 
     /// Sweep the per-fiber scratch arena when the fiber goes back on the
@@ -375,6 +391,7 @@ pub const Worker = struct {
     /// Helper main loop. Drains until shutdown.
     pub fn run(self: *Worker) void {
         worker_id_mod.current = self.worker_id;
+        worker_id_mod.is_worker = true;
         if (comptime gc.enabled) vm_force.gcRegisterWorkerCaches(self.worker_id);
         defer if (comptime gc.enabled) vm_force.gcUnregisterWorkerCaches(self.worker_id);
         while (!self.shouldStop()) {
@@ -408,6 +425,7 @@ pub const Worker = struct {
         demand: exec_context.DemandRole,
     ) !void {
         worker_id_mod.current = self.worker_id;
+        worker_id_mod.is_worker = true;
         if (comptime gc.enabled) vm_force.gcRegisterWorkerCaches(self.worker_id);
         // Each top-level entry begins able to start background work.
         self.scheduler.setSuppressBackground(false);

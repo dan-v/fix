@@ -780,6 +780,13 @@ pub const Scheduler = struct {
     /// on a spec-owned thunk, promote the fiber computing it (see
     /// `promoteFiber` / `VM.demand_rescue`). Default off pending A/B.
     spec_rescue: bool = false,
+    /// `FIX_WAKE_AFFINITY`: route a woken fiber onto the ready queue of the
+    /// worker that resolved its awaited future (the resolver's core is
+    /// cache-hot for the just-published value) instead of the fiber's
+    /// allocator ("home") worker. Only applies when the waker is a compute
+    /// worker — see `WorkerFiber.wakeImpl`. Read-mostly, checked once per
+    /// wake. Default off pending A/B.
+    wake_resolver_affinity: bool = false,
     /// Priority-inheritance registry: `fiber_id -> &VM.demand_rescue`, so a
     /// blocking fiber can flip its blocker's flag without the scheduler
     /// importing the vm layer. Indexed by fiber id (monotonic from 0, bounded
