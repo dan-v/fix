@@ -19,7 +19,7 @@ const shell_cmd = cli.shell;
 const switch_cmd = cli.@"switch";
 
 const ArgsIterator = std.process.Args.Iterator;
-const SubcommandRun = *const fn (std.mem.Allocator, std.process.Init, *ArgsIterator) anyerror!u8;
+const SubcommandRun = *const fn (cli.ProcessContext, std.process.Init, *ArgsIterator) anyerror!u8;
 const Subcommand = struct {
     name: []const u8,
     summary: []const u8,
@@ -74,11 +74,11 @@ pub fn main(init: std.process.Init) !void {
     // w=1 wall in fault handling). See runtime/block_cache.zig.
     var big_blocks = engine.process_support.LargeBlockAllocator.init(init.gpa);
     defer big_blocks.deinit();
-    // Let the evaluator's build-phase release flush the parked blocks
-    // (block_cache.trimGlobal) — it only holds a plain Allocator. Debug
-    // builds don't route through the cache, so trimming it is a no-op.
-    big_blocks.registerGlobalTrim();
     const allocator = if (comptime builtin.mode == .Debug) debug_gpa.allocator() else big_blocks.allocator();
+    const process: cli.ProcessContext = .{
+        .allocator = allocator,
+        .eval_release = .{ .context = &big_blocks, .run = trimLargeBlocks },
+    };
 
     var args_iter = try init.minimal.args.iterateAllocator(allocator);
     defer args_iter.deinit();
@@ -98,17 +98,17 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(0);
     }
 
-    const code = runSubcommand(command, allocator, init, &args_iter) orelse {
+    const code = runSubcommand(command, process, init, &args_iter) orelse {
         std.debug.print("fix: unknown command '{s}'\n\n{s}", .{ command, topUsage(allocator) });
         std.process.exit(2);
     };
     std.process.exit(code);
 }
 
-fn runSubcommand(name: []const u8, allocator: std.mem.Allocator, init: std.process.Init, args_iter: *ArgsIterator) ?u8 {
+fn runSubcommand(name: []const u8, process: cli.ProcessContext, init: std.process.Init, args_iter: *ArgsIterator) ?u8 {
     inline for (subcommands) |subcommand| {
         if (std.mem.eql(u8, name, subcommand.name)) {
-            return subcommand.run(allocator, init, args_iter) catch |err| {
+            return subcommand.run(process, init, args_iter) catch |err| {
                 // `error.ConfigError` (e.g. a bad nix.conf include) already
                 // printed its own message; don't double-report.
                 if (err != error.ConfigError) std.debug.print("error: {s}\n", .{@errorName(err)});
@@ -117,4 +117,9 @@ fn runSubcommand(name: []const u8, allocator: std.mem.Allocator, init: std.proce
         }
     }
     return null;
+}
+
+fn trimLargeBlocks(context: *anyopaque) void {
+    const blocks: *engine.process_support.LargeBlockAllocator = @ptrCast(@alignCast(context));
+    blocks.trim();
 }

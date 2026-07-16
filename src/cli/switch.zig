@@ -76,7 +76,8 @@ pub const synopsis =
     \\remote host with --target-host (build stays local; the closure is copied).
 ;
 
-pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    const allocator = process.allocator;
     // The action is the first positional (like nixos-rebuild). Peek it before
     // the shared parser, which would otherwise treat it as a source path.
     var action: Action = .@"switch";
@@ -113,14 +114,15 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         return 2;
     };
 
-    return buildAndSwitch(allocator, init, target, action, &options);
+    return buildAndSwitch(process, init, target, action, &options);
 }
 
 // ---------------------------------------------------------------------------
 // Phase A: build the toplevel, then activate (in-process or via sudo re-exec)
 // ---------------------------------------------------------------------------
 
-fn buildAndSwitch(allocator: std.mem.Allocator, init: std.process.Init, target: Target, action: Action, options: *args.Options) !u8 {
+fn buildAndSwitch(process: @import("process_context.zig").ProcessContext, init: std.process.Init, target: Target, action: Action, options: *args.Options) !u8 {
+    const allocator = process.allocator;
     // Construct the installable per target, unless the user fully specified one
     // with `-A`. For flakes, the whole attr path is baked into the fragment; for
     // the legacy path we set the default source expr + append the toplevel attr.
@@ -156,7 +158,7 @@ fn buildAndSwitch(allocator: std.mem.Allocator, init: std.process.Init, target: 
     setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options.*);
+    const term = try setup.configure(&ev, process, init, options.*);
 
     if (source_arg == .flake and !ev.policy.flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });

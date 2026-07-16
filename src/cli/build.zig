@@ -19,7 +19,8 @@ pub const synopsis =
     \\--flake, the flake in the current directory).
 ;
 
-pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    const allocator = process.allocator;
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .build);
@@ -38,7 +39,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options);
+    const term = try setup.configure(&ev, process, init, options);
 
     if (source_arg == .flake and !ev.policy.flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });

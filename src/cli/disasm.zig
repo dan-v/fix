@@ -28,7 +28,8 @@ pub const synopsis =
     \\--no-pager). For color through the pager, set e.g. PAGER='less -R' or LESS=R.
 ;
 
-pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    const allocator = process.allocator;
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .disasm);
@@ -58,7 +59,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     // Configure features (pipe-operators/flakes), base path, and NIX_PATH so the
     // compile matches what `eval`/`build` would see. No progress: disasm prints
     // bytecode, not a progress bar.
-    _ = try setup.configure(&ev, init, options);
+    _ = try setup.configure(&ev, process, init, options);
     if (options.disasm_eval) ev.setParallelismToggles(true, true);
     // Best-effort chunk naming: attribute each lambda/thunk chunk to the attr
     // or let binding it was compiled for, so the disassembly headers read like

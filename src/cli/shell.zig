@@ -25,7 +25,8 @@ pub const synopsis =
     \\With `-- cmd args`, run that command in the environment instead of a shell.
 ;
 
-pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    const allocator = process.allocator;
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .shell);
@@ -47,7 +48,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options);
+    const term = try setup.configure(&ev, process, init, options);
     ev.enableStoreWrites();
 
     var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);

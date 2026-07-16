@@ -10,6 +10,24 @@ const renderStrictForTest = helpers.renderStrictForTest;
 const renderForTestFromCurrentPath = helpers.renderForTestFromCurrentPath;
 const renderXmlForTest = helpers.renderXmlForTest;
 
+test "release hook is evaluator-owned and runs once" {
+    const Counter = struct {
+        value: usize = 0,
+
+        fn run(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.value += 1;
+        }
+    };
+    var counter: Counter = .{};
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    ev.setReleaseHook(.{ .context = &counter, .run = Counter.run });
+    ev.releaseEvalState();
+    ev.releaseEvalState();
+    ev.deinit();
+    try std.testing.expectEqual(@as(usize, 1), counter.value);
+}
+
 test "writeValue colorizes strings, numbers, keywords, and attr names when value_color is set" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

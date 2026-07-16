@@ -37,7 +37,8 @@ const Options = struct {
     workers: ?u8 = null,
 };
 
-pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    const allocator = process.allocator;
     const options = parseOptions(args_iter) catch |err| switch (err) {
         error.Help => {
             presentation.printHelp(init.io, usage);
@@ -62,6 +63,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     @import("setup.zig").applyMemoryBacking(null);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
+    process.bindEvaluator(&ev);
     ev.setEnvironment(init.environ_map);
     try ev.setBasePathFromCurrentPath(init.io);
     if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);

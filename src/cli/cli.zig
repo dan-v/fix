@@ -22,6 +22,8 @@ pub const stats = @import("stats.zig");
 pub const trace_setup = @import("trace_setup.zig");
 pub const render = @import("render.zig");
 pub const presentation = @import("presentation.zig");
+pub const process_context = @import("process_context.zig");
+pub const ProcessContext = process_context.ProcessContext;
 pub const progress = @import("progress.zig");
 pub const realize = @import("realize.zig");
 

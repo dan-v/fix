@@ -24,7 +24,6 @@ const heap_collector = @import("runtime").heap_collector;
 const FileCache = host.FileCache;
 const FetchCache = host.FetchCache;
 const regex_mod = @import("base").regex;
-const block_cache_mod = @import("base").block_cache;
 const vma_mod = @import("runtime").mem_tag.vma;
 const realization = @import("realization.zig");
 const RealizationStore = realization.RealizationStore;
@@ -65,6 +64,14 @@ const worker_id_mod = @import("base").worker_id;
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
+
+/// Process-composition callback run after language state has been torn down.
+/// The executable uses it to trim its concrete large-block allocator without
+/// making the evaluator discover allocator ownership through a global hook.
+pub const ReleaseHook = struct {
+    context: *anyopaque,
+    run: *const fn (context: *anyopaque) void,
+};
 
 /// Why the debugger was entered (re-exported from the VM layer so the CLI can
 /// switch on it without reaching into `vm`).
@@ -581,6 +588,7 @@ pub const Evaluator = struct {
     /// Whether `releaseEvalState` already ran (the build-phase memory
     /// release). Makes the release idempotent so `deinit` can share it.
     eval_released: bool = false,
+    release_hook: ?ReleaseHook = null,
 
     /// Speculative import prefetch (`FIX_IMPORT_PREFETCH`): `.nix` path
     /// constants discovered by `ChunkRegistry.register` are submitted as
@@ -737,10 +745,14 @@ pub const Evaluator = struct {
         // Dangling Value into the freed heap; never read again, but don't
         // keep it findable.
         self.builtins_value = null;
-        // The teardown above just flooded the block cache's free stacks
-        // with the dead segment blocks — return them (and everything else
-        // parked) to the OS instead of retaining ~200 MB for the build.
-        block_cache_mod.trimGlobal();
+        // The teardown above just flooded the process allocator with dead
+        // segment blocks. The composition root owns that concrete allocator,
+        // so ask it explicitly to release retained memory before the build.
+        if (self.release_hook) |hook| hook.run(hook.context);
+    }
+
+    pub fn setReleaseHook(self: *Evaluator, hook: ?ReleaseHook) void {
+        self.release_hook = hook;
     }
 
     pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {

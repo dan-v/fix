@@ -11,6 +11,7 @@ const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
 const rstore = engine.host.store;
 const hugetlb = engine.process_support.memory_backing;
+const ProcessContext = @import("process_context.zig").ProcessContext;
 
 const Evaluator = engine.Evaluator;
 
@@ -53,7 +54,8 @@ pub fn applyMemoryBacking(cli_mode: ?hugetlb.Mode) void {
 /// Apply the shared `Options → Evaluator` configuration (feature toggles,
 /// parallelism, environment, base path, NIX_PATH) and resolve the terminal
 /// color/progress policy. Enables ANSI on stderr when coloring.
-pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) !Terminal {
+pub fn configure(ev: *Evaluator, process: ProcessContext, init: std.process.Init, options: args.Options) !Terminal {
+    process.bindEvaluator(ev);
     // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap is
     // pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.lazy_shells_visible = options.output == .xml;

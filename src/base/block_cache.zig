@@ -71,19 +71,6 @@ fn classOf(len: usize) ?usize {
 /// inside the `fix:bigblock` smaps bucket.
 pub var retained_bytes: std.atomic.Value(usize) = .init(0);
 
-/// Process-global trim hook, registered by `main` for its cache instance
-/// (`registerGlobalTrim`). Lets subsystems that only hold a plain
-/// `std.mem.Allocator` — the evaluator's build-phase release — flush the
-/// parked blocks back to the OS without plumbing the concrete cache type.
-var global_trim: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null;
-
-/// Release every block parked on the registered global cache's free stacks
-/// (see `BlockCacheAllocator.trim`). No-op when no cache is registered
-/// (Debug builds use the plain gpa).
-pub fn trimGlobal() void {
-    if (global_trim) |h| h.call(h.ctx);
-}
-
 /// The reuse cache is generic over an instantiated `Vma` region-tracker
 /// (see runtime/vma.zig): it registers/retags/unregisters its backing
 /// mappings through `Vma.*` so `--mem-report` can attribute them, but
@@ -149,20 +136,6 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
         /// Release every retained block back to the backing allocator (or
         /// the OS, for hugetlb-owned blocks).
         pub fn deinit(self: *Self) void {
-            self.trim();
-            if (global_trim) |h| {
-                if (h.ctx == @as(*anyopaque, @ptrCast(self))) global_trim = null;
-            }
-        }
-
-        /// Register this instance as the process-global trim target (see
-        /// `trimGlobal`). One instance per process in practice.
-        pub fn registerGlobalTrim(self: *Self) void {
-            global_trim = .{ .ctx = self, .call = trimThunk };
-        }
-
-        fn trimThunk(ctx: *anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
             self.trim();
         }
 

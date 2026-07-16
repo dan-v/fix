@@ -25,6 +25,7 @@ pub const Value = runtime.value.Value;
 pub const DebugSession = eval.DebugSession;
 pub const DebugFrame = eval.DebugFrame;
 pub const BreakReason = eval.BreakReason;
+pub const ReleaseHook = eval.ReleaseHook;
 
 pub fn reportSchedulerScanCensus() void {
     scheduler.reportScanCensus();
