@@ -7,6 +7,7 @@ pub const opcode = @import("bytecode/opcode.zig");
 pub const encoding = @import("bytecode/encoding.zig");
 pub const chunk = @import("bytecode/chunk.zig");
 pub const inspect = @import("bytecode/inspect.zig");
+pub const stats = @import("bytecode/stats.zig");
 pub const disasm = @import("bytecode/disasm.zig");
 pub const breakpoints = @import("bytecode/breakpoints.zig");
 pub const BreakpointTable = breakpoints.BreakpointTable;

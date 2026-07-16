@@ -158,7 +158,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
 
     const write_err: ?anyerror = blk: {
         if (options.disasm_stats) {
-            bytecode.disasm.writeStats(allocator, writer, ev.chunkRegistry(), symbols) catch |e| break :blk e;
+            bytecode.stats.write(allocator, writer, ev.chunkRegistry()) catch |e| break :blk e;
         } else if (options.disasm_eval and options.disasm_chunk == null) {
             dumpAll(writer, &ev, symbols, opts) catch |e| break :blk e;
         } else {

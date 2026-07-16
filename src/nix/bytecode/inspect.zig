@@ -110,6 +110,60 @@ pub const CaptureCensus = struct {
     dup_ge2: usize = 0,
 };
 
+/// Registry-wide body-sharing and capture-list measurements. Kept as data so
+/// CLI and future machine-readable reporters share the same analysis.
+pub const CodeDedupCensus = struct {
+    total: u32 = 0,
+    total_code: usize = 0,
+    distinct_full: usize = 0,
+    dup_full: u32 = 0,
+    dup_full_bytes: usize = 0,
+    distinct_code: usize = 0,
+    dup_code: u32 = 0,
+    captures: CaptureCensus = .{},
+
+    pub fn build(allocator: std.mem.Allocator, registry: *const ChunkRegistry) !CodeDedupCensus {
+        var by_full: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer by_full.deinit(allocator);
+        var by_code: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer by_code.deinit(allocator);
+
+        var out: CodeDedupCensus = .{};
+        var id: ChunkId = 0;
+        while (id < registry.count()) : (id += 1) {
+            const chunk = registry.get(id) orelse continue;
+            out.total += 1;
+            out.total_code += chunk.code.len;
+
+            var full_hash = std.hash.Wyhash.init(0);
+            full_hash.update(chunk.code);
+            full_hash.update(std.mem.sliceAsBytes(chunk.constants));
+            full_hash.update(std.mem.sliceAsBytes(chunk.attr_names));
+            full_hash.update(std.mem.asBytes(&chunk.local_count));
+            full_hash.update(std.mem.asBytes(&chunk.arity));
+            full_hash.update(std.mem.asBytes(&chunk.strict_params));
+            if ((try by_full.getOrPut(allocator, full_hash.final())).found_existing) {
+                out.dup_full += 1;
+                out.dup_full_bytes += chunk.code.len;
+            }
+
+            var code_hash = std.hash.Wyhash.init(0);
+            code_hash.update(chunk.code);
+            code_hash.update(std.mem.asBytes(&chunk.local_count));
+            code_hash.update(std.mem.asBytes(&chunk.arity));
+            if ((try by_code.getOrPut(allocator, code_hash.final())).found_existing) out.dup_code += 1;
+
+            const captures = captureCensus(allocator, chunk) catch continue;
+            inline for (std.meta.fields(CaptureCensus)) |field| {
+                @field(out.captures, field.name) += @field(captures, field.name);
+            }
+        }
+        out.distinct_full = by_full.count();
+        out.distinct_code = by_code.count();
+        return out;
+    }
+};
+
 /// Measure duplicate inline capture descriptor lists within one chunk.
 pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk) !CaptureCensus {
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;

@@ -194,97 +194,38 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
 /// a naive split shares) and code-only (the upper bound if constants were also
 /// interned).
 fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, reg: *const bytecode.chunk.ChunkRegistry) !void {
-    var by_full: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer by_full.deinit(allocator);
-    var by_code: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer by_code.deinit(allocator);
-
-    var total: u32 = 0;
-    var total_code: usize = 0;
-    var dup_full: u32 = 0;
-    var dup_full_bytes: usize = 0;
-    var dup_code: u32 = 0;
-
-    const n = reg.count();
-    var id: u32 = 0;
-    while (id < n) : (id += 1) {
-        const c = reg.get(id) orelse continue;
-        total += 1;
-        total_code += c.code.len;
-
-        var hf = std.hash.Wyhash.init(0);
-        hf.update(c.code);
-        hf.update(std.mem.sliceAsBytes(c.constants));
-        hf.update(std.mem.sliceAsBytes(c.attr_names));
-        hf.update(std.mem.asBytes(&c.local_count));
-        hf.update(std.mem.asBytes(&c.arity));
-        hf.update(std.mem.asBytes(&c.strict_params));
-        if ((try by_full.getOrPut(allocator, hf.final())).found_existing) {
-            dup_full += 1;
-            dup_full_bytes += c.code.len;
-        }
-
-        var hc = std.hash.Wyhash.init(0);
-        hc.update(c.code);
-        hc.update(std.mem.asBytes(&c.local_count));
-        hc.update(std.mem.asBytes(&c.arity));
-        if ((try by_code.getOrPut(allocator, hc.final())).found_existing) dup_code += 1;
-    }
+    const census = try bytecode.inspect.CodeDedupCensus.build(allocator, reg);
+    const captures = census.captures;
 
     try writer.writeAll("  header/body split potential:\n");
     try writer.print("    distinct bodies (code+consts): {d}  → {d} clones collapse ({d:.1}%)\n", .{
-        by_full.count(), dup_full, percent(dup_full, total),
+        census.distinct_full, census.dup_full, percent(census.dup_full, census.total),
     });
     try writer.print("    code bytes reclaimable:        {d}  of {d} ({d:.1}%)\n", .{
-        dup_full_bytes, total_code, percentUsize(dup_full_bytes, total_code),
+        census.dup_full_bytes, census.total_code, percentUsize(census.dup_full_bytes, census.total_code),
     });
     try writer.print("    distinct code (consts ignored): {d}  → {d} clones ({d:.1}%, upper bound)\n", .{
-        by_code.count(), dup_code, percent(dup_code, total),
+        census.distinct_code, census.dup_code, percent(census.dup_code, census.total),
     });
 
-    // Capture-list interning potential: duplicated capture descriptors within
-    // chunks (attrset values sharing an environment).
-    var cap_total: usize = 0;
-    var cap_dup: usize = 0;
-    var cap_ops: usize = 0;
-    var cap_dup_defer: usize = 0;
-    var cap_dup_thunk: usize = 0;
-    var cap_dup_closure: usize = 0;
-    var cap_total_ge2: usize = 0;
-    var cap_ops_ge2: usize = 0;
-    var cap_dup_ge2: usize = 0;
-    id = 0;
-    while (id < n) : (id += 1) {
-        const c = reg.get(id) orelse continue;
-        const cc = bytecode.inspect.captureCensus(allocator, c) catch continue;
-        cap_total += cc.total;
-        cap_dup += cc.duplicated;
-        cap_ops += cc.ops;
-        cap_dup_defer += cc.dup_defer;
-        cap_dup_thunk += cc.dup_thunk;
-        cap_dup_closure += cc.dup_closure;
-        cap_total_ge2 += cc.total_ge2;
-        cap_ops_ge2 += cc.ops_ge2;
-        cap_dup_ge2 += cc.dup_ge2;
-    }
     try writer.writeAll("  capture-list interning potential:\n");
     try writer.print("    capture-list bytes:            {d}  over {d} ops ({d:.1}% of code)\n", .{
-        cap_total, cap_ops, percentUsize(cap_total, total_code),
+        captures.total, captures.ops, percentUsize(captures.total, census.total_code),
     });
     try writer.print("    duplicated within chunks:      {d}  ({d:.1}% of capture bytes, {d:.1}% of code)\n", .{
-        cap_dup, percentUsize(cap_dup, cap_total), percentUsize(cap_dup, total_code),
+        captures.duplicated, percentUsize(captures.duplicated, captures.total), percentUsize(captures.duplicated, census.total_code),
     });
     try writer.print("    dup by op: thunk_defer {d} ({d:.0}%), thunk {d} ({d:.0}%), closure {d} ({d:.0}%)\n", .{
-        cap_dup_defer,   percentUsize(cap_dup_defer, cap_dup),
-        cap_dup_thunk,   percentUsize(cap_dup_thunk, cap_dup),
-        cap_dup_closure, percentUsize(cap_dup_closure, cap_dup),
+        captures.dup_defer,   percentUsize(captures.dup_defer, captures.duplicated),
+        captures.dup_thunk,   percentUsize(captures.dup_thunk, captures.duplicated),
+        captures.dup_closure, percentUsize(captures.dup_closure, captures.duplicated),
     });
     // Dual-op (ref for M>=2, keep single-capture inline) recoverable code: the
     // M>=2 inline bytes minus the 6-byte refs that replace them.
-    const ref_bytes = cap_ops_ge2 * 6;
-    const recoverable = if (cap_total_ge2 > ref_bytes) cap_total_ge2 - ref_bytes else 0;
+    const ref_bytes = captures.ops_ge2 * 6;
+    const recoverable = if (captures.total_ge2 > ref_bytes) captures.total_ge2 - ref_bytes else 0;
     try writer.print("    M>=2 lists: {d} ops, {d} bytes; dual-op ref saves ~{d} code ({d:.1}% of code), dup among them {d}\n", .{
-        cap_ops_ge2, cap_total_ge2, recoverable, percentUsize(recoverable, total_code), cap_dup_ge2,
+        captures.ops_ge2, captures.total_ge2, recoverable, percentUsize(recoverable, census.total_code), captures.dup_ge2,
     });
 }
 
