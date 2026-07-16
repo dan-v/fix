@@ -35,7 +35,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
+const base_options = @import("base_options");
 
 comptime {
     switch (builtin.cpu.arch) {
@@ -49,7 +49,7 @@ comptime {
 /// the OS to commit every page eagerly, which defeats the lazy-commit
 /// model `init` relies on. Turn on with `-Dfiber-stack-probe` when you
 /// want to size stacks against a representative workload.
-pub const stack_probe_enabled: bool = build_options.fiber_stack_probe;
+pub const stack_probe_enabled: bool = base_options.fiber_stack_probe;
 
 /// Fiber cost census (piggybacks on `-Dprof-main`): rdtsc bracketing of
 /// the swap-in (dispatcher → fiber body) and swap-out (fiber body →
@@ -60,7 +60,7 @@ pub const stack_probe_enabled: bool = build_options.fiber_stack_probe;
 /// (run_mu, timeline branch, spec-ctx refresh, `resume_` setup, the asm
 /// swap) and the swap-out window symmetric machinery on the way back.
 /// Zero-footprint when the build flag is off.
-pub const census_enabled: bool = build_options.prof_main and builtin.cpu.arch == .x86_64;
+pub const census_enabled: bool = base_options.fiber_census and builtin.cpu.arch == .x86_64;
 
 pub threadlocal var census_pre_swap: u64 = 0;
 pub threadlocal var census_exit_swap: u64 = 0;

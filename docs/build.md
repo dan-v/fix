@@ -2,7 +2,7 @@
 
 *The build graph, module layout, and hygiene that keep the fast paths honest.*
 
-`fix` builds with `zig build` from a single `build.zig`. The build's shape is deliberate: every subsystem is a real Zig module imported by name, arranged as an acyclic dependency graph and topped by the `fix` evaluator layer. The build also forces LLVM (the threaded dispatcher needs it), wires per-module unit tests by hand, and lints module boundaries.
+`fix` builds with `zig build` from a single `build.zig`. Every subsystem is a real Zig module imported by name, arranged as an acyclic dependency graph and topped by the `engine` API and `cli` application layer. The installed artifact is named `fix`; there is no second `fix` module or executable. The build also forces LLVM (the threaded dispatcher needs it), wires per-module unit tests by hand, and lints module boundaries.
 
 ## Module model
 
@@ -10,30 +10,32 @@ Zig's `@import("<name>")` reaches a module only through its facade; the compiler
 
 | Module | Facade | Imports | Notes |
 |---|---|---|---|
-| `base` | `src/base/base.zig` | `build_options` | generic infra, no Nix coupling: deque + cache-line isolation, the stackful fiber (inline-asm context switch, vendored from std.Io.fiber), spin/blocking mutexes, segmented + flat stores, the `Vma(Tag)` RSS tracker, the block-cache allocator, a regex engine, a TOML parser |
-| `syntax` | `src/nix/syntax.zig` | `parser_tables` | lexer + LALR(1) parser + AST |
+| `base` | `src/base/base.zig` | `base_options` | generic infra, no Nix coupling: containers, fibers, synchronization, allocators, regex, TOML |
+| `syntax` | `src/nix/syntax.zig` | `base`, `parser_tables` | lexer + LALR(1) parser + AST |
 | `runtime` | `src/nix/runtime.zig` | `build_options`, `base` | Nix value model, heap, interning, thunk/Future, GC tracer, the `MemTag` taxonomy |
+| `host` | `src/nix/host.zig` | `runtime`, `base` | concrete file/fetch caches, NAR serialization, daemon connections and pool |
 | `observ` | `src/nix/observ.zig` | `syntax` | progress sink + error-trace collector — the sinks the VM writes to |
 | `scheduler` | `src/nix/scheduler.zig` | `build_options`, `runtime`, `base` | the evaluator's work-stealing scheduler (urgent/novel/spec lanes) |
-| `derivation` | `src/nix/derivation.zig` | `runtime`, `base` | derivation model, hashing, string context |
+| `derivation` | `src/nix/derivation.zig` | `runtime`, `base` | derivation model, hashing, string context, evaluation registry |
+| `realization` | `src/nix/realization.zig` | `derivation`, `host`, `runtime`, `base` | source recipes, closure planning, store writes, build claims |
 | `bytecode` | `src/nix/bytecode.zig` | `build_options`, `runtime`, `base` | instruction set, chunk encoding/registry, disassembler |
 | `probe` | `src/nix/probe.zig` | `build_options`, `runtime`, `base`, `bytecode` | opt-in profilers, timeline, thunk-trace |
 | `compiler` | `src/nix/compiler.zig` | `build_options`, `runtime`, `base`, `syntax`, `bytecode`, `probe` | single-pass AST → bytecode lowering |
-| `vm` | `src/nix/vm.zig` | `runtime`, `base`, `syntax`, `scheduler`, `derivation`, `observ`, `bytecode`, `compiler`, `probe`, `build_options` | interpreter: dispatch, thunk forcing, the fiber worker pool, builtins |
-| `fix` | `src/nix/root.zig` | all of the above + `build_options` | the `Evaluator` orchestration layer (imports, GC orchestration, config) |
-| `cli` | `src/cli/cli.zig` | `fix` + the shared set | command surface, arg parsing, subcommands, rendering, progress |
+| `vm` | `src/nix/vm.zig` | compiler and the required language/runtime/service modules | interpreter: dispatch, thunk forcing, the fiber worker pool, builtins |
+| `engine` | `src/nix/root.zig` | all evaluator modules + `build_options` | app-facing `Evaluator` API and orchestration |
+| `cli` | `src/cli/cli.zig` | `engine` | command surface, arg parsing, subcommands, rendering, progress |
 
-Eleven modules are lint-guarded; `fix` (`src/nix/root.zig`) is the top orchestration layer. The graph is acyclic and the lint enforces a **down-only** rule (below): every module carries a longest-path level and may only import a strictly lower one. What could look like an `Evaluator`/VM cycle is avoided by placement: the VM's on-demand compilation of a deferred thunk body calls *down* into `compiler`, and the fiber worker that drives forcing lives *inside* the `vm` module next to the force path, so force↔worker is intra-module. Reaching into any module by relative path is a lint error (below).
+Fourteen modules are lint-guarded; `engine` (`src/nix/root.zig`) is the evaluator's app-facing orchestration layer and `cli` sits above it. The graph is acyclic, and the lint enforces both a **down-only** rule and an explicit edge allowlist. A module cannot import an unrelated module merely because it happens to be lower. What could look like an `Evaluator`/VM cycle is avoided by placement: deferred-body compilation calls down from `vm` into `compiler`, while the fiber worker that drives forcing lives inside `vm` next to the force path.
 
-`cli` imports `fix` by name — plus the same shared leaf set as everyone else (below) — so the command tools see the engine and the leaf subsystems at facade granularity only, never a module's internal files; the engine-only modules (`bytecode`, `probe`, `compiler`, `vm`) are not importable from `cli` at all. The `exe` module (`src/main.zig`) imports both `fix` and `cli`. `addSharedImports` gives `fix`, `cli`, and `exe` the identical leaf set — `build_options`, `base`, `syntax`, `runtime`, `scheduler`, `derivation`, `observ` — while the engine modules (`bytecode`, `probe`, `compiler`, `vm`) are wired to `fix` and to each other explicitly, bottom-up.
+`cli` imports only `engine`, so command code consumes evaluator capabilities through one stable facade instead of assembling runtime pieces itself. The executable module (`src/main.zig`) imports only `engine` and `cli`; it creates process-level resources and dispatches. The artifact is named `fix`, which is distinct from both internal module names.
 
 ## Parser-table codegen
 
 The LALR parser tables are expensive to construct at comptime, so a standalone codegen tool builds them once and emits a plain `.zig` of literal arrays. `src/nix/syntax/gen_parser_tables.zig` is compiled into the `gen-parser-tables` host executable, run as a build step whose single output file is fed to the `syntax` module as the anonymous import `parser_tables`. The build system caches the run and only re-executes it when the grammar or generator changes, keeping the table-construction cost off every ordinary rebuild. `zig build gen-parser-tables` runs it explicitly. Because the parser imports the generated `parser_tables`, `zig test src/nix/syntax/parser.zig` cannot resolve it standalone — use `zig build test-syntax` for fast lexer/parser/AST iteration.
 
-## Shared `build_options`
+## Build options
 
-Every `-D` flag is folded into one `build_options` module created **once** and injected into `runtime`, `parallel`, `derivation`, `fix`, `cli`, and `exe`. This is load-bearing: importing the generated options file into two *different* module instances makes Zig treat them as two distinct types, so a single shared instance is the only way every subsystem sees the same flag set (and the same `bool` type for each flag).
+Evaluator-specific `-D` flags are folded into one shared `build_options` module and injected only where they are used. Generic `base` does not see that application-wide option surface. It receives a separate, narrow `base_options` module containing `fiber_stack_probe` and `fiber_census`; `build.zig` maps the relevant application probes onto those generic capabilities.
 
 ### `-D` flag surface
 
@@ -62,24 +64,24 @@ The threaded VM dispatcher (`src/nix/vm/run.zig`) chains handlers with `@call(.a
 
 ## Per-module test wiring
 
-`zig build test` (aliased by `check`) walks import graphs — but only a module's *own* `@import` graph. The root test artifacts (`mod_tests` over `fix`, `exe_tests` over `exe`) therefore collect **only** the `fix`-layer tests; a module pulled in by *name* has its own unit tests invisible to the root artifacts. Each module needs its own `addTest` step, run explicitly:
+`zig build test` (aliased by `check`) walks import graphs — but only a module's *own* `@import` graph. The root test artifacts (`mod_tests` over `engine`, `exe_tests` over the executable module) therefore collect only their own tests; a module pulled in by name has unit tests invisible to those artifacts. Each module needs its own `addTest` step, run explicitly:
 
 ```
 test → lint, mod_tests, exe_tests,
-       base_tests, syntax_tests, runtime_tests, scheduler_tests,
-       derivation_tests, bytecode_tests, probe_tests,
-       compiler_tests, cli_tests
+       base_tests, syntax_tests, runtime_tests, host_tests,
+       scheduler_tests, derivation_tests, realization_tests,
+       bytecode_tests, probe_tests, compiler_tests, vm_tests, cli_tests
 ```
 
 This wiring is easy to get wrong: a module whose test step is missing from `test_step` still compiles but is never *run*. When adding a module, add its test step to `test_step` or its tests never execute. `zig build test-syntax` runs the `syntax` tests alone for fast lexer/parser/AST iteration; `zig build bench -- <file.nix>` runs the parse microbenchmark against the `syntax` module.
 
-Integration tests live in the core graph (`src/root/tests`, `src/eval/tests`) so the root artifacts pick them up; `test/*.nix` holds pathology and spec fixtures driven through eval.
+Evaluator integration tests live under `src/nix/root/tests` and `src/nix/eval/tests`. Socket-backed realization tests use `src/nix/realization_test_root.zig`, keeping the fake daemon out of production modules. `test/*.nix` holds pathology and spec fixtures driven through evaluation.
 
 ## `zig build lint` — module-boundary hygiene
 
 `tools/lint_imports.zig` (`zig build lint`, and a dependency of `test`) enforces the facade pattern. A stray `@import("../runtime/value.zig")` from a core file does **not** fail to compile — it drags that file into a second module instance, silently duplicating its types (`runtime.Value` ≠ the copy's `Value`) and producing baffling mismatches far from the cause. The linter walks every `src/**/*.zig`, resolves each relative `@import`, and errors (with `src/path:line`) if the target lands inside another module's files or its facade. A file *inside* a module's directory may import its own module's internals freely; only cross-boundary reaches are rejected. Use `@import("<module>")` across a boundary, always.
 
-It also enforces the **down-only** rule. `module_levels` assigns each module its longest-path depth in the graph (`base`/`syntax` = 0 … `vm` = 5, `cli` = 7); a by-name `@import("X")` from a file in module M is an error unless `level(X) < level(M)`. Because longest-path levels make every legitimate edge strictly decreasing, this rejects exactly the up- and sideways-imports — so "what may I safely import here?" is a located error, not tribal knowledge. (The `fix` core — `nix/root*`, `nix/eval*` — and `main.zig` own no lint module; they are the top and aren't level-checked.)
+It also enforces the declared graph. `module_levels` assigns each module its longest-path depth (`base` = 0 through `engine` = 6 and `cli` = 7), rejecting up- and sideways-imports. `module_deps` then rejects undeclared imports even when the target is lower. Engine composition files under `src/nix/root*` and `src/nix/eval*` are owned by the `engine` lint module; only `src/main.zig` remains composition outside the checked module set.
 
 ## The correctness gate
 

@@ -14,8 +14,8 @@ source text
   → single-pass compiler                      → bytecode Chunk [compiler + bytecode]
   → threaded VM forces lazy thunks            → Value          [vm + runtime]
   → derivation builtins hash the drv graph    → .drv + store paths  [derivation]
-  → nix-daemon client realizes the closure    → .drv files in the store, built
-                                                outputs, result links  [runtime store/]
+  → realization recipes + nix-daemon client  → .drv files in the store, built
+                                                outputs, result links  [realization + host]
 ```
 
 Each stage is lazy at the seams: the compiler emits **thunks** for anything not needed immediately, and the VM forces them only on demand (or *speculatively*, ahead of demand, on idle cores).
@@ -24,43 +24,46 @@ Each stage is lazy at the seams: the compiler emits **thunks** for anything not 
 - **[compiler](compiler/pipeline.md)** — walks the AST once and lowers it to immutable **bytecode chunks**. It resolves names to stack slots and [upvalue captures](compiler/scopes.md), computes [strictness](compiler/strictness.md) masks, and decides what to make lazy vs eager vs [deferred](compiler/lazy-compile.md).
 - **[runtime](runtime/values.md)** — the data model: an 8-byte NaN-boxed [`Value`](runtime/values.md), a flat [object heap](runtime/heap.md), string [interning](runtime/interning.md), and the [thunk](runtime/thunks.md) that carries laziness.
 - **[vm](vm/dispatch.md)** — a direct-threaded bytecode interpreter that [forces thunks](runtime/thunks.md), [calls closures](vm/calls.md), [reads attrsets/lists](vm/access.md), and runs the [builtins](vm/builtins.md).
-- **[derivation](derivation/model.md)** — the `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths. [String context](derivation/context.md) tracks which store paths each string depends on.
-- **store / daemon** — evaluation parity ends at the `.drv`; the `instantiate`/`build`/`run`/`shell` [subcommands](cli.md) then *realize* it. A hand-rolled nix-daemon **worker-protocol client** (`runtime/store/daemon.zig`, wire framing in `runtime/store/wire.zig`; Lix + CppNix compatible, version-negotiated handshake) adds the `.drv` closure to the store (NAR serialization in `runtime/nar.zig`) and asks the daemon to build, streaming build activity back. The fetching side lives next to it: `runtime/fetch_cache.zig` caches downloads, `vm/builtins/fetch.zig` implements the `fetch*` builtins, and `vm/builtins/flake_registry.zig` resolves flake refs.
+- **[derivation](derivation/model.md)** — the domain model: `Drv`, canonical hashing and paths, string context, and the evaluation-scoped registry of computed derivations. The `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths.
+- **realization** — turns derivation records and source-path recipes into concrete store actions. It owns the evaluation's `DerivationStore`, lazy derivation cache, source ingestion, closure planning, and realization claims; it depends on the pure derivation model and the host interfaces.
+- **host / daemon** — concrete effects: file and fetch caches, NAR serialization, and the nix-daemon worker-protocol client (`host/store/daemon.zig`, wire framing in `host/store/wire.zig`). Store-writing commands configure and warm the daemon connection pool before evaluation begins, so its worker threads perform the 10–30 ms handshakes concurrently with useful evaluator work. The pool remains host machinery; command policy only decides whether to enable store writes.
 
 ## The module DAG
 
-The source tree is three tiers, each answering "what am I looking at": `src/base/` (generic, reusable infrastructure with zero Nix coupling), `src/nix/` (the evaluator itself), and `src/cli/` + `src/main.zig` (the command-line app). Each subsystem is a Zig module reached by name through a single facade; reaching into another module's internals by relative path is a lint error (`zig build lint`), and would silently duplicate-compile those files into a second, incompatible copy of their types. The lint also enforces a **down-only** rule — every import points to a strictly lower layer — so the tree tells you what a file may safely reach.
+The source tree is three tiers, each answering "what am I looking at": `src/base/` (generic, reusable infrastructure with zero Nix coupling), `src/nix/` (language, runtime, effects, and evaluation engine), and `src/cli/` + `src/main.zig` (the command-line app). Each subsystem is a Zig module reached by name through a single facade; reaching into another module's internals by relative path is a lint error (`zig build lint`), and would silently duplicate-compile those files into a second, incompatible copy of their types. The lint enforces both a down-only topological order and an explicit dependency allowlist, so being lower in the graph is necessary but not sufficient for an import.
 
 ```
-src/base/    one `base` module — generic infrastructure, nothing Nix-specific:
-             lock-free deque + cache-line isolation, the stackful fiber, spin/
-             blocking mutexes, segmented + flat stores, the mmap RSS tracker
-             Vma(Tag), the block-cache allocator, a regex engine, a TOML parser.
+src/base/    base → base_options
+             Generic containers, synchronization, fibers, allocators, regex,
+             and TOML. `base_options` contains only generic fiber probe knobs.
 
-src/nix/     the evaluator — one module per subsystem, layered:
-   syntax                    → (parser tables)
-   runtime                   → base        Nix value model, heap, thunk/Future,
-                                            interning, GC tracer, the MemTag taxonomy,
-                                            the nix-daemon client (store/), NAR,
-                                            the fetch cache
-   observ                    → syntax       progress sink + error-trace collector
-   scheduler   derivation    → runtime, base
-   bytecode                  → runtime, base
-   probe                     → bytecode, runtime, base
-   compiler                  → bytecode, runtime, syntax, probe, base
-   vm                        → compiler, bytecode, scheduler, derivation,
-                                observ, probe, runtime, syntax, base
-   fix (src/nix/root.zig)    → all of nix + base   the Evaluator (composes the
-                                                    pipeline, owns shared state)
+src/nix/     language and domain foundations:
+   syntax       → base                       scanner, parser, AST
+   runtime      → base                       Value, heap, thunk/Future, intern, GC
+   observ       → syntax                     progress and error-trace protocols
+   scheduler    → runtime, base              work-stealing execution machinery
+   derivation   → runtime, base              Drv model, hashing, context, Registry
+   bytecode     → runtime, base              instruction and chunk model
 
-src/cli/     the `cli` module + `src/main.zig`  → fix + the shared leaf set
-                                                   (runtime, syntax, scheduler,
-                                                   derivation, observ, base)
+             concrete runtime services:
+   host         → runtime, base              files, fetches, NAR, daemon pool/client
+   realization  → derivation, host, runtime, base
+                                                recipes, source ingestion, builds
+
+             evaluation engine:
+   probe        → bytecode, runtime, base
+   compiler     → probe, bytecode, syntax, runtime, base
+   vm           → compiler, bytecode, scheduler, derivation, realization,
+                  host, observ, probe, runtime, syntax, base
+   engine       → the nix modules above      Evaluator and public app-facing API
+
+src/cli/     cli → engine                    commands, options, rendering, debugger
+src/main.zig    → engine, cli                process composition; executable `fix`
 ```
 
 `base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and `nix` supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
 
-Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler` lowers the AST onto `bytecode`; `vm` is the execution engine — the threaded dispatcher, thunk forcing, the fiber worker pool, the builtins; `fix` composes it into the `Evaluator`. What could look like an `Evaluator`/VM cycle is avoided by placement: the VM's on-demand compilation of a deferred thunk body calls *down* into `compiler`, and the fiber worker that drives forcing lives *inside* `vm` next to the force path, so force↔worker is intra-module. See [build](build.md).
+Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler` lowers the AST onto `bytecode`; `vm` is the execution core; `engine` composes it into the `Evaluator` and is the only evaluator facade visible to the CLI. Language semantics do not import concrete host effects. Realization may use the host, the VM may compose both, and command code cannot reach around the engine boundary. What could look like an `Evaluator`/VM cycle is avoided by placement: the VM's on-demand compilation of a deferred thunk body calls down into `compiler`, and the fiber worker that drives forcing lives inside `vm` next to the force path. See [build](build.md).
 
 ## Laziness and parallelism are one primitive
 

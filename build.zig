@@ -32,10 +32,15 @@ pub fn build(b: *std.Build) void {
     // SAME module object, else Zig sees the generated file in two modules.
     const build_options_mod = build_options.createModule();
 
+    const base_options = b.addOptions();
+    base_options.addOption(bool, "fiber_stack_probe", fiber_stack_probe);
+    base_options.addOption(bool, "fiber_census", prof_main);
+    const base_options_mod = base_options.createModule();
+
     // Every subsystem is a real module: consumers import it by name
     // (`@import("syntax")`) and the compiler enforces that nothing reaches into
     // its internals. The modules form an acyclic graph (see docs/build.md),
-    // topped by the `fix` evaluator layer (src/root.zig).
+    // topped by the `engine` evaluator layer (src/nix/root.zig).
     const syntax_mod = b.addModule("syntax", .{
         .root_source_file = b.path("src/nix/syntax.zig"),
         .target = target,
@@ -74,7 +79,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
-    base_mod.addImport("build_options", build_options_mod);
+    base_mod.addImport("base_options", base_options_mod);
     // The parser's AST arena is the plain (non-atomic) one in base — see
     // src/base/arena.zig. `base` sits below `syntax` in the graph, so this
     // introduces no cycle.
@@ -274,7 +279,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "fix",
         .root_module = exe_mod,
-        // The threaded VM dispatcher in src/vm/run.zig relies on
+        // The threaded VM dispatcher in src/nix/vm/run.zig relies on
         // `@call(.always_tail)`, which only the LLVM backend
         // implements. Force LLVM for every build mode so debug
         // builds don't unbounded-recurse through the dispatch
@@ -308,7 +313,7 @@ pub fn build(b: *std.Build) void {
     // separate modules (clean-cut subsystems, see the comment above
     // `syntax_mod`), so their unit tests aren't collected by the root-module
     // test artifacts above — Zig only walks a module's own `@import` graph,
-    // and these are pulled into `fix` by module name, not by file inclusion.
+    // and these are pulled into `engine` by module name, not by file inclusion.
     // Run each explicitly, the same way `runtime_tests` already was.
     const base_tests = b.addTest(.{
         .root_module = base_mod,
@@ -376,6 +381,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_compiler_tests = b.addRunArtifact(compiler_tests);
 
+    const vm_tests = b.addTest(.{
+        .root_module = vm_mod,
+        .use_llvm = true,
+    });
+    const run_vm_tests = b.addRunArtifact(vm_tests);
+
     // Module-boundary import lint (tools/lint_imports.zig). Catches relative
     // imports that reach into a clean-cut module's files instead of going
     // through `@import("<module>")` — those silently duplicate-compile.
@@ -406,12 +417,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_bytecode_tests.step);
     test_step.dependOn(&run_probe_tests.step);
     test_step.dependOn(&run_compiler_tests.step);
+    test_step.dependOn(&run_vm_tests.step);
 
     const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);
 
     // Quick syntax-only tests. The parser imports the build-generated
-    // `parser_tables`, so `zig test src/syntax/parser.zig` can't resolve it on
+    // `parser_tables`, so `zig test src/nix/syntax/parser.zig` can't resolve it on
     // its own — use this instead for fast iteration on the lexer/parser/AST.
     const test_syntax_step = b.step("test-syntax", "Run only the syntax (lexer/parser/AST) tests");
     test_syntax_step.dependOn(&run_syntax_tests.step);

@@ -1,9 +1,8 @@
 //! Module-boundary import lint.
 //!
-//! The clean-cut subsystems (`syntax`, `runtime`, `base`, `scheduler`,
-//! `derivation`) are real `build.zig` modules. Code outside such a module
-//! must reach it by name — `@import("runtime")` — never by a relative path
-//! into its files.
+//! Every subsystem from generic `base` through `engine` and `cli` is a real
+//! `build.zig` module. Code outside a module must reach it by name —
+//! `@import("runtime")` — never by a relative path into its files.
 //!
 //! A stray `@import("../runtime/value.zig")` from a main-module file does *not*
 //! fail to compile: it pulls that file into a second module instance, silently
@@ -11,10 +10,9 @@
 //! producing baffling mismatches far from the cause. This linter makes that a
 //! hard, located error instead.
 //!
-//! It also enforces the **down-only** rule: modules form a layered acyclic
-//! graph (see `module_levels`), and a file in one module may only `@import` a
-//! module at a strictly lower level — so "what may I safely import here?" is a
-//! located error, not tribal knowledge.
+//! It also enforces the declared dependency graph: imports must point down to
+//! a strictly lower level and appear in `module_deps`. This catches both cycles
+//! and accidental coupling to unrelated lower layers.
 //!
 //! Run via `zig build lint`; the `test` step depends on it.
 
@@ -23,14 +21,13 @@ const std = @import("std");
 /// Every build module's name. A file outside a module may not reach into its
 /// files by relative path; see `owningModule` for how physical paths (the
 /// `base/`, `nix/`, `cli/` tiers) map onto these names.
-const module_dirs = [_][]const u8{ "syntax", "runtime", "host", "base", "scheduler", "derivation", "realization", "cli", "observ", "bytecode", "probe", "compiler", "vm" };
+const module_dirs = [_][]const u8{ "syntax", "runtime", "host", "base", "scheduler", "derivation", "realization", "cli", "observ", "bytecode", "probe", "compiler", "vm", "engine" };
 
 /// Longest-path topological level of each module in the `build.zig` dependency
 /// graph. Imports must point strictly DOWN: a file in module M may only
 /// `@import(name)` a module whose level is LOWER than M's. With longest-path
-/// levels every legitimate edge is strictly decreasing, so this rejects exactly
-/// the up- and sideways-imports. (The `fix` core — `nix/root*`, `nix/eval*` —
-/// and `main.zig` own no lint module; they are the top and aren't checked.)
+/// levels every legitimate edge is strictly decreasing, so this rejects up- and
+/// sideways-imports. `module_deps` below narrows that to the declared edges.
 const ModuleLevel = struct { name: []const u8, level: u8 };
 const module_levels = [_]ModuleLevel{
     .{ .name = "base", .level = 0 },
@@ -47,12 +44,40 @@ const module_levels = [_]ModuleLevel{
     .{ .name = "probe", .level = 3 },
     .{ .name = "compiler", .level = 4 },
     .{ .name = "vm", .level = 5 },
+    .{ .name = "engine", .level = 6 },
     .{ .name = "cli", .level = 7 },
+};
+
+const ModuleDeps = struct { name: []const u8, deps: []const []const u8 };
+const module_deps = [_]ModuleDeps{
+    .{ .name = "base", .deps = &.{} },
+    .{ .name = "syntax", .deps = &.{"base"} },
+    .{ .name = "runtime", .deps = &.{"base"} },
+    .{ .name = "host", .deps = &.{ "runtime", "base" } },
+    .{ .name = "observ", .deps = &.{"syntax"} },
+    .{ .name = "scheduler", .deps = &.{ "runtime", "base" } },
+    .{ .name = "derivation", .deps = &.{ "runtime", "base" } },
+    .{ .name = "realization", .deps = &.{ "runtime", "host", "derivation", "base" } },
+    .{ .name = "bytecode", .deps = &.{ "runtime", "base" } },
+    .{ .name = "probe", .deps = &.{ "runtime", "base", "bytecode" } },
+    .{ .name = "compiler", .deps = &.{ "runtime", "base", "syntax", "bytecode", "probe" } },
+    .{ .name = "vm", .deps = &.{ "runtime", "host", "realization", "base", "syntax", "scheduler", "derivation", "observ", "bytecode", "compiler", "probe" } },
+    .{ .name = "engine", .deps = &.{ "runtime", "host", "realization", "base", "syntax", "scheduler", "derivation", "observ", "bytecode", "compiler", "probe", "vm" } },
+    .{ .name = "cli", .deps = &.{"engine"} },
 };
 
 fn levelOf(name: []const u8) ?u8 {
     for (module_levels) |ml| if (std.mem.eql(u8, ml.name, name)) return ml.level;
     return null;
+}
+
+fn dependencyAllowed(owner: []const u8, imported: []const u8) bool {
+    for (module_deps) |module| {
+        if (!std.mem.eql(u8, owner, module.name)) continue;
+        for (module.deps) |dep| if (std.mem.eql(u8, imported, dep)) return true;
+        return false;
+    }
+    return false;
 }
 
 const max_file_bytes = 8 * 1024 * 1024;
@@ -86,6 +111,13 @@ pub fn main(init: std.process.Init) !void {
                 if (owning) |own| {
                     if (!std.mem.eql(u8, name, own)) {
                         if (levelOf(name)) |imp_lvl| if (levelOf(own)) |own_lvl| {
+                            if (!dependencyAllowed(own, name)) {
+                                violations += 1;
+                                std.debug.print(
+                                    "src/{s}:{d}: undeclared import edge — module '{s}' may not import '{s}'\n    {s}\n",
+                                    .{ entry.path, line_no, own, name, std.mem.trim(u8, line, " \t") },
+                                );
+                            }
                             if (imp_lvl >= own_lvl) {
                                 violations += 1;
                                 std.debug.print(
@@ -123,25 +155,20 @@ pub fn main(init: std.process.Init) !void {
 ///   - `base/**` is a single module (`base`) — the whole tier.
 ///   - `cli/**` is a single module (`cli`) — the whole tier.
 ///   - `nix/**` holds one module per subsystem: `nix/<m>/**` and the facade
-///     `nix/<m>.zig` belong to module `<m>` (the `fix` core files `nix/root*`
-///     and `nix/eval*` belong to no lint module).
+///     `nix/<m>.zig` belong to module `<m>`. Evaluator composition files under
+///     `nix/root*` and `nix/eval*` belong to the `engine` module.
 /// A module's own files may freely import its internals by relative path.
 fn owningModule(rel: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, rel, "base/")) return "base";
     if (std.mem.startsWith(u8, rel, "cli/")) return "cli";
-    if (std.mem.eql(u8, rel, "nix/runtime/file_cache.zig") or
-        std.mem.eql(u8, rel, "nix/runtime/fetch_cache.zig") or
-        std.mem.eql(u8, rel, "nix/runtime/nar.zig") or
-        std.mem.eql(u8, rel, "nix/runtime/store.zig") or
-        std.mem.startsWith(u8, rel, "nix/runtime/store/") or
-        std.mem.eql(u8, rel, "nix/runtime/daemon_runtime.zig")) return "host";
-    if (std.mem.eql(u8, rel, "nix/derivation/store.zig") or
-        std.mem.eql(u8, rel, "nix/derivation/source_path.zig")) return "realization";
     // Strip the `nix/` tier segment (if present) before matching subsystem dirs.
     const inner = if (std.mem.startsWith(u8, rel, "nix/")) rel["nix/".len..] else rel;
-    if (std.mem.eql(u8, inner, "realization_test_root.zig") or
-        std.mem.eql(u8, inner, "derivation/tests.zig") or
-        std.mem.eql(u8, inner, "derivation/recipe_tests.zig")) return "realization";
+    if (std.mem.eql(u8, inner, "root.zig") or
+        std.mem.eql(u8, inner, "process_support.zig") or
+        std.mem.eql(u8, inner, "eval.zig") or
+        std.mem.startsWith(u8, inner, "eval/") or
+        std.mem.startsWith(u8, inner, "root/")) return "engine";
+    if (std.mem.eql(u8, inner, "realization_test_root.zig")) return "realization";
     for (module_dirs) |m| {
         if (std.mem.startsWith(u8, inner, m) and inner.len > m.len and inner[m.len] == '/') return m;
         if (inner.len == m.len + 4 and std.mem.startsWith(u8, inner, m) and std.mem.eql(u8, inner[m.len..], ".zig")) return m;

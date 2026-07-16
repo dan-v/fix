@@ -25,7 +25,7 @@ Everything below is a matter of **which `ty`** and **which `inner_digest`** feed
 2. **Input-addressed output paths** — one *masked* hash-modulo (`mask_outputs=true`) for all outputs, then a path per output.
 3. **Back-patch** each output's `env` entry to its computed path.
 4. **`.drv` text path** — serialize the *actual* (unmasked, inputs-unresolved) `Drv` and text-hash it.
-5. **Dependency hash-modulo** — an *unmasked* hash-modulo (`mask_outputs=false`) recorded in the [`DerivationStore`](./model.md) for consumers to resolve against.
+5. **Dependency hash-modulo** — an *unmasked* hash-modulo (`mask_outputs=false`) recorded in the derivation `Registry` for consumers to resolve against. The realization-owned `DerivationStore` hosts that registry while an evaluation is running.
 
 The input-set resolution (`hashModuloInputs` — one resolver lookup + hash-dup + merge per input drv) is a pure function of `input_drvs` and the resolver, so `computePaths` runs it **once** and feeds the same resolved inputs to both the masked (step 2) and unmasked (step 5) hashes.
 
@@ -62,7 +62,7 @@ Returned as a per-output hash (`.outputs`).
 
 **Input-addressed** derivation: resolve every input drv to *its* hash-modulo, substitute those resolved hashes for the input drv paths, serialize the ATerm (masked or not, per the caller), sha256 it:
 
-- `hashModuloInputs` walks `input_drvs`; for each, `resolver.resolvePath(input.path)` returns the input's recorded hash-modulo (built earlier and stored in the [`DerivationStore`](./model.md)).
+- `hashModuloInputs` walks `input_drvs`; for each, `resolver.resolvePath(input.path)` returns the input's recorded hash-modulo (built earlier and stored in the derivation `Registry`).
   - Resolved to a single **drv** hash → that hash stands in for the path; the input's requested output-names are carried through, **merged by path** (union of output-name sets if the same path appears twice).
   - Resolved to **per-output** hashes → each requested output name is mapped to its output's hash, keyed under output name `"out"`, then merged by path as above.
 - The resulting substituted input list feeds `toATerm(mask_outputs, actual_inputs=...)` with input paths replaced by resolved hashes (and, under `mask_outputs=true`, output `path` fields and output-named `env` values blanked). `sha256_hex` of that ATerm is the modulo digest — a `HashModulo` with the `.drv` union tag (as opposed to the per-output `.outputs` tag of the fixed-output case).

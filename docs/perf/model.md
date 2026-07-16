@@ -26,7 +26,7 @@ Consequence: "eliminate duplicate work" and "add more parallelism" are both larg
 **Main never waits.** It walks the entire critical chain end-to-end. Helpers offload ~99.7% of all forces — but only the work *off* the chain; the chain itself is a strict serial data-dependency main must traverse node by node, discovered just-in-time so helpers cannot get ahead of it.
 
 **What's on the chain** (inherent to Nix semantics, not machinery):
-- **drv-hashing DAG** — `derivationLazyAttr` computing outPath/drvPath SHA256 over the input-derivation graph (~477–828 drvs, ~3 ATerm serializations each), memoized O(N) via the [DerivationStore](../derivation/model.md) resolver. See [derivation/hashing](../derivation/hashing.md).
+- **drv-hashing DAG** — `derivationLazyAttr` computing outPath/drvPath SHA256 over the input-derivation graph (~477–828 drvs, ~3 ATerm serializations each), memoized O(N) via the derivation `Registry` hosted by the realization store. See [derivation/hashing](../derivation/hashing.md).
 - **module-system fixpoint** — applying millions of user functions (`lib/modules.nix`) and option-merging the config tree. See [derivation/model](../derivation/model.md).
 
 **Machinery is ~7% of the w=32 wall** (`run_isolated_frame` + `do_call` + `force_*` ≈ 100M excl cycles). That ~7% is the entire ceiling for any dispatch- or execution-speed optimization — the other ~93% is data-dependency latency the interpreter cannot outrun.

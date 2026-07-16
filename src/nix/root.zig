@@ -1,6 +1,6 @@
-//! fix — A blazing fast Nix evaluator.
+//! Evaluation engine for the `fix` executable.
 //!
-//! Public API surface. Re-exports the evaluator and types for consumers.
+//! Public API surface between evaluator internals and application front ends.
 
 pub const types = @import("runtime").types;
 pub const value = @import("runtime").value;
