@@ -2429,9 +2429,10 @@ test "disassembling prints the constant pool with resolved values" {
     try writeChunk(allocator, &out.writer, null, &chunk, .{}, .{});
     const text = out.written();
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "constants (1)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "42") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "constant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  constants:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "#0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "int 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "push_const") != null);
 }
 
 test "disassembling resolves an interned attribute name via Symbols" {
@@ -2479,5 +2480,5 @@ test "disassembling omits the constant pool section when show_constants is false
     try writeChunk(allocator, &out.writer, null, &chunk, .{}, .{ .show_constants = false });
     const text = out.written();
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "constants (") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  constants:\n") == null);
 }
