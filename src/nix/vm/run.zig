@@ -143,42 +143,62 @@ fn opPop(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize)
 
 // ---- handlers: locals ----
 
-fn opGetLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = code[ip];
-    const raw = vm.stack[frame.frame_base + slot];
-    if (comptime prof.enabled) {
-        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof_census.rf_local += 1;
-    }
-    const val = try force.forceValue(vm, raw);
-    try stack.push(vm, val);
-    return dispatch(vm, frame, code, ip + 1, stop_depth);
-}
+const SlotOp = enum { get, grab, set, cell_set, cell_init, get_ret, get_attr };
 
-fn opGetLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = readU16(code, ip);
-    const raw = vm.stack[frame.frame_base + slot];
-    if (comptime prof.enabled) {
-        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof_census.rf_local += 1;
-    }
-    const val = try force.forceValue(vm, raw);
-    try stack.push(vm, val);
-    return dispatch(vm, frame, code, ip + 2, stop_depth);
-}
-
-fn opCaptureLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = code[ip];
-    try stack.push(vm, vm.stack[frame.frame_base + slot]);
-    return dispatch(vm, frame, code, ip + 1, stop_depth);
-}
-
-fn opCaptureLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = readU16(code, ip);
-    try stack.push(vm, vm.stack[frame.frame_base + slot]);
-    return dispatch(vm, frame, code, ip + 2, stop_depth);
+/// Specialize the repeated narrow/wide local-slot operations at comptime. The
+/// width changes only operand decoding and the following instruction offset;
+/// keeping their semantics here prevents the variants from drifting apart.
+fn slotOp(comptime operation: SlotOp, comptime wide: bool) HandlerFn {
+    return struct {
+        fn op(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+            if (operation != .get_ret) frame.ip = ip;
+            const operand_len: usize = if (wide) 2 else 1;
+            const slot: u32 = if (wide) readU16(code, ip) else code[ip];
+            switch (operation) {
+                .get => {
+                    const raw = vm.stack[frame.frame_base + slot];
+                    if (comptime prof.enabled) {
+                        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof_census.rf_local += 1;
+                    }
+                    try stack.push(vm, try force.forceValue(vm, raw));
+                    return dispatch(vm, frame, code, ip + operand_len, stop_depth);
+                },
+                .grab => {
+                    try stack.push(vm, vm.stack[frame.frame_base + slot]);
+                    return dispatch(vm, frame, code, ip + operand_len, stop_depth);
+                },
+                .set => {
+                    stack.setStack(vm, frame.frame_base + slot, stack.pop(vm));
+                    return dispatch(vm, frame, code, ip + operand_len, stop_depth);
+                },
+                .cell_set => {
+                    const val = stack.pop(vm);
+                    const cell_val = vm.stack[frame.frame_base + slot];
+                    if (!cell_val.isThunk()) return error.TypeError;
+                    const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
+                    // Binding cells are born claimed; publishing installs the
+                    // pass-through value and wakes any parked helper.
+                    if (vm.solo) thunk.publishCellBindingSolo(val) else thunk.publishCellBinding(val);
+                    vm.heap.gcRecordEdge(cell_val.asObjectId(), val);
+                    return dispatch(vm, frame, code, ip + operand_len, stop_depth);
+                },
+                .cell_init => {
+                    vm.stack[frame.frame_base + slot] = try force.makeBindingCell(vm);
+                    return dispatch(vm, frame, code, ip + operand_len, stop_depth);
+                },
+                .get_ret => {
+                    const result = try force.forceValue(vm, vm.stack[frame.frame_base + slot]);
+                    return retEpilogue(vm, stop_depth, result);
+                },
+                .get_attr => {
+                    const name_id = readU16(code, ip + operand_len);
+                    const result = try access.getAttrValue(vm, vm.stack[frame.frame_base + slot], @intCast(name_id));
+                    try stack.push(vm, result);
+                    return dispatch(vm, frame, code, ip + operand_len + 2, stop_depth);
+                },
+            }
+        }
+    }.op;
 }
 
 fn opCaptureUpvalue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -186,51 +206,6 @@ fn opCaptureUpvalue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_de
     const slot = readU16(code, ip);
     const upvalues = frame.upvalues orelse return error.MissingClosure;
     try stack.push(vm, upvalues[slot]);
-    return dispatch(vm, frame, code, ip + 2, stop_depth);
-}
-
-fn opSetLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = code[ip];
-    const val = stack.pop(vm);
-    stack.setStack(vm, frame.frame_base + slot, val);
-    return dispatch(vm, frame, code, ip + 1, stop_depth);
-}
-
-fn opSetLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = readU16(code, ip);
-    const val = stack.pop(vm);
-    stack.setStack(vm, frame.frame_base + slot, val);
-    return dispatch(vm, frame, code, ip + 2, stop_depth);
-}
-
-fn opSetCellLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = code[ip];
-    const val = stack.pop(vm);
-    const cell_val = vm.stack[frame.frame_base + slot];
-    if (!cell_val.isThunk()) return error.TypeError;
-    const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
-    // Cell was born `.evaluating` claimed by us (see initBindingCell):
-    // publishCellBinding installs pass_through(val), drops the claim,
-    // and transitions back to `.unresolved` so future forces run the
-    // pass_through path lazily. Any helper that parked while we held
-    // the claim wakes here.
-    if (vm.solo) thunk.publishCellBindingSolo(val) else thunk.publishCellBinding(val);
-    vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
-    return dispatch(vm, frame, code, ip + 1, stop_depth);
-}
-
-fn opSetCellLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = readU16(code, ip);
-    const val = stack.pop(vm);
-    const cell_val = vm.stack[frame.frame_base + slot];
-    if (!cell_val.isThunk()) return error.TypeError;
-    const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
-    if (vm.solo) thunk.publishCellBindingSolo(val) else thunk.publishCellBinding(val);
-    vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
     return dispatch(vm, frame, code, ip + 2, stop_depth);
 }
 
@@ -601,38 +576,47 @@ fn opPushBuiltins(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dept
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
-fn opFindFile(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const name_id = readU16(code, ip);
-    const host = vm.import_host orelse return error.SearchPathUnavailable;
-    try stack.push(vm, try host.find_file(host.context, vm.intern.get(@intCast(name_id))));
-    return dispatch(vm, frame, code, ip + 2, stop_depth);
-}
+const InternOp = enum { find_file, get_attr, lookup_with };
 
-fn opFindFileLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const name_id: InternId = readU32(code, ip);
-    const host = vm.import_host orelse return error.SearchPathUnavailable;
-    try stack.push(vm, try host.find_file(host.context, vm.intern.get(name_id)));
-    return dispatch(vm, frame, code, ip + 4, stop_depth);
+/// Handlers whose only encoding distinction is a u16/u32 intern id.
+fn internOp(comptime operation: InternOp, comptime wide: bool) HandlerFn {
+    return struct {
+        fn op(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+            frame.ip = ip;
+            const operand_len: usize = if (wide) 4 else 2;
+            const name_id: InternId = if (wide) readU32(code, ip) else readU16(code, ip);
+            switch (operation) {
+                .find_file => {
+                    const host = vm.import_host orelse return error.SearchPathUnavailable;
+                    try stack.push(vm, try host.find_file(host.context, vm.intern.get(name_id)));
+                    return dispatch(vm, frame, code, ip + operand_len, stop_depth);
+                },
+                .get_attr => {
+                    const attrs_val = vm.stack[vm.sp - 1];
+                    vm.stack[vm.sp - 1] = try access.getAttrValue(vm, attrs_val, name_id);
+                    return dispatch(vm, frame, code, ip + operand_len, stop_depth);
+                },
+                .lookup_with => {
+                    try access.lookupWith(vm, name_id, code[ip + operand_len]);
+                    return dispatch(vm, frame, code, ip + operand_len + 1, stop_depth);
+                },
+            }
+        }
+    }.op;
 }
 
 // ---- handlers: closures and thunks ----
 
-fn opClosure(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id = readU16(code, ip);
-    const upvalue_count = readU16(code, ip + 2);
-    try closures.makeClosure(vm, ch_id, upvalue_count);
-    return dispatch(vm, frame, code, ip + 4, stop_depth);
-}
-
-fn opClosureLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id: ChunkId = readU32(code, ip);
-    const upvalue_count = readU16(code, ip + 4);
-    try closures.makeClosure(vm, ch_id, upvalue_count);
-    return dispatch(vm, frame, code, ip + 6, stop_depth);
+fn closureOp(comptime wide: bool) HandlerFn {
+    return struct {
+        fn op(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+            frame.ip = ip;
+            const id_len: usize = if (wide) 4 else 2;
+            const ch_id: ChunkId = if (wide) readU32(code, ip) else readU16(code, ip);
+            try closures.makeClosure(vm, ch_id, readU16(code, ip + id_len));
+            return dispatch(vm, frame, code, ip + id_len + 2, stop_depth);
+        }
+    }.op;
 }
 
 /// Config for `capOp`: every capture-carrying thunk/closure/arg op is this one
@@ -790,44 +774,7 @@ fn opMakeLazyShell(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dep
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
-fn opInitCellSlot(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = code[ip];
-    const cell = try force.makeBindingCell(vm);
-    vm.stack[frame.frame_base + slot] = cell;
-    return dispatch(vm, frame, code, ip + 1, stop_depth);
-}
-
-fn opInitCellSlotLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = readU16(code, ip);
-    const cell = try force.makeBindingCell(vm);
-    vm.stack[frame.frame_base + slot] = cell;
-    return dispatch(vm, frame, code, ip + 2, stop_depth);
-}
-
 // ---- handlers: attribute access ----
-
-fn opGetAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const name_id = readU16(code, ip);
-    // Keep attrs_val on the stack across getAttrValue (which forces the
-    // attrset AND the looked-up value — the second force would otherwise
-    // expose a popped attrs_val). Replace it in place with the result.
-    const attrs_val = vm.stack[vm.sp - 1];
-    const result = try access.getAttrValue(vm, attrs_val, @intCast(name_id));
-    vm.stack[vm.sp - 1] = result;
-    return dispatch(vm, frame, code, ip + 2, stop_depth);
-}
-
-fn opGetAttrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const name_id: InternId = readU32(code, ip);
-    const attrs_val = vm.stack[vm.sp - 1];
-    const result = try access.getAttrValue(vm, attrs_val, name_id);
-    vm.stack[vm.sp - 1] = result;
-    return dispatch(vm, frame, code, ip + 4, stop_depth);
-}
 
 fn opApplyOverrides(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
@@ -935,62 +882,49 @@ fn opGetAttrDynamicOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
-fn opGetAttrPathDynamicOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const segment_count = code[ip];
-    const names_start = ip + 1;
-    const names_end = names_start + @as(usize, segment_count) * 2;
-    // [attrs, name, default] stay on the stack across the (internally
-    // forcing) helper so they remain precise GC roots; drop only after.
-    const default_val = vm.stack[vm.sp - 1];
-    const name_val = vm.stack[vm.sp - 2];
-    const attrs_val = vm.stack[vm.sp - 3];
-    const result = try access.getAttrPathDynamicOrValue(vm, attrs_val, name_val, default_val, code[names_start..names_end], false);
-    vm.sp -= 3;
-    try stack.push(vm, result);
-    return dispatch(vm, frame, code, names_end, stop_depth);
-}
+const StaticPathOp = enum { dynamic_or, or_value, has, validate };
 
-fn opGetAttrPathDynamicOrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const segment_count = code[ip];
-    const names_start = ip + 1;
-    const names_end = names_start + @as(usize, segment_count) * 4;
-    const default_val = vm.stack[vm.sp - 1];
-    const name_val = vm.stack[vm.sp - 2];
-    const attrs_val = vm.stack[vm.sp - 3];
-    const result = try access.getAttrPathDynamicOrValue(vm, attrs_val, name_val, default_val, code[names_start..names_end], true);
-    vm.sp -= 3;
-    try stack.push(vm, result);
-    return dispatch(vm, frame, code, names_end, stop_depth);
-}
-
-fn opGetAttrPathOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const segment_count = code[ip];
-    const names_start = ip + 1;
-    const names_end = names_start + @as(usize, segment_count) * 2;
-    // [attrs, default] stay on the stack across the (internally forcing)
-    // helper so they remain precise GC roots; drop only after.
-    const default_val = vm.stack[vm.sp - 1];
-    const attrs_val = vm.stack[vm.sp - 2];
-    const result = try access.getAttrPathOrValue(vm, attrs_val, default_val, code[names_start..names_end], false);
-    vm.sp -= 2;
-    try stack.push(vm, result);
-    return dispatch(vm, frame, code, names_end, stop_depth);
-}
-
-fn opGetAttrPathOrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const segment_count = code[ip];
-    const names_start = ip + 1;
-    const names_end = names_start + @as(usize, segment_count) * 4;
-    const default_val = vm.stack[vm.sp - 1];
-    const attrs_val = vm.stack[vm.sp - 2];
-    const result = try access.getAttrPathOrValue(vm, attrs_val, default_val, code[names_start..names_end], true);
-    vm.sp -= 2;
-    try stack.push(vm, result);
-    return dispatch(vm, frame, code, names_end, stop_depth);
+/// Attribute-path encodings differ only in the width of each static intern id.
+fn staticPathOp(comptime operation: StaticPathOp, comptime wide: bool) HandlerFn {
+    return struct {
+        fn op(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+            frame.ip = ip;
+            const name_len: usize = if (wide) 4 else 2;
+            switch (operation) {
+                .dynamic_or => {
+                    const names_start = ip + 1;
+                    const names_end = names_start + @as(usize, code[ip]) * name_len;
+                    // Keep [attrs, name, default] rooted across the forcing walk.
+                    const result = try access.getAttrPathDynamicOrValue(vm, vm.stack[vm.sp - 3], vm.stack[vm.sp - 2], vm.stack[vm.sp - 1], code[names_start..names_end], wide);
+                    vm.sp -= 3;
+                    try stack.push(vm, result);
+                    return dispatch(vm, frame, code, names_end, stop_depth);
+                },
+                .or_value => {
+                    const names_start = ip + 1;
+                    const names_end = names_start + @as(usize, code[ip]) * name_len;
+                    // Keep [attrs, default] rooted across the forcing walk.
+                    const result = try access.getAttrPathOrValue(vm, vm.stack[vm.sp - 2], vm.stack[vm.sp - 1], code[names_start..names_end], wide);
+                    vm.sp -= 2;
+                    try stack.push(vm, result);
+                    return dispatch(vm, frame, code, names_end, stop_depth);
+                },
+                .has => {
+                    const names_start = ip + 1;
+                    const names_end = names_start + @as(usize, code[ip]) * name_len;
+                    const attrs_val = vm.stack[vm.sp - 1];
+                    vm.stack[vm.sp - 1] = Value.boolVal(try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], wide));
+                    return dispatch(vm, frame, code, names_end, stop_depth);
+                },
+                .validate => {
+                    const names_start = ip + 3;
+                    const names_end = names_start + @as(usize, readU16(code, ip + 1)) * name_len;
+                    try access.validateAttrs(vm, stack.pop(vm), code[ip] != 0, code[names_start..names_end], wide);
+                    return dispatch(vm, frame, code, names_end, stop_depth);
+                },
+            }
+        }
+    }.op;
 }
 
 fn opArgOrLit(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -1043,28 +977,6 @@ fn opGetAttrPathMixedOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, sto
     return dispatch(vm, frame, code, cur_ip, stop_depth);
 }
 
-fn opHasAttrPath(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const segment_count = code[ip];
-    const names_start = ip + 1;
-    const names_end = names_start + @as(usize, segment_count) * 2;
-    const attrs_val = vm.stack[vm.sp - 1]; // stays on stack across the path walk
-    const r = try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], false);
-    vm.stack[vm.sp - 1] = Value.boolVal(r);
-    return dispatch(vm, frame, code, names_end, stop_depth);
-}
-
-fn opHasAttrPathLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const segment_count = code[ip];
-    const names_start = ip + 1;
-    const names_end = names_start + @as(usize, segment_count) * 4;
-    const attrs_val = vm.stack[vm.sp - 1];
-    const r = try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], true);
-    vm.stack[vm.sp - 1] = Value.boolVal(r);
-    return dispatch(vm, frame, code, names_end, stop_depth);
-}
-
 fn opHasAttrPathMixed(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const segment_count = code[ip];
@@ -1091,44 +1003,6 @@ fn opHasAttrPathMixed(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
     return dispatch(vm, frame, code, cur_ip, stop_depth);
 }
 
-fn opValidateAttrs(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const allow_extra = code[ip] != 0;
-    const expected_count = readU16(code, ip + 1);
-    const names_start = ip + 3;
-    const names_end = names_start + @as(usize, expected_count) * 2;
-    const attrs_val = stack.pop(vm);
-    try access.validateAttrs(vm, attrs_val, allow_extra, code[names_start..names_end], false);
-    return dispatch(vm, frame, code, names_end, stop_depth);
-}
-
-fn opValidateAttrsLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const allow_extra = code[ip] != 0;
-    const expected_count = readU16(code, ip + 1);
-    const names_start = ip + 3;
-    const names_end = names_start + @as(usize, expected_count) * 4;
-    const attrs_val = stack.pop(vm);
-    try access.validateAttrs(vm, attrs_val, allow_extra, code[names_start..names_end], true);
-    return dispatch(vm, frame, code, names_end, stop_depth);
-}
-
-fn opLookupWith(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const name_id: InternId = @intCast(readU16(code, ip));
-    const scope_count = code[ip + 2];
-    try access.lookupWith(vm, name_id, scope_count);
-    return dispatch(vm, frame, code, ip + 3, stop_depth);
-}
-
-fn opLookupWithLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const name_id: InternId = readU32(code, ip);
-    const scope_count = code[ip + 4];
-    try access.lookupWith(vm, name_id, scope_count);
-    return dispatch(vm, frame, code, ip + 5, stop_depth);
-}
-
 // ---- handlers: termination ----
 
 fn opRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -1145,20 +1019,6 @@ fn opConstantRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
     return retEpilogue(vm, stop_depth, result);
 }
 
-fn opGetLocalRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    const slot = code[ip];
-    const raw = vm.stack[frame.frame_base + slot];
-    const result = try force.forceValue(vm, raw);
-    return retEpilogue(vm, stop_depth, result);
-}
-
-fn opGetLocalRetLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    const slot = readU16(code, ip);
-    const raw = vm.stack[frame.frame_base + slot];
-    const result = try force.forceValue(vm, raw);
-    return retEpilogue(vm, stop_depth, result);
-}
-
 fn opGetUpvalueRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     const slot = readU16(code, ip);
     const upvalues = frame.upvalues orelse return error.MissingClosure;
@@ -1172,24 +1032,6 @@ fn opGetUpvalueAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_de
     const name_id = readU16(code, ip + 2);
     const upvalues = frame.upvalues orelse return error.MissingClosure;
     const result = try access.getAttrValue(vm, upvalues[slot], @intCast(name_id));
-    try stack.push(vm, result);
-    return dispatch(vm, frame, code, ip + 4, stop_depth);
-}
-
-fn opGetLocalAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = code[ip];
-    const name_id = readU16(code, ip + 1);
-    const result = try access.getAttrValue(vm, vm.stack[frame.frame_base + slot], @intCast(name_id));
-    try stack.push(vm, result);
-    return dispatch(vm, frame, code, ip + 3, stop_depth);
-}
-
-fn opGetLocalAttrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const slot = readU16(code, ip);
-    const name_id = readU16(code, ip + 2);
-    const result = try access.getAttrValue(vm, vm.stack[frame.frame_base + slot], @intCast(name_id));
     try stack.push(vm, result);
     return dispatch(vm, frame, code, ip + 4, stop_depth);
 }
@@ -1240,15 +1082,15 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .push_true => opPushTrue,
         .push_false => opPushFalse,
         .pop => opPop,
-        .loc_get => opGetLocal,
-        .loc_get_w => opGetLocalLong,
-        .loc_grab => opCaptureLocal,
-        .loc_grab_w => opCaptureLocalLong,
+        .loc_get => slotOp(.get, false),
+        .loc_get_w => slotOp(.get, true),
+        .loc_grab => slotOp(.grab, false),
+        .loc_grab_w => slotOp(.grab, true),
         .up_grab => opCaptureUpvalue,
-        .loc_set => opSetLocal,
-        .loc_set_w => opSetLocalLong,
-        .cell_set => opSetCellLocal,
-        .cell_set_w => opSetCellLocalLong,
+        .loc_set => slotOp(.set, false),
+        .loc_set_w => slotOp(.set, true),
+        .cell_set => slotOp(.cell_set, false),
+        .cell_set_w => slotOp(.cell_set, true),
         .up_get => opGetUpvalue,
         .int_add => opAddInt,
         .int_sub => opSubInt,
@@ -1282,10 +1124,10 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .str_cat => opConcatStrings,
         .path_cat => opConcatPath,
         .push_builtins => opPushBuiltins,
-        .file_find => opFindFile,
-        .file_find_w => opFindFileLong,
-        .closure => opClosure,
-        .closure_w => opClosureLong,
+        .file_find => internOp(.find_file, false),
+        .file_find_w => internOp(.find_file, true),
+        .closure => closureOp(false),
+        .closure_w => closureOp(true),
         .closure_cap => capOp(.{ .kind = .closure, .wide = false }),
         .closure_cap_w => capOp(.{ .kind = .closure, .wide = true }),
         .thunk_arg => capOp(.{ .kind = .arg, .wide = true }),
@@ -1306,33 +1148,33 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .call_n => opCallN,
         .call_tail_n => opTailCallN,
         .push_const_ret => opConstantRet,
-        .loc_get_ret => opGetLocalRet,
-        .loc_get_ret_w => opGetLocalRetLong,
+        .loc_get_ret => slotOp(.get_ret, false),
+        .loc_get_ret_w => slotOp(.get_ret, true),
         .up_get_ret => opGetUpvalueRet,
         .up_get_attr => opGetUpvalueAttr,
-        .loc_get_attr => opGetLocalAttr,
-        .loc_get_attr_w => opGetLocalAttrLong,
+        .loc_get_attr => slotOp(.get_attr, false),
+        .loc_get_attr_w => slotOp(.get_attr, true),
         .cell_new => opMakeCell,
         .thunk_shell => opMakeLazyShell,
         .thunk_attr => opThunkAttr,
-        .cell_init => opInitCellSlot,
-        .cell_init_w => opInitCellSlotLong,
-        .attr_get => opGetAttr,
-        .attr_get_w => opGetAttrLong,
+        .cell_init => slotOp(.cell_init, false),
+        .cell_init_w => slotOp(.cell_init, true),
+        .attr_get => internOp(.get_attr, false),
+        .attr_get_w => internOp(.get_attr, true),
         .attr_get_dyn => opGetAttrDynamic,
         .attr_get_dyn_or => opGetAttrDynamicOr,
-        .attr_get_path_dyn_or => opGetAttrPathDynamicOr,
-        .attr_get_path_dyn_or_w => opGetAttrPathDynamicOrLong,
-        .attr_get_path_or => opGetAttrPathOr,
-        .attr_get_path_or_w => opGetAttrPathOrLong,
+        .attr_get_path_dyn_or => staticPathOp(.dynamic_or, false),
+        .attr_get_path_dyn_or_w => staticPathOp(.dynamic_or, true),
+        .attr_get_path_or => staticPathOp(.or_value, false),
+        .attr_get_path_or_w => staticPathOp(.or_value, true),
         .attr_get_path_mix_or => opGetAttrPathMixedOr,
-        .attr_has_path => opHasAttrPath,
-        .attr_has_path_w => opHasAttrPathLong,
+        .attr_has_path => staticPathOp(.has, false),
+        .attr_has_path_w => staticPathOp(.has, true),
         .attr_has_path_mix => opHasAttrPathMixed,
-        .attr_check => opValidateAttrs,
-        .attr_check_w => opValidateAttrsLong,
-        .with_lookup => opLookupWith,
-        .with_lookup_w => opLookupWithLong,
+        .attr_check => staticPathOp(.validate, false),
+        .attr_check_w => staticPathOp(.validate, true),
+        .with_lookup => internOp(.lookup_with, false),
+        .with_lookup_w => internOp(.lookup_with, true),
         .thunk_defer => opDeferAttrValue,
         .arg_or_lit => opArgOrLit,
         .attrs_apply_overrides => opApplyOverrides,
