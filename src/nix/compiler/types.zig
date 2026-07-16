@@ -34,6 +34,10 @@ pub const WithScope = struct {
 
 pub const AttrEntryView = struct {
     path: []const Node.Atom,
+    /// Present for `${name} = value` entries. Keeping dynamic and static
+    /// entries in the same normalized view lets attr-set lowering use one
+    /// mixed/static/recursive pipeline instead of mirroring the AST path.
+    dynamic_name: ?*const Node = null,
     expr: *const Node,
     inherit_outer: bool = false,
     /// The outermost attr-path segment this view was desugared from, threaded
@@ -46,12 +50,6 @@ pub const AttrEntryView = struct {
 /// All entries sharing one attr-name root, bucketed into direct `leaves`
 /// (path.len == 1) and nested `tails` (path.len > 1).
 ///
-/// FOOTGUN: `leaf_count`/`tail_count` are dual-purpose across the two
-/// passes of `attrEntryGroups`. Pass 1 uses them as running *counts* to
-/// size the `leaves`/`tails` slices; they are then reset to 0 and reused
-/// as fill *cursors* in pass 2. So they equal the true bucket size only
-/// before the carve and again after the fill completes — never trust them
-/// mid-build; read `leaves.len`/`tails.len` once the slices are populated.
 pub const AttrEntryGroup = struct {
     first: Node.Atom,
     name: []const u8,
@@ -59,10 +57,8 @@ pub const AttrEntryGroup = struct {
     leaf: ?AttrEntryView = null,
     duplicate_leaf: ?AttrEntryView = null,
     leaves: []AttrEntryView = &.{},
-    leaf_count: usize = 0,
     first_nested: ?AttrEntryView = null,
     tails: []AttrEntryView = &.{},
-    tail_count: usize = 0,
 };
 
 pub const AttrEntryGroups = struct {
