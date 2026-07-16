@@ -697,7 +697,6 @@ pub const Evaluator = struct {
         // build phase already, but be structural about it.
         self.stopProgressSampler();
         mem_report.report(&self.heap, &self.intern, &self.registry, self.retained_arenas.items, self.mem_report_mode);
-        self.prefetch.seen.deinit(self.allocator);
         gc.recordFinalTotal(&self.heap.gc_report, self.heap.totalReservedBytes());
         if (self.gc_report_on) gc.report(&self.heap.gc_report, self.heap.gc_budget_bytes);
         // Shut helpers down (which joins on `defer vm.deinit()` inside
@@ -708,6 +707,10 @@ pub const Evaluator = struct {
         // a helper still resuming a stolen main fiber.
         if (self.main_worker) |w| w.deinit();
         self.main_worker = null;
+        // Registration effects run directly from compiler workers now. Keep
+        // their dedup state alive until every worker that can publish a chunk
+        // has joined.
+        self.prefetch.seen.deinit(self.allocator);
         // Every VM (helper fibers, main worker, imports) is dead now —
         // all pooled stack/frames buffers are back on the free list.
         self.vm_buffers.deinit();
@@ -753,6 +756,42 @@ pub const Evaluator = struct {
 
     pub fn setReleaseHook(self: *Evaluator, hook: ?ReleaseHook) void {
         self.release_hook = hook;
+    }
+
+    /// Allocator for app-layer values whose ownership is explicitly returned
+    /// to the evaluator (source descriptors, diagnostics, debug records).
+    pub fn hostAllocator(self: *const Evaluator) std.mem.Allocator {
+        return self.allocator;
+    }
+
+    pub fn basePath(self: *const Evaluator) ?[]const u8 {
+        return self.base_path;
+    }
+
+    pub fn configureLanguage(self: *Evaluator, policy: LanguagePolicy) void {
+        self.policy = policy;
+    }
+
+    pub fn languagePolicy(self: *const Evaluator) LanguagePolicy {
+        return self.policy;
+    }
+
+    pub fn configureMemory(self: *Evaluator, max_memory: ?u64, report_mode: ?[]const u8, gc_report: bool) void {
+        self.max_memory_bytes = max_memory;
+        self.mem_report_mode = report_mode;
+        self.gc_report_on = gc_report;
+    }
+
+    pub fn setLazyShellsVisible(self: *Evaluator, visible: bool) void {
+        self.lazy_shells_visible = visible;
+    }
+
+    pub fn setTraceFlows(self: *Evaluator, enabled: bool) void {
+        self.scheduler.setTraceFlows(enabled);
+    }
+
+    pub fn addIndirectRoot(self: *Evaluator, link_path: []const u8) !void {
+        return self.store.addIndirectRoot(link_path);
     }
 
     pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {
@@ -864,6 +903,12 @@ pub const Evaluator = struct {
         // layer.
         if (comptime !vm_mod.thunks_log_enabled) return;
         self.thunk_trace = thunk_trace;
+    }
+
+    /// Construct a thunk trace bound to this evaluator's runtime state without
+    /// exporting mutable heap/registry pointers to the CLI composition layer.
+    pub fn initThunkTrace(self: *Evaluator, writer: *std.Io.Writer) ThunkTrace {
+        return ThunkTrace.init(writer, &self.intern, &self.heap, &self.registry);
     }
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
@@ -1158,6 +1203,70 @@ pub const Evaluator = struct {
     /// Read-only access to the chunk registry for tools.
     pub fn chunkRegistry(self: *const Evaluator) *const ChunkRegistry {
         return &self.registry;
+    }
+
+    /// Explicit diagnostic surface for CLI tooling. Runtime representation is
+    /// intentionally available here, but ordinary command workflows do not get
+    /// direct mutable access to the Evaluator's heap/intern/registry fields.
+    pub const Tooling = struct {
+        ev: *Evaluator,
+
+        pub fn attrs(self: Tooling, value: Value) ![]const runtime.heap.AttrEntry {
+            return self.ev.heap.getAttrs(value.asObjectId());
+        }
+
+        pub fn listLen(self: Tooling, value: Value) !usize {
+            return self.ev.heap.getListLen(value.asObjectId());
+        }
+
+        pub fn internText(self: Tooling, id: types.InternId) []const u8 {
+            return self.ev.intern.get(id);
+        }
+
+        pub fn intern(self: Tooling, text_value: []const u8) !types.InternId {
+            return self.ev.intern.intern(text_value);
+        }
+
+        pub fn attrValueOpt(self: Tooling, value: Value, name: types.InternId) !?Value {
+            return self.ev.heap.getAttrValueOpt(value.asObjectId(), name);
+        }
+
+        pub fn thunk(self: Tooling, value: Value) !*thunk_mod.Thunk {
+            return self.ev.heap.getThunk(value.asObjectId());
+        }
+
+        pub fn closure(self: Tooling, value: Value) !runtime.heap.Closure {
+            return self.ev.heap.getClosure(value.asObjectId());
+        }
+
+        pub fn reportCreationCensus(self: Tooling) void {
+            self.ev.heap.profCreationCensus();
+            self.ev.heap.profSiblingCensus();
+        }
+    };
+
+    pub fn tooling(self: *Evaluator) Tooling {
+        return .{ .ev = self };
+    }
+
+    pub const ScopeBinding = struct { name: []const u8, value: Value };
+
+    /// Replace the REPL's ambient scope and its external GC roots as one
+    /// evaluator-owned operation, so the CLI cannot accidentally construct a
+    /// heap object without registering the values that keep it alive.
+    pub fn replaceExternalScope(self: *Evaluator, bindings: []const ScopeBinding) !Value {
+        const entries = try self.allocator.alloc(runtime.heap.AttrEntry, bindings.len);
+        defer self.allocator.free(entries);
+        const roots = try self.allocator.alloc(Value, bindings.len + 1);
+        defer self.allocator.free(roots);
+        for (bindings, entries, roots[0..bindings.len]) |binding, *entry, *root| {
+            entry.* = .{ .name = try self.intern.intern(binding.name), .value = binding.value };
+            root.* = binding.value;
+        }
+        const scope = Value.attrs(try self.heap.addAttrs(entries));
+        roots[bindings.len] = scope;
+        try self.gcSetExternalRoots(roots);
+        return scope;
     }
 
     /// Enable best-effort chunk naming: the compiler records the attr/let
@@ -1841,8 +1950,7 @@ pub const Evaluator = struct {
     /// path constants — are mostly never imported in a given eval and
     /// would be junk), dedups per intern id, spends the submission
     /// budget, and hands the path to the spec lane.
-    fn prefetchPathConst(context: *anyopaque, path_id: types.InternId) void {
-        const self: *Evaluator = @ptrCast(@alignCast(context));
+    fn prefetchPathConst(self: *Evaluator, path_id: types.InternId) void {
         const text = self.intern.get(path_id);
         if (!std.mem.endsWith(u8, text, ".nix")) return;
         {

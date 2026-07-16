@@ -183,7 +183,7 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
         reg_stats.speculatable_with_strictness,
         percent(reg_stats.speculatable_with_strictness, reg_stats.speculatable),
     });
-    try writeCodeDedupCensus(writer, ev.allocator, ev.chunkRegistry());
+    try writeCodeDedupCensus(writer, ev.hostAllocator(), ev.chunkRegistry());
 
     try writeSchedulerStats(writer, workers, sched_stats);
 
@@ -280,7 +280,7 @@ fn percent(part: u64, total: u64) f64 {
 }
 
 fn writeTopInterned(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
-    const allocator = ev.allocator;
+    const allocator = ev.hostAllocator();
     const stats = ev.internStats();
     const Pair = struct { id: u32, len: u32 };
     var pairs = try allocator.alloc(Pair, stats.entries);

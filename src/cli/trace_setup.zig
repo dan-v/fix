@@ -61,12 +61,7 @@ pub fn setupThunkTrace(
 
     const trace_ptr = try allocator.create(thunk_trace_mod.ThunkTrace);
     errdefer allocator.destroy(trace_ptr);
-    trace_ptr.* = thunk_trace_mod.ThunkTrace.init(
-        &writer_ptr.interface,
-        ev.internTable(),
-        &ev.heap,
-        &ev.registry,
-    );
+    trace_ptr.* = ev.initThunkTrace(&writer_ptr.interface);
     setup.trace = trace_ptr;
     return setup;
 }

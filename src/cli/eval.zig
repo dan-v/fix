@@ -55,7 +55,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
         console.install(&ev);
     }
 
-    if (source_arg == .flake and !ev.policy.flakes_enabled) {
+    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }
@@ -65,9 +65,9 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
         return 1;
     };
     // `--flake` and `-A`/`--arg` wrapping synthesize source text on
-    // `ev.allocator`; plain expr/file text is borrowed (argv) or owned by the
+    // the evaluator's host allocator; plain expr/file text is borrowed (argv) or owned by the
     // evaluator's file cache.
-    defer source.deinit(ev.allocator);
+    defer source.deinit(ev.hostAllocator());
     // Let the debugger show a source snippet for a `-e` expression (files it
     // reads from the FileCache).
     if (options.debugger) ev.setDebugSource(source.text);
@@ -91,9 +91,9 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     // stays dormant (one predictable branch at quantum granularity, ~free).
     const timeline_path = options.timeline_path;
     if (timeline_path != null) {
-        timeline.init(allocator, worker_count, 1 << 21, &ev.intern);
+        timeline.init(allocator, worker_count, 1 << 21, ev.internTable());
         timeline.setFlowSample(options.timeline_flows);
-        ev.scheduler.setTraceFlows(true);
+        ev.setTraceFlows(true);
         timeline.setSource(switch (source_arg) {
             .file => |p| p,
             .expr => "(expression)",

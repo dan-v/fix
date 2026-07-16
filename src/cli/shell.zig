@@ -138,7 +138,7 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
 /// Build the `-e`/`--file`/`--flake` derivation, appending its outPath.
 fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const source_arg = options.source.?;
-    if (source_arg == .flake and !ev.policy.flakes_enabled) {
+    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
@@ -146,7 +146,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
-    defer source.deinit(ev.allocator);
+    defer source.deinit(ev.hostAllocator());
 
     const result = ev.evaluatePath(source.text, eval_support.sourcePathOf(source_arg, source)) catch |err| {
         ev.stopProgressSampler();

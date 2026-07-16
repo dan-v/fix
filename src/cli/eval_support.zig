@@ -53,7 +53,7 @@ pub fn evaluateAndWrite(
         try render.evaluationError(io, use_color, show_trace, ev, source, err);
         return false;
     };
-    try derivation_debug.write(io, use_color, ev.allocator, debug_options, ev.derivationDebugRecords());
+    try derivation_debug.write(io, use_color, ev.hostAllocator(), debug_options, ev.derivationDebugRecords());
     return true;
 }
 
@@ -73,12 +73,12 @@ fn writeResult(io: std.Io, mode: EvaluationMode, ev: *Evaluator, result: Value) 
 
 pub const Source = struct {
     text: []const u8,
-    /// True when `text` was freshly allocated on `ev.allocator` (a `--flake`
+    /// True when `text` was freshly allocated on the evaluator's host allocator (a `--flake`
     /// lowering and/or `-A`/`--arg` wrapping); the caller must free it.
     owned: bool = false,
     /// The file's absolute path, recorded as the evaluation's source path so
     /// positions (`unsafeGetAttrPos`, `__curPos`) and error traces match Nix,
-    /// which always reports absolute paths. Allocated on `ev.allocator`; null
+    /// which always reports absolute paths. Allocated on the host allocator; null
     /// for `-e`, `--flake`, and `-A`/`--arg`-wrapped text whose byte offsets no
     /// longer map to the file.
     abs_path: ?[]const u8 = null,
@@ -134,18 +134,19 @@ pub fn buildFailure(last_store_error: ?[]const u8, err: anyerror) u8 {
 }
 
 pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Source {
+    const allocator = ev.hostAllocator();
     // Load the base source text (borrowed for expr/file, owned for flake).
     const base: Source = switch (source) {
         .expr => |text| .{ .text = text, .owned = false },
         .file => |path| blk: {
             const text = try ev.readSourceFile(path);
-            // `ev.base_path` is still the process cwd here (configure set it,
+            // The evaluator base path is still the process cwd here (configure set it,
             // and the setBasePathToFileDir below hasn't repointed it yet), so
             // resolve `path` against it to get the file's absolute path.
-            const abs = try std.fs.path.resolve(ev.allocator, &.{ ev.base_path orelse ".", path });
+            const abs = try std.fs.path.resolve(allocator, &.{ ev.basePath() orelse ".", path });
             // Roll back `abs` if the base-path repoint below fails; otherwise it
             // would leak (the Source that would own it is never constructed).
-            errdefer ev.allocator.free(abs);
+            errdefer allocator.free(abs);
             // Resolve the file's relative path literals (`./x`, `import ./y`)
             // against the file's directory, like Nix — not the process cwd.
             try ev.setBasePathToFileDir(path);
@@ -157,14 +158,14 @@ pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Sour
     // If selector wrapping fails, `base` (owned flake text and/or file
     // `abs_path`) would otherwise leak. This only fires on the error path; the
     // success paths below hand `base` off or free it explicitly.
-    errdefer base.deinit(ev.allocator);
+    errdefer base.deinit(allocator);
 
     // Apply `-A`/`--arg`/`--argstr`. When they wrap the text, the wrapper
     // prefix shifts every byte offset, so the file path no longer describes
     // `text`: drop the whole base (freeing its text and abs_path).
     const selected = try applySelectors(ev, base.text, options);
     if (selected.owned) {
-        base.deinit(ev.allocator);
+        base.deinit(allocator);
         return selected;
     }
     return base;
@@ -176,7 +177,7 @@ pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Sour
 /// attribute path. Returns owned wrapped text, or `base_text` borrowed when no
 /// selector applies.
 fn applySelectors(ev: *Evaluator, base_text: []const u8, options: args.Options) !Source {
-    const alloc = ev.allocator;
+    const alloc = ev.hostAllocator();
     const has_args = options.arg_defs.items.len > 0;
     // A `-A` with only empty components (`.`/``) selects nothing.
     const has_attr = if (options.attr) |a| std.mem.indexOfNone(u8, a, ".") != null else false;
@@ -224,9 +225,9 @@ fn applySelectors(ev: *Evaluator, base_text: []const u8, options: args.Options) 
 /// (the CLI's cwd); scheme refs (`github:`, `path:`, …) pass through to
 /// `getFlake`. The attrpath is dot-split into quoted selections, so component
 /// names may contain any character except `.`. The returned text is owned by
-/// `ev.allocator` and lives for the rest of the (one-shot) run.
+/// the evaluator's host allocator and lives for the rest of the (one-shot) run.
 fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
-    const alloc = ev.allocator;
+    const alloc = ev.hostAllocator();
     const hash = std.mem.indexOfScalar(u8, installable, '#');
     const flake_ref = if (hash) |i| installable[0..i] else installable;
     const attr_path = if (hash) |i| installable[i + 1 ..] else "";
@@ -275,8 +276,8 @@ const ResolvedRef = struct { ref: []const u8, owned: bool };
 /// to getFlake, which resolves indirect ids via the flake registry itself.
 fn resolveFlakeRef(ev: *Evaluator, flake_ref: []const u8) !ResolvedRef {
     if (flake_ref.len > 0 and (flake_ref[0] == '/' or flake_ref[0] == '.')) {
-        const base = ev.base_path orelse return .{ .ref = flake_ref, .owned = false };
-        const abs = try std.fs.path.resolve(ev.allocator, &.{ base, flake_ref });
+        const base = ev.basePath() orelse return .{ .ref = flake_ref, .owned = false };
+        const abs = try std.fs.path.resolve(ev.hostAllocator(), &.{ base, flake_ref });
         return .{ .ref = abs, .owned = true };
     }
     return .{ .ref = flake_ref, .owned = false };

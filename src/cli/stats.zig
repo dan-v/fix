@@ -58,8 +58,7 @@ pub fn report(ev: *Evaluator) void {
         engine.reportSchedulerScanCensus();
         // Demand-prediction de-risk censuses (see heap.zig): junk ratios
         // for demand-descendant scavenging and sibling prefetch.
-        ev.heap.profCreationCensus();
-        ev.heap.profSiblingCensus();
+        ev.tooling().reportCreationCensus();
     }
     if (comptime prof_path.enabled) prof_path.report(ev.chunkRegistry(), ev.internTable());
 }

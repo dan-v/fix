@@ -28,6 +28,17 @@ test "release hook is evaluator-owned and runs once" {
     try std.testing.expectEqual(@as(usize, 1), counter.value);
 }
 
+test "external scope construction and rooting is evaluator-owned" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const scope = try ev.replaceExternalScope(&.{
+        .{ .name = "answer", .value = Value.int(41) },
+    });
+    const result = try ev.evaluateWithScope("answer + 1", scope);
+    try std.testing.expectEqual(@as(i64, 42), result.asInt());
+}
+
 test "writeValue colorizes strings, numbers, keywords, and attr names when value_color is set" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

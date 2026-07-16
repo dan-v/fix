@@ -915,7 +915,7 @@ test "detect recursive scoped imports with migratable workers" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "cycle.nix",
-        .data = "builtins.scopedImport {} ./cycle.nix\n",
+        .data = "builtins.scopedImport { inherit builtins; } ./cycle.nix\n",
     });
 
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
@@ -931,7 +931,7 @@ test "detect recursive scoped imports with migratable workers" {
 
     const source = try std.fmt.allocPrint(
         std.testing.allocator,
-        "builtins.scopedImport {{}} {s}",
+        "builtins.scopedImport {{ inherit builtins; }} {s}",
         .{file_path},
     );
     defer std.testing.allocator.free(source);

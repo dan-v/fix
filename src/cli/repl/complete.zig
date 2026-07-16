@@ -20,7 +20,6 @@ const commands = @import("commands.zig");
 const Evaluator = engine.Evaluator;
 const Value = engine.Value;
 const builtins_mod = engine.runtime.builtins;
-const thunk_mod = engine.runtime.thunk;
 const future_mod = engine.runtime.future;
 
 pub const Ctx = struct {
@@ -77,9 +76,10 @@ fn complete(ctx_ptr: *anyopaque, arena: std.mem.Allocator, text: []const u8, cur
         const base = resolveForcedPath(ctx, base_path) orelse return empty;
         if (!base.isAttrs()) return empty;
         var items: std.ArrayListUnmanaged([]const u8) = .empty;
-        const entries = ctx.ev.heap.getAttrs(base.asObjectId()) catch return empty;
+        const tooling = ctx.ev.tooling();
+        const entries = tooling.attrs(base) catch return empty;
         for (entries) |entry| {
-            const name = ctx.ev.intern.get(entry.name);
+            const name = tooling.internText(entry.name);
             if (std.mem.startsWith(u8, name, partial)) {
                 try items.append(arena, try arena.dupe(u8, name));
             }
@@ -110,7 +110,7 @@ fn complete(ctx_ptr: *anyopaque, arena: std.mem.Allocator, text: []const u8, cur
     // Ambient builtins: names visible without the `builtins.` prefix.
     if (builtinsAttrs(ctx)) |entries| {
         for (entries) |entry| {
-            const name = ctx.ev.intern.get(entry.name);
+            const name = ctx.ev.tooling().internText(entry.name);
             if (!std.mem.startsWith(u8, name, token)) continue;
             if (builtins_mod.ambientIdForName(name) == null) continue;
             const gop = try seen.getOrPut(arena, name);
@@ -135,7 +135,7 @@ fn sortItems(items: [][]const u8) void {
 fn builtinsAttrs(ctx: *Ctx) ?[]const engine.runtime.heap.AttrEntry {
     const b = ctx.ev.builtinsValue() catch return null;
     if (!b.isAttrs()) return null;
-    return ctx.ev.heap.getAttrs(b.asObjectId()) catch null;
+    return ctx.ev.tooling().attrs(b) catch null;
 }
 
 /// Resolve a dotted attr path against the repl scope WITHOUT forcing:
@@ -156,8 +156,9 @@ fn resolveForcedPath(ctx: *Ctx, path: []const u8) ?Value {
 
     while (it.next()) |segment| {
         if (!current.isAttrs()) return null;
-        const name_id = ctx.ev.intern.intern(segment) catch return null;
-        const attr = ctx.ev.heap.getAttrValueOpt(current.asObjectId(), name_id) catch return null;
+        const tooling = ctx.ev.tooling();
+        const name_id = tooling.intern(segment) catch return null;
+        const attr = tooling.attrValueOpt(current, name_id) catch return null;
         current = lookThroughResolved(ctx, attr orelse return null) orelse return null;
     }
     return current;
@@ -169,7 +170,7 @@ fn lookThroughResolved(ctx: *Ctx, value: Value) ?Value {
     var current = value;
     var hops: usize = 0;
     while (current.kind() == .thunk and hops < 16) : (hops += 1) {
-        const thunk = ctx.ev.heap.getThunk(current.asObjectId()) catch return null;
+        const thunk = ctx.ev.tooling().thunk(current) catch return null;
         const state: future_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
         if (state != .resolved) return null;
         current = thunk.payload.result;

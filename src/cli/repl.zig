@@ -25,8 +25,6 @@ const setup = @import("setup.zig");
 const debugger = @import("debugger.zig");
 const render_err = @import("render.zig");
 const engine = @import("nix");
-const runtime_value = engine.runtime.value;
-const thunk_mod = engine.runtime.thunk;
 const future_mod = engine.runtime.future;
 const types = engine.runtime.types;
 
@@ -596,10 +594,11 @@ const Repl = struct {
             try self.printError("{s} did not evaluate to an attrset", .{path});
             return false;
         }
-        const entries = self.ev.heap.getAttrs(forced.asObjectId()) catch return false;
+        const tooling = self.ev.tooling();
+        const entries = tooling.attrs(forced) catch return false;
         var added: usize = 0;
         for (entries) |entry| {
-            const name = self.ev.intern.get(entry.name);
+            const name = tooling.internText(entry.name);
             try self.bindNoRebuild(name, entry.value);
             added += 1;
         }
@@ -627,25 +626,17 @@ const Repl = struct {
         gop.value_ptr.* = value;
     }
 
-    /// Rebuild the scope attrset from the bindings and re-register the GC
-    /// external roots (every bound value + the attrset itself, so nothing
-    /// is ever reachable only through a swept object).
+    /// Ask the evaluator to rebuild the scope attrset and replace its GC roots
+    /// as one operation.
     fn rebuildScope(self: *Repl) !void {
-        var entries: std.ArrayListUnmanaged(engine.runtime.heap.AttrEntry) = .empty;
-        defer entries.deinit(self.allocator);
-        var roots: std.ArrayListUnmanaged(Value) = .empty;
-        defer roots.deinit(self.allocator);
+        var bindings: std.ArrayListUnmanaged(Evaluator.ScopeBinding) = .empty;
+        defer bindings.deinit(self.allocator);
 
         var it = self.bindings.iterator();
         while (it.next()) |e| {
-            const name_id = try self.ev.intern.intern(e.key_ptr.*);
-            try entries.append(self.allocator, .{ .name = name_id, .value = e.value_ptr.* });
-            try roots.append(self.allocator, e.value_ptr.*);
+            try bindings.append(self.allocator, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
         }
-        const id = try self.ev.heap.addAttrs(entries.items);
-        self.scope = runtime_value.Value.attrs(id);
-        try roots.append(self.allocator, self.scope.?);
-        try self.ev.gcSetExternalRoots(roots.items);
+        self.scope = try self.ev.replaceExternalScope(bindings.items);
     }
 
     /// The between-inputs collection: reclaim the last evaluation's garbage
@@ -669,11 +660,11 @@ const Repl = struct {
             .string, .string_context => try w.writeAll("a string"),
             .path => try w.writeAll("a path"),
             .list => {
-                const n = self.ev.heap.getListLen(value.asObjectId()) catch 0;
+                const n = self.ev.tooling().listLen(value) catch 0;
                 try w.print("a list ({d} item{s})", .{ n, if (n == 1) "" else "s" });
             },
             .attrs => {
-                const entries = self.ev.heap.getAttrs(value.asObjectId()) catch &.{};
+                const entries = self.ev.tooling().attrs(value) catch &.{};
                 try w.print("a set ({d} attr{s})", .{ entries.len, if (entries.len == 1) "" else "s" });
             },
             .closure, .builtin, .builtin_closure, .partial_app => try w.writeAll("a function"),
@@ -687,7 +678,7 @@ const Repl = struct {
         switch (value.kind()) {
             .thunk => {
                 const id = value.asObjectId();
-                const thunk = self.ev.heap.getThunk(id) catch {
+                const thunk = self.ev.tooling().thunk(value) catch {
                     try w.writeAll("thunk (unreadable)\n");
                     return;
                 };
@@ -712,7 +703,7 @@ const Repl = struct {
                 }
             },
             .closure => {
-                const closure = self.ev.heap.getClosure(value.asObjectId()) catch {
+                const closure = self.ev.tooling().closure(value) catch {
                     try w.writeAll("closure (unreadable)\n");
                     return;
                 };
@@ -743,12 +734,12 @@ const Repl = struct {
         if (try self.evalExpr(expr)) |value| {
             switch (value.kind()) {
                 .closure => {
-                    if (self.ev.heap.getClosure(value.asObjectId())) |c| {
+                    if (self.ev.tooling().closure(value)) |c| {
                         chunk_id = c.chunk_id;
                     } else |_| {}
                 },
                 .thunk => {
-                    if (self.ev.heap.getThunk(value.asObjectId())) |t| {
+                    if (self.ev.tooling().thunk(value)) |t| {
                         if (t.targetKind() == .bytecode) chunk_id = t.payload.target.bytecode.chunk_id;
                     } else |_| {}
                 },

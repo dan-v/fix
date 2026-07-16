@@ -58,12 +58,10 @@ pub fn configure(ev: *Evaluator, process: ProcessContext, init: std.process.Init
     process.bindEvaluator(ev);
     // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap is
     // pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
-    ev.lazy_shells_visible = options.output == .xml;
+    ev.setLazyShellsVisible(options.output == .xml);
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
-    ev.max_memory_bytes = options.max_memory;
-    ev.mem_report_mode = options.mem_report;
-    ev.gc_report_on = options.gc_report;
+    ev.configureMemory(options.max_memory, options.mem_report, options.gc_report);
     ev.setEnvironment(init.environ_map);
 
     // Experimental features and the concurrent-fetch cap both come from
@@ -80,7 +78,8 @@ pub fn configure(ev: *Evaluator, process: ProcessContext, init: std.process.Init
     // acts on.
     // A fatal config problem (e.g. a missing required `include`) aborts with a
     // printed message, like Nix; a missing top-level nix.conf is not an error.
-    var settings = try nix_conf.load(ev.allocator, init.environ_map, init.io);
+    const allocator = ev.hostAllocator();
+    var settings = try nix_conf.load(allocator, init.environ_map, init.io);
     defer settings.deinit();
     // `--option NAME VALUE` overrides; `--option extra-NAME VALUE` appends (Nix).
     for (options.option_overrides.items) |o| try settings.setOrAppend(o.name, o.value);
@@ -90,23 +89,25 @@ pub fn configure(ev: *Evaluator, process: ProcessContext, init: std.process.Init
     }
     http_conn = settings.getUint("http-connections") orelse 25;
 
-    ev.policy.pipe_operators_enabled = features.contains(.pipe_operators);
-    ev.policy.flakes_enabled = features.contains(.flakes);
-    ev.policy.coerce_integers_enabled = features.contains(.coerce_integers);
+    var policy = ev.languagePolicy();
+    policy.pipe_operators_enabled = features.contains(.pipe_operators);
+    policy.flakes_enabled = features.contains(.flakes);
+    policy.coerce_integers_enabled = features.contains(.coerce_integers);
     // Deprecated features (Lix `--extra-deprecated-features`) re-permit
     // behaviour fix rejects by default.
-    ev.policy.allow_nul_bytes = options.deprecated_features.contains(.nul_bytes);
-    ev.policy.allow_floor_ceil_corrupt = options.deprecated_features.contains(.floor_ceil_corrupt_integers);
-    ev.policy.allow_rec_set_overrides = options.deprecated_features.contains(.rec_set_overrides);
-    ev.policy.allow_rec_set_merges = options.deprecated_features.contains(.rec_set_merges);
-    ev.policy.allow_cr_line_endings = options.deprecated_features.contains(.cr_line_endings);
-    ev.policy.allow_tokens_no_whitespace = options.deprecated_features.contains(.tokens_no_whitespace);
-    ev.policy.allow_nix_path_shadow = options.deprecated_features.contains(.nix_path_shadow);
+    policy.allow_nul_bytes = options.deprecated_features.contains(.nul_bytes);
+    policy.allow_floor_ceil_corrupt = options.deprecated_features.contains(.floor_ceil_corrupt_integers);
+    policy.allow_rec_set_overrides = options.deprecated_features.contains(.rec_set_overrides);
+    policy.allow_rec_set_merges = options.deprecated_features.contains(.rec_set_merges);
+    policy.allow_cr_line_endings = options.deprecated_features.contains(.cr_line_endings);
+    policy.allow_tokens_no_whitespace = options.deprecated_features.contains(.tokens_no_whitespace);
+    policy.allow_nix_path_shadow = options.deprecated_features.contains(.nix_path_shadow);
     // `--option max-call-depth N` (Nix's call-recursion bound). Clamp to u32.
     if (settings.getUint("max-call-depth")) |n|
-        ev.policy.max_call_depth = @intCast(@min(n, @as(u64, std.math.maxInt(u32))));
+        policy.max_call_depth = @intCast(@min(n, @as(u64, std.math.maxInt(u32))));
     // `flakes` implies `fetch-tree` (as in Nix).
-    ev.policy.fetch_tree_enabled = features.contains(.fetch_tree) or ev.policy.flakes_enabled;
+    policy.fetch_tree_enabled = features.contains(.fetch_tree) or policy.flakes_enabled;
+    ev.configureLanguage(policy);
     ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
     if (settings.getUint("download-attempts")) |n|
         ev.setDownloadAttempts(@intCast(@min(n, @as(u64, std.math.maxInt(u32)))));
@@ -138,14 +139,15 @@ pub fn configure(ev: *Evaluator, process: ProcessContext, init: std.process.Init
 /// user/CLI overrides differ. `set_options` is only emitted when the store
 /// actually connects (build/instantiate/run/shell), never for plain `eval`.
 fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_conf.Settings) !void {
+    const allocator = ev.hostAllocator();
     var overrides: std.ArrayListUnmanaged(rstore.Setting) = .empty;
-    defer overrides.deinit(ev.allocator);
+    defer overrides.deinit(allocator);
     // Owned `extra-<key>` names for keys with no explicit base; freed after the
     // (duping) setDaemonBuildSettings call below.
     var extra_names: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
-        for (extra_names.items) |n| ev.allocator.free(n);
-        extra_names.deinit(ev.allocator);
+        for (extra_names.items) |n| allocator.free(n);
+        extra_names.deinit(allocator);
     }
     var it = settings.map.iterator();
     while (it.next()) |e| {
@@ -155,11 +157,11 @@ fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_con
         // replacing it — otherwise fix, lacking Nix's compiled-in defaults (e.g.
         // `sandbox-paths`'s `/bin/sh=<busybox>`), would strip them.
         const name = if (settings.hasBase(key)) key else blk: {
-            const prefixed = try std.fmt.allocPrint(ev.allocator, "extra-{s}", .{key});
-            try extra_names.append(ev.allocator, prefixed);
+            const prefixed = try std.fmt.allocPrint(allocator, "extra-{s}", .{key});
+            try extra_names.append(allocator, prefixed);
             break :blk prefixed;
         };
-        try overrides.append(ev.allocator, .{ .name = name, .value = e.value_ptr.* });
+        try overrides.append(allocator, .{ .name = name, .value = e.value_ptr.* });
     }
 
     // setDaemonBuildSettings dupes the overrides into owned storage, so this
@@ -181,15 +183,16 @@ fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_con
 /// its credentials to the fetcher for HTTP basic-auth on plain downloads.
 /// Best-effort: a missing/unreadable file just means no netrc auth.
 fn applyNetrc(ev: *Evaluator, init: std.process.Init, settings: *nix_conf.Settings) !void {
+    const allocator = ev.hostAllocator();
     const path: []u8 = if (settings.get("netrc-file")) |p|
-        try ev.allocator.dupe(u8, p)
+        try allocator.dupe(u8, p)
     else blk: {
         const dir = init.environ_map.get("NIX_CONF_DIR") orelse "/etc/nix";
-        break :blk try std.fs.path.join(ev.allocator, &.{ dir, "netrc" });
+        break :blk try std.fs.path.join(allocator, &.{ dir, "netrc" });
     };
-    defer ev.allocator.free(path);
-    const data = std.Io.Dir.cwd().readFileAlloc(init.io, path, ev.allocator, .limited(1 << 20)) catch return;
-    defer ev.allocator.free(data);
+    defer allocator.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch return;
+    defer allocator.free(data);
     try ev.setNetrc(data);
 }
 
@@ -213,6 +216,7 @@ fn jobsSetting(settings: *nix_conf.Settings, key: []const u8, default: u64) u64 
 /// `$NIX_PATH`. Command-line entries come first so they take precedence, as in
 /// Nix. A no-op when neither is present.
 fn applyNixPath(ev: *Evaluator, init: std.process.Init, options: args.Options) !void {
+    const allocator = ev.hostAllocator();
     const env_path = init.environ_map.get("NIX_PATH");
     if (options.include.items.len == 0) {
         if (env_path) |nix_path| try ev.setNixPath(nix_path);
@@ -220,15 +224,15 @@ fn applyNixPath(ev: *Evaluator, init: std.process.Init, options: args.Options) !
     }
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(ev.allocator);
+    defer buf.deinit(allocator);
     for (options.include.items) |entry| {
-        if (buf.items.len != 0) try buf.append(ev.allocator, ':');
-        try buf.appendSlice(ev.allocator, entry);
+        if (buf.items.len != 0) try buf.append(allocator, ':');
+        try buf.appendSlice(allocator, entry);
     }
     if (env_path) |nix_path| {
         if (nix_path.len != 0) {
-            try buf.append(ev.allocator, ':');
-            try buf.appendSlice(ev.allocator, nix_path);
+            try buf.append(allocator, ':');
+            try buf.appendSlice(allocator, nix_path);
         }
     }
     try ev.setNixPath(buf.items);

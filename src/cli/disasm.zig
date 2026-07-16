@@ -66,7 +66,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     // `chunk #42 fetchGit`. Safe here — disasm compiles single-threaded.
     ev.setCaptureChunkNames(true);
 
-    if (source_arg == .flake and !ev.policy.flakes_enabled) {
+    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }
@@ -84,9 +84,9 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
-    // `--flake`/`-A`/`--arg` synthesize source text on `ev.allocator`; plain
+    // `--flake`/`-A`/`--arg` synthesize source text on the evaluator's host allocator; plain
     // expr/file text is borrowed (argv) or owned by the evaluator's file cache.
-    defer source.deinit(ev.allocator);
+    defer source.deinit(ev.hostAllocator());
 
     // Compile (or evaluate) up front, before any pager is spawned: this is where
     // user-facing errors and warnings surface, and it resolves the single target
@@ -251,6 +251,6 @@ fn dumpAll(
         const chunk = registry.get(id) orelse continue;
         if (!first) try writer.writeByte('\n');
         first = false;
-        try bytecode.disasm.writeChunk(ev.allocator, writer, id, chunk, symbols, opts);
+        try bytecode.disasm.writeChunk(ev.hostAllocator(), writer, id, chunk, symbols, opts);
     }
 }

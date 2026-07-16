@@ -160,7 +160,7 @@ fn buildAndSwitch(process: @import("process_context.zig").ProcessContext, init: 
     defer ev.deinit();
     const term = try setup.configure(&ev, process, init, options.*);
 
-    if (source_arg == .flake and !ev.policy.flakes_enabled) {
+    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }
@@ -169,7 +169,7 @@ fn buildAndSwitch(process: @import("process_context.zig").ProcessContext, init: 
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
-    defer source.deinit(ev.allocator);
+    defer source.deinit(ev.hostAllocator());
 
     ev.enableStoreWrites();
 
