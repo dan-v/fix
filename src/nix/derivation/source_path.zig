@@ -10,6 +10,7 @@ const DerivationStore = @import("store.zig").DerivationStore;
 const FileCache = @import("runtime").file_cache.FileCache;
 const nar = @import("runtime").nar;
 const path_ops = @import("runtime").paths;
+const stable = @import("base").sync;
 
 pub fn storePathForSource(
     allocator: std.mem.Allocator,
@@ -102,6 +103,25 @@ pub fn ingestReport(
             return .{ .store_path = hit.store_path, .nar_hash = hit.nar_hash };
         }
     }
+
+    // Single-flight the actual serialize for UNFILTERED ingests so parallel
+    // coercers of the same source don't each re-hash the tree. Take the key's
+    // stripe lock and re-check the memo under it: the first worker serializes and
+    // memoizes; the rest see the entry here and reuse it. Safe to hold a blocking
+    // lock across the serialize because an unfiltered NAR walk has no predicate
+    // callback (no reentrancy) and no fiber-park point (no scheduler deadlock).
+    // Filtered ingests skip this (their serialize calls back into the VM).
+    var ingest_lock: ?*stable.BlockingMutex = null;
+    if (filter == null) {
+        const lock = derivations.sourceIngestLock(path, name);
+        lock.lock();
+        if (try derivations.lookupSourceMemo(allocator, path, name, true, null, null)) |hit| {
+            lock.unlock();
+            return .{ .store_path = hit.store_path, .nar_hash = hit.nar_hash };
+        }
+        ingest_lock = lock;
+    }
+    defer if (ingest_lock) |l| l.unlock();
 
     const payload_allocator = derivations.allocator;
     const nar_bytes = try nar.serializeReport(payload_allocator, files, path, filter, unsupported);
@@ -219,7 +239,7 @@ pub fn flatStorePathForFile(
 
     const store_path = try drv_paths.fixedOutputPath(allocator, derivations.store_dir, name, "out", "sha256", hex[0..]);
     errdefer allocator.free(store_path);
-    try derivations.recordFlatRecipe(store_path, contents);
+    try derivations.recordFlatRecipe(store_path, contents, .source);
 
     return .{ .store_path = store_path, .hash_hex = hex };
 }

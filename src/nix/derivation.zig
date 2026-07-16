@@ -37,6 +37,10 @@ pub const Spec = dtypes.Spec;
 pub const Drv = drv_mod.Drv;
 pub const DerivationStore = store_mod.DerivationStore;
 
+/// Progress-span groups the store reports into (mapped to observ groups by the
+/// eval layer). See `DerivationStore.beginSpan`.
+pub const SpanGroup = store_mod.SpanGroup;
+
 pub const sourcePath = path_mod.sourcePath;
 pub const textPath = path_mod.textPath;
 pub const fixedOutputPath = path_mod.fixedOutputPath;

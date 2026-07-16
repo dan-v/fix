@@ -27,6 +27,26 @@ const OffloadFn = *const fn (ctx: *anyopaque, work: *const fn (conn: ?*anyopaque
 /// on the thread itself (the main-thread realize / tests).
 const FiberParkFn = *const fn (future: *Future) bool;
 
+/// The progress-span groups the derivation store reports into. Mirrors the
+/// observ `SpanGroup`, but named locally: the derivation module must not import
+/// observ (same layer), so the eval layer maps these onto the real groups.
+pub const SpanGroup = enum { store, source };
+
+/// Injected concurrent progress-span hooks for the store's real writes: a
+/// `.store` span around a `.drv` transfer and a `.source` span around a source
+/// copy, both reported in `applyDaemonOp` past the `isValidPath` guard (so the
+/// counts are actual writes, not per-coercion / per-recorded-recipe). The eval
+/// layer adapts its observ `SpanSink` into these opaque fn pointers. `begin`
+/// opens a span labeled with `label` and returns its token; `end` closes it.
+/// A span may open on a pool worker / compute fiber and close after the write.
+const SpanBeginFn = *const fn (ctx: *anyopaque, group: SpanGroup, label: []const u8) usize;
+const SpanEndFn = *const fn (ctx: *anyopaque, token: usize) void;
+const SpanHooks = struct {
+    ctx: *anyopaque,
+    begin: SpanBeginFn,
+    end: SpanEndFn,
+};
+
 /// The daemon connection the current thread's in-flight op runs against. Set at
 /// each offload boundary (a pool worker running one op, or the inline dispatch)
 /// so the whole nested closure walk — `ensureClosure` → writes/queries — reaches
@@ -52,6 +72,9 @@ const freeOutputNames = clone.freeOutputNames;
 /// The name portion of a store path: `/nix/store/<hash>-<name>` -> `<name>`.
 /// Store hashes are 32 base32 chars followed by `-`. Used as the `name` arg to
 /// `addTextToStore`, which recomputes the full path from name+content+refs.
+/// Stripe count for `source_ingest_locks` (unfiltered-ingest single-flight).
+const source_ingest_stripes = 64;
+
 fn storePathName(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
     if (base.len > 33 and base[32] == '-') return base[33..];
@@ -93,6 +116,17 @@ pub const DerivationStore = struct {
     source_memo: std.StringHashMapUnmanaged(SourceMemoEntry) = .empty,
     source_memo_mu: stable.SpinMutex = .{},
 
+    /// Per-key single-flight locks for UNFILTERED source ingests. The lock-free
+    /// memo check races: parallel workers coercing the same source all miss and
+    /// each re-serializes (benign — content-addressed, so identical result — but
+    /// wasted CPU). A worker takes the key's stripe, re-checks the memo, and only
+    /// the first serializes; the rest reuse its entry. Unfiltered ingests only:
+    /// their serialize has no predicate callback and no fiber-park point, so a
+    /// blocking mutex held across it can't reenter or deadlock the scheduler.
+    /// Striped (not per-key) to bound memory; collisions just serialize two
+    /// distinct sources, still correct. Filtered ingests keep the lock-free path.
+    source_ingest_locks: [source_ingest_stripes]stable.BlockingMutex = @splat(.{}),
+
     /// Guards the small shared state every pool worker touches: the `instantiated`
     /// cache and `last_error_msg`. Held only for brief in-memory updates, never
     /// across a daemon round-trip (those run on the worker's own connection).
@@ -124,6 +158,14 @@ pub const DerivationStore = struct {
     /// plain `eval` so the hot eval path never does store I/O per derivation
     /// and fetches stay local/offline (returning their download-cache path).
     store_writes_enabled: bool = false,
+
+    /// Concurrent progress-span hooks for real store writes (see `SpanHooks`):
+    /// a `.store` span per actual `.drv` transfer, a `.source` span per actual
+    /// source copy — both reported in `applyDaemonOp`, past the validity guard.
+    /// Set by the evaluator alongside the demand-fiber stage sink. They count
+    /// actual writes — not per instantiated derivation / per coercion, which only
+    /// record an in-memory recipe or hit the memo. Null when progress isn't drawn.
+    span_hooks: ?SpanHooks = null,
 
     /// The pool-offload entry (`vm.io_offload.runOnPool`), injected by the eval
     /// layer: submits one daemon op to `pool` and parks the caller (fiber yields).
@@ -363,6 +405,10 @@ pub const DerivationStore = struct {
 
     const Recipe = struct {
         payload: Payload,
+        /// Which progress group the actual write reports under (`.store` for a
+        /// `.drv`, `.source` for a local source copy), or null for writes shown
+        /// elsewhere (fetches report under `.fetch` at download). See `applyDaemonOp`.
+        span_group: ?SpanGroup = null,
 
         const TextPayload = struct {
             bytes: []u8,
@@ -582,6 +628,28 @@ pub const DerivationStore = struct {
         _ = self.ensurePool() catch {};
     }
 
+    /// Install (or clear) the concurrent progress-span hooks. A null `ctx` clears
+    /// them (progress not drawn). Set by the evaluator when a progress sink is
+    /// (re)installed; safe to change between top-level runs.
+    pub fn setSpanHooks(self: *DerivationStore, ctx: ?*anyopaque, begin: SpanBeginFn, end: SpanEndFn) void {
+        self.span_hooks = if (ctx) |c| .{ .ctx = c, .begin = begin, .end = end } else null;
+    }
+
+    /// Open a concurrent progress span for real store work, or null when progress
+    /// isn't drawn. Pair with `endSpan` (defer). The label is borrowed for the
+    /// call only. See `SpanHooks`.
+    pub fn beginSpan(self: *DerivationStore, group: SpanGroup, label: []const u8) ?usize {
+        const hooks = self.span_hooks orelse return null;
+        return hooks.begin(hooks.ctx, group, label);
+    }
+
+    /// Close a span opened by `beginSpan` (no-op on null / no hooks).
+    pub fn endSpan(self: *DerivationStore, token: ?usize) void {
+        const t = token orelse return;
+        const hooks = self.span_hooks orelse return;
+        hooks.end(hooks.ctx, t);
+    }
+
     /// Install the pool-offload entry (from the vm layer). Must be set before any
     /// forcing begins, and cleared (`clearOffload`) before the runtime is torn
     /// down. `rt` owns the connection pool this store submits to.
@@ -669,7 +737,7 @@ pub const DerivationStore = struct {
     /// gated on `store_writes_enabled` (off during plain eval).
     pub fn instantiateText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
         if (!self.store_writes_enabled) return;
-        return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } });
+        return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } }, .store);
     }
 
     /// Write a NAR-serialized source tree, gated on `store_writes_enabled`.
@@ -677,14 +745,15 @@ pub const DerivationStore = struct {
     /// references them — so `input_srcs` are valid in time.
     pub fn instantiatePath(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
         if (!self.store_writes_enabled) return;
-        return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } });
+        // Used by `ingestSerializedNar` (fetchTarball) — a fetch, shown under `.fetch`.
+        return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }, null);
     }
 
     /// Add a flat file's raw bytes to the store (fetchurl), gated on
     /// `store_writes_enabled`.
     pub fn instantiateFlat(self: *DerivationStore, store_path: []const u8, bytes: []const u8) !void {
         if (!self.store_writes_enabled) return;
-        return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } });
+        return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } }, null);
     }
 
     /// Is `store_path` already valid in the store? Used to skip fetching an
@@ -815,8 +884,10 @@ pub const DerivationStore = struct {
     /// Dispatch a store write to the pool (parking the caller) or inline. The op's
     /// args are borrowed and stay valid across the transfer because the calling
     /// fiber parks (its stack — holding the NAR/text buffers — is preserved).
-    fn runDaemonOp(self: *DerivationStore, op: DaemonOp) !void {
-        var cell: OpCell = .{ .store = self, .op = op };
+    /// `span_group` is the progress group the actual transfer reports under (null
+    /// for writes shown elsewhere, e.g. fetches under `.fetch`).
+    fn runDaemonOp(self: *DerivationStore, op: DaemonOp, span_group: ?SpanGroup) !void {
+        var cell: OpCell = .{ .store = self, .op = op, .span_group = span_group };
         try self.runOnDaemon(OpCell.run, &cell);
         return cell.err;
     }
@@ -824,6 +895,7 @@ pub const DerivationStore = struct {
     const OpCell = struct {
         store: *DerivationStore,
         op: DaemonOp,
+        span_group: ?SpanGroup = null,
         err: anyerror!void = {},
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
@@ -831,20 +903,27 @@ pub const DerivationStore = struct {
             const prev = active_conn;
             active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
             defer active_conn = prev;
-            self.err = self.store.applyDaemonOp(self.op);
+            self.err = self.store.applyDaemonOp(self.op, self.span_group);
         }
     };
 
     /// Perform a store write against the current connection. Skips the transfer
     /// when the path is already valid (cache or a daemon check). Cache touches are
     /// briefly guarded; the daemon round-trips run without `daemon_mu`.
-    fn applyDaemonOp(self: *DerivationStore, op: DaemonOp) !void {
+    fn applyDaemonOp(self: *DerivationStore, op: DaemonOp, span_group: ?SpanGroup) !void {
         const store_path = switch (op) {
             inline else => |o| o.store_path,
         };
         if (self.cacheContains(store_path)) return;
         const daemon = try self.currentConn();
         if (try daemon.isValidPath(store_path)) return self.cacheMark(store_path);
+        // Report a progress span around the actual transfer, under the caller's
+        // group: `.store` for a `.drv`, `.source` for a local source copy, null for
+        // a fetch (shown under `.fetch` at download). Reporting here — only past the
+        // validity guard — means the count is actual writes, not coercions/records.
+        // The span may open here (on a pool worker) and close after the write.
+        const span_token: ?usize = if (span_group) |group| self.beginSpan(group, storePathName(store_path)) else null;
+        defer self.endSpan(span_token);
         const written = switch (op) {
             .text => |o| daemon.addTextToStore(self.allocator, storePathName(store_path), o.text, o.references),
             .path => |o| daemon.addPath(self.allocator, storePathName(store_path), o.nar_bytes, &.{}),
@@ -899,7 +978,7 @@ pub const DerivationStore = struct {
         errdefer self.allocator.destroy(recipe);
         const owned_refs = try cloneOwnedStrings(self.allocator, references);
         errdefer freeOwnedStrings(self.allocator, owned_refs);
-        recipe.* = .{ .payload = .{ .text = .{ .bytes = text, .references = owned_refs } } };
+        recipe.* = .{ .payload = .{ .text = .{ .bytes = text, .references = owned_refs } }, .span_group = .store };
 
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
@@ -920,14 +999,17 @@ pub const DerivationStore = struct {
         errdefer self.allocator.free(nar_bytes);
         const recipe = try self.allocator.create(Recipe);
         errdefer self.allocator.destroy(recipe);
-        recipe.* = .{ .payload = .{ .nar = nar_bytes } };
+        recipe.* = .{ .payload = .{ .nar = nar_bytes }, .span_group = .source };
 
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
         try self.recipes.put(self.allocator, key, recipe);
     }
 
-    pub fn recordFlatRecipe(self: *DerivationStore, store_path: []const u8, handle: FileCache.ImmutableBytes) !void {
+    /// `span_group` names the progress group the eventual write reports under —
+    /// `.source` for a flat local source (`builtins.path { recursive = false; }`),
+    /// null for a fetched flat file (shown under `.fetch` at download time).
+    pub fn recordFlatRecipe(self: *DerivationStore, store_path: []const u8, handle: FileCache.ImmutableBytes, span_group: ?SpanGroup) !void {
         // Deferred like `recordOwnedTextRecipe`: materialized on demand, deps-first.
         self.recipe_mu.lock();
         defer self.recipe_mu.unlock();
@@ -942,7 +1024,7 @@ pub const DerivationStore = struct {
 
         const recipe = try self.allocator.create(Recipe);
         errdefer self.allocator.destroy(recipe);
-        recipe.* = .{ .payload = .{ .flat = retained } };
+        recipe.* = .{ .payload = .{ .flat = retained }, .span_group = span_group };
 
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
@@ -1096,11 +1178,13 @@ pub const DerivationStore = struct {
         };
 
         for (recipe.references()) |reference| try self.ensureClosureInner(reference, visit);
-        // References are on disk now; write this path (offloaded to the pool).
+        // References are on disk now; write this path (offloaded to the pool). The
+        // recipe's `span_group` picks the progress group for the actual transfer.
+        const group = recipe.span_group;
         switch (recipe.payload) {
-            .text => |text| try self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }),
-            .nar => |nar_bytes| try self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }),
-            .flat => |bytes| try self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }),
+            .text => |text| try self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }, group),
+            .nar => |nar_bytes| try self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }, group),
+            .flat => |bytes| try self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }, group),
         }
         self.releaseRecipeForPath(store_path);
     }
@@ -1322,6 +1406,18 @@ pub const DerivationStore = struct {
     /// the key includes the filter lambda's ObjectId, which a GC can reuse for a
     /// different lambda — so `token` (the heap GC token) is stored per entry and
     /// a mismatch is treated as a miss, exactly like `lookupLazyDerivation`.
+    /// The single-flight stripe lock for an unfiltered ingest of `(path, name)`.
+    /// Callers lock it, re-check the memo, serialize on a miss, and unlock — so
+    /// concurrent coercers of the same source don't each re-serialize. See
+    /// `source_ingest_locks`.
+    pub fn sourceIngestLock(self: *DerivationStore, path: []const u8, name: []const u8) *stable.BlockingMutex {
+        var h = std.hash.Wyhash.init(0);
+        h.update(path);
+        h.update(&[_]u8{0});
+        h.update(name);
+        return &self.source_ingest_locks[h.final() % source_ingest_stripes];
+    }
+
     pub fn lookupSourceMemo(
         self: *DerivationStore,
         out_allocator: std.mem.Allocator,

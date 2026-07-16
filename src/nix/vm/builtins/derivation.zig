@@ -17,7 +17,6 @@ const attrsets = @import("attrsets.zig");
 const serial = @import("serial.zig");
 const shared = @import("shared.zig");
 const strings = @import("strings.zig");
-const eval_progress = @import("observ").progress;
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
@@ -225,20 +224,10 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     try self.derivations.recordDebug(&normalized.drv, computed);
 
     // Render the ATerm exactly once and transfer that allocation to the store's
-    // recipe graph. In global store-writing mode recordOwnedTextRecipe writes it
-    // immediately and consumes it without retaining a recipe.
-    var store_span: ?eval_progress.Span = null;
-    if (self.derivations.store_writes_enabled) {
-        if (self.progress_spans) |spans| {
-            var name_buf: [128]u8 = undefined;
-            const label = std.fmt.bufPrint(&name_buf, "{s}.drv", .{drv_name}) catch drv_name;
-            store_span = spans.beginSpan(.store, label);
-        }
-    }
-    defer if (store_span) |sp| {
-        if (self.progress_spans) |spans| spans.endSpan(sp);
-    };
-
+    // recipe graph. `recordOwnedTextRecipe` only records an in-memory recipe;
+    // the `.drv` is written to the store on demand (see `ensureClosure`), and
+    // the `.store` progress span is reported there, at the actual write — not
+    // here, where every instantiated derivation (demanded or not) passes.
     try self.derivations.noteProducerPayloadForTest(computed.drv_path, computed.drv_aterm);
     // recordOwnedTextRecipe consumes drv_aterm on success and error.
     drv_aterm_owned = false;
@@ -764,8 +753,6 @@ fn normalizeDerivationString(
 }
 
 fn sourceStorePathForContext(self: anytype, path: []const u8, owned_strings: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
-    const src_span = self.storeCopySpanBegin(std.fs.path.basename(path));
-    defer self.storeCopySpanEnd(src_span);
     const store_path = try source_paths.storePathForSource(self.allocator, self.derivations, self.files, path);
     errdefer self.allocator.free(store_path);
     try owned_strings.append(self.allocator, store_path);

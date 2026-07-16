@@ -892,10 +892,40 @@ pub const Evaluator = struct {
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
         self.progress = progress;
+        // The derivation store does its real store work (`.drv` writes, source
+        // serializes) off the demand fiber, so it reports via the thread-safe span
+        // sink. It must not import observ (same module layer), so hand it opaque
+        // hooks bound to this evaluator; they map its groups onto the live sink's
+        // and read the spans half. A null ctx clears them.
+        self.derivations.setSpanHooks(
+            if (progress != null) self else null,
+            drvSpanBegin,
+            drvSpanEnd,
+        );
         // Nothing to sync on the worker: the demand-only handles are passed
         // per top-level entry (`runWithVm` → `runTopLevel`), so a sink
         // (re)set between runs — e.g. across REPL inputs — takes effect on
         // the next entry automatically.
+    }
+
+    /// Adapters bridging the derivation store's opaque span hooks to this
+    /// evaluator's live `SpanSink` (the store can't name observ types), mapping the
+    /// store's local `SpanGroup` onto the observ group. `ctx` is the `*Evaluator`;
+    /// both no-op if the sink was cleared mid-run.
+    fn drvSpanBegin(ctx: *anyopaque, group: derivation.SpanGroup, label: []const u8) usize {
+        const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        const spans = (self.progress orelse return 0).spans;
+        const observ_group: eval_progress.SpanGroup = switch (group) {
+            .store => .store,
+            .source => .source,
+        };
+        return spans.beginSpan(observ_group, label).token;
+    }
+
+    fn drvSpanEnd(ctx: *anyopaque, token: usize) void {
+        const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        const spans = (self.progress orelse return).spans;
+        spans.endSpan(.{ .token = token });
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {

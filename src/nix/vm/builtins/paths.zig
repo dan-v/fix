@@ -162,9 +162,6 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
         expected_hash = self.intern.get(try stringTextInternId(self, value));
     }
 
-    const src_span = self.storeCopySpanBegin(store_name);
-    defer self.storeCopySpanEnd(src_span);
-
     if (!recursive) {
         // Flat ingestion: a single regular file, hashed by its raw contents.
         const flat = try source_paths.flatStorePathForFile(self.allocator, self.derivations, self.files, path, store_name);

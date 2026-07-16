@@ -297,8 +297,6 @@ pub fn sourcePathStringValue(self: *VM, path_id: InternId) !Value {
         return Value.contextString(try self.heap.addContextString(path_id, &entries));
     }
     if (!try self.files.pathExists(path)) return error.FileNotFound;
-    const src_span = self.storeCopySpanBegin(std.fs.path.basename(path));
-    defer self.storeCopySpanEnd(src_span);
     const store_path = try source_paths.storePathForSource(self.allocator, self.derivations, self.files, path);
     defer self.allocator.free(store_path);
     const store_path_id = try self.intern.intern(store_path);

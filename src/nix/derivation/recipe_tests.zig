@@ -185,7 +185,7 @@ test "recordFlatRecipe retains the same ImmutableBytes blob" {
         tracking.track(bytes);
         var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
 
-        try store.recordFlatRecipe(dep_text_path, handle);
+        try store.recordFlatRecipe(dep_text_path, handle, null);
         try std.testing.expectEqual(original_ptr, @intFromPtr(handle.bytes().ptr));
         handle.release();
         try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
@@ -208,7 +208,7 @@ test "ensureClosure realizes flat recipe bytes and releases retained ownership" 
         tracking.track(bytes);
         var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
 
-        try store.recordFlatRecipe(dep_text_path, handle);
+        try store.recordFlatRecipe(dep_text_path, handle, null);
         try std.testing.expectEqual(original_ptr, @intFromPtr(handle.bytes().ptr));
         handle.release();
         try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
@@ -249,8 +249,8 @@ test "duplicate identical flat recipe keeps original blob without leaking a reta
         tracking.track(bytes);
         var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
 
-        try store.recordFlatRecipe(dep_text_path, handle);
-        try store.recordFlatRecipe(dep_text_path, handle);
+        try store.recordFlatRecipe(dep_text_path, handle, null);
+        try store.recordFlatRecipe(dep_text_path, handle, null);
         try std.testing.expectEqual(original_ptr, @intFromPtr(handle.bytes().ptr));
         handle.release();
         try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
@@ -282,8 +282,8 @@ test "conflicting flat recipe releases rejected retain and realizes original blo
         rejected_tracking.track(rejected_bytes);
         var rejected = try FileCache.ImmutableBytes.fromOwned(rejected_allocator, rejected_bytes);
 
-        try store.recordFlatRecipe(dep_text_path, original);
-        try std.testing.expectError(error.RecipeConflict, store.recordFlatRecipe(dep_text_path, rejected));
+        try store.recordFlatRecipe(dep_text_path, original, null);
+        try std.testing.expectError(error.RecipeConflict, store.recordFlatRecipe(dep_text_path, rejected, null));
         try std.testing.expectEqual(original_ptr, @intFromPtr(original.bytes().ptr));
         try std.testing.expectEqual(rejected_ptr, @intFromPtr(rejected.bytes().ptr));
         rejected.release();
@@ -367,7 +367,7 @@ test "releaseRecipePayloads is idempotent and teardown frees exactly once" {
         const bytes = try owned(allocator, "released once");
         tracking.track(bytes);
         var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
-        try store.recordFlatRecipe(dep_text_path, handle);
+        try store.recordFlatRecipe(dep_text_path, handle, null);
         handle.release();
 
         store.releaseRecipePayloads();

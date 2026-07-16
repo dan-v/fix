@@ -123,8 +123,6 @@ pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Val
     };
     var context: Context = .{ .vm = self, .pred = pred };
 
-    const src_span = self.storeCopySpanBegin(path_ops.baseName(root));
-    defer self.storeCopySpanEnd(src_span);
     var unsupported: nar.Unsupported = .{};
     defer unsupported.deinit(self.allocator);
     const store_path = source_paths.storePathForFilteredSourceReport(self.allocator, self.derivations, self.files, root, path_ops.baseName(root), .{
@@ -524,7 +522,8 @@ fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const u8,
         // `readFile`/`import` on the returned store path stays zero-copy.
         try self.files.provideRegular(store_path, contents);
     }
-    try self.derivations.recordFlatRecipe(store_path, contents);
+    // A fetched flat file reports under `.fetch` (at download), not `.source`.
+    try self.derivations.recordFlatRecipe(store_path, contents, null);
     return store_path;
 }
 
