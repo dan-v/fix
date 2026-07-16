@@ -12,11 +12,12 @@
 //!
 //! Policy lives here; the two consumers are `block_cache.zig` (class blocks
 //! ≥2 MB and >64 MB pass-throughs) and `segments.zig` (the flat store's
-//! reserved prefix). Everything is fail-soft: any hugetlb mmap failure falls
-//! back to ordinary pages, and consumers only ever use *reserved*
-//! (non-NORESERVE) hugetlb mappings, so the kernel guarantees page faults
-//! succeed — pool exhaustion can fail an mmap (handled) but never SIGBUS a
-//! touch.
+//! reserved prefix). Everything is fail-soft: every candidate mapping
+//! reserves its pool pages up front, is excluded from `fork`, and is
+//! synchronously write-prefaulted before publication. Pool/NUMA/cgroup
+//! shortages therefore fail during setup (handled) instead of becoming a
+//! later SIGBUS, and exec-only subprocesses cannot create private-hugetlb
+//! COW faults.
 //!
 //! Mode is process-global, default *unconfigured* (= off) so that library
 //! consumers and early allocations never engage hugetlb before the CLI has
@@ -37,6 +38,9 @@ const builtin = @import("builtin");
 
 pub const HUGE_PAGE: usize = 2 << 20;
 
+// Linux 5.14+. Zig's std.os.linux.MADV does not expose this newer value yet.
+const MADV_POPULATE_WRITE: u32 = 23;
+
 /// `auto` engagement floor: the unreserved pool must cover at least this
 /// much before auto turns hugetlb on. Sized to fit the flat store's first
 /// grow-ahead chunk plus a couple of class blocks — below it the win is
@@ -52,9 +56,8 @@ var auto_state: std.atomic.Value(u8) = .init(0);
 var warned_fallback: std.atomic.Value(bool) = .init(false);
 
 /// Bytes currently mapped as hugetlb by this process (via `map`/`mapFixed`),
-/// and the high-water mark. Reserved (non-NORESERVE) mappings are committed
-/// pool pages from the system's point of view, so "mapped" is the honest
-/// footprint figure even before every page is touched.
+/// and the high-water mark. `map` write-prefaults every page before returning,
+/// so mapped bytes are both committed to the pool and physically instantiated.
 var mapped_bytes: std.atomic.Value(usize) = .init(0);
 var peak_mapped_bytes: std.atomic.Value(usize) = .init(0);
 
@@ -168,10 +171,16 @@ pub fn roundedLen(len: usize) usize {
     return std.mem.alignForward(usize, len, HUGE_PAGE);
 }
 
-/// Map `len` (rounded up to 2 MB) of anonymous private hugetlb memory.
-/// Non-NORESERVE: the pool pages are reserved at mmap time, so faults on the
-/// returned region are guaranteed to succeed — exhaustion fails *here*,
-/// cleanly, and the caller falls back to its ordinary allocation path.
+/// Map `len` (rounded up to 2 MB) of anonymous private hugetlb memory and make
+/// it safe to publish to the application:
+///   1. non-NORESERVE mmap commits the pool pages up front;
+///   2. MADV_DONTFORK prevents a subprocess child from inheriting a private
+///      mapping whose later COW could need an unreserved extra huge page;
+///   3. MADV_POPULATE_WRITE instantiates every page under the current
+///      NUMA/cpuset policy, reporting a would-be SIGBUS as a syscall error.
+/// Any failure unmaps the candidate and returns null so the caller can use its
+/// ordinary allocation path. This intentionally makes Linux <5.14 (which has
+/// no MADV_POPULATE_WRITE) fall back rather than expose a weaker guarantee.
 pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
     if (comptime builtin.os.tag != .linux) return null;
     const rounded = roundedLen(len);
@@ -186,14 +195,23 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
         noteFallback();
         return null;
     };
+    const ptr: [*]u8 = mem.ptr;
+    if (std.os.linux.errno(std.os.linux.madvise(ptr, rounded, std.os.linux.MADV.DONTFORK)) != .SUCCESS or
+        std.os.linux.errno(std.os.linux.madvise(ptr, rounded, MADV_POPULATE_WRITE)) != .SUCCESS)
+    {
+        std.posix.munmap(mem);
+        noteFallback();
+        return null;
+    }
     noteMapped(rounded);
     return mem.ptr;
 }
 
 /// Overlay `[target, target+len)` — 2 MB-aligned, a 2 MB multiple — with
-/// reserved hugetlb pages. The flat store uses this to grow its huge prefix
-/// ahead of the bump cursor; the caller must guarantee the range holds no
-/// live data (the replaced mapping's contents are discarded).
+/// reserved, DONTFORK, write-prefaulted hugetlb pages. The flat store uses
+/// this to grow its huge prefix ahead of the bump cursor; the caller must
+/// guarantee the range holds no live data (the replaced mapping's contents
+/// are discarded).
 ///
 /// Two-step on purpose — the obvious single `mmap(MAP_FIXED|MAP_HUGETLB)`
 /// is NOT atomic on failure: the kernel unmaps the target range *before*
@@ -204,8 +222,8 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
 /// clobbers that foreign block and its later munmap blows a hole in the
 /// caller's region (observed as a mid-run SIGSEGV under pool drain).
 /// Instead:
-///   1. `map(len)` at a kernel-chosen address — pool exhaustion fails HERE,
-///      with zero side effects on any existing mapping;
+///   1. `map(len)` at a kernel-chosen address — reservation, DONTFORK, and
+///      prefault failures happen HERE with no effect on the target mapping;
 ///   2. `mremap(MAYMOVE|FIXED)` the fresh mapping onto the target — a
 ///      single syscall under mmap_lock, so no userspace-visible window
 ///      where the target is unmapped.
@@ -215,7 +233,7 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
 pub fn overlayFixed(target: [*]u8, len: usize) bool {
     if (comptime builtin.os.tag != .linux) return false;
     std.debug.assert(@intFromPtr(target) % HUGE_PAGE == 0 and len % HUGE_PAGE == 0 and len > 0);
-    const src = map(len) orelse return false; // sole failure mode under pool exhaustion
+    const src = map(len) orelse return false;
     const rc = std.os.linux.mremap(src, len, len, .{ .MAYMOVE = true, .FIXED = true }, target);
     if (std.os.linux.errno(rc) == .SUCCESS and rc == @intFromPtr(target)) return true;
     // mremap failed (kernel VMA bookkeeping ENOMEM — not pool pressure).
@@ -274,7 +292,7 @@ fn noteFallback() void {
     if (comptime builtin.is_test) return; // stderr corrupts the test runner
     if (warned_fallback.swap(true, .monotonic)) return;
     std.debug.print(
-        "fix: warning: hugetlb pool exhausted or unavailable; falling back to normal pages " ++
+        "fix: warning: hugetlb pool exhausted, unavailable, or mapping hardening failed; falling back to normal pages " ++
             "(provision with `sysctl vm.nr_hugepages=N`, or pass --hugetlb off)\n",
         .{},
     );
@@ -322,6 +340,7 @@ test "roundedLen rounds to 2 MB" {
 
 test "map/unmap: accounting balances whether or not the pool serves it" {
     if (comptime builtin.os.tag != .linux) return;
+    const linux = std.os.linux;
     const saved = mode_state.load(.monotonic);
     defer mode_state.store(saved, .monotonic);
     setMode(.on);
@@ -330,6 +349,28 @@ test "map/unmap: accounting balances whether or not the pool serves it" {
         // Rounded to 2 huge pages; memory is usable end to end.
         try std.testing.expectEqual(before + (4 << 20), mappedBytes());
         try std.testing.expect(peakMappedBytes() >= mappedBytes());
+
+        // MADV_POPULATE_WRITE made every base page resident before `map`
+        // returned, rather than leaving a possible SIGBUS for first touch.
+        var resident: [(4 << 20) / std.heap.page_size_min]u8 = @splat(0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mincore(p, 4 << 20, &resident)));
+        for (resident) |state| try std.testing.expect(state & 1 != 0);
+
+        // MADV_DONTFORK removes the VMA from a child. Keep the child path to
+        // raw syscalls only: this test may fork from a multithreaded runner.
+        const fork_rc = linux.fork();
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(fork_rc));
+        if (fork_rc == 0) {
+            var state: [1]u8 = .{0};
+            const inherited = linux.errno(linux.mincore(p, std.heap.page_size_min, &state)) == .SUCCESS;
+            linux.exit_group(if (inherited) 1 else 0);
+        }
+        var status: u32 = 0;
+        const waited = linux.waitpid(@intCast(fork_rc), &status, 0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(waited));
+        try std.testing.expect(linux.W.IFEXITED(status));
+        try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+
         p[0] = 0xAB;
         p[(4 << 20) - 1] = 0xCD;
         try std.testing.expectEqual(@as(u8, 0xAB), p[0]);

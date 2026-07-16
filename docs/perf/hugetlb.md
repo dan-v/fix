@@ -37,9 +37,9 @@ sudo sysctl vm.nr_hugepages=2048        # 4 GB pool of 2 MB pages
 
 (Persist in `/etc/sysctl.d/`; allocate early after boot — a fragmented
 machine may not be able to assemble the pages later.) A NixOS-toplevel
-eval reserves ~1.65 GB of pool at peak (nearly all of it faulted — the
-chunk-grown prefixes keep mapped-but-untouched slack to one 32 MB chunk
-per active store), so a 4 GB pool (`2048`) leaves comfortable headroom;
+eval uses ~1.65 GB of pool at peak. Every accepted hugetlb mapping is
+write-prefaulted; chunk-grown prefixes keep its unused grow-ahead slack to
+one 32 MB chunk per active store. A 4 GB pool (`2048`) leaves headroom;
 undersizing is safe (overflow falls back to normal pages) but gives up
 part of the win.
 
@@ -57,15 +57,22 @@ Precedence: `--hugetlb MODE` > `FIX_HUGETLB` env (`auto`/`on`/`off`; bare
 — deliberately not a `nix.conf`/`--option` setting, since config loads after
 the flat store already picked its mapping.
 
-## Failure story (no SIGBUS, ever)
+## Failure story (no resource-exhaustion SIGBUS)
 
-Every hugetlb mapping `fix` creates is **non-NORESERVE**: the kernel reserves
-the pool pages at `mmap` time and guarantees faults on the mapped range
-succeed. Pool exhaustion therefore fails an `mmap` — never a touch:
+Before publishing a hugetlb mapping, `fix` applies three safeguards:
 
-- **block cache** — a failed `mmap` falls back to the backing allocator for
-  that block; ownership of live hugetlb blocks is tracked so frees/resizes
-  route to `munmap` and never poison the backing allocator.
+1. **non-NORESERVE** `mmap` reserves every pool page up front;
+2. `MADV_DONTFORK` keeps the private mapping out of exec-only subprocesses,
+   eliminating the unreserved COW-page hazard after `fork`;
+3. `MADV_POPULATE_WRITE` instantiates every page under the current
+   NUMA/cpuset policy and returns an error instead of delivering the SIGBUS
+   that the corresponding later access could have caused.
+
+Failure at any step unmaps the candidate and uses ordinary pages:
+
+- **block cache** — a failed candidate mapping falls back to the backing
+  allocator for that block; ownership of live hugetlb blocks is tracked so
+  frees/resizes route to `munmap` and never poison the backing allocator.
 - **flat store** — the giant virtual reservation stays an ordinary
   `MAP_NORESERVE` mapping; only its low prefix is overlaid (`MAP_FIXED`)
   with reserved huge pages, extended under the store's write lock *before*
@@ -75,8 +82,8 @@ succeed. Pool exhaustion therefore fails an `mmap` — never a touch:
   only stop future extensions.
 
 Shrinking the pool (`vm.nr_hugepages=0`) under a running eval is safe:
-already-mapped pages are reserved to the process; new mappings fail and fall
-back.
+accepted mappings are already instantiated; new mappings fail and fall back.
+Hardware-poison SIGBUS remains possible, as it does for memory generally.
 
 ## Accounting caveat
 

@@ -30,10 +30,11 @@ const hugetlb = @import("hugetlb.zig");
 // the numbers), blocks of 2 MB and up come from explicit hugetlb mmaps
 // instead of the backing allocator's PageAllocator path: one 2 MB TLB entry
 // replaces 512 4 KB ones and first-touch faults drop 512x. The mappings are
-// non-NORESERVE, so pool exhaustion fails the mmap cleanly and the block
-// falls back to the backing allocator — no SIGBUS is possible. Ownership is
-// tracked (`huge_ptrs`/`huge_lens`) so free/resize/remap/deinit munmap these
-// blocks instead of handing foreign memory to the backing allocator.
+// non-NORESERVE, DONTFORK, and write-prefaulted, so pool/NUMA/cgroup failure
+// is reported during setup and the block falls back to the backing allocator
+// instead of risking a later SIGBUS. Ownership is tracked
+// (`huge_ptrs`/`huge_lens`) so free/resize/remap/deinit munmap these blocks
+// instead of handing foreign memory to the backing allocator.
 const HUGE_PAGE: usize = hugetlb.HUGE_PAGE;
 
 const MIN_LOG2: u6 = 16; // 64 KB — the smallest block class

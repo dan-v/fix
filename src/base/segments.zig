@@ -707,10 +707,10 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
         cursor: std.atomic.Value(u32),
         write_mu: SpinMutex,
         /// Hugetlb prefix frontier: bytes `[0, huge_frontier)` of the
-        /// reservation are backed by *reserved* (non-NORESERVE) huge pages,
-        /// so faults there are kernel-guaranteed — pool exhaustion can only
-        /// fail a frontier *extension* (an mmap, handled), never SIGBUS a
-        /// touch. Always a 2 MB multiple; mutated only under `write_mu`.
+        /// reservation are backed by reserved, DONTFORK, write-prefaulted
+        /// huge pages, so pool/NUMA/cgroup failure can only fail a frontier
+        /// extension (handled), never a later touch. Always a 2 MB multiple;
+        /// mutated only under `write_mu`.
         huge_frontier: usize,
         /// Set when the prefix can't grow further (mode off, pool exhausted,
         /// or the overlayable range is used up): the rest of the store stays
