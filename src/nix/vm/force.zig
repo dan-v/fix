@@ -14,6 +14,7 @@ const thunk_mod = @import("runtime").thunk;
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
 const fiber_mod = @import("base").fiber;
+const clock = @import("base").clock;
 const sched_mod = @import("../scheduler.zig");
 const worker_mod = @import("worker.zig");
 
@@ -631,12 +632,7 @@ pub fn sweepMemberAdmissible(self: *VM, thunk_id: ObjectId) bool {
 /// Monotonic microseconds for diagnosis log lines (same clock domain as
 /// `probe/timeline.zig`); 0 off-linux.
 pub fn diagNowUs() u64 {
-    if (builtin.os.tag != .linux) return 0;
-    var ts: std.os.linux.timespec = undefined;
-    if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
-    const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
-    return sec * 1_000_000 + nsec / 1_000;
+    return clock.monotonicUs();
 }
 
 /// Claim dispatch: the solo (plain load/store) protocol at `--workers=1`,

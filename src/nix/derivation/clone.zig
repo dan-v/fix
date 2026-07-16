@@ -7,6 +7,7 @@
 //! catalog.
 
 const std = @import("std");
+const owned_strings = @import("base").owned_strings;
 const types = @import("types.zig");
 
 const DrvOutput = types.DrvOutput;
@@ -17,22 +18,11 @@ const HashModulo = types.HashModulo;
 const HashModuloView = types.HashModuloView;
 
 pub fn cloneStringListDeep(allocator: std.mem.Allocator, strings: []const []const u8) ![]const []const u8 {
-    const cloned = try allocator.alloc([]const u8, strings.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (cloned[0..initialized]) |string| allocator.free(string);
-        allocator.free(cloned);
-    }
-    for (strings, cloned) |string, *dest| {
-        dest.* = try allocator.dupe(u8, string);
-        initialized += 1;
-    }
-    return cloned;
+    return owned_strings.clone(allocator, strings);
 }
 
 pub fn freeStringListDeep(allocator: std.mem.Allocator, strings: []const []const u8) void {
-    for (strings) |string| allocator.free(string);
-    allocator.free(strings);
+    owned_strings.free(allocator, strings);
 }
 
 pub fn cloneDrvOutputsDeep(allocator: std.mem.Allocator, outputs: []const DrvOutput) ![]DrvOutput {

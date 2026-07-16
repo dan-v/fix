@@ -14,6 +14,8 @@ pub const deque = @import("deque.zig");
 pub const cache_line = @import("cache_line.zig");
 pub const fiber = @import("fiber.zig");
 pub const sync = @import("sync.zig");
+pub const clock = @import("clock.zig");
+pub const owned_strings = @import("owned_strings.zig");
 pub const segments = @import("segments.zig");
 pub const vma = @import("vma.zig");
 pub const block_cache = @import("block_cache.zig");
@@ -34,6 +36,8 @@ test {
     _ = cache_line;
     _ = fiber;
     _ = sync;
+    _ = clock;
+    _ = owned_strings;
     _ = segments;
     _ = vma;
     _ = block_cache;

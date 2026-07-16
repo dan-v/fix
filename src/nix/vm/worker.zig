@@ -37,6 +37,7 @@ const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
 const stable = @import("base").sync;
 const arena_mod = @import("base").arena;
+const clock = @import("base").clock;
 const scheduler_mod = @import("../scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
@@ -906,23 +907,8 @@ pub const Worker = struct {
     }
 };
 
-/// CLOCK_MONOTONIC reading in nanoseconds. Used to bucket worker time
-/// between fiber-resume and futex-park. Linux-only fast path (vDSO);
-/// other platforms return 0, which makes the counters stay at 0 —
-/// `fix inspect` will show 0s and the user can read off the platform
-/// instead of getting bogus numbers.
-fn nanoMonotonic() u64 {
-    switch (builtin.os.tag) {
-        .linux => {
-            var ts: std.os.linux.timespec = undefined;
-            if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-            const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
-            const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
-            return sec * std.time.ns_per_s + nsec;
-        },
-        else => return 0,
-    }
-}
+/// CLOCK_MONOTONIC reading used to bucket worker run and park time.
+const nanoMonotonic = clock.monotonicNs;
 
 /// Standard fiber entry: run one task to completion and return.
 /// On entry, the worker has already set `current_task` and reset the

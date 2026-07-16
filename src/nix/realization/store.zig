@@ -17,6 +17,7 @@ const FileCache = host.FileCache;
 const DaemonRuntime = host.DaemonRuntime;
 const Future = runtime.thunk.Future;
 const Waiter = runtime.thunk.Waiter;
+const owned_strings = @import("base").owned_strings;
 
 /// Injected `vm.io_offload.runOnPool`: submit `work(conn)` to the pool and park
 /// the caller. `ctx` is the `*DaemonPool`; `conn` is the worker's connection.
@@ -951,8 +952,8 @@ pub const DerivationStore = struct {
         errdefer self.allocator.free(text);
         const recipe = try self.allocator.create(Recipe);
         errdefer self.allocator.destroy(recipe);
-        const owned_refs = try cloneOwnedStrings(self.allocator, references);
-        errdefer freeOwnedStrings(self.allocator, owned_refs);
+        const owned_refs = try owned_strings.clone(self.allocator, references);
+        errdefer owned_strings.free(self.allocator, owned_refs);
         recipe.* = .{ .payload = .{ .text = .{ .bytes = text, .references = owned_refs } }, .span_group = .store };
 
         const key = try self.allocator.dupe(u8, store_path);
@@ -1312,24 +1313,6 @@ pub const DerivationStore = struct {
             }
         }
         return rendered.toOwnedSlice(self.allocator);
-    }
-
-    fn cloneOwnedStrings(allocator: std.mem.Allocator, strings: []const []const u8) ![][]u8 {
-        const result = try allocator.alloc([]u8, strings.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (result[0..initialized]) |string| allocator.free(string);
-            allocator.free(result);
-        }
-        while (initialized < result.len) : (initialized += 1) {
-            result[initialized] = try allocator.dupe(u8, strings[initialized]);
-        }
-        return result;
-    }
-
-    fn freeOwnedStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
-        for (strings) |string| allocator.free(string);
-        allocator.free(strings);
     }
 
     fn retryableRealizationError(err: anyerror) bool {

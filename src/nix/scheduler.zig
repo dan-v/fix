@@ -32,6 +32,7 @@ const stable = @import("base").sync;
 const gc = @import("runtime").gc;
 const heap_mod = @import("runtime").heap;
 const containers = @import("base");
+const clock = @import("base").clock;
 const build_options = @import("build_options");
 
 /// Idle-scan cost census (piggybacks on `-Dprof-main`, like the probes in
@@ -464,17 +465,7 @@ fn specQueueGcMark(q: *const SpecQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
     }
 }
 
-/// Monotonic-ns clock, matching `probe/timeline.zig`'s `nowNs` domain so the
-/// push timestamps and the timeline's quantum spans share one time base. The
-/// scheduler can't import the probe layer, so the formula is duplicated here.
-fn monotonicNs() u64 {
-    if (builtin.os.tag != .linux) return 0;
-    var ts: std.os.linux.timespec = undefined;
-    if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
-    const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
-    return sec * std.time.ns_per_s + nsec;
-}
+const monotonicNs = clock.monotonicNs;
 
 // Demand-driven fanout arrives in bursts: when the urgent queue rejects,
 // the caller falls back to serially forcing the rest of the list/attrset.

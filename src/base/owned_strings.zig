@@ -1,0 +1,30 @@
+//! Allocation helpers for deeply-owned slices of byte strings.
+
+const std = @import("std");
+
+pub fn clone(allocator: std.mem.Allocator, strings: []const []const u8) ![][]u8 {
+    const result = try allocator.alloc([]u8, strings.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |string| allocator.free(string);
+        allocator.free(result);
+    }
+    while (initialized < result.len) : (initialized += 1) {
+        result[initialized] = try allocator.dupe(u8, strings[initialized]);
+    }
+    return result;
+}
+
+/// Accept both mutable (`[][]u8`) and const-qualified owned slice views.
+pub fn free(allocator: std.mem.Allocator, strings: anytype) void {
+    for (strings) |string| allocator.free(string);
+    allocator.free(strings);
+}
+
+test "clone owns the outer and inner slices" {
+    const original = [_][]const u8{ "one", "two" };
+    const copy = try clone(std.testing.allocator, &original);
+    defer free(std.testing.allocator, copy);
+    try std.testing.expectEqualStrings("one", copy[0]);
+    try std.testing.expect(copy[0].ptr != original[0].ptr);
+}

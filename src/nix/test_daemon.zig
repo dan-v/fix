@@ -5,6 +5,7 @@
 //! buildPaths. It is not a general nix-daemon emulator.
 
 const std = @import("std");
+const owned_strings = @import("base").owned_strings;
 const stable = @import("base").sync;
 const runtime_store = @import("host.zig").store;
 const wire = runtime_store.wire;
@@ -416,7 +417,7 @@ pub const FakeDaemon = struct {
         const content_address = try wire.readString(self.allocator, input);
         defer self.allocator.free(content_address);
         const references = try wire.readStrings(self.allocator, input);
-        defer freeStrings(self.allocator, references);
+        defer owned_strings.free(self.allocator, references);
         _ = try wire.readBool(input); // repair
         const payload = try readFramed(self.allocator, input);
         defer self.allocator.free(payload);
@@ -445,7 +446,7 @@ pub const FakeDaemon = struct {
 
     fn handleBuild(self: *FakeDaemon, input: *std.Io.Reader, output: *std.Io.Writer) !void {
         const paths = try wire.readStrings(self.allocator, input);
-        defer freeStrings(self.allocator, paths);
+        defer owned_strings.free(self.allocator, paths);
         _ = try wire.readInt(input); // build mode
         for (paths) |path| try self.appendOperation(.build, path, "", &.{});
 
@@ -482,8 +483,8 @@ pub const FakeDaemon = struct {
         errdefer self.allocator.free(owned_subject);
         const owned_payload = try self.allocator.dupe(u8, payload);
         errdefer self.allocator.free(owned_payload);
-        const owned_references = try cloneStrings(self.allocator, references);
-        errdefer freeStrings(self.allocator, owned_references);
+        const owned_references = try owned_strings.clone(self.allocator, references);
+        errdefer owned_strings.free(self.allocator, owned_references);
         self.mu.lock();
         defer self.mu.unlock();
         try self.operations.append(self.allocator, .{
@@ -494,24 +495,6 @@ pub const FakeDaemon = struct {
         });
     }
 };
-
-fn cloneStrings(allocator: std.mem.Allocator, strings: []const []const u8) ![][]u8 {
-    const result = try allocator.alloc([]u8, strings.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (result[0..initialized]) |string| allocator.free(string);
-        allocator.free(result);
-    }
-    while (initialized < result.len) : (initialized += 1) {
-        result[initialized] = try allocator.dupe(u8, strings[initialized]);
-    }
-    return result;
-}
-
-fn freeStrings(allocator: std.mem.Allocator, strings: []const []u8) void {
-    for (strings) |string| allocator.free(string);
-    allocator.free(strings);
-}
 
 fn readFramed(allocator: std.mem.Allocator, input: *std.Io.Reader) ![]u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;

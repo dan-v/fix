@@ -17,6 +17,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const containers = @import("base");
+const clock = @import("base").clock;
 const heap_mod = @import("heap.zig");
 const value_mod = @import("value.zig");
 const thunk_mod = @import("thunk.zig");
@@ -561,11 +562,7 @@ var sweep_ns_total: u64 = 0;
 var barrier_ns_total: u64 = 0;
 
 /// Monotonic nanosecond clock for GC timing (collector + barrier).
-pub fn nowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
+pub const nowNs = clock.monotonicNs;
 
 pub const Breakdown = struct {
     obj_live: u64,

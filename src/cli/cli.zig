@@ -7,18 +7,7 @@ const std = @import("std");
 const Evaluator = @import("nix").Evaluator;
 const eval_progress = @import("nix").eval_progress;
 const gc = @import("nix").gc;
-
-const SpinMutex = struct {
-    inner: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *SpinMutex) void {
-        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
-    }
-
-    fn unlock(self: *SpinMutex) void {
-        self.inner.unlock();
-    }
-};
+const SpinMutex = @import("nix").base.sync.SpinMutex;
 
 // Command modules, re-exported so `main.zig` reaches them through the `cli`
 // module by name instead of importing `src/cli/*.zig` by relative path.

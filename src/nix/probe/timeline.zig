@@ -35,6 +35,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const worker_id_mod = @import("base").worker_id;
+const clock = @import("base").clock;
 const InternTable = @import("runtime").intern.InternTable;
 
 /// Always compiled in — timeline is now RUNTIME-gated (`--timeline[=path]`):
@@ -204,22 +205,8 @@ pub fn setSource(s: []const u8) void {
     meta_source = s;
 }
 
-fn nowNs() u64 {
-    if (builtin.os.tag != .linux) return 0;
-    var ts: std.os.linux.timespec = undefined;
-    if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
-    const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
-    return sec * std.time.ns_per_s + nsec;
-}
-
-/// Wall-clock seconds since the epoch (for the trace `metadata` timestamp).
-fn unixTimeSec() i64 {
-    if (builtin.os.tag != .linux) return 0;
-    var ts: std.os.linux.timespec = undefined;
-    if (std.os.linux.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return ts.sec;
-}
+const nowNs = clock.monotonicNs;
+const unixTimeSec = clock.unixTimeSec;
 
 /// Allocate the event/name buffers and per-worker stacks. Call once,
 /// before evaluation, on the main thread. `event_cap` bounds how many

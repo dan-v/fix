@@ -22,6 +22,7 @@ const thunk_mod = @import("runtime").thunk;
 const vm_force = @import("../vm.zig").force;
 const vm_access = @import("../vm.zig").access;
 const timeline = @import("../probe.zig").timeline;
+const clock = @import("base").clock;
 
 /// Cap on the number of participants in a single collection's mark+evac.
 /// The eval still runs `worker_count`-wide; only the STW mark/evac is
@@ -264,11 +265,7 @@ pub fn collectMajor(ev: anytype, collector_id: u8) void {
     gc.recordTiming(t1 - t0, t2 - t1);
 }
 
-pub fn nowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
+pub const nowNs = clock.monotonicNs;
 
 // --- collection policy (the automatic line) -------------------------------
 //
