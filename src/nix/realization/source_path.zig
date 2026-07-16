@@ -1,12 +1,12 @@
 //! Source path realization: compute the `/nix/store` path for a filesystem
 //! source (by NAR hash) and, when a daemon store is attached to the
-//! `DerivationStore`, add the source content there. This is the single
+//! `RealizationStore`, add the source content there. This is the single
 //! ingestion chokepoint for `builtins.path`, `filterSource`, and path
 //! coercion (`src = ./.`).
 
 const std = @import("std");
 const drv_paths = @import("../derivation.zig").paths;
-const DerivationStore = @import("store.zig").DerivationStore;
+const RealizationStore = @import("store.zig").RealizationStore;
 const FileCache = @import("../host.zig").FileCache;
 const nar = @import("../host.zig").nar;
 const path_ops = @import("runtime").paths;
@@ -14,7 +14,7 @@ const stable = @import("base").sync;
 
 pub fn storePathForSource(
     allocator: std.mem.Allocator,
-    derivations: *DerivationStore,
+    derivations: *RealizationStore,
     files: *FileCache,
     path: []const u8,
 ) ![]u8 {
@@ -26,7 +26,7 @@ pub fn storePathForSource(
 
 pub fn storePathForSourceName(
     allocator: std.mem.Allocator,
-    derivations: *DerivationStore,
+    derivations: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
@@ -51,7 +51,7 @@ pub const Ingested = struct {
 /// memo can reuse a repeated `(path, name, filter)` result. `object_id` is the
 /// predicate lambda's heap ObjectId; `token` is the heap GC token — a GC can
 /// reuse the id for a different lambda, so the memo entry stores the token and a
-/// mismatch is a miss (mirrors `DerivationStore.lookupLazyDerivation`). Built
+/// mismatch is a miss (mirrors `RealizationStore.lookupLazyDerivation`). Built
 /// only for heap-object predicates (closures/partial-apps); a bare primop
 /// predicate has no such identity and is passed `null` (never memoized).
 pub const FilterKey = struct { object_id: u32, token: u64 };
@@ -65,7 +65,7 @@ pub const FilterKey = struct { object_id: u32, token: u64 };
 /// heap identity.
 pub fn ingest(
     allocator: std.mem.Allocator,
-    derivations: *DerivationStore,
+    derivations: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
@@ -80,7 +80,7 @@ pub fn ingest(
 /// Nix-style `file '<path>' has an unsupported type` diagnostic.
 pub fn ingestReport(
     allocator: std.mem.Allocator,
-    derivations: *DerivationStore,
+    derivations: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
@@ -153,7 +153,7 @@ pub fn ingestReport(
 /// the synchronous daemon operation; the returned paths remain caller-owned.
 pub fn ingestSerializedNar(
     allocator: std.mem.Allocator,
-    derivations: *DerivationStore,
+    derivations: *RealizationStore,
     name: []const u8,
     nar_bytes: []const u8,
     digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
@@ -180,7 +180,7 @@ fn sriHash(allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
 /// a daemon is attached, add the content to the store.
 pub fn storePathForFilteredSource(
     allocator: std.mem.Allocator,
-    derivations: *DerivationStore,
+    derivations: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
@@ -194,7 +194,7 @@ pub fn storePathForFilteredSource(
 /// `unsupported` (when non-null) on `error.UnsupportedPathType`.
 pub fn storePathForFilteredSourceReport(
     allocator: std.mem.Allocator,
-    derivations: *DerivationStore,
+    derivations: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
@@ -225,7 +225,7 @@ pub const FlatIngested = struct {
 /// store. Mirrors `ingest`, but flat: `fixedOutputPath(.., "sha256", hex)`.
 pub fn flatStorePathForFile(
     allocator: std.mem.Allocator,
-    derivations: *DerivationStore,
+    derivations: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
@@ -252,7 +252,7 @@ pub fn isStoreRootPath(path: []const u8, store_dir: []const u8) bool {
 
 test "ingestSerializedNar uses the supplied digest without rehashing" {
     const testing = std.testing;
-    var derivations = DerivationStore.init(testing.allocator);
+    var derivations = RealizationStore.init(testing.allocator);
     defer derivations.deinit();
 
     const digest = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;

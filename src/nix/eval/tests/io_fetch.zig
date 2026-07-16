@@ -4,7 +4,7 @@ const Evaluator = eval_mod.Evaluator;
 const Diagnostic = eval_mod.Diagnostic;
 const Value = @import("runtime").value.Value;
 const FileCache = @import("../../host.zig").FileCache;
-const DerivationStore = @import("../../realization.zig").DerivationStore;
+const RealizationStore = @import("../../realization.zig").RealizationStore;
 const path_ops = @import("runtime").paths;
 const helpers = @import("../test_helpers.zig");
 const renderForTest = helpers.renderForTest;
@@ -988,7 +988,7 @@ const LifecycleTrackingAllocator = struct {
 };
 
 test "releaseEvalState releases retained flat recipe payload" {
-    if (comptime @hasDecl(DerivationStore, "recordFlatRecipe") and @hasDecl(DerivationStore, "releaseRecipePayloads")) {
+    if (comptime @hasDecl(RealizationStore, "recordFlatRecipe") and @hasDecl(RealizationStore, "releaseRecipePayloads")) {
         var tracking = LifecycleTrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
         var ev = try Evaluator.init(allocator, 0);
@@ -1003,7 +1003,7 @@ test "releaseEvalState releases retained flat recipe payload" {
         handle.release();
         try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
 
-        // DerivationStore remains alive after this call. The payload can be
+        // RealizationStore remains alive after this call. The payload can be
         // freed here only if releaseEvalState explicitly drops its recipe
         // reference; review separately enforces that call precedes files.deinit.
         ev.releaseEvalState();

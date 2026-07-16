@@ -10,7 +10,7 @@ const types_mod = derivation.types;
 const clone_mod = derivation.clone;
 const value_mod = derivation.value;
 
-const DerivationStore = realization.DerivationStore;
+const RealizationStore = realization.RealizationStore;
 const Drv = derivation.Drv;
 const DrvInput = derivation.DrvInput;
 const DrvOutput = derivation.DrvOutput;
@@ -40,7 +40,7 @@ test "store digest uses Nix base32 alphabet" {
 }
 
 test "setDaemonSocket overrides the default path and re-set frees the prior owned copy" {
-    var store = DerivationStore.init(std.testing.allocator);
+    var store = RealizationStore.init(std.testing.allocator);
     defer store.deinit();
 
     try std.testing.expectEqualStrings(host.store.default_socket_path, store.daemonSocket());
@@ -56,7 +56,7 @@ test "setDaemonSocket overrides the default path and re-set frees the prior owne
 }
 
 test "derivation IR computes minimal Nix paths" {
-    var store = DerivationStore.init(std.testing.allocator);
+    var store = RealizationStore.init(std.testing.allocator);
     defer store.deinit();
 
     var outputs = [_]DrvOutput{.{ .name = "out" }};
@@ -549,7 +549,7 @@ test "cloneHashModulo and HashModulo.deinit handle both drv and outputs variants
 // --- store.zig -----------------------------------------------------------
 
 test "record stores hash modulo and outputs retrievable via resolver and outputNames" {
-    var store = DerivationStore.init(std.testing.allocator);
+    var store = RealizationStore.init(std.testing.allocator);
     defer store.deinit();
 
     const outputs = [_]DrvOutput{.{ .name = "out" }};
@@ -567,7 +567,7 @@ test "record stores hash modulo and outputs retrievable via resolver and outputN
 }
 
 test "record is idempotent for a repeated drv_path" {
-    var store = DerivationStore.init(std.testing.allocator);
+    var store = RealizationStore.init(std.testing.allocator);
     defer store.deinit();
 
     const outputs = [_]DrvOutput{.{ .name = "out" }};
@@ -579,7 +579,7 @@ test "record is idempotent for a repeated drv_path" {
 }
 
 test "lazy derivation cache misses on token mismatch (GC id-reuse guard) and hits otherwise" {
-    var store = DerivationStore.init(std.testing.allocator);
+    var store = RealizationStore.init(std.testing.allocator);
     defer store.deinit();
 
     try store.cacheLazyDerivation(7, 1, 0xdeadbeef);
@@ -590,7 +590,7 @@ test "lazy derivation cache misses on token mismatch (GC id-reuse guard) and hit
 }
 
 test "setDebugEnabled(false) clears any accumulated debug records" {
-    var store = DerivationStore.init(std.testing.allocator);
+    var store = RealizationStore.init(std.testing.allocator);
     defer store.deinit();
 
     store.setDebugEnabled(true);
@@ -662,7 +662,7 @@ test "buildStrictValue exposes drvPath and each output path as plain attrs" {
 // --- debug_record.zig -----------------------------------------------------------
 
 test "debugRecordFromDrv captures aterm hash and text references, freed on deinit" {
-    var store = DerivationStore.init(std.testing.allocator);
+    var store = RealizationStore.init(std.testing.allocator);
     defer store.deinit();
 
     var outputs = [_]DrvOutput{.{ .name = "out" }};

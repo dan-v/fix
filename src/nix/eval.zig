@@ -27,7 +27,7 @@ const regex_mod = @import("base").regex;
 const block_cache_mod = @import("base").block_cache;
 const vma_mod = @import("runtime").mem_tag.vma;
 const realization = @import("realization.zig");
-const DerivationStore = realization.DerivationStore;
+const RealizationStore = realization.RealizationStore;
 const derivation = @import("derivation.zig");
 const Value = @import("runtime").value.Value;
 const builtins = @import("runtime").builtins;
@@ -424,7 +424,7 @@ fn firstMappedOffset(chunk: *const bytecode.chunk.Chunk) ?u32 {
 /// table by construction.
 pub const StoreState = struct {
     allocator: std.mem.Allocator,
-    derivations: DerivationStore,
+    derivations: RealizationStore,
     daemon_runtime: *daemon_runtime_mod.DaemonRuntime,
 
     fn init(allocator: std.mem.Allocator) !StoreState {
@@ -433,7 +433,7 @@ pub const StoreState = struct {
         runtime_ptr.* = daemon_runtime_mod.DaemonRuntime.init();
         errdefer runtime_ptr.deinit();
 
-        var derivations = DerivationStore.init(allocator);
+        var derivations = RealizationStore.init(allocator);
         derivations.setOffload(runtime_ptr, io_offload.runOnPool, io_offload.fiberPark);
         return .{ .allocator = allocator, .derivations = derivations, .daemon_runtime = runtime_ptr };
     }

@@ -123,7 +123,7 @@ pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Ev
 /// heap (diagnostics, trace, intern table) is gone, so a build failure can
 /// only render store-side state. Evaluation already succeeded by the time a
 /// build runs — there are no eval diagnostics to lose — and the daemon's own
-/// message (still owned by the surviving DerivationStore) is the useful part.
+/// message (still owned by the surviving RealizationStore) is the useful part.
 pub fn buildFailure(last_store_error: ?[]const u8, err: anyerror) u8 {
     switch (err) {
         error.DaemonError => std.debug.print("error: daemon: {s}\n", .{last_store_error orelse "unknown"}),

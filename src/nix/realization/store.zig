@@ -967,6 +967,3 @@ pub const RealizationStore = struct {
         return self.registry.outputNames(drv_path);
     }
 };
-
-/// Compatibility name retained for callers that model this as derivation state.
-pub const DerivationStore = RealizationStore;

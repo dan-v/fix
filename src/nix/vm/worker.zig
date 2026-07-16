@@ -62,7 +62,7 @@ const InternTable = @import("runtime").intern.InternTable;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const FileCache = @import("../host.zig").FileCache;
 const FetchCache = @import("../host.zig").FetchCache;
-const DerivationStore = @import("../realization.zig").DerivationStore;
+const RealizationStore = @import("../realization.zig").RealizationStore;
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker repoints
@@ -1225,7 +1225,7 @@ test "Worker basic init/deinit" {
         heap: ObjectHeap,
         files: FileCache,
         fetchers: FetchCache,
-        derivations: DerivationStore,
+        derivations: RealizationStore,
         sched: *Scheduler,
         arena: arena_mod.ArenaAllocator,
 
@@ -1250,7 +1250,7 @@ test "Worker basic init/deinit" {
         .heap = try ObjectHeap.init(testing.allocator, 2),
         .files = FileCache.init(testing.allocator),
         .fetchers = FetchCache.init(testing.allocator),
-        .derivations = DerivationStore.init(testing.allocator),
+        .derivations = RealizationStore.init(testing.allocator),
         .sched = &sched,
         .arena = arena_mod.ArenaAllocator.init(testing.allocator),
     };

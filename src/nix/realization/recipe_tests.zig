@@ -1,6 +1,6 @@
 const std = @import("std");
 const stable = @import("base").sync;
-const DerivationStore = @import("../realization.zig").DerivationStore;
+const RealizationStore = @import("../realization.zig").RealizationStore;
 const FileCache = @import("../host.zig").FileCache;
 const DaemonRuntime = @import("../host.zig").DaemonRuntime;
 const FakeDaemon = @import("../test_daemon.zig").FakeDaemon;
@@ -11,23 +11,23 @@ const dep_nar_path = "/nix/store/22222222222222222222222222222222-dep-nar";
 const missing_path = "/nix/store/33333333333333333333333333333333-missing";
 
 fn recipeApiAvailable() bool {
-    return @hasDecl(DerivationStore, "recordOwnedTextRecipe") and
-        @hasDecl(DerivationStore, "recordOwnedNarRecipe") and
-        @hasDecl(DerivationStore, "recordFlatRecipe") and
-        @hasDecl(DerivationStore, "releaseRecipePayloads");
+    return @hasDecl(RealizationStore, "recordOwnedTextRecipe") and
+        @hasDecl(RealizationStore, "recordOwnedNarRecipe") and
+        @hasDecl(RealizationStore, "recordFlatRecipe") and
+        @hasDecl(RealizationStore, "releaseRecipePayloads");
 }
 
 fn realizationApiAvailable() bool {
     return recipeApiAvailable() and
-        @hasDecl(DerivationStore, "ensureClosure") and
-        @hasDecl(DerivationStore, "realizeOutput");
+        @hasDecl(RealizationStore, "ensureClosure") and
+        @hasDecl(RealizationStore, "realizeOutput");
 }
 
 /// Point the store at the fake daemon and give it a small pool (2 workers is
 /// enough for the concurrent-claim tests: at most two distinct claims coexist).
 /// The store owns the runtime and tears it down in `deinit`, before the caller's
 /// `fake.deinit()` (declared first, so it runs last).
-fn attachFake(store: *DerivationStore, fake: *FakeDaemon) void {
+fn attachFake(store: *RealizationStore, fake: *FakeDaemon) void {
     store.setIo(std.testing.io);
     store.setDaemonSocketBorrowedForTest(fake.socketPath());
     const rt = std.testing.allocator.create(DaemonRuntime) catch @panic("OOM");
@@ -96,7 +96,7 @@ test "recordOwnedTextRecipe consumes the producer allocation" {
     if (comptime recipeApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
-        var store = DerivationStore.init(allocator);
+        var store = RealizationStore.init(allocator);
         const payload = try owned(allocator, "owned derivation text");
         const payload_ptr = @intFromPtr(payload.ptr);
         tracking.track(payload);
@@ -115,7 +115,7 @@ test "recordOwnedNarRecipe consumes the original serializer allocation" {
     if (comptime recipeApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
-        var store = DerivationStore.init(allocator);
+        var store = RealizationStore.init(allocator);
         const payload = try owned(allocator, "nix-archive-1 serialized tree");
         tracking.track(payload);
 
@@ -132,7 +132,7 @@ test "duplicate identical NAR recipe consumes incoming allocation and preserves 
         const allocator = tracking.allocator();
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(allocator);
+        var store = RealizationStore.init(allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedNarRecipe(dep_nar_path, try owned(allocator, "same nar payload"));
@@ -156,7 +156,7 @@ test "conflicting NAR recipe frees rejected allocation and realizes original" {
         const allocator = tracking.allocator();
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(allocator);
+        var store = RealizationStore.init(allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedNarRecipe(dep_nar_path, try owned(allocator, "original nar payload"));
@@ -178,7 +178,7 @@ test "recordFlatRecipe retains the same ImmutableBytes blob" {
     if (comptime recipeApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         const bytes = try owned(allocator, "flat cache payload");
         const original_ptr = @intFromPtr(bytes.ptr);
@@ -200,7 +200,7 @@ test "ensureClosure realizes flat recipe bytes and releases retained ownership" 
         const allocator = tracking.allocator();
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         const bytes = try owned(allocator, "flat closure payload");
@@ -224,7 +224,7 @@ test "duplicate identical owned recipe registration releases incoming ownership"
     if (comptime recipeApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
-        var store = DerivationStore.init(allocator);
+        var store = RealizationStore.init(allocator);
         defer store.deinit();
         try store.recordOwnedTextRecipe(root_path, try owned(allocator, "same text"), &.{dep_text_path});
         const duplicate = try owned(allocator, "same text");
@@ -241,7 +241,7 @@ test "duplicate identical flat recipe keeps original blob without leaking a reta
         const allocator = tracking.allocator();
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         const bytes = try owned(allocator, "same flat bytes");
@@ -269,7 +269,7 @@ test "conflicting flat recipe releases rejected retain and realizes original blo
         const rejected_allocator = rejected_tracking.allocator();
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
 
@@ -305,7 +305,7 @@ test "conflicting text recipe preserves the original and consumes the rejected p
         const allocator = tracking.allocator();
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(allocator);
+        var store = RealizationStore.init(allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedTextRecipe(root_path, try owned(allocator, "original text"), &.{});
@@ -329,7 +329,7 @@ test "successful realization releases recipe payload and realizes requested outp
         const allocator = tracking.allocator();
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(allocator);
+        var store = RealizationStore.init(allocator);
         defer store.deinit();
         attachFake(&store, fake);
         const payload = try owned(allocator, "realized derivation");
@@ -348,7 +348,7 @@ test "realizeOutput canonicalizes unsorted duplicate output names" {
     if (comptime realizationApiAvailable()) {
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "multi output derivation"), &.{});
@@ -363,7 +363,7 @@ test "releaseRecipePayloads is idempotent and teardown frees exactly once" {
     if (comptime recipeApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         const bytes = try owned(allocator, "released once");
         tracking.track(bytes);
         var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
@@ -382,7 +382,7 @@ test "ensureClosure materializes invalid references dependency first" {
     if (comptime realizationApiAvailable()) {
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedNarRecipe(dep_nar_path, try owned(std.testing.allocator, "dep nar"));
@@ -402,7 +402,7 @@ test "ensureClosure is a no-op for an already valid path" {
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
         try fake.markValid(root_path);
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "unused"), &.{});
@@ -417,7 +417,7 @@ test "ensureClosure errors for an invalid referenced path with no recipe" {
     if (comptime realizationApiAvailable()) {
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "root"), &.{missing_path});
@@ -431,7 +431,7 @@ test "ensureClosure rejects a cyclic recipe graph deterministically" {
     if (comptime realizationApiAvailable()) {
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "cycle a"), &.{dep_text_path});
@@ -443,7 +443,7 @@ test "ensureClosure rejects a cyclic recipe graph deterministically" {
 }
 
 const ConcurrentDemand = struct {
-    store: *DerivationStore,
+    store: *RealizationStore,
     result: anyerror!void = {},
 
     fn run(self: *ConcurrentDemand) void {
@@ -452,7 +452,7 @@ const ConcurrentDemand = struct {
 };
 
 const ConcurrentPathDemand = struct {
-    store: *DerivationStore,
+    store: *RealizationStore,
     path: []const u8,
     result: anyerror!void = {},
 
@@ -498,7 +498,7 @@ test "concurrent cross-root cyclic demands return RecipeCycle without deadlock" 
     if (comptime realizationApiAvailable()) {
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "cross cycle a"), &.{dep_text_path});
@@ -527,7 +527,7 @@ test "concurrent closure demand has exactly one materializing writer" {
     if (comptime realizationApiAvailable()) {
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "one writer"), &.{});
@@ -549,7 +549,7 @@ test "permanent realization failure is replayed without a second writer" {
         var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
         defer fake.deinit();
         fake.failNextAdd();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         attachFake(&store, fake);
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "permanent failure"), &.{});
@@ -566,7 +566,7 @@ test "transient connection failure resets claim state and permits retry" {
         defer std.testing.allocator.free(socket_path);
         var fake: ?*FakeDaemon = null;
         defer if (fake) |daemon| daemon.deinit();
-        var store = DerivationStore.init(std.testing.allocator);
+        var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         store.setIo(std.testing.io);
         store.setDaemonSocketBorrowedForTest(socket_path);

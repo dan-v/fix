@@ -1,21 +1,21 @@
 const std = @import("std");
 const eval_mod = @import("../../eval.zig");
 const Evaluator = eval_mod.Evaluator;
-const DerivationStore = @import("../../realization.zig").DerivationStore;
+const RealizationStore = @import("../../realization.zig").RealizationStore;
 const Value = @import("runtime").value.Value;
 const ObjectId = @import("runtime").types.ObjectId;
 const nar = @import("../../host.zig").nar;
 const FakeDaemon = @import("../../test_daemon.zig").FakeDaemon;
 
 fn recipeInspectionAvailable() bool {
-    return @hasDecl(DerivationStore, "RecipeVariantForTest") and
-        @hasDecl(DerivationStore, "recipeCountForTest") and
-        @hasDecl(DerivationStore, "recipeVariantForTest") and
-        @hasDecl(DerivationStore, "recipePayloadPointerForTest") and
-        @hasDecl(DerivationStore, "recipePayloadBytesForTest") and
-        @hasDecl(DerivationStore, "recipeReferencesForTest") and
-        @hasDecl(DerivationStore, "noteProducerPayloadForTest") and
-        @hasDecl(DerivationStore, "producerPayloadPointerForTest");
+    return @hasDecl(RealizationStore, "RecipeVariantForTest") and
+        @hasDecl(RealizationStore, "recipeCountForTest") and
+        @hasDecl(RealizationStore, "recipeVariantForTest") and
+        @hasDecl(RealizationStore, "recipePayloadPointerForTest") and
+        @hasDecl(RealizationStore, "recipePayloadBytesForTest") and
+        @hasDecl(RealizationStore, "recipeReferencesForTest") and
+        @hasDecl(RealizationStore, "noteProducerPayloadForTest") and
+        @hasDecl(RealizationStore, "producerPayloadPointerForTest");
 }
 
 const Fixture = struct {
@@ -96,27 +96,27 @@ fn storePathSubject(path: []const u8) []const u8 {
     return base;
 }
 
-fn expectRecipeText(store: *DerivationStore, store_path: []const u8, payload: []const u8, refs: []const []const u8) !void {
+fn expectRecipeText(store: *RealizationStore, store_path: []const u8, payload: []const u8, refs: []const []const u8) !void {
     if (comptime recipeInspectionAvailable()) {
-        try std.testing.expectEqual(DerivationStore.RecipeVariantForTest.text, store.recipeVariantForTest(store_path).?);
+        try std.testing.expectEqual(RealizationStore.RecipeVariantForTest.text, store.recipeVariantForTest(store_path).?);
         try std.testing.expectEqual(store.producerPayloadPointerForTest(store_path).?, store.recipePayloadPointerForTest(store_path).?);
         try std.testing.expectEqualStrings(payload, store.recipePayloadBytesForTest(store_path).?);
         try expectRefsEqual(store.recipeReferencesForTest(store_path).?, refs);
     } else unreachable;
 }
 
-fn expectRecipeNar(store: *DerivationStore, store_path: []const u8, payload: []const u8) !void {
+fn expectRecipeNar(store: *RealizationStore, store_path: []const u8, payload: []const u8) !void {
     if (comptime recipeInspectionAvailable()) {
-        try std.testing.expectEqual(DerivationStore.RecipeVariantForTest.nar, store.recipeVariantForTest(store_path).?);
+        try std.testing.expectEqual(RealizationStore.RecipeVariantForTest.nar, store.recipeVariantForTest(store_path).?);
         try std.testing.expectEqual(store.producerPayloadPointerForTest(store_path).?, store.recipePayloadPointerForTest(store_path).?);
         try std.testing.expectEqualStrings(payload, store.recipePayloadBytesForTest(store_path).?);
         try expectRefsEqual(store.recipeReferencesForTest(store_path).?, &.{});
     } else unreachable;
 }
 
-fn expectRecipeFlat(store: *DerivationStore, store_path: []const u8, expected_ptr: usize, payload: []const u8) !void {
+fn expectRecipeFlat(store: *RealizationStore, store_path: []const u8, expected_ptr: usize, payload: []const u8) !void {
     if (comptime recipeInspectionAvailable()) {
-        try std.testing.expectEqual(DerivationStore.RecipeVariantForTest.flat, store.recipeVariantForTest(store_path).?);
+        try std.testing.expectEqual(RealizationStore.RecipeVariantForTest.flat, store.recipeVariantForTest(store_path).?);
         try std.testing.expectEqual(expected_ptr, store.recipePayloadPointerForTest(store_path).?);
         try std.testing.expectEqualStrings(payload, store.recipePayloadBytesForTest(store_path).?);
         try expectRefsEqual(store.recipeReferencesForTest(store_path).?, &.{});

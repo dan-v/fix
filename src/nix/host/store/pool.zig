@@ -10,7 +10,7 @@
 //!
 //! Ordering is NOT the pool's concern. The daemon enforces referential integrity
 //! against its own committed state, so a write on ANY connection is valid once
-//! its references are committed (on any connection). `DerivationStore`'s
+//! its references are committed (on any connection). `RealizationStore`'s
 //! demand-driven closure walk writes a path's references before the path itself
 //! (deduping concurrent demand via realization claims), so write ordering is a
 //! property of that walk, upstream of the pool — the pool just moves bytes

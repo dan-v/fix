@@ -26,7 +26,7 @@ const heap_mod = @import("runtime").heap;
 const ObjectHeap = heap_mod.ObjectHeap;
 const FileCache = @import("host.zig").FileCache;
 const FetchCache = @import("host.zig").FetchCache;
-const DerivationStore = @import("realization.zig").DerivationStore;
+const RealizationStore = @import("realization.zig").RealizationStore;
 const eval_trace = @import("observ.zig").trace;
 const eval_progress = @import("observ.zig").progress;
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
@@ -220,7 +220,7 @@ pub const VM = struct {
     /// Evaluator-owned network/source fetch cache.
     fetchers: *FetchCache,
     /// Evaluator-owned normalized derivation graph/cache.
-    derivations: *DerivationStore,
+    derivations: *RealizationStore,
     /// Global scheduler (for spawning work).
     scheduler: *Scheduler,
     /// Evaluator-owned error trace collector.
@@ -394,7 +394,7 @@ pub const VM = struct {
         heap: *ObjectHeap,
         files: *FileCache,
         fetchers: *FetchCache,
-        derivations: *DerivationStore,
+        derivations: *RealizationStore,
         scheduler: *Scheduler,
         trace_sink: ?*eval_trace.Trace = null,
         progress_spans: ?eval_progress.SpanSink = null,

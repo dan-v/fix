@@ -313,7 +313,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
     }
     // Interned text (`intern.get`) is stable for the evaluator's lifetime
     // (append-only StableSegments), and everything downstream that needs a
-    // build's strings beyond the build itself (`DerivationStore.record`,
+    // build's strings beyond the build itself (`RealizationStore.record`,
     // `recordDebug`) clones its own copies. So strings that are already
     // interned — the name, output/attr names, whole env values with no
     // rewritten context — are used as-is instead of being duped into
@@ -776,7 +776,7 @@ fn contextOutputs(
             const known = self.derivations.outputNames(path) orelse return error.UnknownInputDerivation;
             const outputs = try self.allocator.alloc([]const u8, known.len);
             errdefer self.allocator.free(outputs);
-            // `DerivationStore.record` clones output names into store-owned
+            // `RealizationStore.record` clones output names into store-owned
             // storage that outlives the build — no per-name dupe needed.
             @memcpy(outputs, known);
             return outputs;

@@ -1,4 +1,4 @@
-//! Minimal worker-protocol daemon used by DerivationStore realization tests.
+//! Minimal worker-protocol daemon used by RealizationStore realization tests.
 //!
 //! It intentionally implements only the operations exercised by the recipe
 //! registry: handshake, isValidPath, add-to-store (text/NAR/flat), and
@@ -94,7 +94,7 @@ pub const FakeDaemon = struct {
         return self;
     }
 
-    /// The connected DerivationStore (and its connection pool) must be
+    /// The connected RealizationStore (and its connection pool) must be
     /// deinitialized before this helper, so closing the client streams lets the
     /// per-connection serve threads leave their read loops.
     pub fn deinit(self: *FakeDaemon) void {

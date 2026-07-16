@@ -20,7 +20,7 @@ const DaemonPool = rstore.DaemonPool;
 /// as unavailable). On a compute fiber this parks the fiber (yielding its worker,
 /// exactly like forcing a `.busy` thunk); off a fiber (the main-thread terminal
 /// build / `fix store`) it blocks the calling thread — which has nothing else to
-/// do — via `runPoolBlocking`. Matches `DerivationStore.Offload.run`; `ctx` is
+/// do — via `runPoolBlocking`. Matches `RealizationStore.Offload.run`; `ctx` is
 /// the `*DaemonPool`.
 pub fn runOnPool(ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void {
     const pool: *DaemonPool = @ptrCast(@alignCast(ctx));
