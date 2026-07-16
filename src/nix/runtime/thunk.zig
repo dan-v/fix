@@ -336,6 +336,25 @@ pub const Thunk = struct {
         return self.future.target_kind;
     }
 
+    /// Racy-benign read of the target arm's leading bytes, reinterpreted as
+    /// `T`, WITHOUT tripping the bare-union active-field safety check. The
+    /// `.closure`/`.bytecode` arms both begin at offset 0 of the payload
+    /// (closure = `Value`, bytecode = `BytecodeThunk{ chunk_id, ... }`), so a
+    /// raw reinterpret of `&payload` reads that arm's first field directly.
+    ///
+    /// Callers gate on a racy `state == unresolved` load (target arm live),
+    /// but a concurrent resolve can flip the payload to `.result` between that
+    /// check and this read — so the result may be stale/garbage. Every caller
+    /// must bound-guard it (a torn chunk id → `registry.slot` returns null; a
+    /// torn closure Value → `getBuiltinClosure` bounds-guards). Reading the
+    /// raw storage is what release already does once the safety tag is elided;
+    /// this makes Debug/ReleaseSafe match that intended semantics instead of
+    /// panicking on the torn union arm.
+    pub inline fn targetLeadingRacy(self: *const Thunk, comptime T: type) T {
+        const p: *const T = @ptrCast(@alignCast(&self.payload));
+        return p.*;
+    }
+
     /// Publish a binding cell's value (see `initBindingCell`). Writes
     /// `target = pass_through(value)` and transitions `.evaluating →
     /// .unresolved` so the next force runs the normal pass_through

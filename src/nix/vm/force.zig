@@ -692,7 +692,12 @@ pub fn sweepMemberAdmissible(self: *VM, thunk_id: ObjectId) bool {
     if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return false;
     switch (th.targetKind()) {
         .closure => {
-            const cv = th.payload.target.closure;
+            // Racy union read (see `Thunk.targetLeadingRacy`): a concurrent
+            // resolve can flip the payload to `.result` after the state load
+            // above. Reinterpret the raw storage so safe builds don't panic on
+            // the torn arm; a torn Value is bounds-guarded by
+            // `getBuiltinClosure` below.
+            const cv = th.targetLeadingRacy(Value);
             if (cv.isBuiltinClosure()) {
                 const bc = self.heap.getBuiltinClosure(cv.asObjectId()) catch return false;
                 if (@as(BuiltinId, @enumFromInt(bc.builtin_id)) == .derivationLazyAttr) return false;

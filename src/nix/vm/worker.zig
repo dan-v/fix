@@ -1138,7 +1138,11 @@ fn specRootBandSmall(f: *WorkerFiber, thunk_id: types.ObjectId) bool {
     const th = f.vm.heap.getThunkAssumeValid(thunk_id);
     if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return false;
     if (th.targetKind() != .bytecode) return false;
-    const slot = f.vm.registry.slot(th.payload.target.bytecode.chunk_id) orelse return false;
+    // Racy union read (see `Thunk.targetLeadingRacy`): a peer may resolve the
+    // thunk between the state load above and here, flipping the payload to
+    // `.result`. Reinterpret the raw storage so safe builds don't panic on the
+    // torn arm; a stale chunk id is bounds-guarded by `registry.slot`.
+    const slot = f.vm.registry.slot(th.targetLeadingRacy(types.ChunkId)) orelse return false;
     return slot.spec_band_small;
 }
 
