@@ -10,20 +10,21 @@ Correctness oracle: byte-identical `.drv`. Speculation and fan-out are *scheduli
 
 ## Representation
 
-Millions of thunks are live at once on a real eval, so the object is kept ~24-byte compact and never grows across its lifetime. Two ideas do the work:
+Millions of thunks are live at once on a real eval, so thunk-only metadata stays on `Thunk` while the reusable synchronization primitive remains small. A normal `Future` is 24 bytes and a normal `Thunk` is 80 bytes; tests pin both sizes. Two ideas keep unrelated future users from paying for evaluator state and keep the thunk payload bounded:
 
-- **Externalized discriminant.** The `ThunkTarget` union is 8-aligned (it holds `Value`s and pointers); an inline `union(enum)` tag would round the whole thing up by 8 bytes. Instead the 1-byte `TargetKind` lives in otherwise-wasted padding inside `Future` (`target_kind`), set once at construction and never mutated.
+- **Separated responsibilities.** `Future` owns only state, claimer identity, and waiters. `Thunk` adds `demanded`, the `TargetKind` discriminant, and optional profiling fields. Imports, realization claims, and I/O futures therefore do not carry thunk scheduling metadata.
 - **`target` XOR `result` overlap.** The `Payload` is a bare 24-byte union: `.target` (what to evaluate) is the live arm while unresolved/evaluating; `.result` (the resolved `Value`, or an `*ErrorInfo`'s bits) is live once terminal. They are *never both live* — the body reads `target`, then the resolver overwrites the same bytes with `result`. So resolving costs no growth. `future.state` is the discriminant that says which arm is live.
 
 ```
-Thunk (~24B core + 24B payload)
+Thunk
   future: Future
     state:        atomic u32   // FutureState FSM (the discriminant)
     claimer:      atomic u32   // ClaimerId of the evaluating fiber
-    demanded:     atomic u8    // observed by a real caller? (vs speculation)
-    target_kind:  u8           // TargetKind, tucked in padding
     waiters_head: ?*Waiter     // parked fibers (null when uncontended)
     waiters_mu:   SpinMutex
+  demanded:       atomic u8    // observed by a real caller? (vs speculation)
+  target_kind:    TargetKind
+  profiling:      zero-sized unless its build probe is enabled
   payload: union {             // bare union — state selects the arm
     target: ThunkTarget,       //   live while unresolved/evaluating
     result: Value,             //   live once resolved/errored
@@ -37,7 +38,7 @@ Thunk (~24B core + 24B payload)
 | Kind | Body | Notes |
 |---|---|---|
 | `closure` | Call a `Value` (user closure → run its chunk; builtin/builtin-closure → apply) | The general case. |
-| `bytecode` | Run `chunk_id` with captured upvalues | Up to `INLINE_CAP` = 2 upvalues live **inline** in the thunk (one alloc, one cache line on the force path); wider captures spill to a slice in the [heap's `values` store](heap.md). `upvalue_count` *is* the discriminant — no tag word, struct stays 24B. |
+| `bytecode` | Run `chunk_id` with captured upvalues | Up to `inline_capacity` = 2 upvalues live **inline** in the thunk (one alloc, one cache line on the force path); wider captures spill to a slice in the [heap's `values` store](heap.md). `upvalue_count` *is* the discriminant — no tag word, struct stays 24B. |
 | `pass_through` | Force a wrapped `Value`, memoize its result | How the compiler models recursive let cells; also `deepSeq`-style memo. |
 | `attr_access` | `getAttrValue(base, name)` directly | **Frameless, O(1)**: no frame push, no bytecode dispatch. Serves the overwhelmingly common `someUpvalue.attr` shape (`config.foo`, `lib.bar`, attrset-pattern params) directly; a `bytecode` thunk over a tiny `up_get_attr; ret` chunk would instead run a whole isolated frame, and `run_isolated_frame` is the biggest machinery bucket on the serial critical path. |
 | `deferred` | Compile an AST node on first force, then run like `bytecode` | Lazy per-attr compilation of huge generated attrsets (e.g. nixpkgs hackage-packages). The compiled `ChunkId` is cached on the shared `DeferredTable` entry; see [lazy-compile](../compiler/lazy-compile.md). |
@@ -99,9 +100,9 @@ The result store *happens-before* the state release-store; a reader that acquire
 - `attr_access` → frameless `getAttrValue`
 - `pass_through` → recurse `forceValueImpl` on the wrapped value
 
-The safepoint sits at this force boundary, never mid-allocation. A requested collection fires at **any** native builtin depth (`native_depth` does not gate it — it is the RSS lever); soundness rests on the precise-root discipline (operand stack, call/arg rooting, the in-flight force chain, container temp-roots), not on depth. (The `--workers>1` peer stop-the-world response *is* gated to `native_depth == 0`, but that collector is dormant; reclaim runs only at `--workers=1`.)
+The safepoint sits at this force boundary, never mid-allocation. The fiber that wins collection coordination may request a collection at any native builtin depth; soundness rests on the precise-root discipline (operand stack, call/arg rooting, the in-flight force chain, and container temp-roots). At multiple workers, peers park only at native-depth-zero boundaries, then assist the parallel mark and evacuation before resuming.
 
-On `.busy`, spin a bounded `BUSY_SPIN_BEFORE_ENROLL` (1024) times in case the owner is about to publish, then enroll + yield, and retry the loop on resume. On `.blackhole` → `error.RecursiveThunk`; on `.errored` → replay the cached error.
+On `.busy`, spin a bounded `busy_spin_before_enroll` (1024) times in case the owner is about to publish, then enroll + yield, and retry the loop on resume. On `.blackhole` → `error.RecursiveThunk`; on `.errored` → replay the cached error.
 
 **In-place forcing.** Ops force operands with `forceAt(depth)` / `forceTop` — the value is forced *while it stays in its stack slot* and written back, never popped first. This keeps the operand stack a precise GC root across the (possibly collecting) force. The in-flight thunk itself is rooted by pushing its id onto `vm.gc_force_chain` for the duration of its body (it's `.evaluating` and off the stack). See [gc](../gc.md).
 
@@ -109,12 +110,12 @@ On `.busy`, spin a bounded `BUSY_SPIN_BEFORE_ENROLL` (1024) times in case the ow
 
 nixpkgs re-evaluates the same pure `lib` helpers (`lib.types.*`, `lib.mkXxx`, …) with identical arguments across thousands of modules — distinct thunk objects computing identical values, which per-object memoization can't share. ~10.8% of bytecode-thunk computations on the NixOS toplevel are such duplicates.
 
-The memo is a bounded **per-worker, zero-contention** table (`MEMO_SIZE = 1 << 14` = 16384 slots) keyed by `(heap_token, chunk_id, upvalue count, ≤2 upvalue Value-bits) → Value`:
+The memo is a bounded **per-worker, zero-contention** table (`memo_size = 1 << 14` = 16384 slots) keyed by `(heap_token, chunk_id, upvalue count, ≤2 upvalue Value-bits) → Value`:
 
 - Only `bytecode` thunks with ≤2 upvalues (the inline-storage majority) — the key compares exactly with no allocation.
 - **Sound because bytecode thunks are pure** — same chunk + same upvalues ⇒ same value.
 - Keyed by `heap_token`, which **bumps on every GC collection**, auto-invalidating stale entries across heap generations / `Evaluator` instances (same trick as the attr inline cache).
-- **Does not cross workers** (thread-local). Under GC each worker publishes its memo's address into a registry so the STW collector can mark live entries (a memo slot can be the momentary sole reference to a shared result).
+- **Does not cross workers** (thread-local). Each worker publishes its memo's address into a registry so the STW collector can mark current-token entries (a memo slot can be the momentary sole reference to a shared result). The heap token is bumped after collection, invalidating those old slots before ObjectIds can be reused.
 
 Checked on the freshly-claimed path before running the body; a hit resolves the thunk to the cached value and skips execution.
 

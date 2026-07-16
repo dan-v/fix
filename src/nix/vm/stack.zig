@@ -90,7 +90,7 @@ pub fn setStack(self: *VM, idx: u32, val: Value) void {
 /// (a GC safepoint), and only then drops via `dropBin` — so the operands
 /// stay on the operand stack (precise GC roots) across the force. Forcing
 /// a thunk memoises its result into the thunk, which the on-stack slot
-/// keeps reachable, so no write-back is needed. See docs/plans/gc-plan.md.
+/// keeps reachable, so no write-back is needed. See docs/gc.md.
 pub inline fn binTop(self: *VM) struct { left: Value, right: Value } {
     return .{ .left = self.stack[self.sp - 2], .right = self.stack[self.sp - 1] };
 }

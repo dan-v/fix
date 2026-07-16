@@ -700,7 +700,7 @@ pub const Scheduler = struct {
     /// the worst case where speculation guessed a large, never-demanded
     /// body: without it, helpers keep pulling the dead backlog and extend
     /// wall time past when the answer was computed (a self-inflicted
-    /// pathology — see docs/plans/parallel-redesign-plan.md). In-flight fibers
+    /// pathology — see docs/perf/probes.md). In-flight fibers
     /// still drain to completion (a suspended fiber only waits on an
     /// already-claimed thunk, never on a queued task), so correctness is
     /// unaffected; only un-started backlog work is skipped.

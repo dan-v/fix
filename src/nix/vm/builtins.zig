@@ -38,8 +38,7 @@ pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
     // GC: args need no rooting here — every caller keeps them rooted
     // for the builtin's whole duration (doCall/doTailCall/callValue rootKeep
     // their arg; doCallN leaves args on the operand stack; evalThunkClosure's
-    // builtin_closure is on the in-flight force chain). See docs/plans/
-    // gc-tax-removal-audit.md.
+    // builtin_closure is on the in-flight force chain). See `docs/gc.md`.
     return switch (id) {
         .toString => strings.builtinToString(self, args[0]),
         .isAttrs => predicates.builtinTypePredicate(self, args[0], .attrs),

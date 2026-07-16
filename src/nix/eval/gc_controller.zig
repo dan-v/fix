@@ -101,7 +101,7 @@ pub fn helpMark(ev: Context, worker_id: u8) void {
 /// GC: one stop-the-world mark-sweep at a safepoint. Mark the
 /// live graph from roots, sweep dead objects/ranges into the free
 /// lists, set the next threshold from the surviving live set. Runs on
-/// the lone mutator at --workers=1; see docs/plans/gc-plan.md for the roots.
+/// the lone mutator at --workers=1; see docs/gc.md for the roots.
 pub fn collect(ev: Context, collector_id: u8) void {
     // Lazy policy (`enableBudget`): the first threshold (budget/2) crossing
     // arms tracking instead of collecting — everything allocated so far
@@ -450,7 +450,7 @@ fn meminfoKb(text: []const u8, key: []const u8) ?u64 {
     return null;
 }
 
-/// Mark all GC roots into `tr` (without draining). See docs/plans/gc-plan.md.
+/// Mark all GC roots into `tr` (without draining). See docs/gc.md.
 pub fn markRoots(ev: Context, tr: *gc.Tracer) void {
     if (ev.builtins_value.*) |b| tr.markValue(ev.heap, b);
     // Caller-held external roots (repl scope bindings / last results —

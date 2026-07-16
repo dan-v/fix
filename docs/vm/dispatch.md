@@ -45,9 +45,9 @@ An equivalent monolithic ~70-arm `switch` compiles to a single ~32 KB function. 
 
 ## Value stack and frames
 
-**Operand stack** — `vm.stack[0..sp)`, capacity `VM_STACK_CAP` (65 536). `push`/`pushFrame` bounds-check against the cap and raise `error.StackOverflow`; `pop` is unchecked (it only decrements `sp`). `sp_high_water` tracks the peak for diagnostics.
+**Operand stack** — `vm.stack[0..sp)`, capacity `vm_stack_capacity` (65 536). `push`/`pushFrame` bounds-check against the cap and raise `error.StackOverflow`; `pop` is unchecked (it only decrements `sp`). `sp_high_water` tracks the peak for diagnostics.
 
-**Frames** — `vm.frames[0..frames_len)`, capacity `MAX_FRAMES` (512). A `Frame` is:
+**Frames** — `vm.frames[0..frames_len)`, capacity `max_frames` (20,000). A `Frame` is:
 
 | field | meaning |
 |---|---|
@@ -90,7 +90,7 @@ A `Chunk` is **immutable after construction**. Key fields (compiler-stamped; see
 | `local_count` | frame slot count (thunk bodies: `0`; lambda bodies: `≥1`) |
 | `arity` | params consumed before the body runs — `1` for curried/attrset lambdas and thunk bodies, `N` for an *uncurried* merged value-lambda chain (see [calls.md](calls.md)) |
 | `strict_params` | per-param must-force bitmask for uncurried chunks |
-| `scheduling` | `SchedulingHints`: `body_is_substantial` (≥ `SPECULATION_MIN_CODE_BYTES` = 256 → worth speculative forcing, see [parallel/speculation.md](../parallel/speculation.md)), `strictness` bitmasks, `trivial` body classification (trivial thunk bodies skip thunk allocation — see [runtime/thunks.md](../runtime/thunks.md)), `strict_param`, `strict_via_upvalue` |
+| `scheduling` | `SchedulingHints`: `body_is_substantial` (≥ `speculation_min_code_bytes` = 256 → worth speculative forcing, see [parallel/speculation.md](../parallel/speculation.md)), `strictness` bitmasks, `trivial` body classification (trivial thunk bodies skip thunk allocation — see [runtime/thunks.md](../runtime/thunks.md)), `strict_param`, `strict_via_upvalue` |
 | `function_args`, `source_map` | `builtins.functionArgs` metadata; cold-path error spans |
 | `body_span` | representative source span of the whole body node — labels a thunk quantum / demand wait in the timeline (`null` for chunks that skip it) |
 
@@ -104,7 +104,7 @@ Two **well-known stub chunks** (`genlist_apply`, `mapattrs_apply`) are registere
 ## Invariants
 
 - **Operand stack is a precise GC root.** Values are forced *in place* on the stack, never after popping into a local — forcing is a GC safepoint, and a popped-then-forced value could be swept. Binary ops read via `binTop`, force in place, and `dropBin` only after. (See [gc.md](../gc.md).)
-- **Single reused machine frame.** The `always_tail` chain never grows the native stack; growth is bounded by `MAX_FRAMES` VM frames, not by opcode count.
+- **Single reused machine frame.** The `always_tail` chain never grows the native stack; growth is bounded by `max_frames` VM frames, not by opcode count.
 - **Registered chunks are immutable**; a chunk is fully built before its `ChunkSlot` is published, so any thread that resolves the id observes a complete, unchanging `Chunk`.
 - **`frame.ip` is written back** before any op that can fault, re-enter the interpreter, or push a frame, so error traces and resumed callers see a consistent ip.
 

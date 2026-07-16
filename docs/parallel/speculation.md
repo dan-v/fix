@@ -20,7 +20,7 @@ Neither changes results. Both are pure earliness: the [claim/waiter protocol](..
 
 **Submission heuristic.** `makeThunk` speculates a freshly created thunk iff `shouldSpeculateClosure` holds:
 
-- for a **user closure**, its chunk's `body_is_substantial` bit — set at chunk registration when the compiled body (plus fusion savings) is ≥ `SPECULATION_MIN_CODE_BYTES` = **256 bytes**;
+- for a **user closure**, its chunk's `body_is_substantial` bit — set at chunk registration when the compiled body (plus fusion savings) is ≥ `speculation_min_code_bytes` = **256 bytes**;
 - for a **`builtin_closure`** whose builtin id is `mapValue`, `mapAttrValue`, or `zipAttrsValue` (the per-element wrappers `map` / `mapAttrs` / `zipAttrsWith` build around a user function), when that inner function (its `args[0]`) is itself a substantial closure or a *known-expensive* builtin — `import`, `scopedImport`, `fetchurl`/`fetchTarball`/`fetchGit`/`fetchTree`, `readFile`/`readFileType`/`readDir`, `derivation` (`isExpensiveBuiltin`). Trivial map bodies (`x: x + 1`) fail the closure size gate, and `derivationLazyAttr` is explicitly excluded, so speculation doesn't wander into unobserved package graphs.
 
 When it fires, a `force_thunk` task for the body goes to the speculation queue and the caller continues with a lazy thunk; the task runs the force with `in_speculation = true`.

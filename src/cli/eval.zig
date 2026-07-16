@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const engine = @import("nix");
-const cli = @import("cli.zig");
+const progress_ui = @import("progress.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const eval_support = @import("eval_support.zig");
@@ -71,7 +71,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     // reads from the FileCache).
     if (options.debugger) ev.setDebugSource(source.text);
 
-    var progress = cli.EvalProgress.init(init.io, term.show_progress);
+    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
     errdefer progress.deinit(false);
     // Only wire the sink when we'll actually draw: it drives a ~100ms counter
     // sampler, so a null sink keeps that fully out of the hot path when off.

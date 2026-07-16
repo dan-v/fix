@@ -144,12 +144,8 @@ pub fn checkScopedCycle(path: []const u8) !void {
     }
 }
 
-/// Resolve `path` against `ev.base_path` if relative, then dedup
-/// through the registry and force the entry to completion. The
-/// evaluator is passed by anytype only to avoid a *file*-level @import cycle
-/// with eval.zig (this is an extracted Evaluator method, not loose coupling);
-/// it must expose `allocator`, `imports`, `files`, `progress*`,
-/// `evaluateSource`, and `resolveHostPath`.
+/// Resolve `path` against the host's base path if relative, then deduplicate
+/// through the registry and force the entry to completion.
 pub fn importPath(ev: Host, path: []const u8, parent_depth: u32) !Value {
     const resolved = try ev.resolveHostPath(path);
     defer if (resolved.owned) ev.allocator.free(resolved.text);

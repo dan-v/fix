@@ -10,15 +10,15 @@ A `Compiler` instance compiles **one chunk** (one function body / thunk body / f
 
 ## Dispatch → domain modules
 
-`compileNodeImpl` is the dispatch switch. The high-level node compilers live in cohesive sibling modules; `ops.zig` is a thin facade re-exporting the entry points for `fold`, `lambda`, and `let`, so callers dispatch through `ops.X`.
+`driver.compileNodeImpl` is the recursive dispatch switch; `context.zig` owns compiler state and carries the driver callback used by child compilers. High-level node compilers live in cohesive sibling modules and the driver imports each owner directly.
 
 | Node family | Module | Lowers |
 | --- | --- | --- |
 | int / float / string / path / search-path / identifier | `literals` | immediates, interpolation (`str_cat`), path resolution, `id → local`/`upvalue`/`with` |
 | bool / null | (inline) | a single `push_true`/`push_false`/`push_null` op |
-| binary / unary | `fold` (via `ops`) | operators; compile-time constant folding |
-| apply / lambda / lambda_attrs | `lambda` (via `ops`) | calls, value-lambda uncurrying, attrset-pattern lambdas, `call_n`/`call_tail_n` spine flattening |
-| let | `let` (via `ops`) | `let` binding classification, cell elision, eager elision |
+| binary / unary | `fold` | operators; compile-time constant folding |
+| apply / lambda / lambda_attrs | `lambda` | calls, value-lambda uncurrying, attrset-pattern lambdas, `call_n`/`call_tail_n` spine flattening |
+| let | `let` | `let` binding classification, cell elision, eager elision |
 | if / assert / with | `control` | branch/join, assertion guard, dynamic-scope push |
 | attrset (static/dynamic/rec/inherit) | `attrs` | attr construction, merge, `inherit`, deferred-set gating |
 | attr access / `?` has-attr / list | `access` | static/dynamic/mixed attr paths, `or`-defaults, list building |
@@ -45,7 +45,7 @@ The strictness stamp (`strictness.stampOnBuilder`) runs at the **end of body com
 
 At **finish** (`ChunkBuilder.finish`), in one pass, the builder freezes into an immutable **Chunk**:
 
-1. **body_is_substantial** — `code.len + fusion_savings + sideTableWeight() ≥ SPECULATION_MIN_CODE_BYTES` (256), gating [speculation](../parallel/speculation.md); `sideTableWeight` re-adds the bytes the attr-name/position side tables moved out of the code stream, mirroring their old inline encodings.
+1. **body_is_substantial** — `code.len + fusion_savings + sideTableWeight() ≥ speculation_min_code_bytes` (256), gating [speculation](../parallel/speculation.md); `sideTableWeight` re-adds the bytes the attr-name/position side tables moved out of the code stream, mirroring their old inline encodings.
 2. **Trivial-body classify** — the finished body is classified once into a `TrivialBody` variant, else `none` (see [lazy-compile.md](lazy-compile.md) and [runtime/thunks.md](../runtime/thunks.md)); safe because thunk bodies have `local_count == 0`.
 3. The strictness masks, `strict_param`, `strict_via_upvalue`, `arity`, and `strict_params` are copied through into the Chunk.
 

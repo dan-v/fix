@@ -5,7 +5,7 @@
 //! entry plus one `apply` arm.
 
 const std = @import("std");
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
 const derivation_debug = @import("derivation_debug.zig");
 const eval_memory = @import("nix").eval.memory;
 const hugetlb = @import("nix").process_support.memory_backing;
@@ -164,8 +164,8 @@ pub const Options = struct {
     /// `--option NAME VALUE`: nix.conf setting overrides, in argv order.
     /// Borrowed from argv; the list backing is owned (caller frees via `deinit`).
     option_overrides: std.ArrayListUnmanaged(OptionOverride) = .empty,
-    color: cli.When = .auto,
-    progress: cli.When = .auto,
+    color: presentation.When = .auto,
+    progress: presentation.When = .auto,
     /// `fix repl --bare`: plain line-based input (no raw mode, no escape
     /// sequences), regardless of whether stdin/stdout are a terminal. The
     /// non-tty repl path is always bare; this forces it for automation.
@@ -263,7 +263,7 @@ pub const Options = struct {
     /// worth ~20-32% wall at --workers>1 (spec-off→on: 2.62→2.11s with GC,
     /// 2.10→1.43s without), and the RSS it costs is absorbed by the GC without
     /// thrashing (3→9 minor collections, +70ms mark — measured, see
-    /// docs/plans/inlining-demand-compilation.md era). `--no-spec-thunks` opts
+    /// docs/compiler/lazy-compile.md era). `--no-spec-thunks` opts
     /// out (bounds RSS at the cost of that wall); it was the pre-2026-07
     /// default when RSS was over-weighted vs the measured GC cost.
     disable_spec_thunks: bool = false,
@@ -699,9 +699,9 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
 
         .show_trace => options.show_trace = true,
         .debugger => options.debugger = true,
-        .color => options.color = if (v0) |v| (cli.parseWhen(v) orelse return error.InvalidColorMode) else .always,
+        .color => options.color = if (v0) |v| (presentation.parseWhen(v) orelse return error.InvalidColorMode) else .always,
         .no_color => options.color = .never,
-        .progress => options.progress = if (v0) |v| (cli.parseWhen(v) orelse return error.InvalidProgressMode) else .always,
+        .progress => options.progress = if (v0) |v| (presentation.parseWhen(v) orelse return error.InvalidProgressMode) else .always,
         .no_progress => options.progress = .never,
         .debug_derivations => options.derivation_debug.mode = if (v0) |v|
             (derivation_debug.parseMode(v) orelse return error.InvalidDerivationDebugMode)
@@ -772,7 +772,7 @@ fn parseVmTraceFormat(text: []const u8) ?@TypeOf(@as(Options, undefined).vm_trac
 const help_col = 26;
 
 /// Print `synopsis`, then the options section for `cmd`, to stdout. Best-effort
-/// (a failed write must not change exit status), mirroring `cli.printHelp`.
+/// (a failed write must not change exit status), mirroring `presentation.printHelp`.
 pub fn writeHelp(io: std.Io, synopsis: []const u8, cmd: Cmd) void {
     var buf: [8192]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(io, &buf);

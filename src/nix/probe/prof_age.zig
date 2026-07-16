@@ -9,6 +9,8 @@ const std = @import("std");
 const worker_id = @import("base").worker_id;
 const prof = @import("prof.zig");
 const prof_path_mod = @import("prof_path.zig");
+const InternTable = @import("runtime").intern.InternTable;
+const ChunkRegistry = @import("../bytecode.zig").chunk.ChunkRegistry;
 const enabled = prof.enabled;
 const rdtsc = prof.rdtsc;
 const pct = prof.pct;
@@ -214,7 +216,7 @@ pub inline fn ageForceEnd(t: u64) void {
 /// Age-at-force breakdown of main's claimed demand-forces. `registry`/
 /// `intern` resolve chunk keys to source locations for the per-body
 /// breakdown (same shapes as `prof_path.report`).
-pub fn report(registry: anytype, intern: anytype) void {
+pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
     var total_n: u64 = 0;
     var total_excl: u64 = 0;
     for (age_buckets) |b| {

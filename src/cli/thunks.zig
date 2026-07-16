@@ -19,7 +19,7 @@
 //! location in either log (so the report flows causally).
 
 const std = @import("std");
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
 
 const usage =
     \\usage: fix thunks <subcommand> [args]
@@ -59,8 +59,8 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         return 2;
     };
     if (std.mem.eql(u8, sub, "diff")) return runDiff(init, args_iter);
-    if (cli.isHelpFlag(sub)) {
-        cli.printHelp(init.io, usage);
+    if (presentation.isHelpFlag(sub)) {
+        presentation.printHelp(init.io, usage);
         return 0;
     }
     std.debug.print("error: unknown subcommand '{s}'\n\n{s}", .{ sub, usage });

@@ -223,7 +223,7 @@ pub const VmTrace = struct {
 /// default in release builds), each call compiles to nothing. When the
 /// runtime sink is null, the hook does nothing either.
 pub inline fn op(
-    sink: anytype,
+    sink: ?*VmTrace,
     worker_id: u8,
     frames_len: u32,
     chunk_id: ChunkId,
@@ -235,22 +235,22 @@ pub inline fn op(
     if (sink) |t| t.recordOp(worker_id, frames_len, chunk_id, ip, opc, sp);
 }
 
-pub inline fn framePush(sink: anytype, worker_id: u8, frames_len: u32, chunk_id: ChunkId, frame_base: u32) void {
+pub inline fn framePush(sink: ?*VmTrace, worker_id: u8, frames_len: u32, chunk_id: ChunkId, frame_base: u32) void {
     if (comptime !enabled) return;
     if (sink) |t| t.recordFramePush(worker_id, frames_len, chunk_id, frame_base);
 }
 
-pub inline fn framePop(sink: anytype, worker_id: u8, frames_len: u32, returning_to_chunk: ChunkId, returning_to_ip: u32) void {
+pub inline fn framePop(sink: ?*VmTrace, worker_id: u8, frames_len: u32, returning_to_chunk: ChunkId, returning_to_ip: u32) void {
     if (comptime !enabled) return;
     if (sink) |t| t.recordFramePop(worker_id, frames_len, returning_to_chunk, returning_to_ip);
 }
 
-pub inline fn forceEnter(sink: anytype, worker_id: u8, thunk_id: ObjectId) void {
+pub inline fn forceEnter(sink: ?*VmTrace, worker_id: u8, thunk_id: ObjectId) void {
     if (comptime !enabled) return;
     if (sink) |t| t.recordForceEnter(worker_id, thunk_id);
 }
 
-pub inline fn forceExit(sink: anytype, worker_id: u8, thunk_id: ObjectId, ok: bool) void {
+pub inline fn forceExit(sink: ?*VmTrace, worker_id: u8, thunk_id: ObjectId, ok: bool) void {
     if (comptime !enabled) return;
     if (sink) |t| t.recordForceExit(worker_id, thunk_id, ok);
 }

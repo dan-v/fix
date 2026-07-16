@@ -23,6 +23,8 @@
 //! resolving `prof.<name>`.
 
 const std = @import("std");
+const InternTable = @import("runtime").intern.InternTable;
+const ChunkRegistry = @import("../bytecode.zig").chunk.ChunkRegistry;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const worker_id = @import("base").worker_id;
@@ -294,7 +296,7 @@ pub inline fn end(comptime path: Path, t: u64) void {
 /// (`--print-sched-stats`). Lives beside the counters it reads.
 /// `registry`/`intern` resolve chunk keys to source locations for the
 /// age-at-force per-body breakdown (same shapes as `prof_path.report`).
-pub fn report(registry: anytype, intern: anytype) void {
+pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
     inline for (@typeInfo(Path).@"enum".fields) |f| {
         const samp = samples[f.value];
         if (samp.calls != 0) {

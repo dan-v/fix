@@ -169,7 +169,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_nix_tests.step);
     test_step.dependOn(&run_cli_tests.step);
 
-    const check_step = b.step("check", "Run unit tests");
+    const format_check = b.addFmt(.{
+        .paths = &.{ "build.zig", "src", "tools" },
+        .check = true,
+    });
+
+    const check_step = b.step("check", "Check formatting and run unit tests");
+    check_step.dependOn(&format_check.step);
     check_step.dependOn(test_step);
 
     // Quick syntax-only tests. The parser imports the build-generated

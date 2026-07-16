@@ -170,7 +170,7 @@ pub const GcKeySet = struct {
 
     /// True if `key` was already present (skip it); otherwise inserts it
     /// and returns false.
-    fn contains(self: *GcKeySet, vm: anytype, key: Value) !bool {
+    fn contains(self: *GcKeySet, vm: *VM, key: Value) !bool {
         const hc = try gcKeyHashCode(vm, key);
         const gop = try self.index.getOrPut(vm.allocator, hc);
         if (!gop.found_existing) gop.value_ptr.* = .empty;

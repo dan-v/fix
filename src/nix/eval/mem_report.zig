@@ -127,6 +127,8 @@ pub fn report(
     smapsDecompose(tracked_total);
 }
 
+const SmapsKind = enum { file, stack, heap, anon };
+
 fn smapsDecompose(tracked_anon: u64) void {
     if (comptime builtin.os.tag != .linux) return;
     const p = std.debug.print;
@@ -145,7 +147,7 @@ fn smapsDecompose(tracked_anon: u64) void {
     // [heap] / anonymous by its header line, then attribute each
     // "Rss:" line to that category. Read in chunks, reassembling lines
     // across chunk boundaries in a small carry buffer.
-    var current: enum { file, stack, heap, anon } = .anon;
+    var current: SmapsKind = .anon;
     var chunk: [64 * 1024]u8 = undefined;
     var carry: [512]u8 = undefined;
     var carry_len: usize = 0;
@@ -194,7 +196,7 @@ fn smapsDecompose(tracked_anon: u64) void {
 
 fn classifySmapsLine(
     line: []const u8,
-    current: anytype,
+    current: *SmapsKind,
     file_rss: *u64,
     stack_rss: *u64,
     heap_rss: *u64,

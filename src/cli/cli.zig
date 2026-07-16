@@ -23,34 +23,10 @@ pub const trace_setup = @import("trace_setup.zig");
 pub const render = @import("render.zig");
 pub const presentation = @import("presentation.zig");
 pub const progress = @import("progress.zig");
-pub const realization = @import("realize.zig");
-
-pub const When = presentation.When;
-pub const Style = presentation.Style;
-pub const Stderr = presentation.Stderr;
-pub const EvalProgress = progress.EvalProgress;
-pub const Realized = realization.Realized;
-pub const RealizeResult = realization.Result;
-
-pub const parseWhen = presentation.parseWhen;
-pub const printHelp = presentation.printHelp;
-pub const isHelpFlag = presentation.isHelpFlag;
-pub const isStderrInteractive = presentation.isStderrInteractive;
-pub const shouldColor = presentation.shouldColor;
-pub const autoColor = presentation.autoColor;
-pub const shouldProgress = presentation.shouldProgress;
-pub const styleCode = presentation.styleCode;
-pub const resetCode = presentation.resetCode;
-pub const style = presentation.style;
-pub const reset = presentation.reset;
-pub const writeLabel = presentation.writeLabel;
-pub const lockStderr = presentation.lockStderr;
-pub const writeMaybePath = presentation.writeMaybePath;
-pub const isPathLike = presentation.isPathLike;
-pub const realize = realization.realize;
+pub const realize = @import("realize.zig");
 
 test {
     _ = presentation;
     _ = progress;
-    _ = realization;
+    _ = realize;
 }

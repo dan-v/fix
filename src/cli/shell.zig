@@ -8,7 +8,8 @@
 
 const std = @import("std");
 const engine = @import("nix");
-const cli = @import("cli.zig");
+const progress_ui = @import("progress.zig");
+const build_progress_ui = @import("build_progress.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const eval_support = @import("eval_support.zig");
@@ -49,11 +50,11 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     const term = try setup.configure(&ev, init, options);
     ev.enableStoreWrites();
 
-    var progress = cli.EvalProgress.init(init.io, term.show_progress);
+    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
     var torn = false;
     defer if (!torn) progress.deinit(false);
     if (term.show_progress) ev.setProgressSink(progress.sink());
-    var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
+    var build_progress = build_progress_ui.BuildProgress.init(allocator, &progress);
     const build_sink = if (term.show_progress) build_progress.sink() else null;
 
     const label = if (options.packages.items.len > 0) "packages" else eval_support.sourceLabel(options.source.?);

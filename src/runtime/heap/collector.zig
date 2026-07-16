@@ -188,10 +188,10 @@ pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
     else
         @max(budget, heap.totalReservedBytes() + headroom);
     // Invalidate all thread-local caches (thunk memo, attr IC, call IC)
-    // that key on `token`: they hold Values weakly (not GC roots), so a
-    // swept object could still be reachable through a stale cache slot.
-    // A fresh unique token makes every existing slot miss. This is why
-    // caches needn't be traced (see docs/plans/gc-plan.md).
+    // that key on `token`. Current thunk-memo and attr-cache values were
+    // traced as roots for this collection because a cache may momentarily be
+    // their sole owner; the fresh token makes every old slot miss afterward,
+    // before a recycled ObjectId can be mistaken for that prior value.
     heap.token = heap_mod.next_heap_token.fetchAdd(1, .monotonic);
 }
 
@@ -522,7 +522,7 @@ pub fn verifyMarkClosed(heap: *ObjectHeap, mark_bits: []const u64) void {
 
 /// Return a dead object's owned store ranges to the free lists. Ranges
 /// are single-owner (every construction site reserves fresh + copies),
-/// so this is the only owner — see docs/plans/gc-plan.md. Thunk *spilled*
+/// so this is the only owner — see docs/gc.md. Thunk *spilled*
 /// upvalue/env storage is a bare slice (no segment/offset to recover),
 /// so it is not reclaimed yet (thunks with >2 upvalues — a minority);
 /// `attrs_merge`/`boxed_int` own no ranges.

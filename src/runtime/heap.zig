@@ -563,7 +563,7 @@ pub const ObjectHeap = struct {
         /// `Thunk.demanded`: `resolved_demanded` were observed by a real
         /// (demand) caller; `resolved_undemanded` were pre-forced by
         /// speculation / fan-out and never observed — the speculative-waste
-        /// fraction. See docs/plans/parallel-redesign-plan.md (instrument I1).
+        /// fraction. See docs/perf/probes.md (instrument I1).
         resolved_demanded: u32,
         resolved_undemanded: u32,
         /// Magnitude histogram for inline `.int` values found in the
@@ -1251,7 +1251,7 @@ pub const ObjectHeap = struct {
         }
     }
 
-    // --- GC reclaim (collector, single-threaded for now) ---
+    // --- GC allocation and reclamation state ---
 
     /// Floor on the collection threshold.
     pub const gc_min_threshold: u64 = 256 << 20;
@@ -2109,7 +2109,7 @@ pub const ObjectHeap = struct {
         // vm/stack.zig Frame), which would dangle if the range were evacuated
         // mid-execution. Born tenured so the frame slice never moves. (A future
         // optimization can re-derive frame.upvalues at GC time and let these be
-        // young — see docs/plans/gc-copying-nursery-plan.md.)
+        // young — see docs/gc.md.)
         const range = try self.appendValuesTenured(upvalues);
         errdefer self.values.rollback(range);
         return self.add(.{ .closure = .{

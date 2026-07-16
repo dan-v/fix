@@ -3,7 +3,7 @@
 //! answer store-validity questions without shelling out to `nix`.
 
 const std = @import("std");
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
 const host = @import("nix").host;
 const store = host.store;
 const nar = host.nar;
@@ -28,8 +28,8 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         std.debug.print("{s}", .{usage});
         return 2;
     };
-    if (cli.isHelpFlag(sub)) {
-        cli.printHelp(init.io, usage);
+    if (presentation.isHelpFlag(sub)) {
+        presentation.printHelp(init.io, usage);
         return 0;
     }
 

@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const engine = @import("nix");
-const cli = @import("cli.zig");
+const progress_ui = @import("progress.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const eval_support = @import("eval_support.zig");
@@ -56,7 +56,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     // The daemon connects lazily on the first write.
     ev.enableStoreWrites();
 
-    var progress = cli.EvalProgress.init(init.io, term.show_progress);
+    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
     var ok = false;
     defer progress.deinit(ok);
     if (term.show_progress) ev.setProgressSink(progress.sink());

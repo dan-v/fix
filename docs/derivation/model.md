@@ -81,8 +81,8 @@ The value returned by the lazy build (`buildValue`) is an attrs with:
 - one attr per output, **each itself a derivation-shaped attrs** (`type`/`outputName`/`drvPath`/`outPath`) so `drv.bin.outPath` works,
 - `all` = a list of those per-output values.
 
-## Value-layer `Output`
+## Value-layer `ValueOutput`
 
-At the [value](../runtime/values.md) layer each output is an `Output{ name: InternId, out_path: InternId }` — both [interned](../runtime/interning.md) strings. In the built value every output appears **twice**: once as a **direct attr** (`drv.out`, `drv.bin`) and once as an element of the **`all` list**. `drvPath` and every `outPath` are [context strings](./context.md), not plain strings: `drvPath`'s context maps the `.drv` path → `{ allOutputs = true }`; each `outPath`'s context maps the `.drv` path → `{ outputs = [ <thisOutput> ]; }`. That embedded context is exactly what makes a *consuming* derivation record this one as an input.
+At the [value](../runtime/values.md) layer each output is a `ValueOutput{ name: InternId, out_path: InternId }` — both [interned](../runtime/interning.md) strings. In the built value every output appears **twice**: once as a **direct attr** (`drv.out`, `drv.bin`) and once as an element of the **`all` list**. `drvPath` and every `outPath` are [context strings](./context.md), not plain strings: `drvPath`'s context maps the `.drv` path → `{ allOutputs = true }`; each `outPath`'s context maps the `.drv` path → `{ outputs = [ <thisOutput> ]; }`. That embedded context is exactly what makes a *consuming* derivation record this one as an input.
 
 Code: `src/nix/derivation/`

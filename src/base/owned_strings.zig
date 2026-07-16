@@ -15,8 +15,8 @@ pub fn clone(allocator: std.mem.Allocator, strings: []const []const u8) ![][]u8 
     return result;
 }
 
-/// Accept both mutable (`[][]u8`) and const-qualified owned slice views.
-pub fn free(allocator: std.mem.Allocator, strings: anytype) void {
+/// Free a deeply-owned slice; mutable slice views coerce to this read-only view.
+pub fn free(allocator: std.mem.Allocator, strings: []const []const u8) void {
     for (strings) |string| allocator.free(string);
     allocator.free(strings);
 }

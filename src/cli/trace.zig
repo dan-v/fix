@@ -4,12 +4,12 @@
 //!   diff  A B    walk two traces in lockstep, report first divergence
 //!   dump  PATH   pretty-print a binary trace as the text format
 //!
-//! Binary trace format is defined in src/vm/trace_log.zig and emitted
+//! Binary trace format is defined in src/nix/vm/trace_log.zig and emitted
 //! by `--vm-trace --vm-trace-format=binary`.
 
 const std = @import("std");
 const engine = @import("nix");
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
 const bytecode = engine.bytecode;
 const trace_log = engine.vm.trace_log;
 
@@ -54,8 +54,8 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         };
         return runDump(init, path);
     }
-    if (cli.isHelpFlag(sub)) {
-        cli.printHelp(init.io, usage);
+    if (presentation.isHelpFlag(sub)) {
+        presentation.printHelp(init.io, usage);
         return 0;
     }
     std.debug.print("error: unknown subcommand '{s}'\n\n{s}", .{ sub, usage });

@@ -6,12 +6,13 @@
 
 const std = @import("std");
 const engine = @import("nix");
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
 const eval = engine.eval;
 const bytecode = engine.bytecode;
 const builtin = @import("builtin");
 
 const Evaluator = eval.Evaluator;
+const SchedulerStats = engine.scheduler.Scheduler.Stats;
 
 const usage =
     \\usage: fix inspect [options] (-e <expression> | --file <path>)
@@ -39,7 +40,7 @@ const Options = struct {
 pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const options = parseOptions(args_iter) catch |err| switch (err) {
         error.Help => {
-            cli.printHelp(init.io, usage);
+            presentation.printHelp(init.io, usage);
             return 0;
         },
         else => {
@@ -234,7 +235,7 @@ fn percentUsize(part: usize, whole: usize) f64 {
     return @as(f64, @floatFromInt(part)) * 100.0 / @as(f64, @floatFromInt(whole));
 }
 
-fn writeSchedulerStats(writer: *std.Io.Writer, workers: u8, s: anytype) !void {
+fn writeSchedulerStats(writer: *std.Io.Writer, workers: u8, s: SchedulerStats) !void {
     try writer.writeAll("\nscheduler\n");
     try writer.print("  workers:          {d}\n", .{workers});
     if (workers <= 1) {

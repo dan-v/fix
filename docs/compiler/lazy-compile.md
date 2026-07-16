@@ -24,16 +24,16 @@ Some Nix files are enormous machine-generated attrsets (e.g. `hackage-packages.n
 | Gate | Constant | Why |
 | --- | --- | --- |
 | file / import scope | `source_path != null` | need retained source + AST arena to recompile later |
-| ≥ 64 entries | `MIN_ENTRIES = 64` | coarse pre-filter; skip the snapshot machinery for small sets |
-| body span ≥ 100 bytes | `MIN_BODY_BYTES = 100` | **the real lever** — defer only when the compile cost beats the deferral bookkeeping |
-| ≤ 32 snapshot entries | `MAX_SCOPE = 32` | snapshot must stay small (lexical bindings + active `with` subjects; perl-packages.nix needs ~16) |
+| ≥ 64 entries | `min_entries = 64` | coarse pre-filter; skip the snapshot machinery for small sets |
+| body span ≥ 100 bytes | `min_body_bytes = 100` | **the real lever** — defer only when the compile cost beats the deferral bookkeeping |
+| ≤ 32 snapshot entries | `max_scope_size = 32` | snapshot must stay small (lexical bindings + active `with` subjects; perl-packages.nix needs ~16) |
 | deferrable leaves | — | value bodies must be recompilable in isolation |
 
 ### Mechanism
 
 At compile time, for a deferring set:
 
-1. **Snapshot the enclosing scope** — capture the ancestor bindings visible to the value bodies, each resolved to a `.local` slot or `.upvalue` index, then the subject values of the active `with` scopes (innermost-first, via `collectWithScopes` — the same capture plumbing a with-lookup uses), all capped at `MAX_SCOPE`. The entry records how many trailing snapshot slots are with-subjects (`with_count`).
+1. **Snapshot the enclosing scope** — capture the ancestor bindings visible to the value bodies, each resolved to a `.local` slot or `.upvalue` index, then the subject values of the active `with` scopes (innermost-first, via `collectWithScopes` — the same capture plumbing a with-lookup uses), all capped at `max_scope_size`. The entry records how many trailing snapshot slots are with-subjects (`with_count`).
 2. **Register an `Entry` per leaf** — the value's AST node + that scope snapshot, into the deferred table (keyed by a table id). The snapshot is **adopted once** (`adoptScope`) and shared by every entry of the set, and the base/source paths are content-deduped (`internPath`), so a 19k-entry generated set does not dupe 19k copies. The evaluator **retains the file's source text and AST arena** so the node stays live.
 3. **Emit `thunk_defer`** — carrying the table id + an environment descriptor array (the snapshot, as [capture descriptors](scopes.md)). The attrset is built with these as deferred thunks.
 
@@ -85,7 +85,7 @@ When such a body would be wrapped at a `thunk` site, the compiler instead **push
 
 ### Keeping the speculation threshold calibrated
 
-Emit-time super-op fusion (see [pipeline.md](pipeline.md)) shrinks a body's encoding, which would make it look *smaller* than it is to the [speculation](../parallel/speculation.md) size gate. The `*_get_attr` and `thunk*_st(_cell)` rewrites each add their saved byte to **`ChunkBuilder.fusion_savings`** (string-interpolation lowering adjusts it too); `fusion_savings` is added back to `code.len` when computing `body_is_substantial`, so `SPECULATION_MIN_CODE_BYTES` measures the *pre-fusion* body size and fusion never silently changes which bodies are deemed substantial enough to speculate. The `<op>_ret` rewrite that produces the trivial shapes above is not recorded — those bodies are a handful of bytes and never approach the 256-byte threshold anyway.
+Emit-time super-op fusion (see [pipeline.md](pipeline.md)) shrinks a body's encoding, which would make it look *smaller* than it is to the [speculation](../parallel/speculation.md) size gate. The `*_get_attr` and `thunk*_st(_cell)` rewrites each add their saved byte to **`ChunkBuilder.fusion_savings`** (string-interpolation lowering adjusts it too); `fusion_savings` is added back to `code.len` when computing `body_is_substantial`, so `speculation_min_code_bytes` measures the *pre-fusion* body size and fusion never silently changes which bodies are deemed substantial enough to speculate. The `<op>_ret` rewrite that produces the trivial shapes above is not recorded — those bodies are a handful of bytes and never approach the 256-byte threshold anyway.
 
 ---
 

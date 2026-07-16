@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const engine = @import("nix");
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
 const syntax = engine.syntax;
 
 const DebugSession = engine.DebugSession;
@@ -94,7 +94,7 @@ pub const Console = struct {
                 defer out.interface.flush() catch {};
                 try self.style(&out.interface, .note_label);
                 try out.interface.writeAll("(debug) ");
-                try cli.reset(&out.interface, self.use_color);
+                try presentation.reset(&out.interface, self.use_color);
             }
             const raw = in.interface.takeDelimiter('\n') catch |err| switch (err) {
                 error.StreamTooLong => {
@@ -191,7 +191,7 @@ pub const Console = struct {
             .eval_error => "error",
         };
         try w.print("\n-- debugger ({s}) --", .{reason});
-        try cli.reset(w, self.use_color);
+        try presentation.reset(w, self.use_color);
         try w.writeByte('\n');
         if (s.currentFrame()) |f| {
             try self.writeFrameLine(w, s, 0, s.frameCount() - 1, true);
@@ -228,11 +228,11 @@ pub const Console = struct {
         try self.style(w, .dim);
         var i: usize = 0;
         while (i < col) : (i += 1) try w.writeByte(' ');
-        try cli.reset(w, self.use_color);
+        try presentation.reset(w, self.use_color);
         try self.style(w, .note_label);
         i = 0;
         while (i < len) : (i += 1) try w.writeByte('^');
-        try cli.reset(w, self.use_color);
+        try presentation.reset(w, self.use_color);
         try w.writeByte('\n');
         if (after) |a| try self.snippetLine(w, text[a.start..a.end], f.line + 1, false);
     }
@@ -240,7 +240,7 @@ pub const Console = struct {
     fn snippetLine(self: *Console, w: *std.Io.Writer, line: []const u8, line_no: u32, current: bool) !void {
         try self.style(w, .dim);
         try w.print("{d: >5} {s} ", .{ line_no, if (current) "▶" else "┆" });
-        try cli.reset(w, self.use_color);
+        try presentation.reset(w, self.use_color);
         try self.highlightLine(w, line);
         try w.writeByte('\n');
     }
@@ -297,7 +297,7 @@ pub const Console = struct {
         if (current) {
             try self.style(w, .note_label);
             try w.writeAll("→ ");
-            try cli.reset(w, self.use_color);
+            try presentation.reset(w, self.use_color);
         }
         try self.style(w, .path);
         if (f.file) |file| {
@@ -305,14 +305,14 @@ pub const Console = struct {
         } else {
             try w.writeAll("<no source>");
         }
-        try cli.reset(w, self.use_color);
+        try presentation.reset(w, self.use_color);
         if (f.line != 0) try w.print(":{d}:{d}", .{ f.line, f.column });
         // Always-on qualified name (`pkgs.hello`), from the name tree.
         if (s.hasFrameName(frame_idx)) {
             try w.writeAll(" ");
             try self.style(w, .name);
             try s.writeFrameName(w, frame_idx);
-            try cli.reset(w, self.use_color);
+            try presentation.reset(w, self.use_color);
         }
         try w.print("  (chunk #{d})\n", .{f.chunk_id});
     }
@@ -370,7 +370,7 @@ pub const Console = struct {
         try w.print("#{d} ", .{depth});
         if (s.hasFrameName(idx)) try s.writeFrameName(w, idx) else try w.writeAll("<anon>");
         try w.writeAll(":\n");
-        try cli.reset(w, self.use_color);
+        try presentation.reset(w, self.use_color);
     }
 
     fn armStep(self: *Console, s: *DebugSession, kind: DebugSession.StepKind) !void {
@@ -439,7 +439,7 @@ pub const Console = struct {
         self.renderTo(w, s, v) catch |e| {
             try self.style(w, .error_label);
             try w.writeAll("error");
-            try cli.reset(w, self.use_color);
+            try presentation.reset(w, self.use_color);
             try w.print(": {s}\n", .{@errorName(e)});
             return;
         };
@@ -482,8 +482,8 @@ pub const Console = struct {
 
     // -- small helpers ----------------------------------------------------------
 
-    fn style(self: *Console, w: *std.Io.Writer, which: cli.Style) !void {
-        try cli.style(w, self.use_color, which);
+    fn style(self: *Console, w: *std.Io.Writer, which: presentation.Style) !void {
+        try presentation.style(w, self.use_color, which);
     }
 
     fn note(self: *Console, comptime fmt: []const u8, fmt_args: anytype) !void {
@@ -498,7 +498,7 @@ pub const Console = struct {
         const w = &out.interface;
         try self.style(w, .error_label);
         try w.writeAll("error");
-        try cli.reset(w, self.use_color);
+        try presentation.reset(w, self.use_color);
         try w.print(": " ++ fmt ++ "\n", fmt_args);
     }
 };

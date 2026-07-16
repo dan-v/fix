@@ -6,7 +6,7 @@ const std = @import("std");
 // (`forceThunk`, `forceThunkFallible`, `forceValueSpeculative`, `forceDeep`)
 // only runs meaningfully behind a full bytecode-compiled evaluation, so
 // these tests drive it through `Evaluator.evaluate`/`forceDeep`, matching
-// the rest of the eval-level test suite (see src/eval/tests/core.zig).
+// the rest of the eval-level test suite (see src/nix/eval/tests/core.zig).
 
 const Evaluator = @import("../../eval.zig").Evaluator;
 

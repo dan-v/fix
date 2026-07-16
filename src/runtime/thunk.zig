@@ -204,7 +204,7 @@ pub const ForceOutcome = union(enum) {
 /// same instant — a thunk reads `target` to compute its value, then
 /// overwrites the same bytes with `result` at resolution — so they
 /// share storage, keeping the (millions-live, cache-bound) Thunk small.
-/// `future.state` is the discriminant. `demanded` (inside `future`)
+/// `future.state` is the discriminant. `demanded` (on this thunk)
 /// distinguishes a real observation from speculative pre-forcing so
 /// lazy renderers can keep speculation invisible.
 pub const Thunk = struct {

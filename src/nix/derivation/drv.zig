@@ -129,7 +129,15 @@ pub const Drv = struct {
     }
 
     pub fn toATerm(self: *const Drv, allocator: std.mem.Allocator, mask_outputs: bool, actual_inputs: ?[]const DrvInput) ![]u8 {
-        return aterm.toATerm(self, allocator, mask_outputs, actual_inputs);
+        return aterm.toATerm(.{
+            .outputs = self.outputs,
+            .input_drvs = self.input_drvs,
+            .input_srcs = self.input_srcs,
+            .system = self.system,
+            .builder = self.builder,
+            .args = self.args,
+            .env = self.env,
+        }, allocator, mask_outputs, actual_inputs);
     }
 
     pub fn isFixedOutput(self: *const Drv) bool {

@@ -6,7 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const engine = @import("nix");
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
 const rstore = engine.host.store;
@@ -120,8 +120,8 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     try ev.setBasePathFromCurrentPath(init.io);
     try applyNixPath(ev, init, options);
 
-    const use_color = cli.shouldColor(options.color, init.io, init.environ_map);
-    const show_progress = cli.shouldProgress(options.progress, init.io, init.environ_map);
+    const use_color = presentation.shouldColor(options.color, init.io, init.environ_map);
+    const show_progress = presentation.shouldProgress(options.progress, init.io, init.environ_map);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
     return .{ .use_color = use_color, .show_progress = show_progress };
 }

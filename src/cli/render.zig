@@ -1,7 +1,7 @@
 //! Rendering of evaluation errors and trace frames to stderr.
 
 const std = @import("std");
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
 const diagnostic = @import("nix").diagnostic;
 const eval = @import("nix").eval;
 const Evaluator = eval.Evaluator;
@@ -21,7 +21,7 @@ pub fn evalFailure(
 ) !void {
     if (ev.getDiagnostics().len > 0) {
         var stderr_buffer: [4096]u8 = undefined;
-        var stderr = try cli.lockStderr(io, &stderr_buffer);
+        var stderr = try presentation.lockStderr(io, &stderr_buffer);
         defer stderr.deinit();
         try diagnostic.writeAllWithOptions(stderr.writer(), source, ev.getDiagnostics(), .{ .color = use_color });
         try stderr.flush();
@@ -32,14 +32,14 @@ pub fn evalFailure(
 
 pub fn evaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !void {
     var stderr_buffer: [4096]u8 = undefined;
-    var stderr = try cli.lockStderr(io, &stderr_buffer);
+    var stderr = try presentation.lockStderr(io, &stderr_buffer);
     defer stderr.deinit();
     const writer = stderr.writer();
     const trace = ev.getTrace();
 
-    try cli.style(writer, use_color, .error_label);
+    try presentation.style(writer, use_color, .error_label);
     try writer.writeAll("error");
-    try cli.reset(writer, use_color);
+    try presentation.reset(writer, use_color);
     if (err == error.DaemonError) {
         // An import-from-derivation build (or other on-demand store op) failed;
         // surface the daemon's own message, which the trace does not carry.
@@ -64,9 +64,9 @@ fn writeTraceFrames(
 ) !void {
     if (frames.len == 0) return;
 
-    try cli.style(writer, use_color, .dim);
+    try presentation.style(writer, use_color, .dim);
     try writer.writeAll("\ntrace:\n");
-    try cli.reset(writer, use_color);
+    try presentation.reset(writer, use_color);
 
     if (show_trace or frames.len <= default_trace_limit) {
         for (frames) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
@@ -77,9 +77,9 @@ fn writeTraceFrames(
     const tail_count = default_trace_limit - head_count;
     for (frames[0..head_count]) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
 
-    try cli.style(writer, use_color, .dim);
+    try presentation.style(writer, use_color, .dim);
     try writer.print("  ... {d} frames omitted; use --show-trace to show all\n", .{frames.len - default_trace_limit});
-    try cli.reset(writer, use_color);
+    try presentation.reset(writer, use_color);
 
     for (frames[frames.len - tail_count ..]) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
 }
@@ -99,9 +99,9 @@ fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Evaluator, sour
     }
 
     try writer.writeAll("  ");
-    try cli.style(writer, use_color, .trace_label);
+    try presentation.style(writer, use_color, .trace_label);
     try writer.writeAll("while evaluating");
-    try cli.reset(writer, use_color);
+    try presentation.reset(writer, use_color);
     try writer.print(": {s}\n", .{frame.message});
 }
 

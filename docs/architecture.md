@@ -56,7 +56,7 @@ src/main.zig       → nix, cli
 
 `base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and `nix` supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
 
-Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler` lowers the AST onto `bytecode`; `vm` is the execution core; `root.zig` composes it into the `Evaluator` and is the facade visible to the CLI. Language semantics do not import concrete host effects. Realization may use the host, the VM may compose both, and command code cannot reach around the `nix` boundary. What could look like an `Evaluator`/VM cycle is avoided by placement: deferred-body compilation calls from `vm` into `compiler`, while the fiber worker that drives forcing lives inside `vm` next to the force path. See [build](build.md).
+Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `eval.zig` composes those services into `Evaluator`. `root.zig` is the narrow facade visible to the CLI. Language semantics do not import concrete host effects. Realization may use the host, the VM may compose both, and command code cannot reach around the `nix` boundary. Deferred-body compilation calls from `vm` into `compiler`, while the fiber worker that drives forcing lives inside `vm` next to the force path. See [build](build.md).
 
 ## Laziness and parallelism are one primitive
 

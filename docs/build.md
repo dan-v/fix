@@ -51,7 +51,7 @@ The threaded VM dispatcher (`src/nix/vm/run.zig`) chains handlers with `@call(.a
 
 ## Group test wiring
 
-`zig build test` (aliased by `check`) runs one test artifact for each durable group:
+`zig build test` runs one test artifact for each durable group. `zig build check` runs that suite plus `zig fmt --check` over `build.zig`, `src/`, and `tools/`:
 
 ```
 test → base_tests, syntax_tests, runtime_tests, nix_tests, cli_tests

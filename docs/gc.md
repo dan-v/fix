@@ -27,7 +27,7 @@ Collections are **minor** and young-gated: each minor examines only the objects 
 
 ## Root set
 
-Marking starts from every place a live ObjectId can be reached without going through the heap (`markRoots` in `src/nix/eval/gc.zig`):
+Marking starts from every place a live ObjectId can be reached without going through the heap (`markRoots` in `src/nix/eval/gc_controller.zig`):
 
 ```
 Root set (all must be enumerated — precise):
@@ -64,8 +64,8 @@ Root set (all must be enumerated — precise):
 
 ## Safepoints
 
-- Collections fire **only** at the `forceThunk` safepoint, and **only at native-depth 0** (no builtin mid-flight holding un-rooted temporaries), when the reserved-bytes threshold is crossed.
-- On collection the **`heap` token is bumped**, which invalidates thread-local caches and the thread-local [thunk-result memo](runtime/thunks.md): they hold Values weakly (not roots), so a fresh token makes every stale ObjectId-keyed slot miss rather than read a reused id. This is why those caches needn't be traced.
+- Collections fire at the `forceThunk` safepoint when the reserved-byte threshold is crossed. The coordinating fiber may enter at any native depth because builtin temporaries follow the explicit-root discipline; peer fibers park only at native-depth-zero boundaries before assisting the collection.
+- Current-token thunk-memo and attr-cache entries are roots because they can momentarily be the sole reference to a shared value. After collection the **heap token is bumped**, making every old cache slot miss before a recycled ObjectId can be read as the prior value.
 
 ## Single-owner range invariant
 
@@ -96,4 +96,4 @@ At `--workers=1` a minor is serial on the lone mutator. At `--workers>1` every l
 - **`FIX_GC_NOREUSE`** (skip free-list reuse; validate the reuse path) and **`FIX_GC_PAR_CAP`** (mark/evac participant cap) are validation/tuning knobs.
 - **`--gc-report`** dumps the per-run collection report (pauses, promoted/freed, live vs reserved breakdown) to stderr.
 
-Code: `src/runtime/gc.zig` (the precise `Tracer` / marker), `src/runtime/heap/gc.zig` (collector driver: arm / evac / sweep / threshold), `src/nix/eval/gc.zig` (root enumeration, stop-the-world glue, budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).
+Code: `src/runtime/gc.zig` (the precise serial/parallel marker and metrics), `src/runtime/heap/collector.zig` (arming, evacuation, sweep, and threshold policy), and `src/nix/eval/gc_controller.zig` (root enumeration, stop-the-world integration, and budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).

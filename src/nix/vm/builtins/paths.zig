@@ -4,6 +4,7 @@
 const std = @import("std");
 const VM = @import("../context.zig").VM;
 const Value = @import("runtime").value.Value;
+const ObjectId = @import("runtime").types.ObjectId;
 const file_cache = @import("../../host.zig").file_cache;
 const derivation = @import("../../derivation.zig");
 const nar = @import("../../host.zig").nar;
@@ -72,7 +73,7 @@ pub fn builtinStorePath(self: *VM, arg: Value) !Value {
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
-fn optionalAttr(self: *VM, attrs_id: anytype, name: []const u8) !Value {
+fn optionalAttr(self: *VM, attrs_id: ObjectId, name: []const u8) !Value {
     const id = try self.intern.intern(name);
     return self.heap.getAttrValue(attrs_id, id) catch |err| switch (err) {
         error.MissingAttribute => Value.null_val,

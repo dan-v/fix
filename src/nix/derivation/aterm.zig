@@ -7,6 +7,18 @@ const sort = @import("sort.zig");
 const types = @import("types.zig");
 
 const DrvInput = types.DrvInput;
+const DrvOutput = types.DrvOutput;
+const EnvVar = types.EnvVar;
+
+pub const DrvView = struct {
+    outputs: []const DrvOutput,
+    input_drvs: []const DrvInput,
+    input_srcs: []const []const u8,
+    system: []const u8,
+    builder: []const u8,
+    args: []const []const u8,
+    env: []const EnvVar,
+};
 
 // SIMD find-first escape byte: derivation env values (build scripts, PATH
 // lists, dependency closures) are long runs of escape-free bytes, so jump
@@ -41,7 +53,7 @@ inline fn nextEscape(string: []const u8, start: usize) usize {
     return i;
 }
 
-pub fn toATerm(drv: anytype, allocator: std.mem.Allocator, mask_outputs: bool, actual_inputs: ?[]const DrvInput) ![]u8 {
+pub fn toATerm(drv: DrvView, allocator: std.mem.Allocator, mask_outputs: bool, actual_inputs: ?[]const DrvInput) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -108,7 +120,7 @@ pub fn toATerm(drv: anytype, allocator: std.mem.Allocator, mask_outputs: bool, a
     return out.toOwnedSlice(allocator);
 }
 
-fn hasOutput(outputs: anytype, name: []const u8) bool {
+fn hasOutput(outputs: []const DrvOutput, name: []const u8) bool {
     for (outputs) |output| {
         if (std.mem.eql(u8, output.name, name)) return true;
     }

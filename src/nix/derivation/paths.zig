@@ -58,7 +58,7 @@ fn textStorePath(
     store_dir: []const u8,
     name: []const u8,
     text: []const u8,
-    refs: anytype,
+    refs: []const []const u8,
 ) ![]u8 {
     const digest = try sha256Hex(allocator, text);
     defer allocator.free(digest);

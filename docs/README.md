@@ -60,4 +60,4 @@
 
 - Docs describe **the system** — mechanisms, data flow, invariants, and the *why* — not the text of specific `.zig` files. Each doc ends with a `Code:` pointer to its area.
 - The **interpreter is the sole engine and is canonical**; collection and diagnostic probes never change output. Byte-identical `.drv` is the ground truth for correctness.
-- Historical plans and the living A/B performance log are in [`plans/`](plans/) — design intent and status, kept separate from these system docs.
+- Historical implementation plans are in [`superpowers/plans/`](superpowers/plans/) — design intent and point-in-time status, kept separate from these maintained system docs.

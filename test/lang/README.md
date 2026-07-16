@@ -77,7 +77,7 @@ pin bump that changes an inventory count or adds an unrecognised case fails thes
   `eval-fail` error text is not compared either — the Lix side asserts `rc == 1`,
   the snix side matches the declared error *kind* by substring with `rc == 1`.
 - `-A` / `--arg` wrap the source, so those cases lose exact source positions (see
-  `src/cli/run.zig`); they still compare values.
+  `src/cli/eval_support.zig`); they still compare values.
 
 [lix]: https://git.lix.systems/lix-project/lix
 [snix]: https://git.snix.dev/snix/snix

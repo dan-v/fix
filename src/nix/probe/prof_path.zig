@@ -46,6 +46,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const BuiltinId = @import("runtime").builtins.BuiltinId;
+const InternTable = @import("runtime").intern.InternTable;
+const ChunkRegistry = @import("../bytecode.zig").chunk.ChunkRegistry;
 const worker_id = @import("base").worker_id;
 
 pub const enabled: bool = build_options.prof_path and builtin.cpu.arch == .x86_64;
@@ -163,9 +165,7 @@ pub inline fn exit(token: usize) void {
 const Agg = struct { self_cy: u64 = 0, total_cy: u64 = 0, calls: u64 = 0 };
 
 /// Print the critical path and a flat source-attributed profile.
-/// `registry` must expose `get(ChunkId) ?*const Chunk`; `intern`
-/// must expose `get(InternId) []const u8`.
-pub fn report(registry: anytype, intern: anytype) void {
+pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
     if (!enabled) return;
     const w = std.debug;
     if (records.items.len == 0) {
@@ -231,7 +231,7 @@ pub fn report(registry: anytype, intern: anytype) void {
 
 var name_scratch: [512]u8 = undefined;
 
-pub fn locName(registry: anytype, intern: anytype, key: u32) []const u8 {
+pub fn locName(registry: *const ChunkRegistry, intern: *const InternTable, key: u32) []const u8 {
     if (key == pass_through_key) return "<pass_through cell>";
     if (key == other_key) return "<other>";
     if (key >= builtin_key_base) {

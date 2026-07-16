@@ -20,7 +20,7 @@ Closures are **immutable**: `closure`/`closure_captures` snapshot the upvalue *v
 
 ## Currying and uncurrying
 
-Nix lambdas are curried (`a: b: c: …`). Naively each `:` is its own one-arg closure, so `f 1 2 3` allocates two intermediate closures. The compiler instead **merges an adjacent value-lambda chain into one uncurried chunk** with `arity = N` (capped at `MAX_UNCURRY_ARITY` = 4; see [compiler/scopes.md](../compiler/scopes.md)). Such a chunk consumes N params in a **single frame**.
+Nix lambdas are curried (`a: b: c: …`). Naively each `:` is its own one-arg closure, so `f 1 2 3` allocates two intermediate closures. The compiler instead **merges an adjacent value-lambda chain into one uncurried chunk** with `arity = N` (capped at `max_uncurry_arity` = 4; see [compiler/scopes.md](../compiler/scopes.md)). Such a chunk consumes N params in a **single frame**.
 
 Application against an uncurried chunk has three cases:
 

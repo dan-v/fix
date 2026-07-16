@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const store = @import("nix").host.store;
-const EvalProgress = @import("cli.zig").EvalProgress;
+const EvalProgress = @import("progress.zig").EvalProgress;
 
 pub const BuildProgress = struct {
     progress: *EvalProgress,

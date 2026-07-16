@@ -493,7 +493,7 @@ fn listFromJson(self: *VM, values: []const std.json.Value) !Value {
     return Value.list(try self.heap.addList(items));
 }
 
-fn attrsFromJson(self: *VM, object: anytype) !Value {
+fn attrsFromJson(self: *VM, object: std.json.ObjectMap) !Value {
     const entries = try self.allocator.alloc(heap_mod.AttrEntry, object.count());
     defer self.allocator.free(entries);
 

@@ -9,7 +9,7 @@
 const std = @import("std");
 const engine = @import("nix");
 const bytecode = engine.bytecode;
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const runner = @import("eval_support.zig");
@@ -76,7 +76,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     const use_color = switch (options.color) {
         .always => true,
         .never => false,
-        .auto => cli.autoColor(stdout_tty, init.environ_map),
+        .auto => presentation.autoColor(stdout_tty, init.environ_map),
     };
 
     const source = runner.getSource(&ev, source_arg, options) catch |err| {

@@ -4,7 +4,7 @@
 
 ## Mental model
 
-A builtin is a native Zig function reachable from Nix as a `BuiltinId`-tagged value. The compiler emits references to builtins by id, not by name; the VM applies them through a single enum-indexed switch. Builtins are the leaves of evaluation — they consume already-forced (or force-on-demand) [values](../runtime/values.md), do native work (arithmetic, string coercion, I/O, hashing, [derivation](../derivation/model.md) assembly), and return a value or a thunk. Everything a builtin can touch — allocator, [heap](../runtime/heap.md), [interner](../runtime/interning.md), derivations store, [worker pool](../parallel/workers.md) — comes from the closed-over evaluator `self`.
+A builtin is a native Zig function reachable from Nix as a `BuiltinId`-tagged value. The compiler emits references to builtins by id, not by name; the VM applies them through a single enum-indexed switch. Builtins are the leaves of evaluation — they consume already-forced (or force-on-demand) [values](../runtime/values.md), do native work (arithmetic, string coercion, I/O, hashing, [derivation](../derivation/model.md) assembly), and return a value or a thunk. Each builtin takes a concrete `*VM`; the VM context carries the allocator, [heap](../runtime/heap.md), [interner](../runtime/interning.md), realization services, and scheduler interfaces it may use.
 
 ## Dispatch
 

@@ -658,12 +658,12 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     // GC safepoint. forceThunk is a clean unit
     // boundary; collect here, never mid-allocation. The value being forced
     // may be off the VM stack (passed by value), so root it explicitly
-    // across the collection. See docs/plans/gc-plan.md.
+    // across the collection. See docs/gc.md.
     {
         // Peer stop-the-world response (w>1): only park at native depth 0,
         // where this fiber holds no builtin Zig locals a peer collector would
-        // need but can't precisely see. (The w>1 collector is dormant today;
-        // see Evaluator.ensureMainWorker.)
+        // need but can't precisely see. The collection coordinator waits for
+        // every peer to reach one of these safe native-depth-zero boundaries.
         if (self.native_depth == 0 and self.scheduler.gcStopRequested()) {
             self.gc_extra_root = thunk_val;
             self.scheduler.gcSafepointPark(self.workerId());
@@ -676,7 +676,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
         // Fires at ANY native depth (the RSS lever). Correctness rests on the
         // precise root discipline: eval-VM registration, arg/call rooting, the
         // in-flight force chain, and container temp-roots in force-walking
-        // native fns. Audit in progress (see force.zig root helpers).
+        // native functions; see the root inventory in `docs/gc.md`.
         if (demand and self.heap.gcCollectRequested()) {
             self.gc_extra_root = thunk_val;
             if (self.scheduler.gcTryBeginCollection()) {
@@ -745,7 +745,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // never-needed) body to completion, abandon it at this safe
                 // checkpoint and reset the thunk so a later real demand
                 // recomputes it. Bounds the cost of a single wrong
-                // speculative guess (see docs/plans/parallel-redesign-plan.md).
+                // speculative guess (see docs/perf/probes.md).
                 // Speculative path only — demand never bails — and the
                 // atomic load is off the resolved fast path.
                 // A rescued fiber (`FIX_RESCUE`) is on a demand fiber's critical
@@ -827,7 +827,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // its body runs, and `thunk_val` is dead here (only `thunk_id`
                 // + the raw pointer remain), so the conservative scan can't
                 // see it — the per-VM force chain is load-bearing. The tracer
-                // follows an `.evaluating` thunk's target. See docs/plans/gc-plan.md.
+                // follows an `.evaluating` thunk's target. See docs/gc.md.
                 //
                 // DORMANT GATE (the GC-default rooting tax): skip this push/pop
                 // entirely while rooting is DORMANT (`gc_root_active == false`).

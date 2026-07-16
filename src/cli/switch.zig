@@ -25,7 +25,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const engine = @import("nix");
-const cli = @import("cli.zig");
+const realization_workflow = @import("realize.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const eval_support = @import("eval_support.zig");
@@ -171,7 +171,7 @@ fn buildAndSwitch(allocator: std.mem.Allocator, init: std.process.Init, target: 
 
     ev.enableStoreWrites();
 
-    const realized = switch (try cli.realize(allocator, init.io, &ev, term, options.*, source_arg, source, false)) {
+    const realized = switch (try realization_workflow.realize(allocator, init.io, &ev, term, options.*, source_arg, source, false)) {
         .failed => |code| return code,
         .ok => |r| r,
     };

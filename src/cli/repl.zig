@@ -18,7 +18,8 @@
 //! not accrete across evaluations.
 
 const std = @import("std");
-const cli = @import("cli.zig");
+const presentation = @import("presentation.zig");
+const progress_ui = @import("progress.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const debugger = @import("debugger.zig");
@@ -93,7 +94,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         console.install(&ev);
     }
 
-    var progress = cli.EvalProgress.init(init.io, term.show_progress);
+    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
     var repl_ok = false;
     defer progress.deinit(repl_ok);
     if (term.show_progress) ev.setProgressSink(progress.sink());
@@ -231,9 +232,9 @@ const Repl = struct {
         if (!hint_off) {
             var out = self.stdout();
             defer out.interface.flush() catch {};
-            try cli.style(&out.interface, self.use_color, .dim);
+            try presentation.style(&out.interface, self.use_color, .dim);
             try out.interface.writeAll("fix repl — :? for help, :q or Ctrl-D to quit\n");
-            try cli.reset(&out.interface, self.use_color);
+            try presentation.reset(&out.interface, self.use_color);
         }
 
         self.history.open(self.io, env);
@@ -291,7 +292,7 @@ const Repl = struct {
             self.allocator,
             term_mod.size().cols,
             self.use_color,
-            cli.styleCode(true, .trace_label),
+            presentation.styleCode(true, .trace_label),
         );
         defer renderer.deinit();
 
@@ -499,9 +500,9 @@ const Repl = struct {
                 } else {
                     var it = self.bindings.iterator();
                     while (it.next()) |e| {
-                        try cli.style(&out.interface, self.use_color, .name);
+                        try presentation.style(&out.interface, self.use_color, .name);
                         try out.interface.writeAll(e.key_ptr.*);
-                        try cli.reset(&out.interface, self.use_color);
+                        try presentation.reset(&out.interface, self.use_color);
                         try out.interface.writeAll(" : ");
                         try self.describeType(&out.interface, e.value_ptr.*);
                         try out.interface.writeByte('\n');
@@ -781,12 +782,12 @@ const Repl = struct {
 
     fn printError(self: *Repl, comptime fmt: []const u8, fmt_args: anytype) !void {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr = try cli.lockStderr(self.io, &stderr_buffer);
+        var stderr = try presentation.lockStderr(self.io, &stderr_buffer);
         defer stderr.deinit();
         const w = stderr.writer();
-        try cli.style(w, self.use_color, .error_label);
+        try presentation.style(w, self.use_color, .error_label);
         try w.writeAll("error");
-        try cli.reset(w, self.use_color);
+        try presentation.reset(w, self.use_color);
         try w.print(": " ++ fmt ++ "\n", fmt_args);
         try stderr.flush();
     }

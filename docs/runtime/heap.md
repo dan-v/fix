@@ -12,7 +12,7 @@ Every non-immediate [`Value`](values.md) refers to a boxed runtime object by **`
 
 ## The object store: `FlatStore`
 
-The `objects` store is a `FlatStore` — a single `mmap` region, **not** geometric segments. `OBJECT_MAX_SLOTS = 2^30` slots are reserved virtually with `MAP_NORESERVE`; only touched pages cost physical memory (the ~6M objects a NixOS toplevel produces sit against that reservation for free). The base pointer is immutable after init, so `get(id)` collapses to one load — `base[id]` — with no segment decode and no per-access atomic. This access happens tens of millions of times on the NixOS toplevel, which is why the object store forgoes the segment machinery the range stores use. Allocation is still per-worker TLAB'd (workers reserve chunks of the flat region and fill them lock-free); the flat single-region layout is only about the `get` path, not about how slots are handed out. The `builtins.builtins` self-reference reserves its slot up front (`reserveObjectSlot` → `fillObjectSlot`) so it can embed its own id before the object is filled.
+The `objects` store is a `FlatStore` — a single `mmap` region, **not** geometric segments. `object_max_slots = 2^30` slots are reserved virtually with `MAP_NORESERVE`; only touched pages cost physical memory (the ~6M objects a NixOS toplevel produces sit against that reservation for free). The base pointer is immutable after init, so `get(id)` collapses to one load — `base[id]` — with no segment decode and no per-access atomic. This access happens tens of millions of times on the NixOS toplevel, which is why the object store forgoes the segment machinery the range stores use. Allocation is still per-worker TLAB'd (workers reserve chunks of the flat region and fill them lock-free); the flat single-region layout is only about the `get` path, not about how slots are handed out. The `builtins.builtins` self-reference reserves its slot up front (`reserveObjectSlot` → `fillObjectSlot`) so it can embed its own id before the object is filled.
 
 ## The range stores: `StableSegments`
 
@@ -53,13 +53,13 @@ An `AttrsObject` holds its `AttrEntry`s **sorted by `InternId`** (name). Lookup 
 The NixOS module/overlay fixpoints `//` a massive accumulator thousands of times; materializing each step copies the whole accumulator (O(N) per step → O(N·K), dominating the attr store). The heap instead records a large `a // b` as an **O(1) `merge_attrs` node** — just `base` + `overlay` ObjectIds + a `depth`. Mechanics:
 
 - **Lookup walks overlay-first without flattening.** `getAttrValueOpt` on a `merge_attrs` checks `overlay` then `base` (`//` is shallow, right-biased); the `(obj, name)` inline cache in the [VM](../vm/access.md) absorbs repeats. `base`/`overlay` may themselves be `merge_attrs`, forming a chain.
-- **Small merges stay eager.** Only when the left side is at least `MERGE_LAYER_MIN` (32) entries is a node created; literal `{…} // {…}` stays a flat single-binary-search attrset.
-- **Flatten is deferred and atomically memoized.** The plain flattened attrset (`flattened`, sentinel `NO_FLAT` until forced) is produced lazily on first `getAttrs`/iteration by `flattenMerge` — it collects the whole chain's leaves in precedence order and runs *one* right-biased k-way merge (`kwayMergeLeaves`), avoiding the O(depth·N) intermediates a pairwise flatten would allocate — then installs the id with a `cmpxchgStrong` so concurrent forcers converge on the CAS winner's result.
-- **Chain depth is capped.** Construction (`mergeAttrsLayered`) stops extending the chain once a node's `depth` would exceed `MERGE_FLATTEN_DEPTH` (8): it eagerly merges (`addMergedAttrs`) instead, which forces the left chain flat and collapses it, bounding both per-lookup overlay walks and the work any single flatten must do.
+- **Small merges stay eager.** Only when the left side is at least `merge_layer_min_size` (32) entries is a node created; literal `{…} // {…}` stays a flat single-binary-search attrset.
+- **Flatten is deferred and atomically memoized.** The plain flattened attrset (`flattened`, sentinel `no_flattened_attrs` until forced) is produced lazily on first `getAttrs`/iteration by `flattenMerge` — it collects the whole chain's leaves in precedence order and runs *one* right-biased k-way merge (`kwayMergeLeaves`), avoiding the O(depth·N) intermediates a pairwise flatten would allocate — then installs the id with a `cmpxchgStrong` so concurrent forcers converge on the CAS winner's result.
+- **Chain depth is capped.** Construction (`mergeAttrsLayered`) stops extending the chain once a node's `depth` would exceed `merge_flatten_depth` (8): it eagerly merges (`addMergedAttrs`) instead, which forces the left chain flat and collapses it, bounding both per-lookup overlay walks and the work any single flatten must do.
 
 ## Constants
 
-The evaluator-wide limits live in `src/runtime/types.zig`: `VM_STACK_CAP = 65536`, `MAX_FRAMES = 512`, `MAX_UNCURRY_ARITY = 4`.
+The evaluator-wide limits live in `src/runtime/types.zig`: `vm_stack_capacity = 65,536`, `max_frames = 20,000`, and `max_uncurry_arity = 4`.
 
 Out of scope: the `//` opcode's execution and inline cache → [vm/access.md](../vm/access.md); thunk internals/state machine → [thunks.md](thunks.md); the collection algorithm → [gc.md](../gc.md).
 

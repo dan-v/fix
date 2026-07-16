@@ -1,18 +1,16 @@
-//! Garbage collector. Non-moving, stop-the-world mark-sweep — see
-//! docs/plans/gc-plan.md for the architecture (and why moving / refcounting are
-//! ruled out, and why the end goal is concurrent SATB).
+//! Precise marker and collection metrics for the non-moving, generational,
+//! stop-the-world collector. See `docs/gc.md` for the architecture and root
+//! map.
 //!
 //! `fix`'s stores are append-only bump allocators, so without reclamation
 //! peak RSS tracks *total* allocation, not the *live* set. Phase 0
 //! measured ~81% of the nixos_toplevel heap is reclaimable garbage with a
-//! stable ~228 MB live plateau. This module provides the marker; the heap
-//! (heap.zig) provides the sweep + free lists; the evaluator (eval.zig)
-//! drives a collection at a forceThunk safepoint when the byte threshold
-//! is crossed. Single-threaded (`--workers=1`) for now.
+//! stable ~228 MB live plateau. This module provides serial and parallel
+//! marking; `heap/collector.zig` owns collection policy and reclamation; the
+//! evaluator enumerates roots and the VM coordinates force-boundary
+//! safepoints. At multiple workers, parked peers assist marking and evacuation.
 //!
-//! The `Tracer` is precise — it follows exactly the heap edges (the trace
-//! map in docs/plans/gc-plan.md) — and is the reusable marker for the later
-//! parallel/concurrent phases.
+//! The `Tracer` follows exactly the heap edges described in `docs/gc.md`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -413,10 +411,8 @@ pub const Tracer = struct {
         for (self.markers[0..self.marker_count]) |*m| self.stats.add(m.stats);
     }
 
-    /// Collect every currently-marked ObjectId (the live set) into a fresh
-    /// slice. For the later parallel-mark phase (partition work across
-    /// threads). Caller owns the returned memory.
-    pub fn collectLiveIds(self: *Tracer, allocator: std.mem.Allocator) ![]ObjectId {
+    /// Snapshot the marked ObjectIds for tracer tests. Caller owns the slice.
+    fn collectLiveIds(self: *Tracer, allocator: std.mem.Allocator) ![]ObjectId {
         var list: std.ArrayListUnmanaged(ObjectId) = .empty;
         errdefer list.deinit(allocator);
         try list.ensureTotalCapacity(allocator, self.stats.objects);
@@ -469,7 +465,7 @@ const SerialSink = struct {
 // `Marker`), so the mapping from each heap object to its outgoing edges — the
 // GC correctness invariant — has a single source of truth. A missed edge here
 // is a swept live object (use-after-free) at BOTH --workers=1 and --workers>1,
-// so both mark paths always agree by construction. See docs/plans/gc-plan.md.
+// so both mark paths always agree by construction. See docs/gc.md.
 
 /// Account object `id`'s slot and follow its outgoing edges via `sink`.
 fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: ObjectId) void {
@@ -547,7 +543,7 @@ pub inline fn hasObjectRef(v: Value) bool {
         v.isPartialApp();
 }
 
-// --- collection stats (global; single-threaded for now) ---
+// --- collection stats (written by the single collection coordinator) ---
 
 var collections: u64 = 0;
 var objects_freed_total: u64 = 0;
@@ -559,7 +555,7 @@ var sweep_ns_total: u64 = 0;
 /// Wall time the collector spends in the STW barrier NOT marking/sweeping:
 /// waiting for every worker to reach a safepoint (time-to-safepoint) plus the
 /// post-collection release handshake. At --workers>1 this busy-spins, so it is
-/// the dominant cost of a w>1 collection — see docs/plans/gc-parallel-mark-plan.md.
+/// the dominant cost of a w>1 collection — see docs/gc.md.
 var barrier_ns_total: u64 = 0;
 
 /// Monotonic nanosecond clock for GC timing (collector + barrier).

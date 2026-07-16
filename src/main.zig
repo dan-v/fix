@@ -93,8 +93,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    if (cli.isHelpFlag(command)) {
-        cli.printHelp(init.io, topUsage(allocator));
+    if (cli.presentation.isHelpFlag(command)) {
+        cli.presentation.printHelp(init.io, topUsage(allocator));
         std.process.exit(0);
     }
 

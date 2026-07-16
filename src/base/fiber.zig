@@ -377,7 +377,7 @@ pub const Fiber = struct {
         errdefer std.posix.munmap(@alignCast(stack));
         // RSS attribution for the stack (fiber stacks are the process's most
         // numerous big mappings) is done by the *owner* that creates/destroys
-        // fibers — see src/vm/worker.zig — not here, so the fiber primitive
+        // fibers — see src/nix/vm/worker.zig — not here, so the fiber primitive
         // stays free of the app's tag taxonomy.
         var fiber: Fiber = .{
             .ctx = .{},
@@ -399,7 +399,7 @@ pub const Fiber = struct {
         _ = allocator;
         // A live fiber whose stack is freed will crash on resume; the
         // caller must arrange shutdown semantics. RSS un-registration of the
-        // stack is the owner's job (see src/vm/worker.zig).
+        // stack is the owner's job (see src/nix/vm/worker.zig).
         std.posix.munmap(@alignCast(self.stack));
         self.* = undefined;
     }
