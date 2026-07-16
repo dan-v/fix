@@ -526,7 +526,7 @@ pub fn markRoots(ev: anytype, tr: *gc.Tracer) void {
     // token entries are live roots; stale ones (pre-GC id, now reused) are
     // dead and will miss on lookup, so don't retain them.
     const LazyRootContext = struct { tracer: *gc.Tracer, heap: *ObjectHeap };
-    ev.store.derivations.visitLiveLazyDerivations(
+    ev.store.realization.visitLiveLazyDerivations(
         ev.heap.token,
         LazyRootContext{ .tracer = tr, .heap = &ev.heap },
         struct {

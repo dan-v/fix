@@ -467,7 +467,6 @@ pub const Scanner = struct {
         return c != '/' and hasClass(c, C_PATH_CONT);
     }
 
-
     fn isSearchPathStart(c: u8) bool {
         return hasClass(c, C_IDENT_START) or c == '.' or c == '-';
     }

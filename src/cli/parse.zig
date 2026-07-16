@@ -30,7 +30,7 @@ pub const synopsis =
     \\deprecated features are reported as errors, as in `nix-instantiate --parse`.
 ;
 
-pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .parse);

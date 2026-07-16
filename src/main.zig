@@ -14,7 +14,7 @@ const eval_cmd = cli.eval;
 const parse_cmd = cli.parse;
 const instantiate_cmd = cli.instantiate;
 const build_cmd = cli.build;
-const run_cmd = cli.runcmd;
+const run_cmd = cli.run;
 const shell_cmd = cli.shell;
 const switch_cmd = cli.@"switch";
 
@@ -27,14 +27,14 @@ const Subcommand = struct {
 };
 
 const subcommands = [_]Subcommand{
-    .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = eval_cmd.run_cmd },
-    .{ .name = "parse", .summary = "parse an expression and print its AST as JSON", .run = parse_cmd.run_cmd },
-    .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = instantiate_cmd.run_cmd },
-    .{ .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .run = build_cmd.run_cmd },
-    .{ .name = "run", .summary = "build a derivation and run a program from its output", .run = run_cmd.run_cmd },
-    .{ .name = "shell", .summary = "build a derivation and open a shell with its bin/ on PATH", .run = shell_cmd.run_cmd },
-    .{ .name = "switch", .summary = "build and activate a NixOS/nix-darwin/home-manager configuration", .run = switch_cmd.run_cmd },
-    .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = repl.run_cmd },
+    .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = eval_cmd.run },
+    .{ .name = "parse", .summary = "parse an expression and print its AST as JSON", .run = parse_cmd.run },
+    .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = instantiate_cmd.run },
+    .{ .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .run = build_cmd.run },
+    .{ .name = "run", .summary = "build a derivation and run a program from its output", .run = run_cmd.run },
+    .{ .name = "shell", .summary = "build a derivation and open a shell with its bin/ on PATH", .run = shell_cmd.run },
+    .{ .name = "switch", .summary = "build and activate a NixOS/nix-darwin/home-manager configuration", .run = switch_cmd.run },
+    .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = repl.run },
     .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = disasm_cmd.run },
     .{ .name = "inspect", .summary = "evaluate and dump evaluator statistics", .run = inspect_cmd.run },
     .{ .name = "trace", .summary = "work with binary VM trace files", .run = trace_cmd.run },

@@ -1118,7 +1118,7 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
         // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
         // instance of a chunk goes to the high-priority novel lane.
         // builtin_closure thunks carry no chunk of their own — bulk lane.
-        const ok = if (self.scheduler.config.spec_novel and speculate.novelClosureChunk(self, closure))
+        const ok = if (self.scheduler.config.spec_novel and speculate.isNovelClosureChunk(self, closure))
             self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
         else
             self.scheduler.submit(.{ .force_thunk = id }, self.workerId());

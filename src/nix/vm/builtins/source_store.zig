@@ -63,18 +63,18 @@ pub fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value
     for (ref_ids.items, refs) |ref_id, *ref| ref.* = self.intern.get(ref_id);
 
     const name = self.intern.get(name_id);
-    const contents = try self.derivations.allocator.dupe(u8, self.intern.get(contents_id));
-    const path = derivation.textPath(self.allocator, self.derivations.store_dir, name, contents, refs) catch |err| {
-        self.derivations.allocator.free(contents);
+    const contents = try self.realization.allocator.dupe(u8, self.intern.get(contents_id));
+    const path = derivation.textPath(self.allocator, self.realization.store_dir, name, contents, refs) catch |err| {
+        self.realization.allocator.free(contents);
         return err;
     };
     defer self.allocator.free(path);
-    self.derivations.noteProducerPayloadForTest(path, contents) catch |err| {
-        self.derivations.allocator.free(contents);
+    self.realization.noteProducerPayloadForTest(path, contents) catch |err| {
+        self.realization.allocator.free(contents);
         return err;
     };
     // recordOwnedTextRecipe consumes contents on success and error.
-    try self.derivations.recordOwnedTextRecipe(path, contents, refs);
+    try self.realization.recordOwnedTextRecipe(path, contents, refs);
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
@@ -113,7 +113,7 @@ pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Val
 
     var unsupported: nar.Unsupported = .{};
     defer unsupported.deinit(self.allocator);
-    const store_path = source_paths.storePathForFilteredSourceReport(self.allocator, self.derivations, self.files, root, path_ops.baseName(root), .{
+    const store_path = source_paths.storePathForFilteredSourceReport(self.allocator, self.realization, self.files, root, path_ops.baseName(root), .{
         .context = &context,
         .accept = Context.accept,
     }, filterKeyOf(self, pred), &unsupported) catch |err| return reportUnsupportedType(self, &unsupported, err);

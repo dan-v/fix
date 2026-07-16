@@ -31,7 +31,7 @@ const ObjectId = types.ObjectId;
 const InternTable = @import("runtime").intern.InternTable;
 const heap_mod = @import("runtime").heap;
 const ObjectHeap = heap_mod.ObjectHeap;
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const bytecode = @import("../bytecode.zig");
 const ChunkRegistry = bytecode.ChunkRegistry;
 const Chunk = bytecode.chunk.Chunk;
@@ -48,7 +48,7 @@ pub const ThunkTrace = struct {
     intern: *const InternTable,
     heap: *ObjectHeap,
     registry: *const ChunkRegistry,
-    mu: stable.SpinMutex = .{},
+    mu: sync.SpinMutex = .{},
     seq: std.atomic.Value(u64) = .init(0),
 
     pub fn init(

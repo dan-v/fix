@@ -28,7 +28,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("runtime").types;
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const gc = @import("runtime").gc;
 const heap_mod = @import("runtime").heap;
 const containers = @import("base");
@@ -228,7 +228,7 @@ const ReadyQueue = struct {
     /// queues shared one, and every idle worker's steal scan probes
     /// every peer's queue: worker i's push/pop invalidated the line
     /// under workers i±1's queues too.
-    mu: stable.SpinMutex align(std.atomic.cache_line),
+    mu: sync.SpinMutex align(std.atomic.cache_line),
     /// Mutated only under `mu`; additionally probed lock-free by `pop`'s
     /// empty fast path (monotonic — the lock provides the real
     /// synchronization for any node actually taken).
@@ -343,7 +343,7 @@ const SpecQueue = struct {
     /// idle steal scan (`stealSpecExcluding`, on both the novel and bulk
     /// lanes) locks every peer's ring each rescan: worker i's push/pop
     /// invalidated the line under workers i±1's rings too.
-    mu: stable.SpinMutex align(std.atomic.cache_line),
+    mu: sync.SpinMutex align(std.atomic.cache_line),
     items: []TracedTask,
     mask: u32,
     head: u32,
@@ -438,7 +438,7 @@ const SpecQueue = struct {
 /// GC: mark the objects referenced by pending tasks. A queued
 /// `force_thunk`/`force_list_range` is a live reference (a helper — or,
 /// after this collection, demand — may still force it). Called only at
-/// the STW safepoint, so `top..bottom` is stable.
+/// the STW safepoint, so `top..bottom` is sync.
 fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
     const t = q.top.v.load(.monotonic);
     const b = q.bottom.v.load(.monotonic);
@@ -455,7 +455,7 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
 }
 
 /// GC: same, for the mutexed spec ring. STW-only — no mutator holds
-/// `mu`, so a plain `tail..head` walk is stable.
+/// `mu`, so a plain `tail..head` walk is sync.
 fn specQueueGcMark(q: *const SpecQueue, tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
     var i = q.tail;
     while (i != q.head) : (i +%= 1) {
@@ -1417,7 +1417,7 @@ pub const Scheduler = struct {
             return;
         }
         if (self.shutdown_flag.load(.acquire)) return;
-        stable.Futex.wait(word, 0);
+        sync.Futex.wait(word, 0);
         // Drain any wake signal that arrived.
         word.store(0, .release);
     }
@@ -1502,7 +1502,7 @@ pub const Scheduler = struct {
         // sleeper consumed the old signal it also cleared the word, so
         // this swap would see 0 and we fall through to the wake.)
         if (word.swap(1, .release) == 1) return;
-        stable.Futex.wake(word, 1);
+        sync.Futex.wake(word, 1);
     }
 
     comptime {

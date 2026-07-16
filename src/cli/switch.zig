@@ -28,7 +28,7 @@ const engine = @import("nix");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
-const run = @import("run.zig");
+const eval_support = @import("eval_support.zig");
 const build = @import("build.zig");
 
 const Evaluator = engine.Evaluator;
@@ -76,7 +76,7 @@ pub const synopsis =
     \\remote host with --target-host (build stays local; the closure is copied).
 ;
 
-pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     // The action is the first positional (like nixos-rebuild). Peek it before
     // the shared parser, which would otherwise treat it as a source path.
     var action: Action = .@"switch";
@@ -163,7 +163,7 @@ fn buildAndSwitch(allocator: std.mem.Allocator, init: std.process.Init, target: 
         return 2;
     }
 
-    const source = run.getSource(&ev, source_arg, options.*) catch |err| {
+    const source = eval_support.getSource(&ev, source_arg, options.*) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };

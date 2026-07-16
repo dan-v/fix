@@ -63,7 +63,7 @@ pub fn demandPathArg(self: anytype, arg: Value) ![]const u8 {
     vm_force.rootKeep(self, value);
     const path = self.intern.get(try vm_strings.stringTextInternId(self, value));
 
-    if (!isStorePath(path, self.derivations.store_dir)) return path;
+    if (!isStorePath(path, self.realization.store_dir)) return path;
     // Deliberately uncached: recording a pre-build false in FileCache would
     // make pathExists contradict the successful realization below.
     if (try self.files.existsUncached(path)) return path;
@@ -81,13 +81,13 @@ pub fn demandPathArg(self: anytype, arg: Value) ![]const u8 {
         // build. The `.drv` write was already offloaded (and awaited) when the
         // derivation was forced, so `ensureClosure` just tops up the recipe
         // closure (input sources, substitutions) that isn't yet present.
-        try self.derivations.ensureClosure(context.drv_path);
+        try self.realization.ensureClosure(context.drv_path);
     } else {
         // Demanding a derivation OUTPUT (IFD): realize it through the daemon.
         // `realizeOutput` does dependency-first closure realization + build, all
         // as one daemon-I/O offload job, so the demand fiber parks (and other
         // fibers run) rather than blocking a compute worker on the socket.
-        try self.derivations.realizeOutput(context.drv_path, context.outputs);
+        try self.realization.realizeOutput(context.drv_path, context.outputs);
     }
     return path;
 }
@@ -136,7 +136,7 @@ fn demandContext(self: anytype, value: Value) !?DemandContext {
         const all = try vm_force.forceValue(self, all_value);
         if (!all.isBool()) return error.TypeError;
         if (all.asBool()) {
-            const known = self.derivations.outputNames(self.intern.get(name)) orelse &.{};
+            const known = self.realization.outputNames(self.intern.get(name)) orelse &.{};
             const outputs = try self.allocator.alloc([]const u8, known.len);
             @memcpy(outputs, known);
             return .{ .drv_path = self.intern.get(name), .outputs = outputs };

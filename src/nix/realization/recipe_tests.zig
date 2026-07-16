@@ -1,5 +1,5 @@
 const std = @import("std");
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const RealizationStore = @import("../realization.zig").RealizationStore;
 const FileCache = @import("../host.zig").FileCache;
 const DaemonRuntime = @import("../host.zig").DaemonRuntime;
@@ -476,21 +476,21 @@ const RootClaimBarrier = struct {
         else
             unreachable;
         _ = self.observed.fetchOr(bit, .acq_rel);
-        stable.Futex.wake(&self.observed, std.math.maxInt(u32));
-        while (self.released.load(.acquire) == 0) stable.Futex.wait(&self.released, 0);
+        sync.Futex.wake(&self.observed, std.math.maxInt(u32));
+        while (self.released.load(.acquire) == 0) sync.Futex.wait(&self.released, 0);
     }
 
     fn waitForBoth(self: *RootClaimBarrier) u32 {
         while (true) {
             const current = self.observed.load(.acquire);
             if (current == both_claimed) return current;
-            stable.Futex.wait(&self.observed, current);
+            sync.Futex.wait(&self.observed, current);
         }
     }
 
     fn releaseBoth(self: *RootClaimBarrier) void {
         self.released.store(1, .release);
-        stable.Futex.wake(&self.released, std.math.maxInt(u32));
+        sync.Futex.wake(&self.released, std.math.maxInt(u32));
     }
 };
 

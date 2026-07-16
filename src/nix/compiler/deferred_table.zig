@@ -18,7 +18,7 @@ const std = @import("std");
 const ast = @import("syntax").ast;
 const types = @import("runtime").types;
 const Capture = @import("types.zig").Capture;
-const stable = @import("base").segments;
+const segments = @import("base").segments;
 const sync = @import("base").sync;
 const diagnostic = @import("syntax").diagnostic;
 const Parser = @import("syntax").parser.Parser;
@@ -111,7 +111,7 @@ pub const Entry = struct {
 };
 
 pub const Table = struct {
-    const Store = stable.StableSegments(*Entry, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
+    const Store = segments.StableSegments(*Entry, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
     allocator: std.mem.Allocator,
     entries: Store = .empty,

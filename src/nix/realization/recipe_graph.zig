@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const owned_strings = @import("base").owned_strings;
 const runtime = @import("runtime");
 const FileCache = @import("../host.zig").FileCache;
@@ -106,7 +106,7 @@ pub const Recipe = struct {
 };
 
 pub const Claim = struct {
-    mu: stable.BlockingMutex = .{},
+    mu: sync.BlockingMutex = .{},
     future: runtime.thunk.Future = runtime.thunk.Future.initClaimedStatic(runtime.thunk.makeClaimer(0)),
     refs: std.atomic.Value(usize) = .init(1),
     state: State = .writing,
@@ -141,7 +141,7 @@ pub const Graph = struct {
     claims: std.StringHashMapUnmanaged(*Claim) = .empty,
     realized_outputs: std.StringHashMapUnmanaged(void) = .empty,
     pending_fetches: std.StringHashMapUnmanaged(PendingFetch) = .empty,
-    mu: stable.BlockingMutex = .{},
+    mu: sync.BlockingMutex = .{},
     test_root_claim_hook: if (builtin.is_test) ?RootClaimHook else void = if (builtin.is_test) null else {},
     test_producer_payload_pointers: if (builtin.is_test) std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) else void = if (builtin.is_test) .empty else {},
 

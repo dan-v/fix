@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const host = @import("../host.zig");
 const rstore = host.store;
 const DaemonRuntime = host.DaemonRuntime;
@@ -34,7 +34,7 @@ pub fn restoreActiveConnection(previous: ?*rstore.DaemonStore) void {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
-    mu: stable.BlockingMutex = .{},
+    mu: sync.BlockingMutex = .{},
     last_error_msg: ?[]u8 = null,
     instantiated: std.StringHashMapUnmanaged(void) = .empty,
     io: ?std.Io = null,
@@ -48,7 +48,7 @@ pub const Client = struct {
     fiber_park: ?FiberParkFn = null,
     runtime: ?*DaemonRuntime = null,
     pool: ?*rstore.DaemonPool = null,
-    pool_mu: stable.BlockingMutex = .{},
+    pool_mu: sync.BlockingMutex = .{},
     test_owned_runtime: if (builtin.is_test) ?*DaemonRuntime else void = if (builtin.is_test) null else {},
 
     pub fn init(allocator: std.mem.Allocator) Client {

@@ -12,7 +12,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const types = @import("runtime").types;
 const bytecode = @import("../bytecode.zig");
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 
 const OpCode = bytecode.OpCode;
 const ChunkId = types.ChunkId;
@@ -36,7 +36,7 @@ pub const Format = enum {
 pub const VmTrace = struct {
     writer: *std.Io.Writer,
     format: Format,
-    mu: stable.SpinMutex = .{},
+    mu: sync.SpinMutex = .{},
     /// Monotonic event counter — useful as a search anchor in diffs.
     seq: std.atomic.Value(u64) = .init(0),
     /// Skip events beyond this count; 0 means unlimited. Useful for very

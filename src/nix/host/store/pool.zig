@@ -21,7 +21,7 @@
 //! any daemon-protocol dependency; the real backend opens a `DaemonStore`.
 
 const std = @import("std");
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 
 /// Per-worker connection lifecycle. `open` runs once per worker thread (its own
 /// connection, opened warm at spawn); `close` runs at shutdown. A failed `open`
@@ -39,7 +39,7 @@ pub const DaemonPool = struct {
     backend: Backend,
     worker_count: usize,
 
-    mu: stable.BlockingMutex = .{},
+    mu: sync.BlockingMutex = .{},
     /// Bumped on every submit and on shutdown; idle workers futex-wait on it (a
     /// submit that races the wait bumps the value so the wait returns).
     seq: std.atomic.Value(u32) = .init(0),
@@ -101,7 +101,7 @@ pub const DaemonPool = struct {
     const BlockingCell = struct {
         work: *const fn (conn: ?*anyopaque, ctx: *anyopaque) void,
         ctx: *anyopaque,
-        done: stable.Semaphore = stable.Semaphore.init(0),
+        done: sync.Semaphore = sync.Semaphore.init(0),
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *BlockingCell = @ptrCast(@alignCast(p));
@@ -131,7 +131,7 @@ pub const DaemonPool = struct {
 
     fn wake(self: *DaemonPool) void {
         _ = self.seq.fetchAdd(1, .release);
-        stable.Futex.wake(&self.seq, std.math.maxInt(u32));
+        sync.Futex.wake(&self.seq, std.math.maxInt(u32));
     }
 
     fn worker(self: *DaemonPool) void {
@@ -146,7 +146,7 @@ pub const DaemonPool = struct {
             while (self.head == null and !self.shutdown) {
                 const s = self.seq.load(.acquire);
                 self.mu.unlock();
-                stable.Futex.wait(&self.seq, s);
+                sync.Futex.wait(&self.seq, s);
                 self.mu.lock();
             }
             if (self.head == null and self.shutdown) {

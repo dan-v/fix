@@ -22,17 +22,17 @@ const parser_mod = @import("parser.zig");
 /// A minimal JSON value model. Built in an arena, then emitted. Keeping an
 /// explicit tree (rather than streaming) lets us sort object keys and omit
 /// empty fields uniformly.
-pub const J = union(enum) {
+const JsonValue = union(enum) {
     int: i64,
     /// A float, emitted with a forced decimal point (Nix/nlohmann style).
     float: f64,
     str: []const u8,
     boolean: bool,
     nul,
-    array: []const J,
+    array: []const JsonValue,
     object: []const Field,
 
-    pub const Field = struct { key: []const u8, val: J };
+    pub const Field = struct { key: []const u8, val: JsonValue };
 };
 
 /// Serialize `node` (a parse-OKAY AST rooted in `source`) as JSON to `writer`.
@@ -46,20 +46,20 @@ pub fn write(
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    var ser: Ser = .{ .arena = arena_state.allocator(), .gpa = gpa, .source = source };
+    var ser: Serializer = .{ .arena = arena_state.allocator(), .gpa = gpa, .source = source };
     const j = try ser.node(node);
     try emit(writer, j, 0);
     try writer.writeByte('\n');
 }
 
-const Ser = struct {
+const Serializer = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     source: []const u8,
 
     // ---- dispatch ----
 
-    fn node(self: *Ser, n_in: *const Node) anyerror!J {
+    fn node(self: *Serializer, n_in: *const Node) anyerror!JsonValue {
         const n = ast.unwrapParens(n_in);
         return switch (n.tag) {
             .integer => self.literal("Int", .{ .int = try self.parseInt(n.data.atom) }),
@@ -117,19 +117,19 @@ const Ser = struct {
 
     // ---- atoms ----
 
-    fn atomText(self: *Ser, atom: Node.Atom) []const u8 {
+    fn atomText(self: *Serializer, atom: Node.Atom) []const u8 {
         return self.source[atom.offset .. atom.offset + atom.len];
     }
 
-    fn parseInt(self: *Ser, atom: Node.Atom) !i64 {
+    fn parseInt(self: *Serializer, atom: Node.Atom) !i64 {
         return std.fmt.parseInt(i64, self.atomText(atom), 10) catch error.InvalidInteger;
     }
 
-    fn parseFloat(self: *Ser, atom: Node.Atom) !f64 {
+    fn parseFloat(self: *Serializer, atom: Node.Atom) !f64 {
         return std.fmt.parseFloat(f64, self.atomText(atom)) catch error.InvalidFloat;
     }
 
-    fn literal(self: *Ser, value_type: []const u8, value: J) J {
+    fn literal(self: *Serializer, value_type: []const u8, value: JsonValue) JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprLiteral" } },
             .{ .key = "value", .val = value },
@@ -140,21 +140,21 @@ const Ser = struct {
     /// A string or name value: a JSON string when valid UTF-8, else a JSON
     /// array of byte values (`[97, 255, 98]`) — matching how Nix's parse JSON
     /// represents an invalid-UTF-8 string/name.
-    fn strOrBytes(self: *Ser, bytes: []const u8) !J {
+    fn strOrBytes(self: *Serializer, bytes: []const u8) !JsonValue {
         if (std.unicode.utf8ValidateSlice(bytes)) return .{ .str = bytes };
-        const out = try self.arena.alloc(J, bytes.len);
+        const out = try self.arena.alloc(JsonValue, bytes.len);
         for (bytes, out) |b, *j| j.* = .{ .int = b };
         return .{ .array = out };
     }
 
-    fn exprVar(self: *Ser, name: []const u8) !J {
+    fn exprVar(self: *Serializer, name: []const u8) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprVar" } },
             .{ .key = "value", .val = try self.strOrBytes(name) },
         });
     }
 
-    fn identifier(self: *Ser, name: []const u8) !J {
+    fn identifier(self: *Serializer, name: []const u8) !JsonValue {
         // The magic `__curPos` identifier is Nix's `ExprPos`.
         if (std.mem.eql(u8, name, "__curPos")) {
             return self.obj(&.{.{ .key = "_type", .val = .{ .str = "ExprPos" } }});
@@ -162,7 +162,7 @@ const Ser = struct {
         return self.exprVar(name);
     }
 
-    fn searchPath(self: *Ser, atom: Node.Atom) !J {
+    fn searchPath(self: *Serializer, atom: Node.Atom) !JsonValue {
         // `<x>` → __findFile __nixPath "x"
         const text = self.atomText(atom);
         const inner = if (text.len >= 2 and text[0] == '<' and text[text.len - 1] == '>')
@@ -183,9 +183,10 @@ const Ser = struct {
 
     /// A string atom. A single constant text run is an `ExprLiteral String`;
     /// any `${...}` makes it an interpolating `ExprConcatStrings`.
-    fn stringNode(self: *Ser, atom: Node.Atom) !J {
+    fn stringNode(self: *Serializer, atom: Node.Atom) !JsonValue {
         const parsed = string_syntax.parseLiteral(self.gpa, self.source, .{
-            .start = atom.offset, .end = atom.offset + atom.len,
+            .start = atom.offset,
+            .end = atom.offset + atom.len,
         }) catch return error.InvalidStringLiteral;
         defer parsed.deinit();
 
@@ -223,7 +224,7 @@ const Ser = struct {
             }
         }
 
-        var es: std.ArrayListUnmanaged(J) = .empty;
+        var es: std.ArrayListUnmanaged(JsonValue) = .empty;
         for (parsed.parts) |part| {
             switch (part) {
                 .text => |t| {
@@ -256,7 +257,7 @@ const Ser = struct {
 
     /// If `${...}` interpolates a single constant string literal, its decoded
     /// bytes (arena-owned); else null.
-    fn constInterpolation(self: *Ser, span: string_syntax.Span) !?[]const u8 {
+    fn constInterpolation(self: *Serializer, span: string_syntax.Span) !?[]const u8 {
         const sub = self.source[span.start..span.end];
         var arena = ast.AstArena.init(self.gpa);
         defer arena.deinit();
@@ -265,7 +266,8 @@ const Ser = struct {
         const n = ast.unwrapParens(parser.parse() catch return null);
         if (n.tag != .string) return null;
         const lit = string_syntax.parseLiteral(self.gpa, sub, .{
-            .start = n.data.atom.offset, .end = n.data.atom.offset + n.data.atom.len,
+            .start = n.data.atom.offset,
+            .end = n.data.atom.offset + n.data.atom.len,
         }) catch return null;
         defer lit.deinit();
         var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -279,20 +281,20 @@ const Ser = struct {
     /// Parse and serialize one `${...}` interpolation. It's a standalone
     /// expression over the interpolation's source slice, so a fresh sub-parser
     /// runs there and a nested serializer walks the result (its own `source`).
-    fn interpolation(self: *Ser, span: string_syntax.Span) !J {
+    fn interpolation(self: *Serializer, span: string_syntax.Span) !JsonValue {
         const sub = self.source[span.start..span.end];
         var arena = ast.AstArena.init(self.gpa);
         defer arena.deinit();
         var parser = parser_mod.Parser.init(self.gpa, &arena, sub);
         defer parser.deinit();
         const n = parser.parse() catch return error.InterpolationParseError;
-        var sub_ser: Ser = .{ .arena = self.arena, .gpa = self.gpa, .source = sub };
+        var sub_ser: Serializer = .{ .arena = self.arena, .gpa = self.gpa, .source = sub };
         return sub_ser.node(n);
     }
 
     // ---- operators ----
 
-    fn unary(self: *Ser, u: Node.Unary) !J {
+    fn unary(self: *Serializer, u: Node.Unary) !JsonValue {
         return switch (u.op) {
             .not => self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprOpNot" } },
@@ -306,7 +308,7 @@ const Ser = struct {
         };
     }
 
-    fn binary(self: *Ser, b: Node.Binary) !J {
+    fn binary(self: *Serializer, b: Node.Binary) !JsonValue {
         const l = try self.node(b.left);
         const r = try self.node(b.right);
         return switch (b.op) {
@@ -329,7 +331,7 @@ const Ser = struct {
         };
     }
 
-    fn binOp(self: *Ser, type_name: []const u8, e1: J, e2: J) J {
+    fn binOp(self: *Serializer, type_name: []const u8, e1: JsonValue, e2: JsonValue) JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = type_name } },
             .{ .key = "e1", .val = e1 },
@@ -337,14 +339,14 @@ const Ser = struct {
         });
     }
 
-    fn opNot(self: *Ser, e: J) J {
+    fn opNot(self: *Serializer, e: JsonValue) JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprOpNot" } },
             .{ .key = "e", .val = e },
         });
     }
 
-    fn primopCall(self: *Ser, name: []const u8, args: []const J) !J {
+    fn primopCall(self: *Serializer, name: []const u8, args: []const JsonValue) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprCall" } },
             .{ .key = "fun", .val = try self.exprVar(name) },
@@ -352,7 +354,7 @@ const Ser = struct {
         });
     }
 
-    fn concatStrings(self: *Ser, es: []const J, is_interp: bool) J {
+    fn concatStrings(self: *Serializer, es: []const JsonValue, is_interp: bool) JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprConcatStrings" } },
             .{ .key = "es", .val = self.arr(es) },
@@ -362,7 +364,7 @@ const Ser = struct {
 
     // ---- application (curried-apply flattening) ----
 
-    fn call(self: *Ser, n: *const Node) !J {
+    fn call(self: *Serializer, n: *const Node) !JsonValue {
         const app = n.data.apply;
         // A pipe application is a single call `func arg`; the spine is not
         // flattened across it.
@@ -380,7 +382,7 @@ const Ser = struct {
             try args_rev.append(self.arena, cur.data.apply.arg);
             cur = ast.unwrapParens(cur.data.apply.func);
         }
-        const args = try self.arena.alloc(J, args_rev.items.len);
+        const args = try self.arena.alloc(JsonValue, args_rev.items.len);
         // args_rev holds outermost-arg-first; reverse into source order.
         for (args_rev.items, 0..) |arg_node, i| {
             args[args_rev.items.len - 1 - i] = try self.node(arg_node);
@@ -394,17 +396,17 @@ const Ser = struct {
 
     // ---- lambda patterns ----
 
-    fn lambdaAttrs(self: *Ser, la: *const Node.LambdaAttrs) !J {
-        var fields: std.ArrayListUnmanaged(J.Field) = .empty;
+    fn lambdaAttrs(self: *Serializer, la: *const Node.LambdaAttrs) !JsonValue {
+        var fields: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
         try fields.append(self.arena, .{ .key = "_type", .val = .{ .str = "ExprLambda" } });
         if (la.bind_name) |bind| {
             try fields.append(self.arena, .{ .key = "arg", .val = .{ .str = self.atomText(bind) } });
         }
         try fields.append(self.arena, .{ .key = "body", .val = try self.node(la.body) });
         if (la.params.len != 0) {
-            var formals: std.ArrayListUnmanaged(J.Field) = .empty;
+            var formals: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
             for (la.params) |p| {
-                const dflt: J = if (p.default) |d| try self.node(d) else .nul;
+                const dflt: JsonValue = if (p.default) |d| try self.node(d) else .nul;
                 try formals.append(self.arena, .{ .key = self.attrNameText(p.name), .val = dflt });
             }
             try fields.append(self.arena, .{ .key = "formals", .val = .{ .object = try formals.toOwnedSlice(self.arena) } });
@@ -419,10 +421,10 @@ const Ser = struct {
     /// Flatten a select chain (`attr_path`/`attr_dynamic` nesting) into a base
     /// expression `e` plus an ordered `attrs` list (static names as strings,
     /// dynamic keys as expressions).
-    fn select(self: *Ser, chain: *const Node, default: ?*const Node) !J {
-        var attrs: std.ArrayListUnmanaged(J) = .empty;
+    fn select(self: *Serializer, chain: *const Node, default: ?*const Node) !JsonValue {
+        var attrs: std.ArrayListUnmanaged(JsonValue) = .empty;
         const base = try self.collectSelect(chain, &attrs);
-        var fields: std.ArrayListUnmanaged(J.Field) = .empty;
+        var fields: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
         try fields.append(self.arena, .{ .key = "_type", .val = .{ .str = "ExprSelect" } });
         try fields.append(self.arena, .{ .key = "attrs", .val = self.arr(try attrs.toOwnedSlice(self.arena)) });
         if (default) |d| try fields.append(self.arena, .{ .key = "default", .val = try self.node(d) });
@@ -430,7 +432,7 @@ const Ser = struct {
         return .{ .object = try fields.toOwnedSlice(self.arena) };
     }
 
-    fn collectSelect(self: *Ser, n_in: *const Node, attrs: *std.ArrayListUnmanaged(J)) anyerror!*const Node {
+    fn collectSelect(self: *Serializer, n_in: *const Node, attrs: *std.ArrayListUnmanaged(JsonValue)) anyerror!*const Node {
         const n = ast.unwrapParens(n_in);
         switch (n.tag) {
             .attr_path => {
@@ -449,9 +451,9 @@ const Ser = struct {
         }
     }
 
-    fn hasAttr(self: *Ser, n: *const Node) !J {
+    fn hasAttr(self: *Serializer, n: *const Node) !JsonValue {
         const ha = n.data.has_attr;
-        const attrs = try self.arena.alloc(J, ha.segments.len);
+        const attrs = try self.arena.alloc(JsonValue, ha.segments.len);
         for (ha.segments, attrs) |seg, *out| out.* = try self.strOrBytes(self.attrNameText(seg));
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprOpHasAttr" } },
@@ -460,9 +462,9 @@ const Ser = struct {
         });
     }
 
-    fn hasAttrMixed(self: *Ser, n: *const Node) !J {
+    fn hasAttrMixed(self: *Serializer, n: *const Node) !JsonValue {
         const ha = n.data.has_attr_mixed;
-        const attrs = try self.arena.alloc(J, ha.segments.len);
+        const attrs = try self.arena.alloc(JsonValue, ha.segments.len);
         for (ha.segments, attrs) |seg, *out| {
             out.* = switch (seg) {
                 .static => |a| try self.strOrBytes(self.attrNameText(a)),
@@ -476,8 +478,8 @@ const Ser = struct {
         });
     }
 
-    fn list(self: *Ser, l: Node.List) !J {
-        const elems = try self.arena.alloc(J, l.items.len);
+    fn list(self: *Serializer, l: Node.List) !JsonValue {
+        const elems = try self.arena.alloc(JsonValue, l.items.len);
         for (l.items, elems) |item, *out| out.* = try self.node(item);
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprList" } },
@@ -487,13 +489,13 @@ const Ser = struct {
 
     // ---- attribute sets / let (nesting, merging, inherit regrouping) ----
 
-    fn attrSet(self: *Ser, n: *const Node) !J {
+    fn attrSet(self: *Serializer, n: *const Node) !JsonValue {
         const set = try self.buildSet(n.data.attr_set);
         return self.emitSet(set, false, null);
     }
 
-    fn letIn(self: *Ser, l: Node.LetIn) !J {
-        const set = try self.arena.create(BSet);
+    fn letIn(self: *Serializer, l: Node.LetIn) !JsonValue {
+        const set = try self.arena.create(BindingSet);
         set.* = .{};
         for (l.bindings) |b| {
             try self.addBinding(set, b.path, null, b.expr, b.inherit_outer);
@@ -501,8 +503,8 @@ const Ser = struct {
         return self.emitSet(set, true, l.body);
     }
 
-    fn buildSet(self: *Ser, s: Node.AttrSet) anyerror!*BSet {
-        const set = try self.arena.create(BSet);
+    fn buildSet(self: *Serializer, s: Node.AttrSet) anyerror!*BindingSet {
+        const set = try self.arena.create(BindingSet);
         set.* = .{ .recursive = s.recursive };
         for (s.entries) |e| {
             try self.addBinding(set, e.path, e.dynamic_name, e.expr, e.inherit_outer);
@@ -510,12 +512,12 @@ const Ser = struct {
         return set;
     }
 
-    /// Route one binding into the mutable `BSet`, performing constant-dynamic
+    /// Route one binding into the mutable `BindingSet`, performing constant-dynamic
     /// folding, static-path nesting/merging, and inherit / inherit-from
     /// regrouping.
     fn addBinding(
-        self: *Ser,
-        set: *BSet,
+        self: *Serializer,
+        set: *BindingSet,
         path: []const Node.Atom,
         dynamic_name: ?*const Node,
         expr: *const Node,
@@ -559,7 +561,7 @@ const Ser = struct {
         try self.setLeaf(cur, self.attrNameText(path[path.len - 1]), expr);
     }
 
-    fn addInheritFrom(self: *Ser, set: *BSet, from: *const Node, name: []const u8) !void {
+    fn addInheritFrom(self: *Serializer, set: *BindingSet, from: *const Node, name: []const u8) !void {
         const from_off: u32 = if (from.span) |s| s.offset else 0;
         if (set.inherit_from.items.len > 0) {
             const last = &set.inherit_from.items[set.inherit_from.items.len - 1];
@@ -574,7 +576,7 @@ const Ser = struct {
     }
 
     /// Descend (creating/merging as needed) into the nested set at `name`.
-    fn descend(self: *Ser, set: *BSet, name: []const u8) !*BSet {
+    fn descend(self: *Serializer, set: *BindingSet, name: []const u8) !*BindingSet {
         if (set.attrs.getPtr(name)) |slot| {
             switch (slot.*) {
                 .set => |s| return s,
@@ -582,14 +584,14 @@ const Ser = struct {
                 // which Nix rejects (parse-fail, out of scope). Best-effort:
                 // replace it with a fresh set so serialization proceeds.
                 .leaf => {
-                    const s = try self.arena.create(BSet);
+                    const s = try self.arena.create(BindingSet);
                     s.* = .{};
                     slot.* = .{ .set = s };
                     return s;
                 },
             }
         }
-        const s = try self.arena.create(BSet);
+        const s = try self.arena.create(BindingSet);
         s.* = .{};
         try set.attrs.put(self.arena, name, .{ .set = s });
         return s;
@@ -597,7 +599,7 @@ const Ser = struct {
 
     /// Assign `expr` at `name`, merging when both the existing and new values
     /// are (non-recursive) attribute sets — Nix's recursive attr merge.
-    fn setLeaf(self: *Ser, set: *BSet, name: []const u8, expr: *const Node) !void {
+    fn setLeaf(self: *Serializer, set: *BindingSet, name: []const u8, expr: *const Node) !void {
         const newv = try self.buildValue(expr);
         if (set.attrs.getPtr(name)) |slot| {
             if (slot.* == .set and newv == .set and !slot.set.recursive and !newv.set.recursive) {
@@ -610,7 +612,7 @@ const Ser = struct {
         try set.attrs.put(self.arena, name, newv);
     }
 
-    fn mergeSets(self: *Ser, dst: *BSet, src: *BSet) !void {
+    fn mergeSets(self: *Serializer, dst: *BindingSet, src: *BindingSet) !void {
         var it = src.attrs.iterator();
         while (it.next()) |kv| {
             const name = kv.key_ptr.*;
@@ -631,16 +633,16 @@ const Ser = struct {
     }
 
     /// A value slot: a non-recursive attribute-set literal becomes a mutable
-    /// `BSet` (so sibling binds can merge into it); everything else is a leaf
+    /// `BindingSet` (so sibling binds can merge into it); everything else is a leaf
     /// serialized on demand.
-    fn buildValue(self: *Ser, expr: *const Node) !BValue {
+    fn buildValue(self: *Serializer, expr: *const Node) !BindingValue {
         const e = ast.unwrapParens(expr);
         if (e.tag == .attr_set) return .{ .set = try self.buildSet(e.data.attr_set) };
         return .{ .leaf = e };
     }
 
-    fn emitSet(self: *Ser, set: *BSet, is_let: bool, body: ?*const Node) anyerror!J {
-        var fields: std.ArrayListUnmanaged(J.Field) = .empty;
+    fn emitSet(self: *Serializer, set: *BindingSet, is_let: bool, body: ?*const Node) anyerror!JsonValue {
+        var fields: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
         try fields.append(self.arena, .{ .key = "_type", .val = .{ .str = if (is_let) "ExprLet" else "ExprSet" } });
         if (is_let) {
             try fields.append(self.arena, .{ .key = "body", .val = try self.node(body.?) });
@@ -651,8 +653,8 @@ const Ser = struct {
         // attrs — a valid-UTF-8 name is a JSON object key; an invalid one can't
         // be, so it moves to a sibling `binary_attrs` list (Nix's shape).
         if (set.attrs.count() != 0) {
-            var attr_fields: std.ArrayListUnmanaged(J.Field) = .empty;
-            var bin_list: std.ArrayListUnmanaged(J) = .empty;
+            var attr_fields: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
+            var bin_list: std.ArrayListUnmanaged(JsonValue) = .empty;
             var it = set.attrs.iterator();
             while (it.next()) |kv| {
                 const val = try self.emitValue(kv.value_ptr.*);
@@ -674,7 +676,7 @@ const Ser = struct {
         }
         // dynamicAttrs (never present for let)
         if (set.dynamic.items.len != 0) {
-            const dyn = try self.arena.alloc(J, set.dynamic.items.len);
+            const dyn = try self.arena.alloc(JsonValue, set.dynamic.items.len);
             for (set.dynamic.items, dyn) |d, *out| {
                 out.* = self.obj(&.{
                     .{ .key = "name", .val = try self.node(d.name) },
@@ -685,8 +687,8 @@ const Ser = struct {
         }
         // inherit — invalid-UTF-8 names move to a `binary_inherit` list.
         if (set.inherits.items.len != 0) {
-            var inh: std.ArrayListUnmanaged(J.Field) = .empty;
-            var bin_list: std.ArrayListUnmanaged(J) = .empty;
+            var inh: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
+            var bin_list: std.ArrayListUnmanaged(JsonValue) = .empty;
             for (set.inherits.items) |name| {
                 if (std.unicode.utf8ValidateSlice(name)) {
                     try inh.append(self.arena, .{ .key = name, .val = try self.exprVar(name) });
@@ -706,9 +708,9 @@ const Ser = struct {
         }
         // inheritFrom
         if (set.inherit_from.items.len != 0) {
-            const groups = try self.arena.alloc(J, set.inherit_from.items.len);
+            const groups = try self.arena.alloc(JsonValue, set.inherit_from.items.len);
             for (set.inherit_from.items, groups) |g, *out| {
-                const names = try self.arena.alloc(J, g.names.items.len);
+                const names = try self.arena.alloc(JsonValue, g.names.items.len);
                 for (g.names.items, names) |name, *nn| nn.* = try self.strOrBytes(name);
                 out.* = self.obj(&.{
                     .{ .key = "attrs", .val = .{ .array = names } },
@@ -721,7 +723,7 @@ const Ser = struct {
         return .{ .object = try fields.toOwnedSlice(self.arena) };
     }
 
-    fn emitValue(self: *Ser, v: BValue) !J {
+    fn emitValue(self: *Serializer, v: BindingValue) !JsonValue {
         return switch (v) {
             .leaf => |n| try self.node(n),
             .set => |s| try self.emitSet(s, false, null),
@@ -732,11 +734,12 @@ const Ser = struct {
 
     /// The textual name of a static attr/formal atom. A quoted-string atom is
     /// decoded (`"a b"` → `a b`); a bare identifier/keyword is taken verbatim.
-    fn attrNameText(self: *Ser, atom: Node.Atom) []const u8 {
+    fn attrNameText(self: *Serializer, atom: Node.Atom) []const u8 {
         const text = self.atomText(atom);
         if (string_syntax.kindAt(text, 0) == null) return text;
         const parsed = string_syntax.parseLiteral(self.gpa, self.source, .{
-            .start = atom.offset, .end = atom.offset + atom.len,
+            .start = atom.offset,
+            .end = atom.offset + atom.len,
         }) catch return text;
         defer parsed.deinit();
         var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -751,12 +754,13 @@ const Ser = struct {
 
     /// If `n` is a constant (non-interpolating) string literal, its decoded
     /// text; otherwise null. Drives `${"lit"}` → static-attr folding.
-    fn constString(self: *Ser, n_in: *const Node) !?[]const u8 {
+    fn constString(self: *Serializer, n_in: *const Node) !?[]const u8 {
         const n = ast.unwrapParens(n_in);
         if (n.tag != .string) return null;
         const atom = n.data.atom;
         const parsed = string_syntax.parseLiteral(self.gpa, self.source, .{
-            .start = atom.offset, .end = atom.offset + atom.len,
+            .start = atom.offset,
+            .end = atom.offset + atom.len,
         }) catch return null;
         defer parsed.deinit();
         var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -769,33 +773,33 @@ const Ser = struct {
         return try buf.toOwnedSlice(self.arena);
     }
 
-    // ---- J builders ----
+    // ---- JsonValue builders ----
 
-    fn obj(self: *Ser, fields: []const J.Field) J {
-        return .{ .object = self.arena.dupe(J.Field, fields) catch unreachable };
+    fn obj(self: *Serializer, fields: []const JsonValue.Field) JsonValue {
+        return .{ .object = self.arena.dupe(JsonValue.Field, fields) catch unreachable };
     }
 
-    fn arr(self: *Ser, items: []const J) J {
-        return .{ .array = self.arena.dupe(J, items) catch unreachable };
+    fn arr(self: *Serializer, items: []const JsonValue) JsonValue {
+        return .{ .array = self.arena.dupe(JsonValue, items) catch unreachable };
     }
 };
 
 /// A mutable attribute-set under construction. Static attrs are keyed by
 /// decoded name; the other buckets preserve source order.
-const BSet = struct {
+const BindingSet = struct {
     recursive: bool = false,
-    attrs: std.StringArrayHashMapUnmanaged(BValue) = .empty,
-    dynamic: std.ArrayListUnmanaged(BDyn) = .empty,
+    attrs: std.StringArrayHashMapUnmanaged(BindingValue) = .empty,
+    dynamic: std.ArrayListUnmanaged(DynamicBinding) = .empty,
     inherits: std.ArrayListUnmanaged([]const u8) = .empty,
     inherit_from: std.ArrayListUnmanaged(BInheritFrom) = .empty,
 };
 
-const BValue = union(enum) {
+const BindingValue = union(enum) {
     leaf: *const Node,
-    set: *BSet,
+    set: *BindingSet,
 };
 
-const BDyn = struct { name: *const Node, value: BValue };
+const DynamicBinding = struct { name: *const Node, value: BindingValue };
 
 const BInheritFrom = struct {
     from: *const Node,
@@ -807,7 +811,7 @@ const BInheritFrom = struct {
 // Emitting (nlohmann dump(2) shape: 2-space indent, `_type` first, keys sorted)
 // ---------------------------------------------------------------------------
 
-fn emit(w: *std.Io.Writer, j: J, indent: usize) !void {
+fn emit(w: *std.Io.Writer, j: JsonValue, indent: usize) !void {
     switch (j) {
         .int => |v| try w.print("{d}", .{v}),
         .float => |v| try emitFloat(w, v),
@@ -835,11 +839,11 @@ fn emit(w: *std.Io.Writer, j: J, indent: usize) !void {
                 return;
             }
             // Sort: `_type` first, then lexicographic by key.
-            var buf: [24]J.Field = undefined;
+            var buf: [24]JsonValue.Field = undefined;
             const sorted = if (fields.len <= buf.len) blk: {
                 @memcpy(buf[0..fields.len], fields);
                 const s = buf[0..fields.len];
-                std.mem.sort(J.Field, s, {}, fieldLess);
+                std.mem.sort(JsonValue.Field, s, {}, fieldLess);
                 break :blk s;
             } else fields; // pathological; emit unsorted rather than fail
             try w.writeAll("{\n");
@@ -857,7 +861,7 @@ fn emit(w: *std.Io.Writer, j: J, indent: usize) !void {
     }
 }
 
-fn fieldLess(_: void, a: J.Field, b: J.Field) bool {
+fn fieldLess(_: void, a: JsonValue.Field, b: JsonValue.Field) bool {
     const a_type = std.mem.eql(u8, a.key, "_type");
     const b_type = std.mem.eql(u8, b.key, "_type");
     if (a_type != b_type) return a_type; // `_type` sorts first

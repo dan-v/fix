@@ -61,7 +61,7 @@ const Harness = struct {
             .heap = &ev.heap,
             .files = &ev.files,
             .fetchers = &ev.fetchers,
-            .derivations = &ev.store.derivations,
+            .realization = &ev.store.realization,
             .scheduler = &ev.scheduler,
             .builtins_value = ev.builtins_value.?,
         });

@@ -151,7 +151,7 @@ fn flattenAttrPath(self: *Compiler, node: *const Node, segments: *std.ArrayListU
 pub fn compileHasAttr(self: *Compiler, node: *const Node) !void {
     const has_attr = node.data.has_attr;
     try self.compileNode(has_attr.root);
-    if (hasAttrSegmentsHaveInterpolation(self, has_attr.segments)) {
+    if (hasInterpolatedAttrSegment(self, has_attr.segments)) {
         var dynamic_count: usize = 0;
         for (has_attr.segments) |seg| {
             if (attrs.attrSegmentHasInterpolation(self, seg)) {
@@ -192,7 +192,7 @@ pub fn compileHasAttrMixed(self: *Compiler, node: *const Node) !void {
     try emit.writeHasAttrMixedOperand(self, has_attr.segments, dynamic_count, hasAttrMixedDiagnosticAtom(has_attr));
 }
 
-fn hasAttrSegmentsHaveInterpolation(self: *Compiler, segments: []const Node.Atom) bool {
+fn hasInterpolatedAttrSegment(self: *Compiler, segments: []const Node.Atom) bool {
     for (segments) |segment| {
         if (attrs.attrSegmentHasInterpolation(self, segment)) return true;
     }

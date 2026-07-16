@@ -156,10 +156,11 @@ pub fn reportStrictWalks(w: *const StrictWalks, label: []const u8) void {
     std.debug.print(
         "prof strict-{s} walks (main demand): n={d} items={d} | UNFANNABLE(<4) walks={d} ({d:.1}%) items={d} ({d:.1}%) | sizes 1={d} 2-3={d} 4-7={d} 8-15={d} 16-31={d} 32-63={d} 64+={d}\n",
         .{
-            label, w.walks, w.items,
-            w.small_walks, pct(w.small_walks, w.walks),
-            w.small_items, pct(w.small_items, w.items),
-            w.buckets[0], w.buckets[1], w.buckets[2], w.buckets[3], w.buckets[4], w.buckets[5], w.buckets[6],
+            label,                       w.walks,                     w.items,
+            w.small_walks,               pct(w.small_walks, w.walks), w.small_items,
+            pct(w.small_items, w.items), w.buckets[0],                w.buckets[1],
+            w.buckets[2],                w.buckets[3],                w.buckets[4],
+            w.buckets[5],                w.buckets[6],
         },
     );
 }
@@ -229,9 +230,9 @@ pub fn reportStrConcat() void {
         std.debug.print(
             "prof str-concat: calls={d} cycles={d} avg_cy={d} bytes={d} new={d} ({d:.1}%) new_bytes={d}\n",
             .{
-                str.concat_calls,           str.concat_cycles,
+                str.concat_calls,                     str.concat_cycles,
                 str.concat_cycles / str.concat_calls, str.concat_bytes,
-                str.concat_new,             pct(str.concat_new, str.concat_calls),
+                str.concat_new,                       pct(str.concat_new, str.concat_calls),
                 str.concat_new_bytes,
             },
         );
@@ -294,16 +295,19 @@ pub fn reportDiscovery() void {
             "prof discovery (main demand-forces, n={d}): resolved_ahead={d} ({d:.1}%) claimed_by_main={d} ({d:.1}%) busy_wait={d} ({d:.1}%)\n",
             .{
                 total,
-                disc.resolved_ahead,  pct(disc.resolved_ahead, total),
-                disc.claimed_by_main, pct(disc.claimed_by_main, total),
-                disc.busy_wait,       pct(disc.busy_wait, total),
+                disc.resolved_ahead,
+                pct(disc.resolved_ahead, total),
+                disc.claimed_by_main,
+                pct(disc.claimed_by_main, total),
+                disc.busy_wait,
+                pct(disc.busy_wait, total),
             },
         );
         std.debug.print(
             "prof discovery (crit-path busy waits): busy_spec_owned={d}/{d} spec_wait_cy={d} total_wait_cy={d} ({d:.1}% of wait cycles is spec-owned = PROMOTION headroom)\n",
             .{
-                disc.busy_spec_owned, disc.busy_wait,
-                disc.busy_spec_cycles, disc.busy_cycles,
+                disc.busy_spec_owned,                         disc.busy_wait,
+                disc.busy_spec_cycles,                        disc.busy_cycles,
                 pct(disc.busy_spec_cycles, disc.busy_cycles),
             },
         );

@@ -102,7 +102,7 @@ inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId)
             prof_census.attr_cache_misses += 1;
             // Attr-lookup size census: bucket this compulsory binary
             // search by the set's entry count.
-            switch (self.heap.getConst(obj_id).*) {
+            switch (self.heap.get(obj_id).*) {
                 .attrs => |a| {
                     const n: u64 = a.range.len;
                     const k: usize = @min(prof_census.AL_BUCKETS - 1, std.math.log2_int(u64, @max(2, n) - 1));

@@ -11,7 +11,7 @@ const engine = @import("nix");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
-const run = @import("run.zig");
+const eval_support = @import("eval_support.zig");
 
 const Evaluator = engine.Evaluator;
 const EnvMap = std.process.Environ.Map;
@@ -24,7 +24,7 @@ pub const synopsis =
     \\With `-- cmd args`, run that command in the environment instead of a shell.
 ;
 
-pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .shell);
@@ -56,7 +56,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
     const build_sink = if (term.show_progress) build_progress.sink() else null;
 
-    const label = if (options.packages.items.len > 0) "packages" else run.sourceLabel(options.source.?);
+    const label = if (options.packages.items.len > 0) "packages" else eval_support.sourceLabel(options.source.?);
     ev.progressSessionBegin(label);
     ev.startProgressSampler();
 
@@ -89,7 +89,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const nixpkgs = ev.evaluate("import <nixpkgs> { }") catch |err| {
         ev.stopProgressSampler();
-        return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, "import <nixpkgs> {}", err);
+        return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, "import <nixpkgs> {}", err);
     };
 
     var derived: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -101,7 +101,7 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     for (options.packages.items) |name| {
         const drv = (ev.attrPathValue(nixpkgs, name) catch |err| {
             ev.stopProgressSampler();
-            return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, name, err);
+            return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, name, err);
         }) orelse {
             ev.stopProgressSampler();
             std.debug.print("error: '{s}' not found in <nixpkgs>\n", .{name});
@@ -109,7 +109,7 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
         };
         const drv_path = (ev.derivationDrvPath(drv) catch |err| {
             ev.stopProgressSampler();
-            return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, name, err);
+            return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, name, err);
         }) orelse {
             ev.stopProgressSampler();
             std.debug.print("error: '{s}' is not a derivation\n", .{name});
@@ -124,11 +124,11 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     // heap (see build.zig) concurrently with the build phase, which can run
     // for minutes and needs only the daemon connection.
     var build_session = ev.beginBuildPhase(derived.items) catch |err| {
-        return run.buildFailure(ev.lastStoreError(), err);
+        return eval_support.buildFailure(ev.lastStoreError(), err);
     };
     defer build_session.deinit();
-    build_session.buildPaths(derived.items, sink, run.buildMode(options)) catch |err| {
-        return run.buildFailure(build_session.lastStoreError(), err);
+    build_session.buildPaths(derived.items, sink, eval_support.buildMode(options)) catch |err| {
+        return eval_support.buildFailure(build_session.lastStoreError(), err);
     };
     return null;
 }
@@ -140,19 +140,19 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
-    const source = run.getSource(ev, source_arg, options) catch |err| {
+    const source = eval_support.getSource(ev, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
     defer source.deinit(ev.allocator);
 
-    const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
+    const result = ev.evaluatePath(source.text, eval_support.sourcePathOf(source_arg, source)) catch |err| {
         ev.stopProgressSampler();
-        return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
+        return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
     };
     const drv_path = (ev.derivationDrvPath(result) catch |err| {
         ev.stopProgressSampler();
-        return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
+        return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
     }) orelse {
         ev.stopProgressSampler();
         std.debug.print("error: expression did not evaluate to a derivation\n", .{});
@@ -166,11 +166,11 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     // See realizePackages: results are copied out, so free the language heap
     // concurrently with the build phase.
     var build_session = ev.beginBuildPhase(&.{derived}) catch |err| {
-        return run.buildFailure(ev.lastStoreError(), err);
+        return eval_support.buildFailure(ev.lastStoreError(), err);
     };
     defer build_session.deinit();
-    build_session.buildPaths(&.{derived}, sink, run.buildMode(options)) catch |err| {
-        return run.buildFailure(build_session.lastStoreError(), err);
+    build_session.buildPaths(&.{derived}, sink, eval_support.buildMode(options)) catch |err| {
+        return eval_support.buildFailure(build_session.lastStoreError(), err);
     };
     return null;
 }

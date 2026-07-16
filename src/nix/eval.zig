@@ -424,7 +424,7 @@ fn firstMappedOffset(chunk: *const bytecode.chunk.Chunk) ?u32 {
 /// table by construction.
 pub const StoreState = struct {
     allocator: std.mem.Allocator,
-    derivations: RealizationStore,
+    realization: RealizationStore,
     daemon_runtime: *daemon_runtime_mod.DaemonRuntime,
 
     fn init(allocator: std.mem.Allocator) !StoreState {
@@ -433,28 +433,28 @@ pub const StoreState = struct {
         runtime_ptr.* = daemon_runtime_mod.DaemonRuntime.init();
         errdefer runtime_ptr.deinit();
 
-        var derivations = RealizationStore.init(allocator);
-        derivations.setOffload(runtime_ptr, io_offload.runOnPool, io_offload.fiberPark);
-        return .{ .allocator = allocator, .derivations = derivations, .daemon_runtime = runtime_ptr };
+        var realization_store = RealizationStore.init(allocator);
+        realization_store.setOffload(runtime_ptr, io_offload.runOnPool, io_offload.fiberPark);
+        return .{ .allocator = allocator, .realization = realization_store, .daemon_runtime = runtime_ptr };
     }
 
     fn deinit(self: *StoreState) void {
-        self.derivations.clearOffload();
+        self.realization.clearOffload();
         self.daemon_runtime.deinit();
         self.allocator.destroy(self.daemon_runtime);
-        self.derivations.deinit();
+        self.realization.deinit();
     }
 
     pub fn buildPaths(self: *StoreState, paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
-        return self.derivations.buildPaths(paths, sink, mode);
+        return self.realization.buildPaths(paths, sink, mode);
     }
 
     pub fn lastError(self: *StoreState) ?[]const u8 {
-        return self.derivations.lastStoreError();
+        return self.realization.lastStoreError();
     }
 
     pub fn addIndirectRoot(self: *StoreState, link_path: []const u8) !void {
-        return self.derivations.addIndirectRoot(link_path);
+        return self.realization.addIndirectRoot(link_path);
     }
 };
 
@@ -720,7 +720,7 @@ pub const Evaluator = struct {
         self.search_paths.deinit(self.allocator);
         self.fetchers.deinit();
         self.regexes.deinit();
-        self.store.derivations.releaseRecipePayloads();
+        self.store.realization.releaseRecipePayloads();
         self.files.deinit();
         self.heap.deinit();
         // Free deferred-compile state after the heap (whose thunks
@@ -751,7 +751,7 @@ pub const Evaluator = struct {
     }
 
     pub fn setDerivationDebug(self: *Evaluator, enabled: bool) void {
-        self.store.derivations.setDebugEnabled(enabled);
+        self.store.realization.setDebugEnabled(enabled);
     }
 
     /// Cap concurrent fetches (`http-connections`; 0 = unlimited).
@@ -777,13 +777,13 @@ pub const Evaluator = struct {
     }
 
     pub fn derivationDebugRecords(self: *const Evaluator) []const derivation.DebugRecord {
-        return self.store.derivations.debugRecords();
+        return self.store.realization.debugRecords();
     }
 
     pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
         self.files.setIo(io);
         self.fetchers.setIo(io);
-        self.store.derivations.setIo(io);
+        self.store.realization.setIo(io);
         if (self.base_path) |path| self.allocator.free(path);
         self.base_path = try std.process.currentPathAlloc(io, self.allocator);
     }
@@ -791,7 +791,7 @@ pub const Evaluator = struct {
     pub fn setFileIo(self: *Evaluator, io: std.Io) void {
         self.files.setIo(io);
         self.fetchers.setIo(io);
-        self.store.derivations.setIo(io);
+        self.store.realization.setIo(io);
     }
 
     /// Point the base path (used to resolve relative path literals like `./x`)
@@ -855,15 +855,15 @@ pub const Evaluator = struct {
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
         self.progress_control.setSink(progress);
-        // The derivation store does its real store work (`.drv` writes, source
+        // The realization service does its real store work (`.drv` writes, source
         // serializes) off the demand fiber, so it reports via the thread-safe span
         // sink. It must not import observ (same module layer), so hand it opaque
         // hooks bound to this evaluator; they map its groups onto the live sink's
         // and read the spans half. A null ctx clears them.
-        self.store.derivations.setSpanHooks(
+        self.store.realization.setSpanHooks(
             if (progress != null) self else null,
-            drvSpanBegin,
-            drvSpanEnd,
+            realizationSpanBegin,
+            realizationSpanEnd,
         );
         // Nothing to sync on the worker: the demand-only handles are passed
         // per top-level entry (`runWithVm` → `runTopLevel`), so a sink
@@ -871,11 +871,11 @@ pub const Evaluator = struct {
         // the next entry automatically.
     }
 
-    /// Adapters bridging the derivation store's opaque span hooks to this
+    /// Adapters bridging the realization service's opaque span hooks to this
     /// evaluator's live `SpanSink` (the store can't name observ types), mapping the
     /// store's local `SpanGroup` onto the observ group. `ctx` is the `*Evaluator`;
     /// both no-op if the sink was cleared mid-run.
-    fn drvSpanBegin(ctx: *anyopaque, group: realization.SpanGroup, label: []const u8) usize {
+    fn realizationSpanBegin(ctx: *anyopaque, group: realization.SpanGroup, label: []const u8) usize {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
         const spans = (self.progress_control.sink orelse return 0).spans;
         const observ_group: eval_progress.SpanGroup = switch (group) {
@@ -885,7 +885,7 @@ pub const Evaluator = struct {
         return spans.beginSpan(observ_group, label).token;
     }
 
-    fn drvSpanEnd(ctx: *anyopaque, token: usize) void {
+    fn realizationSpanEnd(ctx: *anyopaque, token: usize) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
         const spans = (self.progress_control.sink orelse return).spans;
         spans.endSpan(.{ .token = token });
@@ -1319,7 +1319,7 @@ pub const Evaluator = struct {
         }
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
-        self.store.derivations.clearDebugRecords();
+        self.store.realization.clearDebugRecords();
         // Not routed through `evaluateSource`: its top-level detection is
         // `source_path == null`, so passing the path there would send the
         // top-level eval down the nested-import path (wrong fiber). Attribute
@@ -1405,7 +1405,7 @@ pub const Evaluator = struct {
             .heap = &self.heap,
             .files = &self.files,
             .fetchers = &self.fetchers,
-            .derivations = &self.store.derivations,
+            .realization = &self.store.realization,
             .scheduler = &self.scheduler,
             // Helpers (worker_id != 0) don't write to the shared trace —
             // it's a side effect of *real* evaluation, so speculative force
@@ -1479,12 +1479,12 @@ pub const Evaluator = struct {
     /// are forced (`fix instantiate`/`build`). The daemon connects lazily on
     /// first use; plain eval leaves this off and never touches the store.
     pub fn enableStoreWrites(self: *Evaluator) void {
-        self.store.derivations.enableStoreWrites();
+        self.store.realization.enableStoreWrites();
     }
 
     /// The last daemon error message, for surfacing `error.DaemonError`.
     pub fn lastStoreError(self: *Evaluator) ?[]const u8 {
-        return self.store.derivations.lastStoreError();
+        return self.store.realization.lastStoreError();
     }
 
     /// If `value` is a derivation (an attrset with a `drvPath`), force it — which
@@ -1542,7 +1542,7 @@ pub const Evaluator = struct {
     /// is materialized — for `instantiate`, and before a build. Must run before
     /// eval state is released (it reads the recipe graph).
     pub fn ensureDerivationClosure(self: *Evaluator, drv_path: []const u8) !void {
-        return self.store.derivations.ensureClosure(drv_path);
+        return self.store.realization.ensureClosure(drv_path);
     }
 
     /// Finish evaluation and return the only state needed by the build phase.
@@ -1555,7 +1555,7 @@ pub const Evaluator = struct {
         // daemon can't build a `.drv` whose closure isn't on disk yet.)
         for (derived_paths) |derived| {
             const drv = derived[0..(std.mem.indexOfScalar(u8, derived, '!') orelse derived.len)];
-            try self.store.derivations.ensureClosure(drv);
+            try self.store.realization.ensureClosure(drv);
         }
         // Now release on a helper thread so the build launches immediately and
         // the ~2 GB heap teardown overlaps it. If the thread can't spawn, fall
@@ -1570,12 +1570,12 @@ pub const Evaluator = struct {
     /// Set the per-connection daemon settings (`--cores`/`--max-jobs`/… via
     /// `set_options`) applied when the store connects. See `setup.configure`.
     pub fn setDaemonBuildSettings(self: *Evaluator, settings: host.store.BuildSettings) !void {
-        return self.store.derivations.setBuildSettings(settings);
+        return self.store.realization.setBuildSettings(settings);
     }
 
     /// Override the nix-daemon socket path (`$NIX_DAEMON_SOCKET_PATH`).
     pub fn setDaemonSocket(self: *Evaluator, path: []const u8) !void {
-        return self.store.derivations.setDaemonSocket(path);
+        return self.store.realization.setDaemonSocket(path);
     }
 
     /// Navigate a dotted attr path (e.g. `python3Packages.requests`) from `value`,

@@ -11,14 +11,14 @@ const types = @import("types.zig");
 const AttrEntry = heap_mod.AttrEntry;
 const ObjectHeap = heap_mod.ObjectHeap;
 const InternId = @import("runtime").types.InternId;
-const Output = types.Output;
-const Spec = types.Spec;
+const ValueOutput = types.ValueOutput;
+const ValueSpec = types.ValueSpec;
 
 pub fn buildValue(
     allocator: std.mem.Allocator,
     intern: *InternTable,
     heap: *ObjectHeap,
-    spec: Spec,
+    spec: ValueSpec,
 ) !Value {
     const output_values = try allocator.alloc(Value, spec.outputs.len);
     defer allocator.free(output_values);
@@ -34,7 +34,7 @@ pub fn buildStrictValue(
     allocator: std.mem.Allocator,
     intern: *InternTable,
     heap: *ObjectHeap,
-    spec: Spec,
+    spec: ValueSpec,
 ) !Value {
     var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
     defer entries.deinit(allocator);
@@ -57,8 +57,8 @@ fn buildSelectedValue(
     allocator: std.mem.Allocator,
     intern: *InternTable,
     heap: *ObjectHeap,
-    spec: Spec,
-    selected: Output,
+    spec: ValueSpec,
+    selected: ValueOutput,
     output_values: ?[]const Value,
 ) !Value {
     var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
@@ -121,7 +121,7 @@ fn outputReferenceValues(
     allocator: std.mem.Allocator,
     intern: *InternTable,
     heap: *ObjectHeap,
-    spec: Spec,
+    spec: ValueSpec,
 ) ![]Value {
     const values = try allocator.alloc(Value, spec.outputs.len);
     errdefer allocator.free(values);
@@ -134,8 +134,8 @@ fn outputReferenceValues(
 fn buildOutputReferenceValue(
     intern: *InternTable,
     heap: *ObjectHeap,
-    spec: Spec,
-    output: Output,
+    spec: ValueSpec,
+    output: ValueOutput,
 ) !Value {
     const entries = [_]AttrEntry{
         .{
@@ -158,7 +158,7 @@ fn buildOutputReferenceValue(
     return Value.attrs(try heap.addAttrs(&entries));
 }
 
-pub fn isSyntheticName(intern: *InternTable, name: []const u8, outputs: []const Output) bool {
+pub fn isSyntheticName(intern: *InternTable, name: []const u8, outputs: []const ValueOutput) bool {
     const synthetic = [_][]const u8{ "type", "outputName", "outPath", "drvPath", "drvAttrs", "outputs", "all" };
     for (synthetic) |candidate| {
         if (std.mem.eql(u8, name, candidate)) return true;
@@ -172,7 +172,7 @@ pub fn isSyntheticName(intern: *InternTable, name: []const u8, outputs: []const 
 fn outputNamesList(
     allocator: std.mem.Allocator,
     heap: *ObjectHeap,
-    outputs: []const Output,
+    outputs: []const ValueOutput,
 ) !heap_mod.ObjectId {
     const values = try allocator.alloc(Value, outputs.len);
     defer allocator.free(values);
@@ -199,7 +199,7 @@ fn outputPathString(
     intern: *InternTable,
     heap: *ObjectHeap,
     drv_path: InternId,
-    output: Output,
+    output: ValueOutput,
 ) !Value {
     const output_values = [_]Value{Value.string(output.name)};
     const outputs = [_]AttrEntry{
@@ -212,7 +212,7 @@ fn outputPathString(
     return Value.contextString(try heap.addContextString(output.out_path, &context));
 }
 
-fn outputByName(outputs: []const Output, name: InternId) ?Output {
+fn outputByName(outputs: []const ValueOutput, name: InternId) ?ValueOutput {
     for (outputs) |output| {
         if (output.name == name) return output;
     }

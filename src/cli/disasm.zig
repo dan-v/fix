@@ -12,7 +12,7 @@ const bytecode = engine.bytecode;
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
-const runner = @import("run.zig");
+const runner = @import("eval_support.zig");
 
 const Evaluator = engine.Evaluator;
 const ChunkId = engine.types.ChunkId;

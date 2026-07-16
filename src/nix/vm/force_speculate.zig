@@ -11,7 +11,7 @@ const BuiltinId = @import("runtime").builtins.BuiltinId;
 /// `FIX_SPEC_NOVEL` selector for `makeThunk`: is this closure the first
 /// speculative instance of its chunk? (Test-and-set — call at most once
 /// per submission, only when the knob is on.)
-pub fn novelClosureChunk(self: *VM, closure: Value) bool {
+pub fn isNovelClosureChunk(self: *VM, closure: Value) bool {
     if (!closure.isClosure()) return false;
     const c = self.heap.getClosure(closure.asObjectId()) catch return false;
     return self.registry.markSpecSubmitted(c.chunk_id);

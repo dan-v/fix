@@ -12,14 +12,14 @@ const SpinMutex = @import("nix").base.sync.SpinMutex;
 // Command modules, re-exported so `main.zig` reaches them through the `cli`
 // module by name instead of importing `src/cli/*.zig` by relative path.
 pub const args = @import("args.zig");
-pub const run = @import("run.zig");
+pub const eval_support = @import("eval_support.zig");
 pub const setup = @import("setup.zig");
 pub const nix_conf = @import("nix_conf.zig");
 pub const eval = @import("eval.zig");
 pub const parse = @import("parse.zig");
 pub const instantiate = @import("instantiate.zig");
 pub const build = @import("build.zig");
-pub const runcmd = @import("runcmd.zig");
+pub const run = @import("run.zig");
 pub const shell = @import("shell.zig");
 pub const @"switch" = @import("switch.zig");
 pub const build_progress = @import("build_progress.zig");
@@ -61,7 +61,7 @@ pub fn isHelpFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
-pub fn stderrInteractive(io: std.Io, env: *const std.process.Environ.Map) bool {
+pub fn isStderrInteractive(io: std.Io, env: *const std.process.Environ.Map) bool {
     if (env.get("TERM")) |term| {
         if (std.mem.eql(u8, term, "dumb")) return false;
     }
@@ -72,7 +72,7 @@ pub fn shouldColor(mode: When, io: std.Io, env: *const std.process.Environ.Map) 
     return switch (mode) {
         .always => true,
         .never => false,
-        .auto => autoColor(stderrInteractive(io, env), env),
+        .auto => autoColor(isStderrInteractive(io, env), env),
     };
 }
 
@@ -86,7 +86,7 @@ pub fn shouldProgress(mode: When, io: std.Io, env: *const std.process.Environ.Ma
     return switch (mode) {
         .always => true,
         .never => false,
-        .auto => stderrInteractive(io, env),
+        .auto => isStderrInteractive(io, env),
     };
 }
 

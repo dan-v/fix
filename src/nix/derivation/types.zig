@@ -1,6 +1,6 @@
 //! Shared data types for the derivation model: outputs, inputs, env vars,
 //! hash-modulo (owned + borrowed views), computed paths, debug records, the
-//! resolver interface, and the Spec used to build the runtime derivation Value.
+//! resolver interface, and the ValueSpec used to build the runtime derivation Value.
 
 const std = @import("std");
 const heap_mod = @import("runtime").heap;
@@ -11,7 +11,7 @@ const clone = @import("clone.zig");
 
 const AttrEntry = heap_mod.AttrEntry;
 
-pub const Output = struct {
+pub const ValueOutput = struct {
     name: InternId,
     out_path: InternId,
 };
@@ -134,10 +134,10 @@ pub const ComputedPaths = struct {
     drv_text_references: []const []const u8,
 };
 
-pub const Spec = struct {
+pub const ValueSpec = struct {
     drv_path: InternId,
     default_output: InternId,
-    outputs: []const Output,
+    outputs: []const ValueOutput,
     explicit_outputs: bool,
     original_attrs: []const AttrEntry,
 };

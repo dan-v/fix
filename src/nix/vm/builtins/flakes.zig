@@ -436,7 +436,7 @@ fn buildNodeThunk(self: anytype, nodes: std.json.ObjectMap, node_name: []const u
 /// uses an offline synthetic), and only for the tree types whose NAR hash is
 /// confirmed to match Nix (forges/tarball/path); git/mercurial/file are skipped.
 fn verifyLockedNarHash(self: anytype, ref_attrs: Value, src_info: Value) !void {
-    if (!self.derivations.storeWritesEnabled()) return;
+    if (!self.realization.storeWritesEnabled()) return;
     if (!ref_attrs.isAttrs()) return;
     const ty = (try optionalStringAttr(self, ref_attrs.asObjectId(), "type")) orelse return;
     defer self.allocator.free(ty);
@@ -461,7 +461,7 @@ fn verifyLockedNarHash(self: anytype, ref_attrs: Value, src_info: Value) !void {
 /// Reuses the same store-path scheme (`sourcePath`) and value constructors the
 /// real fetch would, so a skipped fetch is indistinguishable from a real one.
 fn flakeInputFromStore(self: anytype, attrs: Value) !?Value {
-    if (!self.derivations.storeWritesEnabled()) return null;
+    if (!self.realization.storeWritesEnabled()) return null;
     if (!attrs.isAttrs()) return null;
     const id = attrs.asObjectId();
     const nar_hash = (try optionalStringAttr(self, id, "narHash")) orelse return null;
@@ -488,9 +488,9 @@ fn flakeInputFromStore(self: anytype, attrs: Value) !?Value {
 
     const hex = derivation.hashToBase16(self.allocator, "sha256", nar_hash) catch return null;
     defer self.allocator.free(hex);
-    const store_path = try derivation.sourcePath(self.allocator, self.derivations.store_dir, name, hex);
+    const store_path = try derivation.sourcePath(self.allocator, self.realization.store_dir, name, hex);
     defer self.allocator.free(store_path);
-    if (!try self.derivations.pathIsValid(store_path)) return null;
+    if (!try self.realization.pathIsValid(store_path)) return null;
 
     if (is_forge) {
         const rev = try optionalStringAttr(self, id, "rev");

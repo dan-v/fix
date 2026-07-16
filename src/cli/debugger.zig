@@ -60,7 +60,7 @@ pub const Console = struct {
         return self.drive(session);
     }
 
-    fn reader_(self: *Console) *std.Io.File.Reader {
+    fn inputReader(self: *Console) *std.Io.File.Reader {
         if (self.ext_reader) |r| return r;
         if (self.reader == null) {
             self.reader = std.Io.File.stdin().readerStreaming(self.io, &self.stdin_buf);
@@ -87,7 +87,7 @@ pub const Console = struct {
             try self.banner(w, s);
         }
 
-        var in = self.reader_();
+        var in = self.inputReader();
         while (true) {
             {
                 var out = self.stderr();

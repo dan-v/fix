@@ -35,7 +35,7 @@ const builtin = @import("builtin");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const arena_mod = @import("base").arena;
 const clock = @import("base").clock;
 const scheduler_mod = @import("../scheduler.zig");
@@ -142,7 +142,7 @@ pub const WorkerFiber = struct {
     /// RIP / crash. The mutex makes those calls strictly sequential.
     /// `ReadyNode.queued` independently prevents double-enqueue, so
     /// in normal flow the mutex is uncontended.
-    run_mu: stable.SpinMutex,
+    run_mu: sync.SpinMutex,
     /// Task currently assigned to this fiber. Read by the fiber's entry
     /// on first run; nil'd before processing so a recycled fiber sees a
     /// fresh assignment on its next reset.
@@ -232,7 +232,7 @@ pub const Worker = struct {
     /// resident forever, and 99.9% of tasks are served by the first
     /// (still-warm) `prewarm_fiber_count` fibers.
     free_count: u32,
-    free_mu: stable.SpinMutex,
+    free_mu: sync.SpinMutex,
 
     shutdown_requested: std.atomic.Value(u8),
 
@@ -1225,7 +1225,7 @@ test "Worker basic init/deinit" {
         heap: ObjectHeap,
         files: FileCache,
         fetchers: FetchCache,
-        derivations: RealizationStore,
+        realization: RealizationStore,
         sched: *Scheduler,
         arena: arena_mod.ArenaAllocator,
 
@@ -1238,7 +1238,7 @@ test "Worker basic init/deinit" {
                 .heap = &self.heap,
                 .files = &self.files,
                 .fetchers = &self.fetchers,
-                .derivations = &self.derivations,
+                .realization = &self.realization,
                 .scheduler = self.sched,
             });
         }
@@ -1250,7 +1250,7 @@ test "Worker basic init/deinit" {
         .heap = try ObjectHeap.init(testing.allocator, 2),
         .files = FileCache.init(testing.allocator),
         .fetchers = FetchCache.init(testing.allocator),
-        .derivations = RealizationStore.init(testing.allocator),
+        .realization = RealizationStore.init(testing.allocator),
         .sched = &sched,
         .arena = arena_mod.ArenaAllocator.init(testing.allocator),
     };
@@ -1260,7 +1260,7 @@ test "Worker basic init/deinit" {
         ctx.heap.deinit();
         ctx.files.deinit();
         ctx.fetchers.deinit();
-        ctx.derivations.deinit();
+        ctx.realization.deinit();
         ctx.arena.deinit();
     }
 

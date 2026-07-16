@@ -19,8 +19,8 @@ const HashModulo = derivation.HashModulo;
 const HashModuloResolver = derivation.HashModuloResolver;
 const HashModuloView = derivation.HashModuloView;
 const OutputHash = derivation.OutputHash;
-const Output = derivation.Output;
-const Spec = derivation.Spec;
+const ValueOutput = derivation.ValueOutput;
+const ValueSpec = derivation.ValueSpec;
 const hashToBase16 = derivation.hashToBase16;
 const storeDigest = derivation.storeDigest;
 const outputPathName = derivation.outputPathName;
@@ -609,7 +609,7 @@ test "isSyntheticName recognizes reserved attrs and declared output names but no
     defer intern.deinit();
 
     const out_id = try intern.intern("out");
-    const outputs = [_]Output{.{ .name = out_id, .out_path = out_id }};
+    const outputs = [_]ValueOutput{.{ .name = out_id, .out_path = out_id }};
 
     try std.testing.expect(value_mod.isSyntheticName(&intern, "type", &outputs));
     try std.testing.expect(value_mod.isSyntheticName(&intern, "drvAttrs", &outputs));
@@ -627,7 +627,7 @@ test "buildStrictValue exposes drvPath and each output path as plain attrs" {
     const out_name = try intern.intern("out");
     const out_path = try intern.intern("/nix/store/pkg-out");
 
-    const spec: Spec = .{
+    const spec: ValueSpec = .{
         .drv_path = drv_path,
         .default_output = out_name,
         .outputs = &.{.{ .name = out_name, .out_path = out_path }},

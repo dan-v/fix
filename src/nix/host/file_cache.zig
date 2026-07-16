@@ -15,7 +15,7 @@
 //! single-file-at-a-time pipeline and a fan-out.
 
 const std = @import("std");
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const vma = @import("runtime").mem_tag.vma;
 
 pub const FileCache = struct {
@@ -28,7 +28,7 @@ pub const FileCache = struct {
     entries: std.StringHashMapUnmanaged(*Entry),
     /// Protects the hashmap structure only. Held briefly during
     /// lookup / insert, never across I/O.
-    map_mu: stable.BlockingMutex = .{},
+    map_mu: sync.BlockingMutex = .{},
 
     const max_read_bytes = 128 * 1024 * 1024;
 
@@ -105,7 +105,7 @@ pub const FileCache = struct {
         /// concurrent reader for the same path waits on the in-flight
         /// fetch rather than duplicating it. Different paths get
         /// different entries → different mutexes → fully parallel.
-        mu: stable.BlockingMutex = .{},
+        mu: sync.BlockingMutex = .{},
         exists_known: bool = false,
         exists: bool = false,
         kind: ?FileKind = null,

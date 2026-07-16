@@ -5,7 +5,7 @@
 //! source ingestion, daemon connections, and builds belong to `realization`.
 
 const std = @import("std");
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const debug_record_mod = @import("debug_record.zig");
 const drv_mod = @import("drv.zig");
 const types = @import("types.zig");
@@ -24,7 +24,7 @@ pub const Registry = struct {
     records: std.StringHashMapUnmanaged(Record) = .empty,
     debug_enabled: bool = false,
     debug_records: std.ArrayListUnmanaged(DebugRecord) = .empty,
-    mu: stable.BlockingMutex = .{},
+    mu: sync.BlockingMutex = .{},
 
     const Record = struct {
         hash_modulo: HashModulo,

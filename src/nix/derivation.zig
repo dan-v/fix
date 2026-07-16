@@ -26,7 +26,7 @@ const std = @import("std");
 /// `builtins.toFile`, and derivation construction.
 pub const store_name = @import("derivation/store_name.zig");
 
-pub const Output = dtypes.Output;
+pub const ValueOutput = dtypes.ValueOutput;
 pub const DrvOutput = dtypes.DrvOutput;
 pub const DrvInput = dtypes.DrvInput;
 pub const OutputHash = dtypes.OutputHash;
@@ -37,7 +37,7 @@ pub const DebugRecord = dtypes.DebugRecord;
 pub const HashModuloResolver = dtypes.HashModuloResolver;
 pub const EnvVar = dtypes.EnvVar;
 pub const ComputedPaths = dtypes.ComputedPaths;
-pub const Spec = dtypes.Spec;
+pub const ValueSpec = dtypes.ValueSpec;
 
 pub const Drv = drv_mod.Drv;
 pub const sourcePath = path_mod.sourcePath;
@@ -53,7 +53,7 @@ pub fn buildValue(
     allocator: std.mem.Allocator,
     intern: *InternTable,
     heap: *heap_mod.ObjectHeap,
-    spec: Spec,
+    spec: ValueSpec,
 ) !Value {
     return value_builder.buildValue(allocator, intern, heap, spec);
 }
@@ -62,7 +62,7 @@ pub fn buildStrictValue(
     allocator: std.mem.Allocator,
     intern: *InternTable,
     heap: *heap_mod.ObjectHeap,
-    spec: Spec,
+    spec: ValueSpec,
 ) !Value {
     return value_builder.buildStrictValue(allocator, intern, heap, spec);
 }

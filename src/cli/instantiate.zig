@@ -7,7 +7,7 @@ const engine = @import("nix");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
-const run = @import("run.zig");
+const eval_support = @import("eval_support.zig");
 const build = @import("build.zig");
 
 const Evaluator = engine.Evaluator;
@@ -20,7 +20,7 @@ pub const synopsis =
     \\the flake in the current directory).
 ;
 
-pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .instantiate);
@@ -46,7 +46,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         return 2;
     }
 
-    const source = run.getSource(&ev, source_arg, options) catch |err| {
+    const source = eval_support.getSource(&ev, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -65,7 +65,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     ev.startProgressSampler();
     defer ev.stopProgressSampler();
 
-    const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
+    const result = ev.evaluatePath(source.text, eval_support.sourcePathOf(source_arg, source)) catch |err| {
         return storeOrEvalFailure(init, term, options, &ev, source.text, err);
     };
     const drv_path = ev.derivationDrvPath(result) catch |err| {

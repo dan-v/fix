@@ -219,8 +219,8 @@ pub const VM = struct {
     files: *FileCache,
     /// Evaluator-owned network/source fetch cache.
     fetchers: *FetchCache,
-    /// Evaluator-owned normalized derivation graph/cache.
-    derivations: *RealizationStore,
+    /// Evaluator-owned realization service for recipes, store I/O, and builds.
+    realization: *RealizationStore,
     /// Global scheduler (for spawning work).
     scheduler: *Scheduler,
     /// Evaluator-owned error trace collector.
@@ -394,7 +394,7 @@ pub const VM = struct {
         heap: *ObjectHeap,
         files: *FileCache,
         fetchers: *FetchCache,
-        derivations: *RealizationStore,
+        realization: *RealizationStore,
         scheduler: *Scheduler,
         trace_sink: ?*eval_trace.Trace = null,
         progress_spans: ?eval_progress.SpanSink = null,
@@ -431,7 +431,7 @@ pub const VM = struct {
             .heap = options.heap,
             .files = options.files,
             .fetchers = options.fetchers,
-            .derivations = options.derivations,
+            .realization = options.realization,
             .scheduler = options.scheduler,
             .trace = options.trace_sink,
             .progress_spans = options.progress_spans,

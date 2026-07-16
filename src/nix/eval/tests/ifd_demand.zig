@@ -52,8 +52,8 @@ const DemandFixture = struct {
         var ev = try Evaluator.init(allocator, workers);
         errdefer ev.deinit();
         ev.setFileIo(std.testing.io);
-        ev.store.derivations.store_dir = store_dir;
-        ev.store.derivations.setDaemonSocketBorrowedForTest(fake.socketPath());
+        ev.store.realization.store_dir = store_dir;
+        ev.store.realization.setDaemonSocketBorrowedForTest(fake.socketPath());
 
         return .{
             .allocator = allocator,

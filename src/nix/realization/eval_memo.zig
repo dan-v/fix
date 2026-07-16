@@ -1,7 +1,7 @@
 //! Evaluation-local memoization for lazy derivations and source ingestion.
 
 const std = @import("std");
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 
 const source_ingest_stripes = 64;
 
@@ -13,10 +13,10 @@ pub const SourceMemoHit = struct { store_path: []u8, nar_hash: []u8 };
 pub const EvalMemo = struct {
     allocator: std.mem.Allocator,
     lazy_drv_cache: std.AutoHashMapUnmanaged(u32, LazyDrvEntry) = .empty,
-    lazy_drv_mu: stable.SpinMutex = .{},
+    lazy_drv_mu: sync.SpinMutex = .{},
     source_memo: std.StringHashMapUnmanaged(SourceMemoEntry) = .empty,
-    source_memo_mu: stable.SpinMutex = .{},
-    source_ingest_locks: [source_ingest_stripes]stable.BlockingMutex = @splat(.{}),
+    source_memo_mu: sync.SpinMutex = .{},
+    source_ingest_locks: [source_ingest_stripes]sync.BlockingMutex = @splat(.{}),
 
     pub fn init(allocator: std.mem.Allocator) EvalMemo {
         return .{ .allocator = allocator };
@@ -47,7 +47,7 @@ pub const EvalMemo = struct {
         return std.fmt.allocPrint(allocator, "{c}{s}\x00{s}", .{ rf, name, path });
     }
 
-    pub fn sourceIngestLock(self: *EvalMemo, path: []const u8, name: []const u8) *stable.BlockingMutex {
+    pub fn sourceIngestLock(self: *EvalMemo, path: []const u8, name: []const u8) *sync.BlockingMutex {
         var hash = std.hash.Wyhash.init(0);
         hash.update(path);
         hash.update(&[_]u8{0});

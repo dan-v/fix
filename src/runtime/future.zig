@@ -16,7 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const TargetKind = @import("thunk.zig").TargetKind;
 
 /// `-Dprof-main` age-at-force probe support: every Future carries its
@@ -157,7 +157,7 @@ pub const Future = struct {
     /// only under `waiters_mu`. Empty in the common (uncontended) case
     /// where the claimer resolves before any other fiber tries to force.
     waiters_head: ?*Waiter,
-    waiters_mu: stable.SpinMutex,
+    waiters_mu: sync.SpinMutex,
     /// Creation TSC for the `-Dprof-main` age-at-force probe; zero bytes
     /// (`void`) on normal builds. See `created_tsc_enabled`.
     created_tsc: CreatedTsc,

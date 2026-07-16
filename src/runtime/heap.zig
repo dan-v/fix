@@ -26,7 +26,7 @@ const types = @import("types.zig");
 /// traps at the first stale read with a stack trace, instead of a
 /// nondeterministic segfault much later. Off in ReleaseFast (production).
 pub const gc_debug = builtin.mode == .ReleaseSafe;
-const stable = @import("base").segments;
+const segments = @import("base").segments;
 const sync = @import("base").sync;
 const worker_id_mod = @import("base").worker_id;
 /// GC collector driver: the non-inline mark/sweep/evac/minor-collect
@@ -75,7 +75,7 @@ pub const AttrPosEntry = struct {
 /// produces costs no physical memory.
 pub const OBJECT_MAX_SLOTS: u32 = 1 << 30;
 const mem_tag = @import("mem_tag.zig");
-const ObjectStore = stable.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS, .vma_tag = .objects }, mem_tag.vma);
+const ObjectStore = segments.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS, .vma_tag = .objects }, mem_tag.vma);
 // `huge_overlay_min`: the ≥64 MB doubling-tail segments get a NORESERVE
 // mapping + chunk-grown hugetlb prefix instead of a fully-mapped hugetlb
 // block — an up-front map bills the whole (mostly empty at peak) tail
@@ -83,9 +83,9 @@ const ObjectStore = stable.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS, .
 // the three stores on a NixOS toplevel. All three stores move their
 // cursors under `write_mu` only (no `appendAtomic`), which the overlay
 // requires. 64 MB keeps the (GC) nursery segments allocator-backed.
-const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024, .vma_tag = .values, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
-const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
-const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+const ValueStore = segments.StableSegments(Value, .{ .first_segment_size = 1024, .vma_tag = .values, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+const AttrStore = segments.StableSegments(AttrEntry, .{ .first_segment_size = 512, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+const AttrPosStore = segments.StableSegments(AttrPosEntry, .{ .first_segment_size = 512, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 
 pub var next_heap_token: std.atomic.Value(u64) = .init(1);
 
@@ -1594,18 +1594,18 @@ pub const ObjectHeap = struct {
         self.gc_major_gate = @max(GC_MAJOR_GATE_FLOOR, live_objects);
     }
 
-    pub fn get(self: *ObjectHeap, id: ObjectId) *Object {
+    pub fn getMut(self: *ObjectHeap, id: ObjectId) *Object {
         self.gcAssertLive(id);
         return self.objects.getMut(id);
     }
 
-    pub fn getConst(self: *const ObjectHeap, id: ObjectId) *const Object {
+    pub fn get(self: *const ObjectHeap, id: ObjectId) *const Object {
         self.gcAssertLive(id);
         return self.objects.get(id);
     }
 
     pub fn getList(self: *const ObjectHeap, id: ObjectId) ![]const Value {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .list => |range| self.values.slice(range),
             else => error.InvalidObjectType,
         };
@@ -1626,9 +1626,9 @@ pub const ObjectHeap = struct {
     /// callers (deep force, `==`, JSON/XML, `attrNames`) see a normal
     /// sorted entry slice. Non-const because flattening allocates.
     pub fn getAttrs(self: *ObjectHeap, id: ObjectId) ![]const AttrEntry {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .attrs => |a| self.attrs.slice(a.range),
-            .merge_attrs => self.attrs.slice(self.getConst(try self.flattenMerge(id)).attrs.range),
+            .merge_attrs => self.attrs.slice(self.get(try self.flattenMerge(id)).attrs.range),
             else => error.InvalidObjectType,
         };
     }
@@ -1642,12 +1642,12 @@ pub const ObjectHeap = struct {
     /// it stays const and feeds the hot inline cache). Once a node has
     /// been flattened it delegates to the flat object's binary search.
     pub fn getAttrValueOpt(self: *const ObjectHeap, id: ObjectId, name: InternId) anyerror!?Value {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .attrs => |a| binarySearchAttr(self.attrs.slice(a.range), name),
             .merge_attrs => |m| {
                 const flat = m.flattened.load(.acquire);
                 if (flat != NO_FLAT) {
-                    return binarySearchAttr(self.attrs.slice(self.getConst(flat).attrs.range), name);
+                    return binarySearchAttr(self.attrs.slice(self.get(flat).attrs.range), name);
                 }
                 if (try self.getAttrValueOpt(m.overlay, name)) |v| return v;
                 return self.getAttrValueOpt(m.base, name);
@@ -1657,7 +1657,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn getAttrPos(self: *const ObjectHeap, id: ObjectId, name: InternId) ?SourcePos {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .attrs => |a| if (a.positions.len == 0) null else self.findAttrPos(a.positions, name),
             // `//` is right-biased; report the overlay's position if it
             // defines the name, else the base's. Walks the chain rather
@@ -1671,7 +1671,7 @@ pub const ObjectHeap = struct {
     }
 
     fn attrContains(self: *const ObjectHeap, id: ObjectId, name: InternId) bool {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .attrs => |a| binarySearchAttrIndex(self.attrs.slice(a.range), name) != null,
             .merge_attrs => |m| self.attrContains(m.overlay, name) or self.attrContains(m.base, name),
             else => false,
@@ -1687,12 +1687,12 @@ pub const ObjectHeap = struct {
         // building a merge node or copying. An empty attrset is always a
         // plain `.attrs` of range.len 0 (merges of non-empties are never
         // empty). `{} // x` in the module fixpoint is common — see census.
-        const l = self.getConst(left_id).*;
+        const l = self.get(left_id).*;
         if (l == .attrs and l.attrs.range.len == 0) return right_id;
-        const r = self.getConst(right_id).*;
+        const r = self.get(right_id).*;
         if (r == .attrs and r.attrs.range.len == 0) return left_id;
 
-        const next_depth: u16 = switch (self.getConst(left_id).*) {
+        const next_depth: u16 = switch (self.get(left_id).*) {
             .attrs => |a| if (a.range.len < MERGE_LAYER_MIN) 0 else 1,
             .merge_attrs => |m| if (m.depth + 1 > MERGE_FLATTEN_DEPTH) 0 else m.depth + 1,
             else => 0,
@@ -1712,7 +1712,7 @@ pub const ObjectHeap = struct {
     /// the O(depth·N) intermediate attrs objects a recursive pairwise
     /// flatten would allocate.
     fn flattenMerge(self: *ObjectHeap, id: ObjectId) anyerror!ObjectId {
-        const cached = self.get(id).merge_attrs.flattened.load(.acquire);
+        const cached = self.getMut(id).merge_attrs.flattened.load(.acquire);
         if (cached != NO_FLAT) return cached;
 
         var leaves: std.ArrayListUnmanaged(ObjectId) = .empty;
@@ -1720,7 +1720,7 @@ pub const ObjectHeap = struct {
         try self.collectMergeLeaves(id, &leaves);
         const flat = try self.kwayMergeLeaves(leaves.items);
 
-        const prev = self.get(id).merge_attrs.flattened.cmpxchgStrong(NO_FLAT, flat, .acq_rel, .acquire);
+        const prev = self.getMut(id).merge_attrs.flattened.cmpxchgStrong(NO_FLAT, flat, .acq_rel, .acquire);
         // old→young barrier: the (possibly old) merge node now points at its
         // flattened attrs object. Only the CAS winner installed the edge.
         if (prev == null) self.gcRecordEdge(id, Value.attrs(flat));
@@ -1731,7 +1731,7 @@ pub const ObjectHeap = struct {
     /// in left-to-right (oldest-base → newest-overlay) precedence order.
     /// An already-flattened node contributes its cached flat leaf.
     fn collectMergeLeaves(self: *ObjectHeap, id: ObjectId, out: *std.ArrayListUnmanaged(ObjectId)) anyerror!void {
-        switch (self.getConst(id).*) {
+        switch (self.get(id).*) {
             .attrs => try out.append(self.allocator, id),
             .merge_attrs => |m| {
                 const f = m.flattened.load(.acquire);
@@ -1779,7 +1779,7 @@ pub const ObjectHeap = struct {
 
         var cap: u32 = 0;
         for (leaves, 0..) |leaf, i| {
-            slices[i] = self.attrs.slice(self.getConst(leaf).attrs.range);
+            slices[i] = self.attrs.slice(self.get(leaf).attrs.range);
             cursors[i] = 0;
             cap += @intCast(slices[i].len);
         }
@@ -1853,7 +1853,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn getClosure(self: *const ObjectHeap, id: ObjectId) !Closure {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .closure => |closure| .{
                 .chunk_id = closure.chunk_id,
                 .upvalues = self.values.slice(closure.upvalues),
@@ -1863,7 +1863,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn getBuiltinClosure(self: *const ObjectHeap, id: ObjectId) !BuiltinClosure {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .builtin_closure => |closure| .{
                 .builtin_id = closure.builtin_id,
                 .args = self.values.slice(closure.args),
@@ -1873,7 +1873,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn getPartialApp(self: *const ObjectHeap, id: ObjectId) !PartialApp {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .partial_app => |pa| .{
                 .func = pa.func,
                 .args = self.values.slice(pa.args),
@@ -1883,7 +1883,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn getContextString(self: *const ObjectHeap, id: ObjectId) !ContextString {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .context_string => |string| .{
                 .text = string.text,
                 .context = self.attrs.slice(string.context),
@@ -1893,7 +1893,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn getThunk(self: *ObjectHeap, id: ObjectId) !*Thunk {
-        return switch (self.get(id).*) {
+        return switch (self.getMut(id).*) {
             .thunk => |*thunk| thunk,
             else => error.InvalidObjectType,
         };
@@ -1904,7 +1904,7 @@ pub const ObjectHeap = struct {
     /// the object slot is a thunk. The release build elides the
     /// generated tag check; debug builds keep it.
     pub fn getThunkAssumeValid(self: *ObjectHeap, id: ObjectId) *Thunk {
-        return &self.get(id).thunk;
+        return &self.getMut(id).thunk;
     }
 
     pub fn addList(self: *ObjectHeap, items: []const Value) !ObjectId {
@@ -2194,7 +2194,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn getBoxedInt(self: *const ObjectHeap, id: ObjectId) !i64 {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .boxed_int => |v| v,
             else => error.InvalidObjectType,
         };
@@ -2389,7 +2389,7 @@ pub const ObjectHeap = struct {
     /// Borrow an attrset's source-position entries (empty slice when it
     /// has none or `id` is not an attrset).
     fn attrPositionsSlice(self: *const ObjectHeap, id: ObjectId) []const AttrPosEntry {
-        return switch (self.getConst(id).*) {
+        return switch (self.get(id).*) {
             .attrs => |a| if (a.positions.len == 0) &.{} else self.attr_positions.slice(a.positions),
             else => &.{},
         };

@@ -4,7 +4,7 @@ const std = @import("std");
 const types = @import("runtime").types;
 const OpCode = @import("../opcode.zig").OpCode;
 const Value = @import("runtime").value.Value;
-const stable = @import("base").segments;
+const segments = @import("base").segments;
 const sync = @import("base").sync;
 const name_tree_mod = @import("../name_tree.zig");
 const model = @import("model.zig");
@@ -80,7 +80,7 @@ pub const ChunkRegistry = struct {
         spec_submitted: std.atomic.Value(u8) = .init(0),
     };
 
-    const Store = stable.StableSegments(ChunkSlot, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
+    const Store = segments.StableSegments(ChunkSlot, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
     const dedup_shard_count = 64;
     /// One shard of the content-addressed dedup map. `align(cache_line)` on
@@ -297,7 +297,7 @@ pub const ChunkRegistry = struct {
     /// Whether `id` has an always-on qualified name.
     pub fn hasQualifiedName(self: *const ChunkRegistry, id: ChunkId) bool {
         const s = self.slot(id) orelse return false;
-        return self.name_tree.named(s.name);
+        return self.name_tree.isNamed(s.name);
     }
 
     /// Intern a child name under `parent` for `segment` (compiler use, during

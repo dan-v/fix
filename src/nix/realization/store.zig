@@ -6,7 +6,7 @@ const builtin = @import("builtin");
 const derivation = @import("../derivation.zig");
 const drv_mod = derivation.drv;
 const types = derivation.types;
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const runtime = @import("runtime");
 const host = @import("../host.zig");
 const rstore = host.store;
@@ -26,9 +26,9 @@ const OffloadFn = daemon_client.OffloadFn;
 /// on the thread itself (the main-thread realize / tests).
 const FiberParkFn = daemon_client.FiberParkFn;
 
-/// The progress-span groups the derivation store reports into. Mirrors the
-/// observ `SpanGroup`, but named locally: the derivation module must not import
-/// observ (same layer), so the eval layer maps these onto the real groups.
+/// The progress-span groups the realization service reports. Mirrors the
+/// evaluator's `SpanGroup`, but is named locally to keep this layer independent
+/// from evaluator progress types.
 pub const SpanGroup = recipe_graph.SpanGroup;
 
 /// Injected concurrent progress-span hooks for the store's real writes: a
@@ -616,7 +616,7 @@ pub const RealizationStore = struct {
 
             const visit: Visit = .{ .path = store_path, .claim = claim, .parent = parent };
             self.ensureClosureWriter(store_path, &visit) catch |err| {
-                if (retryableRealizationError(err)) {
+                if (isRetryableRealizationError(err)) {
                     self.finishRetryableClaim(store_path, claim, err);
                 } else {
                     claim.publish(.permanent_failure, err);
@@ -658,7 +658,7 @@ pub const RealizationStore = struct {
             // The build itself is offloaded to the pool (the demanding caller
             // parks / blocks); the `.drv` closure is already on disk above.
             self.buildPaths(&.{derived}, null, .normal) catch |err| {
-                if (retryableRealizationError(err)) {
+                if (isRetryableRealizationError(err)) {
                     self.finishRetryableClaim(derived, claim, err);
                 } else {
                     claim.publish(.permanent_failure, err);
@@ -781,7 +781,7 @@ pub const RealizationStore = struct {
     /// before calling `wake_fn`.
     const SemaphoreWaiter = struct {
         waiter: Waiter,
-        sem: stable.Semaphore = stable.Semaphore.init(0),
+        sem: sync.Semaphore = sync.Semaphore.init(0),
 
         fn wake(waiter: *Waiter) void {
             const self: *SemaphoreWaiter = @fieldParentPtr("waiter", waiter);
@@ -850,7 +850,7 @@ pub const RealizationStore = struct {
         return rendered.toOwnedSlice(self.allocator);
     }
 
-    fn retryableRealizationError(err: anyerror) bool {
+    fn isRetryableRealizationError(err: anyerror) bool {
         return switch (err) {
             // A null pool connection (the worker could not reach the daemon) —
             // transient, like the raw connect errors below (which the pool
@@ -883,7 +883,7 @@ pub const RealizationStore = struct {
     /// Callers lock it, re-check the memo, serialize on a miss, and unlock — so
     /// concurrent coercers of the same source don't each re-serialize. See
     /// `source_ingest_locks`.
-    pub fn sourceIngestLock(self: *RealizationStore, path: []const u8, name: []const u8) *stable.BlockingMutex {
+    pub fn sourceIngestLock(self: *RealizationStore, path: []const u8, name: []const u8) *sync.BlockingMutex {
         return self.memo.sourceIngestLock(path, name);
     }
 

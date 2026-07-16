@@ -64,13 +64,13 @@ pub fn builtinDerivationLazyAttr(self: anytype, attrs_arg: Value, name_arg: Valu
     // `derivationLazyAttr`'s wall time on workloads like the
     // NixOS toplevel where one derivation is touched for several
     // of its lazy attrs.
-    const cached_bits = self.derivations.lookupLazyDerivation(attrs_id, self.heap.token);
+    const cached_bits = self.realization.lookupLazyDerivation(attrs_id, self.heap.token);
     const value: Value = if (cached_bits) |bits| .{ .bits = bits } else blk: {
         const built = try buildForcedDerivationValue(self, attrs_id, .lazy);
         // Best-effort cache; if the put fails (OOM) we still
         // proceed — correctness doesn't depend on caching. Token-guarded so a
         // GC that reuses `attrs_id` for a different attrs can't hit a stale entry.
-        self.derivations.cacheLazyDerivation(attrs_id, self.heap.token, built.bits) catch {};
+        self.realization.cacheLazyDerivation(attrs_id, self.heap.token, built.bits) catch {};
         break :blk built;
     };
     return self.heap.getAttrValue(value.asObjectId(), name_id);
@@ -80,7 +80,7 @@ fn buildLazyDerivationValue(self: anytype, attrs_id: ObjectId) !Value {
     const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);
 
-    const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
+    const outputs = try self.allocator.alloc(derivation.ValueOutput, output_names.names.len);
     defer self.allocator.free(outputs);
     for (output_names.names, outputs) |output_name, *output| {
         output.* = .{ .name = output_name, .out_path = output_name };
@@ -208,8 +208,8 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     const t_comp = prof.start(.drv_compute);
     const computed = normalized.drv.computePathsWithPayloadAllocator(
         self.allocator,
-        self.derivations.allocator,
-        self.derivations.resolver(),
+        self.realization.allocator,
+        self.realization.resolver(),
     ) catch |err| {
         prof.end(.drv_compute, t_comp);
         return err;
@@ -219,19 +219,19 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     defer computed.hash_modulo.deinit(self.allocator);
     defer self.allocator.free(computed.drv_text_references);
     var drv_aterm_owned = true;
-    defer if (drv_aterm_owned) self.derivations.allocator.free(computed.drv_aterm);
-    try self.derivations.record(computed.drv_path, computed.hash_modulo.view(), normalized.drv.outputs);
-    try self.derivations.recordDebug(&normalized.drv, computed);
+    defer if (drv_aterm_owned) self.realization.allocator.free(computed.drv_aterm);
+    try self.realization.record(computed.drv_path, computed.hash_modulo.view(), normalized.drv.outputs);
+    try self.realization.recordDebug(&normalized.drv, computed);
 
     // Render the ATerm exactly once and transfer that allocation to the store's
     // recipe graph. `recordOwnedTextRecipe` only records an in-memory recipe;
     // the `.drv` is written to the store on demand (see `ensureClosure`), and
     // the `.store` progress span is reported there, at the actual write — not
     // here, where every instantiated derivation (demanded or not) passes.
-    try self.derivations.noteProducerPayloadForTest(computed.drv_path, computed.drv_aterm);
+    try self.realization.noteProducerPayloadForTest(computed.drv_path, computed.drv_aterm);
     // recordOwnedTextRecipe consumes drv_aterm on success and error.
     drv_aterm_owned = false;
-    try self.derivations.recordOwnedTextRecipe(
+    try self.realization.recordOwnedTextRecipe(
         computed.drv_path,
         computed.drv_aterm,
         computed.drv_text_references,
@@ -247,7 +247,7 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     // which instantiation won the demand-vs-speculation race decided the set —
     // burning builder time for no output.
 
-    const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
+    const outputs = try self.allocator.alloc(derivation.ValueOutput, output_names.names.len);
     defer self.allocator.free(outputs);
     for (output_names.names, outputs) |output_name, *output| {
         const path = normalized.outputPath(self.intern.get(output_name)) orelse return error.InvalidDerivationOutput;
@@ -257,7 +257,7 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
         };
     }
 
-    const spec: derivation.Spec = .{
+    const spec: derivation.ValueSpec = .{
         .drv_path = try self.intern.intern(computed.drv_path),
         .default_output = output_names.names[0],
         .outputs = outputs,
@@ -753,7 +753,7 @@ fn normalizeDerivationString(
 }
 
 fn sourceStorePathForContext(self: anytype, path: []const u8, owned_strings: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
-    const store_path = try source_paths.storePathForSource(self.allocator, self.derivations, self.files, path);
+    const store_path = try source_paths.storePathForSource(self.allocator, self.realization, self.files, path);
     errdefer self.allocator.free(store_path);
     try owned_strings.append(self.allocator, store_path);
     return store_path;
@@ -773,7 +773,7 @@ fn contextOutputs(
         const all_outputs = try vm_force.forceValue(self, all_outputs_value);
         if (!all_outputs.isBool()) return error.TypeError;
         if (all_outputs.asBool()) {
-            const known = self.derivations.outputNames(path) orelse return error.UnknownInputDerivation;
+            const known = self.realization.outputNames(path) orelse return error.UnknownInputDerivation;
             const outputs = try self.allocator.alloc([]const u8, known.len);
             errdefer self.allocator.free(outputs);
             // `RealizationStore.record` clones output names into store-owned

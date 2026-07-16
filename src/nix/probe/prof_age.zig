@@ -241,8 +241,9 @@ pub fn report(registry: anytype, intern: anytype) void {
         std.debug.print(
             "prof age-at-force OLD (age>=2^21cy): top_n={d} offloadable_min_cy={d} ({d:.1}% of main claimed excl) kinds closure={d} bytecode={d} pass_through={d} attr_access={d} deferred={d}\n",
             .{
-                age_old_top_n, age_offloadable_incl, pct(age_offloadable_incl, total_excl),
-                age_old_kind[0], age_old_kind[1], age_old_kind[2], age_old_kind[3], age_old_kind[4],
+                age_old_top_n,   age_offloadable_incl, pct(age_offloadable_incl, total_excl),
+                age_old_kind[0], age_old_kind[1],      age_old_kind[2],
+                age_old_kind[3], age_old_kind[4],
             },
         );
         // Top bodies holding the offloadable cycles.
@@ -284,8 +285,8 @@ pub fn report(registry: anytype, intern: anytype) void {
             "prof age-at-force YOUNG (age<2^21cy) creators: n={d} excl_cy={d} ({d:.1}% of main claimed excl) kinds closure={d} bytecode={d} pass_through={d} attr_access={d} deferred={d} (overflow={d})\n",
             .{
                 young_total_n, young_total_excl, pct(young_total_excl, total_excl),
-                young_kind[0], young_kind[1], young_kind[2], young_kind[3], young_kind[4],
-                young_agg_overflow,
+                young_kind[0], young_kind[1],    young_kind[2],
+                young_kind[3], young_kind[4],    young_agg_overflow,
             },
         );
         var ytop: [TOP]YoungAgg = @splat(.{});

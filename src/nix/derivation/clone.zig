@@ -2,7 +2,7 @@
 //!
 //! The `types.zig` structs are plain data; this is the allocation-owning
 //! toolkit that duplicates and frees their heap-backed string fields (used by
-//! the derivation store and the debug-record builder to take independent
+//! the realization service and the debug-record builder to take independent
 //! copies of borrowed data). Kept separate so `types.zig` stays a pure type
 //! catalog.
 

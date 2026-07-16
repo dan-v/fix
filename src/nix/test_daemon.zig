@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const owned_strings = @import("base").owned_strings;
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 const runtime_store = @import("host.zig").store;
 const wire = runtime_store.wire;
 
@@ -20,7 +20,7 @@ pub const FakeDaemon = struct {
     thread: std.Thread,
     conn_threads: std.ArrayListUnmanaged(std.Thread) = .empty,
     shutdown: std.atomic.Value(bool) = .init(false),
-    mu: stable.BlockingMutex = .{},
+    mu: sync.BlockingMutex = .{},
     valid_paths: std.StringHashMapUnmanaged(void) = .empty,
     operations: std.ArrayListUnmanaged(Operation) = .empty,
     materializations: std.ArrayListUnmanaged(Materialization) = .empty,

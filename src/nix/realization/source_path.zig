@@ -10,28 +10,28 @@ const RealizationStore = @import("store.zig").RealizationStore;
 const FileCache = @import("../host.zig").FileCache;
 const nar = @import("../host.zig").nar;
 const path_ops = @import("runtime").paths;
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 
 pub fn storePathForSource(
     allocator: std.mem.Allocator,
-    derivations: *RealizationStore,
+    realization: *RealizationStore,
     files: *FileCache,
     path: []const u8,
 ) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
-    if (isStoreRootPath(path, derivations.store_dir)) return allocator.dupe(u8, path);
+    if (isStoreRootPath(path, realization.store_dir)) return allocator.dupe(u8, path);
 
-    return storePathForSourceName(allocator, derivations, files, path, path_ops.baseName(path));
+    return storePathForSourceName(allocator, realization, files, path, path_ops.baseName(path));
 }
 
 pub fn storePathForSourceName(
     allocator: std.mem.Allocator,
-    derivations: *RealizationStore,
+    realization: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
 ) ![]u8 {
-    return storePathForFilteredSource(allocator, derivations, files, path, name, null, null);
+    return storePathForFilteredSource(allocator, realization, files, path, name, null, null);
 }
 
 /// A source added to (or computed for) the store.
@@ -65,14 +65,14 @@ pub const FilterKey = struct { object_id: u32, token: u64 };
 /// heap identity.
 pub fn ingest(
     allocator: std.mem.Allocator,
-    derivations: *RealizationStore,
+    realization: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
     filter: ?nar.Filter,
     filter_key: ?FilterKey,
 ) !Ingested {
-    return ingestReport(allocator, derivations, files, path, name, filter, filter_key, null);
+    return ingestReport(allocator, realization, files, path, name, filter, filter_key, null);
 }
 
 /// `ingest`, but records the offending path into `unsupported` (when non-null)
@@ -80,7 +80,7 @@ pub fn ingest(
 /// Nix-style `file '<path>' has an unsupported type` diagnostic.
 pub fn ingestReport(
     allocator: std.mem.Allocator,
-    derivations: *RealizationStore,
+    realization: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
@@ -99,7 +99,7 @@ pub fn ingestReport(
     const token: ?u64 = if (filter_key) |k| k.token else null;
     const memoizable = filter == null or filter_id != null;
     if (memoizable) {
-        if (try derivations.lookupSourceMemo(allocator, path, name, true, filter_id, token)) |hit| {
+        if (try realization.lookupSourceMemo(allocator, path, name, true, filter_id, token)) |hit| {
             return .{ .store_path = hit.store_path, .nar_hash = hit.nar_hash };
         }
     }
@@ -111,11 +111,11 @@ pub fn ingestReport(
     // lock across the serialize because an unfiltered NAR walk has no predicate
     // callback (no reentrancy) and no fiber-park point (no scheduler deadlock).
     // Filtered ingests skip this (their serialize calls back into the VM).
-    var ingest_lock: ?*stable.BlockingMutex = null;
+    var ingest_lock: ?*sync.BlockingMutex = null;
     if (filter == null) {
-        const lock = derivations.sourceIngestLock(path, name);
+        const lock = realization.sourceIngestLock(path, name);
         lock.lock();
-        if (try derivations.lookupSourceMemo(allocator, path, name, true, null, null)) |hit| {
+        if (try realization.lookupSourceMemo(allocator, path, name, true, null, null)) |hit| {
             lock.unlock();
             return .{ .store_path = hit.store_path, .nar_hash = hit.nar_hash };
         }
@@ -123,7 +123,7 @@ pub fn ingestReport(
     }
     defer if (ingest_lock) |l| l.unlock();
 
-    const payload_allocator = derivations.allocator;
+    const payload_allocator = realization.allocator;
     const nar_bytes = try nar.serializeReport(payload_allocator, files, path, filter, unsupported);
     var nar_owned = true;
     defer if (nar_owned) payload_allocator.free(nar_bytes);
@@ -131,19 +131,19 @@ pub fn ingestReport(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    const store_path = try drv_paths.sourcePath(allocator, derivations.store_dir, name, hex[0..]);
+    const store_path = try drv_paths.sourcePath(allocator, realization.store_dir, name, hex[0..]);
     errdefer allocator.free(store_path);
     const nar_hash = try sriHash(allocator, &digest);
     errdefer allocator.free(nar_hash);
-    try derivations.noteProducerPayloadForTest(store_path, nar_bytes);
+    try realization.noteProducerPayloadForTest(store_path, nar_bytes);
     nar_owned = false; // recordOwnedNarRecipe consumes on success and error.
-    try derivations.recordOwnedNarRecipe(store_path, nar_bytes);
+    try realization.recordOwnedNarRecipe(store_path, nar_bytes);
     // Memoize the result so later coercions of this source skip the serialize +
     // hash above. A memo-insert failure is non-fatal — worst case a future
     // coercion recomputes. `token` is only consulted for filtered entries; pass
     // 0 for the unfiltered case.
     if (memoizable) {
-        derivations.storeSourceMemo(path, name, true, filter_id, token orelse 0, store_path, nar_hash) catch {};
+        realization.storeSourceMemo(path, name, true, filter_id, token orelse 0, store_path, nar_hash) catch {};
     }
     return .{ .store_path = store_path, .nar_hash = nar_hash };
 }
@@ -153,15 +153,15 @@ pub fn ingestReport(
 /// the synchronous daemon operation; the returned paths remain caller-owned.
 pub fn ingestSerializedNar(
     allocator: std.mem.Allocator,
-    derivations: *RealizationStore,
+    realization: *RealizationStore,
     name: []const u8,
     nar_bytes: []const u8,
     digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
 ) !Ingested {
     const hex = std.fmt.bytesToHex(digest.*, .lower);
-    const store_path = try drv_paths.sourcePath(allocator, derivations.store_dir, name, hex[0..]);
+    const store_path = try drv_paths.sourcePath(allocator, realization.store_dir, name, hex[0..]);
     errdefer allocator.free(store_path);
-    try derivations.instantiatePath(store_path, nar_bytes);
+    try realization.instantiatePath(store_path, nar_bytes);
 
     return .{ .store_path = store_path, .nar_hash = try sriHash(allocator, digest) };
 }
@@ -180,21 +180,21 @@ fn sriHash(allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
 /// a daemon is attached, add the content to the store.
 pub fn storePathForFilteredSource(
     allocator: std.mem.Allocator,
-    derivations: *RealizationStore,
+    realization: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
     filter: ?nar.Filter,
     filter_key: ?FilterKey,
 ) ![]u8 {
-    return storePathForFilteredSourceReport(allocator, derivations, files, path, name, filter, filter_key, null);
+    return storePathForFilteredSourceReport(allocator, realization, files, path, name, filter, filter_key, null);
 }
 
 /// `storePathForFilteredSource`, but records the offending path into
 /// `unsupported` (when non-null) on `error.UnsupportedPathType`.
 pub fn storePathForFilteredSourceReport(
     allocator: std.mem.Allocator,
-    derivations: *RealizationStore,
+    realization: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
@@ -202,7 +202,7 @@ pub fn storePathForFilteredSourceReport(
     filter_key: ?FilterKey,
     unsupported: ?*nar.Unsupported,
 ) ![]u8 {
-    const ingested = try ingestReport(allocator, derivations, files, path, name, filter, filter_key, unsupported);
+    const ingested = try ingestReport(allocator, realization, files, path, name, filter, filter_key, unsupported);
     allocator.free(ingested.nar_hash);
     return ingested.store_path;
 }
@@ -225,7 +225,7 @@ pub const FlatIngested = struct {
 /// store. Mirrors `ingest`, but flat: `fixedOutputPath(.., "sha256", hex)`.
 pub fn flatStorePathForFile(
     allocator: std.mem.Allocator,
-    derivations: *RealizationStore,
+    realization: *RealizationStore,
     files: *FileCache,
     path: []const u8,
     name: []const u8,
@@ -237,9 +237,9 @@ pub fn flatStorePathForFile(
     std.crypto.hash.sha2.Sha256.hash(contents.bytes(), &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
 
-    const store_path = try drv_paths.fixedOutputPath(allocator, derivations.store_dir, name, "out", "sha256", hex[0..]);
+    const store_path = try drv_paths.fixedOutputPath(allocator, realization.store_dir, name, "out", "sha256", hex[0..]);
     errdefer allocator.free(store_path);
-    try derivations.recordFlatRecipe(store_path, contents, .source);
+    try realization.recordFlatRecipe(store_path, contents, .source);
 
     return .{ .store_path = store_path, .hash_hex = hex };
 }
@@ -252,15 +252,15 @@ pub fn isStoreRootPath(path: []const u8, store_dir: []const u8) bool {
 
 test "ingestSerializedNar uses the supplied digest without rehashing" {
     const testing = std.testing;
-    var derivations = RealizationStore.init(testing.allocator);
-    defer derivations.deinit();
+    var realization = RealizationStore.init(testing.allocator);
+    defer realization.deinit();
 
     const digest = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
-    const ingested = try ingestSerializedNar(testing.allocator, &derivations, "source", "borrowed NAR bytes", &digest);
+    const ingested = try ingestSerializedNar(testing.allocator, &realization, "source", "borrowed NAR bytes", &digest);
     defer ingested.deinit(testing.allocator);
 
     const hex = std.fmt.bytesToHex(digest, .lower);
-    const expected_path = try drv_paths.sourcePath(testing.allocator, derivations.store_dir, "source", &hex);
+    const expected_path = try drv_paths.sourcePath(testing.allocator, realization.store_dir, "source", &hex);
     defer testing.allocator.free(expected_path);
     try testing.expectEqualStrings(expected_path, ingested.store_path);
 }

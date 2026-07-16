@@ -53,4 +53,3 @@ pub const ConstIdx = u16;
 /// An index into the evaluator object heap.
 pub const ObjectId = u32;
 pub const OBJECT_ID_NONE: ObjectId = std.math.maxInt(ObjectId);
-

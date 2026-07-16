@@ -18,7 +18,7 @@
 const std = @import("std");
 const types = @import("runtime").types;
 const InternTable = @import("runtime").intern.InternTable;
-const stable = @import("base").segments;
+const segments = @import("base").segments;
 
 /// A name is an index into the node store, biased by 1 so `0` means "no name"
 /// (the root) without storing a sentinel node.
@@ -33,7 +33,7 @@ pub const NameTree = struct {
         /// path never reads as a false attr path; a real binding joins with `.`.
         synthetic: bool,
     };
-    const Store = stable.StableSegments(Node, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
+    const Store = segments.StableSegments(Node, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
     nodes: Store = .empty,
 
@@ -68,7 +68,7 @@ pub const NameTree = struct {
     }
 
     /// Whether `id` names anything (has at least one segment).
-    pub fn named(self: *const NameTree, id: NameId) bool {
+    pub fn isNamed(self: *const NameTree, id: NameId) bool {
         return id != NAME_ROOT and id - 1 < self.nodes.count();
     }
 };

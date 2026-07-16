@@ -164,7 +164,7 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
 
     if (!recursive) {
         // Flat ingestion: a single regular file, hashed by its raw contents.
-        const flat = try source_paths.flatStorePathForFile(self.allocator, self.derivations, self.files, path, store_name);
+        const flat = try source_paths.flatStorePathForFile(self.allocator, self.realization, self.files, path, store_name);
         defer flat.deinit(self.allocator);
         if (expected_hash) |expected| try checkFodHash(self, expected, flat.hash_hex[0..]);
         return contextStringWithPath(self, try self.intern.intern(flat.store_path));
@@ -193,7 +193,7 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
 /// in `unsupported` when the source contains an unsupported node (fifo/socket).
 fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filter_value: Value, unsupported: *nar.Unsupported) !source_paths.Ingested {
     if (filter_value.isNull()) {
-        return source_paths.ingestReport(self.allocator, self.derivations, self.files, path, store_name, null, null, unsupported);
+        return source_paths.ingestReport(self.allocator, self.realization, self.files, path, store_name, null, null, unsupported);
     }
     const pred = try vm_force.forceValue(self, filter_value);
     const Context = struct {
@@ -206,7 +206,7 @@ fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filt
         }
     };
     var context: Context = .{ .vm = self, .pred = pred };
-    return source_paths.ingestReport(self.allocator, self.derivations, self.files, path, store_name, .{
+    return source_paths.ingestReport(self.allocator, self.realization, self.files, path, store_name, .{
         .context = &context,
         .accept = Context.accept,
     }, source_store.filterKeyOf(self, pred), unsupported);

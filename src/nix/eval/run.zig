@@ -12,7 +12,7 @@
 const std = @import("std");
 const diagnostic = @import("syntax").diagnostic;
 const trace_mod = @import("../observ.zig").trace;
-const stable = @import("base").sync;
+const sync = @import("base").sync;
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const Trace = trace_mod.Trace;
@@ -26,7 +26,7 @@ pub const Run = struct {
     string_arena: @import("base").arena.ArenaAllocator,
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
     trace: Trace,
-    mu: stable.SpinMutex,
+    mu: sync.SpinMutex,
 
     pub fn init(allocator: std.mem.Allocator) Run {
         return .{
