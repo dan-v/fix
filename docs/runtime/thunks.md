@@ -132,4 +132,4 @@ Checked on the freshly-claimed path before running the body; a hit resolves the 
 - **Speculative forcing** (`forceValueSpeculative`) resolves without setting `demanded` and raises `in_speculation`, which (a) stops new thunks from cascading further speculation and (b) lets big builtin loops `error.SpeculativeBail` (a transient reset) once the demanded result is already in hand — bounding one wrong guess. See [speculation](../parallel/speculation.md).
 - **Single-owner ranges.** Every `ValueRange` / `AttrRange` a thunk's upvalues spill into is single-owner (a structural invariant), so the GC marks objects not ranges.
 
-Code: `src/nix/runtime/thunk.zig`, `src/nix/vm/force.zig`
+Code: `src/runtime/thunk.zig`, `src/nix/vm/force.zig`

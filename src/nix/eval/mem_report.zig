@@ -16,7 +16,7 @@ const mem_tag = @import("runtime").mem_tag;
 const vma_mod = mem_tag.vma;
 const block_cache = @import("base").block_cache;
 const base_hugetlb = @import("base").hugetlb;
-const bytecode = @import("bytecode");
+const bytecode = @import("../bytecode.zig");
 const ast = @import("syntax").ast;
 
 /// `FIX_MEM_REPORT`: attribute peak RSS across every subsystem so we can see

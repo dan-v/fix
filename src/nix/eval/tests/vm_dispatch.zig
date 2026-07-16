@@ -13,17 +13,17 @@ const testing = std.testing;
 
 const eval_mod = @import("../../eval.zig");
 const Evaluator = eval_mod.Evaluator;
-const vm_mod = @import("vm");
+const vm_mod = @import("../../vm.zig");
 const VM = vm_mod.VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const heap_mod = @import("runtime").heap;
-const bytecode = @import("bytecode");
+const bytecode = @import("../../bytecode.zig");
 const ChunkBuilder = bytecode.ChunkBuilder;
 const OpCode = bytecode.OpCode;
-const closures = @import("vm").closures;
-const stack = @import("vm").stack;
-const equality = @import("vm").equality;
+const closures = @import("../../vm.zig").closures;
+const stack = @import("../../vm.zig").stack;
+const equality = @import("../../vm.zig").equality;
 
 /// A live Evaluator plus a bare VM sharing its registry/heap/intern
 /// state. `evaluate("null")` on the Evaluator first drives the normal
@@ -243,7 +243,7 @@ test "list_new constructs a list value from stack items" {
 
 // ---- attrset/list merge opcodes (objects.zig) ----
 
-const objects_mod = @import("vm").objects;
+const objects_mod = @import("../../vm.zig").objects;
 
 test "merge_attrs lets the right-hand side override a colliding key" {
     var h = try Harness.init();
@@ -495,7 +495,7 @@ test "thunk_w_st_cell publishes the thunk into a cell-initialized slot" {
 
 // ---- strings.zig: real logic (interned-string concatenation) ----
 
-const strings_mod = @import("vm").strings;
+const strings_mod = @import("../../vm.zig").strings;
 
 test "concatInternedString interns the concatenation of two interned strings" {
     var h = try Harness.init();

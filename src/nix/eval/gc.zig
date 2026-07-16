@@ -21,9 +21,9 @@ const types = @import("runtime").types;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_gc = @import("runtime").heap.heap_gc;
 const thunk_mod = @import("runtime").thunk;
-const vm_force = @import("vm").force;
-const vm_access = @import("vm").access;
-const timeline = @import("probe").timeline;
+const vm_force = @import("../vm.zig").force;
+const vm_access = @import("../vm.zig").access;
+const timeline = @import("../probe.zig").timeline;
 
 /// Cap on the number of participants in a single collection's mark+evac.
 /// The eval still runs `worker_count`-wide; only the STW mark/evac is

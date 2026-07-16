@@ -24,8 +24,8 @@ const diagnostic = @import("syntax").diagnostic;
 const Parser = @import("syntax").parser.Parser;
 
 const InternId = types.InternId;
-const NameId = @import("bytecode").NameId;
-const NAME_ROOT = @import("bytecode").NAME_ROOT;
+const NameId = @import("../bytecode.zig").NameId;
+const NAME_ROOT = @import("../bytecode.zig").NAME_ROOT;
 
 /// Gate tunables for lazy per-attr compilation (see `compiler/attrs.zig`).
 ///

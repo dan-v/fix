@@ -5,7 +5,7 @@
 //! Use `--no-eval` to inspect what compilation alone produces.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const cli = @import("cli.zig");
 const eval = engine.eval;
 const bytecode = engine.bytecode;

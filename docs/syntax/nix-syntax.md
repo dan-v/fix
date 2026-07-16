@@ -87,4 +87,4 @@ Both always parse; the parser records that a pipe was seen (`used_pipe_operators
 
 Inside `[ ... ]`, elements are `expr_select`, not `expr_app`: the list-items production folds one `expr_select` at a time, so function application is grammatically unavailable between adjacent elements. `[ f x ]` is therefore a two-element list, not `[ (f x) ]` — matching Nix. Consequently a bare `if`/`let`/lambda/`!`/`-` — anything above the selection layer that would greedily consume following tokens — is **not** a legal unparenthesized list element and must be wrapped in `( ... )`.
 
-Code: `src/nix/syntax/`
+Code: `src/syntax/`

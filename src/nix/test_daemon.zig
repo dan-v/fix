@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const stable = @import("base").sync;
-const runtime_store = @import("host").store;
+const runtime_store = @import("host.zig").store;
 const wire = runtime_store.wire;
 
 pub const FakeDaemon = struct {

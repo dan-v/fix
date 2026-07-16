@@ -11,7 +11,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const types = @import("runtime").types;
-const bytecode = @import("bytecode");
+const bytecode = @import("../bytecode.zig");
 const stable = @import("base").sync;
 
 const OpCode = bytecode.OpCode;

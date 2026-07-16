@@ -4,9 +4,9 @@
 //! formatting primitives. Evaluation progress itself is backed by `std.Progress`.
 
 const std = @import("std");
-const Evaluator = @import("engine").Evaluator;
-const eval_progress = @import("engine").eval_progress;
-const gc = @import("engine").gc;
+const Evaluator = @import("nix").Evaluator;
+const eval_progress = @import("nix").eval_progress;
+const gc = @import("nix").gc;
 
 const SpinMutex = struct {
     inner: std.atomic.Mutex = .unlocked,

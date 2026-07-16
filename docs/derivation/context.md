@@ -71,4 +71,4 @@ When [`derivation`](./model.md) normalizes its argument, each attribute value is
 
 The store-path strings a derivation *hands out* are themselves context strings that seed this: `drvPath` carries `{ <drv> = { allOutputs = true; }; }`, and each `outPath` carries `{ <drv> = { outputs = [ <thatOutput> ]; }; }`. So the moment one derivation's `outPath` flows into another's env, the consumer records the exact input-drv edge and output name. This closed loop — context in the produced strings, context read back at consumption — is what makes cross-derivation dependency tracking byte-correct.
 
-Code: `src/nix/runtime/heap.zig` (`ContextString`, `addContextString`), `src/nix/vm/strings.zig` (concat / path-concat context union), `src/nix/vm/builtins/string_context.zig` (context builtins), `src/nix/vm/builtins/derivation.zig` (`normalizeDerivationString`: context → `.drv`/src deps)
+Code: `src/runtime/heap.zig` (`ContextString`, `addContextString`), `src/nix/vm/strings.zig` (concat / path-concat context union), `src/nix/vm/builtins/string_context.zig` (context builtins), `src/nix/vm/builtins/derivation.zig` (`normalizeDerivationString`: context → `.drv`/src deps)

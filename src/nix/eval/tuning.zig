@@ -9,11 +9,11 @@
 //! because it references evaluator-private callbacks.
 
 const std = @import("std");
-const scheduler_mod = @import("scheduler");
+const scheduler_mod = @import("../scheduler.zig");
 const heap_mod = @import("runtime").heap;
-const worker_mod = @import("vm").worker;
-const vm_closures = @import("vm").closures;
-const vm_force = @import("vm").force;
+const worker_mod = @import("../vm.zig").worker;
+const vm_closures = @import("../vm.zig").closures;
+const vm_force = @import("../vm.zig").force;
 
 /// Resolve and apply the scheduler/speculation tuning knobs. Takes exactly the
 /// lower-layer state it touches — the scheduler, the heap's scavenge flag, the

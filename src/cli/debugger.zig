@@ -12,7 +12,7 @@
 //! `cli`-side implementation, so no VM internals leak below the facade.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const cli = @import("cli.zig");
 const syntax = engine.syntax;
 

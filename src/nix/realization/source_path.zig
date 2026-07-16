@@ -5,10 +5,10 @@
 //! coercion (`src = ./.`).
 
 const std = @import("std");
-const drv_paths = @import("derivation").paths;
+const drv_paths = @import("../derivation.zig").paths;
 const DerivationStore = @import("store.zig").DerivationStore;
-const FileCache = @import("host").FileCache;
-const nar = @import("host").nar;
+const FileCache = @import("../host.zig").FileCache;
+const nar = @import("../host.zig").nar;
 const path_ops = @import("runtime").paths;
 const stable = @import("base").sync;
 

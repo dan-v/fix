@@ -11,7 +11,7 @@
 //! the pinned parse corpus checks.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const syntax = engine.syntax;
 const args = @import("args.zig");
 const setup = @import("setup.zig");

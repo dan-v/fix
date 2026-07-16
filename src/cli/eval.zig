@@ -2,7 +2,7 @@
 //! value. This is the former default (no-subcommand) path, now a real command.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");

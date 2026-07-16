@@ -9,7 +9,7 @@
 //! same text non-interactively.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const term_mod = @import("term.zig");
 const keys_mod = @import("keys.zig");
 

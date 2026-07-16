@@ -4,7 +4,7 @@
 const std = @import("std");
 const builtins = @import("runtime").builtins;
 const path_ops = @import("runtime").paths;
-const FileCache = @import("host").FileCache;
+const FileCache = @import("../host.zig").FileCache;
 const InternTable = @import("runtime").intern.InternTable;
 const Value = @import("runtime").value.Value;
 

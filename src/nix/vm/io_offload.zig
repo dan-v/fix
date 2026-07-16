@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const thunk_mod = @import("runtime").thunk;
-const rstore = @import("host").store;
+const rstore = @import("../host.zig").store;
 const sync = @import("base").sync;
 const fiber_mod = @import("base").fiber;
 const worker_mod = @import("worker.zig");

@@ -10,13 +10,13 @@ const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
-const chunk = @import("bytecode").chunk;
+const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 const heap_mod = @import("runtime").heap;
 const Closure = heap_mod.Closure;
 const BytecodeThunk = @import("runtime").thunk.BytecodeThunk;
 const Thunk = @import("runtime").thunk.Thunk;
-const deferred_mod = @import("compiler").deferred_table;
+const deferred_mod = @import("../compiler.zig").deferred_table;
 
 const access = @import("access.zig");
 const debug = @import("debug.zig");
@@ -25,7 +25,7 @@ const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const force = @import("force.zig");
 const trace_log = @import("trace_log.zig");
-const prof = @import("probe").prof;
+const prof = @import("../probe.zig").prof;
 const run_mod = @import("run.zig");
 
 const VM = vm_mod.VM;

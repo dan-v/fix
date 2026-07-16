@@ -7,7 +7,7 @@ const std = @import("std");
 const Value = @import("runtime").value.Value;
 const heap_mod = @import("runtime").heap;
 const path_ops = @import("runtime").paths;
-const FileCache = @import("host").FileCache;
+const FileCache = @import("../../host.zig").FileCache;
 const strings = @import("strings.zig");
 const fetch = @import("fetch.zig");
 const vm_force = @import("../force.zig");
@@ -199,7 +199,7 @@ pub fn builtinReadDir(self: anytype, arg: Value) !Value {
     return Value.attrs(try self.heap.addAttrs(attrs.items));
 }
 
-const FileKindCount = @typeInfo(@import("host").FileCache.FileKind).@"enum".fields.len;
+const FileKindCount = @typeInfo(@import("../../host.zig").FileCache.FileKind).@"enum".fields.len;
 
 /// Children per `readdir_prefetch` task: coarse enough to amortise the
 /// queue+wake cost (a child listing is ~20-30µs of getdents), fine

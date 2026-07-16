@@ -24,7 +24,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const engine = @import("engine");
+const engine = @import("nix");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");

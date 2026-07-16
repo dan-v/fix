@@ -6,7 +6,7 @@
 //! trapping the user in continuation lines.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 
 /// True when `source` should be submitted on Enter; false to continue on a
 /// new line. Empty input is complete (the repl skips it).

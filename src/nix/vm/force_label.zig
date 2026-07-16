@@ -15,7 +15,7 @@ const ObjectId = types.ObjectId;
 const ChunkId = types.ChunkId;
 const thunk_mod = @import("runtime").thunk;
 const vm_errors = @import("errors.zig");
-const timeline = @import("probe").timeline;
+const timeline = @import("../probe.zig").timeline;
 const BuiltinId = @import("runtime").builtins.BuiltinId;
 
 /// Rich source label for a thunk, as a `timeline.Subject` — an interned source

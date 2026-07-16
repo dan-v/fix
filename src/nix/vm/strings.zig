@@ -9,14 +9,14 @@ const InternId = types.InternId;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
 const int_mod = @import("runtime").int;
-const source_paths = @import("realization").source_path;
+const source_paths = @import("../realization.zig").source_path;
 
 const closures = @import("closures.zig");
 const force = @import("force.zig");
 const context_merge = @import("context_merge.zig");
 const trace = @import("trace.zig");
-const prof = @import("probe").prof;
-const prof_census = @import("probe").prof_census;
+const prof = @import("../probe.zig").prof;
+const prof_census = @import("../probe.zig").prof_census;
 
 const VM = vm_mod.VM;
 

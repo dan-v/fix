@@ -59,8 +59,8 @@ The NixOS module/overlay fixpoints `//` a massive accumulator thousands of times
 
 ## Constants
 
-The evaluator-wide limits live in `src/nix/runtime/types.zig`: `VM_STACK_CAP = 65536`, `MAX_FRAMES = 512`, `MAX_UNCURRY_ARITY = 4`.
+The evaluator-wide limits live in `src/runtime/types.zig`: `VM_STACK_CAP = 65536`, `MAX_FRAMES = 512`, `MAX_UNCURRY_ARITY = 4`.
 
 Out of scope: the `//` opcode's execution and inline cache → [vm/access.md](../vm/access.md); thunk internals/state machine → [thunks.md](thunks.md); the collection algorithm → [gc.md](../gc.md).
 
-Code: `src/nix/runtime/heap.zig`
+Code: `src/runtime/heap.zig`

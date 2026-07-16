@@ -1,10 +1,10 @@
 const std = @import("std");
 const eval_mod = @import("../../eval.zig");
 const Evaluator = eval_mod.Evaluator;
-const DerivationStore = @import("realization").DerivationStore;
+const DerivationStore = @import("../../realization.zig").DerivationStore;
 const Value = @import("runtime").value.Value;
 const ObjectId = @import("runtime").types.ObjectId;
-const nar = @import("host").nar;
+const nar = @import("../../host.zig").nar;
 const FakeDaemon = @import("../../test_daemon.zig").FakeDaemon;
 
 fn recipeInspectionAvailable() bool {

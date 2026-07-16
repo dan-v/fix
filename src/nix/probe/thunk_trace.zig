@@ -32,7 +32,7 @@ const InternTable = @import("runtime").intern.InternTable;
 const heap_mod = @import("runtime").heap;
 const ObjectHeap = heap_mod.ObjectHeap;
 const stable = @import("base").sync;
-const bytecode = @import("bytecode");
+const bytecode = @import("../bytecode.zig");
 const ChunkRegistry = bytecode.ChunkRegistry;
 const Chunk = bytecode.chunk.Chunk;
 

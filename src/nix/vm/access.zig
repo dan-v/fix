@@ -10,17 +10,17 @@ const types = @import("runtime").types;
 const thunk_mod = @import("runtime").thunk;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
-const bytecode_mod = @import("bytecode");
+const bytecode_mod = @import("../bytecode.zig");
 
 const closures = @import("closures.zig");
 const force = @import("force.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const vm_builtins = @import("builtins.zig");
-const prof = @import("probe").prof;
-const prof_census = @import("probe").prof_census;
+const prof = @import("../probe.zig").prof;
+const prof_census = @import("../probe.zig").prof_census;
 const gc = @import("runtime").gc;
-const sched_mod = @import("scheduler");
+const sched_mod = @import("../scheduler.zig");
 const heap_mod = @import("runtime").heap;
 
 const VM = vm_mod.VM;

@@ -2395,7 +2395,7 @@ test "disassembling a chunk prints arithmetic opcode names and jump targets" {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try writeChunk(&out.writer, 7, &chunk, .{}, .{});
+    try writeChunk(allocator, &out.writer, 7, &chunk, .{}, .{});
     const text = out.written();
 
     try std.testing.expect(std.mem.indexOf(u8, text, "chunk[0x7]") != null);
@@ -2426,7 +2426,7 @@ test "disassembling prints the constant pool with resolved values" {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try writeChunk(&out.writer, null, &chunk, .{}, .{});
+    try writeChunk(allocator, &out.writer, null, &chunk, .{}, .{});
     const text = out.written();
 
     try std.testing.expect(std.mem.indexOf(u8, text, "constants (1)") != null);
@@ -2454,7 +2454,7 @@ test "disassembling resolves an interned attribute name via Symbols" {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try writeChunk(&out.writer, null, &chunk, .{ .intern = &intern }, .{});
+    try writeChunk(allocator, &out.writer, null, &chunk, .{ .intern = &intern }, .{});
     const text = out.written();
 
     try std.testing.expect(std.mem.indexOf(u8, text, "attr_get") != null);
@@ -2476,7 +2476,7 @@ test "disassembling omits the constant pool section when show_constants is false
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try writeChunk(&out.writer, null, &chunk, .{}, .{ .show_constants = false });
+    try writeChunk(allocator, &out.writer, null, &chunk, .{}, .{ .show_constants = false });
     const text = out.written();
 
     try std.testing.expect(std.mem.indexOf(u8, text, "constants (") == null);

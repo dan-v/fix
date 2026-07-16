@@ -5,7 +5,7 @@
 //! caller `deinit`s; `finish` flushes before teardown.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const eval = engine.eval;
 const Evaluator = eval.Evaluator;
 const Options = @import("args.zig").Options;

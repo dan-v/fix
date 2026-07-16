@@ -23,13 +23,13 @@ const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
-const bytecode_mod = @import("bytecode");
+const bytecode_mod = @import("../bytecode.zig");
 const opcode = bytecode_mod.opcode;
 const OpCode = opcode.OpCode;
 const heap_mod = @import("runtime").heap;
 const numeric = @import("runtime").numeric;
-const prof = @import("probe").prof;
-const prof_census = @import("probe").prof_census;
+const prof = @import("../probe.zig").prof;
+const prof_census = @import("../probe.zig").prof_census;
 
 const access = @import("access.zig");
 const builtin_errors = @import("builtins/errors.zig");

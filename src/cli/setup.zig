@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const engine = @import("engine");
+const engine = @import("nix");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");

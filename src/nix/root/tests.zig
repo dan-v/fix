@@ -7,5 +7,5 @@ test {
     _ = @import("tests/parallel.zig");
     // Whole probe/ subsystem via its aggregator facade, so no submodule can
     // silently drop out of the test run.
-    _ = @import("probe");
+    _ = @import("../probe.zig");
 }

@@ -5,10 +5,10 @@ const std = @import("std");
 const render = @import("render.zig");
 const args = @import("args.zig");
 const derivation_debug = @import("derivation_debug.zig");
-const eval = @import("engine").eval;
+const eval = @import("nix").eval;
 const Evaluator = eval.Evaluator;
-const Value = @import("engine").Value;
-const rstore = @import("engine").host.store;
+const Value = @import("nix").Value;
+const rstore = @import("nix").host.store;
 const EvaluationMode = args.EvaluationMode;
 const SourceArg = args.SourceArg;
 

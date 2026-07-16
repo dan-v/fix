@@ -8,7 +8,7 @@
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;
-const chunk = @import("bytecode").chunk;
+const chunk = @import("../bytecode.zig").chunk;
 const emit = @import("emit.zig");
 const diagnostics = @import("diagnostics.zig");
 

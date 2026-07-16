@@ -37,7 +37,7 @@ const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
 const stable = @import("base").sync;
 const arena_mod = @import("base").arena;
-const scheduler_mod = @import("scheduler");
+const scheduler_mod = @import("../scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
 const vm_mod = @import("../vm.zig");
@@ -51,18 +51,18 @@ const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("base").worker_id;
 const mem_tag = @import("runtime").mem_tag;
 const gc = @import("runtime").gc;
-const eval_trace = @import("observ").trace;
-const eval_progress = @import("observ").progress;
-const prof = @import("probe").prof;
-const timeline = @import("probe").timeline;
+const eval_trace = @import("../observ.zig").trace;
+const eval_progress = @import("../observ.zig").progress;
+const prof = @import("../probe.zig").prof;
+const timeline = @import("../probe.zig").timeline;
 // Used only by the test fixture below.
-const bytecode = @import("bytecode");
+const bytecode = @import("../bytecode.zig");
 const InternTable = @import("runtime").intern.InternTable;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_ring_size = @import("runtime").heap.SCAV_RING_SIZE;
-const FileCache = @import("host").FileCache;
-const FetchCache = @import("host").FetchCache;
-const DerivationStore = @import("realization").DerivationStore;
+const FileCache = @import("../host.zig").FileCache;
+const FetchCache = @import("../host.zig").FetchCache;
+const DerivationStore = @import("../realization.zig").DerivationStore;
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker repoints

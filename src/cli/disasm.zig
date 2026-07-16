@@ -7,7 +7,7 @@
 //! piped to `$PAGER`.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const bytecode = engine.bytecode;
 const cli = @import("cli.zig");
 const args = @import("args.zig");

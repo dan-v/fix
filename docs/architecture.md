@@ -30,40 +30,33 @@ Each stage is lazy at the seams: the compiler emits **thunks** for anything not 
 
 ## The module DAG
 
-The source tree is three tiers, each answering "what am I looking at": `src/base/` (generic, reusable infrastructure with zero Nix coupling), `src/nix/` (language, runtime, effects, and evaluation engine), and `src/cli/` + `src/main.zig` (the command-line app). Each subsystem is a Zig module reached by name through a single facade; reaching into another module's internals by relative path is a lint error (`zig build lint`), and would silently duplicate-compile those files into a second, incompatible copy of their types. The lint enforces both a down-only topological order and an explicit dependency allowlist, so being lower in the graph is necessary but not sufficient for an import.
+The source tree has five durable module groups. `base`, `syntax`, and `runtime` are reusable foundations; `nix` contains the cooperating evaluator subsystems; `cli` is the application layer. Subsystems under `src/nix/` keep their own facades and namespaces, but use ordinary file imports rather than each restating the same graph as a build module.
 
 ```
-src/base/    base → base_options
-             Generic containers, synchronization, fibers, allocators, regex,
-             and TOML. `base_options` contains only generic fiber probe knobs.
+src/base/       base → base_options
+                Generic containers, synchronization, fibers, allocators,
+                regex, and TOML.
 
-src/nix/     language and domain foundations:
-   syntax       → base                       scanner, parser, AST
-   runtime      → base                       Value, heap, thunk/Future, intern, GC
-   observ       → syntax                     progress and error-trace protocols
-   scheduler    → runtime, base              work-stealing execution machinery
-   derivation   → runtime, base              Drv model, hashing, context, Registry
-   bytecode     → runtime, base              instruction and chunk model
+src/syntax/     syntax → base, parser_tables
+                Scanner, parser, AST; independently benchmarked.
 
-             concrete runtime services:
-   host         → runtime, base              files, fetches, NAR, daemon pool/client
-   realization  → derivation, host, runtime, base
-                                                recipes, source ingestion, builds
+src/runtime/    runtime → base, build_options
+                Value, heap, thunk/Future, interning, GC.
 
-             evaluation engine:
-   probe        → bytecode, runtime, base
-   compiler     → probe, bytecode, syntax, runtime, base
-   vm           → compiler, bytecode, scheduler, derivation, realization,
-                  host, observ, probe, runtime, syntax, base
-   engine       → the nix modules above      Evaluator and public app-facing API
+src/nix/        nix → base, syntax, runtime, build_options
+                Exports bytecode, compiler, scheduler, derivation, host,
+                realization, observability, probes, VM, and Evaluator.
 
-src/cli/     cli → engine                    commands, options, rendering, debugger
-src/main.zig    → engine, cli                process composition; executable `fix`
+src/cli/        cli → nix
+                Commands, options, rendering, debugger.
+
+src/main.zig       → nix, cli
+                Process composition; executable `fix`.
 ```
 
 `base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and `nix` supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
 
-Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler` lowers the AST onto `bytecode`; `vm` is the execution core; `engine` composes it into the `Evaluator` and is the only evaluator facade visible to the CLI. Language semantics do not import concrete host effects. Realization may use the host, the VM may compose both, and command code cannot reach around the engine boundary. What could look like an `Evaluator`/VM cycle is avoided by placement: the VM's on-demand compilation of a deferred thunk body calls down into `compiler`, and the fiber worker that drives forcing lives inside `vm` next to the force path. See [build](build.md).
+Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler` lowers the AST onto `bytecode`; `vm` is the execution core; `root.zig` composes it into the `Evaluator` and is the facade visible to the CLI. Language semantics do not import concrete host effects. Realization may use the host, the VM may compose both, and command code cannot reach around the `nix` boundary. What could look like an `Evaluator`/VM cycle is avoided by placement: deferred-body compilation calls from `vm` into `compiler`, while the fiber worker that drives forcing lives inside `vm` next to the force path. See [build](build.md).
 
 ## Laziness and parallelism are one primitive
 

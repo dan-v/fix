@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const derivation = @import("engine").derivation;
+const derivation = @import("nix").derivation;
 
 pub const Mode = enum {
     off,

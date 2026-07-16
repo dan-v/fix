@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const diagnostic = @import("syntax").diagnostic;
-const trace_mod = @import("observ").trace;
+const trace_mod = @import("../observ.zig").trace;
 const stable = @import("base").sync;
 
 pub const Diagnostic = diagnostic.Diagnostic;

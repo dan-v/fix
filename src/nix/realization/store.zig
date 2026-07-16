@@ -6,12 +6,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const derivation = @import("derivation");
+const derivation = @import("../derivation.zig");
 const drv_mod = derivation.drv;
 const types = derivation.types;
 const stable = @import("base").sync;
 const runtime = @import("runtime");
-const host = @import("host");
+const host = @import("../host.zig");
 const rstore = host.store;
 const FileCache = host.FileCache;
 const DaemonRuntime = host.DaemonRuntime;

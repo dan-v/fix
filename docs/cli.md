@@ -2,7 +2,7 @@
 
 *The command surface and the introspection tools that read the machine's mind.*
 
-The command surface lives in the `cli` module (`src/cli/cli.zig` facade over `src/cli/`). Its only dependency is the `engine` facade: CLI code cannot import runtime, VM, host, or derivation modules directly. `src/main.zig` is composition only; it imports `engine` and `cli`, sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar, and `src/cli/setup.zig` folds common `Options → Evaluator` configuration through engine-owned types. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
+The command surface lives in the `cli` module (`src/cli/cli.zig` facade over `src/cli/`). Its only dependency is the `nix` facade: CLI code cannot import runtime or evaluator internals directly. `src/main.zig` is composition only; it imports `nix` and `cli`, sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar, and `src/cli/setup.zig` folds common `Options → Evaluator` configuration through `nix`-owned types. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
 
 ## Invocation
 

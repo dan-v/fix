@@ -8,7 +8,7 @@
 //! by `--vm-trace --vm-trace-format=binary`.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const cli = @import("cli.zig");
 const bytecode = engine.bytecode;
 const trace_log = engine.vm.trace_log;

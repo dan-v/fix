@@ -1,17 +1,17 @@
 //! `syntax` module facade — lexing, parsing, and the AST.
 //!
 //! Self-contained front end: source text → tokens → AST, plus diagnostics.
-//! Depends on nothing else in the tree. Consumers import this module by name
+//! Depends only on generic `base`. Consumers import this module by name
 //! (`@import("syntax")`) and reach submodules through it; they must not import
 //! `syntax/*` files directly.
 
-pub const token = @import("syntax/token.zig");
-pub const scanner = @import("syntax/scanner.zig");
-pub const string_syntax = @import("syntax/string_syntax.zig");
-pub const diagnostic = @import("syntax/diagnostic.zig");
-pub const ast = @import("syntax/ast.zig");
-pub const parser = @import("syntax/parser.zig");
-pub const json = @import("syntax/json.zig");
+pub const token = @import("token.zig");
+pub const scanner = @import("scanner.zig");
+pub const string_syntax = @import("string_syntax.zig");
+pub const diagnostic = @import("diagnostic.zig");
+pub const ast = @import("ast.zig");
+pub const parser = @import("parser.zig");
+pub const json = @import("json.zig");
 
 // Common flat re-exports for the most-used types.
 pub const Token = token.Token;

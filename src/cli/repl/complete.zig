@@ -13,7 +13,7 @@
 //! All results are allocated in the arena the editor hands us.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const editor_mod = @import("editor.zig");
 const commands = @import("commands.zig");
 

@@ -1,8 +1,8 @@
 const std = @import("std");
 const stable = @import("base").sync;
-const DerivationStore = @import("realization").DerivationStore;
-const FileCache = @import("host").FileCache;
-const DaemonRuntime = @import("host").DaemonRuntime;
+const DerivationStore = @import("../realization.zig").DerivationStore;
+const FileCache = @import("../host.zig").FileCache;
+const DaemonRuntime = @import("../host.zig").DaemonRuntime;
 const FakeDaemon = @import("../test_daemon.zig").FakeDaemon;
 
 const root_path = "/nix/store/00000000000000000000000000000000-root.drv";

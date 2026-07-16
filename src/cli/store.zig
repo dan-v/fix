@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const host = @import("engine").host;
+const host = @import("nix").host;
 const store = host.store;
 const nar = host.nar;
 const FileCache = host.FileCache;

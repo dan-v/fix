@@ -1475,11 +1475,11 @@ test "chunk dedup: structurally identical registrations share one id" {
     var registry = try ChunkRegistry.init(allocator);
     defer registry.deinit();
 
-    const first = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1));
+    const first = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1), name_tree_mod.NAME_ROOT);
     try std.testing.expect(!first.reused);
 
     var copy = try buildDedupTestChunk(allocator, 7, 1);
-    const second = try registry.registerDeduped(copy);
+    const second = try registry.registerDeduped(copy, name_tree_mod.NAME_ROOT);
     try std.testing.expect(second.reused);
     try std.testing.expectEqual(first.id, second.id);
     // reused=true ⇒ the registry kept the first registration; the caller
@@ -1492,9 +1492,9 @@ test "chunk dedup: a differing constant or span is a distinct registration" {
     var registry = try ChunkRegistry.init(allocator);
     defer registry.deinit();
 
-    const base = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1));
-    const other_const = try registry.registerDeduped(try buildDedupTestChunk(allocator, 8, 1));
-    const other_span = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 2));
+    const base = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1), name_tree_mod.NAME_ROOT);
+    const other_const = try registry.registerDeduped(try buildDedupTestChunk(allocator, 8, 1), name_tree_mod.NAME_ROOT);
+    const other_span = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 2), name_tree_mod.NAME_ROOT);
 
     try std.testing.expect(!other_const.reused);
     try std.testing.expect(!other_span.reused);
@@ -1522,13 +1522,13 @@ test "chunk dedup: concurrent registrations converge (equal) and stay distinct (
                 // thread's shard-map insert won the race (`registerDeduped`
                 // returns the winner even for the losing racer).
                 var equal = buildDedupTestChunk(alloc, 4242, 1) catch @panic("chunk build failed");
-                const re = reg.registerDeduped(equal) catch @panic("registerDeduped failed");
+                const re = reg.registerDeduped(equal, name_tree_mod.NAME_ROOT) catch @panic("registerDeduped failed");
                 if (re.reused) equal.deinit(alloc);
                 e.* = re.id;
 
                 // Per-(thread, iteration) unique constant: never merged.
                 var distinct = buildDedupTestChunk(alloc, @intCast(t_idx * 100_000 + i), 1) catch @panic("chunk build failed");
-                const rd = reg.registerDeduped(distinct) catch @panic("registerDeduped failed");
+                const rd = reg.registerDeduped(distinct, name_tree_mod.NAME_ROOT) catch @panic("registerDeduped failed");
                 if (rd.reused) distinct.deinit(alloc);
                 d.* = rd.id;
             }

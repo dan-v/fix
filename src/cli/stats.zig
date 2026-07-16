@@ -6,7 +6,7 @@
 //! are imported here at the top of the file rather than inline at each use.
 
 const std = @import("std");
-const engine = @import("engine");
+const engine = @import("nix");
 const Evaluator = engine.Evaluator;
 const prof = engine.probe.prof;
 const prof_path = engine.probe.prof_path;
