@@ -123,8 +123,12 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     // Evaluation is done and its results are copied out: drop the language
     // heap (see build.zig) concurrently with the build phase, which can run
     // for minutes and needs only the daemon connection.
-    ev.buildDerivationsReleasing(derived.items, sink, run.buildMode(options)) catch |err| {
-        return run.buildFailure(ev, err);
+    var build_session = ev.beginBuildPhase(derived.items) catch |err| {
+        return run.buildFailure(ev.lastStoreError(), err);
+    };
+    defer build_session.deinit();
+    build_session.buildPaths(derived.items, sink, run.buildMode(options)) catch |err| {
+        return run.buildFailure(build_session.lastStoreError(), err);
     };
     return null;
 }
@@ -161,8 +165,12 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     defer allocator.free(derived);
     // See realizePackages: results are copied out, so free the language heap
     // concurrently with the build phase.
-    ev.buildDerivationsReleasing(&.{derived}, sink, run.buildMode(options)) catch |err| {
-        return run.buildFailure(ev, err);
+    var build_session = ev.beginBuildPhase(&.{derived}) catch |err| {
+        return run.buildFailure(ev.lastStoreError(), err);
+    };
+    defer build_session.deinit();
+    build_session.buildPaths(&.{derived}, sink, run.buildMode(options)) catch |err| {
+        return run.buildFailure(build_session.lastStoreError(), err);
     };
     return null;
 }

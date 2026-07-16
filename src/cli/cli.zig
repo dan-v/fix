@@ -559,10 +559,16 @@ pub fn realize(
     // build phase — the build starts immediately, cleanup runs alongside it.
     var bp = build_progress.BuildProgress.init(allocator, &progress);
     const build_sink = if (term.show_progress) bp.sink() else null;
-    ev.buildDerivationsReleasing(&.{derived}, build_sink, run.buildMode(options)) catch |err| {
+    var build_session = ev.beginBuildPhase(&.{derived}) catch |err| {
         bp.deinit();
         ev.progressSessionEnd();
-        return .{ .failed = run.buildFailure(ev, err) };
+        return .{ .failed = run.buildFailure(ev.lastStoreError(), err) };
+    };
+    defer build_session.deinit();
+    build_session.buildPaths(&.{derived}, build_sink, run.buildMode(options)) catch |err| {
+        bp.deinit();
+        ev.progressSessionEnd();
+        return .{ .failed = run.buildFailure(build_session.lastStoreError(), err) };
     };
     bp.deinit();
     ev.progressSessionEnd();

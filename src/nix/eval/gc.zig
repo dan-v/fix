@@ -536,7 +536,7 @@ pub fn markRoots(ev: anytype, tr: *gc.Tracer) void {
     // Lazy-derivation cache (Value bits keyed by attrs id). Only current-
     // token entries are live roots; stale ones (pre-GC id, now reused) are
     // dead and will miss on lookup, so don't retain them.
-    var dit = ev.derivations.lazy_drv_cache.iterator();
+    var dit = ev.store.derivations.lazy_drv_cache.iterator();
     while (dit.next()) |e| if (e.value_ptr.token == ev.heap.token)
         tr.markValue(&ev.heap, .{ .bits = e.value_ptr.bits });
 }

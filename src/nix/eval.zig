@@ -416,6 +416,67 @@ fn firstMappedOffset(chunk: *const bytecode.chunk.Chunk) ?u32 {
     return best;
 }
 
+/// Store/daemon ownership that remains valid after the language runtime has
+/// been released. Keeping this state in one object makes the terminal build
+/// phase independent of the evaluator heap, scheduler, bytecode, and intern
+/// table by construction.
+pub const StoreState = struct {
+    allocator: std.mem.Allocator,
+    derivations: DerivationStore,
+    daemon_runtime: *daemon_runtime_mod.DaemonRuntime,
+
+    fn init(allocator: std.mem.Allocator) !StoreState {
+        const runtime_ptr = try allocator.create(daemon_runtime_mod.DaemonRuntime);
+        errdefer allocator.destroy(runtime_ptr);
+        runtime_ptr.* = daemon_runtime_mod.DaemonRuntime.init();
+        errdefer runtime_ptr.deinit();
+
+        var derivations = DerivationStore.init(allocator);
+        derivations.setOffload(runtime_ptr, io_offload.runOnPool, io_offload.fiberPark);
+        return .{ .allocator = allocator, .derivations = derivations, .daemon_runtime = runtime_ptr };
+    }
+
+    fn deinit(self: *StoreState) void {
+        self.derivations.clearOffload();
+        self.daemon_runtime.deinit();
+        self.allocator.destroy(self.daemon_runtime);
+        self.derivations.deinit();
+    }
+
+    pub fn buildPaths(self: *StoreState, paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
+        return self.derivations.buildPaths(paths, sink, mode);
+    }
+
+    pub fn lastError(self: *StoreState) ?[]const u8 {
+        return self.derivations.lastStoreError();
+    }
+
+    pub fn addIndirectRoot(self: *StoreState, link_path: []const u8) !void {
+        return self.derivations.addIndirectRoot(link_path);
+    }
+};
+
+/// Handle for the terminal build phase. Creating it starts language teardown;
+/// thereafter build callers need only this store-side object. `deinit` joins
+/// teardown before the owning Evaluator itself can be destroyed.
+pub const BuildSession = struct {
+    store: *StoreState,
+    release_thread: ?std.Thread,
+
+    pub fn deinit(self: *BuildSession) void {
+        if (self.release_thread) |thread| thread.join();
+        self.release_thread = null;
+    }
+
+    pub fn buildPaths(self: *BuildSession, paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
+        return self.store.buildPaths(paths, sink, mode);
+    }
+
+    pub fn lastStoreError(self: *BuildSession) ?[]const u8 {
+        return self.store.lastError();
+    }
+};
+
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     intern: InternTable,
@@ -424,12 +485,8 @@ pub const Evaluator = struct {
     heap: ObjectHeap,
     files: FileCache,
     fetchers: FetchCache,
-    derivations: DerivationStore,
-    /// Owns the fast IO lane — the background thread that runs blocking daemon
-    /// store ops off the compute fibers (see `host.daemon_runtime`).
-    /// Heap-allocated so its address is stable — the thread captures it, and the
-    /// Evaluator itself is returned by value.
-    daemon_runtime: *daemon_runtime_mod.DaemonRuntime,
+    /// Store and daemon state that deliberately outlives language teardown.
+    store: StoreState,
     /// Compiled-regex cache shared by every VM (`builtins.match`/`split`).
     regexes: regex_mod.PatternCache,
     imports: imports_mod.Registry,
@@ -585,12 +642,10 @@ pub const Evaluator = struct {
         } else {};
         errdefer if (gc.enabled) allocator.free(gc_workers);
 
-        const daemon_rt = try allocator.create(daemon_runtime_mod.DaemonRuntime);
-        errdefer allocator.destroy(daemon_rt);
-        daemon_rt.* = daemon_runtime_mod.DaemonRuntime.init();
-        errdefer daemon_rt.deinit();
+        var store = try StoreState.init(allocator);
+        errdefer store.deinit();
 
-        var ev: Evaluator = .{
+        const ev: Evaluator = .{
             .allocator = allocator,
             .intern = intern,
             .registry = registry,
@@ -598,8 +653,7 @@ pub const Evaluator = struct {
             .heap = try ObjectHeap.init(allocator, worker_count),
             .files = FileCache.init(allocator),
             .fetchers = FetchCache.init(allocator),
-            .derivations = DerivationStore.init(allocator),
-            .daemon_runtime = daemon_rt,
+            .store = store,
             .regexes = regex_mod.PatternCache.init(allocator),
             .imports = .{},
             .search_paths = .{},
@@ -622,10 +676,6 @@ pub const Evaluator = struct {
             .gc_import_vms_mu = if (gc.enabled) .{} else {},
             .gc_workers = gc_workers,
         };
-        // Route daemon store ops (writes, IFD realization, the terminal build)
-        // through the fast lane. `offload` is plain movable data (a stable heap
-        // ptr + a fn ptr), so it survives the by-value return of `ev`.
-        ev.derivations.setOffload(daemon_rt, io_offload.runOnPool, io_offload.fiberPark);
         return ev;
     }
 
@@ -633,14 +683,9 @@ pub const Evaluator = struct {
         if (self.breakpoints) |*bp| bp.deinit();
         self.releaseEvalState();
         if (self.base_path) |path| self.allocator.free(path);
-        // Stop the daemon runtime (the fast IO lane) before the store's own
-        // connection is closed. Safe here: the scheduler + main worker are
-        // already joined (in `releaseEvalState`), so no fiber is still parked on
-        // an in-flight fast-lane op.
-        self.derivations.clearOffload();
-        self.daemon_runtime.deinit();
-        self.allocator.destroy(self.daemon_runtime);
-        self.derivations.deinit();
+        // Language workers are joined by releaseEvalState, so no fiber remains
+        // parked on the store's fast IO lane when it is shut down here.
+        self.store.deinit();
     }
 
     /// Free the language-evaluation half of the evaluator — workers and
@@ -655,8 +700,8 @@ pub const Evaluator = struct {
     /// blocks for the build's duration.
     ///
     /// Idempotent; `deinit` runs it too. After this only store-side entry
-    /// points are valid (`buildDerivations`, `addIndirectRoot`,
-    /// `lastStoreError`, the progress-session calls) — no evaluation, value
+    /// points are valid (`StoreState`/`BuildSession` and the progress-session
+    /// calls) — no evaluation, value
     /// access, or diagnostics rendering.
     pub fn releaseEvalState(self: *Evaluator) void {
         if (self.eval_released) return;
@@ -710,7 +755,7 @@ pub const Evaluator = struct {
         self.search_paths.deinit(self.allocator);
         self.fetchers.deinit();
         self.regexes.deinit();
-        self.derivations.releaseRecipePayloads();
+        self.store.derivations.releaseRecipePayloads();
         self.files.deinit();
         self.heap.deinit();
         // Free deferred-compile state after the heap (whose thunks
@@ -741,7 +786,7 @@ pub const Evaluator = struct {
     }
 
     pub fn setDerivationDebug(self: *Evaluator, enabled: bool) void {
-        self.derivations.setDebugEnabled(enabled);
+        self.store.derivations.setDebugEnabled(enabled);
     }
 
     /// Cap concurrent fetches (`http-connections`; 0 = unlimited).
@@ -767,13 +812,13 @@ pub const Evaluator = struct {
     }
 
     pub fn derivationDebugRecords(self: *const Evaluator) []const derivation.DebugRecord {
-        return self.derivations.debugRecords();
+        return self.store.derivations.debugRecords();
     }
 
     pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
         self.files.setIo(io);
         self.fetchers.setIo(io);
-        self.derivations.setIo(io);
+        self.store.derivations.setIo(io);
         if (self.base_path) |path| self.allocator.free(path);
         self.base_path = try std.process.currentPathAlloc(io, self.allocator);
     }
@@ -781,7 +826,7 @@ pub const Evaluator = struct {
     pub fn setFileIo(self: *Evaluator, io: std.Io) void {
         self.files.setIo(io);
         self.fetchers.setIo(io);
-        self.derivations.setIo(io);
+        self.store.derivations.setIo(io);
     }
 
     /// Point the base path (used to resolve relative path literals like `./x`)
@@ -850,7 +895,7 @@ pub const Evaluator = struct {
         // sink. It must not import observ (same module layer), so hand it opaque
         // hooks bound to this evaluator; they map its groups onto the live sink's
         // and read the spans half. A null ctx clears them.
-        self.derivations.setSpanHooks(
+        self.store.derivations.setSpanHooks(
             if (progress != null) self else null,
             drvSpanBegin,
             drvSpanEnd,
@@ -1299,7 +1344,7 @@ pub const Evaluator = struct {
         }
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
-        self.derivations.clearDebugRecords();
+        self.store.derivations.clearDebugRecords();
         // Not routed through `evaluateSource`: its top-level detection is
         // `source_path == null`, so passing the path there would send the
         // top-level eval down the nested-import path (wrong fiber). Attribute
@@ -1401,7 +1446,7 @@ pub const Evaluator = struct {
             .heap = &self.heap,
             .files = &self.files,
             .fetchers = &self.fetchers,
-            .derivations = &self.derivations,
+            .derivations = &self.store.derivations,
             .scheduler = &self.scheduler,
             // Helpers (worker_id != 0) don't write to the shared trace —
             // it's a side effect of *real* evaluation, so speculative force
@@ -1476,12 +1521,12 @@ pub const Evaluator = struct {
     /// are forced (`fix instantiate`/`build`). The daemon connects lazily on
     /// first use; plain eval leaves this off and never touches the store.
     pub fn enableStoreWrites(self: *Evaluator) void {
-        self.derivations.enableStoreWrites();
+        self.store.derivations.enableStoreWrites();
     }
 
     /// The last daemon error message, for surfacing `error.DaemonError`.
     pub fn lastStoreError(self: *Evaluator) ?[]const u8 {
-        return self.derivations.lastStoreError();
+        return self.store.derivations.lastStoreError();
     }
 
     /// If `value` is a derivation (an attrset with a `drvPath`), force it — which
@@ -1534,41 +1579,25 @@ pub const Evaluator = struct {
         return self.intern.get(text_id);
     }
 
-    /// Realize `derived_paths` (`<drvpath>^<outputs>`) via the daemon store,
-    /// forwarding the build activity/log stream to `sink` if given.
-    pub fn buildDerivations(self: *Evaluator, derived_paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
-        return self.derivations.buildPaths(derived_paths, sink, mode);
-    }
-
     /// Write `drv_path`'s `.drv` closure to the store on demand (deps-first via
     /// the recipe graph). Since forcing only records recipes, this is how a `.drv`
     /// is materialized — for `instantiate`, and before a build. Must run before
     /// eval state is released (it reads the recipe graph).
     pub fn ensureDerivationClosure(self: *Evaluator, drv_path: []const u8) !void {
-        return self.derivations.ensureClosure(drv_path);
+        return self.store.derivations.ensureClosure(drv_path);
     }
 
-    /// Like `buildDerivations`, but tears down the language heap
-    /// (`releaseEvalState`) *concurrently* with the build instead of before
-    /// it. Evaluation is done and its results are copied out, so the ~2 GB
-    /// eval heap is dead — but freeing it (worker join + segment sweep +
-    /// arena teardown) is real wall-time. Doing it before the build is
-    /// head-of-line blocking: the build should start the moment eval
-    /// finishes, not wait on cleanup. The teardown touches only eval state
-    /// (heap, scheduler, arenas, caches) plus the recipe cache under its own
-    /// `recipe_mu`; `buildPaths` drives the daemon connection under
-    /// `daemon_mu` and never reads recipes, so the two never contend, and
-    /// the base allocator is already thread-safe (the IO thread allocates
-    /// against it during builds). The single build-phase entry point for the
-    /// realizing subcommands — no caller should sequence release-then-build.
-    pub fn buildDerivationsReleasing(self: *Evaluator, derived_paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
+    /// Finish evaluation and return the only state needed by the build phase.
+    /// Language teardown overlaps daemon work once the returned session starts
+    /// a build; callers must keep the session alive until that work completes.
+    pub fn beginBuildPhase(self: *Evaluator, derived_paths: []const []const u8) !BuildSession {
         // Writes are demand-driven: materialize each target's `.drv` closure now,
         // BEFORE releasing eval state — `ensureClosure` walks the recipe graph,
         // which `releaseEvalState` frees. (Cheap, and inherently sequential: the
         // daemon can't build a `.drv` whose closure isn't on disk yet.)
         for (derived_paths) |derived| {
             const drv = derived[0..(std.mem.indexOfScalar(u8, derived, '!') orelse derived.len)];
-            try self.derivations.ensureClosure(drv);
+            try self.store.derivations.ensureClosure(drv);
         }
         // Now release on a helper thread so the build launches immediately and
         // the ~2 GB heap teardown overlaps it. If the thread can't spawn, fall
@@ -1577,25 +1606,18 @@ pub const Evaluator = struct {
             self.releaseEvalState();
             break :blk null;
         };
-        defer if (releaser) |t| t.join();
-        return self.buildDerivations(derived_paths, sink, mode);
+        return .{ .store = &self.store, .release_thread = releaser };
     }
 
     /// Set the per-connection daemon settings (`--cores`/`--max-jobs`/… via
     /// `set_options`) applied when the store connects. See `setup.configure`.
     pub fn setDaemonBuildSettings(self: *Evaluator, settings: host.store.BuildSettings) !void {
-        return self.derivations.setBuildSettings(settings);
+        return self.store.derivations.setBuildSettings(settings);
     }
 
     /// Override the nix-daemon socket path (`$NIX_DAEMON_SOCKET_PATH`).
     pub fn setDaemonSocket(self: *Evaluator, path: []const u8) !void {
-        return self.derivations.setDaemonSocket(path);
-    }
-
-    /// Register `link_path` (an existing absolute symlink into the store) as an
-    /// indirect GC root via the daemon (`--add-root`/`--indirect`).
-    pub fn addIndirectRoot(self: *Evaluator, link_path: []const u8) !void {
-        return self.derivations.addIndirectRoot(link_path);
+        return self.store.derivations.setDaemonSocket(path);
     }
 
     /// Navigate a dotted attr path (e.g. `python3Packages.requests`) from `value`,

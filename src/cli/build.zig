@@ -116,7 +116,7 @@ pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Evaluator, name: 
             std.debug.print("warning: {s} is not in the gcroots directory, so it will not be an effective GC root (pass --indirect)\n", .{abs});
         return;
     }
-    ev.addIndirectRoot(abs) catch |err| {
+    ev.store.addIndirectRoot(abs) catch |err| {
         std.debug.print("warning: could not register GC root {s}: {s}\n", .{ abs, @errorName(err) });
     };
 }

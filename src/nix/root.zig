@@ -41,6 +41,8 @@ pub const diagnostic = syntax.diagnostic;
 pub const process_support = @import("process_support.zig");
 
 pub const Evaluator = eval.Evaluator;
+pub const StoreState = eval.StoreState;
+pub const BuildSession = eval.BuildSession;
 pub const Value = value.Value;
 pub const DebugSession = eval.DebugSession;
 pub const DebugFrame = eval.DebugFrame;

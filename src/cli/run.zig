@@ -124,9 +124,9 @@ pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Ev
 /// only render store-side state. Evaluation already succeeded by the time a
 /// build runs — there are no eval diagnostics to lose — and the daemon's own
 /// message (still owned by the surviving DerivationStore) is the useful part.
-pub fn buildFailure(ev: *Evaluator, err: anyerror) u8 {
+pub fn buildFailure(last_store_error: ?[]const u8, err: anyerror) u8 {
     switch (err) {
-        error.DaemonError => std.debug.print("error: daemon: {s}\n", .{ev.lastStoreError() orelse "unknown"}),
+        error.DaemonError => std.debug.print("error: daemon: {s}\n", .{last_store_error orelse "unknown"}),
         error.StoreUnavailable => std.debug.print("error: cannot reach the nix-daemon (is it running?)\n", .{}),
         else => std.debug.print("error: build failed: {s}\n", .{@errorName(err)}),
     }
