@@ -1069,7 +1069,7 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
             var slot = entry.compiled.load(.acquire);
             if (slot == 0) {
                 const line_index = try table.lineIndexFor(entry.source);
-                const new_id = try deferred_compile.compile(table.allocator, self.registry, self.intern, self.heap, entry, line_index);
+                const new_id = try deferred_compile.compile(table.allocator, self.registry, self.intern, self.heap, self.registration_sink, entry, line_index);
                 // Publish once; a concurrent racer may have won — then our
                 // chunk is orphaned-but-correct and `slot` is the canonical id.
                 if (entry.compiled.cmpxchgStrong(0, new_id + 1, .acq_rel, .acquire)) |winner| {

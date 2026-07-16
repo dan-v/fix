@@ -41,6 +41,7 @@ pub fn compile(
     registry: *ChunkRegistry,
     intern: *InternTable,
     heap: *ObjectHeap,
+    registration_sink: ?compiler_mod.ChunkRegistrationSink,
     entry: *const deferred.Entry,
     line_index: *LineIndex,
 ) !ChunkId {
@@ -58,6 +59,7 @@ pub fn compile(
     var parent_builder = try ChunkBuilder.init(sa);
     defer parent_builder.deinit(sa);
     var parent = Compiler.init(&compiler_driver.driver, sa, allocator, &parent_builder, registry, entry.source, intern, heap);
+    parent.registration_sink = registration_sink;
     parent.base_path = entry.base_path;
     parent.source_path = entry.source_path;
     parent.source_file_id = entry.source_file_id;
@@ -101,6 +103,7 @@ pub fn compile(
     var child_builder = try ChunkBuilder.init(sa);
     defer child_builder.deinit(sa);
     var child = Compiler.init(&compiler_driver.driver, sa, allocator, &child_builder, registry, entry.source, intern, heap);
+    child.registration_sink = registration_sink;
     child.parent = &parent;
     child.base_path = entry.base_path;
     child.source_path = entry.source_path;

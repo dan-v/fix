@@ -42,6 +42,19 @@ pub const Driver = struct {
     compile_and_finish: *const fn (*Compiler, *const Node, ?Value) anyerror!void,
 };
 
+/// Explicit post-registration effect owned by the evaluator. The compiler
+/// reports newly published chunks after registry mutation is complete; the
+/// registry itself remains a storage component and never schedules imports or
+/// patches debugger bytecode as a hidden side effect.
+pub const ChunkRegistrationSink = struct {
+    context: *anyopaque,
+    registered: *const fn (context: *anyopaque, chunk_id: types.ChunkId) void,
+
+    pub fn notify(self: ChunkRegistrationSink, chunk_id: types.ChunkId) void {
+        self.registered(self.context, chunk_id);
+    }
+};
+
 pub const Compiler = struct {
     driver: *const Driver,
     /// Per-compilation-unit SCRATCH allocator. Everything the compiler
@@ -62,6 +75,7 @@ pub const Compiler = struct {
     persistent: std.mem.Allocator,
     builder: *ChunkBuilder,
     registry: *ChunkRegistry,
+    registration_sink: ?ChunkRegistrationSink = null,
     /// Used by integer-literal compilation to box i64 values that
     /// exceed the inline Value range (see `runtime/int.zig`). The
     /// resulting boxed object lives in the heap for the same span as
@@ -230,6 +244,7 @@ pub const Compiler = struct {
         child.home_dir = self.home_dir;
         child.policy = self.policy;
         child.source_file_id = self.source_file_id;
+        child.registration_sink = self.registration_sink;
         // Qualified-name tree: the first child spun up for a named bound value
         // claims the pending name as a child node of this compiler's name and
         // becomes the parent for its own nested bodies. Real binding segments
@@ -301,6 +316,7 @@ pub const Compiler = struct {
             copy.deinit(self.persistent);
             return r.id; // first registration keeps its name/upvalue sidecar
         }
+        if (r.new_id) |id| if (self.registration_sink) |sink| sink.notify(id);
         try self.recordChunkSidecar(r.id, &ch);
         return r.id;
     }

@@ -21,6 +21,7 @@ const driver_mod = @import("compiler/driver.zig");
 
 pub const Compiler = context.Compiler;
 pub const Driver = context.Driver;
+pub const ChunkRegistrationSink = context.ChunkRegistrationSink;
 pub const driver = driver_mod.driver;
 
 pub const Node = context.Node;

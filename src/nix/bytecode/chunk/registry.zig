@@ -105,13 +105,6 @@ pub const ChunkRegistry = struct {
     /// nothing and the hot `Chunk` layout is untouched. Not concurrency-safe;
     /// only enabled for the single-threaded disasm compile.
     capture_names: bool = false,
-    /// Debugger source-line-breakpoint patcher (see `BreakpointSink`). Null
-    /// unless a debugger is attached.
-    breakpoint_sink: ?BreakpointSink = null,
-    /// Import-prefetch discovery hook for this registry. Keeping the hook on
-    /// the registry prevents concurrently-live Evaluators from redirecting
-    /// each other's newly compiled path constants.
-    path_const_sink: ?PathConstSink = null,
     /// The thread that first recorded into the sidecar, captured lazily. The
     /// maps are not synchronized, so every `recordName`/`recordFile` must come
     /// from one thread; a debug assertion enforces it (see `checkSingleThread`).
@@ -311,28 +304,6 @@ pub const ChunkRegistry = struct {
         return self.files.get(id);
     }
 
-    /// Optional import-prefetch discovery sink (`FIX_IMPORT_PREFETCH`): when
-    /// set (by the Evaluator, before workers start), `register` reports each
-    /// freshly compiled chunk's `.path` constants so `.nix` file references
-    /// can be speculatively parsed+compiled+evaluated on idle helpers ahead
-    /// of the demand fiber. Deferred force-time compiles already register
-    /// through this registry, so they feed the same per-Evaluator hook without
-    /// additional compiler plumbing. Read-only after start; called concurrently
-    /// from every compiling worker (the callee synchronizes and deduplicates).
-    pub const PathConstSink = struct {
-        ctx: *anyopaque,
-        call: *const fn (ctx: *anyopaque, path_id: types.InternId) void,
-    };
-    /// Debugger hook: called for every chunk as it registers, so pending
-    /// source-line breakpoints get patched into freshly (often lazily) compiled
-    /// bodies — imports and deferred attrs register mid-evaluation. Null in
-    /// every normal run. Per-registry (not a global) so it can't leak across
-    /// evaluators. See `bytecode/breakpoints.zig`.
-    pub const BreakpointSink = struct {
-        ctx: *anyopaque,
-        place: *const fn (ctx: *anyopaque, chunk_id: types.ChunkId, chunk: *Chunk) void,
-    };
-
     // Every field of `Chunk` must either be covered by `contentHash` AND
     // `contentEql` or be derived from covered fields (`scheduling` is the
     // one derived field today): a semantic field missing from both silently
@@ -446,7 +417,15 @@ pub const ChunkRegistry = struct {
     /// registration when possible (see `dedup_shards`). Returns the id and
     /// whether it was reused — reused=true means the caller still owns (and
     /// must deinit) its own copy of `chunk`.
-    pub fn registerDeduped(self: *ChunkRegistry, chunk: Chunk, name: name_tree_mod.NameId) !struct { id: ChunkId, reused: bool } {
+    pub const RegisterResult = struct {
+        id: ChunkId,
+        reused: bool,
+        /// Slot published by this call. It can differ from `id` when a
+        /// concurrent equal registration wins canonical deduplication.
+        new_id: ?ChunkId,
+    };
+
+    pub fn registerDeduped(self: *ChunkRegistry, chunk: Chunk, name: name_tree_mod.NameId) !RegisterResult {
         const h = contentHash(&chunk);
         const shard = &self.dedup_shards[@as(usize, @intCast(h >> 58))];
 
@@ -460,12 +439,13 @@ pub const ChunkRegistry = struct {
 
         if (candidate) |existing| {
             if (contentEql(self.get(existing).?, &chunk)) {
-                return .{ .id = existing, .reused = true };
+                return .{ .id = existing, .reused = true, .new_id = null };
             }
             // Hash collision with different content. `h`'s map entry is
             // permanent (first writer wins, entries are never replaced), so
             // there is nothing to insert: register plain, as before.
-            return .{ .id = try self.registerNamed(chunk, name), .reused = false };
+            const id = try self.registerNamed(chunk, name);
+            return .{ .id = id, .reused = false, .new_id = id };
         }
 
         const id = try self.registerNamed(chunk, name);
@@ -480,7 +460,7 @@ pub const ChunkRegistry = struct {
             break :blk null;
         };
         if (!self.solo) shard.mu.unlock();
-        const winner = inserted orelse return .{ .id = id, .reused = false };
+        const winner = inserted orelse return .{ .id = id, .reused = false, .new_id = id };
 
         // A concurrent registration won the insert race for this hash while
         // we were registering. When it is content-equal (the common case: the
@@ -490,9 +470,9 @@ pub const ChunkRegistry = struct {
         // caller doesn't deinit it; it stays registered but unreferenced
         // (benign). A mere hash collision keeps our own id.
         if (contentEql(self.get(winner).?, self.get(id).?)) {
-            return .{ .id = winner, .reused = false };
+            return .{ .id = winner, .reused = false, .new_id = id };
         }
-        return .{ .id = id, .reused = false };
+        return .{ .id = id, .reused = false, .new_id = id };
     }
 
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {
@@ -508,11 +488,6 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(stored);
         }
         stored.* = chunk;
-        if (self.path_const_sink) |sink| {
-            for (stored.constants) |c| {
-                if (c.isPath()) sink.call(sink.ctx, c.asInternId());
-            }
-        }
         // Lock-free registration: many workers compile (deferred bodies +
         // speculative imports) concurrently; the writer-mutex append serialized
         // them per-chunk. `appendAtomic` CAS-bumps the cursor instead. In
@@ -530,10 +505,6 @@ pub const ChunkRegistry = struct {
             try self.chunks.appendSerial(self.allocator, new_slot)
         else
             try self.chunks.appendAtomic(self.allocator, new_slot);
-        // Debugger: patch any pending source-line breakpoints into this newly
-        // registered body. Solo-only in practice (the debugger forces w=1), so
-        // patching the just-published chunk races nothing.
-        if (self.breakpoint_sink) |s| s.place(s.ctx, id, stored);
         return id;
     }
 
@@ -641,36 +612,6 @@ test "chunk builder emits opcodes and operands into the code stream" {
     try std.testing.expectEqual(@as(u8, 3), chunk.code[1]);
     try std.testing.expectEqual(@intFromEnum(OpCode.jump), chunk.code[2]);
     try std.testing.expectEqual(@as(u32, 10), readU32Inline(chunk.code, 3));
-}
-
-test "chunk path hooks are isolated per registry" {
-    const allocator = std.testing.allocator;
-    var left = try ChunkRegistry.init(allocator);
-    defer left.deinit();
-    var right = try ChunkRegistry.init(allocator);
-    defer right.deinit();
-
-    const Counter = struct {
-        value: u32 = 0,
-
-        fn note(ctx: *anyopaque, _: types.InternId) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.value += 1;
-        }
-    };
-    var left_count: Counter = .{};
-    var right_count: Counter = .{};
-    left.path_const_sink = .{ .ctx = &left_count, .call = Counter.note };
-    right.path_const_sink = .{ .ctx = &right_count, .call = Counter.note };
-
-    var builder = try ChunkBuilder.init(allocator);
-    defer builder.deinit(allocator);
-    _ = try builder.addConstant(allocator, Value.path(17));
-    const chunk = try builder.finish(allocator, 0);
-    _ = try left.register(chunk);
-
-    try std.testing.expectEqual(@as(u32, 1), left_count.value);
-    try std.testing.expectEqual(@as(u32, 0), right_count.value);
 }
 
 test "chunk builder patches a forward jump offset after emission" {
@@ -864,10 +805,12 @@ test "chunk dedup: structurally identical registrations share one id" {
 
     const first = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1), name_tree_mod.root_name_id);
     try std.testing.expect(!first.reused);
+    try std.testing.expectEqual(first.id, first.new_id.?);
 
     var copy = try buildDedupTestChunk(allocator, 7, 1);
     const second = try registry.registerDeduped(copy, name_tree_mod.root_name_id);
     try std.testing.expect(second.reused);
+    try std.testing.expectEqual(@as(?ChunkId, null), second.new_id);
     try std.testing.expectEqual(first.id, second.id);
     // reused=true ⇒ the registry kept the first registration; the caller
     // still owns (and must free) its own copy.

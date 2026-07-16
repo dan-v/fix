@@ -689,9 +689,6 @@ pub const Evaluator = struct {
         // build phase already, but be structural about it.
         self.stopProgressSampler();
         mem_report.report(&self.heap, &self.intern, &self.registry, self.retained_arenas.items, self.mem_report_mode);
-        // No compilation may notify this Evaluator once registry teardown
-        // begins. The hook is instance-owned, so other evaluators are untouched.
-        self.registry.path_const_sink = null;
         self.prefetch.seen.deinit(self.allocator);
         gc.recordFinalTotal(&self.heap.gc_report, self.heap.totalReservedBytes());
         if (self.gc_report_on) gc.report(&self.heap.gc_report, self.heap.gc_budget_bytes);
@@ -1061,6 +1058,7 @@ pub const Evaluator = struct {
         compiler.source_path = source_path;
         compiler.home_dir = if (self.env_map) |env| env.get("HOME") else null;
         compiler.policy = self.policy;
+        compiler.registration_sink = chunkRegistrationSink(self);
         // Set eagerly (not lazily on first position record, see sourceFileId):
         // chunks registered before any position record would otherwise miss
         // their file in the disasm sidecar.
@@ -1107,6 +1105,7 @@ pub const Evaluator = struct {
         else
             bytecode.root_name_id;
         const chunk_id = try self.registry.registerNamed(chunk, top_name);
+        self.chunkRegistered(chunk_id);
         if (compiler.source_file_id) |f| try self.registry.recordFile(chunk_id, f);
         // Local binding names for the top chunk (child chunks get theirs in
         // `registerChunk`); lets the debugger and disasm name top-level locals.
@@ -1167,8 +1166,6 @@ pub const Evaluator = struct {
         self.debugger.setUi(.{ .ctx = ctx, .run = run });
         if (self.debugger.breakpoints == null) {
             self.debugger.breakpoints = bytecode.BreakpointTable.init(self.allocator, &self.intern);
-            // Newly (often lazily) compiled chunks get pending breakpoints too.
-            self.registry.breakpoint_sink = self.debugger.breakpoints.?.sink();
         }
     }
 
@@ -1286,13 +1283,7 @@ pub const Evaluator = struct {
                     if (std.fmt.parseInt(u32, s, 10)) |n| max = n else |_| {}
                 }
             }
-            if (on and self.worker_count > 1) {
-                self.prefetch.budget = max;
-                self.registry.path_const_sink = .{ .ctx = self, .call = prefetchPathConst };
-            } else {
-                self.prefetch.budget = 0;
-                self.registry.path_const_sink = null;
-            }
+            self.prefetch.budget = if (on and self.worker_count > 1) max else 0;
         }
         // Speculative readDir-children prefetch: a cold builtins.readDir
         // whose listing is a directory-of-directories fans the children out
@@ -1435,6 +1426,7 @@ pub const Evaluator = struct {
             .import_host = .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             .builtins_value = try self.ensureBuiltins(),
             .deferred_table = &self.deferred_table,
+            .registration_sink = chunkRegistrationSink(self),
             .regexes = &self.regexes,
             .break_sink = if (self.debugger.ui != null) .{ .ctx = self, .fire = fireBreak } else null,
             .breakpoints = if (self.debugger.breakpoints != null) &self.debugger.breakpoints.? else null,
@@ -1815,8 +1807,22 @@ pub const Evaluator = struct {
         return imports_mod.importPath(importHost(self), path, parent_depth);
     }
 
-    /// This Evaluator's `ChunkRegistry.path_const_sink` target
-    /// (`FIX_IMPORT_PREFETCH`):
+    /// Explicit post-registration phase: compiler code reports a newly
+    /// published chunk here, after the registry mutation has completed. Import
+    /// discovery and debugger patching are evaluator orchestration, not hidden
+    /// side effects of `ChunkRegistry.register`.
+    fn chunkRegistered(self: *Evaluator, chunk_id: ChunkId) void {
+        const chunk = self.registry.get(chunk_id) orelse return;
+        for (chunk.constants) |value| {
+            if (value.isPath()) prefetchPathConst(self, value.asInternId());
+        }
+        if (self.debugger.breakpoints) |*breakpoints| {
+            breakpoints.placeRegisteredChunk(chunk_id, @constCast(chunk));
+        }
+    }
+
+    /// Import-path discovery in the evaluator's explicit chunk-registration
+    /// phase (`FIX_IMPORT_PREFETCH`):
     /// called for every `.path` constant of every freshly compiled chunk,
     /// from whichever worker ran the compile. Filters to `.nix` files
     /// (directory references — the bulk of e.g. all-packages.nix's ~1.7K
@@ -2057,6 +2063,15 @@ fn valuePrintHost(ev: *Evaluator) eval_print.Host {
         .progress_count_begin = printProgressCountBegin,
         .progress_step = printProgressStep,
     };
+}
+
+fn chunkRegistrationSink(ev: *Evaluator) compiler_mod.ChunkRegistrationSink {
+    return .{ .context = ev, .registered = chunkRegisteredThunk };
+}
+
+fn chunkRegisteredThunk(context: *anyopaque, chunk_id: ChunkId) void {
+    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    ev.chunkRegistered(chunk_id);
 }
 
 fn printForceValue(context: *anyopaque, value: Value) anyerror!Value {

@@ -32,6 +32,7 @@ const eval_progress = @import("../observ.zig").progress;
 const VmTrace = @import("trace_log.zig").VmTrace;
 const worker_id_mod = @import("base").worker_id;
 const DeferredTable = @import("../compiler/deferred_table.zig").Table;
+const ChunkRegistrationSink = @import("../compiler/context.zig").ChunkRegistrationSink;
 const ThunkTrace = @import("../probe.zig").thunk_trace.ThunkTrace;
 const LanguagePolicy = @import("../policy.zig").LanguagePolicy;
 
@@ -183,6 +184,7 @@ pub const VM = struct {
     /// (which never create `.deferred` thunks). See
     /// `compiler/deferred_table.zig`.
     deferred_table: ?*DeferredTable = null,
+    registration_sink: ?ChunkRegistrationSink = null,
     /// Evaluator-owned compiled-regex cache for `builtins.match`/`split`
     /// (see `runtime.regex.PatternCache`). Set post-init by
     /// `Evaluator.initVm`; null in standalone test VMs, which fall back
@@ -393,6 +395,7 @@ pub const VM = struct {
         import_host: ?ImportHost = null,
         builtins_value: Value = Value.null_val,
         deferred_table: ?*DeferredTable = null,
+        registration_sink: ?ChunkRegistrationSink = null,
         regexes: ?*PatternCache = null,
         break_sink: ?BreakSink = null,
         breakpoints: ?*bytecode_mod.BreakpointTable = null,
@@ -415,6 +418,7 @@ pub const VM = struct {
             .allocator = options.allocator,
             .registry = options.registry,
             .deferred_table = options.deferred_table,
+            .registration_sink = options.registration_sink,
             .regexes = options.regexes,
             .break_sink = options.break_sink,
             .breakpoints = options.breakpoints,

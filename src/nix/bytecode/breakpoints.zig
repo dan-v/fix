@@ -85,13 +85,10 @@ pub const BreakpointTable = struct {
         self.step_temps.deinit(self.gpa);
     }
 
-    /// The registration hook handed to `ChunkRegistry.breakpoint_sink`.
-    pub fn sink(self: *BreakpointTable) chunk_mod.ChunkRegistry.BreakpointSink {
-        return .{ .ctx = self, .place = placeCb };
-    }
-
-    fn placeCb(ctx: *anyopaque, chunk_id: ChunkId, chunk: *Chunk) void {
-        const self: *BreakpointTable = @ptrCast(@alignCast(ctx));
+    /// Apply pending breakpoint requests to one explicitly reported new chunk.
+    /// The evaluator calls this after registration; the registry has no hidden
+    /// debugger mutation hook.
+    pub fn placeRegisteredChunk(self: *BreakpointTable, chunk_id: ChunkId, chunk: *Chunk) void {
         for (self.requests.items) |req| self.placeRequestInChunk(req, chunk_id, chunk) catch {};
     }
 
