@@ -8,12 +8,12 @@
 #   RUNS=3 ./result/bin/fix-bench json
 #
 # With no suite (or with `all`), all three run into one /tmp/fix-bench.* tree.
-# `TOOLS=nix,detsys-1core,fix-1core` selects exact rows; `/fix-.*/` selects by
-# Bash ERE, and a leading `-` excludes (`TOOLS=-snix`). `WORKLOADS=...` selects
-# workload basenames, `OUT=/path` selects the output directory, and
-# `BENCH_NIX_PATH=...` overrides the pinned search path. Workloads themselves
-# use <nixpkgs> / <home-manager>, so they are directly runnable with any
-# suitable NIX_PATH.
+# `TOOLS=fix,lix` selects a parameterized group plus an exact row; `/fix-.*/`
+# selects by Bash ERE, and a leading `-` excludes (`TOOLS=fix,-fix-32core`).
+# `WORKLOADS=...` selects workload basenames, `OUT=/path` selects the output
+# directory, and `BENCH_NIX_PATH=...` overrides the pinned search path.
+# Workloads themselves use <nixpkgs> / <home-manager>, so they are directly
+# runnable with any suitable NIX_PATH.
 {
   pkgs,
   lib,
@@ -49,23 +49,23 @@
         } --strict";
       in
         map (
-          workers: "fix-${toString workers}core|${base} --workers=${toString workers} --no-progress --file"
+          workers: "fix-${toString workers}core|fix|${base} --workers=${toString workers} --no-progress --file"
         )
         fixWorkerCounts
-        ++ ["fix-autocore|${base} --no-progress --file"]
+        ++ ["fix-autocore|fix|${base} --no-progress --file"]
     );
 
   # Torture keeps explicit one-core rows for core-efficiency comparisons while
   # also showing whether each parallel evaluator can exploit the workload.
   scalarTools =
-    optional (nix != null) "nix|${nix}/bin/nix-instantiate --eval --strict"
+    optional (nix != null) "nix|nix|${nix}/bin/nix-instantiate --eval --strict"
     ++ optionals (detsys != null) [
-      "detsys-1core|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 1"
-      "detsys-2core|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 2"
-      "detsys-allcore|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 0"
+      "detsys-1core|detsys|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 1"
+      "detsys-2core|detsys|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 2"
+      "detsys-allcore|detsys|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 0"
     ]
-    ++ optional (lix != null) "lix|${lix}/bin/nix-instantiate --eval --strict"
-    ++ optional (snix != null) "snix|${snix}/bin/snix-eval -qqqq --no-warnings --strict"
+    ++ optional (lix != null) "lix|lix|${lix}/bin/nix-instantiate --eval --strict"
+    ++ optional (snix != null) "snix|snix|${snix}/bin/snix-eval -qqqq --no-warnings --strict"
     ++ fixTools false;
 
   tortureTools = scalarTools;
@@ -78,13 +78,13 @@
   # is the path on which Determinate performs parallel deep forcing. Snix is
   # omitted because snix-eval currently has no JSON output mode.
   jsonTools =
-    optional (nix != null) "nix|${nix}/bin/nix eval --json --file"
+    optional (nix != null) "nix|nix|${nix}/bin/nix eval --json --file"
     ++ optionals (detsys != null) [
-      "detsys-1core|${detsys}/bin/nix eval --json --eval-cores 1 --file"
-      "detsys-2core|${detsys}/bin/nix eval --json --eval-cores 2 --file"
-      "detsys-allcore|${detsys}/bin/nix eval --json --eval-cores 0 --file"
+      "detsys-1core|detsys|${detsys}/bin/nix eval --json --eval-cores 1 --file"
+      "detsys-2core|detsys|${detsys}/bin/nix eval --json --eval-cores 2 --file"
+      "detsys-allcore|detsys|${detsys}/bin/nix eval --json --eval-cores 0 --file"
     ]
-    ++ optional (lix != null) "lix|${lix}/bin/nix eval --json --file"
+    ++ optional (lix != null) "lix|lix|${lix}/bin/nix eval --json --file"
     ++ fixTools true;
 
   shellArray = tools: builtins.concatStringsSep " " (map lib.escapeShellArg tools);
@@ -131,10 +131,12 @@ in
         WARMUP=N            warmup runs per command (default: 1)
         RECLAIM_MEMORY=0    skip per-run cache reclaim and memory compaction
         OUT=DIR             output directory (default: /tmp/fix-bench.XXXXXX)
-        TOOLS=RULE,...      select evaluator rows: exact name or /Bash ERE/;
+        TOOLS=RULE,...      select evaluator rows: group, exact name, or /Bash ERE/;
                             prefix a rule with - to exclude it. If every rule
                             is negative, all tools start included.
-                            Examples: TOOLS='/fix-.*/,lix'
+                            Groups: fix, detsys (for parameterized profiles)
+                            Examples: TOOLS=fix,lix
+                                      TOOLS=fix,-fix-32core
                                       TOOLS='/fix-.*/,-/fix-..core/'
                                       TOOLS=-snix
         WORKLOADS=a,b,c     include only these workload names
@@ -249,18 +251,20 @@ in
 
       tool_rule_matches() {
         local name="$1"
-        local selector="$2"
+        local group="$2"
+        local selector="$3"
         if tool_rule_is_regex "$selector"; then
           local regex
           regex="$(tool_rule_regex "$selector")"
-          [[ "$name" =~ $regex ]]
+          [[ "$name" =~ $regex || "$group" =~ $regex ]]
         else
-          [[ "$name" == "$selector" ]]
+          [[ "$name" == "$selector" || "$group" == "$selector" ]]
         fi
       }
 
       tool_selected() {
         local name="$1"
+        local group="$2"
         local rule selector
         local included=1
         if [[ "$tool_has_include" -eq 1 ]]; then
@@ -268,7 +272,7 @@ in
         fi
         for rule in "''${tool_rules[@]}"; do
           selector="''${rule#-}"
-          if tool_rule_matches "$name" "$selector"; then
+          if tool_rule_matches "$name" "$group" "$selector"; then
             if [[ "$rule" == -* ]]; then
               return 1
             fi
@@ -317,8 +321,10 @@ in
           args=()
           for tool in "''${tools[@]}"; do
             label="''${tool%%|*}"
-            tool_selected "$label" || continue
-            cmd="''${tool#*|} $f"
+            tool_fields="''${tool#*|}"
+            group="''${tool_fields%%|*}"
+            tool_selected "$label" "$group" || continue
+            cmd="''${tool_fields#*|} $f"
             args+=(-n "$label" "$cmd")
           done
 

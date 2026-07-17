@@ -25,7 +25,9 @@ the harness without creating a `result` link. Useful environment variables are:
   drops reclaimable caches and compacts normal memory before every measured
   run. The harness obtains credentials once with `sudo -v`; explicit hugetlb
   pages remain in the configured pool and are reused after each evaluator exits.
-- `TOOLS=nix,lix,fix-1core` selects evaluator rows.
+- `TOOLS=nix,lix,fix-1core` selects evaluator rows. `fix` and `detsys` select
+  their complete parameterized groups; individual rows can still be excluded,
+  as in `TOOLS=fix,-fix-32core`.
 - `WORKLOADS=call-heavy,string-heavy` selects workloads by basename.
 - `OUT=/path` selects the result directory instead of `/tmp/fix-bench.XXXXXX`.
 - `BENCH_NIX_PATH` overrides the harness's pinned source search path.

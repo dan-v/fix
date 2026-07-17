@@ -98,8 +98,21 @@ def time_label(seconds: float) -> str:
     return f"{seconds * 1_000_000:.0f} µs"
 
 
+def time_stddev_label(mean: float, stddev: float) -> str:
+    if mean >= 1:
+        return f"{mean:.3f} ± {stddev:.3f} s"
+    if mean >= 0.001:
+        return f"{mean * 1000:.1f} ± {stddev * 1000:.1f} ms"
+    return f"{mean * 1_000_000:.0f} ± {stddev * 1_000_000:.0f} µs"
+
+
 def color_for(name: str) -> str:
     return COLORS.get(name, "#667085")
+
+
+def label_color_for(name: str) -> str:
+    group = parameter_group(name)
+    return group["color"] if group is not None else color_for(name)
 
 
 def parameter_group(name: str) -> dict | None:
@@ -378,11 +391,10 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
         for tool_name, row_position in zip(tool_names, row_positions):
             row = rows_by_name.get(tool_name)
             if row is None:
-                background, foreground, label = "#F3F5F8", "#98A2B3", "—"
+                background, foreground = "#F3F5F8", "#98A2B3"
             else:
                 ratio = row["mean"] / best
                 background, foreground = ratio_style(ratio)
-                label = ratio_label(ratio)
             ax.add_patch(
                 Rectangle(
                     (column - 0.47, row_position - 0.43),
@@ -393,16 +405,37 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
                     linewidth=1.0,
                 )
             )
-            ax.text(
-                column,
-                row_position,
-                label,
-                ha="center",
-                va="center",
-                fontsize=8.2,
-                color=foreground,
-                fontweight="bold" if row is not None and ratio == 1.0 else "normal",
-            )
+            if row is None:
+                ax.text(
+                    column,
+                    row_position,
+                    "—",
+                    ha="center",
+                    va="center",
+                    fontsize=8.2,
+                    color=foreground,
+                )
+            else:
+                is_fastest = ratio == 1.0
+                ax.text(
+                    column,
+                    row_position - 0.11,
+                    ratio_label(ratio),
+                    ha="center",
+                    va="center",
+                    fontsize=7.7,
+                    color=foreground,
+                    fontweight="bold" if is_fastest else "normal",
+                )
+                ax.text(
+                    column,
+                    row_position + 0.17,
+                    time_stddev_label(row["mean"], row["stddev"]),
+                    ha="center",
+                    va="center",
+                    fontsize=5.6,
+                    color="#DDF2EF" if is_fastest else MUTED,
+                )
 
     ax.set_xlim(-0.5, len(workloads) - 0.5)
     ax.set_ylim(row_extent - 0.5, -0.5)
@@ -413,8 +446,9 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
     for label in ax.get_xticklabels():
         label.set_color("#344054")
         label.set_linespacing(1.3)
-    for row_position, tool_name in zip(row_positions, tool_names):
-        ax.scatter(-0.535, row_position, s=24, color=color_for(tool_name), clip_on=False, zorder=3)
+    for label, tool_name in zip(ax.get_yticklabels(), tool_names):
+        label.set_color(label_color_for(tool_name))
+        label.set_fontweight("bold")
     mark_parameter_groups(ax, parameter_groups, labels=True)
     for spine in ax.spines.values():
         spine.set_visible(False)
