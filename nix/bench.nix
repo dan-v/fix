@@ -9,7 +9,7 @@
 #
 # With no suite (or with `all`), all three run into one /tmp/fix-bench.* tree.
 # `TOOLS=fix,lix` selects a parameterized group plus an exact row; `/fix-.*/`
-# selects by Bash ERE, and a leading `-` excludes (`TOOLS=fix,-fix-32core`).
+# selects by Bash ERE, and a leading `-` excludes (`TOOLS=fix,-fix-16core`).
 # `WORKLOADS=...` selects workload basenames, `OUT=/path` selects the output
 # directory, and `BENCH_NIX_PATH=...` overrides the pinned search path.
 # Workloads themselves use <nixpkgs> / <home-manager>, so they are directly
@@ -33,11 +33,8 @@
   fixWorkerCounts = [
     1
     2
-    4
     8
-    12
     16
-    32
   ];
   fixTools = json:
     optionals (fix != null) (
@@ -55,37 +52,61 @@
         ++ ["fix-autocore|fix|${base} --no-progress --file"]
     );
 
-  # Torture keeps explicit one-core rows for core-efficiency comparisons while
-  # also showing whether each parallel evaluator can exploit the workload.
+  detsysTools = {
+    json ? false,
+    scaling ? false,
+  }:
+    optionals (detsys != null) (
+      let
+        base =
+          if json
+          then "${detsys}/bin/nix eval --json"
+          else "${detsys}/bin/nix-instantiate --eval --strict";
+        suffix =
+          if json
+          then " --file"
+          else "";
+        coreCounts =
+          if scaling
+          then [
+            1
+            2
+            8
+            16
+          ]
+          else [1];
+      in
+        map (
+          cores: "detsys-${toString cores}core|detsys|${base} --eval-cores ${toString cores}${suffix}"
+        )
+        coreCounts
+        ++ ["detsys-autocore|detsys|${base} --eval-cores 0${suffix}"]
+    );
+
+  # Scalar suites retain only Determinate's efficiency baseline and automatic
+  # mode. JSON adds its wider deep-forcing scaling sweep.
   scalarTools =
-    optional (nix != null) "nix|nix|${nix}/bin/nix-instantiate --eval --strict"
-    ++ optionals (detsys != null) [
-      "detsys-1core|detsys|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 1"
-      "detsys-2core|detsys|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 2"
-      "detsys-allcore|detsys|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 0"
-    ]
+    fixTools false
+    ++ optional (nix != null) "nix|nix|${nix}/bin/nix-instantiate --eval --strict"
     ++ optional (lix != null) "lix|lix|${lix}/bin/nix-instantiate --eval --strict"
-    ++ optional (snix != null) "snix|snix|${snix}/bin/snix-eval -qqqq --no-warnings --strict"
-    ++ fixTools false;
+    ++ detsysTools {}
+    ++ optional (snix != null) "snix|snix|${snix}/bin/snix-eval -qqqq --no-warnings --strict";
 
   tortureTools = scalarTools;
 
-  # Real-world scalar evaluation includes the scaling rows even though
-  # Determinate's evaluator cores primarily help wide/deep result forcing.
   realworldTools = scalarTools;
 
   # JSON workloads return wide trees of independent values. `nix eval --json`
   # is the path on which Determinate performs parallel deep forcing. Snix is
   # omitted because snix-eval currently has no JSON output mode.
   jsonTools =
-    optional (nix != null) "nix|nix|${nix}/bin/nix eval --json --file"
-    ++ optionals (detsys != null) [
-      "detsys-1core|detsys|${detsys}/bin/nix eval --json --eval-cores 1 --file"
-      "detsys-2core|detsys|${detsys}/bin/nix eval --json --eval-cores 2 --file"
-      "detsys-allcore|detsys|${detsys}/bin/nix eval --json --eval-cores 0 --file"
-    ]
+    fixTools true
+    ++ optional (nix != null) "nix|nix|${nix}/bin/nix eval --json --file"
     ++ optional (lix != null) "lix|lix|${lix}/bin/nix eval --json --file"
-    ++ fixTools true;
+    ++ detsysTools {
+      json = true;
+      scaling = true;
+    };
 
   shellArray = tools: builtins.concatStringsSep " " (map lib.escapeShellArg tools);
   plotPython = pkgs.python3.withPackages (ps: [ps.matplotlib]);
@@ -136,7 +157,7 @@ in
                             is negative, all tools start included.
                             Groups: fix, detsys (for parameterized profiles)
                             Examples: TOOLS=fix,lix
-                                      TOOLS=fix,-fix-32core
+                                      TOOLS=fix,-fix-16core
                                       TOOLS='/fix-.*/,-/fix-..core/'
                                       TOOLS=-snix
         WORKLOADS=a,b,c     include only these workload names

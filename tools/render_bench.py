@@ -24,16 +24,15 @@ COLORS = {
     "nix": "#3976D3",
     "lix": "#7557C5",
     "snix": "#D85B53",
-    "detsys-1core": "#E69F35",
-    "detsys-2core": "#D57C22",
-    "detsys-allcore": "#B75A18",
+    "detsys-1core": "#ECA239",
+    "detsys-2core": "#DE8928",
+    "detsys-8core": "#CE711E",
+    "detsys-16core": "#B85B19",
+    "detsys-autocore": "#9F4915",
     "fix-1core": "#42B8B1",
     "fix-2core": "#2BA59D",
-    "fix-4core": "#1C9188",
-    "fix-8core": "#117E75",
-    "fix-12core": "#0C7068",
-    "fix-16core": "#08625B",
-    "fix-32core": "#07544E",
+    "fix-8core": "#168C84",
+    "fix-16core": "#0B6D66",
     "fix-autocore": "#064943",
 }
 SUITE_COLORS = {
@@ -47,14 +46,19 @@ PARAMETER_GROUPS = (
         "label": "DETERMINATE",
         "parameter": "EVAL CORES",
         "color": "#C66A1A",
+        "order": 3,
+        "values": ("1core", "2core", "8core", "16core", "autocore"),
     },
     {
         "prefix": "fix-",
         "label": "FIX",
         "parameter": "WORKERS",
         "color": "#08766B",
+        "order": 0,
+        "values": ("1core", "2core", "8core", "16core", "autocore"),
     },
 )
+TOOL_ORDER = {"nix": 1, "lix": 2, "snix": 4}
 RATIO_STYLES = (
     (1.0, "#147D74", "#FFFFFF", "fastest"),
     (1.25, "#D9F0EC", TEXT, "≤ 1.25×"),
@@ -120,6 +124,18 @@ def parameter_group(name: str) -> dict | None:
         (group for group in PARAMETER_GROUPS if name.startswith(group["prefix"])),
         None,
     )
+
+
+def tool_order(name: str) -> tuple[int, int, str]:
+    group = parameter_group(name)
+    if group is None:
+        return TOOL_ORDER.get(name, len(TOOL_ORDER) + len(PARAMETER_GROUPS)), 0, name
+    value = name.removeprefix(group["prefix"])
+    try:
+        value_order = group["values"].index(value)
+    except ValueError:
+        value_order = len(group["values"])
+    return group["order"], value_order, name
 
 
 def row_layout(names: list[str]) -> tuple[list[float], list[dict]]:
@@ -372,8 +388,9 @@ def ratio_label(ratio: float) -> str:
 
 
 def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) -> None:
-    tool_names = list(
-        dict.fromkeys(row["name"] for workload in workloads for row in workload["rows"])
+    tool_names = sorted(
+        dict.fromkeys(row["name"] for workload in workloads for row in workload["rows"]),
+        key=tool_order,
     )
     row_maps = [{row["name"]: row for row in workload["rows"]} for workload in workloads]
     fastest = [min(row["mean"] for row in workload["rows"]) for workload in workloads]

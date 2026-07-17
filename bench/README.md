@@ -27,7 +27,9 @@ the harness without creating a `result` link. Useful environment variables are:
   pages remain in the configured pool and are reused after each evaluator exits.
 - `TOOLS=nix,lix,fix-1core` selects evaluator rows. `fix` and `detsys` select
   their complete parameterized groups; individual rows can still be excluded,
-  as in `TOOLS=fix,-fix-32core`.
+  as in `TOOLS=fix,-fix-16core`. Fix profiles use 1, 2, 8, 16, and automatic
+  workers. Determinate uses 1 and automatic evaluator cores in scalar suites,
+  adding 2, 8, and 16 cores for JSON.
 - `WORKLOADS=call-heavy,string-heavy` selects workloads by basename.
 - `OUT=/path` selects the result directory instead of `/tmp/fix-bench.XXXXXX`.
 - `BENCH_NIX_PATH` overrides the harness's pinned source search path.
