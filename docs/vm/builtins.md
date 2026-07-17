@@ -47,7 +47,7 @@ Builtins that merge [string context](../derivation/context.md) or build large in
 | `shared` | builtin closure/thunk value construction (`makeBuiltinClosure`, `makeBuiltinThunk`), the JSON cycle guard, and the adaptive `NameIndex` used by accumulate-by-name builtins |
 | `strings` | `toString`, `stringLength`, `substring`, `concatStringsSep`, `replaceStrings`; coercion & interning |
 | `attrsets` | attrset ops: `hasAttr`, `getAttr`, `attrNames`, `attrValues`, `mapAttrs`, `zipAttrsWith`, `catAttrs`, `intersectAttrs`, `removeAttrs`, `functionArgs`, plus the internal per-key thunk bodies `mapAttrValue`/`zipAttrsValue` |
-| `lists` | list structure (`length`, `head`, `tail`, `elemAt`, `concatLists`, `listToAttrs`, `elem`, `seq`, `deepSeq`) and the functional list ops (`map`, `filter`, `foldl'`, `any`, `all`, `sort`, `partition`, `groupBy`, `genList`, `concatMap`, `genericClosure`) |
+| `lists` | list structure (`length`, `head`, `tail`, `elemAt`, `concatLists`, `listToAttrs`, `elem`, `seq`, `deepSeq`) and the functional list ops (`map`, `filter`, `foldl'`, `any`, `all`, `sort`, `partition`, `groupBy`, `genList`, `concatMap`, `genericClosure`). `concatLists` and `concatMap` retain their produced sublists as roots, total their lengths, and fill one exact heap range directly instead of staging and recopying every element. |
 | `paths` | `baseNameOf`, `dirOf`, `path`, `storePath`, `placeholder` |
 | `hash` | `hashString`, `hashFile` |
 | `io` | `readFile`, `readDir`, `readFileType`, `pathExists`, `import`/`scopedImport` |

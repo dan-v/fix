@@ -49,12 +49,16 @@ pub fn builtinConcatLists(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isList()) return error.TypeError;
 
-    var out: std.ArrayListUnmanaged(Value) = .empty;
-    defer out.deinit(self.allocator);
-
     const list_id = value.asObjectId();
     const lists = try self.heap.getList(list_id);
     vm_force.forceListAccelerate(self, list_id, lists);
+    const list_values = try self.allocator.alloc(Value, lists.len);
+    defer self.allocator.free(list_values);
+    // A forced outer thunk points at its result, but root the resolved lists
+    // explicitly as well: this keeps the direct-builder contract independent
+    // of how each outer element was represented.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
     // gc: re-fetch — the outer range may move across the force
     const n = lists.len;
     var i: usize = 0;
@@ -62,10 +66,11 @@ pub fn builtinConcatLists(self: *VM, arg: Value) !Value {
         const list_item = try self.heap.getListItem(list_id, i);
         const list = try vm_force.forceValue(self, list_item);
         if (!list.isList()) return error.TypeError;
-        try out.appendSlice(self.allocator, try self.heap.getList(list.asObjectId()));
+        list_values[i] = list;
+        vm_force.rootKeep(self, list);
     }
 
-    return Value.list(try self.heap.addList(out.items));
+    return Value.list(try self.heap.addConcatenatedListValues(list_values));
 }
 
 pub fn builtinListToAttrs(self: *VM, arg: Value) !Value {
@@ -329,16 +334,14 @@ pub fn builtinConcatMap(self: *VM, fn_arg: Value, list_arg: Value) !Value {
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
 
-    var out: std.ArrayListUnmanaged(Value) = .empty;
-    defer out.deinit(self.allocator);
-
     const list_id = list.asObjectId();
     const items = try self.heap.getList(list_id);
     vm_force.forceListAccelerate(self, list_id, items);
-    // GC: `out` accumulates elements of NEW lists produced by `func` — not
-    // reachable through any argument — and holds them across later iterations'
-    // forces. Root each produced list. (`func`/`list` and its elements are
-    // covered by the arg roots.)
+    const mapped_lists = try self.allocator.alloc(Value, items.len);
+    defer self.allocator.free(mapped_lists);
+    // GC: mapped_lists holds NEW lists produced by `func` — not reachable
+    // through any argument — across later iterations' forces. Root each one.
+    // The final direct heap builder copies their elements exactly once.
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     // gc: re-fetch — the input range may move across the force
@@ -349,9 +352,9 @@ pub fn builtinConcatMap(self: *VM, fn_arg: Value, list_arg: Value) !Value {
         const mapped = try vm_force.forceValue(self, try vm_closures.callValue(self, func, item));
         if (!mapped.isList()) return error.TypeError;
         vm_force.rootKeep(self, mapped);
-        try out.appendSlice(self.allocator, try self.heap.getList(mapped.asObjectId()));
+        mapped_lists[i] = mapped;
     }
-    return Value.list(try self.heap.addList(out.items));
+    return Value.list(try self.heap.addConcatenatedListValues(mapped_lists));
 }
 
 pub fn builtinGenList(self: *VM, fn_arg: Value, count_arg: Value) !Value {
