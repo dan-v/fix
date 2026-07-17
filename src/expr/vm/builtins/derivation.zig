@@ -238,9 +238,17 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
         computed.drv_text_references,
     );
 
-    // Instantiation WRITES the `.drv` (above, offloaded onto the IO thread) but
-    // deliberately does NOT build it. Instantiating a derivation only means it
-    // was evaluated — not that its output is needed. Building is reserved for
+    // Read-write eval is the one eager mode: legacy nix-instantiate promises
+    // that every derivation demanded during evaluation is instantiated even
+    // though the command still prints the evaluated value. Normal
+    // instantiate/build stay terminal-closure-driven to avoid materializing
+    // speculative or unrelated derivations.
+    if (self.realization.eagerEvaluationWritesEnabled())
+        try self.realization.ensureClosure(computed.drv_path);
+
+    // Instantiation deliberately does NOT build the derivation. Instantiating
+    // a derivation only means it was evaluated — not that its output is needed.
+    // Building is reserved for
     // exactly what a stock `nix build` realizes: the requested output's closure
     // (the final authoritative `buildPaths`) plus any output demanded mid-eval via
     // IFD (`demandPathArg`). Eagerly building every instantiated `.drv` here also

@@ -104,6 +104,10 @@ pub const SwitchTarget = enum { nixos, darwin, home_manager };
 pub const Options = struct {
     output: OutputFormat = .nix,
     strict: bool = false,
+    /// Legacy `nix-instantiate --eval --read-write-mode`: permit evaluation to
+    /// register derivations and fetched sources in the store while still
+    /// rendering the evaluated value rather than a top-level `.drv` path.
+    read_write_mode: bool = false,
     /// `--no-location`: omit source positions from `--xml` output. fix's XML
     /// serializer never emits positions, so this is accepted for CLI/tooling
     /// compatibility (Nix's `nix-instantiate --eval --xml --no-location`) and
@@ -296,6 +300,7 @@ const Opt = enum {
     raw,
     xml,
     strict,
+    read_write_mode,
     no_location,
     // Settings / features.
     experimental_features,
@@ -447,6 +452,7 @@ const specs = [_]Spec{
     .{ .id = .xml, .long = "--xml", .help = "write the evaluated value as XML", .show_in = value_cmds },
     .{ .id = .no_location, .long = "--no-location", .help = "omit source positions from --xml output", .show_in = value_cmds },
     .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing", .show_in = value_cmds },
+    .{ .id = .read_write_mode, .long = "--read-write-mode", .help = "allow eval to register derivations and sources in\nthe store", .show_in = &.{.eval} },
 
     .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)" },
     .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set" },
@@ -649,6 +655,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .xml => options.output = .xml,
         .no_location => options.no_location = true,
         .strict => options.strict = true,
+        .read_write_mode => options.read_write_mode = true,
 
         .experimental_features => {
             options.experimental_features = .{};
@@ -954,4 +961,14 @@ test "legacy daemon settings are accepted by nix-instantiate modes" {
     try std.testing.expectError(error.InvalidMaxJobs, parseForTest(&bad_jobs, .build));
     const bad_cores = [_][*:0]const u8{ "fix", "--cores", "all" };
     try std.testing.expectError(error.InvalidCores, parseForTest(&bad_cores, .build));
+}
+
+test "read-write mode is an eval-only store-write switch" {
+    const argv = [_][*:0]const u8{ "fix", "--read-write-mode", "-E", "1" };
+    var options = try parseForTest(&argv, .eval);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expect(options.read_write_mode);
+
+    try std.testing.expectError(error.OptionNotValidForCommand, parseForTest(&argv, .instantiate));
+    try std.testing.expectError(error.OptionNotValidForCommand, parseForTest(&argv, .parse));
 }

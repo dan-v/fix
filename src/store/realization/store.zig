@@ -47,6 +47,10 @@ pub const RealizationStore = struct {
     graph: recipe_graph.Graph,
     daemon: daemon_client.Client,
     progress_spans: ?eval_progress.SpanSink = null,
+    /// Legacy read-write evaluation materializes each demand-evaluated
+    /// derivation immediately. Normal instantiate/build keep this false and
+    /// materialize only their requested terminal closure.
+    eager_evaluation_writes: bool = false,
 
     pub const RootClaimHook = recipe_graph.RootClaimHook;
 
@@ -233,6 +237,15 @@ pub const RealizationStore = struct {
     /// compute fiber's critical path at the first store op.
     pub fn enableStoreWrites(self: *RealizationStore) void {
         self.daemon.enableWrites();
+    }
+
+    pub fn enableEagerEvaluationWrites(self: *RealizationStore) void {
+        self.eager_evaluation_writes = true;
+        self.enableStoreWrites();
+    }
+
+    pub fn eagerEvaluationWritesEnabled(self: *const RealizationStore) bool {
+        return self.eager_evaluation_writes;
     }
 
     /// Install the thread-safe progress channel used for real store work.
@@ -1019,3 +1032,14 @@ pub const RealizationStore = struct {
         return self.registry.outputNames(drv_path);
     }
 };
+
+test "eager evaluation writes enable store writes without changing the default" {
+    var store = RealizationStore.init(std.testing.allocator);
+    defer store.deinit();
+    try std.testing.expect(!store.storeWritesEnabled());
+    try std.testing.expect(!store.eagerEvaluationWritesEnabled());
+
+    store.enableEagerEvaluationWrites();
+    try std.testing.expect(store.storeWritesEnabled());
+    try std.testing.expect(store.eagerEvaluationWritesEnabled());
+}

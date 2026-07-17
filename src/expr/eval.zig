@@ -1508,6 +1508,13 @@ pub const Evaluator = struct {
         self.store.realization.enableStoreWrites();
     }
 
+    /// Legacy `nix-instantiate --eval --read-write-mode`: materialize every
+    /// derivation actually demanded by evaluation, while the CLI still renders
+    /// the evaluated value rather than returning a `.drv` path.
+    pub fn enableReadWriteEvaluation(self: *Evaluator) void {
+        self.store.realization.enableEagerEvaluationWrites();
+    }
+
     /// The last daemon error message, for surfacing `error.DaemonError`.
     pub fn lastStoreError(self: *Evaluator) ?[]const u8 {
         return self.store.realization.lastStoreError();

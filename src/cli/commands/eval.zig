@@ -43,6 +43,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
+    if (options.read_write_mode) {
+        // Store writes are observable. Keep them on the demand path so helper
+        // speculation cannot instantiate derivations the user never demanded.
+        ev.setParallelismToggles(true, true);
+        ev.enableReadWriteEvaluation();
+    }
 
     var console: debugger.Console = undefined;
     if (options.debugger) {
