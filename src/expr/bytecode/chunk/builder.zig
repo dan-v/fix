@@ -21,6 +21,11 @@ pub const ChunkBuilder = struct {
 
     code: std.ArrayListUnmanaged(u8),
     constants: std.ArrayListUnmanaged(Value),
+    /// Exact-bit interning for constant operands. Value identity is sufficient
+    /// here: equal scalar encodings and references are interchangeable in an
+    /// immutable pool, while distinct float encodings (notably +/-0) remain
+    /// distinct. This also makes canonical NaN constants shareable.
+    constant_index: std.AutoHashMapUnmanaged(u64, ConstIdx) = .empty,
     function_args: std.ArrayListUnmanaged(AttrEntry),
     function_arg_pos: std.ArrayListUnmanaged(AttrPosEntry) = .empty,
     source_map: std.ArrayListUnmanaged(Chunk.SourceMapEntry),
@@ -93,6 +98,7 @@ pub const ChunkBuilder = struct {
     pub fn deinit(self: *ChunkBuilder, allocator: std.mem.Allocator) void {
         self.code.deinit(allocator);
         self.constants.deinit(allocator);
+        self.constant_index.deinit(allocator);
         self.function_args.deinit(allocator);
         self.function_arg_pos.deinit(allocator);
         self.source_map.deinit(allocator);
@@ -107,6 +113,7 @@ pub const ChunkBuilder = struct {
     pub fn reset(self: *ChunkBuilder) void {
         self.code.clearRetainingCapacity();
         self.constants.clearRetainingCapacity();
+        self.constant_index.clearRetainingCapacity();
         self.function_args.clearRetainingCapacity();
         self.function_arg_pos.clearRetainingCapacity();
         self.attr_pos.clearRetainingCapacity();
@@ -163,11 +170,16 @@ pub const ChunkBuilder = struct {
         try encoding.writeU32(&self.code, allocator, val);
     }
 
-    /// Add a constant to the pool and return its index.
+    /// Intern a constant in the pool and return its index.
     pub fn addConstant(self: *ChunkBuilder, allocator: std.mem.Allocator, val: Value) !ConstIdx {
+        if (self.constant_index.get(val.bits)) |idx| return idx;
         if (self.constants.items.len > std.math.maxInt(ConstIdx)) return error.TooManyConstants;
-        try self.constants.append(allocator, val);
-        return @intCast(self.constants.items.len - 1);
+        try self.constants.ensureUnusedCapacity(allocator, 1);
+        try self.constant_index.ensureUnusedCapacity(allocator, 1);
+        const idx: ConstIdx = @intCast(self.constants.items.len);
+        self.constants.appendAssumeCapacity(val);
+        self.constant_index.putAssumeCapacityNoClobber(val.bits, idx);
+        return idx;
     }
 
     /// Emit a constant-loading instruction (op + 2-byte index).

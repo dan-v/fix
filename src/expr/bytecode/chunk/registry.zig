@@ -639,17 +639,24 @@ test "chunk builder patches a forward jump offset after emission" {
     try std.testing.expectEqual(chunk.code.len, patch_at + 4 + decoded);
 }
 
-test "addConstant appends without deduping identical values" {
+test "addConstant deduplicates exact values and reset clears its index" {
     const allocator = std.testing.allocator;
     var builder = try ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
 
     const first = try builder.addConstant(allocator, Value.int(7));
     const second = try builder.addConstant(allocator, Value.int(7));
+    const distinct = try builder.addConstant(allocator, Value.int(8));
 
     try std.testing.expectEqual(@as(ConstIdx, 0), first);
-    try std.testing.expectEqual(@as(ConstIdx, 1), second);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(@as(ConstIdx, 1), distinct);
     try std.testing.expectEqual(@as(usize, 2), builder.constants.items.len);
+
+    builder.reset();
+    const after_reset = try builder.addConstant(allocator, Value.int(7));
+    try std.testing.expectEqual(@as(ConstIdx, 0), after_reset);
+    try std.testing.expectEqual(@as(usize, 1), builder.constants.items.len);
 }
 
 test "emitConstant writes a constant op referencing the new pool index" {

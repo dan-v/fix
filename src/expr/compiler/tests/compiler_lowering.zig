@@ -212,6 +212,17 @@ test "static literal membership emits a boolean without member code" {
     try testing.expect(!missing.contains("attr_has_path"));
 }
 
+test "repeated constants share one chunk-pool index" {
+    var ev = try Evaluator.init(testing.allocator, 0);
+    defer ev.deinit();
+
+    var d = try disassemble(&ev, "x: x + 7 + 7");
+    defer d.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), d.count("push_const"));
+    try testing.expect(std.mem.indexOf(u8, d.text, "push_const #0") != null);
+    try testing.expect(std.mem.indexOf(u8, d.text, "push_const #1") == null);
+}
+
 test "compileBinary folds literal-on-literal arithmetic to a constant instead of emitting an opcode" {
     var ev = try Evaluator.init(testing.allocator, 0);
     defer ev.deinit();

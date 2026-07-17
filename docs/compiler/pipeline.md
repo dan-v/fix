@@ -34,7 +34,7 @@ Domain modules call `emit` to write bytes; `emit` sees only opcodes/operands and
 `ChunkBuilder` accumulates, during the walk:
 
 - **code** — opcode bytes + little-endian operands.
-- **constants** — a pool of [`Value`s](../runtime/values.md); ops reference by index.
+- **constants** — an exact-value intern pool of [`Value`s](../runtime/values.md); repeated operands share an index.
 - **function_args** — attrset-pattern parameter names + a has-default flag, retained for `builtins.functionArgs`.
 - **source_map** — sparse `bytecode byte-range → SourceSpan` entries, added at `compileNode` exit; runtime stack traces bind a program counter back to file/line/col.
 - **body_span** — a single representative span for the whole body, stamped even when `source_map` is empty (it is sparse). Labels a thunk quantum / demand wait in the timeline.
