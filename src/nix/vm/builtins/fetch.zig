@@ -7,10 +7,12 @@ const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
-const file_cache = @import("../../host.zig").file_cache;
-const fetch_cache = @import("../../host.zig").fetch_cache;
+const fetchers = @import("fetchers");
+const file_cache = fetchers.file_cache;
+const fetch_cache = fetchers.fetch_cache;
+const forge_mod = fetchers.forge;
 const derivation = @import("../../derivation.zig");
-const nar = @import("../../host.zig").nar;
+const nar = fetchers.nar;
 const path_ops = @import("runtime").paths;
 const source_paths = @import("../../realization.zig").source_path;
 const eval_progress = @import("../../observ.zig").progress;
@@ -650,174 +652,44 @@ pub fn fetchMercurialSpecFromAttrs(self: *VM, attrs_id: ObjectId) !FetchMercuria
     return .{ .url = url, .name = name, .rev = rev };
 }
 
-pub const GithubTreeSpec = struct {
-    url: []u8,
-    metadata_url: ?[]u8,
-    metadata_ref: ?[]u8,
-    metadata_head_url: ?[]u8,
-    resolved_url_template: ?[]u8,
-    name: []u8,
-    rev: ?[]u8,
-
-    pub fn deinit(self: GithubTreeSpec, allocator: std.mem.Allocator) void {
-        allocator.free(self.url);
-        if (self.metadata_url) |url| allocator.free(url);
-        if (self.metadata_ref) |ref| allocator.free(ref);
-        if (self.metadata_head_url) |url| allocator.free(url);
-        if (self.resolved_url_template) |url| allocator.free(url);
-        allocator.free(self.name);
-        if (self.rev) |rev| allocator.free(rev);
-    }
-};
+pub const ForgeTreeSpec = forge_mod.Plan;
 
 /// Build the codeload archive URL for github/gitlab/sourcehut, honoring a
 /// `host` override (self-hosted forges) and pinning `rev`/`ref` (else HEAD).
-pub fn forgeTreeSpec(self: *VM, attrs_id: ObjectId, forge: []const u8) !GithubTreeSpec {
+pub fn forgeTreeSpec(self: *VM, attrs_id: ObjectId, forge: []const u8) !ForgeTreeSpec {
     const owner = try requiredStringAttr(self, attrs_id, "owner");
     defer self.allocator.free(owner);
     const repo = try requiredStringAttr(self, attrs_id, "repo");
     defer self.allocator.free(repo);
-    const rev_attr = try optionalStringAttr(self, attrs_id, "rev");
-    errdefer if (rev_attr) |owned| self.allocator.free(owned);
-    const ref_attr = try optionalStringAttr(self, attrs_id, "ref");
-    defer if (ref_attr) |owned| self.allocator.free(owned);
-    // A forge ref (github/gitlab/sourcehut) cannot pin both a branch/tag and a
-    // revision (Nix/Lix reject this, lix#1133).
-    if (rev_attr != null and ref_attr != null) {
-        try vm_trace.setErrorMessage(self, "fetchTree: 'ref' and 'rev' cannot both be specified for a forge source");
-        return error.UnexpectedArgument;
-    }
+    const rev = try optionalStringAttr(self, attrs_id, "rev");
+    defer if (rev) |owned| self.allocator.free(owned);
+    const ref = try optionalStringAttr(self, attrs_id, "ref");
+    defer if (ref) |owned| self.allocator.free(owned);
     const host = try optionalStringAttr(self, attrs_id, "host");
-    defer if (host) |h| self.allocator.free(h);
-    const archive_ref = rev_attr orelse ref_attr orelse "HEAD";
-    const url = if (std.mem.eql(u8, forge, "gitlab"))
-        try std.fmt.allocPrint(self.allocator, "https://{[host]s}/{[owner]s}/{[repo]s}/-/archive/{[ref]s}/{[repo]s}-{[ref]s}.tar.gz", .{
-            .host = host orelse "gitlab.com",
-            .owner = owner,
-            .repo = repo,
-            .ref = archive_ref,
-        })
-    else if (std.mem.eql(u8, forge, "sourcehut"))
-        try std.fmt.allocPrint(self.allocator, "https://{[host]s}/{[owner]s}/{[repo]s}/archive/{[ref]s}.tar.gz", .{
-            .host = host orelse "git.sr.ht",
-            .owner = owner,
-            .repo = repo,
-            .ref = archive_ref,
-        })
-    else if (host == null)
-        // Avoid the github.com -> codeload.github.com redirect so libcurl can
-        // retain its safe default of never forwarding Authorization across
-        // origins. FetchCache maps codeload back to github.com for token lookup.
-        try std.fmt.allocPrint(self.allocator, "https://codeload.github.com/{[owner]s}/{[repo]s}/tar.gz/{[ref]s}", .{
-            .owner = owner,
-            .repo = repo,
-            .ref = archive_ref,
-        })
+    defer if (host) |owned| self.allocator.free(owned);
+    const name = try optionalStringAttr(self, attrs_id, "name");
+    defer if (name) |owned| self.allocator.free(owned);
+    const kind: forge_mod.Forge = if (std.mem.eql(u8, forge, "github"))
+        .github
+    else if (std.mem.eql(u8, forge, "gitlab"))
+        .gitlab
     else
-        try std.fmt.allocPrint(self.allocator, "https://{[host]s}/{[owner]s}/{[repo]s}/archive/{[ref]s}.tar.gz", .{
-            .host = host.?,
-            .owner = owner,
-            .repo = repo,
-            .ref = archive_ref,
-        });
-    errdefer self.allocator.free(url);
-    const metadata_url: ?[]u8 = if (std.mem.eql(u8, forge, "github"))
-        if (host) |custom|
-            try std.fmt.allocPrint(self.allocator, "https://{[host]s}/api/v3/repos/{[owner]s}/{[repo]s}/commits/{[ref]s}", .{
-                .host = custom,
-                .owner = owner,
-                .repo = repo,
-                .ref = archive_ref,
-            })
-        else
-            try std.fmt.allocPrint(self.allocator, "https://api.github.com/repos/{[owner]s}/{[repo]s}/commits/{[ref]s}", .{
-                .owner = owner,
-                .repo = repo,
-                .ref = archive_ref,
-            })
-    else if (std.mem.eql(u8, forge, "gitlab")) metadata: {
-        const raw_project = try std.fmt.allocPrint(self.allocator, "{[owner]s}/{[repo]s}", .{ .owner = owner, .repo = repo });
-        defer self.allocator.free(raw_project);
-        const project = try percentEncode(self.allocator, raw_project);
-        defer self.allocator.free(project);
-        const encoded_ref = try percentEncode(self.allocator, archive_ref);
-        defer self.allocator.free(encoded_ref);
-        break :metadata try std.fmt.allocPrint(self.allocator, "https://{[host]s}/api/v4/projects/{[project]s}/repository/commits/{[ref]s}", .{
-            .host = host orelse "gitlab.com",
-            .project = project,
-            .ref = encoded_ref,
-        });
-    } else if (std.mem.eql(u8, forge, "sourcehut"))
-        try std.fmt.allocPrint(self.allocator, "https://{[host]s}/{[owner]s}/{[repo]s}/info/refs", .{
-            .host = host orelse "git.sr.ht",
-            .owner = owner,
-            .repo = repo,
-        })
-    else
-        null;
-    errdefer if (metadata_url) |owned| self.allocator.free(owned);
-    const metadata_ref = if (std.mem.eql(u8, forge, "sourcehut")) try self.allocator.dupe(u8, archive_ref) else null;
-    errdefer if (metadata_ref) |owned| self.allocator.free(owned);
-    const metadata_head_url = if (std.mem.eql(u8, forge, "sourcehut"))
-        try std.fmt.allocPrint(self.allocator, "https://{[host]s}/{[owner]s}/{[repo]s}/HEAD", .{
-            .host = host orelse "git.sr.ht",
-            .owner = owner,
-            .repo = repo,
-        })
-    else
-        null;
-    errdefer if (metadata_head_url) |owned| self.allocator.free(owned);
-    const resolved_url_template: ?[]u8 = if (std.mem.eql(u8, forge, "gitlab"))
-        try std.fmt.allocPrint(self.allocator, "https://{[host]s}/{[owner]s}/{[repo]s}/-/archive/{{rev}}/{[repo]s}-{{rev}}.tar.gz", .{
-            .host = host orelse "gitlab.com",
-            .owner = owner,
-            .repo = repo,
-        })
-    else if (std.mem.eql(u8, forge, "sourcehut"))
-        try std.fmt.allocPrint(self.allocator, "https://{[host]s}/{[owner]s}/{[repo]s}/archive/{{rev}}.tar.gz", .{
-            .host = host orelse "git.sr.ht",
-            .owner = owner,
-            .repo = repo,
-        })
-    else if (host) |custom|
-        try std.fmt.allocPrint(self.allocator, "https://{[host]s}/{[owner]s}/{[repo]s}/archive/{{rev}}.tar.gz", .{
-            .host = custom,
-            .owner = owner,
-            .repo = repo,
-        })
-    else
-        try std.fmt.allocPrint(self.allocator, "https://codeload.github.com/{[owner]s}/{[repo]s}/tar.gz/{{rev}}", .{
-            .owner = owner,
-            .repo = repo,
-        });
-    errdefer if (resolved_url_template) |owned| self.allocator.free(owned);
-    const name = try optionalStringAttr(self, attrs_id, "name") orelse try self.allocator.dupe(u8, "source");
-    // A symbolic ref is not a revision hash. Until the archive endpoint gives
-    // us a resolved commit, omit rev rather than exposing the branch name as
-    // one; explicit rev remains exact.
-    return .{
-        .url = url,
-        .metadata_url = metadata_url,
-        .metadata_ref = metadata_ref,
-        .metadata_head_url = metadata_head_url,
-        .resolved_url_template = resolved_url_template,
-        .name = name,
-        .rev = rev_attr,
-    };
-}
+        .sourcehut;
 
-fn percentEncode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    const hex = "0123456789ABCDEF";
-    for (text) |byte| {
-        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~') {
-            try out.append(allocator, byte);
-        } else {
-            try out.appendSlice(allocator, &.{ '%', hex[byte >> 4], hex[byte & 0xf] });
-        }
-    }
-    return out.toOwnedSlice(allocator);
+    return forge_mod.plan(self.allocator, kind, .{
+        .owner = owner,
+        .repo = repo,
+        .rev = rev,
+        .ref = ref,
+        .host = host,
+        .name = name,
+    }) catch |err| switch (err) {
+        error.RefAndRev => {
+            try vm_trace.setErrorMessage(self, "fetchTree: 'ref' and 'rev' cannot both be specified for a forge source");
+            return error.UnexpectedArgument;
+        },
+        else => return err,
+    };
 }
 
 pub fn githubTreeValue(self: *VM, path: []const u8, nar_hash: []const u8, rev: ?[]const u8, metadata: ?FetchCache.ForgeMetadata) !Value {

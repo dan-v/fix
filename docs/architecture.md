@@ -26,11 +26,12 @@ Each stage is lazy at the seams: the compiler emits **thunks** for anything not 
 - **[vm](vm/dispatch.md)** — a direct-threaded bytecode interpreter that [forces thunks](runtime/thunks.md), [calls closures](vm/calls.md), [reads attrsets/lists](vm/access.md), and runs the [builtins](vm/builtins.md).
 - **[derivation](derivation/model.md)** — the domain model: `Drv`, canonical hashing and paths, string context, and the evaluation-scoped registry of computed derivations. The `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths.
 - **realization** — turns derivation records and source-path recipes into concrete store actions. It owns the evaluation's `DerivationStore`, lazy derivation cache, source ingestion, closure planning, and realization claims; it depends on the pure derivation model and the host interfaces.
-- **host / daemon** — concrete effects: file and fetch caches, NAR serialization, and the nix-daemon worker-protocol client (`host/store/daemon.zig`, wire framing in `host/store/wire.zig`). Store-writing commands configure and warm the daemon connection pool before evaluation begins, so its worker threads perform the 10–30 ms handshakes concurrently with useful evaluator work. The pool remains host machinery; command policy only decides whether to enable store writes.
+- **fetchers** — source acquisition outside the expression engine: filesystem snapshots, remote-source caching, NAR serialization of fetched trees, Git/curl transports, and provider-specific GitHub/GitLab/SourceHut request planning. VM builtins only decode Nix values and map fetch results back to values.
+- **host / daemon** — the nix-daemon worker-protocol client (`host/store/daemon.zig`, wire framing in `host/store/wire.zig`). Store-writing commands configure and warm the daemon connection pool before evaluation begins, so its worker threads perform the 10–30 ms handshakes concurrently with useful evaluator work. The pool remains host machinery; command policy only decides whether to enable store writes.
 
 ## The module DAG
 
-The source tree has five durable module groups. `base`, `syntax`, and `runtime` are reusable foundations; `nix` contains the cooperating evaluator subsystems; `cli` is the application layer. Subsystems under `src/nix/` keep their own facades and namespaces, but use ordinary file imports rather than each restating the same graph as a build module.
+The source tree has six durable module groups. `base`, `syntax`, and `runtime` are reusable foundations; `fetchers` owns source acquisition; `nix` contains the cooperating evaluator subsystems; `cli` is the application layer. Subsystems under each durable root keep their own facades and namespaces, but use ordinary file imports rather than each restating the same graph as a build module.
 
 ```
 src/base/       base → base_options
@@ -43,7 +44,11 @@ src/syntax/     syntax → base, parser_tables
 src/runtime/    runtime → base, build_options
                 Value, heap, thunk/Future, interning, GC.
 
-src/nix/        nix → base, syntax, runtime, build_options
+src/fetchers/   fetchers → base, runtime, libcurl, libgit2
+                File/source cache, provider planning, transports, fetched-tree
+                NAR serialization.
+
+src/nix/        nix → base, syntax, runtime, fetchers, build_options
                 Exports bytecode, compiler, scheduler, derivation, host,
                 realization, execution, language support, observability,
                 probes, VM, and Evaluator.

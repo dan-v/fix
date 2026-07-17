@@ -26,10 +26,9 @@ pub fn build(b: *std.Build) void {
     base_options.addOption(bool, "fiber_census", prof_main);
     const base_options_mod = base_options.createModule();
 
-    // Keep build modules for the boundaries that are independently reusable or
-    // consumed. Subsystems inside `nix` are ordinary files exported by its root.
-    // This keeps the permanent graph small and lets Zig's normal file imports
-    // provide one canonical instance of every internal type.
+    // Keep build modules for durable domain boundaries. Internal subsystems use
+    // ordinary file imports beneath these roots so each type has one canonical
+    // instance without restating every file edge in the build graph.
     const syntax_mod = b.addModule("syntax", .{
         .root_source_file = b.path("src/syntax/syntax.zig"),
         .target = target,
@@ -79,6 +78,19 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("build_options", build_options_mod);
     runtime_mod.addImport("base", base_mod);
 
+    const fetchers_mod = b.addModule("fetchers", .{
+        .root_source_file = b.path("src/fetchers/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    fetchers_mod.addImport("runtime", runtime_mod);
+    fetchers_mod.addImport("base", base_mod);
+    fetchers_mod.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
+    fetchers_mod.linkSystemLibrary("libgit2", .{ .use_pkg_config = .force });
+    fetchers_mod.link_libc = true;
+
     const nix_mod = b.addModule("nix", .{
         .root_source_file = b.path("src/nix/root.zig"),
         .target = target,
@@ -90,11 +102,7 @@ pub fn build(b: *std.Build) void {
     nix_mod.addImport("syntax", syntax_mod);
     nix_mod.addImport("runtime", runtime_mod);
     nix_mod.addImport("base", base_mod);
-    // Evaluator-owned remote source transport. libcurl handles generic HTTP;
-    // libgit2 handles the Git smart protocol (including its HTTP transport).
-    nix_mod.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
-    nix_mod.linkSystemLibrary("libgit2", .{ .use_pkg_config = .force });
-    nix_mod.link_libc = true;
+    nix_mod.addImport("fetchers", fetchers_mod);
 
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli/cli.zig"),
@@ -173,6 +181,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_nix_tests = b.addRunArtifact(nix_tests);
 
+    const fetchers_tests = b.addTest(.{
+        .root_module = fetchers_mod,
+        .use_llvm = true,
+    });
+    const run_fetchers_tests = b.addRunArtifact(fetchers_tests);
+
     const cli_tests = b.addTest(.{
         .root_module = cli_mod,
         .use_llvm = true,
@@ -183,6 +197,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_base_tests.step);
     test_step.dependOn(&run_syntax_tests.step);
     test_step.dependOn(&run_runtime_tests.step);
+    test_step.dependOn(&run_fetchers_tests.step);
     test_step.dependOn(&run_nix_tests.step);
     test_step.dependOn(&run_cli_tests.step);
 

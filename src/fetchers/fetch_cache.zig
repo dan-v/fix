@@ -11,7 +11,8 @@ const FileCache = @import("file_cache.zig").FileCache;
 const sync = @import("base").sync;
 const curl_transport = @import("curl_transport.zig");
 const git_transport = @import("git_transport.zig");
-const BlockingPool = @import("../execution/blocking_pool.zig").BlockingPool;
+const BlockingPool = @import("blocking_pool.zig").BlockingPool;
+const forge_mod = @import("forge.zig");
 
 /// Download-staging cache under `$XDG_CACHE_HOME/fix` (default `~/.cache/fix`,
 /// mirroring Nix's `~/.cache/nix`; falls back to `./.zig-cache/fix` when the
@@ -73,7 +74,7 @@ pub const FetchCache = struct {
     /// `access-tokens` only authenticate forge (and git) fetches, not arbitrary
     /// `fetchurl`/`fetchTarball`; the header format is per-forge (see
     /// `authHeader`). Null on a spec = no token, ever.
-    pub const Forge = enum { github, gitlab, sourcehut };
+    pub const Forge = forge_mod.Forge;
 
     const command_stderr_limit = 512 * 1024;
     pub const GitSpec = struct {

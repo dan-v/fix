@@ -5,7 +5,7 @@ pub const context = @import("execution/context.zig");
 pub const port = @import("execution/port.zig");
 pub const worker = @import("execution/worker.zig");
 pub const fiber_executor = @import("execution/fiber_executor.zig").fiber_executor;
-pub const BlockingPool = @import("execution/blocking_pool.zig").BlockingPool;
+pub const BlockingPool = @import("fetchers").BlockingPool;
 
 pub const ExecutionContext = context.ExecutionContext;
 pub const DemandRole = context.DemandRole;

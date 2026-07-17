@@ -2,7 +2,7 @@
 //! importing concrete worker machinery.
 
 const Future = @import("runtime").future.Future;
-const BlockingPool = @import("blocking_pool.zig").BlockingPool;
+const BlockingPool = @import("fetchers").BlockingPool;
 
 pub const BlockingFn = *const fn (context: *anyopaque) void;
 
