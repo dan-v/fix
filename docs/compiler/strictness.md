@@ -74,5 +74,5 @@ The **zero-capture case is elided**: `stampOnBuilder` returns early for a captur
 
 Out of scope: scheduler speculation and fan-out → [parallel/speculation.md](../parallel/speculation.md); thunk representation → [runtime/thunks.md](../runtime/thunks.md); the stamp site in the pipeline → [pipeline.md](pipeline.md).
 
-Code: `src/nix/compiler/strictness.zig`
+Code: `src/expr/compiler/strictness.zig`
 </content>

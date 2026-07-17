@@ -102,17 +102,29 @@ pub fn build(b: *std.Build) void {
     fetchers_mod.linkSystemLibrary("libgit2", .{ .use_pkg_config = .force });
     fetchers_mod.link_libc = true;
 
-    const nix_mod = b.addModule("nix", .{
-        .root_source_file = b.path("src/nix/root.zig"),
+    const expr_mod = b.addModule("expr", .{
+        .root_source_file = b.path("src/expr/root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
-    nix_mod.addImport("build_options", build_options_mod);
-    nix_mod.addImport("syntax", syntax_mod);
+    expr_mod.addImport("build_options", build_options_mod);
+    expr_mod.addImport("syntax", syntax_mod);
+    expr_mod.addImport("runtime", runtime_mod);
+    expr_mod.addImport("base", base_mod);
+    expr_mod.addImport("store", store_mod);
+    expr_mod.addImport("fetchers", fetchers_mod);
+
+    const nix_mod = b.addModule("nix", .{
+        .root_source_file = b.path("src/nix.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    nix_mod.addImport("expr", expr_mod);
     nix_mod.addImport("runtime", runtime_mod);
-    nix_mod.addImport("base", base_mod);
     nix_mod.addImport("store", store_mod);
     nix_mod.addImport("fetchers", fetchers_mod);
 
@@ -152,7 +164,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "fix",
         .root_module = exe_mod,
-        // The threaded VM dispatcher in src/nix/vm/run.zig relies on
+        // The threaded VM dispatcher in src/expr/vm/run.zig relies on
         // `@call(.always_tail)`, which only the LLVM backend
         // implements. Force LLVM for every build mode so debug
         // builds don't unbounded-recurse through the dispatch
@@ -193,6 +205,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_nix_tests = b.addRunArtifact(nix_tests);
 
+    const expr_tests = b.addTest(.{
+        .root_module = expr_mod,
+        .use_llvm = true,
+    });
+    const run_expr_tests = b.addRunArtifact(expr_tests);
+
     const fetchers_tests = b.addTest(.{
         .root_module = fetchers_mod,
         .use_llvm = true,
@@ -217,6 +235,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runtime_tests.step);
     test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_fetchers_tests.step);
+    test_step.dependOn(&run_expr_tests.step);
     test_step.dependOn(&run_nix_tests.step);
     test_step.dependOn(&run_cli_tests.step);
 

@@ -79,4 +79,4 @@ Corollary — **ownership returns home:** a stolen fiber, once `.finished`, is r
 
 ---
 
-Code: `src/base/fiber.zig`, `src/nix/eval/workers/worker.zig`, `src/nix/eval/workers/context.zig`
+Code: `src/base/fiber.zig`, `src/expr/eval/workers/worker.zig`, `src/expr/eval/workers/context.zig`

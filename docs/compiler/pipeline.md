@@ -113,4 +113,4 @@ Lambda bodies (`compileLambda` / `compileLambdaAttrs`) enter `compileTailExpress
 
 Out of scope: how opcodes execute → [vm/dispatch.md](../vm/dispatch.md); name resolution → [scopes.md](scopes.md); strictness masks → [strictness.md](strictness.md); deferral/trivial short-circuits → [lazy-compile.md](lazy-compile.md).
 
-Code: `src/nix/compiler/`
+Code: `src/expr/compiler/`

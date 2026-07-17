@@ -76,4 +76,4 @@ Operand **coercion to a string** (`coerceLanguageStringValue`): `string`/`string
 - **Attr IC is per-thread and `heap_token`-guarded**; entries are GC roots while the token matches.
 - **Equality/order coerce** across int↔float and string/path/context, and short-circuit derivations by `.outPath`.
 
-Code: `src/nix/vm/`, `src/nix/bytecode/`
+Code: `src/expr/vm/`, `src/expr/bytecode/`

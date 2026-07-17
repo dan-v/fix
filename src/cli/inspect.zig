@@ -11,7 +11,7 @@ const bytecode = engine.tooling.bytecode;
 const builtin = @import("builtin");
 
 const Evaluator = engine.Evaluator;
-const SchedulerStats = engine.tooling.scheduler.Scheduler.Stats;
+const SchedulerStats = engine.tooling.workers.Scheduler.Stats;
 
 const usage =
     \\usage: fix inspect [options] (-e <expression> | --file <path>)

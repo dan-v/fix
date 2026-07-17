@@ -100,4 +100,4 @@ So the critical path is a **serial chain of parse+compile through the import gra
 
 File & path caching is shared via the evaluator's `files` reader. See [workers](workers.md).
 
-Code: evaluator-owned orchestration in `src/nix/eval.zig`, registry/entry state in `src/nix/eval/imports.zig`, compatibility sources in `src/nix/eval/imports/corepkgs.zig`, and parking in `src/nix/eval/workers/worker.zig`.
+Code: evaluator-owned orchestration in `src/expr/eval.zig`, registry/entry state in `src/expr/eval/imports.zig`, compatibility sources in `src/expr/eval/imports/corepkgs.zig`, and parking in `src/expr/eval/workers/worker.zig`.

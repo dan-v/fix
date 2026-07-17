@@ -64,7 +64,7 @@ pub fn report(ev: *Evaluator) void {
 }
 
 fn reportSchedulerScanCensus() void {
-    const t = engine.tooling.scheduler.scanCensus() orelse return;
+    const t = engine.tooling.workers.scanCensus() orelse return;
     const total = t.ready_pop_cy + t.ready_steal_cy + t.pop_own_cy +
         t.urgent_steal_cy + t.novel_steal_cy + t.spec_steal_cy;
     if (total == 0) return;

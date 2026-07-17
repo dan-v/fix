@@ -4,7 +4,7 @@
 //!   diff  A B    walk two traces in lockstep, report first divergence
 //!   dump  PATH   pretty-print a binary trace as the text format
 //!
-//! Binary trace format is defined in src/nix/vm/trace_log.zig and emitted
+//! Binary trace format is defined in src/expr/vm/trace_log.zig and emitted
 //! by `--vm-trace --vm-trace-format=binary`.
 
 const std = @import("std");

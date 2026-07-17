@@ -30,7 +30,7 @@ Each stage is lazy at the seams: the compiler emits **thunks** for anything not 
 
 ## The module DAG
 
-The source tree has seven durable module groups. `base`, `syntax`, and `runtime` are reusable foundations; `store` owns derivations and concrete store behavior; `fetchers` owns remote source acquisition; `nix` contains the cooperating evaluator subsystems; `cli` is the application layer. Subsystems under each durable root keep their own facades and namespaces, but use ordinary file imports rather than each restating the same graph as a build module.
+The source tree has seven durable module groups. `base`, `syntax`, and `runtime` are reusable foundations; `store` owns derivations and concrete store behavior; `fetchers` owns remote source acquisition; `expr` owns the expression engine; and `cli` is the application layer. `src/nix.zig` is a thin public composition facade, not another implementation tree. Subsystems under each durable root keep their own facades and namespaces, but use ordinary file imports rather than each restating the same graph as a build module.
 
 ```
 src/base/       base → base_options
@@ -50,9 +50,12 @@ src/store/      store → base, runtime
 src/fetchers/   fetchers → base, runtime, store, libcurl, libgit2
                 Remote-source cache, provider planning, transports.
 
-src/nix/        nix → base, syntax, runtime, store, fetchers, build_options
-                Exports bytecode, compiler, evaluator workers, language support, observability,
-                probes, VM, and Evaluator.
+src/expr/       expr → base, syntax, runtime, store, fetchers, build_options
+                Bytecode, compiler, builtins, VM, evaluator workers,
+                language support, observability, and probes.
+
+src/nix.zig     nix → expr, runtime, store, fetchers
+                Thin stable evaluation/build API and expert composition view.
 
 src/cli/        cli → nix, base
                 Commands, options, rendering, debugger.
@@ -61,9 +64,9 @@ src/main.zig       → nix, cli, process_support
                 Process composition; executable `fix`.
 ```
 
-`base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and `nix` supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
+`base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and the runtime supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
 
-Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `eval.zig` composes those services into `Evaluator`. `eval/workers/` owns the scheduler, fiber workers, fiber-scoped context, and capabilities for parking futures and blocking work away from compute workers; the VM borrows that context and capability without owning worker machinery. `store/realization/daemon_execution.zig` defines the store-facing executor capability, while `eval/workers/daemon_executor.zig` supplies its fiber implementation. `root.zig` is the narrow stable facade visible to ordinary consumers, including typed build/evaluation progress protocols and diagnostic views; commands that intentionally inspect representation details opt into the explicitly unstable `nix.tooling` surface. Deferred-body compilation calls from `vm` into `compiler`, while import orchestration and synthetic corepkgs sources remain evaluator-owned and `eval/imports.zig` owns only the concurrent registry/entry state. See [build](build.md).
+Within `expr` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `eval.zig` composes those services into `Evaluator`. `eval/workers/` owns the scheduler, fiber workers, fiber-scoped context, and capabilities for parking futures and blocking work away from compute workers; the VM borrows that context and capability without owning worker machinery. `store/realization/daemon_execution.zig` defines the store-facing executor capability, while `expr/eval/workers/daemon_executor.zig` supplies its fiber implementation. `nix.zig` is the narrow stable facade visible to ordinary consumers, including typed build/evaluation progress protocols and diagnostic views; commands that intentionally inspect representation details opt into `nix.tooling`, which composes the explicit unstable views of `expr`, `store`, and `fetchers`. Deferred-body compilation calls from `vm` into `compiler`, while import orchestration and synthetic corepkgs sources remain evaluator-owned and `eval/imports.zig` owns only the concurrent registry/entry state. See [build](build.md).
 
 Callbacks mark real ownership, policy, or execution-domain changes: CLI debugger/progress/build sinks, heap/scheduler GC dispatch, fiber wakeups, blocking execution, and leaf policies such as NAR filters. File extraction alone is not a boundary. Evaluator helper files therefore receive concrete state views (for example debugger `Context`) or remain evaluator-owned instead of back-calling through opaque “host” bundles. Concurrent progress `Span` handles retain the sink that created them, so a sink replacement cannot misroute an in-flight token.
 

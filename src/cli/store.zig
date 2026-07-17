@@ -4,10 +4,10 @@
 
 const std = @import("std");
 const presentation = @import("presentation.zig");
-const host = @import("nix").tooling.host;
-const store = host.store;
-const nar = host.nar;
-const FileCache = host.FileCache;
+const store_domain = @import("nix").tooling.store;
+const store = store_domain.daemon;
+const nar = store_domain.nar;
+const FileCache = store_domain.FileCache;
 
 const usage =
     \\usage: fix store <subcommand> [args]

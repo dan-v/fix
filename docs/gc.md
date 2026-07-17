@@ -27,7 +27,7 @@ Collections are **minor** and young-gated: each minor examines only the objects 
 
 ## Root set
 
-Marking starts from every place a live ObjectId can be reached without going through the heap (`markRoots` in `src/nix/eval/gc_controller.zig`):
+Marking starts from every place a live ObjectId can be reached without going through the heap (`markRoots` in `src/expr/eval/gc_controller.zig`):
 
 ```
 Root set (all must be enumerated — precise):
@@ -96,4 +96,4 @@ At `--workers=1` a minor is serial on the lone mutator. At `--workers>1` every l
 - **`FIX_GC_NOREUSE`** (skip free-list reuse; validate the reuse path) and **`FIX_GC_PAR_CAP`** (mark/evac participant cap) are validation/tuning knobs.
 - **`--gc-report`** dumps the per-run collection report (pauses, promoted/freed, live vs reserved breakdown) to stderr.
 
-Code: `src/runtime/gc.zig` (the precise serial/parallel marker and metrics), `src/runtime/heap/collector.zig` (arming, evacuation, sweep, and threshold policy), and `src/nix/eval/gc_controller.zig` (root enumeration, stop-the-world integration, and budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).
+Code: `src/runtime/gc.zig` (the precise serial/parallel marker and metrics), `src/runtime/heap/collector.zig` (arming, evacuation, sweep, and threshold policy), and `src/expr/eval/gc_controller.zig` (root enumeration, stop-the-world integration, and budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).

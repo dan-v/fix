@@ -74,4 +74,4 @@ Two thread-local, `heap_token`-guarded caches. `chunk_id`s and `obj_id`s are not
 - **Saturated uncurried calls run in one frame** with no intermediate closure/PAP; under-application produces a callable PAP; over-application folds.
 - **Caches are per-thread and `heap_token`-guarded**; a stale entry from a prior evaluator is never used.
 
-Code: `src/nix/vm/`, `src/nix/bytecode/`
+Code: `src/expr/vm/`, `src/expr/bytecode/`

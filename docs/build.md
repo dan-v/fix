@@ -2,11 +2,11 @@
 
 *The build graph, module layout, and hygiene that keep the fast paths honest.*
 
-`fix` builds with `zig build` from a single `build.zig`. Seven durable groups are Zig modules; subsystems beneath those roots are ordinary file namespaces. An executable-only `process_support` module composes allocator policy without adding it to the engine API. The installed artifact is named `fix`. The build also forces LLVM because the threaded dispatcher needs it.
+`fix` builds with `zig build` from a single `build.zig`. Seven durable source groups are Zig modules, plus the thin `nix` public facade; subsystems beneath durable roots are ordinary file namespaces. An executable-only `process_support` module composes allocator policy without adding it to the engine API. The installed artifact is named `fix`. The build also forces LLVM because the threaded dispatcher needs it.
 
 ## Module model
 
-The build-module graph follows independently reusable or consumed groups. Within the `nix` group, normal relative file imports keep one canonical instance of every internal type without restating the subsystem graph in `build.zig`.
+The build-module graph follows independently reusable or consumed groups. Within `expr`, `store`, and `fetchers`, normal relative file imports keep one canonical instance of every internal type without restating the subsystem graph in `build.zig`.
 
 | Module | Facade | Imports | Notes |
 |---|---|---|---|
@@ -15,11 +15,12 @@ The build-module graph follows independently reusable or consumed groups. Within
 | `runtime` | `src/runtime/runtime.zig` | `build_options`, `base` | value model, heap, interning, thunk/Future, GC, memory tags |
 | `store` | `src/store/root.zig` | `base`, `runtime` | derivations, file snapshots, NAR, realization, daemon protocol/runtime |
 | `fetchers` | `src/fetchers/root.zig` | `base`, `runtime`, `store`, libcurl, libgit2 | forge planning, remote-source cache and transports |
-| `nix` | `src/nix/root.zig` | `build_options`, `base`, `syntax`, `runtime`, `store`, `fetchers` | narrow evaluator API plus explicit `tooling` access to internal subsystems |
+| `expr` | `src/expr/root.zig` | `build_options`, `base`, `syntax`, `runtime`, `store`, `fetchers` | bytecode/compiler/VM, builtins, evaluator workers and engine tooling |
+| `nix` | `src/nix.zig` | `expr`, `runtime`, `store`, `fetchers` | thin stable API plus composed expert `tooling` view |
 | `cli` | `src/cli/cli.zig` | `nix`, `base` | command surface, argument parsing, rendering, progress |
 | `process_support` | `src/process_support.zig` | `base`, `runtime` | executable-only allocator composition |
 
-`nix` exports a narrow evaluator API, including stable build/evaluation progress protocols, diagnostic views, memory configuration parsing, and language policy. The CLI's ordinary path does not import daemon wire, syntax, or evaluator implementation namespaces. Diagnostics that intentionally inspect representation details use `nix.tooling`, which exposes bytecode, compiler, evaluator workers, store derivation/realization views, probes, VM, and observability. Compatibility aliases retain the old `scheduler`, `execution`, and `host` tooling names during extraction.
+`nix` exports a narrow evaluator API, including stable build/evaluation progress protocols, diagnostic views, memory configuration parsing, and language policy. The CLI's ordinary path does not import daemon wire, syntax, or evaluator implementation namespaces. Diagnostics that intentionally inspect representation details use `nix.tooling`, which exposes bytecode, compiler, evaluator workers, store derivation/realization views, fetchers, probes, VM, and observability.
 
 `cli` imports `nix` plus generic synchronization from `base`; ordinary workflows use the stable evaluator API while diagnostics opt into `nix.tooling`. The executable (`src/main.zig`) imports `nix`, `cli`, and the private `process_support` composition module.
 
@@ -50,19 +51,19 @@ The `--vm-trace` / `--thunks-log` runtime flags are inert unless the matching `-
 
 ## Why LLVM is forced (`use_llvm = true`)
 
-The threaded VM dispatcher (`src/nix/vm/run.zig`) chains handlers with `@call(.always_tail)`. Only the LLVM backend implements guaranteed tail calls; the self-hosted backend would emit ordinary calls and the dispatch chain would **unbounded-recurse and blow the stack** — even in Debug. So `use_llvm = true` is pinned on the `exe` *and* on every `addTest` artifact, for all optimize modes.
+The threaded VM dispatcher (`src/expr/vm/run.zig`) chains handlers with `@call(.always_tail)`. Only the LLVM backend implements guaranteed tail calls; the self-hosted backend would emit ordinary calls and the dispatch chain would **unbounded-recurse and blow the stack** — even in Debug. So `use_llvm = true` is pinned on the `exe` *and* on every `addTest` artifact, for all optimize modes.
 
 ## Group test wiring
 
 `zig build test` runs one test artifact for each durable group. `zig build check` runs that suite plus `zig fmt --check` over `build.zig`, `src/`, and `tools/`:
 
 ```
-test → base_tests, syntax_tests, runtime_tests, store_tests, fetchers_tests, nix_tests, cli_tests
+test → base_tests, syntax_tests, runtime_tests, store_tests, fetchers_tests, expr_tests, nix_tests, cli_tests
 ```
 
-Relative imports inside `nix` let its single test artifact discover subsystem tests recursively. `zig build test-syntax` runs the front-end tests alone; `zig build bench -- <file.nix>` runs the parse microbenchmark against `syntax`.
+Relative imports inside each durable root let its test artifact discover subsystem tests recursively. `zig build test-syntax` runs the front-end tests alone; `zig build bench -- <file.nix>` runs the parse microbenchmark against `syntax`.
 
-Evaluator integration tests live under `src/nix/root/tests` and `src/nix/eval/tests`. Compiler and VM tests live with those subsystems, while the store realization facade owns its socket-backed tests and fake daemon. `test/*.nix` holds pathology and spec fixtures driven through evaluation.
+Public-facade integration tests live under `src/integration/nix_api`; evaluator, compiler, and VM tests live with their `src/expr` subsystems, while the store realization facade owns its socket-backed tests and fake daemon. `test/*.nix` holds pathology and spec fixtures driven through evaluation.
 
 ## The correctness gate
 

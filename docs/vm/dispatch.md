@@ -108,4 +108,4 @@ Two **well-known stub chunks** (`genlist_apply`, `mapattrs_apply`) are registere
 - **Registered chunks are immutable**; a chunk is fully built before its `ChunkSlot` is published, so any thread that resolves the id observes a complete, unchanging `Chunk`.
 - **`frame.ip` is written back** before any op that can fault, re-enter the interpreter, or push a frame, so error traces and resumed callers see a consistent ip.
 
-Code: `src/nix/vm/`, `src/nix/bytecode/`
+Code: `src/expr/vm/`, `src/expr/bytecode/`
