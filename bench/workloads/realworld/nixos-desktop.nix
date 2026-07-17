@@ -1,8 +1,8 @@
 # A less trivial NixOS system: several services and a handful of packages, so
 # far more of the module system and nixpkgs is forced than the minimal profile.
-# `@nixpkgs@` is substituted with the pinned nixpkgs store path by nix/bench.nix.
+# Resolve nixpkgs through NIX_PATH so this workload can be run directly.
 let
-  nixpkgs = @nixpkgs@;
+  nixpkgs = <nixpkgs>;
 in
   ((import (nixpkgs + "/nixos") {
     system = "x86_64-linux";

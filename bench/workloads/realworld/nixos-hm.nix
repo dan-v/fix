@@ -1,9 +1,9 @@
 # NixOS system with home-manager integrated as a module — the full system
 # fixpoint plus a per-user home-manager fixpoint evaluated together.
-# `@nixpkgs@` / `@homeManager@` are substituted with pinned store paths.
+# Resolve sources through NIX_PATH so this workload can be run directly.
 let
-  nixpkgs = @nixpkgs@;
-  home-manager = @homeManager@;
+  nixpkgs = <nixpkgs>;
+  home-manager = <home-manager>;
 in
   ((import (nixpkgs + "/nixos") {
     system = "x86_64-linux";

@@ -3,7 +3,7 @@ let
 in
   {pkgs ? import sources.nixpkgs {}}:
     pkgs.mkShell {
-      NIX_PATH = "nixpkgs=${sources.nixpkgs}";
+      NIX_PATH = "nixpkgs=${sources.nixpkgs}:home-manager=${pkgs.home-manager.src}";
 
       packages = [
         pkgs.zig_0_16
