@@ -30,11 +30,13 @@ the harness without creating a `result` link. Useful environment variables are:
 - `OUT=/path` selects the result directory instead of `/tmp/fix-bench.XXXXXX`.
 - `BENCH_NIX_PATH` overrides the harness's pinned source search path.
 
-The result root contains a unified `summary.svg` / `summary.png` covering every
-selected suite. Each suite directory contains Hyperfine Markdown and JSON, an
-SVG and PNG for each workload, and its own `summary.svg` / `summary.png`.
-When one evaluator would flatten the rest of a chart, the renderer marks and
-uses a broken time axis while keeping the exact times and relative ratios.
+The result root contains a compact landscape `summary.svg` / `summary.png`
+covering every selected suite. Its comparison matrix shows relative wall time
+per evaluator and the absolute best time for each workload. Each suite directory
+contains Hyperfine Markdown and JSON, an SVG and PNG for each workload, and its
+own detailed `summary.svg` / `summary.png`. When one evaluator would flatten
+the rest of a detailed bar chart, the renderer marks and uses a broken time
+axis while keeping the exact times and relative ratios.
 
 ## Running workloads directly
 
