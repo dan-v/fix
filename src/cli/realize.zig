@@ -22,9 +22,7 @@ pub const Realized = struct {
 
 pub const Result = union(enum) { ok: Realized, failed: u8 };
 
-pub const BuildInput = struct {
-    source: eval_support.Source,
-};
+pub const BuildInput = eval_support.LoadedInput;
 
 const FailureStage = enum { none, evaluation, derivation, closure };
 
@@ -118,16 +116,9 @@ const OrderedPrinter = struct {
         }
     }
 
-    fn numberedName(self: *OrderedPrinter, base: []const u8, index: usize) ?[]u8 {
-        return if (index == 0)
-            self.allocator.dupe(u8, base) catch null
-        else
-            std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ base, index + 1 }) catch null;
-    }
-
     fn linkOutput(self: *OrderedPrinter, index: usize, target: []const u8) void {
         const base = self.options.add_root orelse (if (self.options.no_link) return else (self.options.out_link orelse "result"));
-        const name = self.numberedName(base, index) orelse return;
+        const name = numberedName(self.allocator, base, index) catch return;
         defer self.allocator.free(name);
         const indirect = self.options.add_root == null or self.options.indirect;
         linkRoot(self.io, self.allocator, self.ev, name, target, indirect);
@@ -135,13 +126,20 @@ const OrderedPrinter = struct {
 
     fn linkDrv(self: *OrderedPrinter, index: usize, target: []const u8) void {
         if (!self.options.add_drv_link) return;
-        const name = self.numberedName(self.options.drv_link orelse "derivation", index) orelse return;
+        const name = numberedName(self.allocator, self.options.drv_link orelse "derivation", index) catch return;
         defer self.allocator.free(name);
         makeLink(self.io, name, target) catch |err| {
             std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
         };
     }
 };
+
+pub fn numberedName(allocator: std.mem.Allocator, base: []const u8, index: usize) ![]u8 {
+    return if (index == 0)
+        allocator.dupe(u8, base)
+    else
+        std.fmt.allocPrint(allocator, "{s}-{d}", .{ base, index + 1 });
+}
 
 pub fn makeLink(io: std.Io, name: []const u8, target: []const u8) !void {
     const cwd = std.Io.Dir.cwd();

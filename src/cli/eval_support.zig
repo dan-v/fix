@@ -95,6 +95,102 @@ pub const Source = struct {
     }
 };
 
+/// One ordered CLI input after expanding sources × `-A` selectors. The options
+/// value borrows all list storage from the command's parsed Options and changes
+/// only the legacy single-selector mirror consumed by `getSource`.
+pub const SelectedInput = struct {
+    source_arg: SourceArg,
+    options: args.Options,
+};
+
+pub const LoadedInput = struct {
+    source_arg: SourceArg,
+    source: Source,
+
+    pub fn deinit(self: LoadedInput, ev: *Evaluator) void {
+        self.source.deinit(ev.hostAllocator());
+    }
+
+    pub fn label(self: LoadedInput) []const u8 {
+        return sourceLabel(self.source_arg);
+    }
+};
+
+/// Shared ordered expansion used by build, eval, and instantiate. Inputs are
+/// source-major, with repeated `-A` selectors kept in their command-line order.
+pub const InputPlan = struct {
+    parsed: args.Options,
+    default_source: SourceArg,
+    selector_count: usize,
+
+    pub fn init(options: args.Options) InputPlan {
+        return .{
+            .parsed = options,
+            .default_source = options.defaultSource(),
+            .selector_count = if (options.attrs.items.len == 0) 1 else options.attrs.items.len,
+        };
+    }
+
+    pub fn count(self: InputPlan) !usize {
+        const source_count: usize = if (self.parsed.sources.items.len == 0) 1 else self.parsed.sources.items.len;
+        return std.math.mul(usize, source_count, self.selector_count);
+    }
+
+    pub fn selected(self: InputPlan, index: usize) SelectedInput {
+        const source_index = index / self.selector_count;
+        const selector_index = index % self.selector_count;
+        const source_arg = if (self.parsed.sources.items.len == 0)
+            self.default_source
+        else
+            self.parsed.sources.items[source_index];
+        var input_options = self.parsed;
+        input_options.attr = if (self.parsed.attrs.items.len == 0) null else self.parsed.attrs.items[selector_index];
+        return .{ .source_arg = source_arg, .options = input_options };
+    }
+
+    pub fn validate(self: InputPlan, ev: *Evaluator) !void {
+        if (ev.languagePolicy().flakes_enabled) return;
+        const input_count = try self.count();
+        for (0..input_count) |index| {
+            if (self.selected(index).source_arg == .flake) return error.FlakesFeatureRequired;
+        }
+    }
+
+    pub fn load(self: InputPlan, ev: *Evaluator, index: usize) !LoadedInput {
+        const input = self.selected(index);
+        return .{
+            .source_arg = input.source_arg,
+            .source = try getSource(ev, input.source_arg, input.options),
+        };
+    }
+};
+
+pub fn reportInputReadError(input_count: usize, index: usize, err: anyerror) void {
+    if (input_count == 1)
+        std.debug.print("error: reading source: {s}\n", .{@errorName(err)})
+    else
+        std.debug.print("error: reading input {d}: {s}\n", .{ index + 1, @errorName(err) });
+}
+
+test "input plan shares ordered source and selector expansion" {
+    var options: args.Options = .{};
+    defer options.deinit(std.testing.allocator);
+    try options.sources.append(std.testing.allocator, .{ .expr = "one" });
+    try options.sources.append(std.testing.allocator, .{ .expr = "two" });
+    try options.attrs.append(std.testing.allocator, "first");
+    try options.attrs.append(std.testing.allocator, "second");
+
+    const plan = InputPlan.init(options);
+    try std.testing.expectEqual(@as(usize, 4), try plan.count());
+    const expected_sources = [_][]const u8{ "one", "one", "two", "two" };
+    const expected_attrs = [_][]const u8{ "first", "second", "first", "second" };
+    for (expected_sources, expected_attrs, 0..) |expected_source, expected_attr, index| {
+        const input = plan.selected(index);
+        try std.testing.expectEqualStrings(expected_source, input.source_arg.expr);
+        try std.testing.expectEqualStrings(expected_attr, input.options.attr.?);
+    }
+}
+
 /// The real file path behind a source, when the text is the file's own
 /// content (not `--flake`/`-A`/`--arg`-synthesized wrapping) — so evaluation
 /// attributes spans and attr positions to the file, like Nix does. This is the

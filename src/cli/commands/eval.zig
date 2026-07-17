@@ -15,9 +15,10 @@ const timeline = engine.probe.timeline;
 const Evaluator = engine.Evaluator;
 
 pub const synopsis =
-    \\usage: fix eval [options] [path | -e <expression>]
+    \\usage: fix eval [options] [paths... | -e <expression>...]
     \\
-    \\evaluate a Nix expression, file, or flake output and print the value.
+    \\evaluate Nix expressions, files, or flake outputs and print each value in
+    \\input order.
     \\with no source, evaluates ./default.nix (or, with --flake, the flake in the
     \\current directory).
 ;
@@ -35,12 +36,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         },
     };
     defer options.deinit(allocator);
-    if (options.sources.items.len > 1) {
-        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
-        return 2;
-    }
-
-    const source_arg = options.source orelse options.defaultSource();
 
     // The debugger needs a deterministic pause point: one worker, no
     // speculative forcing racing ahead of the break.
@@ -59,22 +54,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         console.install(&ev);
     }
 
-    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
-        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
+    const input_plan = eval_support.InputPlan.init(options);
+    input_plan.validate(&ev) catch |err| {
+        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
         return 2;
-    }
-
-    const source = eval_support.getSource(&ev, source_arg, options) catch |err| {
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
-        return 1;
     };
-    // `--flake` and `-A`/`--arg` wrapping synthesize source text on
-    // the evaluator's host allocator; plain expr/file text is borrowed (argv) or owned by the
-    // evaluator's file cache.
-    defer source.deinit(ev.hostAllocator());
-    // Let the debugger show a source snippet for a `-e` expression (files it
-    // reads from the FileCache).
-    if (options.debugger) ev.setDebugSource(source.text);
+    const input_count = try input_plan.count();
 
     var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
     errdefer progress.deinit(false);
@@ -98,19 +83,35 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         timeline.init(allocator, worker_count, 1 << 21, ev.internTable());
         timeline.setFlowSample(options.timeline_flows);
         ev.setTraceFlows(true);
-        timeline.setSource(switch (source_arg) {
+        timeline.setSource(if (input_count == 1) switch (input_plan.selected(0).source_arg) {
             .file => |p| p,
             .expr => "(expression)",
             .flake => |inst| inst,
-        });
+        } else "(multiple inputs)");
     }
 
-    const eval_label = switch (source_arg) {
-        .file => |p| std.fs.path.basename(p),
-        .expr => "expression",
-        .flake => |inst| inst,
-    };
-    const ok = try eval_support.evaluateAndWrite(init.io, options.evaluationMode(), term.use_color, options.show_trace, options.derivation_debug, &ev, source, eval_label);
+    var ok = true;
+    for (0..input_count) |index| {
+        const input = input_plan.load(&ev, index) catch |err| {
+            eval_support.reportInputReadError(input_count, index, err);
+            ok = false;
+            continue;
+        };
+        defer input.deinit(&ev);
+        // Let the debugger show snippets for synthesized expressions.
+        if (options.debugger) ev.setDebugSource(input.source.text);
+        const input_ok = try eval_support.evaluateAndWrite(
+            init.io,
+            options.evaluationMode(),
+            term.use_color,
+            options.show_trace,
+            options.derivation_debug,
+            &ev,
+            input.source,
+            input.label(),
+        );
+        ok = input_ok and ok;
+    }
     progress.deinit(ok);
 
     if (timeline_path) |p| timeline.dump(init.io, p, worker_count);

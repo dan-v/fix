@@ -13,11 +13,11 @@ const build = @import("build.zig");
 const Evaluator = engine.Evaluator;
 
 pub const synopsis =
-    \\usage: fix instantiate [options] [path | -e <expr>]
+    \\usage: fix instantiate [options] [paths... | -e <expr>...]
     \\
-    \\evaluate to a derivation, add its .drv closure to the store, and print the
-    \\top-level .drv path. With no source, uses ./default.nix (or, with --flake,
-    \\the flake in the current directory).
+    \\evaluate to derivations, add their .drv closures to the store, and print
+    \\the top-level .drv paths in input order. With no source, uses ./default.nix
+    \\(or, with --flake, the flake in the current directory).
 ;
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
@@ -33,12 +33,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         },
     };
     defer options.deinit(allocator);
-    if (options.sources.items.len > 1) {
-        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
-        return 2;
-    }
-
-    const source_arg = options.source orelse options.defaultSource();
 
     const worker_count = try setup.workerCount(options);
     setup.applyMemoryBacking(options.hugetlb);
@@ -46,16 +40,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
 
-    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
-        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
+    const input_plan = eval_support.InputPlan.init(options);
+    input_plan.validate(&ev) catch |err| {
+        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
         return 2;
-    }
-
-    const source = eval_support.getSource(&ev, source_arg, options) catch |err| {
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
-        return 1;
     };
-    defer source.deinit(ev.hostAllocator());
+    const input_count = try input_plan.count();
 
     // Forcing a derivation now writes its `.drv` (and sources) to the store.
     // The daemon connects lazily on the first write.
@@ -65,37 +55,60 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var ok = false;
     defer progress.deinit(ok);
     if (term.show_progress) ev.setProgressSink(progress.sink());
-    ev.progressSessionBegin(label(source_arg));
+    ok = true;
+    for (0..input_count) |index| {
+        const input = input_plan.load(&ev, index) catch |err| {
+            eval_support.reportInputReadError(input_count, index, err);
+            ok = false;
+            continue;
+        };
+        defer input.deinit(&ev);
+        ok = (try instantiateOne(allocator, init, term, options, &ev, input, index)) and ok;
+    }
+    return if (ok) 0 else 1;
+}
+
+fn instantiateOne(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    term: setup.Terminal,
+    options: args.Options,
+    ev: *Evaluator,
+    input: eval_support.LoadedInput,
+    index: usize,
+) !bool {
+    ev.progressSessionBegin(input.label());
     defer ev.progressSessionEnd();
     ev.startProgressSampler();
     defer ev.stopProgressSampler();
 
-    const result = ev.evaluatePathAt(source.text, source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
-        return storeOrEvalFailure(init, term, options, &ev, source.text, err);
+    const source = input.source;
+    const result = ev.evaluatePathAt(source.text, source.base_path, source.abs_path) catch |err| {
+        _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
+        return false;
     };
     const drv_path = ev.derivationDrvPath(result) catch |err| {
-        return storeOrEvalFailure(init, term, options, &ev, source.text, err);
+        _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
+        return false;
     } orelse {
-        std.debug.print("error: expression did not evaluate to a derivation\n", .{});
-        return 1;
+        std.debug.print("error: input {d} did not evaluate to a derivation\n", .{index + 1});
+        return false;
     };
 
-    // Writes are demand-driven: materialize the `.drv` closure now (deps-first
-    // via the recipe graph). This IS instantiate's contract — nix-instantiate
-    // writes the whole `.drv` closure to the store, but nothing is built.
+    // Materialize the `.drv` closure, but do not build its outputs.
     ev.ensureDerivationClosure(drv_path) catch |err| {
-        return storeOrEvalFailure(init, term, options, &ev, source.text, err);
+        _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
+        return false;
     };
 
-    ok = true;
-
-    // nix-instantiate roots the .drv only when asked, and makes a direct root
-    // unless --indirect.
     if (options.add_root) |root_path| {
-        build.linkRoot(init.io, allocator, &ev, root_path, drv_path, options.indirect);
+        const name = try build.numberedName(allocator, root_path, index);
+        defer allocator.free(name);
+        build.linkRoot(init.io, allocator, ev, name, drv_path, options.indirect);
     }
     if (options.add_drv_link) {
-        const name = options.drv_link orelse "derivation";
+        const name = try build.numberedName(allocator, options.drv_link orelse "derivation", index);
+        defer allocator.free(name);
         build.makeLink(init.io, name, drv_path) catch |err| {
             std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
         };
@@ -105,26 +118,5 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
     try w.interface.print("{s}\n", .{drv_path});
     try w.interface.flush();
-    return 0;
-}
-
-const render = @import("../render.zig");
-
-/// Render a store-op failure (daemon down / daemon error) specially, else fall
-/// back to the normal eval-failure trace.
-fn storeOrEvalFailure(init: std.process.Init, term: setup.Terminal, options: args.Options, ev: *Evaluator, source: []const u8, err: anyerror) !u8 {
-    switch (err) {
-        error.DaemonError => std.debug.print("error: daemon: {s}\n", .{ev.lastStoreError() orelse "unknown"}),
-        error.StoreUnavailable => std.debug.print("error: cannot reach the nix-daemon (is it running?)\n", .{}),
-        else => try render.evalFailure(init.io, term.use_color, options.show_trace, ev, source, err),
-    }
-    return 1;
-}
-
-fn label(source_arg: args.SourceArg) []const u8 {
-    return switch (source_arg) {
-        .file => |p| std.fs.path.basename(p),
-        .expr => "expression",
-        .flake => |inst| inst,
-    };
+    return true;
 }

@@ -41,33 +41,24 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     ev.enableStoreWrites();
 
-    var default_sources = [_]args.SourceArg{options.defaultSource()};
-    const source_args = if (options.sources.items.len == 0) default_sources[0..] else options.sources.items;
-    const selector_count = if (options.attrs.items.len == 0) 1 else options.attrs.items.len;
-    const input_count = try std.math.mul(usize, source_args.len, selector_count);
+    const input_plan = eval_support.InputPlan.init(options);
+    input_plan.validate(&ev) catch |err| {
+        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+        return 2;
+    };
+    const input_count = try input_plan.count();
     const inputs = try allocator.alloc(realization_workflow.BuildInput, input_count);
     var loaded: usize = 0;
     defer {
-        for (inputs[0..loaded]) |input| input.source.deinit(ev.hostAllocator());
+        for (inputs[0..loaded]) |input| input.deinit(&ev);
         allocator.free(inputs);
     }
 
-    for (source_args) |source_arg| {
-        if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
-            return 2;
-        }
-        var selector_index: usize = 0;
-        while (selector_index < selector_count) : (selector_index += 1) {
-            var input_options = options;
-            input_options.attr = if (options.attrs.items.len == 0) null else options.attrs.items[selector_index];
-            const source = eval_support.getSource(&ev, source_arg, input_options) catch |err| {
-                std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
-                return 1;
-            };
-            inputs[loaded] = .{ .source = source };
-            loaded += 1;
-        }
+    while (loaded < inputs.len) : (loaded += 1) {
+        inputs[loaded] = input_plan.load(&ev, loaded) catch |err| {
+            eval_support.reportInputReadError(input_count, loaded, err);
+            return 1;
+        };
     }
 
     return realization_workflow.realizeMany(allocator, init.io, &ev, process.eval_release, term, options, inputs);
@@ -75,3 +66,4 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
 pub const makeLink = realization_workflow.makeLink;
 pub const linkRoot = realization_workflow.linkRoot;
+pub const numberedName = realization_workflow.numberedName;
