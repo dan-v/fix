@@ -133,11 +133,20 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
             .gitlab
         else
             .sourcehut;
-        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name, .forge = forge }, span);
+        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
+            .url = spec.url,
+            .name = spec.name,
+            .forge = forge,
+            .metadata_url = spec.metadata_url,
+            .metadata_ref = spec.metadata_ref,
+            .metadata_head_url = spec.metadata_head_url,
+            .resolved_rev = spec.rev,
+            .resolved_url_template = spec.resolved_url_template,
+        }, span);
         defer result.deinit(self.fetchers.allocator);
         const out = try ingestFetchedTree(self, result.path, spec.name, spec.rev orelse "", null);
         defer out.deinit(self.allocator);
-        return githubTreeValue(self, out.out_path, out.nar_hash, spec.rev);
+        return githubTreeValue(self, out.out_path, out.nar_hash, spec.rev, result.forge_metadata);
     }
 
     if (std.mem.eql(u8, type_value, "mercurial")) {
@@ -496,7 +505,7 @@ fn flakeInputFromStore(self: *VM, attrs: Value) !?Value {
     if (is_forge) {
         const rev = try optionalStringAttr(self, id, "rev");
         defer if (rev) |r| self.allocator.free(r);
-        return try githubTreeValue(self, store_path, nar_hash, rev);
+        return try githubTreeValue(self, store_path, nar_hash, rev, null);
     }
     return try pathTreeValue(self, store_path, nar_hash);
 }

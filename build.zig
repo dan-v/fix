@@ -90,6 +90,11 @@ pub fn build(b: *std.Build) void {
     nix_mod.addImport("syntax", syntax_mod);
     nix_mod.addImport("runtime", runtime_mod);
     nix_mod.addImport("base", base_mod);
+    // Evaluator-owned remote source transport. libcurl handles generic HTTP;
+    // libgit2 handles the Git smart protocol (including its HTTP transport).
+    nix_mod.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
+    nix_mod.linkSystemLibrary("libgit2", .{ .use_pkg_config = .force });
+    nix_mod.link_libc = true;
 
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli/cli.zig"),

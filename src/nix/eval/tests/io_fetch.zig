@@ -268,16 +268,22 @@ test "evaluate fetchGit builtin for local repository" {
     defer std.testing.allocator.free(out_path_source);
     const short_rev_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.stringLength (builtins.fetchGit {{ url = \"{s}\"; }}).shortRev", .{cwd});
     defer std.testing.allocator.free(short_rev_source);
+    const untracked_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.hasAttr \".zig-cache\" (builtins.readDir (builtins.fetchGit {{ url = \"{s}\"; }}).outPath)", .{cwd});
+    defer std.testing.allocator.free(untracked_source);
 
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
     const out_path = try ev.evaluate(out_path_source);
-    try std.testing.expectEqualStrings(cwd, ev.intern.get(out_path.asInternId()));
+    const fetched_path = ev.intern.get(out_path.asInternId());
+    try std.testing.expect(!std.mem.eql(u8, cwd, fetched_path));
+    try std.testing.expect(std.mem.indexOf(u8, fetched_path, "/git-local/") != null);
 
     const short_rev_len = try ev.evaluate(short_rev_source);
     try std.testing.expectEqual(@as(i64, 7), short_rev_len.asInt());
+    const includes_untracked = try ev.evaluate(untracked_source);
+    try std.testing.expect(!includes_untracked.asBool());
 }
 
 test "evaluate fetchurl builtin through fetch cache" {

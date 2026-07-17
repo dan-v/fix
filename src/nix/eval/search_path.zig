@@ -59,8 +59,11 @@ pub const Paths = struct {
             entries.deinit(allocator);
         }
 
-        var parts = std.mem.splitScalar(u8, nix_path, ':');
-        while (parts.next()) |part| {
+        var offset: usize = 0;
+        while (offset < nix_path.len) {
+            const end = searchPathSeparator(nix_path, offset) orelse nix_path.len;
+            const part = nix_path[offset..end];
+            offset = if (end < nix_path.len) end + 1 else nix_path.len;
             if (part.len == 0) continue;
             const eq = std.mem.indexOfScalar(u8, part, '=');
             const prefix = if (eq) |i| part[0..i] else "";
@@ -118,6 +121,34 @@ pub const Paths = struct {
     }
 };
 
+/// Find the next NIX_PATH separator without mistaking the colon in an HTTP(S)
+/// URI (or its port) for an entry boundary. A following `prefix=` or absolute
+/// path is an unambiguous new entry; raw colons inside a URL remain part of it.
+fn searchPathSeparator(text: []const u8, start: usize) ?usize {
+    const first_colon = std.mem.indexOfScalarPos(u8, text, start, ':') orelse return null;
+    const eq = std.mem.indexOfScalarPos(u8, text, start, '=');
+    const raw_start = if (eq != null and eq.? < first_colon) eq.? + 1 else start;
+    const remote = std.mem.startsWith(u8, text[raw_start..], "http://") or std.mem.startsWith(u8, text[raw_start..], "https://") or std.mem.startsWith(u8, text[raw_start..], "file://");
+    if (!remote) return first_colon;
+
+    const scheme_colon = std.mem.indexOfScalarPos(u8, text, raw_start, ':').?;
+    var in_brackets = false;
+    var i = scheme_colon + 3;
+    while (i < text.len) : (i += 1) switch (text[i]) {
+        '[' => in_brackets = true,
+        ']' => in_brackets = false,
+        ':' => if (!in_brackets) {
+            const rest = text[i + 1 ..];
+            if (rest.len == 0) return null;
+            if (rest[0] == '/') return i;
+            const next_slash = std.mem.indexOfAny(u8, rest, "/?#:") orelse rest.len;
+            if (std.mem.indexOfScalar(u8, rest[0..next_slash], '=') != null) return i;
+        },
+        else => {},
+    };
+    return null;
+}
+
 fn candidate(
     allocator: std.mem.Allocator,
     files: *FileCache,
@@ -131,4 +162,11 @@ fn candidate(
     if (try files.pathExists(result)) return result;
     allocator.free(result);
     return null;
+}
+
+test "NIX_PATH separators preserve HTTP schemes and ports" {
+    try std.testing.expect(searchPathSeparator("nixpkgs=https://example.org/archive.tar.gz", 0) == null);
+    const combined = "nixpkgs=http://127.0.0.1:8080/archive.tar.gz:local=/src";
+    const separator = searchPathSeparator(combined, 0).?;
+    try std.testing.expectEqualStrings("nixpkgs=http://127.0.0.1:8080/archive.tar.gz", combined[0..separator]);
 }

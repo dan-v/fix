@@ -3,14 +3,17 @@
 //!
 //! Maps an indirect flakeref id (`nixpkgs`, `nixpkgs/nixos-24.05`) to a concrete
 //! ref via `registry.json`. Precedence: user (`$XDG_CONFIG_HOME/nix`), system
-//! (`/etc/nix`), then the pinned global registry (`$XDG_CACHE_HOME/nix/
-//! flake-registry.json`). Missing/unparseable registries are skipped.
+//! (`/etc/nix`), then the configured global registry refreshed through the
+//! shared fetch cache, with `$XDG_CACHE_HOME/nix/flake-registry.json` as a
+//! legacy fallback. Missing/unparseable local registries are skipped.
 //!
 //! Uses the VM's own primitives (`self.files`, `self.import_host.get_env`) so it
 //! works wherever a flake builtin runs, independent of the CLI.
 
 const std = @import("std");
 const VM = @import("../context.zig").VM;
+const FetchCache = @import("../../host.zig").fetch_cache.FetchCache;
+const fetch = @import("fetch.zig");
 
 /// Resolve indirect `ref` (`id` or `id/refOrRev`) to a concrete flakeref string
 /// owned by `self.allocator`, or null when it isn't a known indirect id.
@@ -48,6 +51,13 @@ fn lookupId(self: *VM, id: []const u8) !?[]u8 {
         if (try lookupIn(self, path, id)) |r| return r;
     }
     if (try lookupIn(self, "/etc/nix/registry.json", id)) |r| return r;
+    if (self.fetchers.globalRegistrySpec()) |spec| {
+        const result = try fetch.offloadFetch(self, FetchCache.fetchUrl, spec, null);
+        defer result.deinit(self.fetchers.allocator);
+        if (try lookupIn(self, result.path, id)) |r| return r;
+    } else if (self.fetchers.globalRegistryPath()) |path| {
+        if (try lookupIn(self, path, id)) |r| return r;
+    }
     if (try xdgPath(self, "XDG_CACHE_HOME", ".cache", "nix/flake-registry.json")) |path| {
         defer self.allocator.free(path);
         if (try lookupIn(self, path, id)) |r| return r;

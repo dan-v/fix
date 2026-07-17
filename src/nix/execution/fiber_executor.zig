@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const future_mod = @import("runtime").future;
-const sync = @import("base").sync;
 const fiber_mod = @import("base").fiber;
 const worker_mod = @import("worker.zig");
 const port = @import("port.zig");
@@ -25,15 +24,27 @@ pub fn parkFuture(future: *future_mod.Future) bool {
     return true;
 }
 
-pub fn runBlocking(sem: ?*sync.Semaphore, work: port.BlockingFn, work_ctx: *anyopaque) void {
+const BlockingPool = @import("blocking_pool.zig").BlockingPool;
+
+pub fn runBlocking(pool: ?*BlockingPool, work: port.BlockingFn, work_ctx: *anyopaque) void {
     const inner = fiber_mod.currentFiber() orelse {
-        work(work_ctx);
+        if (pool) |bounded| bounded.submitBlocking(work, work_ctx) else work(work_ctx);
         return;
     };
     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
     wf.io_future = future_mod.Future.initClaimed(future_mod.makeClaimer(wf.fiber_id));
 
-    var cell: BlockingCell = .{ .work = work, .work_ctx = work_ctx, .future = &wf.io_future, .sem = sem };
+    var cell: BlockingCell = .{ .work = work, .work_ctx = work_ctx, .future = &wf.io_future };
+    if (pool) |bounded| {
+        var job: BlockingPool.Job = .{ .run = BlockingCell.run, .context = &cell };
+        bounded.submit(&job);
+        if (wf.io_future.enrollWaiter(&wf.waiter)) {
+            wf.state = .suspended;
+            fiber_mod.Fiber.yield();
+            wf.state = .running;
+        }
+        return;
+    }
     var thread = std.Thread.spawn(.{}, BlockingCell.run, .{&cell}) catch {
         work(work_ctx);
         return;
@@ -51,13 +62,10 @@ const BlockingCell = struct {
     work: port.BlockingFn,
     work_ctx: *anyopaque,
     future: *future_mod.Future,
-    sem: ?*sync.Semaphore,
 
     fn run(p: *anyopaque) void {
         const self: *BlockingCell = @ptrCast(@alignCast(p));
-        if (self.sem) |s| s.acquire();
         self.work(self.work_ctx);
-        if (self.sem) |s| s.release();
         self.future.publish();
     }
 };

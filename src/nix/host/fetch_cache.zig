@@ -9,16 +9,18 @@ const nix_hash = @import("runtime").hash;
 const nar = @import("nar.zig");
 const FileCache = @import("file_cache.zig").FileCache;
 const sync = @import("base").sync;
+const curl_transport = @import("curl_transport.zig");
+const git_transport = @import("git_transport.zig");
+const BlockingPool = @import("../execution/blocking_pool.zig").BlockingPool;
 
 /// Download-staging cache under `$XDG_CACHE_HOME/fix` (default `~/.cache/fix`,
 /// mirroring Nix's `~/.cache/nix`; falls back to `./.zig-cache/fix` when the
 /// environment is unset). This is only a place to land downloads before they
 /// are hashed/added to the real store — never a substitute for `/nix/store`.
 ///
-/// Trap: this does NOT memoize within a process run. There is no in-memory
-/// cache; the on-disk cache merely skips re-writing/re-extracting
-/// already-present paths. Each `fetchUrl`/`fetchTarball` call still
-/// re-downloads and re-hashes the bytes on every invocation.
+/// Mutable remote sources are reused for `tarball-ttl` seconds. URL metadata is
+/// only trusted after the content-addressed file is re-hashed; publication is
+/// atomic, so interrupted writers never become cache hits.
 pub const FetchCache = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,
@@ -26,31 +28,40 @@ pub const FetchCache = struct {
     /// `~/.cache/fix`), mirroring Nix's `~/.cache/nix`. When unset (e.g. tests
     /// that never call `setEnvironment`) it falls back to `./.zig-cache/fix`.
     cache_root: ?[]u8 = null,
-    /// Max concurrent fetches (`http-connections`; 0 = unlimited). The offload
-    /// path (`FiberExecutor.runBlocking`) acquires `conn_sem` when this is > 0.
+    /// Max concurrent fetches (`http-connections`; 0 = unlimited). A nonzero
+    /// value owns exactly this many long-lived blocking workers; unlimited
+    /// mode intentionally creates work on demand.
     max_connections: u32 = 0,
-    conn_sem: sync.Semaphore = sync.Semaphore.init(0),
+    fetch_pool: ?*BlockingPool = null,
+    fetch_pool_mu: sync.BlockingMutex = .{},
     /// `download-attempts` (nix default 5): how many times to try a download
     /// before giving up, retrying only transient failures (connection errors,
-    /// 5xx). See `fetchUrlBytes`.
+    /// timeouts, and 5xx responses).
     download_attempts: u32 = 5,
-    /// `access-tokens` from `nix.conf`: `<host>[/<path>] -> <token>`, used to
-    /// add an `Authorization: Bearer` header on downloads to a matching host
-    /// (private GitHub/GitLab/… archives). Owned; see `setAccessTokens`.
+    /// Freshness window shared by URL, Git, and Mercurial sources.
+    tarball_ttl: u32 = 3600,
+    connect_timeout_seconds: u32 = 15,
+    stalled_timeout_seconds: u32 = 300,
+    download_speed_kib: u64 = 0,
+    ssl_cert_file: ?[]u8 = null,
+    flake_registry_url: ?[]u8 = null,
+    /// Same-process single-flight for mutable source refreshes. Stripes keep
+    /// the structure fixed-size while ensuring identical URLs cannot race.
+    fetch_locks: [64]sync.BlockingMutex = @splat(.{}),
+    /// `access-tokens` from `nix.conf`: `<host>[/<path>] -> <token>`, converted
+    /// to the matching forge's HTTP header or Git credential convention.
     access_tokens: std.ArrayListUnmanaged(TokenEntry) = .empty,
     /// Parsed `netrc-file` entries: HTTP basic-auth credentials applied to a
     /// plain (non-forge) download whose host matches, as Nix does via curl.
     /// Owned; see `setNetrc`.
     netrc: std.ArrayListUnmanaged(NetrcEntry) = .empty,
-    /// The process environment (borrowed), inherited by git/tar/hg subprocesses.
+    /// The process environment (borrowed), inherited by tar and Mercurial
+    /// subprocesses and consulted by the in-process transports.
     env: ?*const std.process.Environ.Map = null,
     /// Lazily-built subprocess environment = `env` plus:
-    ///   - `GIT_TERMINAL_PROMPT=0` — a git CLI fetch of a private remote fails
-    ///     fast instead of blocking on an interactive credential prompt. Nix
-    ///     gets this for free via libgit2; we shell out to git, so we set it.
     ///   - `HGPLAIN=` — consistent `hg` output, ignoring a user/system `.hgrc`,
     ///     exactly as Nix's mercurial fetcher (`hgOptions`).
-    /// Both are harmless to the unrelated subprocesses (git/tar/hg share this).
+    /// Both are harmless to the unrelated subprocesses sharing this map.
     /// Built on first subprocess run (most evals never fetch); freed in deinit.
     subprocess_env: ?std.process.Environ.Map = null,
 
@@ -64,12 +75,7 @@ pub const FetchCache = struct {
     /// `authHeader`). Null on a spec = no token, ever.
     pub const Forge = enum { github, gitlab, sourcehut };
 
-    const command_stdout_limit = 4 * 1024 * 1024;
     const command_stderr_limit = 512 * 1024;
-    /// HTTP `User-Agent` for downloads — identifies fix (some hosts, e.g. the
-    /// GitHub API, require a non-empty one), mirroring Nix's `Nix/<v>` string.
-    const user_agent = "fix";
-
     pub const GitSpec = struct {
         url: []const u8,
         name: []const u8 = "source",
@@ -82,12 +88,24 @@ pub const FetchCache = struct {
         url: []const u8,
         name: []const u8,
         forge: ?Forge = null,
+        /// URL used only for access-token matching. Forge API endpoints often
+        /// have a different path (or, for github.com, a different host) from
+        /// the repository URL users configure tokens for.
+        auth_url: ?[]const u8 = null,
     };
 
     pub const TarballSpec = struct {
         url: []const u8,
         name: []const u8 = "source",
         forge: ?Forge = null,
+        metadata_url: ?[]const u8 = null,
+        metadata_ref: ?[]const u8 = null,
+        metadata_head_url: ?[]const u8 = null,
+        resolved_rev: ?[]const u8 = null,
+        /// Forge archive URL containing one or more literal `{rev}` markers.
+        /// When metadata resolves a symbolic ref, download this exact commit
+        /// rather than racing the mutable ref between API and archive calls.
+        resolved_url_template: ?[]const u8 = null,
         /// Serialize and hash the unpacked tree while still on the bounded
         /// fetch worker. Direct hashed fetchTarball requests this payload;
         /// unhashed and fetchTree callers retain the original extraction-only
@@ -131,10 +149,23 @@ pub const FetchCache = struct {
     pub const TarballResult = struct {
         path: []u8,
         nar_payload: ?TarballNar,
+        forge_metadata: ?ForgeMetadata,
 
         pub fn deinit(self: TarballResult, allocator: std.mem.Allocator) void {
             allocator.free(self.path);
             if (self.nar_payload) |payload| allocator.free(payload.bytes);
+            if (self.forge_metadata) |metadata| metadata.deinit(allocator);
+        }
+    };
+
+    pub const ForgeMetadata = struct {
+        rev: []u8,
+        last_modified: i64,
+        last_modified_date: []u8,
+
+        fn deinit(self: ForgeMetadata, allocator: std.mem.Allocator) void {
+            allocator.free(self.rev);
+            allocator.free(self.last_modified_date);
         }
     };
 
@@ -175,7 +206,13 @@ pub const FetchCache = struct {
     }
 
     pub fn deinit(self: *FetchCache) void {
+        if (self.fetch_pool) |pool| {
+            pool.deinit();
+            self.allocator.destroy(pool);
+        }
         if (self.cache_root) |root| self.allocator.free(root);
+        if (self.ssl_cert_file) |path| self.allocator.free(path);
+        if (self.flake_registry_url) |url| self.allocator.free(url);
         for (self.access_tokens.items) |t| {
             self.allocator.free(t.host);
             self.allocator.free(t.token);
@@ -276,17 +313,21 @@ pub const FetchCache = struct {
         self.io = io;
     }
 
-    /// Set the process environment inherited by git/tar/hg subprocesses.
+    /// Set the process environment inherited by tar/hg subprocesses and used
+    /// to derive proxy/TLS settings for libcurl and libgit2.
     pub fn setEnvironment(self: *FetchCache, env: *const std.process.Environ.Map) void {
         self.env = env;
         if (self.subprocess_env) |*e| { // rebuild lazily on next use
             e.deinit();
             self.subprocess_env = null;
         }
+        // Nix's environment precedence for evaluator-owned HTTPS downloads.
+        const ca = env.get("NIX_SSL_CERT_FILE") orelse env.get("SSL_CERT_FILE");
+        if (ca) |path| if (path.len != 0) self.setSslCertFile(path) catch {};
     }
 
-    /// The environment for a git/tar/hg subprocess: the inherited process env
-    /// plus `GIT_TERMINAL_PROMPT=0` and `HGPLAIN=`. Built once and cached. Null
+    /// The environment for a tar/hg subprocess: the inherited process env
+    /// plus `HGPLAIN=`. Built once and cached. Null
     /// (inherit the parent env unchanged) when no environment was set (tests).
     fn subprocessEnviron(self: *FetchCache) !?*const std.process.Environ.Map {
         if (self.subprocess_env) |*e| return e;
@@ -294,8 +335,8 @@ pub const FetchCache = struct {
         var env = std.process.Environ.Map.init(self.allocator);
         errdefer env.deinit();
         for (parent.keys(), parent.values()) |k, v| try env.put(k, v);
-        try env.put("GIT_TERMINAL_PROMPT", "0");
         try env.put("HGPLAIN", "");
+        if (self.ssl_cert_file) |path| try env.put("SSL_CERT_FILE", path);
         self.subprocess_env = env;
         return &self.subprocess_env.?;
     }
@@ -375,7 +416,14 @@ pub const FetchCache = struct {
     ///     header `<type>: <value>` (a bare, colon-less token yields the Nix
     ///     degenerate `<token>:` empty-value header). Null if no token matches.
     fn authHeader(self: *const FetchCache, forge: Forge, url: []const u8) !?AuthHeader {
-        const token = self.tokenFor(url) orelse return null;
+        var github_lookup: ?[]u8 = null;
+        defer if (github_lookup) |value| self.allocator.free(value);
+        const direct = self.tokenFor(url);
+        const token = direct orelse token: {
+            if (forge != .github or !std.mem.eql(u8, urlHostPath(url).host, "codeload.github.com")) return null;
+            github_lookup = try std.fmt.allocPrint(self.allocator, "https://github.com{s}", .{urlHostPath(url).path});
+            break :token self.tokenFor(github_lookup.?) orelse return null;
+        };
         const alloc = self.allocator;
         return switch (forge) {
             .github => .{
@@ -404,9 +452,18 @@ pub const FetchCache = struct {
     }
 
     /// Set the concurrent-fetch cap (`http-connections`; 0 = unlimited).
-    pub fn setMaxConnections(self: *FetchCache, n: u32) void {
+    pub fn setMaxConnections(self: *FetchCache, n: u32) !void {
+        if (self.fetch_pool) |pool| {
+            pool.deinit();
+            self.allocator.destroy(pool);
+            self.fetch_pool = null;
+        }
         self.max_connections = n;
-        self.conn_sem = sync.Semaphore.init(n);
+        if (n == 0) return;
+        const pool = try self.allocator.create(BlockingPool);
+        errdefer self.allocator.destroy(pool);
+        pool.* = BlockingPool.init(self.allocator, n);
+        self.fetch_pool = pool;
     }
 
     /// Set `download-attempts` (total tries per download; clamped to >= 1).
@@ -414,9 +471,56 @@ pub const FetchCache = struct {
         self.download_attempts = @max(1, n);
     }
 
-    /// The permit semaphore to gate a fetch on, or null when unlimited.
-    pub fn connSem(self: *FetchCache) ?*sync.Semaphore {
-        return if (self.max_connections > 0) &self.conn_sem else null;
+    pub fn setTarballTtl(self: *FetchCache, seconds: u32) void {
+        self.tarball_ttl = seconds;
+    }
+
+    pub fn setConnectTimeout(self: *FetchCache, seconds: u32) void {
+        self.connect_timeout_seconds = seconds;
+    }
+
+    pub fn setStalledDownloadTimeout(self: *FetchCache, seconds: u32) void {
+        self.stalled_timeout_seconds = seconds;
+    }
+
+    pub fn setDownloadSpeed(self: *FetchCache, kib_per_second: u64) void {
+        self.download_speed_kib = kib_per_second;
+    }
+
+    pub fn setSslCertFile(self: *FetchCache, path: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, path);
+        if (self.ssl_cert_file) |old| self.allocator.free(old);
+        self.ssl_cert_file = owned;
+        if (self.subprocess_env) |*environment| {
+            environment.deinit();
+            self.subprocess_env = null;
+        }
+    }
+
+    pub fn setFlakeRegistryUrl(self: *FetchCache, url: ?[]const u8) !void {
+        const owned = if (url) |value| try self.allocator.dupe(u8, value) else null;
+        if (self.flake_registry_url) |old| self.allocator.free(old);
+        self.flake_registry_url = owned;
+    }
+
+    pub fn globalRegistrySpec(self: *const FetchCache) ?UrlSpec {
+        const url = self.flake_registry_url orelse return null;
+        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) return null;
+        return .{ .url = url, .name = "flake-registry.json" };
+    }
+
+    pub fn globalRegistryPath(self: *const FetchCache) ?[]const u8 {
+        const path = self.flake_registry_url orelse return null;
+        if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return null;
+        return if (std.mem.startsWith(u8, path, "file://")) path["file://".len..] else path;
+    }
+
+    pub fn blockingPool(self: *FetchCache) ?*BlockingPool {
+        const pool = self.fetch_pool orelse return null;
+        self.fetch_pool_mu.lock();
+        defer self.fetch_pool_mu.unlock();
+        if (!pool.started) pool.start() catch return null;
+        return pool;
     }
 
     /// Set the download-cache root (duped/owned). See `cache_root`.
@@ -435,41 +539,73 @@ pub const FetchCache = struct {
         return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix" });
     }
 
-    pub fn fetchGit(self: *FetchCache, files: *FileCache, spec: GitSpec, _: ?Reporter) !GitResult {
+    pub fn fetchGit(self: *FetchCache, files: *FileCache, spec: GitSpec, reporter: ?Reporter) !GitResult {
         if (localFetchPath(spec.url)) |path| {
             return self.localGit(files, path, spec);
         }
-        return self.remoteGit(files, spec);
+        return self.remoteGit(files, spec, reporter);
     }
 
     pub fn fetchUrl(self: *FetchCache, files: *FileCache, spec: UrlSpec, reporter: ?Reporter) !UrlResult {
         const io = self.io orelse return error.FetchIoUnavailable;
-        const body = try self.fetchUrlBytes(files, spec.url, spec.forge, reporter);
-        defer self.allocator.free(body);
-
-        const hash = try nix_hash.hashBytes(self.allocator, "sha256", body);
-        errdefer self.allocator.free(hash);
-        const path = try self.urlCachePath(io, spec.name, hash);
-        errdefer self.allocator.free(path);
-
-        if (!try hostPathExists(io, path)) {
-            if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
-            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+        if (localFetchPath(spec.url)) |local_path| {
+            const body = try files.readFile(local_path);
+            const hash = try nix_hash.hashBytes(self.allocator, "sha256", body);
+            errdefer self.allocator.free(hash);
+            const path = try self.urlCachePath(io, spec.name, hash);
+            errdefer self.allocator.free(path);
+            try self.publishBytes(io, path, body);
+            return .{ .path = path, .hash = hash };
         }
-
-        return .{ .path = path, .hash = hash };
+        return self.fetchRemoteUrl(io, spec, reporter);
     }
 
     pub fn fetchTarball(self: *FetchCache, files: *FileCache, spec: TarballSpec, reporter: ?Reporter) !TarballResult {
         const io = self.io orelse return error.FetchIoUnavailable;
-        const archive = try self.fetchUrl(files, .{ .url = spec.url, .name = spec.name, .forge = spec.forge }, reporter);
+        var forge_metadata = if (spec.resolved_rev) |rev|
+            try self.forgeMetadataForRev(rev, 0)
+        else if (spec.metadata_url) |url| metadata: {
+            const forge = spec.forge orelse break :metadata null;
+            const response = try self.fetchUrl(files, .{
+                .url = url,
+                .name = "forge-commit.json",
+                .forge = forge,
+                .auth_url = spec.url,
+            }, reporter);
+            defer response.deinit(self.allocator);
+            break :metadata if (forge == .sourcehut)
+                try self.parseSourcehutMetadata(files, response.path, spec.metadata_ref orelse "HEAD", spec.metadata_head_url, spec.url, reporter)
+            else
+                try self.parseForgeMetadata(files, forge, response.path);
+        } else null;
+        errdefer if (forge_metadata) |metadata| metadata.deinit(self.allocator);
+        const resolved_url = if (forge_metadata) |metadata|
+            if (spec.resolved_url_template) |template| try expandRevisionTemplate(self.allocator, template, metadata.rev) else null
+        else
+            null;
+        defer if (resolved_url) |url| self.allocator.free(url);
+        const archive = try self.fetchUrl(files, .{
+            .url = resolved_url orelse spec.url,
+            .name = spec.name,
+            .forge = spec.forge,
+            .auth_url = spec.url,
+        }, reporter);
         defer archive.deinit(self.allocator);
 
         const out_path = try self.tarballCachePath(io, spec.name, archive.hash);
         errdefer self.allocator.free(out_path);
-        if (!try hostPathExists(io, out_path)) {
-            try std.Io.Dir.cwd().createDirPath(io, out_path);
-            try self.runCommandDiscard(&.{ "tar", "-xf", archive.path, "-C", out_path, "--strip-components=1" });
+        {
+            const extraction_lock = &self.fetch_locks[@as(usize, @intCast(std.hash.Wyhash.hash(0, out_path) % self.fetch_locks.len))];
+            extraction_lock.lock();
+            defer extraction_lock.unlock();
+            try self.ensureTarballExtracted(io, archive.path, out_path);
+        }
+
+        if (forge_metadata) |*metadata| {
+            const last_modified = try self.maxTreeMtime(io, out_path);
+            self.allocator.free(metadata.last_modified_date);
+            metadata.last_modified = last_modified;
+            metadata.last_modified_date = try formatTimestamp(self.allocator, last_modified);
         }
 
         const nar_payload: ?TarballNar = if (spec.serialize_nar) payload: {
@@ -479,7 +615,124 @@ pub const FetchCache = struct {
             std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
             break :payload .{ .bytes = bytes, .digest = digest };
         } else null;
-        return .{ .path = out_path, .nar_payload = nar_payload };
+        return .{ .path = out_path, .nar_payload = nar_payload, .forge_metadata = forge_metadata };
+    }
+
+    fn parseForgeMetadata(self: *FetchCache, files: *FileCache, forge: Forge, path: []const u8) !?ForgeMetadata {
+        if (forge == .sourcehut) unreachable;
+        const data = try files.readFile(path);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, data, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const rev_value = switch (forge) {
+            .github => parsed.value.object.get("sha") orelse return null,
+            .gitlab => parsed.value.object.get("id") orelse return null,
+            .sourcehut => unreachable,
+        };
+        if (rev_value != .string) return null;
+        if (!validSha1(rev_value.string)) return null;
+        return try self.forgeMetadataForRev(rev_value.string, 0);
+    }
+
+    fn parseSourcehutMetadata(
+        self: *FetchCache,
+        files: *FileCache,
+        refs_path: []const u8,
+        requested_ref: []const u8,
+        head_url: ?[]const u8,
+        auth_url: []const u8,
+        reporter: ?Reporter,
+    ) !?ForgeMetadata {
+        var owned_target: ?[]u8 = null;
+        defer if (owned_target) |target| self.allocator.free(target);
+        const target = if (std.mem.eql(u8, requested_ref, "HEAD")) target: {
+            const url = head_url orelse return null;
+            const response = try self.fetchUrl(files, .{
+                .url = url,
+                .name = "sourcehut-HEAD",
+                .forge = .sourcehut,
+                .auth_url = auth_url,
+            }, reporter);
+            defer response.deinit(self.allocator);
+            const head = std.mem.trim(u8, try files.readFile(response.path), " \t\r\n");
+            if (std.mem.startsWith(u8, head, "ref:")) {
+                owned_target = try self.allocator.dupe(u8, std.mem.trim(u8, head[4..], " \t\r\n"));
+                break :target owned_target.?;
+            }
+            if (validSha1(head)) return try self.forgeMetadataForRev(head, 0);
+            return null;
+        } else target: {
+            owned_target = if (std.mem.startsWith(u8, requested_ref, "refs/"))
+                try self.allocator.dupe(u8, requested_ref)
+            else
+                try std.fmt.allocPrint(self.allocator, "refs/heads/{s}", .{requested_ref});
+            break :target owned_target.?;
+        };
+
+        const refs = try files.readFile(refs_path);
+        var lines = std.mem.splitScalar(u8, refs, '\n');
+        while (lines.next()) |line| {
+            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+            const rev = std.mem.trim(u8, line[0..tab], " \t\r");
+            const ref_name = std.mem.trim(u8, line[tab + 1 ..], " \t\r");
+            if (std.mem.eql(u8, ref_name, target) and validSha1(rev)) return try self.forgeMetadataForRev(rev, 0);
+            if (!std.mem.startsWith(u8, requested_ref, "refs/") and std.mem.eql(u8, ref_name, requested_ref) and validSha1(rev))
+                return try self.forgeMetadataForRev(rev, 0);
+        }
+        // Nix accepts either a branch or a tag for a short ref.
+        if (!std.mem.startsWith(u8, requested_ref, "refs/") and !std.mem.eql(u8, requested_ref, "HEAD")) {
+            const tag = try std.fmt.allocPrint(self.allocator, "refs/tags/{s}", .{requested_ref});
+            defer self.allocator.free(tag);
+            lines = std.mem.splitScalar(u8, refs, '\n');
+            while (lines.next()) |line| {
+                const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+                const rev = std.mem.trim(u8, line[0..tab], " \t\r");
+                const ref_name = std.mem.trim(u8, line[tab + 1 ..], " \t\r");
+                if (std.mem.eql(u8, ref_name, tag) and validSha1(rev)) return try self.forgeMetadataForRev(rev, 0);
+            }
+        }
+        return null;
+    }
+
+    fn forgeMetadataForRev(self: *FetchCache, rev_text: []const u8, timestamp: i64) !ForgeMetadata {
+        const rev = try self.allocator.dupe(u8, rev_text);
+        errdefer self.allocator.free(rev);
+        return .{
+            .rev = rev,
+            .last_modified = timestamp,
+            .last_modified_date = try formatTimestamp(self.allocator, timestamp),
+        };
+    }
+
+    fn maxTreeMtime(self: *FetchCache, io: std.Io, path: []const u8) !i64 {
+        var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+        defer dir.close(io);
+        var walker = try dir.walk(self.allocator);
+        defer walker.deinit();
+        var latest: i64 = 0;
+        while (try walker.next(io)) |entry| {
+            const stat = try entry.dir.statFile(io, entry.basename, .{ .follow_symlinks = false });
+            latest = @max(latest, stat.mtime.toSeconds());
+        }
+        return latest;
+    }
+
+    fn ensureTarballExtracted(self: *FetchCache, io: std.Io, archive_path: []const u8, out_path: []const u8) !void {
+        const marker = try std.fmt.allocPrint(self.allocator, "{s}.complete", .{out_path});
+        defer self.allocator.free(marker);
+        if (try hostPathExists(io, marker) and try hostPathExists(io, out_path)) return;
+
+        if (try hostPathExists(io, out_path)) try std.Io.Dir.cwd().deleteTree(io, out_path);
+        std.Io.Dir.deleteFileAbsolute(io, marker) catch {};
+        const parent = std.fs.path.dirname(out_path) orelse return error.FetchCacheWriteFailed;
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+        const staging = try self.uniqueStagingPath(parent, ".extract");
+        defer self.allocator.free(staging);
+        errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, staging);
+        try self.runCommandDiscard(&.{ "tar", "-xf", archive_path, "-C", staging, "--strip-components=1" });
+        try self.publishStagedDir(io, staging, out_path);
+        try self.publishBytes(io, marker, "1\n");
     }
 
     pub fn fetchMercurial(self: *FetchCache, files: *FileCache, spec: MercurialSpec, _: ?Reporter) !MercurialResult {
@@ -499,184 +752,326 @@ pub const FetchCache = struct {
             error.FetchClientError,
             error.FetchInvalidUrl,
             error.FetchTooManyRedirects,
+            error.FetchTlsVerificationFailed,
+            error.FetchGitRevisionNotFound,
             => false,
             else => true,
         };
     }
 
-    /// Resolve a redirect `Location` against the current absolute URL `base`,
-    /// returning a new owned absolute URL. Handles an absolute Location (the
-    /// common case), a scheme-relative `//host/…`, an absolute path `/…`, and a
-    /// relative path (against `base`'s directory).
-    fn resolveRedirect(self: *FetchCache, base: []const u8, loc: []const u8) ![]u8 {
-        const alloc = self.allocator;
-        if (std.mem.startsWith(u8, loc, "http://") or std.mem.startsWith(u8, loc, "https://"))
-            return alloc.dupe(u8, loc);
-        const scheme_end = std.mem.indexOf(u8, base, "://") orelse return error.FetchInvalidUrl;
-        if (std.mem.startsWith(u8, loc, "//")) // scheme-relative: keep base's scheme
-            return std.fmt.allocPrint(alloc, "{s}:{s}", .{ base[0..scheme_end], loc });
-        const authority_start = scheme_end + 3;
-        const path_start = std.mem.indexOfScalarPos(u8, base, authority_start, '/') orelse base.len;
-        const origin = base[0..path_start]; // scheme://authority
-        if (std.mem.startsWith(u8, loc, "/")) // absolute path on the same origin
-            return std.fmt.allocPrint(alloc, "{s}{s}", .{ origin, loc });
-        // Relative path: replace the last path segment of `base`.
-        const last_slash = std.mem.lastIndexOfScalar(u8, base, '/') orelse return error.FetchInvalidUrl;
-        const dir = if (last_slash >= path_start) base[0 .. last_slash + 1] else origin;
-        return std.fmt.allocPrint(alloc, "{s}{s}", .{ dir, loc });
-    }
+    fn fetchRemoteUrl(self: *FetchCache, io: std.Io, spec: UrlSpec, reporter: ?Reporter) !UrlResult {
+        const lock = &self.fetch_locks[@as(usize, @intCast(std.hash.Wyhash.hash(0, spec.url) % self.fetch_locks.len))];
+        lock.lock();
+        defer lock.unlock();
 
-    fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8, forge: ?Forge, reporter: ?Reporter) ![]u8 {
-        if (localFetchPath(url)) |path| return self.allocator.dupe(u8, try files.readFile(path));
+        const root = try self.cacheRootDir(io);
+        defer self.allocator.free(root);
+        const metadata_path = try self.urlMetadataPath(root, spec.url);
+        defer self.allocator.free(metadata_path);
+        if (try self.readFreshUrlCache(io, metadata_path, spec.name)) |cached| return cached;
 
-        const io = self.io orelse return error.FetchIoUnavailable;
-        const uri = std.Uri.parse(url) catch return error.FetchInvalidUrl;
+        const staging_dir = try std.fs.path.join(self.allocator, &.{ root, "tmp" });
+        defer self.allocator.free(staging_dir);
+        try std.Io.Dir.cwd().createDirPath(io, staging_dir);
+        const staging_path = try self.uniqueStagingPath(staging_dir, "download");
+        defer self.allocator.free(staging_path);
+        errdefer std.Io.Dir.deleteFileAbsolute(io, staging_path) catch {};
 
-        // Retry transient failures up to `download-attempts` times (nix default
-        // 5), with a short linear backoff. A permanent failure (4xx, bad URL)
-        // returns immediately.
+        const auth = if (spec.forge) |forge|
+            try self.authHeader(forge, spec.auth_url orelse spec.url)
+        else
+            try self.netrcHeader(spec.url);
+        defer if (auth) |header| header.deinit(self.allocator);
+        var header_storage: [1]curl_transport.Header = undefined;
+        const headers: []const curl_transport.Header = if (auth) |header| blk: {
+            header_storage[0] = .{ .name = header.name, .value = header.value };
+            break :blk header_storage[0..1];
+        } else &.{};
+        const curl_reporter: ?curl_transport.Reporter = if (reporter) |r|
+            .{ .ctx = r.ctx, .report = r.report }
+        else
+            null;
+
         var attempt: u32 = 1;
-        while (true) : (attempt += 1) {
-            return self.fetchUrlAttempt(io, uri, url, forge, reporter) catch |err| {
+        const downloaded = while (true) : (attempt += 1) {
+            break curl_transport.download(self.allocator, spec.url, staging_path, .{
+                .headers = headers,
+                .reporter = curl_reporter,
+                .connect_timeout_seconds = self.connect_timeout_seconds,
+                .stalled_timeout_seconds = self.stalled_timeout_seconds,
+                .max_bytes_per_second = std.math.mul(u64, self.download_speed_kib, 1024) catch std.math.maxInt(u64),
+                .ca_file = self.ssl_cert_file,
+            }) catch |err| {
+                std.Io.Dir.deleteFileAbsolute(io, staging_path) catch {};
                 if (attempt >= self.download_attempts or !retryable(err)) return err;
                 io.sleep(std.Io.Duration.fromMilliseconds(@min(5_000, 250 * @as(i64, attempt))), .awake) catch {};
                 continue;
             };
-        }
+        };
+
+        const hash_array = std.fmt.bytesToHex(downloaded.digest, .lower);
+        const hash = try self.allocator.dupe(u8, &hash_array);
+        errdefer self.allocator.free(hash);
+        const path = try self.urlCachePath(io, spec.name, hash);
+        errdefer self.allocator.free(path);
+        try self.publishStagedFile(io, staging_path, path);
+        try self.writeUrlMetadata(io, metadata_path, hash);
+        return .{ .path = path, .hash = hash };
     }
 
-    fn fetchUrlAttempt(self: *FetchCache, io: std.Io, initial_uri: std.Uri, initial_url: []const u8, forge: ?Forge, reporter: ?Reporter) ![]u8 {
-        var client = std.http.Client{ .allocator = self.allocator, .io = io };
-        defer client.deinit();
+    fn urlMetadataPath(self: *FetchCache, root: []const u8, url: []const u8) ![]u8 {
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(url, &digest, .{});
+        const encoded = std.fmt.bytesToHex(digest, .lower);
+        return std.fs.path.join(self.allocator, &.{ root, "url-index", &encoded });
+    }
 
-        // A forge fetch's token is sticky across redirects (computed once): it
-        // must reach codeload.github.com after the github.com archive redirect,
-        // and the forge is trusted. A plain download's `netrc` credentials are
-        // re-evaluated for the *current* host on every hop, so they are never
-        // sent to a different host after a redirect. We follow redirects
-        // ourselves (`.unhandled`) because std.http can't strip auth for us
-        // (it never emits `privileged_headers`).
-        const forge_auth: ?AuthHeader = if (forge) |f| try self.authHeader(f, initial_url) else null;
-        defer if (forge_auth) |a| a.deinit(self.allocator);
+    fn readFreshUrlCache(self: *FetchCache, io: std.Io, metadata_path: []const u8, name: []const u8) !?UrlResult {
+        if (self.tarball_ttl == 0) return null;
+        const metadata = std.Io.Dir.cwd().readFileAlloc(io, metadata_path, self.allocator, .limited(256)) catch return null;
+        defer self.allocator.free(metadata);
+        var lines = std.mem.splitScalar(u8, metadata, '\n');
+        const written_text = lines.next() orelse return null;
+        const hash = lines.next() orelse return null;
+        if (hash.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return null;
+        for (hash) |byte| if (!std.ascii.isHex(byte)) return null;
+        const written = std.fmt.parseInt(i64, written_text, 10) catch return null;
+        const now = std.Io.Clock.real.now(io).toSeconds();
+        if (now < written or now - written > self.tarball_ttl) return null;
 
-        var current_url: []const u8 = initial_url;
-        var current_uri = initial_uri;
-        var owned_url: ?[]u8 = null;
-        defer if (owned_url) |u| self.allocator.free(u);
-        var redirects_left: u32 = 10;
-
-        while (true) {
-            // Per-hop auth: the sticky forge token, else netrc for the host we
-            // are about to contact (so creds don't cross a redirect boundary).
-            const hop_netrc: ?AuthHeader = if (forge_auth == null) try self.netrcHeader(current_url) else null;
-            defer if (hop_netrc) |a| a.deinit(self.allocator);
-            var extra_headers: []const std.http.Header = &.{};
-            var auth_storage: [1]std.http.Header = undefined;
-            if (forge_auth orelse hop_netrc) |a| {
-                auth_storage[0] = .{ .name = a.name, .value = a.value };
-                extra_headers = auth_storage[0..1];
-            }
-
-            var req = try client.request(.GET, current_uri, .{
-                .redirect_behavior = .unhandled,
-                .headers = .{ .user_agent = .{ .override = user_agent } },
-                .extra_headers = extra_headers,
-            });
-            defer req.deinit();
-            try req.sendBodiless();
-
-            var redirect_buffer: [8 * 1024]u8 = undefined;
-            var response = try req.receiveHead(&redirect_buffer);
-            const class = response.head.status.class();
-            if (class == .redirect) {
-                if (redirects_left == 0) return error.FetchTooManyRedirects;
-                const loc = response.head.location orelse return error.FetchHttpStatus;
-                const next = try self.resolveRedirect(current_url, loc);
-                if (owned_url) |u| self.allocator.free(u);
-                owned_url = next;
-                current_url = next;
-                current_uri = std.Uri.parse(next) catch return error.FetchInvalidUrl;
-                redirects_left -= 1;
-                continue;
-            }
-            // 4xx is a permanent client error (bad URL, auth); anything else
-            // non-2xx (5xx, unexpected) is transient and gets retried.
-            if (class == .client_error) return error.FetchClientError;
-            if (class != .success) return error.FetchHttpStatus;
-
-            // Stream (rather than one-shot `fetch`) so we can read `content_length`
-            // up front and report bytes as they arrive to the fetch progress span.
-            // Content-Length is the compressed wire size; we count decompressed
-            // bytes, so it's only a valid progress total when the body is identity.
-            const total: u64 = if (response.head.content_encoding == .identity)
-                (response.head.content_length orelse 0)
-            else
-                0;
-
-            // Decompress like std.http's one-shot fetch does, else we'd hash/store
-            // the raw gzip/deflate/zstd bytes instead of the real content.
-            const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-                .identity => &.{},
-                .zstd => try self.allocator.alloc(u8, std.compress.zstd.default_window_len),
-                .deflate, .gzip => try self.allocator.alloc(u8, std.compress.flate.max_window_len),
-                .compress => return error.UnsupportedCompressionMethod,
-            };
-            defer if (decompress_buffer.len > 0) self.allocator.free(decompress_buffer);
-
-            var transfer_buffer: [64 * 1024]u8 = undefined;
-            var decompress: std.http.Decompress = undefined;
-            const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-
-            var body = std.Io.Writer.Allocating.init(self.allocator);
-            defer body.deinit();
-            var chunk: [64 * 1024]u8 = undefined;
-            var downloaded: u64 = 0;
-            Reporter.emit(reporter, 0, total);
-            while (true) {
-                const n = reader.readSliceShort(&chunk) catch return error.FetchHttpStatus;
-                if (n == 0) break;
-                try body.writer.writeAll(chunk[0..n]);
-                downloaded += n;
-                Reporter.emit(reporter, downloaded, total);
-            }
-            return body.toOwnedSlice();
+        const path = try self.urlCachePath(io, name, hash);
+        errdefer self.allocator.free(path);
+        const actual = curl_transport.fileDigest(self.allocator, path) catch {
+            self.allocator.free(path);
+            return null;
+        };
+        const actual_hex = std.fmt.bytesToHex(actual, .lower);
+        if (!std.mem.eql(u8, &actual_hex, hash)) {
+            self.allocator.free(path);
+            return null;
         }
+        return .{ .path = path, .hash = try self.allocator.dupe(u8, hash) };
+    }
+
+    fn writeUrlMetadata(self: *FetchCache, io: std.Io, path: []const u8, hash: []const u8) !void {
+        const now = std.Io.Clock.real.now(io).toSeconds();
+        const contents = try std.fmt.allocPrint(self.allocator, "{d}\n{s}\n", .{ now, hash });
+        defer self.allocator.free(contents);
+        try self.publishBytes(io, path, contents);
+    }
+
+    fn publishBytes(self: *FetchCache, io: std.Io, path: []const u8, bytes: []const u8) !void {
+        const parent = std.fs.path.dirname(path) orelse return error.FetchCacheWriteFailed;
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+        const staging = try self.uniqueStagingPath(parent, ".file");
+        defer self.allocator.free(staging);
+        errdefer std.Io.Dir.deleteFileAbsolute(io, staging) catch {};
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staging, .data = bytes });
+        try self.publishStagedFile(io, staging, path);
+    }
+
+    fn publishStagedFile(_: *FetchCache, io: std.Io, staging: []const u8, final: []const u8) !void {
+        const parent = std.fs.path.dirname(final) orelse return error.FetchCacheWriteFailed;
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+        try std.Io.Dir.renameAbsolute(staging, final, io);
+    }
+
+    fn publishStagedDir(_: *FetchCache, io: std.Io, staging: []const u8, final: []const u8) !void {
+        std.Io.Dir.renameAbsolute(staging, final, io) catch |err| {
+            // Another process may have won the same content-addressed commit.
+            // Its directory became visible through one atomic rename, so it is
+            // complete; discard our equally complete staging tree.
+            if (try hostPathExists(io, final)) {
+                try std.Io.Dir.cwd().deleteTree(io, staging);
+                return;
+            }
+            return err;
+        };
+    }
+
+    fn uniqueStagingPath(self: *FetchCache, dir: []const u8, stem: []const u8) ![]u8 {
+        var random: [12]u8 = undefined;
+        std.Io.random(self.io.?, &random);
+        const suffix = std.fmt.bytesToHex(random, .lower);
+        const name = try std.fmt.allocPrint(self.allocator, "{s}-{s}.tmp", .{ stem, &suffix });
+        defer self.allocator.free(name);
+        return std.fs.path.join(self.allocator, &.{ dir, name });
     }
 
     fn localGit(self: *FetchCache, files: *FileCache, path: []const u8, spec: GitSpec) !GitResult {
-        const rev = if (spec.rev) |r| try self.allocator.dupe(u8, r) else try self.localGitRevision(files, path) orelse try self.allocator.dupe(u8, "");
-        errdefer self.allocator.free(rev);
-        return self.gitResult(path, rev, spec.submodules, self.io != null);
+        const io = self.io orelse return error.FetchIoUnavailable;
+        const root = try self.cacheRootDir(io);
+        defer self.allocator.free(root);
+        const snapshots = try std.fs.path.join(self.allocator, &.{ root, "git-local" });
+        defer self.allocator.free(snapshots);
+        try std.Io.Dir.cwd().createDirPath(io, snapshots);
+        const staging = try self.uniqueStagingPath(snapshots, ".snapshot");
+        defer self.allocator.free(staging);
+        errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+        const metadata = try git_transport.snapshotLocal(self.allocator, io, path, staging, spec.rev, spec.submodules);
+        const serialized = try nar.serialize(self.allocator, files, staging, null);
+        defer self.allocator.free(serialized);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(serialized, &digest, .{});
+        const encoded = std.fmt.bytesToHex(digest, .lower);
+        const snapshot = try std.fs.path.join(self.allocator, &.{ snapshots, encoded[0..32], "source" });
+        defer self.allocator.free(snapshot);
+        const lock = &self.fetch_locks[@as(usize, @intCast(std.hash.Wyhash.hash(0, snapshot) % self.fetch_locks.len))];
+        lock.lock();
+        defer lock.unlock();
+        const marker = try std.fmt.allocPrint(self.allocator, "{s}.complete", .{snapshot});
+        defer self.allocator.free(marker);
+        if (try hostPathExists(io, marker) and try hostPathExists(io, snapshot)) {
+            try std.Io.Dir.cwd().deleteTree(io, staging);
+        } else {
+            const parent = std.fs.path.dirname(snapshot) orelse return error.FetchCacheWriteFailed;
+            try std.Io.Dir.cwd().createDirPath(io, parent);
+            try self.publishStagedDir(io, staging, snapshot);
+            try self.publishBytes(io, marker, "1\n");
+        }
+        return self.gitResultFromTransport(snapshot, metadata, spec.submodules);
     }
 
-    fn remoteGit(self: *FetchCache, files: *FileCache, spec: GitSpec) !GitResult {
+    fn remoteGit(self: *FetchCache, _: *FileCache, spec: GitSpec, reporter: ?Reporter) !GitResult {
         const io = self.io orelse return error.FetchIoUnavailable;
         const path = try self.remoteGitPath(io, spec);
         defer self.allocator.free(path);
-
         const git_dir = try std.fs.path.join(self.allocator, &.{ path, ".git" });
         defer self.allocator.free(git_dir);
-        if (!try files.pathExists(git_dir)) {
-            try std.Io.Dir.cwd().createDirPath(io, path);
-            if (spec.ref) |ref| {
-                try self.runCommandDiscard(&.{ "git", "clone", "--filter=blob:none", "--branch", ref, "--single-branch", spec.url, path });
-            } else {
-                try self.runCommandDiscard(&.{ "git", "clone", "--filter=blob:none", spec.url, path });
+        const lock = &self.fetch_locks[@as(usize, @intCast(std.hash.Wyhash.hash(0, path) % self.fetch_locks.len))];
+        lock.lock();
+        defer lock.unlock();
+
+        const parent = std.fs.path.dirname(path) orelse return error.FetchCacheWriteFailed;
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+        if (!try hostPathExists(io, git_dir) and try hostPathExists(io, path))
+            try std.Io.Dir.cwd().deleteTree(io, path);
+
+        const marker = try std.fmt.allocPrint(self.allocator, "{s}.fresh", .{path});
+        defer self.allocator.free(marker);
+        const exists = try hostPathExists(io, git_dir);
+        // A pinned commit is immutable once present. Mutable refs/HEAD obey the
+        // same tarball-ttl policy as URL and Mercurial sources.
+        var refresh = !exists or (spec.rev == null and !try self.timestampFresh(io, marker));
+        const credential = try self.gitCredential(spec.url);
+        defer if (credential) |value| value.deinit(self.allocator);
+        const git_reporter: ?git_transport.Reporter = if (reporter) |r| .{ .ctx = r.ctx, .report = r.report } else null;
+
+        const staging = if (!exists) try self.uniqueStagingPath(parent, ".git-clone") else null;
+        defer if (staging) |value| self.allocator.free(value);
+        errdefer if (staging) |value| std.Io.Dir.cwd().deleteTree(io, value) catch {};
+        const materialize_path = staging orelse path;
+        var attempt: u32 = 1;
+        var result = while (true) : (attempt += 1) {
+            break git_transport.materialize(self.allocator, spec.url, materialize_path, spec.rev, spec.ref, spec.submodules, refresh, .{
+                .credentials = if (credential) |value| .{ .username = value.username, .password = value.password } else null,
+                .reporter = git_reporter,
+                .ca_file = self.ssl_cert_file,
+                .proxy_url = self.proxyFor(spec.url),
+                .connect_timeout_seconds = self.connect_timeout_seconds,
+                .stalled_timeout_seconds = self.stalled_timeout_seconds,
+            }) catch |err| {
+                if (staging) |value| std.Io.Dir.cwd().deleteTree(io, value) catch {};
+                // A pinned object may not have been in an older shallow/cache
+                // population; retry once with a real fetch before failing.
+                if (!refresh and spec.rev != null) {
+                    refresh = true;
+                    continue;
+                }
+                if (attempt >= self.download_attempts or !retryable(err)) return err;
+                io.sleep(std.Io.Duration.fromMilliseconds(@min(5_000, 250 * @as(i64, attempt))), .awake) catch {};
+                continue;
+            };
+        };
+        if (staging) |value| {
+            try self.publishStagedDir(io, value, path);
+            // If another process won the atomic directory commit, report the
+            // revision actually present at the shared final path.
+            result = try git_transport.materialize(self.allocator, spec.url, path, spec.rev, spec.ref, spec.submodules, false, .{
+                .credentials = if (credential) |item| .{ .username = item.username, .password = item.password } else null,
+                .ca_file = self.ssl_cert_file,
+                .proxy_url = self.proxyFor(spec.url),
+                .connect_timeout_seconds = self.connect_timeout_seconds,
+                .stalled_timeout_seconds = self.stalled_timeout_seconds,
+            });
+        }
+        if (refresh) try self.writeTimestamp(io, marker);
+
+        return self.gitResultFromTransport(path, result, spec.submodules);
+    }
+
+    const GitCredential = struct {
+        username: []u8,
+        password: []u8,
+        fn deinit(self: GitCredential, allocator: std.mem.Allocator) void {
+            allocator.free(self.username);
+            allocator.free(self.password);
+        }
+    };
+
+    fn gitCredential(self: *const FetchCache, url: []const u8) !?GitCredential {
+        if (self.tokenFor(url)) |token_raw| {
+            const colon = std.mem.indexOfScalar(u8, token_raw, ':');
+            const host = urlHostPath(url).host;
+            const token = if (colon) |index| token: {
+                const kind = token_raw[0..index];
+                break :token if (std.mem.eql(u8, kind, "PAT") or std.mem.eql(u8, kind, "OAuth2")) token_raw[index + 1 ..] else token_raw;
+            } else token_raw;
+            return try self.ownedGitCredential(if (std.mem.indexOf(u8, host, "github") != null) "x-access-token" else "oauth2", token);
+        }
+        const host = urlHostPath(url).host;
+        var fallback: ?NetrcEntry = null;
+        for (self.netrc.items) |entry| {
+            if (entry.machine) |machine| {
+                if (std.mem.eql(u8, machine, host)) return if (entry.login.len == 0) null else try self.ownedGitCredential(entry.login, entry.password);
+            } else if (fallback == null) fallback = entry;
+        }
+        if (fallback) |entry| if (entry.login.len != 0) return try self.ownedGitCredential(entry.login, entry.password);
+        return null;
+    }
+
+    fn ownedGitCredential(self: *const FetchCache, username: []const u8, password: []const u8) !GitCredential {
+        const owned_username = try self.allocator.dupe(u8, username);
+        errdefer self.allocator.free(owned_username);
+        return .{
+            .username = owned_username,
+            .password = try self.allocator.dupe(u8, password),
+        };
+    }
+
+    fn timestampFresh(self: *FetchCache, io: std.Io, marker: []const u8) !bool {
+        if (self.tarball_ttl == 0) return false;
+        const contents = std.Io.Dir.cwd().readFileAlloc(io, marker, self.allocator, .limited(64)) catch return false;
+        defer self.allocator.free(contents);
+        const written = std.fmt.parseInt(i64, std.mem.trim(u8, contents, " \t\r\n"), 10) catch return false;
+        const now = std.Io.Clock.real.now(io).toSeconds();
+        return now >= written and now - written <= self.tarball_ttl;
+    }
+
+    fn writeTimestamp(self: *FetchCache, io: std.Io, marker: []const u8) !void {
+        const contents = try std.fmt.allocPrint(self.allocator, "{d}\n", .{std.Io.Clock.real.now(io).toSeconds()});
+        defer self.allocator.free(contents);
+        try self.publishBytes(io, marker, contents);
+    }
+
+    fn proxyFor(self: *const FetchCache, url: []const u8) ?[]const u8 {
+        const environment = self.env orelse return null;
+        const host = urlHostPath(url).host;
+        const no_proxy = environment.get("NO_PROXY") orelse environment.get("no_proxy");
+        if (no_proxy) |list| {
+            var entries = std.mem.tokenizeScalar(u8, list, ',');
+            while (entries.next()) |raw| {
+                var entry = std.mem.trim(u8, raw, " \t");
+                if (std.mem.eql(u8, entry, "*")) return null;
+                if (std.mem.indexOfScalar(u8, entry, ':')) |colon| entry = entry[0..colon];
+                if (std.mem.startsWith(u8, entry, ".")) entry = entry[1..];
+                if (entry.len != 0 and (std.mem.eql(u8, host, entry) or
+                    (host.len > entry.len and std.mem.endsWith(u8, host, entry) and host[host.len - entry.len - 1] == '.'))) return null;
             }
         }
-
-        if (spec.rev) |rev| {
-            try self.runCommandDiscard(&.{ "git", "-C", path, "checkout", "--detach", rev });
-        } else if (spec.ref) |ref| {
-            try self.runCommandDiscard(&.{ "git", "-C", path, "checkout", ref });
-        }
-        if (spec.submodules) {
-            try self.runCommandDiscard(&.{ "git", "-C", path, "submodule", "update", "--init", "--recursive" });
-        }
-
-        const rev = try self.gitOneLine(&.{ "git", "-C", path, "rev-parse", "HEAD" });
-        errdefer self.allocator.free(rev);
-        return self.gitResult(path, rev, spec.submodules, true);
+        if (std.mem.startsWith(u8, url, "https://"))
+            return environment.get("HTTPS_PROXY") orelse environment.get("https_proxy") orelse environment.get("ALL_PROXY") orelse environment.get("all_proxy");
+        return environment.get("HTTP_PROXY") orelse environment.get("http_proxy") orelse environment.get("ALL_PROXY") orelse environment.get("all_proxy");
     }
 
     fn localMercurial(self: *FetchCache, files: *FileCache, path: []const u8, spec: MercurialSpec) !MercurialResult {
@@ -689,53 +1084,65 @@ pub const FetchCache = struct {
         const io = self.io orelse return error.FetchIoUnavailable;
         const path = try self.remoteMercurialPath(io, spec);
         defer self.allocator.free(path);
-
         const hg_dir = try std.fs.path.join(self.allocator, &.{ path, ".hg" });
         defer self.allocator.free(hg_dir);
-        if (!try files.pathExists(hg_dir)) {
-            try std.Io.Dir.cwd().createDirPath(io, path);
-            try self.runCommandDiscard(&.{ "hg", "clone", spec.url, path });
+        _ = files;
+        const lock = &self.fetch_locks[@as(usize, @intCast(std.hash.Wyhash.hash(0, path) % self.fetch_locks.len))];
+        lock.lock();
+        defer lock.unlock();
+        const marker = try std.fmt.allocPrint(self.allocator, "{s}.fresh", .{path});
+        defer self.allocator.free(marker);
+        var exists = try hostPathExists(io, hg_dir);
+        if (!exists and try hostPathExists(io, path)) try std.Io.Dir.cwd().deleteTree(io, path);
+        const refresh = !exists or (spec.rev == null and !try self.timestampFresh(io, marker));
+        if (!exists) {
+            const parent = std.fs.path.dirname(path) orelse return error.FetchCacheWriteFailed;
+            try std.Io.Dir.cwd().createDirPath(io, parent);
+            const staging = try self.uniqueStagingPath(parent, ".hg-clone");
+            defer self.allocator.free(staging);
+            errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+            try self.runCommandRetried(io, &.{ "hg", "clone", spec.url, staging });
+            try self.publishStagedDir(io, staging, path);
+            exists = true;
+        } else if (refresh) {
+            try self.runCommandRetried(io, &.{ "hg", "--cwd", path, "pull" });
         }
-
         if (spec.rev) |rev| {
             try self.runCommandDiscard(&.{ "hg", "--cwd", path, "update", "--rev", rev });
+        } else if (refresh) {
+            try self.runCommandDiscard(&.{ "hg", "--cwd", path, "update" });
         }
+        if (refresh) try self.writeTimestamp(io, marker);
 
         const rev = try self.commandOneLine(&.{ "hg", "--cwd", path, "id", "--id" });
         defer self.allocator.free(rev);
         return self.mercurialResult(path, stripMercurialDirtySuffix(rev));
     }
 
-    fn gitResult(self: *FetchCache, path: []const u8, rev: []u8, submodules: bool, query_git: bool) !GitResult {
+    fn runCommandRetried(self: *FetchCache, io: std.Io, argv: []const []const u8) !void {
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            self.runCommandDiscard(argv) catch |err| {
+                if (attempt >= self.download_attempts) return err;
+                io.sleep(std.Io.Duration.fromMilliseconds(@min(5_000, 250 * @as(i64, attempt))), .awake) catch {};
+                continue;
+            };
+            return;
+        }
+    }
+
+    fn gitResultFromTransport(self: *FetchCache, path: []const u8, result: git_transport.Result, submodules: bool) !GitResult {
+        const rev = try self.allocator.dupe(u8, &result.rev);
         errdefer self.allocator.free(rev);
-
-        const short_len = @min(rev.len, 7);
-        const short_rev = try self.allocator.dupe(u8, rev[0..short_len]);
+        const short_rev = try self.allocator.dupe(u8, result.rev[0..7]);
         errdefer self.allocator.free(short_rev);
-
-        const rev_count: i64 = if (query_git and rev.len != 0)
-            try self.gitOneLineInt(&.{ "git", "-C", path, "rev-list", "--count", "HEAD" })
-        else
-            0;
-
-        const last_modified: i64 = if (query_git and rev.len != 0)
-            try self.gitOneLineInt(&.{ "git", "-C", path, "log", "-1", "--format=%ct" })
-        else
-            0;
-
-        const last_modified_date = if (query_git and rev.len != 0)
-            try self.gitOneLine(&.{ "git", "-C", path, "log", "-1", "--date=format:%Y%m%d%H%M%S", "--format=%cd" })
-        else
-            try self.allocator.dupe(u8, "19700101000000");
-        errdefer self.allocator.free(last_modified_date);
-
         return .{
             .out_path = try self.allocator.dupe(u8, path),
             .rev = rev,
             .short_rev = short_rev,
-            .rev_count = rev_count,
-            .last_modified = last_modified,
-            .last_modified_date = last_modified_date,
+            .rev_count = result.rev_count,
+            .last_modified = result.last_modified,
+            .last_modified_date = try self.allocator.dupe(u8, &result.last_modified_date),
             .submodules = submodules,
         };
     }
@@ -811,118 +1218,28 @@ pub const FetchCache = struct {
         return try self.allocator.dupe(u8, stripMercurialDirtySuffix(rev));
     }
 
-    fn localGitRevision(self: *FetchCache, files: *FileCache, repo_path: []const u8) !?[]u8 {
-        const dot_git = try std.fs.path.join(self.allocator, &.{ repo_path, ".git" });
-        defer self.allocator.free(dot_git);
-        if (!try files.pathExists(dot_git)) return null;
-
-        // Resolve the actual git directory. In a normal checkout `.git` is a
-        // directory; in a linked WORKTREE it is a FILE containing
-        // `gitdir: <path-to-worktree-git-dir>` (matching Nix/Lix, which follow
-        // it). HEAD is per-worktree, so read it from the resolved git dir…
-        const git_dir = (try self.resolveGitDir(files, dot_git, repo_path)) orelse return null;
-        defer self.allocator.free(git_dir);
-        // …but branches (refs) are SHARED across worktrees — they live in the
-        // common dir (`<git_dir>/commondir` → the main `.git`).
-        const common_dir = try self.resolveGitCommonDir(files, git_dir);
-        defer self.allocator.free(common_dir);
-
-        const head_path = try std.fs.path.join(self.allocator, &.{ git_dir, "HEAD" });
-        defer self.allocator.free(head_path);
-        const head = std.mem.trim(u8, files.readFile(head_path) catch return null, " \t\r\n");
-        if (std.mem.startsWith(u8, head, "ref:")) {
-            const ref_name = std.mem.trim(u8, head[4..], " \t\r\n");
-            if (try self.readGitRef(files, common_dir, ref_name)) |rev| return rev;
-            return self.readPackedGitRef(files, common_dir, ref_name);
-        }
-        if (head.len == 0) return null;
-        return try self.allocator.dupe(u8, head);
-    }
-
-    /// The real git directory for `dot_git` (= `<repo>/.git`). A directory is
-    /// returned as-is; a worktree's `.git` file (`gitdir: <path>`) is followed
-    /// (path resolved relative to the repo when not absolute). Caller owns the
-    /// result. Null when `.git` is neither a usable dir nor a gitdir pointer.
-    fn resolveGitDir(self: *FetchCache, files: *FileCache, dot_git: []const u8, repo_path: []const u8) !?[]u8 {
-        if ((try files.fileType(dot_git)) == .directory) return try self.allocator.dupe(u8, dot_git);
-        const contents = std.mem.trim(u8, files.readFile(dot_git) catch return null, " \t\r\n");
-        const prefix = "gitdir:";
-        if (!std.mem.startsWith(u8, contents, prefix)) return null;
-        const target = std.mem.trim(u8, contents[prefix.len..], " \t\r\n");
-        if (target.len == 0) return null;
-        if (std.fs.path.isAbsolute(target)) return try self.allocator.dupe(u8, target);
-        return try std.fs.path.join(self.allocator, &.{ repo_path, target });
-    }
-
-    /// The common git directory holding shared refs (`packed-refs`,
-    /// `refs/heads/*`). For a linked worktree `<git_dir>/commondir` points at
-    /// the main `.git`; otherwise the git dir is its own common dir. Caller
-    /// owns the result.
-    fn resolveGitCommonDir(self: *FetchCache, files: *FileCache, git_dir: []const u8) ![]u8 {
-        const cd_path = try std.fs.path.join(self.allocator, &.{ git_dir, "commondir" });
-        defer self.allocator.free(cd_path);
-        const contents = std.mem.trim(u8, files.readFile(cd_path) catch return try self.allocator.dupe(u8, git_dir), " \t\r\n");
-        if (contents.len == 0) return try self.allocator.dupe(u8, git_dir);
-        if (std.fs.path.isAbsolute(contents)) return try self.allocator.dupe(u8, contents);
-        return try std.fs.path.join(self.allocator, &.{ git_dir, contents });
-    }
-
-    fn readGitRef(self: *FetchCache, files: *FileCache, dot_git: []const u8, ref_name: []const u8) !?[]u8 {
-        const ref_path = try std.fs.path.join(self.allocator, &.{ dot_git, ref_name });
-        defer self.allocator.free(ref_path);
-        const contents = files.readFile(ref_path) catch return null;
-        const rev = std.mem.trim(u8, contents, " \t\r\n");
-        if (rev.len == 0) return null;
-        return try self.allocator.dupe(u8, rev);
-    }
-
-    fn readPackedGitRef(self: *FetchCache, files: *FileCache, dot_git: []const u8, ref_name: []const u8) !?[]u8 {
-        const packed_path = try std.fs.path.join(self.allocator, &.{ dot_git, "packed-refs" });
-        defer self.allocator.free(packed_path);
-        const contents = files.readFile(packed_path) catch return null;
-
-        var lines = std.mem.splitScalar(u8, contents, '\n');
-        while (lines.next()) |line_raw| {
-            const line = std.mem.trim(u8, line_raw, " \t\r");
-            if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
-            const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
-            if (std.mem.eql(u8, line[space + 1 ..], ref_name)) {
-                return try self.allocator.dupe(u8, line[0..space]);
-            }
-        }
-        return null;
-    }
-
-    fn gitOneLine(self: *FetchCache, argv: []const []const u8) ![]u8 {
-        return self.commandOneLine(argv);
-    }
-
     fn commandOneLine(self: *FetchCache, argv: []const []const u8) ![]u8 {
-        const result = try self.runGit(argv, null);
+        const result = try self.runCommand(argv, null);
         defer self.allocator.free(result.stderr);
         defer self.allocator.free(result.stdout);
         return self.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
     }
 
-    fn gitOneLineInt(self: *FetchCache, argv: []const []const u8) !i64 {
-        const text = try self.gitOneLine(argv);
-        defer self.allocator.free(text);
-        return std.fmt.parseInt(i64, text, 10) catch return error.InvalidGitOutput;
-    }
-
     fn runCommandDiscard(self: *FetchCache, argv: []const []const u8) !void {
-        const result = try self.runGit(argv, null);
+        const result = try self.runCommand(argv, null);
         self.allocator.free(result.stdout);
         self.allocator.free(result.stderr);
     }
 
-    fn runGit(self: *FetchCache, argv: []const []const u8, cwd: ?[]const u8) !std.process.RunResult {
+    fn runCommand(self: *FetchCache, argv: []const []const u8, cwd: ?[]const u8) !std.process.RunResult {
         const io = self.io orelse return error.FetchIoUnavailable;
         const result = try std.process.run(self.allocator, io, .{
             .argv = argv,
             .cwd = if (cwd) |path| .{ .path = path } else .inherit,
             .environ_map = try self.subprocessEnviron(),
-            .stdout_limit = .limited(command_stdout_limit),
+            // These are trusted tools with machine-readable output. Large
+            // repositories can legitimately exceed an arbitrary capture cap.
+            .stdout_limit = .unlimited,
             .stderr_limit = .limited(command_stderr_limit),
         });
         errdefer {
@@ -965,6 +1282,57 @@ fn localFetchPath(url: []const u8) ?[]const u8 {
 fn stripMercurialDirtySuffix(rev: []const u8) []const u8 {
     if (std.mem.endsWith(u8, rev, "+")) return rev[0 .. rev.len - 1];
     return rev;
+}
+
+fn validSha1(text: []const u8) bool {
+    if (text.len != 40) return false;
+    for (text) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
+}
+
+fn expandRevisionTemplate(allocator: std.mem.Allocator, template: []const u8, rev: []const u8) ![]u8 {
+    const marker = "{rev}";
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var rest = template;
+    var replaced = false;
+    while (std.mem.indexOf(u8, rest, marker)) |position| {
+        try out.appendSlice(allocator, rest[0..position]);
+        try out.appendSlice(allocator, rev);
+        rest = rest[position + marker.len ..];
+        replaced = true;
+    }
+    if (!replaced) return error.InvalidRevisionUrlTemplate;
+    try out.appendSlice(allocator, rest);
+    return out.toOwnedSlice(allocator);
+}
+
+fn formatTimestamp(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    return std.fmt.allocPrint(allocator, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
+}
+
+test "forge timestamps render in UTC" {
+    const rendered = try formatTimestamp(std.testing.allocator, 1_331_075_210);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("20120306230650", rendered);
+}
+
+test "forge archive revision templates pin every ref occurrence" {
+    const expanded = try expandRevisionTemplate(std.testing.allocator, "https://gitlab/x/-/archive/{rev}/x-{rev}.tar.gz", "abc123");
+    defer std.testing.allocator.free(expanded);
+    try std.testing.expectEqualStrings("https://gitlab/x/-/archive/abc123/x-abc123.tar.gz", expanded);
 }
 
 test "access-tokens: parse and longest-prefix host/path match" {
@@ -1021,7 +1389,7 @@ test "netrc: basic-auth header by machine, else default" {
     try testing.expect((try empty.netrcHeader("https://example.com")) == null);
 }
 
-test "subprocess env: inherits parent and disables the git terminal prompt" {
+test "subprocess env: inherits parent and normalizes Mercurial" {
     const testing = std.testing;
     var parent = std.process.Environ.Map.init(testing.allocator);
     defer parent.deinit();
@@ -1033,7 +1401,6 @@ test "subprocess env: inherits parent and disables the git terminal prompt" {
     fc.setEnvironment(&parent);
 
     const env = (try fc.subprocessEnviron()).?;
-    try testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
     try testing.expectEqualStrings("", env.get("HGPLAIN").?);
     try testing.expectEqualStrings("/home/u", env.get("HOME").?); // inherited
     try testing.expectEqualStrings("/run/ssh", env.get("SSH_AUTH_SOCK").?); // inherited (creds/ssh)
@@ -1061,6 +1428,8 @@ test "access-tokens: per-forge auth header (matches Nix)" {
 
     // GitHub: `Authorization: token <tok>`.
     try check.one(&fc, .github, "https://github.com/o/r/archive/HEAD.tar.gz", "Authorization", "token ghp_x");
+    // Direct codeload URLs deliberately map back to github.com for token lookup.
+    try check.one(&fc, .github, "https://codeload.github.com/o/r/tar.gz/HEAD", "Authorization", "token ghp_x");
     // SourceHut: `Authorization: Bearer <tok>`.
     try check.one(&fc, .sourcehut, "https://git.sr.ht/~o/r/archive/HEAD.tar.gz", "Authorization", "Bearer srhtok");
     // GitLab PAT: `Private-token: <value>`.
@@ -1119,4 +1488,90 @@ test "fetchTarball only serializes NAR when requested" {
     var independently_hashed: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload.bytes, &independently_hashed, .{});
     try testing.expectEqualSlices(u8, &independently_hashed, &payload.digest);
+}
+
+test "URL metadata only reuses fresh, content-verified cache files" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var fc = FetchCache.init(testing.allocator);
+    defer fc.deinit();
+    fc.setIo(testing.io);
+    try fc.setCacheRoot(root);
+    const payload = "verified payload";
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+    const path = try fc.urlCachePath(testing.io, "source", &hash);
+    defer testing.allocator.free(path);
+    try fc.publishBytes(testing.io, path, payload);
+    const metadata = try fc.urlMetadataPath(root, "https://example.invalid/source");
+    defer testing.allocator.free(metadata);
+    try fc.writeUrlMetadata(testing.io, metadata, &hash);
+
+    const cached = (try fc.readFreshUrlCache(testing.io, metadata, "source")).?;
+    defer cached.deinit(testing.allocator);
+    try testing.expectEqualStrings(&hash, cached.hash);
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "corrupt" });
+    try testing.expect((try fc.readFreshUrlCache(testing.io, metadata, "source")) == null);
+    fc.setTarballTtl(0);
+    try testing.expect((try fc.readFreshUrlCache(testing.io, metadata, "source")) == null);
+}
+
+test "http-connections zero remains truly unlimited" {
+    var fc = FetchCache.init(std.testing.allocator);
+    defer fc.deinit();
+    try fc.setMaxConnections(0);
+    try std.testing.expectEqual(@as(u32, 0), fc.max_connections);
+    try std.testing.expect(fc.blockingPool() == null);
+}
+
+test "remote URL retries transient status then reuses the verified TTL cache" {
+    const testing = std.testing;
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    const Server = struct {
+        fn run(s: *std.Io.net.Server) void {
+            for (0..2) |attempt| {
+                const stream = s.accept(testing.io) catch return;
+                defer stream.close(testing.io);
+                var buffer: [1024]u8 = undefined;
+                var writer = std.Io.net.Stream.Writer.init(stream, testing.io, &buffer);
+                if (attempt == 0)
+                    writer.interface.writeAll("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch return
+                else
+                    writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload") catch return;
+                writer.interface.flush() catch return;
+            }
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Server.run, .{&server});
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    var files = FileCache.init(testing.allocator);
+    defer files.deinit();
+    files.setIo(testing.io);
+    var fc = FetchCache.init(testing.allocator);
+    defer fc.deinit();
+    fc.setIo(testing.io);
+    fc.setDownloadAttempts(2);
+    try fc.setCacheRoot(root);
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/source", .{server.socket.address.ip4.port});
+    defer testing.allocator.free(url);
+
+    const first = try fc.fetchUrl(&files, .{ .url = url, .name = "source" }, null);
+    defer first.deinit(testing.allocator);
+    thread.join();
+    const second = try fc.fetchUrl(&files, .{ .url = url, .name = "source" }, null);
+    defer second.deinit(testing.allocator);
+    try testing.expectEqualStrings(first.hash, second.hash);
+    try testing.expectEqualStrings(first.path, second.path);
 }

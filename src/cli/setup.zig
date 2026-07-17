@@ -92,9 +92,20 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     if (settings.getUint("max-call-depth")) |n|
         policy.max_call_depth = @intCast(@min(n, @as(u64, std.math.maxInt(u32))));
     ev.configureLanguage(policy);
-    ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
+    try ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
     if (settings.getUint("download-attempts")) |n|
         ev.setDownloadAttempts(@intCast(@min(n, @as(u64, std.math.maxInt(u32)))));
+    ev.setTarballTtl(@intCast(@min(settings.getUint("tarball-ttl") orelse 3600, @as(u64, std.math.maxInt(u32)))));
+    if (settings.getUint("connect-timeout")) |n|
+        ev.setFetchConnectTimeout(@intCast(@min(n, @as(u64, std.math.maxInt(u32)))));
+    ev.setStalledDownloadTimeout(@intCast(@min(settings.getUint("stalled-download-timeout") orelse 300, @as(u64, std.math.maxInt(u32)))));
+    ev.setDownloadSpeed(settings.getUint("download-speed") orelse 0);
+    // The process environment has higher precedence than nix.conf for the CA
+    // bundle, matching Nix/libcurl.
+    if (init.environ_map.get("NIX_SSL_CERT_FILE") == null and init.environ_map.get("SSL_CERT_FILE") == null)
+        if (settings.get("ssl-cert-file")) |path| if (path.len != 0) try ev.setSslCertFile(path);
+    const registry = settings.get("flake-registry") orelse "https://channels.nixos.org/flake-registry.json";
+    try ev.setFlakeRegistryUrl(if (registry.len != 0) registry else null);
     // `access-tokens` from nix.conf (incl. `--option access-tokens ...`):
     // authenticate fetches to private GitHub/GitLab/… hosts.
     if (settings.get("access-tokens")) |tokens| try ev.setAccessTokens(tokens);

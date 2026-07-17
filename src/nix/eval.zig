@@ -586,13 +586,37 @@ pub const Evaluator = struct {
     }
 
     /// Cap concurrent fetches (`http-connections`; 0 = unlimited).
-    pub fn setFetchConnections(self: *Evaluator, n: u32) void {
-        self.fetchers.setMaxConnections(n);
+    pub fn setFetchConnections(self: *Evaluator, n: u32) !void {
+        try self.fetchers.setMaxConnections(n);
     }
 
     /// `download-attempts`: total tries per download before failing.
     pub fn setDownloadAttempts(self: *Evaluator, n: u32) void {
         self.fetchers.setDownloadAttempts(n);
+    }
+
+    pub fn setTarballTtl(self: *Evaluator, seconds: u32) void {
+        self.fetchers.setTarballTtl(seconds);
+    }
+
+    pub fn setFetchConnectTimeout(self: *Evaluator, seconds: u32) void {
+        self.fetchers.setConnectTimeout(seconds);
+    }
+
+    pub fn setStalledDownloadTimeout(self: *Evaluator, seconds: u32) void {
+        self.fetchers.setStalledDownloadTimeout(seconds);
+    }
+
+    pub fn setDownloadSpeed(self: *Evaluator, kib_per_second: u64) void {
+        self.fetchers.setDownloadSpeed(kib_per_second);
+    }
+
+    pub fn setSslCertFile(self: *Evaluator, path: []const u8) !void {
+        try self.fetchers.setSslCertFile(path);
+    }
+
+    pub fn setFlakeRegistryUrl(self: *Evaluator, url: ?[]const u8) !void {
+        try self.fetchers.setFlakeRegistryUrl(url);
     }
 
     /// Set the fetcher's `access-tokens` (a raw `nix.conf` value), used to
@@ -701,6 +725,13 @@ pub const Evaluator = struct {
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
         try self.search_paths.set(self.allocator, nix_path, self, resolveHostPath);
+        for (self.search_paths.entries) |*entry| {
+            if (!std.mem.startsWith(u8, entry.path, "http://") and !std.mem.startsWith(u8, entry.path, "https://") and !std.mem.startsWith(u8, entry.path, "file://")) continue;
+            const result = try self.fetchers.fetchTarball(&self.files, .{ .url = entry.path, .name = "source" }, null);
+            self.allocator.free(entry.path);
+            entry.path = result.path;
+            if (result.nar_payload) |payload| self.allocator.free(payload.bytes);
+        }
     }
 
     pub fn readSourceFile(self: *Evaluator, path: []const u8) ![]const u8 {
@@ -1828,6 +1859,8 @@ pub const Evaluator = struct {
     }
 
     pub fn resolveHostPath(self: *Evaluator, path: []const u8) !search_path_mod.ResolvedPath {
+        if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or std.mem.startsWith(u8, path, "file://"))
+            return .{ .text = path, .owned = false };
         if (std.fs.path.isAbsolute(path)) return .{ .text = path, .owned = false };
 
         const base_path = self.base_path orelse return error.RelativePath;

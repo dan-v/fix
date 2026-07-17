@@ -5,6 +5,11 @@
   release ? "fast",
   zig_0_16,
   pkg-config,
+  curl,
+  libgit2,
+  mercurial,
+  gnutar,
+  makeWrapper,
 }: let
   zig = zig_0_16;
 in
@@ -24,7 +29,15 @@ in
       ];
     };
 
-    nativeBuildInputs = [zig.hook pkg-config];
+    nativeBuildInputs = [zig.hook pkg-config makeWrapper];
+    buildInputs = [curl libgit2];
+
+    # Mercurial and archive extraction remain subprocess adapters. Git source
+    # transport and local-worktree plumbing are both provided by libgit2.
+    postFixup = ''
+      wrapProgram $out/bin/fix \
+        --prefix PATH : ${lib.makeBinPath [mercurial gnutar]}
+    '';
 
     zigBuildFlags = (lib.optional (release != null) "--release=${release}") ++ (lib.optional (cpu != null) "-Dcpu=${cpu}");
 
