@@ -58,13 +58,6 @@ const eval_trace = @import("../observ.zig").trace;
 const eval_progress = @import("../observ.zig").progress;
 const prof = @import("../probe.zig").prof;
 const timeline = @import("../probe.zig").timeline;
-// Used only by the test fixture below.
-const bytecode = @import("../bytecode.zig");
-const InternTable = @import("runtime").intern.InternTable;
-const ObjectHeap = @import("runtime").heap.ObjectHeap;
-const FileCache = @import("../host.zig").FileCache;
-const FetchCache = @import("../host.zig").FetchCache;
-const RealizationStore = @import("../realization.zig").RealizationStore;
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker repoints
@@ -1218,82 +1211,5 @@ fn runTask(f: *WorkerFiber, task: Task) void {
                 for (listing) |le| _ = f.vm.intern.intern(le.name) catch break;
             }
         },
-    }
-}
-
-// ---- Tests ----
-
-const testing = std.testing;
-
-test "Worker basic init/deinit" {
-    var sched = try Scheduler.init(testing.allocator, 2);
-    defer sched.deinit();
-
-    const TestCtx = struct {
-        registry: bytecode.ChunkRegistry,
-        intern: InternTable,
-        heap: ObjectHeap,
-        files: FileCache,
-        fetchers: FetchCache,
-        realization: RealizationStore,
-        sched: *Scheduler,
-        arena: arena_mod.ArenaAllocator,
-
-        fn initVm(ctx: *anyopaque, _: u8, _: u32, scratch: std.mem.Allocator) anyerror!VM {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            return VM.init(.{
-                .driver = &vm_driver,
-                .allocator = scratch,
-                .registry = &self.registry,
-                .intern = &self.intern,
-                .heap = &self.heap,
-                .files = &self.files,
-                .fetchers = &self.fetchers,
-                .realization = &self.realization,
-                .scheduler = self.sched,
-            });
-        }
-    };
-
-    var ctx: TestCtx = .{
-        .registry = try bytecode.ChunkRegistry.init(testing.allocator),
-        .intern = try InternTable.init(testing.allocator),
-        .heap = try ObjectHeap.init(testing.allocator, 2),
-        .files = FileCache.init(testing.allocator),
-        .fetchers = FetchCache.init(testing.allocator),
-        .realization = RealizationStore.init(testing.allocator),
-        .sched = &sched,
-        .arena = arena_mod.ArenaAllocator.init(testing.allocator),
-    };
-    defer {
-        ctx.registry.deinit();
-        ctx.intern.deinit();
-        ctx.heap.deinit();
-        ctx.files.deinit();
-        ctx.fetchers.deinit();
-        ctx.realization.deinit();
-        ctx.arena.deinit();
-    }
-
-    const worker = try Worker.init(testing.allocator, &sched, 1, &ctx, TestCtx.initVm);
-    defer worker.deinit();
-
-    try testing.expectEqual(@as(u8, 1), worker.worker_id);
-    // Prewarmed fibers: all on the free list, none active yet.
-    try testing.expectEqual(@as(usize, prewarm_fiber_count), worker.fibers.items.len);
-    try testing.expect(worker.free_head != null);
-    try testing.expect(sched.popReady(1) == null);
-    // Fiber ids are now globally allocated by the scheduler — no fixed
-    // mapping to position in the worker's fibers list. Each fiber's
-    // claimer_id should equal `makeClaimer(fiber_id)`.
-    for (worker.fibers.items) |f| {
-        try testing.expectEqual(future_mod.makeClaimer(f.fiber_id), f.ctx.claimer_id);
-        try testing.expectEqual(FiberState.free, f.state);
-    }
-    // All fiber ids should be distinct.
-    for (worker.fibers.items, 0..) |f, i| {
-        for (worker.fibers.items[i + 1 ..]) |g| {
-            try testing.expect(f.fiber_id != g.fiber_id);
-        }
     }
 }

@@ -57,7 +57,7 @@ loop:
 A failed compile publishes an `ErrorInfo` sidecar via `publishErrored`, so the same error replays on every later force — imports that fail (file-not-found, parse error) fail deterministically. Resource-pressure failures (`OutOfMemory`, `StackOverflow`) are the exception: they are **never** cached — the future is `reset` (transient) so the next caller retries — because a speculative prefetch fiber hitting a memory/stack limit must not poison the path for real demand. If even the `ErrorInfo` allocation fails, the future is likewise `reset`.
 
 ### Directories & corepkgs
-`import <dir>` redirects to `<dir>/default.nix`. `<nix/fetchurl.nix>` resolves to the synthetic source in `language/corepkgs.zig`, so no corepkgs store path is needed on disk. Both flow back through the same registry.
+`import <dir>` redirects to `<dir>/default.nix`. `<nix/fetchurl.nix>` resolves to the synthetic source in `eval/imports/corepkgs.zig`, so no corepkgs store path is needed on disk. Both flow back through the same registry.
 
 ### Speculative import prefetch
 A spec-lane prefetch (`FIX_IMPORT_PREFETCH`) submits `import_prefetch` [tasks](scheduler.md) that resolve + parse + compile + top-level-eval a `.nix` file ahead of demand — discovered from the `.path` constants of freshly compiled chunks (via `ChunkRegistry.path_const_sink`) and deduplicated per path before submission, capped at `FIX_IMPORT_PREFETCH_MAX` = **8192** submissions per eval. It populates the *same* registry, so the demand fiber later hits `.already_resolved` (or joins the in-flight `Future`) instead of paying parse+compile on the critical chain. Errors are swallowed on the prefetch path; deterministic failures still cache on the entry and replay identically on real demand. It is **on by default whenever helpers exist** (the same gate as the [novel lane](speculation.md)): at `--workers=1` nothing drains it. (An earlier `2..16` bound existed because past 16 workers the extra spec-lane volume chased junk; the bulk-spec drain cap — `Scheduler.spec_helper_cap`, default 16 — now contains that volume, and prefetch-on re-measured as a win at w=32.) `FIX_IMPORT_PREFETCH=0`/`1` overrides.
@@ -100,4 +100,4 @@ So the critical path is a **serial chain of parse+compile through the import gra
 
 File & path caching is shared via the evaluator's `files` reader. See [workers](workers.md).
 
-Code: evaluator-owned orchestration in `src/nix/eval.zig`, registry/entry state in `src/nix/eval/imports.zig`, compatibility sources in `src/nix/language/corepkgs.zig`, and parking in `src/nix/execution/worker.zig`.
+Code: evaluator-owned orchestration in `src/nix/eval.zig`, registry/entry state in `src/nix/eval/imports.zig`, compatibility sources in `src/nix/eval/imports/corepkgs.zig`, and parking in `src/nix/execution/worker.zig`.

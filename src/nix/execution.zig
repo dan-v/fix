@@ -16,4 +16,5 @@ pub const WorkerFiber = worker.WorkerFiber;
 test {
     _ = worker;
     _ = fiber_executor;
+    _ = @import("execution/tests/worker.zig");
 }
