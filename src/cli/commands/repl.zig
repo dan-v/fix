@@ -94,7 +94,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         console.install(&ev);
     }
 
-    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress, term.log_progress, term.use_color);
+    var progress = progress_ui.EvalProgress.init(init.io, term.log_progress, term.use_color, options.verbose);
     var repl_ok = false;
     defer progress.deinit(repl_ok);
     if (term.progressEnabled()) ev.setProgressSink(progress.sink());

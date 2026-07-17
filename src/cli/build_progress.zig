@@ -1,8 +1,6 @@
-//! Build progress adapter: drives a set of `std.Progress` nodes off the daemon's
-//! typed activity/log stream (a node per build/substitution, updated
-//! with `done/expected` progress). Nodes hang under the run node of the shared
-//! `EvalProgress`, so eval and build render as one tree. Daemon-provided prose
-//! and styling never enter progress node names; this layer owns both.
+//! Build progress adapter: turns the daemon's typed activity/log stream into
+//! timestamped records. Daemon-provided prose and styling never control the
+//! record presentation; this layer owns both.
 
 const std = @import("std");
 const daemon = @import("store").daemon;
@@ -25,28 +23,38 @@ const Action = enum {
         };
     }
 
-    fn accent(self: Action) presentation.Accent {
+    fn completedVerb(self: Action) []const u8 {
         return switch (self) {
-            .building => .magenta,
-            .copying => .green,
-            .fetching => .cyan,
-            .post_build => .green,
+            .building => "built",
+            .copying => "copied",
+            .fetching => "fetched",
+            .post_build => "ran post-build for",
+        };
+    }
+
+    fn verbRole(self: Action) presentation.Verb {
+        return switch (self) {
+            .building => .build,
+            .copying => .store,
+            .fetching => .fetch,
+            .post_build => .store,
         };
     }
 };
 
+const Phase = enum { ongoing, completed };
+const max_name_len = 192;
+
 const Active = struct {
-    node: std.Progress.Node,
     action: Action,
-    noun: [std.Progress.Node.max_name_len]u8,
+    noun: [max_name_len]u8,
     noun_len: u8,
 
-    fn init(node: std.Progress.Node, action: Action, noun: []const u8) Active {
+    fn init(action: Action, noun: []const u8) Active {
         var active: Active = .{
-            .node = node,
             .action = action,
             .noun = undefined,
-            .noun_len = @intCast(@min(noun.len, std.Progress.Node.max_name_len)),
+            .noun_len = @intCast(@min(noun.len, max_name_len)),
         };
         @memcpy(active.noun[0..active.noun_len], noun[0..active.noun_len]);
         return active;
@@ -63,8 +71,8 @@ pub const BuildProgress = struct {
     io: std.Io,
     use_color: bool,
     log_progress: bool,
-    /// Active activity id -> its node.
-    nodes: std.AutoHashMapUnmanaged(u64, Active) = .empty,
+    /// Active activity id -> its presentation identity.
+    activities: std.AutoHashMapUnmanaged(u64, Active) = .empty,
     mu: sync.BlockingMutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, use_color: bool, log_progress: bool, progress: *EvalProgress) BuildProgress {
@@ -77,15 +85,12 @@ pub const BuildProgress = struct {
         };
     }
 
-    /// End all active nodes and free. Idempotent (safe to call before session
-    /// teardown and again via defer).
+    /// Free tracked activity identities. Idempotent.
     pub fn deinit(self: *BuildProgress) void {
         self.mu.lock();
         defer self.mu.unlock();
-        var it = self.nodes.valueIterator();
-        while (it.next()) |active| active.node.end();
-        self.nodes.deinit(self.allocator);
-        self.nodes = .empty;
+        self.activities.deinit(self.allocator);
+        self.activities = .empty;
     }
 
     pub fn sink(self: *BuildProgress) daemon.BuildSink {
@@ -101,23 +106,16 @@ pub const BuildProgress = struct {
         defer self.mu.unlock();
         switch (event) {
             .start => |activity| {
-                var label_buffer: [std.Progress.Node.max_name_len]u8 = undefined;
                 const action = activityAction(activity);
                 const noun = activityNoun(activity);
-                // std.Progress clips names to the terminal width by raw byte
-                // count. ANSI here could therefore lose its trailing reset;
-                // keep the tree label plain and color only writes we own.
-                const label = activityLabel(&label_buffer, action, noun);
-                const node = self.progress.childNode(label);
-                if (self.nodes.fetchRemove(activity.id)) |old| old.value.node.end();
-                self.nodes.put(self.allocator, activity.id, Active.init(node, action, noun)) catch node.end();
-                if (self.log_progress) self.writeActivity(action, noun);
+                _ = self.activities.remove(activity.id);
+                self.activities.put(self.allocator, activity.id, Active.init(action, noun)) catch return;
+                if (self.log_progress) self.writeActivity(action, noun, .ongoing);
             },
-            .stop => |id| if (self.nodes.fetchRemove(id)) |kv| kv.value.node.end(),
-            .progress => |update| if (self.nodes.get(update.id)) |active| {
-                if (update.expected != 0) active.node.setEstimatedTotalItems(update.expected);
-                active.node.setCompletedItems(update.done);
+            .stop => |id| if (self.activities.fetchRemove(id)) |kv| {
+                if (self.log_progress) self.writeActivity(kv.value.action, kv.value.name(), .completed);
             },
+            .progress => {},
             .log => |log| self.writeLog(log),
         }
     }
@@ -136,21 +134,22 @@ pub const BuildProgress = struct {
             stderr.flush() catch {};
         }
 
-        if (log.kind != .daemon) {
-            const active = if (log.activity_id) |id| self.nodes.get(id) else null;
-            if (active) |value| {
-                self.writeActivityText(writer, value.action, value.name()) catch return;
-            } else {
-                const action: Action = if (log.kind == .post_build) .post_build else .building;
-                self.writeActivityText(writer, action, "") catch return;
-            }
-            writer.writeAll(if (log.kind == .post_build) " (post) | " else " | ") catch return;
+        const active = if (log.activity_id) |id| self.activities.get(id) else null;
+        const is_build_log = log.kind != .daemon;
+        const system = if (is_build_log) "build" else "daemon";
+        if (self.log_progress) {
+            self.progress.writeLogPrefix(writer, system) catch return;
+        }
+
+        if (is_build_log) {
+            if (active) |value| self.writeNoun(writer, value.name(), value.name()) catch return;
+            writer.writeAll(if (active == null) "| " else " | ") catch return;
         }
         writer.writeAll(log.text) catch return;
         if (!std.mem.endsWith(u8, log.text, "\n")) writer.writeByte('\n') catch return;
     }
 
-    fn writeActivity(self: *BuildProgress, action: Action, noun: []const u8) void {
+    fn writeActivity(self: *BuildProgress, action: Action, noun: []const u8, phase: Phase) void {
         var stderr_buffer: [4096]u8 = undefined;
         var stderr = presentation.lockStderr(self.io, &stderr_buffer) catch return;
         defer stderr.deinit();
@@ -161,17 +160,29 @@ pub const BuildProgress = struct {
             presentation.reset(writer, self.use_color) catch {};
             stderr.flush() catch {};
         }
-        self.writeActivityText(writer, action, noun) catch return;
+        self.progress.writeLogPrefix(writer, "daemon") catch return;
+        self.writeActivityText(writer, action, noun, phase) catch return;
+        if (phase == .completed and action == .building and std.mem.endsWith(u8, noun, ".drv")) {
+            writer.writeAll(" -> ") catch return;
+            self.writeNoun(writer, stripDrv(noun), noun) catch return;
+        }
         writer.writeByte('\n') catch return;
     }
 
-    fn writeActivityText(self: *BuildProgress, writer: *std.Io.Writer, action: Action, noun: []const u8) !void {
-        try presentation.accent(writer, self.use_color, action.accent(), false);
-        try writer.writeAll(action.verb());
+    fn writeActivityText(self: *BuildProgress, writer: *std.Io.Writer, action: Action, noun: []const u8, phase: Phase) !void {
+        try presentation.foreground(writer, self.use_color, presentation.verbColor(action.verbRole()), false);
+        try writer.writeAll(switch (phase) {
+            .ongoing => action.verb(),
+            .completed => action.completedVerb(),
+        });
         try presentation.reset(writer, self.use_color);
         if (noun.len == 0) return;
         try writer.writeByte(' ');
-        try presentation.accent(writer, self.use_color, presentation.stableNounAccent(noun), true);
+        try self.writeNoun(writer, noun, noun);
+    }
+
+    fn writeNoun(self: *BuildProgress, writer: *std.Io.Writer, noun: []const u8, identity: []const u8) !void {
+        try presentation.foreground(writer, self.use_color, presentation.nounColor(identity), true);
         try writer.writeAll(noun);
         try presentation.reset(writer, self.use_color);
     }
@@ -187,14 +198,7 @@ fn activityAction(activity: daemon.build_events.Activity) Action {
 
 fn activityNoun(activity: daemon.build_events.Activity) []const u8 {
     const name = storePathName(activity.subject);
-    return switch (activity.kind) {
-        .build, .post_build_hook => stripDrv(name),
-        .substitute => name,
-    };
-}
-
-fn activityLabel(buffer: []u8, action: Action, noun: []const u8) []const u8 {
-    return std.fmt.bufPrint(buffer, "{s} {s}", .{ action.verb(), noun }) catch noun[0..@min(noun.len, buffer.len)];
+    return name;
 }
 
 fn storePathName(path: []const u8) []const u8 {
@@ -207,28 +211,32 @@ fn stripDrv(name: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, name, ".drv")) name[0 .. name.len - 4] else name;
 }
 
-test "build activity labels are owned presentation" {
-    var buffer: [std.Progress.Node.max_name_len]u8 = undefined;
+test "build activities have owned presentation identities" {
     const build: daemon.build_events.Activity = .{
         .id = 1,
         .kind = .build,
         .subject = "/nix/store/01234567890123456789012345678901-hello-1.0.drv",
         .detail = "",
     };
-    try std.testing.expectEqualStrings("building hello-1.0", activityLabel(&buffer, activityAction(build), activityNoun(build)));
+    try std.testing.expectEqual(Action.building, activityAction(build));
+    try std.testing.expectEqualStrings("hello-1.0.drv", activityNoun(build));
+    try std.testing.expectEqualStrings("hello-1.0", stripDrv(activityNoun(build)));
     const copy: daemon.build_events.Activity = .{
         .id = 2,
         .kind = .substitute,
         .subject = "/nix/store/01234567890123456789012345678901-source",
         .detail = "local",
     };
-    try std.testing.expectEqualStrings("copying source", activityLabel(&buffer, activityAction(copy), activityNoun(copy)));
+    try std.testing.expectEqual(Action.copying, activityAction(copy));
+    try std.testing.expectEqualStrings("source", activityNoun(copy));
     const fetch: daemon.build_events.Activity = .{
         .id = 3,
         .kind = .substitute,
         .subject = "/nix/store/01234567890123456789012345678901-source",
         .detail = "https://cache.example",
     };
-    try std.testing.expectEqualStrings("fetching source", activityLabel(&buffer, activityAction(fetch), activityNoun(fetch)));
-    try std.testing.expectEqual(presentation.stableNounAccent("source"), presentation.stableNounAccent("source"));
+    try std.testing.expectEqual(Action.fetching, activityAction(fetch));
+    try std.testing.expectEqual(presentation.nounColor("source"), presentation.nounColor("source"));
+    try std.testing.expectEqualStrings("built", Action.building.completedVerb());
+    try std.testing.expectEqualStrings("copied", Action.copying.completedVerb());
 }

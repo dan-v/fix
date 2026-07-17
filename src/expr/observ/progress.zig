@@ -7,6 +7,7 @@
 const std = @import("std");
 const store_progress = @import("store").progress;
 
+pub const SpanKind = store_progress.SpanKind;
 pub const Span = store_progress.Span;
 pub const SpanSink = store_progress.SpanSink;
 

@@ -62,7 +62,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer ev.deinit();
     // Configure features (pipe-operators/flakes), base path, and NIX_PATH so the
     // compile matches what `eval`/`build` would see. No progress: disasm prints
-    // bytecode, not a progress bar.
+    // bytecode, not evaluation records.
     _ = try setup.configure(&ev, init, options);
     if (options.disasm_eval) ev.setParallelismToggles(true, true);
     // Best-effort chunk naming: attribute each lambda/thunk chunk to the attr

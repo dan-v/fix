@@ -37,6 +37,12 @@ fn storePathName(path: []const u8) []const u8 {
     return base;
 }
 
+fn pathsLabel(buffer: []u8, paths: []const []const u8) []const u8 {
+    if (paths.len == 0) return "paths";
+    if (paths.len == 1) return storePathName(paths[0]);
+    return std.fmt.bufPrint(buffer, "{d} paths", .{paths.len}) catch "paths";
+}
+
 pub const RealizationStore = struct {
     allocator: std.mem.Allocator,
     store_dir: []const u8 = "/nix/store",
@@ -256,9 +262,9 @@ pub const RealizationStore = struct {
     /// Open a concurrent progress span for real store work, or null when progress
     /// is disabled. Pair with `endSpan` (defer). The label is borrowed for the
     /// call only. The returned handle retains its originating sink.
-    pub fn beginSpan(self: *RealizationStore, label: []const u8) ?eval_progress.Span {
+    pub fn beginSpan(self: *RealizationStore, kind: eval_progress.SpanKind, label: []const u8) ?eval_progress.Span {
         const spans = self.progress_spans orelse return null;
-        return spans.beginSpan(label);
+        return spans.beginSpan(kind, label);
     }
 
     /// Close a span opened by `beginSpan` (no-op on null / no hooks).
@@ -328,16 +334,14 @@ pub const RealizationStore = struct {
     /// references them — so `input_srcs` are valid in time.
     pub fn instantiatePath(self: *RealizationStore, store_path: []const u8, nar_bytes: []const u8) !void {
         if (!self.daemon.writes_enabled) return;
-        // Used by `ingestSerializedNar` (fetchTarball), whose fetch span already
-        // reports the operation.
-        return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }, false);
+        return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }, true);
     }
 
     /// Add a flat file's raw bytes to the store (fetchurl), gated on
     /// `store_writes_enabled`.
     pub fn instantiateFlat(self: *RealizationStore, store_path: []const u8, bytes: []const u8) !void {
         if (!self.daemon.writes_enabled) return;
-        return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } }, false);
+        return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } }, true);
     }
 
     /// Is `store_path` already valid in the store? Used to skip fetching an
@@ -385,6 +389,8 @@ pub const RealizationStore = struct {
     /// pool workers don't serialize on it.
     fn applyIsValid(self: *RealizationStore, conn: *rstore.DaemonStore, store_path: []const u8) !bool {
         if (self.cacheContains(store_path)) return true;
+        const span = self.beginSpan(.check, storePathName(store_path));
+        defer self.endSpan(span);
         const valid = try conn.isValidPath(store_path);
         // A path valid now stays valid for the eval (same assumption the cache
         // already makes for writes), so a later demand skips the round-trip.
@@ -419,6 +425,10 @@ pub const RealizationStore = struct {
                 self.result = err;
                 return;
             };
+            var label_buffer: [std.Progress.Node.max_name_len]u8 = undefined;
+            const label = pathsLabel(&label_buffer, self.paths);
+            const span = self.store.beginSpan(.query, label);
+            defer self.store.endSpan(span);
             self.result = daemon.queryMissing(self.store.allocator, self.paths) catch |err| {
                 self.store.captureDaemonError(daemon);
                 self.result = err;
@@ -483,6 +493,13 @@ pub const RealizationStore = struct {
 
     /// Build against the connection supplied by the pool worker.
     fn buildOnConn(self: *RealizationStore, conn: *rstore.DaemonStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+        var label_buffer: [std.Progress.Node.max_name_len]u8 = undefined;
+        const label = pathsLabel(&label_buffer, derived_paths);
+        // A typed activity sink reports the actual builds/substitutions inside
+        // this request. Use a coarse fallback only for internal builds (IFD),
+        // where no daemon activity stream is installed.
+        const span = if (sink == null) self.beginSpan(.build, label) else null;
+        defer self.endSpan(span);
         conn.buildPaths(derived_paths, sink, mode) catch |err| {
             self.captureDaemonError(conn);
             return err;
@@ -523,6 +540,8 @@ pub const RealizationStore = struct {
             const self: *RootCell = @ptrCast(@alignCast(p));
             self.err = blk: {
                 const c = daemonConn(conn) catch |e| break :blk e;
+                const span = self.store.beginSpan(.register, std.fs.path.basename(self.link_path));
+                defer self.store.endSpan(span);
                 break :blk c.addIndirectRoot(self.link_path);
             };
         }
@@ -537,7 +556,6 @@ pub const RealizationStore = struct {
     /// Dispatch a store write to the pool (parking the caller) or inline. The op's
     /// args are borrowed and stay valid across the transfer because the calling
     /// fiber parks (its stack — holding the NAR/text buffers — is preserved).
-    /// `report_progress` is false for writes already shown by a fetch span.
     fn runDaemonOp(self: *RealizationStore, op: DaemonOp, report_progress: bool) !void {
         var cell: OpCell = .{ .store = self, .op = op, .report_progress = report_progress };
         try self.runOnDaemon(OpCell.run, &cell);
@@ -568,12 +586,11 @@ pub const RealizationStore = struct {
             inline else => |o| o.store_path,
         };
         if (self.cacheContains(store_path)) return;
-        if (try daemon.isValidPath(store_path)) return self.cacheMark(store_path);
-        // Report a progress span around the actual transfer unless a fetch span
-        // already represents it. Reporting here — only past the validity guard —
-        // means the visible activity is an actual write, not a coercion/record.
-        // The span may open here (on a pool worker) and close after the write.
-        const span = if (report_progress) self.beginSpan(storePathName(store_path)) else null;
+        if (try self.applyIsValid(daemon, store_path)) return;
+        // The fetch that produced this content and its store write are distinct
+        // operations, so both get spans. Open this only after the validity
+        // check confirms that a transfer will actually happen.
+        const span = if (report_progress) self.beginSpan(.store, storePathName(store_path)) else null;
         defer self.endSpan(span);
         const written = switch (op) {
             .text => |o| daemon.addTextToStore(self.allocator, storePathName(store_path), o.text, o.references),
@@ -606,8 +623,6 @@ pub const RealizationStore = struct {
         return self.graph.recordOwnedNar(store_path, nar_bytes);
     }
 
-    /// `report_progress` is false for a fetched flat file whose download span
-    /// already represents the work.
     pub fn recordFlatRecipe(self: *RealizationStore, store_path: []const u8, handle: FileCache.ImmutableBytes, report_progress: bool) !void {
         return self.graph.recordFlat(store_path, handle, report_progress);
     }

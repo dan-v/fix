@@ -725,7 +725,7 @@ pub const Evaluator = struct {
         try self.search_paths.set(self.allocator, nix_path, self, resolveHostPath);
         for (self.search_paths.entries) |*entry| {
             if (!std.mem.startsWith(u8, entry.path, "http://") and !std.mem.startsWith(u8, entry.path, "https://") and !std.mem.startsWith(u8, entry.path, "file://")) continue;
-            const result = try self.fetchers.fetchTarball(&self.files, .{ .url = entry.path, .name = "source" }, null);
+            const result = try self.fetchTarball(entry.path);
             self.allocator.free(entry.path);
             entry.path = result.path;
             if (result.nar_payload) |payload| self.allocator.free(payload.bytes);
@@ -745,9 +745,15 @@ pub const Evaluator = struct {
 
     /// Fetch and unpack a legacy fileish tarball, returning its owned cache path.
     pub fn fetchTarballPath(self: *Evaluator, url: []const u8) ![]u8 {
-        const result = try self.fetchers.fetchTarball(&self.files, .{ .url = url, .name = "source" }, null);
+        const result = try self.fetchTarball(url);
         if (result.nar_payload) |payload| self.allocator.free(payload.bytes);
         return result.path;
+    }
+
+    fn fetchTarball(self: *Evaluator, url: []const u8) !@import("fetchers").FetchCache.TarballResult {
+        const span = if (self.progress_sink) |progress| progress.spans.beginSpan(.fetch, url) else null;
+        defer if (span) |active| active.end();
+        return self.fetchers.fetchTarball(&self.files, .{ .url = url, .name = "source" }, null);
     }
 
     pub fn isSourceDirectory(self: *Evaluator, path: []const u8) !bool {

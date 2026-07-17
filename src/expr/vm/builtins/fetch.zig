@@ -129,19 +129,6 @@ pub fn mercurialResultValue(self: *VM, name: []const u8, result: fetch_cache.Fet
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-/// Open a concurrent fetch progress span. Fetches run on
-/// whatever fiber forces them (often off the demand path), so this uses the
-/// thread-safe concurrent-span channel — its node is independent of the demand
-/// LIFO stage stack. Null (and a no-op `end`) when progress is disabled.
-pub fn fetchSpanBegin(self: *VM, subject: []const u8) ?eval_progress.Span {
-    const spans = self.progress_spans orelse return null;
-    return spans.beginSpan(subject);
-}
-
-pub fn fetchSpanEnd(self: *VM, span: ?eval_progress.Span) void {
-    if (span) |sp| if (self.progress_spans) |spans| spans.endSpan(sp);
-}
-
 const FetchCache = fetch_cache.FetchCache;
 const FileCache = file_cache.FileCache;
 
@@ -149,12 +136,11 @@ const FileCache = file_cache.FileCache;
 /// (`downloaded`/`total`) without knowing the progress types. Lives on the
 /// `offloadFetch` frame, which stays parked for the whole fetch.
 const FetchReport = struct {
-    sink: eval_progress.SpanSink,
     span: eval_progress.Span,
 
     fn report(ctx: *anyopaque, downloaded: u64, total: u64) void {
         const self: *FetchReport = @ptrCast(@alignCast(ctx));
-        self.sink.updateSpan(self.span, downloaded, total);
+        self.span.update(downloaded, total);
     }
 };
 
@@ -162,34 +148,34 @@ const FetchReport = struct {
 /// `http-connections`) while the calling fiber parks — so the compute worker is
 /// free to run other fibers instead of blocking on network/subprocess I/O. The
 /// fetch's borrowed args stay valid because the fiber stays parked for the whole
-/// call. `call` is a `FetchCache` method, e.g. `FetchCache.fetchUrl`; `span` is
-/// this fetch's progress span (download bytes are reported onto it).
-pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype, span: ?eval_progress.Span) anyerror!@typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload {
+/// call. The blocking thread opens the progress span immediately before the
+/// `FetchCache` call and closes it immediately after.
+pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload {
     const Res = @typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload;
     const Cell = struct {
         fetchers: *FetchCache,
         files: *FileCache,
         spec: @TypeOf(spec),
-        reporter: ?FetchCache.Reporter,
+        progress_spans: ?eval_progress.SpanSink,
         res: Res = undefined,
         err: ?anyerror = null,
 
         fn run(p: *anyopaque) void {
             const c: *@This() = @ptrCast(@alignCast(p));
-            c.res = call(c.fetchers, c.files, c.spec, c.reporter) catch |e| {
+            const span = if (c.progress_spans) |spans| spans.beginSpan(.fetch, c.spec.url) else null;
+            defer if (span) |active| active.end();
+            var report_store: FetchReport = undefined;
+            const reporter: ?FetchCache.Reporter = if (span) |active| blk: {
+                report_store = .{ .span = active };
+                break :blk .{ .ctx = &report_store, .report = FetchReport.report };
+            } else null;
+            c.res = call(c.fetchers, c.files, c.spec, reporter) catch |e| {
                 c.err = e;
                 return;
             };
         }
     };
-    var report_store: FetchReport = undefined;
-    const reporter: ?FetchCache.Reporter = reporter: {
-        const sink = self.progress_spans orelse break :reporter null;
-        const sp = span orelse break :reporter null;
-        report_store = .{ .sink = sink, .span = sp };
-        break :reporter .{ .ctx = &report_store, .report = FetchReport.report };
-    };
-    var cell: Cell = .{ .fetchers = self.fetchers, .files = self.files, .spec = spec, .reporter = reporter };
+    var cell: Cell = .{ .fetchers = self.fetchers, .files = self.files, .spec = spec, .progress_spans = self.progress_spans };
     if (self.executor) |executor|
         executor.runBlocking(self.fetchers.blockingPool(), Cell.run, &cell)
     else
@@ -209,9 +195,7 @@ pub fn builtinFetchGit(self: *VM, arg: Value) !Value {
     const spec = try fetchGitSpec(self, arg);
     defer spec.deinit(self.allocator);
 
-    const span = fetchSpanBegin(self, spec.url);
-    defer fetchSpanEnd(self, span);
-    const result = try offloadFetch(self, FetchCache.fetchGit, spec.borrowed(), span);
+    const result = try offloadFetch(self, FetchCache.fetchGit, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return gitResultValue(self, spec.name, result);
 }
@@ -360,9 +344,7 @@ pub fn builtinFetchurl(self: *VM, arg: Value) !Value {
         }
     }
 
-    const span = fetchSpanBegin(self, spec.url);
-    defer fetchSpanEnd(self, span);
-    const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed(), span);
+    const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     try validateFetchedSha256(self, "file", spec.url, expected_hash, result.hash);
     const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
@@ -416,9 +398,7 @@ pub fn flatFetchOutPath(self: *VM, cache_path: []const u8, hash_hex: []const u8,
         // `readFile`/`import` on the returned store path stays zero-copy.
         try self.files.provideRegular(store_path, contents);
     }
-    // The download span already represents this fetched flat file, so its
-    // eventual store write does not open a second activity.
-    try self.realization.recordFlatRecipe(store_path, contents, false);
+    try self.realization.recordFlatRecipe(store_path, contents, true);
     return store_path;
 }
 
@@ -489,13 +469,11 @@ pub fn builtinFetchTarball(self: *VM, arg: Value) !Value {
         }
     }
 
-    const span = fetchSpanBegin(self, spec.url);
-    defer fetchSpanEnd(self, span);
     const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
         .url = spec.url,
         .name = spec.name,
         .serialize_nar = expected_hash != null,
-    }, span);
+    });
     defer result.deinit(self.fetchers.allocator);
 
     if (expected_hash) |expected| {
@@ -541,15 +519,12 @@ pub fn materializePendingFetch(self: *VM, demanded_path: []const u8) !bool {
     var pending = (try self.realization.peekPendingFetch(store_root)) orelse return false;
     defer pending.deinit(self.realization.allocator);
 
-    const span = fetchSpanBegin(self, pending.url);
-    defer fetchSpanEnd(self, span);
-
     if (pending.recursive) {
         const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
             .url = pending.url,
             .name = pending.name,
             .serialize_nar = true,
-        }, span);
+        });
         defer result.deinit(self.fetchers.allocator);
         const payload = result.nar_payload orelse unreachable;
         const actual_hash = std.fmt.bytesToHex(payload.digest, .lower);
@@ -570,7 +545,7 @@ pub fn materializePendingFetch(self: *VM, demanded_path: []const u8) !bool {
     const result = try offloadFetch(self, FetchCache.fetchUrl, FetchCache.UrlSpec{
         .url = pending.url,
         .name = pending.name,
-    }, span);
+    });
     defer result.deinit(self.fetchers.allocator);
     try validateFetchedSha256(self, "file", pending.url, pending.hash_hex, result.hash);
     var contents = try self.files.retainFile(result.path);
@@ -620,9 +595,7 @@ pub fn builtinFetchMercurial(self: *VM, arg: Value) !Value {
     const spec = try fetchMercurialSpec(self, arg);
     defer spec.deinit(self.allocator);
 
-    const span = fetchSpanBegin(self, spec.url);
-    defer fetchSpanEnd(self, span);
-    const result = try offloadFetch(self, FetchCache.fetchMercurial, spec.borrowed(), span);
+    const result = try offloadFetch(self, FetchCache.fetchMercurial, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return mercurialResultValue(self, spec.name, result);
 }

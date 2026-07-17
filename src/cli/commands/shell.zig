@@ -56,7 +56,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const term = try setup.configure(&ev, init, options);
     ev.enableStoreWrites();
 
-    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress, term.log_progress, term.use_color);
+    var progress = progress_ui.EvalProgress.init(init.io, term.log_progress, term.use_color, options.verbose);
     var torn = false;
     defer if (!torn) progress.deinit(false);
     if (term.progressEnabled()) ev.setProgressSink(progress.sink());
@@ -80,7 +80,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     else
         try realizeSource(allocator, init, &ev, process.eval_release, term, options, build_sink, &out_paths);
 
-    // Tear the progress bar down before the shell/command takes over.
+    // Tear progress state down before the shell/command takes over.
     build_progress.deinit();
     ev.progressSessionEnd();
     progress.deinit(failed == null);

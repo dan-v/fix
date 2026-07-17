@@ -126,7 +126,7 @@ pub const Options = struct {
     /// Borrowed from argv; the list backing is owned (caller frees via `deinit`).
     option_overrides: std.ArrayListUnmanaged(OptionOverride) = .empty,
     color: presentation.When = .auto,
-    progress: presentation.ProgressMode = .auto,
+    progress: presentation.ProgressMode = .enabled,
     /// `fix repl --bare`: plain line-based input (no raw mode, no escape
     /// sequences), regardless of whether stdin/stdout are a terminal. The
     /// non-tty repl path is always bare; this forces it for automation.
@@ -162,7 +162,7 @@ pub const Options = struct {
     check: bool = false,
     /// `--repair`: rebuild and repair corrupted store paths (BuildMode repair).
     repair: bool = false,
-    /// `--verbose`/`-v` repeat count → daemon build-log verbosity.
+    /// `--verbose`/`-v` repeat count controls progress detail and daemon logs.
     verbose: u8 = 0,
     /// `fix switch --nixos|--darwin|--home-manager`: the activation target.
     /// `null` = auto-detect (see `switch.zig:resolveTarget`).
@@ -429,6 +429,7 @@ const realize_cmds = &[_]Cmd{ .build, .run, .shell, .@"switch" };
 /// eval can use them for IFD, while parse/find-file simply accept them as
 /// process-wide compatibility settings. Realizing commands use them directly.
 const daemon_setting_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .@"switch" };
+const verbose_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .repl, .@"switch" };
 
 const specs = [_]Spec{
     .{ .id = .expr, .short = "-E", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text; repeatable", .show_in = source_cmds },
@@ -471,14 +472,14 @@ const specs = [_]Spec{
     .{ .id = .keep_going, .short = "-k", .long = "--keep-going", .help = "keep building other derivations if one fails", .show_in = daemon_setting_cmds },
     .{ .id = .max_silent_time, .long = "--max-silent-time", .arg = .req, .metavar = "SECS", .help = "abort a build silent for SECS seconds (0 = no limit)", .show_in = daemon_setting_cmds },
     .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = daemon_setting_cmds },
-    .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase daemon build verbosity (repeatable)", .show_in = daemon_setting_cmds },
+    .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase progress detail and daemon build verbosity (repeatable)", .show_in = verbose_cmds },
     .{ .id = .no_build_output, .short = "-Q", .long = "--no-build-output", .help = "suppress builder output", .show_in = daemon_setting_cmds },
 
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error", .show_in = eval_cmds },
     .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{ .eval, .repl } },
     .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
     .{ .id = .no_color, .long = "--no-color", .help = "disable color diagnostics" },
-    .{ .id = .progress, .long = "--progress", .arg = .opt, .metavar = "log", .help = "show automatic progress; `=log` forces durable lines", .show_in = eval_cmds },
+    .{ .id = .progress, .long = "--progress", .help = "write timestamped progress records", .show_in = eval_cmds },
     .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress", .show_in = eval_cmds },
     .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC collection budget (MiB,\nor with a k/m/g suffix; 0 = never collect).\nDefault: auto, scaled to RAM.", .show_in = eval_cmds },
     .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds },
@@ -555,6 +556,17 @@ pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
         // forwards them as program arguments).
         if (std.mem.eql(u8, arg, "--")) break;
 
+        // Verbosity is conventionally clustered (`-vv`, `-vvv`). It is the
+        // only repeatable short flag, so recognize its compact spelling before
+        // ordinary exact/attached-value matching.
+        if (repeatedVerbose(arg)) |count| {
+            const verbose_spec = findShort("-v").?;
+            if (std.mem.indexOfScalar(Cmd, verbose_spec.show_in, cmd) == null)
+                return error.OptionNotValidForCommand;
+            options.verbose +|= count;
+            continue;
+        }
+
         // Match the token against the table, extracting any inline `=value`.
         var spec: ?*const Spec = null;
         var inline_value: ?[:0]const u8 = null;
@@ -620,6 +632,12 @@ pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
     }
 
     return options;
+}
+
+fn repeatedVerbose(arg: []const u8) ?u8 {
+    if (arg.len <= 2 or arg[0] != '-') return null;
+    for (arg[1..]) |byte| if (byte != 'v') return null;
+    return @intCast(@min(arg.len - 1, std.math.maxInt(u8)));
 }
 
 /// Apply a matched option to `options`. `v0`/`v1` carry the gathered values
@@ -694,7 +712,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .debugger => options.debugger = true,
         .color => options.color = if (v0) |v| (presentation.parseWhen(v) orelse return error.InvalidColorMode) else .always,
         .no_color => options.color = .never,
-        .progress => options.progress = if (v0) |v| (presentation.parseProgressMode(v) orelse return error.InvalidProgressMode) else .auto,
+        .progress => options.progress = .enabled,
         .no_progress => options.progress = .disabled,
         .gc_budget => options.gc_budget = engine.parseMemorySize(v0.?) orelse return error.InvalidGcBudget,
         .hugetlb => options.hugetlb = hugetlb.parseMode(v0.?) orelse return error.InvalidHugetlbMode,
@@ -841,7 +859,6 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.FlakesFeatureRequired => "flake inputs require the flakes experimental feature; pass --extra-experimental-features flakes",
         error.TooManySources => "provide only one expression or file",
         error.InvalidColorMode => "expected --color to be auto, always, or never",
-        error.InvalidProgressMode => "expected bare --progress or --progress=log",
         error.InvalidVmTraceFormat => "expected --vm-trace-format to be text or binary",
         error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
         error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators, fetch-tree, flakes)",
@@ -900,19 +917,21 @@ test "package list returns to ordinary option parsing" {
     try std.testing.expectEqual(presentation.ProgressMode.disabled, options.progress);
 }
 
-test "progress surface selects auto log or disabled" {
+test "progress surface selects enabled or disabled records" {
     const automatic_argv = [_][*:0]const u8{ "fix", "--progress" };
     var automatic = try parseForTest(&automatic_argv, .eval);
     defer automatic.deinit(std.testing.allocator);
-    try std.testing.expectEqual(presentation.ProgressMode.auto, automatic.progress);
+    try std.testing.expectEqual(presentation.ProgressMode.enabled, automatic.progress);
 
-    const log_argv = [_][*:0]const u8{ "fix", "--progress=log" };
-    var logged = try parseForTest(&log_argv, .eval);
-    defer logged.deinit(std.testing.allocator);
-    try std.testing.expectEqual(presentation.ProgressMode.log, logged.progress);
+    const old_log_argv = [_][*:0]const u8{ "fix", "--progress=log" };
+    try std.testing.expectError(error.UnexpectedValue, parseForTest(&old_log_argv, .eval));
+}
 
-    const invalid_argv = [_][*:0]const u8{ "fix", "--progress=always" };
-    try std.testing.expectError(error.InvalidProgressMode, parseForTest(&invalid_argv, .eval));
+test "verbosity accepts clustered short flags" {
+    const argv = [_][*:0]const u8{ "fix", "-vv" };
+    var options = try parseForTest(&argv, .eval);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 2), options.verbose);
 }
 
 test "GC budget replaces max-memory and derivation debug flags are gone" {

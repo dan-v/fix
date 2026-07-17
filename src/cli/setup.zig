@@ -36,11 +36,10 @@ pub fn workerCount(options: args.Options) !u8 {
 
 pub const Terminal = struct {
     use_color: bool,
-    show_progress: bool,
     log_progress: bool,
 
     pub fn progressEnabled(self: Terminal) bool {
-        return self.show_progress or self.log_progress;
+        return self.log_progress;
     }
 };
 
@@ -124,11 +123,10 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     try applyNixPath(ev, init, options);
 
     const use_color = presentation.shouldColor(options.color, init.io, init.environ_map);
-    const progress = presentation.progressPolicy(options.progress, init.io, init.environ_map);
+    const progress = presentation.progressPolicy(options.progress);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
     return .{
         .use_color = use_color,
-        .show_progress = progress.show,
         .log_progress = progress.log,
     };
 }

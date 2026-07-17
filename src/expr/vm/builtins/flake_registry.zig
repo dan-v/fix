@@ -52,7 +52,7 @@ fn lookupId(self: *VM, id: []const u8) !?[]u8 {
     }
     if (try lookupIn(self, "/etc/nix/registry.json", id)) |r| return r;
     if (self.fetchers.globalRegistrySpec()) |spec| {
-        const result = try fetch.offloadFetch(self, FetchCache.fetchUrl, spec, null);
+        const result = try fetch.offloadFetch(self, FetchCache.fetchUrl, spec);
         defer result.deinit(self.fetchers.allocator);
         if (try lookupIn(self, result.path, id)) |r| return r;
     } else if (self.fetchers.globalRegistryPath()) |path| {

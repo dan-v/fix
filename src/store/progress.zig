@@ -1,5 +1,17 @@
 //! Thread-safe progress capability shared by store and expression layers.
 
+/// The operation represented by a concurrent span. This is deliberately
+/// semantic rather than presentational: the CLI owns wording and color, while
+/// store/fetch code identifies the work it is actually doing.
+pub const SpanKind = enum {
+    check,
+    store,
+    fetch,
+    query,
+    build,
+    register,
+};
+
 /// Opaque handle to a concurrent progress span. It retains the sink that
 /// created it, so replacing a live sink cannot misroute an in-flight token.
 pub const Span = struct {
@@ -21,14 +33,14 @@ pub const Span = struct {
 /// thread/fiber and closed or updated on another.
 pub const SpanSink = struct {
     context: *anyopaque,
-    begin_span_fn: *const fn (*anyopaque, []const u8) usize,
+    begin_span_fn: *const fn (*anyopaque, SpanKind, []const u8) usize,
     end_span_fn: *const fn (*anyopaque, usize) void,
     update_span_fn: *const fn (*anyopaque, usize, u64, u64) void,
 
-    pub fn beginSpan(self: SpanSink, subject: []const u8) Span {
+    pub fn beginSpan(self: SpanSink, kind: SpanKind, subject: []const u8) Span {
         return .{
             .context = self.context,
-            .token = self.begin_span_fn(self.context, subject),
+            .token = self.begin_span_fn(self.context, kind, subject),
             .end_fn = self.end_span_fn,
             .update_fn = self.update_span_fn,
         };

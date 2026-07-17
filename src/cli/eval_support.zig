@@ -32,8 +32,7 @@ pub fn evaluateAndWrite(
     source: Source,
     label: []const u8,
 ) !bool {
-    // Bracket the whole run (evaluate + force + render) so the progress bar
-    // keeps an always-open "evaluating <label>" node across every phase.
+    // Bracket the whole run so progress state is cleanly scoped across inputs.
     // Values render in the same palette as diagnostics when writing to a tty.
     ev.setValueColor(use_color);
     ev.progressSessionBegin(label);
@@ -183,7 +182,7 @@ pub fn sourcePathOf(source: SourceArg, loaded: Source) ?[]const u8 {
     return loaded.abs_path;
 }
 
-/// A short human label for the progress "evaluating <label>" node.
+/// A short human label for an evaluation progress session.
 pub fn sourceLabel(source: SourceArg) []const u8 {
     return switch (source) {
         .file => |p| std.fs.path.basename(p),

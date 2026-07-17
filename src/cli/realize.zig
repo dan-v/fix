@@ -190,7 +190,7 @@ pub fn realizeMany(
     options: args.Options,
     inputs: []const BuildInput,
 ) !u8 {
-    var progress = EvalProgress.init(io, terminal.show_progress, terminal.log_progress, terminal.use_color);
+    var progress = EvalProgress.init(io, terminal.log_progress, terminal.use_color, options.verbose);
     if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
     ev.progressSessionBegin("build inputs");
     var progress_closed = false;
@@ -255,7 +255,7 @@ pub fn dryRunMany(
     options: args.Options,
     inputs: []const BuildInput,
 ) !u8 {
-    var progress = EvalProgress.init(io, terminal.show_progress, terminal.log_progress, terminal.use_color);
+    var progress = EvalProgress.init(io, terminal.log_progress, terminal.use_color, options.verbose);
     var progress_ok = false;
     defer progress.deinit(progress_ok);
     if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
@@ -325,7 +325,7 @@ pub fn realize(
     source: eval_support.Source,
     want_program: bool,
 ) !Result {
-    var progress = EvalProgress.init(io, terminal.show_progress, terminal.log_progress, terminal.use_color);
+    var progress = EvalProgress.init(io, terminal.log_progress, terminal.use_color, options.verbose);
     var torn_down = false;
     defer if (!torn_down) progress.deinit(false);
     if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());

@@ -1,17 +1,17 @@
 //! Terminal policy, styling, and synchronized stderr presentation.
 
 const std = @import("std");
+const terminal_color = @import("base").terminal_color;
 
 pub const When = enum { auto, always, never };
 
-pub const ProgressMode = enum { auto, log, disabled };
+pub const ProgressMode = enum { enabled, disabled };
 
 pub const ProgressPolicy = struct {
-    show: bool,
     log: bool,
 
     pub fn enabled(self: ProgressPolicy) bool {
-        return self.show or self.log;
+        return self.log;
     }
 };
 
@@ -19,11 +19,6 @@ pub fn parseWhen(text: []const u8) ?When {
     if (std.mem.eql(u8, text, "auto")) return .auto;
     if (std.mem.eql(u8, text, "always")) return .always;
     if (std.mem.eql(u8, text, "never")) return .never;
-    return null;
-}
-
-pub fn parseProgressMode(text: []const u8) ?ProgressMode {
-    if (std.mem.eql(u8, text, "log")) return .log;
     return null;
 }
 
@@ -55,18 +50,10 @@ pub fn autoColor(interactive: bool, env: *const std.process.Environ.Map) bool {
     return interactive and env.get("NO_COLOR") == null;
 }
 
-pub fn progressPolicy(mode: ProgressMode, io: std.Io, env: *const std.process.Environ.Map) ProgressPolicy {
-    return progressPolicyForTerminal(mode, isStderrInteractive(io, env));
-}
-
-pub fn progressPolicyForTerminal(mode: ProgressMode, interactive: bool) ProgressPolicy {
+pub fn progressPolicy(mode: ProgressMode) ProgressPolicy {
     return switch (mode) {
-        .disabled => .{ .show = false, .log = false },
-        .log => .{ .show = false, .log = true },
-        .auto => if (interactive)
-            .{ .show = true, .log = false }
-        else
-            .{ .show = false, .log = true },
+        .disabled => .{ .log = false },
+        .enabled => .{ .log = true },
     };
 }
 
@@ -81,13 +68,17 @@ pub const Style = enum {
     warning,
 };
 
-pub const Accent = enum {
-    red,
-    green,
-    yellow,
-    blue,
-    magenta,
-    cyan,
+pub const Rgb = terminal_color.Rgb;
+
+/// Semantic verb identities. Ongoing and completed spellings of the same
+/// operation deliberately share a color.
+pub const Verb = enum {
+    transform,
+    evaluate,
+    store,
+    query,
+    fetch,
+    build,
 };
 
 pub fn styleCode(use_color: bool, which: Style) []const u8 {
@@ -116,26 +107,53 @@ pub fn reset(writer: *std.Io.Writer, use_color: bool) !void {
     if (use_color) try writer.writeAll(resetCode(true));
 }
 
-pub fn accent(writer: *std.Io.Writer, use_color: bool, which: Accent, bold: bool) !void {
-    if (!use_color) return;
-    const code: u8 = switch (which) {
-        .red => '1',
-        .green => '2',
-        .yellow => '3',
-        .blue => '4',
-        .magenta => '5',
-        .cyan => '6',
-    };
-    if (bold) try writer.writeAll("\x1b[1;3") else try writer.writeAll("\x1b[3");
-    try writer.writeByte(code);
-    try writer.writeByte('m');
+/// Prefix a durable record with elapsed time and its independently colored
+/// source tag. Verb and noun colors are applied by the record writer.
+pub fn writeLogPrefix(
+    writer: *std.Io.Writer,
+    io: std.Io,
+    use_color: bool,
+    started_at: std.Io.Timestamp,
+    tag: []const u8,
+) !void {
+    const now = std.Io.Clock.awake.now(io);
+    const elapsed_ns = now.nanoseconds - started_at.nanoseconds;
+    const elapsed_ms: u64 = if (elapsed_ns <= 0) 0 else @intCast(@divFloor(elapsed_ns, std.time.ns_per_ms));
+    try style(writer, use_color, .dim);
+    try writeElapsedTimestamp(writer, elapsed_ms);
+    try reset(writer, use_color);
+    try writer.writeByte(' ');
+    try terminal_color.foreground(writer, use_color, systemColor(tag), false);
+    try writer.print("[{s}]", .{tag});
+    try reset(writer, use_color);
+    try writer.writeByte(' ');
 }
 
-pub fn stableNounAccent(noun: []const u8) Accent {
-    // Keep noun colors disjoint from the progress-verb palette so grammar is
-    // still obvious when both spans are adjacent.
-    const palette = [_]Accent{ .red, .yellow, .blue };
-    return palette[std.hash.Wyhash.hash(0, noun) % palette.len];
+fn writeElapsedTimestamp(writer: *std.Io.Writer, elapsed_ms: u64) !void {
+    try writer.print("[{d:>8}ms]", .{elapsed_ms});
+}
+
+pub fn foreground(writer: *std.Io.Writer, use_color: bool, color: Rgb, bold: bool) !void {
+    try terminal_color.foreground(writer, use_color, color, bold);
+}
+
+pub fn verbColor(verb: Verb) Rgb {
+    return terminal_color.hueColor(@intFromEnum(verb));
+}
+
+pub fn nounColor(noun: []const u8) Rgb {
+    return terminal_color.stableColor(0x6e6f_756e, noun);
+}
+
+pub fn systemColor(system: []const u8) Rgb {
+    // Keep the small, user-facing system vocabulary at deliberately separated
+    // points in the shared palette. Unknown producers still get an identity
+    // color without needing to extend this presentation layer first.
+    if (std.mem.eql(u8, system, "eval")) return terminal_color.hueColor(2);
+    if (std.mem.eql(u8, system, "daemon")) return terminal_color.hueColor(4);
+    if (std.mem.eql(u8, system, "fetch")) return terminal_color.hueColor(3);
+    if (std.mem.eql(u8, system, "build")) return terminal_color.hueColor(1);
+    return terminal_color.stableColor(0x7379_7374, system);
 }
 
 pub const Stderr = struct {
@@ -162,11 +180,13 @@ pub fn lockStderr(io: std.Io, buffer: []u8) std.Io.Cancelable!Stderr {
 test "parse terminal policy" {
     try std.testing.expectEqual(When.auto, parseWhen("auto").?);
     try std.testing.expect(parseWhen("sometimes") == null);
-    try std.testing.expectEqual(ProgressMode.log, parseProgressMode("log").?);
-    try std.testing.expect(parseProgressMode("sometimes") == null);
+    try std.testing.expect(progressPolicy(.enabled).log);
+    try std.testing.expect(!progressPolicy(.disabled).enabled());
+}
 
-    try std.testing.expect(progressPolicyForTerminal(.auto, true).show);
-    try std.testing.expect(progressPolicyForTerminal(.auto, false).log);
-    try std.testing.expect(progressPolicyForTerminal(.log, true).log);
-    try std.testing.expect(!progressPolicyForTerminal(.disabled, true).enabled());
+test "log timestamps are space-padded elapsed milliseconds" {
+    var buffer: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeElapsedTimestamp(&writer, 12);
+    try std.testing.expectEqualStrings("[      12ms]", writer.buffered());
 }

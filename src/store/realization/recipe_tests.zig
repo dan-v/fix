@@ -1,6 +1,7 @@
 const std = @import("std");
 const sync = @import("base").sync;
 const RealizationStore = @import("../realization.zig").RealizationStore;
+const store_progress = @import("../progress.zig");
 const FileCache = @import("../file_cache.zig").FileCache;
 const DaemonRuntime = @import("../daemon_runtime.zig").DaemonRuntime;
 const FakeDaemon = @import("testing/fake_daemon.zig").FakeDaemon;
@@ -35,6 +36,44 @@ fn attachFake(store: *RealizationStore, fake: *FakeDaemon) void {
     rt.pool_workers = 2;
     store.setTestRuntime(rt);
 }
+
+const ProgressRecorder = struct {
+    mu: sync.BlockingMutex = .{},
+    begun: [std.enums.values(store_progress.SpanKind).len]usize = @splat(0),
+    ended: usize = 0,
+
+    fn sink(self: *ProgressRecorder) store_progress.SpanSink {
+        return .{
+            .context = self,
+            .begin_span_fn = begin,
+            .end_span_fn = end,
+            .update_span_fn = update,
+        };
+    }
+
+    fn begin(raw: *anyopaque, kind: store_progress.SpanKind, _: []const u8) usize {
+        const self: *ProgressRecorder = @ptrCast(@alignCast(raw));
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.begun[@intFromEnum(kind)] += 1;
+        return 1;
+    }
+
+    fn end(raw: *anyopaque, _: usize) void {
+        const self: *ProgressRecorder = @ptrCast(@alignCast(raw));
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.ended += 1;
+    }
+
+    fn update(_: *anyopaque, _: usize, _: u64, _: u64) void {}
+
+    fn count(self: *ProgressRecorder, kind: store_progress.SpanKind) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.begun[@intFromEnum(kind)];
+    }
+};
 
 fn owned(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return allocator.dupe(u8, bytes);
@@ -124,6 +163,24 @@ test "recordOwnedNarRecipe consumes the original serializer allocation" {
         store.deinit();
         try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
     } else return error.MissingRecipeRegistryApi;
+}
+
+test "daemon worker spans bracket validity checks and store writes" {
+    if (comptime realizationApiAvailable()) {
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = RealizationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        var progress: ProgressRecorder = .{};
+        store.setProgressSpans(progress.sink());
+        try store.recordOwnedNarRecipe(dep_nar_path, try owned(std.testing.allocator, "nar payload"));
+
+        try store.ensureClosure(dep_nar_path);
+        try std.testing.expectEqual(@as(usize, 2), progress.count(.check));
+        try std.testing.expectEqual(@as(usize, 1), progress.count(.store));
+        try std.testing.expectEqual(@as(usize, 3), progress.ended);
+    } else return error.MissingRecipeRealizationApi;
 }
 
 test "duplicate identical NAR recipe consumes incoming allocation and preserves original" {

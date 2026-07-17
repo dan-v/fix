@@ -1,70 +1,59 @@
-//! Evaluation progress rendering for the CLI.
+//! Timestamped evaluation progress records for the CLI.
 
 const std = @import("std");
 const eval_progress = @import("expr").EvalProgress;
+const sync = @import("base").sync;
 const terminal_text = @import("base").terminal_text;
 const presentation = @import("presentation.zig");
 
 pub const EvalProgress = struct {
-    const max_active = 128;
+    const max_log_spans = 128;
+    const max_subject_len = 192;
 
-    root: std.Progress.Node,
-    io: std.Io,
-    use_color: bool,
-    log_progress: bool,
-    active: [max_active]Active = undefined,
-    active_len: usize = 0,
-    /// Always-open parent for the coarse phase spans, opened on `session_begin`.
-    /// Keeps at least one line visible during the windows where the demand path
-    /// is blocked and the stage tree would otherwise be empty.
-    run_node: ?std.Progress.Node = null,
-    /// What the demand path is currently blocked on, shown as a `waiting <loc>`
-    /// node under the run node during the windows where the stage tree is empty
-    /// (demand parked while helpers churn). The demand fiber creates it before
-    /// parking and ends it as soon as work resumes.
-    waiting: ?std.Progress.Node = null,
-    const Active = struct {
-        stage: eval_progress.Stage,
-        node: std.Progress.Node,
+    const LogSubject = struct {
+        bytes: [max_subject_len]u8 = undefined,
+        len: u8 = 0,
+
+        fn set(self: *LogSubject, subject: []const u8) void {
+            self.len = @intCast(@min(subject.len, self.bytes.len));
+            @memcpy(self.bytes[0..self.len], subject[0..self.len]);
+        }
+
+        fn get(self: *const LogSubject) []const u8 {
+            return self.bytes[0..self.len];
+        }
     };
 
-    pub fn init(io: std.Io, show_progress: bool, log_progress: bool, use_color: bool) EvalProgress {
+    const LogSpan = struct {
+        token: usize = 0,
+        kind: eval_progress.SpanKind = .fetch,
+        subject: LogSubject = .{},
+        active: bool = false,
+    };
+
+    io: std.Io,
+    started_at: std.Io.Timestamp,
+    use_color: bool,
+    log_progress: bool,
+    verbosity: u8,
+    log_span_mu: sync.BlockingMutex = .{},
+    log_spans: [max_log_spans]LogSpan = [_]LogSpan{.{}} ** max_log_spans,
+    next_log_span_token: usize = 1,
+    log_waiting: LogSubject = .{},
+
+    pub fn init(io: std.Io, log_progress: bool, use_color: bool, verbosity: u8) EvalProgress {
         return .{
             .io = io,
+            .started_at = std.Io.Clock.awake.now(io),
             .use_color = use_color,
             .log_progress = log_progress,
-            .root = std.Progress.start(io, .{
-                .root_name = "",
-                .disable_printing = !show_progress,
-                .initial_delay_ns = .fromMilliseconds(180),
-                .refresh_rate_ns = .fromMilliseconds(100),
-            }),
+            .verbosity = verbosity,
         };
     }
 
     pub fn deinit(self: *EvalProgress, success: bool) void {
-        // Defensive: a well-formed run ends via `session_end`, but tear down
-        // anything still open.
-        self.endSessionNodes();
-        std.Progress.setStatus(if (success) .success else .failure);
-        self.root.end();
-    }
-
-    /// End the run node and any dangling child nodes, and null them so the next
-    /// session (REPL) starts clean. Called from `session_end` and `deinit`.
-    fn endSessionNodes(self: *EvalProgress) void {
-        while (self.active_len != 0) {
-            self.active_len -= 1;
-            self.active[self.active_len].node.end();
-        }
-        if (self.waiting) |n| {
-            n.end();
-            self.waiting = null;
-        }
-        if (self.run_node) |n| {
-            n.end();
-            self.run_node = null;
-        }
+        _ = success;
+        self.log_waiting.len = 0;
     }
 
     pub fn sink(self: *EvalProgress) eval_progress.Sink {
@@ -79,80 +68,122 @@ pub const EvalProgress = struct {
         };
     }
 
-    /// Create a child node under the run node for a build activity (a build /
-    /// substitute / download). Caller ends it. Used by the build progress
-    /// group, which drives its own set of nodes off the daemon activity stream.
-    pub fn childNode(self: *EvalProgress, name: []const u8) std.Progress.Node {
-        const parent = self.run_node orelse self.root;
-        return parent.start(name[0..@min(name.len, std.Progress.Node.max_name_len)], 0);
+    pub fn writeLogPrefix(self: *EvalProgress, writer: *std.Io.Writer, tag: []const u8) !void {
+        return presentation.writeLogPrefix(writer, self.io, self.use_color, self.started_at, tag);
     }
 
-    /// Concurrent-span support (see `eval_progress.Span`). Each activity is a
-    /// direct child of the run node and is safe to open on one thread/fiber and
-    /// close on another. A `std.Progress.Node` is just its index, so we
-    /// round-trip it through the opaque token with no allocation.
-    fn beginSpan(context: *anyopaque, subject: []const u8) usize {
+    fn beginSpan(context: *anyopaque, kind: eval_progress.SpanKind, subject: []const u8) usize {
         const self: *EvalProgress = @ptrCast(@alignCast(context));
-        if (self.log_progress) {
-            self.writeProgressLog("processing", .cyan, subject, false);
-            return 0;
-        }
-        const node = self.childNode(subject);
-        return @intFromEnum(node.index);
+        if (!self.log_progress or !spanVisible(self.verbosity, kind)) return 0;
+        return self.beginLogSpan(kind, subject);
     }
 
     fn endSpan(context: *anyopaque, token: usize) void {
         const self: *EvalProgress = @ptrCast(@alignCast(context));
-        if (self.log_progress) return;
-        const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(token))) };
-        node.end();
+        if (self.log_progress) self.endLogSpan(token);
     }
 
-    /// Report download bytes on a fetch span. `std.Progress` renders the node as
-    /// `subject [downloaded/total]`; nodes are updated lock-free, so this is safe
-    /// from the off-demand fetch thread. `total` 0 means the size isn't known yet
-    /// (no Content-Length), leaving a bare downloaded count.
+    fn beginLogSpan(self: *EvalProgress, kind: eval_progress.SpanKind, subject: []const u8) usize {
+        self.log_span_mu.lock();
+        var started: ?LogSpan = null;
+        for (&self.log_spans) |*span| {
+            if (span.active) continue;
+            const token = self.next_log_span_token;
+            self.next_log_span_token +%= 1;
+            if (self.next_log_span_token == 0) self.next_log_span_token = 1;
+            span.* = .{ .token = token, .kind = kind, .active = true };
+            span.subject.set(subject);
+            started = span.*;
+            break;
+        }
+        self.log_span_mu.unlock();
+
+        if (started) |span| {
+            if (spanLogsStart(self.verbosity, span.kind)) self.writeProgressLog(
+                spanTag(span.kind),
+                spanVerb(span.kind),
+                spanVerbRole(span.kind),
+                span.subject.get(),
+                false,
+            );
+            return span.token;
+        }
+        return 0;
+    }
+
+    fn endLogSpan(self: *EvalProgress, token: usize) void {
+        if (token == 0) return;
+        var completed: ?LogSpan = null;
+        self.log_span_mu.lock();
+        for (&self.log_spans) |*span| {
+            if (!span.active or span.token != token) continue;
+            completed = span.*;
+            span.active = false;
+            break;
+        }
+        self.log_span_mu.unlock();
+
+        if (completed) |span| self.writeProgressLog(
+            spanTag(span.kind),
+            completedSpanVerb(span.kind),
+            spanVerbRole(span.kind),
+            span.subject.get(),
+            false,
+        );
+    }
+
+    /// Byte counters existed only to update the live tree. Durable records keep
+    /// the fetch lifecycle but intentionally do not emit per-chunk updates.
     fn updateSpan(context: *anyopaque, token: usize, downloaded: u64, total: u64) void {
-        const self: *EvalProgress = @ptrCast(@alignCast(context));
-        if (self.log_progress) return;
-        const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(token))) };
-        if (total != 0) node.setEstimatedTotalItems(@intCast(@min(total, std.math.maxInt(usize))));
-        node.setCompletedItems(@intCast(@min(downloaded, std.math.maxInt(usize))));
+        _ = context;
+        _ = token;
+        _ = downloaded;
+        _ = total;
     }
 
     fn emit(context: *anyopaque, event: eval_progress.Event) void {
         const self: *EvalProgress = @ptrCast(@alignCast(context));
-        if (self.log_progress) return self.logEvent(event);
-        switch (event) {
-            .begin => |step| self.beginStep(step),
-            .end => |step| self.endStep(step.stage),
-            .instant => |step| self.instantStep(step),
-            .wait_begin => |subject| self.beginWaiting(subject),
-            .wait_end => self.endWaiting(),
-            .count => |c| self.updateCount(c),
-            .session_begin => |label| self.sessionBegin(label),
-            .session_end => self.endSessionNodes(),
-        }
+        if (self.log_progress) self.logEvent(event);
     }
 
     fn logEvent(self: *EvalProgress, event: eval_progress.Event) void {
         switch (event) {
-            .session_begin => |label| self.writeProgressLog("evaluating", .magenta, label, false),
-            .begin, .instant => |step| self.writeProgressLog(
+            .session_begin, .count => {},
+            .session_end => self.log_waiting.len = 0,
+            .begin => |step| if (stageVisible(self.verbosity, step.stage) and stageLogsStart(self.verbosity, step.stage)) self.writeProgressLog(
+                "eval",
                 stageVerb(step.stage),
-                stageAccent(step.stage),
+                stageVerbRole(step.stage),
                 step.subject,
                 true,
             ),
-            .wait_begin => |subject| self.writeProgressLog("waiting", .yellow, subject, false),
-            .end, .wait_end, .count, .session_end => {},
+            .end, .instant => |step| if (stageVisible(self.verbosity, step.stage)) self.writeProgressLog(
+                "eval",
+                completedStageVerb(step.stage),
+                stageVerbRole(step.stage),
+                step.subject,
+                true,
+            ),
+            .wait_begin => |subject| {
+                self.log_waiting.set(subject);
+                self.writeProgressLog("eval", "waiting for", .query, subject, false);
+            },
+            .wait_end => self.logWaitEnd(),
         }
+    }
+
+    fn logWaitEnd(self: *EvalProgress) void {
+        if (self.log_waiting.len == 0) return;
+        const subject = self.log_waiting;
+        self.log_waiting.len = 0;
+        self.writeProgressLog("eval", "waited for", .query, subject.get(), false);
     }
 
     fn writeProgressLog(
         self: *EvalProgress,
+        tag: []const u8,
         verb: []const u8,
-        verb_accent: presentation.Accent,
+        verb_role: presentation.Verb,
         raw_subject: []const u8,
         basename: bool,
     ) void {
@@ -172,86 +203,18 @@ pub const EvalProgress = struct {
             presentation.reset(writer, self.use_color) catch {};
             stderr.flush() catch {};
         }
-        presentation.accent(writer, self.use_color, verb_accent, false) catch return;
+        const verb_color = presentation.verbColor(verb_role);
+        self.writeLogPrefix(writer, tag) catch return;
+        presentation.foreground(writer, self.use_color, verb_color, false) catch return;
         writer.writeAll(verb) catch return;
         presentation.reset(writer, self.use_color) catch return;
         if (clean.len != 0) {
             writer.writeByte(' ') catch return;
-            presentation.accent(writer, self.use_color, presentation.stableNounAccent(clean), true) catch return;
+            presentation.foreground(writer, self.use_color, presentation.nounColor(clean), true) catch return;
             writer.writeAll(clean) catch return;
             presentation.reset(writer, self.use_color) catch return;
         }
         writer.writeByte('\n') catch return;
-    }
-
-    /// Apply an `[completed/total]` item count to the innermost stage span (the
-    /// node the demand path is currently working under — e.g. render). Runs on
-    /// the demand/main thread, same as the stage events that own `active[]`.
-    fn updateCount(self: *EvalProgress, c: eval_progress.Count) void {
-        if (self.active_len == 0) return;
-        const node = self.active[self.active_len - 1].node;
-        node.setEstimatedTotalItems(c.total);
-        node.setCompletedItems(c.completed);
-    }
-
-    fn sessionBegin(self: *EvalProgress, label: []const u8) void {
-        if (self.run_node != null) return;
-        var buf: [std.Progress.Node.max_name_len]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "evaluating {s}", .{label}) catch "evaluating";
-        self.run_node = self.root.start(name, 0);
-    }
-
-    fn beginWaiting(self: *EvalProgress, subject: []const u8) void {
-        const run_node = self.run_node orelse return;
-        if (subject.len == 0) return;
-        var buf: [std.Progress.Node.max_name_len]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "waiting {s}", .{subject}) catch "waiting";
-        if (self.waiting) |n| {
-            n.setName(name);
-        } else {
-            self.waiting = run_node.start(name, 0);
-        }
-    }
-
-    fn endWaiting(self: *EvalProgress) void {
-        if (self.waiting) |n| n.end();
-        self.waiting = null;
-    }
-
-    fn beginStep(self: *EvalProgress, step: eval_progress.Step) void {
-        const parent = if (self.active_len != 0)
-            self.active[self.active_len - 1].node
-        else
-            (self.run_node orelse self.root);
-        const node = startStepNode(parent, step);
-        if (self.active_len >= self.active.len) {
-            node.end();
-            return;
-        }
-        self.active[self.active_len] = .{ .stage = step.stage, .node = node };
-        self.active_len += 1;
-    }
-
-    fn endStep(self: *EvalProgress, stage: eval_progress.Stage) void {
-        if (self.active_len == 0) return;
-
-        var i = self.active_len;
-        while (i > 0) {
-            i -= 1;
-            if (self.active[i].stage == stage) {
-                while (self.active_len > i) {
-                    self.active_len -= 1;
-                    self.active[self.active_len].node.end();
-                }
-                return;
-            }
-        }
-    }
-
-    fn instantStep(self: *EvalProgress, step: eval_progress.Step) void {
-        const parent = if (self.active_len == 0) self.root else self.active[self.active_len - 1].node;
-        const node = startStepNode(parent, step);
-        node.end();
     }
 };
 
@@ -268,27 +231,104 @@ fn stageVerb(stage: eval_progress.Stage) []const u8 {
     };
 }
 
-fn stageAccent(stage: eval_progress.Stage) presentation.Accent {
+fn completedStageVerb(stage: eval_progress.Stage) []const u8 {
     return switch (stage) {
-        .parse, .compile, .render => .cyan,
-        .evaluate, .import => .magenta,
-        .derivation, .store => .green,
-        .build => .magenta,
+        .parse => "parsed",
+        .compile => "compiled",
+        .evaluate => "evaluated",
+        .import => "imported",
+        .derivation => "instantiated",
+        .store => "stored",
+        .build => "built",
+        .render => "rendered",
     };
 }
 
-fn startStepNode(parent: std.Progress.Node, step: eval_progress.Step) std.Progress.Node {
-    if (step.subject.len == 0) return parent.start(eval_progress.stageName(step.stage), 0);
-    var buffer: [std.Progress.Node.max_name_len]u8 = undefined;
-    const name = std.fmt.bufPrint(&buffer, "{s} {s}", .{
-        eval_progress.stageName(step.stage),
-        std.fs.path.basename(step.subject),
-    }) catch eval_progress.stageName(step.stage);
-    return parent.start(name, 0);
+fn stageLogsStart(verbosity: u8, stage: eval_progress.Stage) bool {
+    return switch (stage) {
+        .parse, .compile, .render => false,
+        .store => verbosity >= 1,
+        .evaluate, .import, .derivation, .build => true,
+    };
 }
 
-test "logged stage verbs are actions" {
-    try std.testing.expectEqualStrings("parsing", stageVerb(.parse));
-    try std.testing.expectEqualStrings("instantiating", stageVerb(.derivation));
-    try std.testing.expectEqualStrings("rendering", stageVerb(.render));
+fn stageVisible(verbosity: u8, stage: eval_progress.Stage) bool {
+    return switch (stage) {
+        .parse, .compile => verbosity >= 2,
+        .evaluate, .import, .derivation, .store, .build, .render => true,
+    };
+}
+
+fn spanVisible(verbosity: u8, kind: eval_progress.SpanKind) bool {
+    return switch (kind) {
+        .check => verbosity >= 1,
+        .store, .fetch, .query, .build, .register => true,
+    };
+}
+
+fn spanLogsStart(verbosity: u8, kind: eval_progress.SpanKind) bool {
+    return switch (kind) {
+        .check, .register => false,
+        .store => verbosity >= 1,
+        .fetch, .query, .build => true,
+    };
+}
+
+fn spanVerb(kind: eval_progress.SpanKind) []const u8 {
+    return switch (kind) {
+        .check => "checking",
+        .store => "storing",
+        .fetch => "fetching",
+        .query => "querying",
+        .build => "building",
+        .register => "registering",
+    };
+}
+
+fn completedSpanVerb(kind: eval_progress.SpanKind) []const u8 {
+    return switch (kind) {
+        .check => "checked",
+        .store => "stored",
+        .fetch => "fetched",
+        .query => "queried",
+        .build => "built",
+        .register => "registered",
+    };
+}
+
+fn spanTag(kind: eval_progress.SpanKind) []const u8 {
+    return if (kind == .fetch) "fetch" else "daemon";
+}
+
+fn spanVerbRole(kind: eval_progress.SpanKind) presentation.Verb {
+    return switch (kind) {
+        .check, .query => .query,
+        .store, .register => .store,
+        .fetch => .fetch,
+        .build => .build,
+    };
+}
+
+fn stageVerbRole(stage: eval_progress.Stage) presentation.Verb {
+    return switch (stage) {
+        .parse, .compile, .render => .transform,
+        .evaluate, .import => .evaluate,
+        .derivation, .store => .store,
+        .build => .build,
+    };
+}
+
+test "progress verbosity filters starts and detail" {
+    try std.testing.expectEqualStrings("parsed", completedStageVerb(.parse));
+    try std.testing.expectEqualStrings("instantiated", completedStageVerb(.derivation));
+    try std.testing.expect(!stageLogsStart(0, .store));
+    try std.testing.expect(stageLogsStart(1, .store));
+    try std.testing.expect(!stageVisible(1, .parse));
+    try std.testing.expect(stageVisible(2, .parse));
+    try std.testing.expect(!spanVisible(0, .check));
+    try std.testing.expect(spanVisible(1, .check));
+    try std.testing.expect(!spanLogsStart(0, .store));
+    try std.testing.expect(spanLogsStart(1, .store));
+    try std.testing.expectEqualStrings("stored", completedSpanVerb(.store));
+    try std.testing.expectEqualStrings("fetch", spanTag(.fetch));
 }

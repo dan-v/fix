@@ -7,6 +7,7 @@
 //! closure/thunk opcodes.
 
 const std = @import("std");
+const hueColor = @import("base").terminal_color.hueColor;
 const bytecode = @import("../../bytecode.zig");
 const Chunk = bytecode.Chunk;
 const ChunkRegistry = bytecode.ChunkRegistry;
@@ -363,40 +364,6 @@ fn byteRgb(b: u8) [3]u8 {
     return hueColor(b);
 }
 
-fn hsvToRgb(h: f32, s: f32, v: f32) [3]u8 {
-    const c = v * s;
-    const hp = h / 60.0;
-    const x = c * (1.0 - @abs(@mod(hp, 2.0) - 1.0));
-    var r: f32 = 0;
-    var g: f32 = 0;
-    var bl: f32 = 0;
-    if (hp < 1.0) {
-        r = c;
-        g = x;
-    } else if (hp < 2.0) {
-        r = x;
-        g = c;
-    } else if (hp < 3.0) {
-        g = c;
-        bl = x;
-    } else if (hp < 4.0) {
-        g = x;
-        bl = c;
-    } else if (hp < 5.0) {
-        r = x;
-        bl = c;
-    } else {
-        r = c;
-        bl = x;
-    }
-    const m = v - c;
-    return .{
-        @intFromFloat(@round((r + m) * 255.0)),
-        @intFromFloat(@round((g + m) * 255.0)),
-        @intFromFloat(@round((bl + m) * 255.0)),
-    };
-}
-
 fn writeOffset(writer: *std.Io.Writer, off: usize, bg: ?[3]u8, use_color: bool) !void {
     try writer.writeAll("  ");
     if (use_color) try writer.writeAll("\x1b[2m");
@@ -422,15 +389,6 @@ fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, bg: ?[3]u8, use_color: bool
 // ---------------------------------------------------------------------------
 // Operand field rendering: one indented line per operand field
 // ---------------------------------------------------------------------------
-
-/// A legible color for sequence position `seq`. Consecutive values land a
-/// golden angle (~137.5°) apart, so neighbouring groups are always well
-/// separated — we care more about telling adjacent parts apart than about a
-/// given value always mapping to the same color.
-fn hueColor(seq: usize) [3]u8 {
-    const hue: f32 = @floatCast(@mod(@as(f64, @floatFromInt(seq)) * 137.508, 360.0));
-    return hsvToRgb(hue, 0.62, 0.99);
-}
 
 /// Every chunk has an identity color derived from its id — the same hue is used
 /// for its header title and for every reference to it, so a `chunk[0xN]` operand

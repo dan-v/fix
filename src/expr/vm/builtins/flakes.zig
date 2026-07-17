@@ -40,8 +40,6 @@ const forgeTreeSpec = fetch.forgeTreeSpec;
 const githubTreeValue = fetch.githubTreeValue;
 const fetchMercurialSpecFromAttrs = fetch.fetchMercurialSpecFromAttrs;
 const mercurialResultValue = fetch.mercurialResultValue;
-const fetchSpanBegin = fetch.fetchSpanBegin;
-const fetchSpanEnd = fetch.fetchSpanEnd;
 
 /// Dispatch entry for a direct `builtins.fetchTree` call. Gated on the
 /// `fetch-tree` experimental feature (Nix parity). `getFlake` bypasses this by
@@ -81,11 +79,6 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     const type_value = try requiredStringAttr(self, attrs_id, "type");
     defer self.allocator.free(type_value);
 
-    // One span for the whole tree fetch (the network branches below); the
-    // local `path` branch is fast, so a brief span there is harmless.
-    const span = fetchSpanBegin(self, type_value);
-    defer fetchSpanEnd(self, span);
-
     if (std.mem.eql(u8, type_value, "path")) {
         const path = try dupPathAttr(self, attrs_id, "path");
         defer self.allocator.free(path);
@@ -97,7 +90,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "file")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, null);
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed(), span);
+        const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
         defer self.allocator.free(path);
@@ -107,7 +100,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "tarball")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, "source");
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
+        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name });
         defer result.deinit(self.fetchers.allocator);
         const out = try ingestFetchedTree(self, result.path, spec.name, "", null);
         defer out.deinit(self.allocator);
@@ -117,7 +110,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "git")) {
         const spec = try fetchGitSpecFromAttrs(self, attrs_id);
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchCache.fetchGit, spec.borrowed(), span);
+        const result = try offloadFetch(self, FetchCache.fetchGit, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         return gitResultValue(self, spec.name, result);
     }
@@ -142,7 +135,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
             .metadata_head_url = spec.metadata_head_url,
             .resolved_rev = spec.rev,
             .resolved_url_template = spec.resolved_url_template,
-        }, span);
+        });
         defer result.deinit(self.fetchers.allocator);
         const out = try ingestFetchedTree(self, result.path, spec.name, spec.rev orelse "", null);
         defer out.deinit(self.allocator);
@@ -152,7 +145,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "mercurial")) {
         const spec = try fetchMercurialSpecFromAttrs(self, attrs_id);
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchCache.fetchMercurial, spec.borrowed(), span);
+        const result = try offloadFetch(self, FetchCache.fetchMercurial, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         return mercurialResultValue(self, spec.name, result);
     }

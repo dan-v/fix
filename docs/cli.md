@@ -140,7 +140,8 @@ explicit typed flake-output/installable form.
 | `--show-trace` | full evaluation traces on error |
 | `--debugger` (eval, repl) | pause into the interactive debug console at `builtins.break` and on evaluation errors; forces `--workers=1`. See [The debugger](#the-debugger). |
 | `--color[=auto\|always\|never]` / `--no-color` | color diagnostics |
-| `--progress[=log]` / `--no-progress` | automatic eval progress on stderr; `=log` forces durable lines instead of the live TTY tree |
+| `--progress` / `--no-progress` | enable / disable timestamped progress records on stderr |
+| `-v, --verbose` | increase progress detail (checks at `-v`, parse/compile at `-vv`) and daemon build verbosity |
 | `--bare` (repl) | plain line-based input: no editor, no escape sequences — for pipes and expect-style automation |
 
 ### Store links & realization (`instantiate`/`build`/`run`/`shell`)
@@ -158,7 +159,6 @@ explicit typed flake-output/installable form.
 | `-k, --keep-going` | continue with independent builds after a failure |
 | `-K, --keep-failed` | keep the build tree of failed builds |
 | `--max-silent-time SECS` / `--timeout SECS` | abort builds silent/running too long (`0` = no limit) |
-| `-v, --verbose` | increase daemon build verbosity (repeatable) |
 | `-p, --packages NAMES...` | (`shell`) packages (attr paths) from `<nixpkgs>`, e.g. `-p ripgrep jq` |
 
 ### Introspection / trace flags
