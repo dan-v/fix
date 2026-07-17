@@ -79,7 +79,7 @@ pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *std.ArrayListUn
         .float => va.asFloat() == vb.asFloat(),
         .list => try listsEqual(self, va, vb, seen),
         .attrs => try attrsEqual(self, va, vb, seen),
-        .closure => va.asObjectId() == vb.asObjectId(),
+        .closure => va.bits == vb.bits,
         .builtin => va.asBuiltinId() == vb.asBuiltinId(),
         .builtin_closure => va.asObjectId() == vb.asObjectId(),
         .partial_app => va.asObjectId() == vb.asObjectId(),

@@ -56,7 +56,7 @@ inline fn pathKey(self: *VM, target: *const ThunkTarget, kind: thunk_mod.TargetK
     return switch (kind) {
         .bytecode => target.bytecode.chunk_id,
         .closure => switch (target.closure.kind()) {
-            .closure => if (self.heap.getClosure(target.closure.asObjectId())) |cl| cl.chunk_id else |_| prof_path.other_key,
+            .closure => if (target.closure.isFunction()) target.closure.asFunctionChunkId() else if (self.heap.getClosure(target.closure.asObjectId())) |cl| cl.chunk_id else |_| prof_path.other_key,
             .builtin_closure => if (self.heap.getBuiltinClosure(target.closure.asObjectId())) |bc| prof_path.builtin_key_base + @as(u32, bc.builtin_id) else |_| prof_path.other_key,
             .builtin => prof_path.builtin_key_base + @as(u32, target.closure.asBuiltinId()),
             else => prof_path.other_key,
@@ -1069,8 +1069,7 @@ fn runBytecodeChunk(self: *VM, ch: *const Chunk, chunk_id: ChunkId, upvalues: []
 pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
     switch (closure_val.kind()) {
         .closure => {
-            const closure_id = closure_val.asObjectId();
-            const closure = try closures.getClosureById(self, closure_id);
+            const closure = try closures.closureRef(self, closure_val);
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
             return closures.runIsolatedFrame(self, ch, closure.chunk_id, 0, closure.upvalues, false);
         },
@@ -1174,8 +1173,8 @@ inline fn recordCreateForClosure(self: *VM, id: ObjectId, closure: Value) void {
             .builtin_closure => .builtin_closure,
             else => .closure,
         };
-        const ckid: ?types.ChunkId = if (closure.isClosure()) blk: {
-            const c = self.heap.getClosure(closure.asObjectId()) catch break :blk null;
+        const ckid: ?types.ChunkId = if (closure.isNixClosure()) blk: {
+            const c = closures.closureRef(self, closure) catch break :blk null;
             break :blk c.chunk_id;
         } else null;
         const creator = creatorFrame(self);

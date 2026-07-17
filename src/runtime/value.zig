@@ -71,6 +71,9 @@ const qnan_prefix_mask: u64 = qnan_prefix;
 const high_16_mask: u64 = 0xFFFF_0000_0000_0000;
 
 const payload_mask: u64 = 0x0000_FFFF_FFFF_FFFF;
+/// Within the closure primary tag, bit 47 distinguishes a capture-free
+/// function (payload = ChunkId) from a heap closure (payload = ObjectId).
+const function_marker: u64 = 1 << 47;
 
 // Primary tags (3 bits, shifted into bits 50:48).
 const tag_int: u64 = 0;
@@ -189,6 +192,10 @@ pub const Value = extern struct {
         return tagged(tag_closure, id);
     }
 
+    pub fn function(chunk_id: types.ChunkId) Value {
+        return tagged(tag_closure, function_marker | chunk_id);
+    }
+
     pub fn thunk(id: ObjectId) Value {
         return tagged(tag_thunk, id);
     }
@@ -280,7 +287,15 @@ pub const Value = extern struct {
     }
 
     pub fn isClosure(self: Value) bool {
-        return (self.bits & high_16_mask) == tagPrefix(tag_closure);
+        return (self.bits & high_16_mask) == tagPrefix(tag_closure) and (self.rawPayload() & function_marker) == 0;
+    }
+
+    pub fn isFunction(self: Value) bool {
+        return (self.bits & high_16_mask) == tagPrefix(tag_closure) and (self.rawPayload() & function_marker) != 0;
+    }
+
+    pub fn isNixClosure(self: Value) bool {
+        return self.isClosure() or self.isFunction();
     }
 
     inline fn isMiscSub(self: Value, sub: u64) bool {
@@ -345,6 +360,12 @@ pub const Value = extern struct {
     }
 
     pub fn asObjectId(self: Value) ObjectId {
+        std.debug.assert(!self.isFunction());
+        return @intCast(self.bits & 0xFFFF_FFFF);
+    }
+
+    pub fn asFunctionChunkId(self: Value) types.ChunkId {
+        std.debug.assert(self.isFunction());
         return @intCast(self.bits & 0xFFFF_FFFF);
     }
 
@@ -454,6 +475,15 @@ test "value: misc-tag variants" {
     const cs = Value.contextString(@as(ObjectId, 7));
     try std.testing.expect(cs.isContextString());
     try std.testing.expectEqual(@as(ObjectId, 7), cs.asObjectId());
+}
+
+test "value: capture-free function uses the closure tag without an object id" {
+    const f = Value.function(1234);
+    try std.testing.expect(f.isFunction());
+    try std.testing.expect(f.isNixClosure());
+    try std.testing.expect(!f.isClosure());
+    try std.testing.expectEqual(ValueType.closure, f.kind());
+    try std.testing.expectEqual(@as(types.ChunkId, 1234), f.asFunctionChunkId());
 }
 
 test "value: idEq compares scalars and objects by bits, floats by IEEE" {

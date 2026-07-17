@@ -12,8 +12,8 @@ const BuiltinId = @import("runtime").builtins.BuiltinId;
 /// speculative instance of its chunk? (Test-and-set — call at most once
 /// per submission, only when the knob is on.)
 pub fn isNovelClosureChunk(self: *VM, closure: Value) bool {
-    if (!closure.isClosure()) return false;
-    const c = self.heap.getClosure(closure.asObjectId()) catch return false;
+    if (!closure.isNixClosure()) return false;
+    const c = @import("closures.zig").closureRef(self, closure) catch return false;
     return self.registry.markSpecSubmitted(c.chunk_id);
 }
 
@@ -41,7 +41,7 @@ pub fn isSpeculatableClosureChunk(self: *VM, closure: Value) bool {
     // The eligibility bit is pre-computed at chunk registration time
     // (see Chunk.speculatable); read it from the registry's dense slot
     // rather than dereferencing the heap-scattered Chunk.
-    const c = self.heap.getClosure(closure.asObjectId()) catch return false;
+    const c = @import("closures.zig").closureRef(self, closure) catch return false;
     const slot = self.registry.slot(c.chunk_id) orelse return false;
     return slot.body_is_substantial;
 }
@@ -69,7 +69,7 @@ pub fn isSpeculatableBuiltinClosure(self: *VM, closure: Value) bool {
 }
 
 pub inline fn isSpeculatableMapFunc(self: *VM, func: Value) bool {
-    if (func.isClosure()) return isSpeculatableClosureChunk(self, func);
+    if (func.isNixClosure()) return isSpeculatableClosureChunk(self, func);
     if (func.isBuiltin()) return isExpensiveBuiltin(@enumFromInt(func.asBuiltinId()));
     return false;
 }

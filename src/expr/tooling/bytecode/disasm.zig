@@ -838,7 +838,10 @@ fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
         .path => lineStringRef(l, "path", value.asInternId(), symbols, max),
         .list => l.storeRef("list", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
         .attrs => l.storeRef("attrs", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
-        .closure => l.storeRef("closure", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .closure => if (value.isFunction())
+            l.storeRef("function", objColor(value.asFunctionChunkId()), "0x{x}", .{value.asFunctionChunkId()})
+        else
+            l.storeRef("closure", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
         .thunk => l.storeRef("thunk", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
         .builtin => {
             const bid = value.asBuiltinId();
@@ -1825,7 +1828,10 @@ fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max:
         .path => try writeStringRef(writer, "path", value.asInternId(), symbols, max, use_color),
         .list => try writeStoreRefText(writer, "list", value.asObjectId(), heapColor(value.asObjectId()), use_color),
         .attrs => try writeStoreRefText(writer, "attrs", value.asObjectId(), heapColor(value.asObjectId()), use_color),
-        .closure => try writeStoreRefText(writer, "closure", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .closure => if (value.isFunction())
+            try writeStoreRefText(writer, "function", value.asFunctionChunkId(), objColor(value.asFunctionChunkId()), use_color)
+        else
+            try writeStoreRefText(writer, "closure", value.asObjectId(), heapColor(value.asObjectId()), use_color),
         .thunk => try writeStoreRefText(writer, "thunk", value.asObjectId(), heapColor(value.asObjectId()), use_color),
         .builtin => {
             const bid = value.asBuiltinId();

@@ -390,7 +390,7 @@ fn writeXmlAttrs(
 /// to a self-closing `<function />` when the chunk carries no pattern (never
 /// happens for real lambdas, but keeps non-lambda closures well-formed).
 fn writeXmlFunction(self: *VM, writer: *std.Io.Writer, value: Value, depth: usize) !void {
-    const closure = try self.heap.getClosure(value.asObjectId());
+    const closure = try @import("../closures.zig").closureRef(self, value);
     const ch = self.registry.get(closure.chunk_id) orelse {
         try writer.writeAll("<function />\n");
         return;

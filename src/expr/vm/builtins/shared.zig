@@ -119,8 +119,8 @@ pub const NameIndex = struct {
 /// this fast path only handles the closure case.) Used by `map`/`genList`
 /// (lists) and `mapAttrs` (attrsets).
 pub fn isSpeculatableUserFunc(self: *VM, func: Value) bool {
-    if (!func.isClosure()) return false;
-    const closure = self.heap.getClosure(func.asObjectId()) catch return false;
+    if (!func.isNixClosure()) return false;
+    const closure = @import("../closures.zig").closureRef(self, func) catch return false;
     const slot = self.registry.slot(closure.chunk_id) orelse return false;
     return slot.body_is_substantial;
 }

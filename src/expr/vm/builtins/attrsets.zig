@@ -223,9 +223,9 @@ pub fn builtinFunctionArgs(self: *VM, arg: Value) !Value {
     if (func.isBuiltin() or func.isBuiltinClosure() or func.isPartialApp()) {
         return Value.attrs(try self.heap.addAttrs(&.{}));
     }
-    if (!func.isClosure()) return vm_trace.typeErrorExpected(self, "a function", func);
+    if (!func.isNixClosure()) return vm_trace.typeErrorExpected(self, "a function", func);
 
-    const closure = try self.heap.getClosure(func.asObjectId());
+    const closure = try vm_closures.closureRef(self, func);
     const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
     // Carry the formals' source positions so unsafeGetAttrPos works on the
     // result (Nix records a parameter's declaration site).

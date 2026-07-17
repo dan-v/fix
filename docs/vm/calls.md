@@ -10,13 +10,13 @@ A call applies a **callee** value to arguments. Five callee kinds:
 
 | kind | apply behavior |
 |---|---|
-| **closure** | `ObjectId → { chunk_id, upvalues }` (see [runtime/heap.md](../runtime/heap.md)). Runs the chunk body in a frame. |
+| **function / closure** | A capture-free function stores its `ChunkId` directly in `Value`; a captured closure is `ObjectId → { chunk_id, upvalues }` (see [runtime/heap.md](../runtime/heap.md)). Both run the chunk body in a frame. |
 | **PartialApp** | an under-applied uncurried closure: `{ func, accumulated_args }`. Extended or saturated by the next arg. |
 | **builtin** | a primop id; `applyBuiltin(id, args)` (see [builtins.md](builtins.md)). |
 | **builtin_closure** | a primop pre-bound to leading args (`{ builtin_id, args }`); appends the new arg and applies. |
 | **attrs with `__functor`** | callable attrset: fetch `.__functor`, then apply *it* to the attrset itself, then apply the original arg (one extra call level). |
 
-Closures are **immutable**: `closure`/`closure_captures` snapshot the upvalue *values* at creation. There is no re-readable reference to an outer slot — a later shadow of a captured name cannot change what the closure sees (Nix has no mutation; "rebind" is scope shadowing).
+Captured closures are **immutable**: `closure_captures` snapshots the upvalue *values* at creation. A zero-capture `closure` instruction instead pushes the immediate function value and performs no heap allocation. There is no re-readable reference to an outer slot — a later shadow of a captured name cannot change what the closure sees (Nix has no mutation; "rebind" is scope shadowing).
 
 ## Currying and uncurrying
 

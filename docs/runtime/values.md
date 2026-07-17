@@ -25,7 +25,7 @@ The tagged prefix is sign=1 with the full exponent and the quiet-NaN bit set (`q
 
 ## Value kinds
 
-`ValueType` (the surface of `kind()`) enumerates: `null`, `bool_false`, `bool_true`, `int`, `float`, `string` (InternId), `path` (InternId), `list`, `attrs`, `closure`, `thunk`, `builtin` (u16 id), `builtin_closure`, `string_context`, `boxed_int`, `partial_app`. Booleans are two distinct sub-tag slots — `isBool` checks both; `asBool` tests the `true` slot. `null`, `bool_false`, `bool_true`, and `builtin` are pure immediates (no heap object). All ref kinds index the [object heap](heap.md); `string`/`path` index the [intern table](interning.md).
+`ValueType` (the surface of `kind()`) enumerates: `null`, `bool_false`, `bool_true`, `int`, `float`, `string` (InternId), `path` (InternId), `list`, `attrs`, `closure`, `thunk`, `builtin` (u16 id), `builtin_closure`, `string_context`, `boxed_int`, `partial_app`. Booleans are two distinct sub-tag slots — `isBool` checks both; `asBool` tests the `true` slot. `null`, `bool_false`, `bool_true`, and `builtin` are pure immediates (no heap object). The `closure` primary tag is split by payload bit 47: capture-free functions store their `ChunkId` directly (`isFunction`), while captured closures store an `ObjectId` (`isClosure`). Other ref kinds index the [object heap](heap.md); `string`/`path` index the [intern table](interning.md).
 
 `partial_app` is the under-saturated result of applying an uncurried (arity>1) closure — it presents as a function (`typeOf → "lambda"`, callable) and its payload is an ObjectId into a `partial_app` heap slot.
 
@@ -46,9 +46,9 @@ Arithmetic can produce NaNs whose bit pattern lands anywhere in qNaN space — i
 
 ## Constructors / discriminators / accessors
 
-- Construct: `int` / `float` / `string` / `path` / `list` / `attrs` / `closure` / `thunk` / `boolVal` / `null_val` / `builtin` / `builtinClosure` / `contextString` / `boxedInt` / `partialApp`.
-- Discriminate: `kind()` (full `ValueType`); fast predicates `isInt`/`isFloat`/`isString`/`isPath`/`isList`/`isAttrs`/`isThunk`/`isClosure`/`isBuiltin`/`isBuiltinClosure`/`isContextString`/`isBoxedInt`/`isPartialApp`/`isNull`/`isBool`.
-- Access: `asInt` / `asFloat` / `asInternId` / `asObjectId` / `asBuiltinId` / `asBool`. `asInt` and `asFloat` assert their kind in debug; `asInternId`/`asObjectId`/`asBuiltinId`/`asBool` only mask the payload with no kind check, so the caller must have already discriminated.
+- Construct: `int` / `float` / `string` / `path` / `list` / `attrs` / `function` / `closure` / `thunk` / `boolVal` / `null_val` / `builtin` / `builtinClosure` / `contextString` / `boxedInt` / `partialApp`.
+- Discriminate: `kind()` (full `ValueType`); fast predicates `isInt`/`isFloat`/`isString`/`isPath`/`isList`/`isAttrs`/`isThunk`/`isFunction`/`isClosure`/`isNixClosure`/`isBuiltin`/`isBuiltinClosure`/`isContextString`/`isBoxedInt`/`isPartialApp`/`isNull`/`isBool`.
+- Access: `asInt` / `asFloat` / `asInternId` / `asObjectId` / `asFunctionChunkId` / `asBuiltinId` / `asBool`. Callers must discriminate first; in particular, a `kind() == .closure` value may be either a direct function chunk or an object-backed captured closure.
 
 ## Identity: `idEq` / `idHash`
 

@@ -35,6 +35,7 @@ pub fn Adapter(comptime Evaluator: type) type {
         }
 
         pub fn closure(self: Self, value: Value) !runtime.heap.Closure {
+            if (value.isFunction()) return .{ .chunk_id = value.asFunctionChunkId(), .upvalues = &.{} };
             return self.ev.heap.getClosure(value.asObjectId());
         }
 

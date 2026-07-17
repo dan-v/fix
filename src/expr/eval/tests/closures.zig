@@ -60,6 +60,25 @@ test "a closure captures its upvalue's value at creation time, unaffected by a l
     try std.testing.expectEqual(@as(i64, 1), result.asInt());
 }
 
+test "capture-free lambdas are immediate functions while captured lambdas use heap closures" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const plain = try ev.evaluate("x: x");
+    try std.testing.expect(plain.isFunction());
+    try std.testing.expect(!plain.isClosure());
+
+    const attrs = try ev.evaluate("{ x }: x");
+    try std.testing.expect(attrs.isFunction());
+
+    const captured = try ev.evaluate("let y = 1; in x: x + y");
+    try std.testing.expect(captured.isClosure());
+    try std.testing.expect(!captured.isFunction());
+
+    const applied = try ev.evaluate("(x: x + 1) 4");
+    try std.testing.expectEqual(@as(i64, 5), applied.asInt());
+}
+
 test "doCall/doCallN: a curried multi-arg lambda is callable after a partial application" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

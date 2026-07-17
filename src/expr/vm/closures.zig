@@ -41,10 +41,23 @@ pub fn getClosureById(self: *VM, closure_id: ObjectId) !Closure {
 }
 
 pub fn makeClosure(self: *VM, chunk_id: ChunkId, upvalue_count: u16) !void {
+    if (upvalue_count == 0) return stack.push(self, Value.function(chunk_id));
     const start = self.sp - upvalue_count;
     const id = try self.heap.addClosure(chunk_id, self.stack[start..self.sp]);
     self.sp = start;
     try stack.push(self, Value.closure(id));
+}
+
+pub const ClosureRef = struct {
+    chunk_id: ChunkId,
+    upvalues: []const Value,
+};
+
+pub inline fn closureRef(self: *VM, value: Value) !ClosureRef {
+    if (value.isFunction()) return .{ .chunk_id = value.asFunctionChunkId(), .upvalues = &.{} };
+    if (!value.isClosure()) return error.NotCallable;
+    const closure = try getClosureById(self, value.asObjectId());
+    return .{ .chunk_id = closure.chunk_id, .upvalues = closure.upvalues };
 }
 
 pub fn stageCaptureDescriptors(self: *VM, descriptors: []const u8, frame: *const Frame) !u16 {
@@ -186,8 +199,8 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
 /// keep the lazy thunk. Cheap: one closure load + one chunk lookup, both
 /// of which `doCall` performs again immediately after.
 pub fn calleeForcesArg(self: *VM, callee: Value) bool {
-    if (!callee.isClosure()) return false;
-    const cl = self.heap.getClosure(callee.asObjectId()) catch return false;
+    if (!callee.isNixClosure()) return false;
+    const cl = closureRef(self, callee) catch return false;
     const slot = self.registry.slot(cl.chunk_id) orelse return false;
     if (slot.strict_param) return true;
     // Forwarding `x: f x`: forces x iff the captured `f` (an upvalue we
@@ -196,8 +209,8 @@ pub fn calleeForcesArg(self: *VM, callee: Value) bool {
     if (slot.strict_via_upvalue) |idx| {
         if (idx < cl.upvalues.len) {
             const f = cl.upvalues[idx];
-            if (f.isClosure()) {
-                const fcl = self.heap.getClosure(f.asObjectId()) catch return false;
+            if (f.isNixClosure()) {
+                const fcl = closureRef(self, f) catch return false;
                 const fslot = self.registry.slot(fcl.chunk_id) orelse return false;
                 return fslot.strict_param;
             }
@@ -412,9 +425,8 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
     defer force.rootsEnd(self, gc_roots);
     force.rootKeep(self, callee);
     force.rootKeep(self, arg);
-    if (callee.isClosure()) {
-        const closure_id = callee.asObjectId();
-        const closure = try getClosureById(self, closure_id);
+    if (callee.isNixClosure()) {
+        const closure = try closureRef(self, callee);
         const ch = try closureChunkViaIC(self, closure.chunk_id);
         if (ch.arity != 1) {
             // Uncurried closure, one arg supplied → under-applied PAP.
@@ -444,7 +456,7 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
 /// as a normal `call` would).
 fn applyToPartial(self: *VM, pap: Value, arg: Value) !void {
     const pa = try self.heap.getPartialApp(pap.asObjectId());
-    const closure = try getClosureById(self, pa.func.asObjectId());
+    const closure = try closureRef(self, pa.func);
     const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
     const have: u16 = @intCast(pa.args.len);
     if (have + 1 < ch.arity) {
@@ -477,8 +489,7 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
     while (true) {
         switch (current.kind()) {
             .closure => {
-                const closure_id = current.asObjectId();
-                const closure = try getClosureById(self, closure_id);
+                const closure = try closureRef(self, current);
                 const ch = try closureChunkViaIC(self, closure.chunk_id);
                 if (ch.arity != 1) {
                     // Uncurried closure, one arg → under-applied PAP value.
@@ -602,8 +613,8 @@ fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId
 pub fn doCallN(self: *VM, n: u16) !void {
     const base = self.sp - n;
     const callee = self.stack[base - 1];
-    if (callee.isClosure()) {
-        const closure = try getClosureById(self, callee.asObjectId());
+    if (callee.isNixClosure()) {
+        const closure = try closureRef(self, callee);
         const ch = try closureChunkViaIC(self, closure.chunk_id);
         if (ch.arity == n) {
             // Saturated: drop the callee from below the args (shift the
@@ -661,8 +672,8 @@ pub fn doCallN(self: *VM, n: u16) !void {
 pub fn doTailCallN(self: *VM, n: u16) !void {
     const base = self.sp - n;
     const callee = self.stack[base - 1];
-    if (callee.isClosure()) {
-        const closure = try getClosureById(self, callee.asObjectId());
+    if (callee.isNixClosure()) {
+        const closure = try closureRef(self, callee);
         const ch = try closureChunkViaIC(self, closure.chunk_id);
         if (ch.arity == n) {
             try forceStrictArgs(self, ch, base, n);
@@ -702,9 +713,8 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
     defer force.rootsEnd(self, gc_roots);
     force.rootKeep(self, callee);
     force.rootKeep(self, arg);
-    if (callee.isClosure()) {
-        const closure_id = callee.asObjectId();
-        const closure = try getClosureById(self, closure_id);
+    if (callee.isNixClosure()) {
+        const closure = try closureRef(self, callee);
         const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
         if (ch.arity != 1) {
             // Uncurried closure, one arg → under-applied PAP value.
@@ -735,7 +745,7 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
 /// args and return its value.
 fn callValuePartial(self: *VM, pap: Value, arg: Value) anyerror!Value {
     const pa = try self.heap.getPartialApp(pap.asObjectId());
-    const closure = try getClosureById(self, pa.func.asObjectId());
+    const closure = try closureRef(self, pa.func);
     const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
     var buf: [max_uncurry_arity]Value = undefined;
     @memcpy(buf[0..pa.args.len], pa.args);

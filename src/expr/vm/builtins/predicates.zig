@@ -23,7 +23,7 @@ pub fn builtinIsBool(self: *VM, arg: Value) !Value {
 
 pub fn builtinIsFunction(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    return Value.boolVal(value.isClosure() or value.isBuiltin() or value.isBuiltinClosure() or value.isPartialApp());
+    return Value.boolVal(value.isNixClosure() or value.isBuiltin() or value.isBuiltinClosure() or value.isPartialApp());
 }
 
 pub fn builtinTypeOf(self: *VM, arg: Value) !Value {

@@ -158,7 +158,7 @@ fn critChunkLoc(self: *VM, chunk_id: ChunkId) timeline.Subject {
 fn critClosureLabel(self: *VM, cv: Value, buf: []u8) timeline.Subject {
     return switch (cv.kind()) {
         .closure => blk: {
-            const cl = self.heap.getClosure(cv.asObjectId()) catch break :blk .{};
+            const cl = @import("closures.zig").closureRef(self, cv) catch break :blk .{};
             break :blk critChunkLoc(self, cl.chunk_id);
         },
         .builtin_closure => blk: {
