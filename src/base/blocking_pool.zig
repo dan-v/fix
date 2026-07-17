@@ -1,7 +1,7 @@
-//! Fixed worker pool for evaluator-owned blocking work.
+//! Generic fixed worker pool for blocking work.
 
 const std = @import("std");
-const sync = @import("base").sync;
+const sync = @import("sync.zig");
 
 pub const WorkFn = *const fn (context: *anyopaque) void;
 

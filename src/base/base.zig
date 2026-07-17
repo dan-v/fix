@@ -22,12 +22,14 @@ pub const block_cache = @import("block_cache.zig");
 pub const hugetlb = @import("hugetlb.zig");
 pub const arena = @import("arena.zig");
 pub const worker_id = @import("worker_id.zig");
+pub const blocking_pool = @import("blocking_pool.zig");
 
 // Common flat re-exports for the most-used types.
 pub const Deque = deque.Deque;
 pub const GrowableDeque = deque.GrowableDeque;
 pub const Isolated = cache_line.Isolated;
 pub const Fiber = fiber.Fiber;
+pub const BlockingPool = blocking_pool.BlockingPool;
 
 test {
     _ = deque;
@@ -42,4 +44,5 @@ test {
     _ = hugetlb;
     _ = arena;
     _ = worker_id;
+    _ = blocking_pool;
 }

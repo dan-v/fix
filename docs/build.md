@@ -10,7 +10,7 @@ The build-module graph follows independently reusable or consumed groups. Within
 
 | Module | Facade | Imports | Notes |
 |---|---|---|---|
-| `base` | `src/base/base.zig` | `base_options` | generic containers, fibers, synchronization, allocators, clocks, memory backing |
+| `base` | `src/base/base.zig` | `base_options` | generic containers, fibers, synchronization, blocking pools, allocators, clocks, memory backing |
 | `syntax` | `src/syntax/syntax.zig` | `base`, `parser_tables` | independently consumed lexer, parser, and AST |
 | `runtime` | `src/runtime/runtime.zig` | `build_options`, `base` | value model, heap, interning, thunk/Future, GC, memory tags |
 | `fetchers` | `src/fetchers/root.zig` | `base`, `runtime`, libcurl, libgit2 | file/source cache, forge planning, remote transports, fetched-tree NAR serialization |

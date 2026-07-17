@@ -24,7 +24,7 @@ pub fn parkFuture(future: *future_mod.Future) bool {
     return true;
 }
 
-const BlockingPool = @import("fetchers").BlockingPool;
+const BlockingPool = @import("base").BlockingPool;
 
 pub fn runBlocking(pool: ?*BlockingPool, work: port.BlockingFn, work_ctx: *anyopaque) void {
     const inner = fiber_mod.currentFiber() orelse {

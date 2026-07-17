@@ -11,7 +11,7 @@ const FileCache = @import("file_cache.zig").FileCache;
 const sync = @import("base").sync;
 const curl_transport = @import("curl_transport.zig");
 const git_transport = @import("git_transport.zig");
-const BlockingPool = @import("blocking_pool.zig").BlockingPool;
+const BlockingPool = @import("base").BlockingPool;
 const forge_mod = @import("forge.zig");
 
 /// Download-staging cache under `$XDG_CACHE_HOME/fix` (default `~/.cache/fix`,

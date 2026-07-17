@@ -36,7 +36,7 @@ The source tree has six durable module groups. `base`, `syntax`, and `runtime` a
 ```
 src/base/       base → base_options
                 Generic containers, synchronization, fibers, allocators,
-                clocks, and memory backing.
+                blocking pools, clocks, and memory backing.
 
 src/syntax/     syntax → base, parser_tables
                 Scanner, parser, AST; independently benchmarked.

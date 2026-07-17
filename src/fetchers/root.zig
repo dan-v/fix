@@ -7,11 +7,9 @@ pub const forge = @import("forge.zig");
 pub const nar = @import("nar.zig");
 pub const curl_transport = @import("curl_transport.zig");
 pub const git_transport = @import("git_transport.zig");
-pub const blocking_pool = @import("blocking_pool.zig");
 
 pub const FileCache = file_cache.FileCache;
 pub const FetchCache = fetch_cache.FetchCache;
-pub const BlockingPool = blocking_pool.BlockingPool;
 
 test {
     _ = FileCache;
@@ -20,5 +18,4 @@ test {
     _ = nar;
     _ = curl_transport;
     _ = git_transport;
-    _ = BlockingPool;
 }
