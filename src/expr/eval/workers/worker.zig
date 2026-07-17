@@ -142,6 +142,10 @@ pub const WorkerFiber = struct {
     /// on first run; nil'd before processing so a recycled fiber sees a
     /// fresh assignment on its next reset.
     current_task: ?Task,
+    /// Non-null only for a member of a multi-entry demand run. Published from
+    /// `runFiber` after the entry has fully returned and the fiber is recycled,
+    /// so the driver can safely tear evaluation state down at the count limit.
+    top_completion: ?*std.atomic.Value(usize) = null,
     /// Timeline (`--timeline`): flow-arrow id for a STOLEN task's quantum,
     /// so the run emits a `flowIn` matching the steal's `flowOut` (→ a
     /// victim→stealer arrow). Set by `drainStep` (0 = not stolen / no arrow);
@@ -404,9 +408,9 @@ pub const Worker = struct {
         const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
         const top = try self.acquireFreeFiber();
         top.current_task = null;
-        // Dress the top fiber's execution context — the ONE demand-role
-        // write site. Its blocking waits are the critical path, and the
-        // demand-only progress handles exist only here (helpers' ctxs stay
+        // Dress the top fiber's execution context — the single-entry
+        // demand-role write site. Its blocking waits are the critical path,
+        // and the demand-only progress handles exist only here (helpers' ctxs stay
         // null, which is what makes an off-demand stage emit
         // inexpressible). `runFiber`'s finished arm resets the role.
         top.ctx.is_demand = true;
@@ -439,6 +443,66 @@ pub const Worker = struct {
         // background work; this thread spins through ready fibers and
         // returns). Flush so its timing is visible to schedulerStats()
         // callers before the evaluator deinits.
+        self.flushTimingToScheduler();
+    }
+
+    pub const TopLevelEntry = struct {
+        entry: fiber_mod.EntryFn,
+        arg: *anyopaque,
+    };
+
+    /// Drive several independent demanded entries at once. Each gets its own
+    /// demand fiber and is queued onto a different worker when possible. The
+    /// multi-entry path deliberately omits the single-writer stage/progress-wait
+    /// handles; concurrent demand fibers still report through the thread-safe
+    /// span channel.
+    pub fn runTopLevels(self: *Worker, entries: []const TopLevelEntry) !void {
+        if (entries.len == 0) return;
+        worker_id_mod.current = self.worker_id;
+        worker_id_mod.is_worker = true;
+        vm_force.gcRegisterWorkerCaches(self.worker_id);
+        self.scheduler.setSuppressBackground(false);
+
+        var completed: std.atomic.Value(usize) = .init(0);
+        const tops = try self.allocator.alloc(*WorkerFiber, entries.len);
+        defer self.allocator.free(tops);
+
+        var acquired: usize = 0;
+        errdefer for (tops[0..acquired]) |top| self.pushFree(top);
+        for (tops) |*slot| {
+            slot.* = try self.acquireFreeFiber();
+            acquired += 1;
+        }
+
+        for (entries, tops) |entry, top| {
+            top.current_task = null;
+            top.top_completion = &completed;
+            top.ctx.is_demand = true;
+            top.ctx.parallel_demand = true;
+            top.ctx.progress_stage = null;
+            top.ctx.progress_wait = null;
+            top.inner.reset(entry.entry, entry.arg);
+            if (comptime census_on) {
+                self.census.tasks += 1;
+                prof.fiberLiveInc();
+            }
+            top.state = .running;
+        }
+
+        // Publish only after every entry owns a fiber, so a very small first
+        // input cannot recycle its fiber into a later slot before setup ends.
+        for (tops, 0..) |top, i| {
+            const target: u8 = @intCast(i % @as(usize, self.scheduler.worker_count));
+            self.scheduler.enqueueReady(target, &top.ready_node);
+        }
+
+        while (completed.load(.acquire) != entries.len or self.anyFiberSuspended()) {
+            self.gcSafepoint();
+            if (completed.load(.acquire) == entries.len) self.scheduler.setSuppressBackground(true);
+            if (self.drainStep() catch false) continue;
+            self.parkAndAccount();
+        }
+        self.scheduler.setSuppressBackground(true);
         self.flushTimingToScheduler();
     }
 
@@ -641,6 +705,8 @@ pub const Worker = struct {
                 // resumed a stolen fiber. Nudge the owning worker so
                 // its `runTopLevel` loop observes the completion (it
                 // may be parked waiting on this very fiber).
+                const top_completion = f.top_completion;
+                f.top_completion = null;
                 f.ctx.resetRole(); // clear the demand role before recycle (else a reused fiber mislabels)
                 if (comptime census_on) {
                     self.census.finished += 1;
@@ -655,6 +721,7 @@ pub const Worker = struct {
                 f.state = .free;
                 f.recycleScratch();
                 f.worker.pushFree(f);
+                if (top_completion) |counter| _ = counter.fetchAdd(1, .release);
                 if (f.worker != self) f.worker.nudge();
             },
             .suspended => {
@@ -822,6 +889,7 @@ pub const Worker = struct {
             .in_runfiber = .init(0),
             .run_mu = .{},
             .current_task = null,
+            .top_completion = null,
             .next_free = null,
             .ready_node = .{},
             .waiter = .{ .wake_fn = WorkerFiber.wakeImpl },

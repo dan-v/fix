@@ -135,6 +135,13 @@ pub const Client = struct {
         }
     }
 
+    /// Enqueue daemon work without parking the submitter. The caller owns the
+    /// job and its context until the job signals completion.
+    pub fn submit(self: *Client, job: *rstore.DaemonPool.Job) !void {
+        const pool = try self.ensurePool();
+        pool.submit(job);
+    }
+
     pub fn captureError(self: *Client, conn: *rstore.DaemonStore) void {
         const message = conn.last_error orelse return;
         self.mu.lock();

@@ -42,6 +42,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         },
     };
     defer options.deinit(allocator);
+    if (options.sources.items.len > 1) {
+        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        return 2;
+    }
 
     const source_arg = options.source orelse options.defaultSource();
 
@@ -96,12 +100,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var target_chunk: ?*const bytecode.Chunk = null;
     // Only a plain `--file`/positional (no selector wrapping) carries a real
     // source path for span annotations; synthesized text has none.
-    const source_path: ?[]const u8 = switch (source_arg) {
-        .file => |p| if (source.owned) null else p,
-        else => null,
-    };
+    const source_path = runner.sourcePathOf(source_arg, source);
     if (options.disasm_eval) {
-        try compileByEval(&ev, source.text, source_path);
+        try compileByEval(&ev, source.text, source.base_path, source_path);
         if (options.disasm_chunk) |id| {
             target_id = id;
             target_chunk = ev.getChunk(id) orelse {
@@ -110,7 +111,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
             };
         }
     } else {
-        const top_id = ev.compileSource(source.text, source_path) catch |err| {
+        const top_id = ev.compileSourceAt(source.text, source.base_path, source_path) catch |err| {
             std.debug.print("error: compilation failed: {s}\n", .{@errorName(err)});
             return 1;
         };
@@ -230,8 +231,8 @@ const Pager = struct {
 /// (and would FrameOverflow, or blow a speculative worker's stack). Best-effort:
 /// a failing eval still leaves its compiled chunks behind to inspect, so a
 /// failure is a warning, not an abort.
-fn compileByEval(ev: *Evaluator, source: []const u8, source_path: ?[]const u8) !void {
-    _ = ev.evaluatePath(source, source_path) catch |err| {
+fn compileByEval(ev: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !void {
+    _ = ev.evaluatePathAt(source, base_path, source_path) catch |err| {
         std.debug.print("warning: evaluation failed: {s} (dumping chunks compiled so far)\n", .{@errorName(err)});
     };
 }

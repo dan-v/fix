@@ -390,6 +390,54 @@ pub const RealizationStore = struct {
         return cell.err;
     }
 
+    /// Caller-owned asynchronous build request. Its path slices and sink must
+    /// remain valid through `wait`; the daemon pool signals `done` after the
+    /// connection is released back to the pool.
+    pub const AsyncBuildRequest = struct {
+        store: ?*RealizationStore = null,
+        paths: []const []const u8 = &.{},
+        sink: ?rstore.BuildSink = null,
+        mode: rstore.BuildMode = .normal,
+        job: rstore.DaemonPool.Job = undefined,
+        done: sync.Semaphore = sync.Semaphore.init(0),
+        result: anyerror!void = {},
+
+        pub fn init(paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) AsyncBuildRequest {
+            return .{ .paths = paths, .sink = sink, .mode = mode };
+        }
+
+        pub fn fail(self: *AsyncBuildRequest, err: anyerror) void {
+            self.result = err;
+            self.done.release();
+        }
+
+        pub fn wait(self: *AsyncBuildRequest) !void {
+            self.done.acquire();
+            return self.result;
+        }
+
+        fn run(conn: ?*anyopaque, raw: *anyopaque) void {
+            const self: *AsyncBuildRequest = @ptrCast(@alignCast(raw));
+            const store = self.store.?;
+            const daemon = daemonConn(conn) catch |err| {
+                self.result = err;
+                self.done.release();
+                return;
+            };
+            self.result = store.buildOnConn(daemon, self.paths, self.sink, self.mode);
+            self.done.release();
+        }
+    };
+
+    /// Hand a build to the daemon pool and return immediately. Pool startup
+    /// failures complete the request with that error, keeping the wait path
+    /// uniform for callers.
+    pub fn submitBuild(self: *RealizationStore, request: *AsyncBuildRequest) void {
+        request.store = self;
+        request.job = .{ .run = AsyncBuildRequest.run, .ctx = request };
+        self.daemon.submit(&request.job) catch |err| request.fail(err);
+    }
+
     /// Realize `derived_paths` for import-from-derivation. Same as `buildPaths`;
     /// kept as a distinct entry for the `run`/`shell` realize call sites.
     pub fn realizePaths(self: *RealizationStore, derived_paths: []const []const u8, mode: rstore.BuildMode) !void {

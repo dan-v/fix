@@ -35,6 +35,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         },
     };
     defer options.deinit(allocator);
+    if (options.sources.items.len > 1) {
+        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        return 2;
+    }
 
     const source_arg = options.source orelse options.defaultSource();
 
@@ -106,7 +110,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         .expr => "expression",
         .flake => |inst| inst,
     };
-    const ok = try eval_support.evaluateAndWrite(init.io, options.evaluationMode(), term.use_color, options.show_trace, options.derivation_debug, &ev, source.text, eval_support.sourcePathOf(source_arg, source), eval_label);
+    const ok = try eval_support.evaluateAndWrite(init.io, options.evaluationMode(), term.use_color, options.show_trace, options.derivation_debug, &ev, source, eval_label);
     progress.deinit(ok);
 
     if (timeline_path) |p| timeline.dump(init.io, p, worker_count);

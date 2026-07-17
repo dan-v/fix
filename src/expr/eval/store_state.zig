@@ -8,6 +8,7 @@ const store = @import("store");
 const realization = store.realization;
 
 pub const StoreState = struct {
+    pub const AsyncBuildRequest = realization.RealizationStore.AsyncBuildRequest;
     allocator: std.mem.Allocator,
     realization: realization.RealizationStore,
     daemon_runtime: *store.DaemonRuntime,
@@ -32,6 +33,10 @@ pub const StoreState = struct {
 
     pub fn buildPaths(self: *StoreState, paths: []const []const u8, sink: ?store.daemon.BuildSink, mode: store.daemon.BuildMode) !void {
         return self.realization.buildPaths(paths, sink, mode);
+    }
+
+    pub fn submitBuild(self: *StoreState, request: *AsyncBuildRequest) void {
+        self.realization.submitBuild(request);
     }
 
     pub fn lastError(self: *StoreState) ?[]const u8 {

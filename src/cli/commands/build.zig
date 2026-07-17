@@ -12,7 +12,7 @@ const eval_support = @import("../eval_support.zig");
 const Evaluator = engine.Evaluator;
 
 pub const synopsis =
-    \\usage: fix build [options] [path | -e <expr>]
+    \\usage: fix build [options] [paths... | -e <expr>...]
     \\
     \\evaluate to a derivation, build (or substitute) its outputs, link ./result,
     \\and print the output path. With no source, uses ./default.nix (or, with
@@ -33,100 +33,45 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
     defer options.deinit(allocator);
 
-    const source_arg = options.source orelse options.defaultSource();
-
     const worker_count = try setup.workerCount(options);
     setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
 
-    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
-        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
-        return 2;
-    }
-
-    const source = eval_support.getSource(&ev, source_arg, options) catch |err| {
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    defer source.deinit(ev.hostAllocator());
-
     ev.enableStoreWrites();
 
-    const realized = switch (try realization_workflow.realize(allocator, init.io, &ev, process.eval_release, term, options, source_arg, source, false)) {
-        .failed => |code| return code,
-        .ok => |r| r,
-    };
-    defer realized.deinit(allocator);
-    const drv_path_owned = realized.drv_path;
-    const out_path = realized.out_path;
-
-    // The output link, which — as in nix-build — is registered as an indirect
-    // GC root. `--add-root PATH` relocates it (and, per nix-store/-instantiate,
-    // makes a direct root unless `--indirect`); `--out-link`/`-o` name it;
-    // `--no-out-link` suppresses it (unless `--add-root` asks for one).
-    const link_name = options.add_root orelse (if (options.no_link) null else (options.out_link orelse "result"));
-    if (link_name) |name| {
-        const indirect = options.add_root == null or options.indirect;
-        linkRoot(init.io, allocator, &ev, name, out_path, indirect);
-    }
-    if (options.add_drv_link) {
-        const name = options.drv_link orelse "derivation";
-        makeLink(init.io, name, drv_path_owned) catch |err| {
-            std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
-        };
+    var default_sources = [_]args.SourceArg{options.defaultSource()};
+    const source_args = if (options.sources.items.len == 0) default_sources[0..] else options.sources.items;
+    const selector_count = if (options.attrs.items.len == 0) 1 else options.attrs.items.len;
+    const input_count = try std.math.mul(usize, source_args.len, selector_count);
+    const inputs = try allocator.alloc(realization_workflow.BuildInput, input_count);
+    var loaded: usize = 0;
+    defer {
+        for (inputs[0..loaded]) |input| input.source.deinit(ev.hostAllocator());
+        allocator.free(inputs);
     }
 
-    var stdout_buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
-    try w.interface.print("{s}\n", .{out_path});
-    try w.interface.flush();
-    return 0;
-}
-
-/// Replace `./<name>` with a symlink to `target` (the result/derivation link).
-pub fn makeLink(io: std.Io, name: []const u8, target: []const u8) !void {
-    const cwd = std.Io.Dir.cwd();
-    cwd.deleteFile(io, name) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    try cwd.symLink(io, target, name, .{});
-}
-
-/// Create the symlink `name` -> `target` and register `name` as a GC root, as
-/// nix does. `indirect` picks an indirect root (the daemon records
-/// `<gcroots>/auto/<hash>` -> `name`, so `name` may live anywhere) versus a
-/// direct root (the symlink itself, effective only under the gcroots dir).
-/// Warns (does not fail) on any step. Shared by `build` and `instantiate`.
-pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Evaluator, name: []const u8, target: []const u8, indirect: bool) void {
-    makeLink(io, name, target) catch |err| {
-        std.debug.print("warning: could not create {s}: {s}\n", .{ name, @errorName(err) });
-        return;
-    };
-    const abs = absPath(io, allocator, name) catch |err| {
-        std.debug.print("warning: could not resolve {s}: {s}\n", .{ name, @errorName(err) });
-        return;
-    };
-    defer allocator.free(abs);
-    if (!indirect) {
-        // A direct root is just the symlink; the GC only honors it when it lives
-        // under the gcroots dir. Warn otherwise, as nix does.
-        if (!std.mem.startsWith(u8, abs, "/nix/var/nix/gcroots/"))
-            std.debug.print("warning: {s} is not in the gcroots directory, so it will not be an effective GC root (pass --indirect)\n", .{abs});
-        return;
+    for (source_args) |source_arg| {
+        if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
+            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
+            return 2;
+        }
+        var selector_index: usize = 0;
+        while (selector_index < selector_count) : (selector_index += 1) {
+            var input_options = options;
+            input_options.attr = if (options.attrs.items.len == 0) null else options.attrs.items[selector_index];
+            const source = eval_support.getSource(&ev, source_arg, input_options) catch |err| {
+                std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            inputs[loaded] = .{ .source = source };
+            loaded += 1;
+        }
     }
-    ev.addIndirectRoot(abs) catch |err| {
-        std.debug.print("warning: could not register GC root {s}: {s}\n", .{ abs, @errorName(err) });
-    };
+
+    return realization_workflow.realizeMany(allocator, init.io, &ev, process.eval_release, term, options, inputs);
 }
 
-/// Absolute, normalized (cwd-joined) form of `name` — the link path the daemon
-/// roots. `resolve` collapses `.`/`..` so the root path is canonical.
-fn absPath(io: std.Io, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(name)) return std.fs.path.resolve(allocator, &.{name});
-    const cwd = try std.process.currentPathAlloc(io, allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &.{ cwd, name });
-}
+pub const makeLink = realization_workflow.makeLink;
+pub const linkRoot = realization_workflow.linkRoot;

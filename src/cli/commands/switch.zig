@@ -99,6 +99,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         },
     };
     defer options.deinit(allocator);
+    if (options.sources.items.len > 1) {
+        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        return 2;
+    }
 
     // Re-exec'd privileged half: skip eval/build, activate the given path.
     if (options.activate_toplevel) |top| {

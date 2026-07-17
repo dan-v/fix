@@ -759,6 +759,10 @@ pub const Evaluator = struct {
         return self.parseAndCompile(source, self.base_path, source_path, null);
     }
 
+    pub fn compileSourceAt(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !ChunkId {
+        return self.parseAndCompile(source, base_path, source_path, null);
+    }
+
     /// `compileSource` with an ambient scope attrset (see
     /// `evaluateWithScope`). The repl's `:disasm` compiles expressions that
     /// reference repl bindings through this.
@@ -1101,14 +1105,21 @@ pub const Evaluator = struct {
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
-        return self.evaluateTop(source, null, null);
+        return self.evaluateTop(source, self.base_path, null, null);
     }
 
     /// `evaluate`, attributing the top-level source to `source_path` — source
     /// spans and the disasm file sidecar then carry the entry file's name, the
     /// same way imported files do. Used by `fix disasm --eval`.
     pub fn evaluatePath(self: *Evaluator, source: []const u8, source_path: ?[]const u8) !Value {
-        return self.evaluateTop(source, source_path, null);
+        return self.evaluateTop(source, self.base_path, source_path, null);
+    }
+
+    /// `evaluatePath` with an explicit relative-path base. Multi-input CLI
+    /// builds use this so each file keeps its own directory while sharing one
+    /// evaluator.
+    pub fn evaluatePathAt(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !Value {
+        return self.evaluateTop(source, base_path, source_path, null);
     }
 
     /// Like `evaluate`, but compiles the source inside an ambient scope
@@ -1117,10 +1128,26 @@ pub const Evaluator = struct {
     /// make its bindings visible. `scope` is baked into the compiled
     /// chunk's constants, which are GC roots.
     pub fn evaluateWithScope(self: *Evaluator, source: []const u8, scope: ?Value) !Value {
-        return self.evaluateTop(source, null, scope);
+        return self.evaluateTop(source, self.base_path, null, scope);
     }
 
-    fn evaluateTop(self: *Evaluator, source: []const u8, source_path: ?[]const u8, scope: ?Value) !Value {
+    fn evaluateTop(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value) !Value {
+        try self.prepareEvaluations();
+        // Not routed through `evaluateSource`: its top-level detection is
+        // `source_path == null`, so passing the path there would send the
+        // top-level eval down the nested-import path (wrong fiber). Attribute
+        // the source at compile time (and bake `scope` into the chunk's
+        // constants, the repl's ambient-scope mechanism), then run on the
+        // main worker as usual.
+        const chunk_id = try self.parseAndCompile(source, base_path, source_path, scope);
+        const subject = source_path orelse "expression";
+        self.progressBegin(.evaluate, subject);
+        defer self.progressEnd(.evaluate, subject);
+        timeline.instant(.evaluate, subject);
+        return self.runChunkOnMainWorker(chunk_id);
+    }
+
+    fn prepareEvaluations(self: *Evaluator) !void {
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only
@@ -1184,18 +1211,93 @@ pub const Evaluator = struct {
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.store.realization.clearDebugRecords();
-        // Not routed through `evaluateSource`: its top-level detection is
-        // `source_path == null`, so passing the path there would send the
-        // top-level eval down the nested-import path (wrong fiber). Attribute
-        // the source at compile time (and bake `scope` into the chunk's
-        // constants, the repl's ambient-scope mechanism), then run on the
-        // main worker as usual.
-        const chunk_id = try self.parseAndCompile(source, self.base_path, source_path, scope);
-        const subject = source_path orelse "expression";
-        self.progressBegin(.evaluate, subject);
-        defer self.progressEnd(.evaluate, subject);
-        timeline.instant(.evaluate, subject);
-        return self.runChunkOnMainWorker(chunk_id);
+    }
+
+    pub const ParallelInput = struct {
+        source: []const u8,
+        base_path: ?[]const u8 = null,
+        source_path: ?[]const u8 = null,
+    };
+
+    pub const ParallelSink = struct {
+        context: *anyopaque,
+        complete_fn: *const fn (context: *anyopaque, index: usize, value: ?Value, err: ?anyerror) void,
+
+        pub fn complete(self: ParallelSink, index: usize, value: ?Value, err: ?anyerror) void {
+            self.complete_fn(self.context, index, value, err);
+        }
+    };
+
+    /// Compile several independent inputs, then evaluate each on its own demand
+    /// fiber. `sink` is called exactly once per input, from that demand fiber
+    /// for runtime outcomes and from the caller for compile/setup failures.
+    pub fn evaluatePathsParallel(self: *Evaluator, inputs: []const ParallelInput, sink: ParallelSink) void {
+        if (inputs.len == 0) return;
+        self.prepareEvaluations() catch |err| {
+            for (inputs, 0..) |_, index| sink.complete(index, null, err);
+            return;
+        };
+
+        const Context = struct {
+            ev: *Evaluator,
+            sink: ParallelSink,
+            index: usize,
+            chunk_id: ChunkId,
+
+            fn entry(raw: *anyopaque) void {
+                const ctx: *@This() = @ptrCast(@alignCast(raw));
+                var scratch = @import("base").arena.ArenaAllocator.init(ctx.ev.allocator);
+                defer scratch.deinit();
+                var vm = ctx.ev.initVm(0, scratch.allocator()) catch |err| {
+                    ctx.sink.complete(ctx.index, null, err);
+                    return;
+                };
+                defer vm.deinit();
+                gc_controller.registerVm(gcContext(ctx.ev), &vm);
+                defer gc_controller.unregisterVm(gcContext(ctx.ev), &vm);
+                const value = vm.eval(ctx.chunk_id) catch |err| {
+                    ctx.sink.complete(ctx.index, null, err);
+                    return;
+                };
+                ctx.sink.complete(ctx.index, value, null);
+            }
+        };
+
+        const contexts = self.allocator.alloc(Context, inputs.len) catch {
+            for (inputs, 0..) |_, index| sink.complete(index, null, error.OutOfMemory);
+            return;
+        };
+        defer self.allocator.free(contexts);
+        var entries: std.ArrayListUnmanaged(worker_mod.Worker.TopLevelEntry) = .empty;
+        defer entries.deinit(self.allocator);
+        entries.ensureTotalCapacity(self.allocator, inputs.len) catch {
+            for (inputs, 0..) |_, index| sink.complete(index, null, error.OutOfMemory);
+            return;
+        };
+
+        for (inputs, 0..) |input, index| {
+            const chunk_id = self.parseAndCompile(input.source, input.base_path orelse self.base_path, input.source_path, null) catch |err| {
+                sink.complete(index, null, err);
+                continue;
+            };
+            contexts[index] = .{ .ev = self, .sink = sink, .index = index, .chunk_id = chunk_id };
+            entries.appendAssumeCapacity(.{ .entry = Context.entry, .arg = &contexts[index] });
+            timeline.instant(.evaluate, input.source_path orelse "expression");
+        }
+
+        const worker = self.ensureMainWorker() catch |err| {
+            for (entries.items) |entry| {
+                const ctx: *Context = @ptrCast(@alignCast(entry.arg));
+                sink.complete(ctx.index, null, err);
+            }
+            return;
+        };
+        worker.runTopLevels(entries.items) catch |err| {
+            for (entries.items) |entry| {
+                const ctx: *Context = @ptrCast(@alignCast(entry.arg));
+                sink.complete(ctx.index, null, err);
+            }
+        };
     }
 
     pub fn evaluateSource(
@@ -1317,6 +1419,7 @@ pub const Evaluator = struct {
         if (fiber_mod.currentFiber()) |inner| {
             const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
             vm.ctx = &wf.ctx;
+            if (wf.ctx.parallel_demand) vm.trace = null;
         }
         return vm;
     }
@@ -1339,6 +1442,10 @@ pub const Evaluator = struct {
 
     pub fn forceValue(self: *Evaluator, value: Value) !Value {
         self.report.trace.clear();
+        return self.forceValueUntraced(value);
+    }
+
+    fn forceValueUntraced(self: *Evaluator, value: Value) !Value {
         return self.runWithVm(vm_force.forceValue, .{value});
     }
 
@@ -1359,19 +1466,39 @@ pub const Evaluator = struct {
     /// drv path (borrowed from the intern table). Returns null if `value` is not
     /// a derivation-shaped attrset.
     pub fn derivationDrvPath(self: *Evaluator, value: Value) !?[]const u8 {
+        self.report.trace.clear();
         return self.derivationAttrPath(value, "drvPath");
     }
 
     /// The default output path (`outPath`) of a derivation `value`, or null if
     /// it is not a derivation-shaped attrset.
     pub fn derivationOutPath(self: *Evaluator, value: Value) !?[]const u8 {
+        self.report.trace.clear();
         return self.derivationAttrPath(value, "outPath");
     }
 
     fn derivationAttrPath(self: *Evaluator, value: Value, attr_name: []const u8) !?[]const u8 {
-        const forced = try self.forceValue(value);
+        const forced = try self.forceValueUntraced(value);
         if (!forced.isAttrs()) return null;
         return self.forcedStringAttr(forced.asObjectId(), attr_name);
+    }
+
+    pub const DerivationBuildPaths = struct {
+        drv_path: []const u8,
+        out_path: []const u8,
+    };
+
+    /// Extract the paths needed by the parallel build pipeline without touching
+    /// the evaluator's single-run diagnostic trace.
+    pub fn derivationBuildPaths(self: *Evaluator, value: Value) !?DerivationBuildPaths {
+        const forced = try self.forceValueUntraced(value);
+        if (!forced.isAttrs()) return null;
+        const id = forced.asObjectId();
+        const drv_path = (try self.forcedStringAttr(id, "drvPath")) orelse return null;
+        return .{
+            .drv_path = drv_path,
+            .out_path = (try self.forcedStringAttr(id, "outPath")) orelse drv_path,
+        };
     }
 
     /// The name of the program `fix run` should exec from a derivation's output:
@@ -1395,7 +1522,7 @@ pub const Evaluator = struct {
     fn forcedStringAttr(self: *Evaluator, id: types.ObjectId, name: []const u8) !?[]const u8 {
         const name_id = try self.intern.intern(name);
         const attr = (try self.heap.getAttrValueOpt(id, name_id)) orelse return null;
-        const forced = try self.forceValue(attr);
+        const forced = try self.forceValueUntraced(attr);
         const text_id = switch (forced.kind()) {
             .string, .path => forced.asInternId(),
             .string_context => (try self.heap.getContextString(forced.asObjectId())).text,
@@ -1410,6 +1537,14 @@ pub const Evaluator = struct {
     /// eval state is released (it reads the recipe graph).
     pub fn ensureDerivationClosure(self: *Evaluator, drv_path: []const u8) !void {
         return self.store.realization.ensureClosure(drv_path);
+    }
+
+    pub const AsyncBuildRequest = StoreState.AsyncBuildRequest;
+
+    /// Submit a fully materialized derivation to the daemon pool without
+    /// waiting for its build to finish.
+    pub fn submitBuild(self: *Evaluator, request: *AsyncBuildRequest) void {
+        self.store.submitBuild(request);
     }
 
     /// Finish evaluation and return the only state needed by the build phase.

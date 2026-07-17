@@ -39,6 +39,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         },
     };
     defer options.deinit(allocator);
+    if (options.sources.items.len > 1) {
+        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        return 2;
+    }
 
     if (options.packages.items.len == 0 and options.source == null) {
         std.debug.print("error: give packages (-p) or an expression (-e/--file/--flake)\n\n{s}\n", .{synopsis});
@@ -149,7 +153,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     };
     defer source.deinit(ev.hostAllocator());
 
-    const result = ev.evaluatePath(source.text, eval_support.sourcePathOf(source_arg, source)) catch |err| {
+    const result = ev.evaluatePathAt(source.text, source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
         ev.stopProgressSampler();
         return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
     };

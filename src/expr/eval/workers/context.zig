@@ -13,11 +13,11 @@
 //!     embedded in the `WorkerFiber`, which is never reallocated).
 //!   - Single writer: only the fiber's driving worker mutates it, and only
 //!     between resumes — `allocateFiber` bakes the claim id once,
-//!     `runTopLevel` dresses the demand role on the top fiber before its
-//!     first resume, and `runFiber`'s finished arm resets the role before
-//!     the fiber recycles. Readers (the VM run paths) only see it while the
-//!     fiber runs, sequenced by the same handoff that publishes all other
-//!     fiber state.
+//!     `runTopLevel(s)` dresses the demand role on each top fiber before its
+//!     first resume, and `runFiber`'s finished arm resets the role before the
+//!     fiber recycles. Readers (the VM run paths) only see it while the fiber
+//!     runs, sequenced by the same handoff that publishes all other fiber
+//!     state.
 //!
 //! Because it is fiber-lifetime, single-writer, and at a stable address,
 //! this record is the natural future home for a sampler-readable "current
@@ -51,11 +51,15 @@ pub const ExecutionContext = struct {
     /// standalone test VMs on the main thread) — a real address is always
     /// ≥ 0, so the `frameAddress() < stack_limit` compare never fires there.
     stack_limit: usize = 0,
-    /// True only on the top-level DEMAND fiber for the duration of one
+    /// True only on a top-level DEMAND fiber for the duration of one
     /// top-level entry: its blocking waits on busy thunks are the serial
     /// critical path (crit track, "waiting on" line). Set by
-    /// `Worker.runTopLevel`; cleared by the recycle reset.
+    /// `Worker.runTopLevel(s)`; cleared by the recycle reset.
     is_demand: bool = false,
+    /// Parallel top-level demand entries intentionally do not contribute to
+    /// the evaluator's single-run diagnostic trace. The trace is not a
+    /// concurrent data structure, and build reports failures per input.
+    parallel_demand: bool = false,
     /// The demand-only stage-stack half of the progress protocol. Non-null
     /// ONLY on the demand fiber: the stage stack is a single-writer LIFO
     /// owned by the demand path, and a stray off-demand begin/end corrupts
@@ -91,6 +95,7 @@ pub const ExecutionContext = struct {
         // the fiber can finish and return to the recycle list.
         std.debug.assert(self.scoped_import_top == null);
         self.is_demand = false;
+        self.parallel_demand = false;
         self.progress_stage = null;
         self.progress_wait = null;
     }

@@ -43,6 +43,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         },
     };
     defer options.deinit(allocator);
+    if (options.sources.items.len > 1) {
+        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        return 2;
+    }
 
     const source_arg = options.source orelse options.defaultSource();
     const loaded = loadSource(allocator, init, source_arg) catch |err| {

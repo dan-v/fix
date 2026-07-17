@@ -33,6 +33,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         },
     };
     defer options.deinit(allocator);
+    if (options.sources.items.len > 1) {
+        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        return 2;
+    }
 
     const source_arg = options.source orelse options.defaultSource();
 
@@ -66,7 +70,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     ev.startProgressSampler();
     defer ev.stopProgressSampler();
 
-    const result = ev.evaluatePath(source.text, eval_support.sourcePathOf(source_arg, source)) catch |err| {
+    const result = ev.evaluatePathAt(source.text, source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
         return storeOrEvalFailure(init, term, options, &ev, source.text, err);
     };
     const drv_path = ev.derivationDrvPath(result) catch |err| {

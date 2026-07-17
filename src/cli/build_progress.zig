@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const daemon = @import("store").daemon;
+const sync = @import("base").sync;
 const EvalProgress = @import("progress.zig").EvalProgress;
 
 pub const BuildProgress = struct {
@@ -12,6 +13,7 @@ pub const BuildProgress = struct {
     allocator: std.mem.Allocator,
     /// Active activity id -> its node.
     nodes: std.AutoHashMapUnmanaged(u64, std.Progress.Node) = .empty,
+    mu: sync.BlockingMutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, progress: *EvalProgress) BuildProgress {
         return .{ .progress = progress, .allocator = allocator };
@@ -20,6 +22,8 @@ pub const BuildProgress = struct {
     /// End all active nodes and free. Idempotent (safe to call before session
     /// teardown and again via defer).
     pub fn deinit(self: *BuildProgress) void {
+        self.mu.lock();
+        defer self.mu.unlock();
         var it = self.nodes.valueIterator();
         while (it.next()) |node| node.end();
         self.nodes.deinit(self.allocator);
@@ -35,6 +39,8 @@ pub const BuildProgress = struct {
 
     fn emit(context: *anyopaque, event: daemon.BuildEvent) void {
         const self: *BuildProgress = @ptrCast(@alignCast(context));
+        self.mu.lock();
+        defer self.mu.unlock();
         switch (event) {
             .start => |activity| {
                 const node = self.progress.childNode(activity.text);

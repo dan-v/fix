@@ -34,6 +34,38 @@ test "build transition runs its explicit post-release action once" {
     try std.testing.expectEqual(@as(usize, 1), counter.value);
 }
 
+test "parallel top-level evaluation uses one demand fiber per ordered input" {
+    const Capture = struct {
+        values: [3]?Value = .{ null, null, null },
+        fibers: [3]usize = .{ 0, 0, 0 },
+        errors: [3]?anyerror = .{ null, null, null },
+
+        fn complete(raw: *anyopaque, index: usize, value: ?Value, err: ?anyerror) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.values[index] = value;
+            self.errors[index] = err;
+            self.fibers[index] = @intFromPtr(@import("base").fiber.currentFiber().?);
+        }
+    };
+
+    var ev = try Evaluator.init(std.testing.allocator, 4);
+    defer ev.deinit();
+    var capture: Capture = .{};
+    ev.evaluatePathsParallel(&.{
+        .{ .source = "11" },
+        .{ .source = "22" },
+        .{ .source = "33" },
+    }, .{ .context = &capture, .complete_fn = Capture.complete });
+
+    for (capture.errors) |err| try std.testing.expect(err == null);
+    try std.testing.expectEqual(@as(i64, 11), capture.values[0].?.asInt());
+    try std.testing.expectEqual(@as(i64, 22), capture.values[1].?.asInt());
+    try std.testing.expectEqual(@as(i64, 33), capture.values[2].?.asInt());
+    try std.testing.expect(capture.fibers[0] != capture.fibers[1]);
+    try std.testing.expect(capture.fibers[1] != capture.fibers[2]);
+    try std.testing.expect(capture.fibers[0] != capture.fibers[2]);
+}
+
 test "external scope construction and rooting is evaluator-owned" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

@@ -30,8 +30,7 @@ pub fn evaluateAndWrite(
     show_trace: bool,
     debug_options: derivation_debug.Options,
     ev: *Evaluator,
-    source: []const u8,
-    source_path: ?[]const u8,
+    source: Source,
     label: []const u8,
 ) !bool {
     // Bracket the whole run (evaluate + force + render) so the progress bar
@@ -45,13 +44,13 @@ pub fn evaluateAndWrite(
     ev.startProgressSampler();
     defer ev.stopProgressSampler();
 
-    const result = ev.evaluatePath(source, source_path) catch |err| {
-        try render.evalFailure(io, use_color, show_trace, ev, source, err);
+    const result = ev.evaluatePathAt(source.text, source.base_path, source.abs_path) catch |err| {
+        try render.evalFailure(io, use_color, show_trace, ev, source.text, err);
         return false;
     };
 
     writeResult(io, mode, ev, result) catch |err| {
-        try render.evaluationError(io, use_color, show_trace, ev, source, err);
+        try render.evaluationError(io, use_color, show_trace, ev, source.text, err);
         return false;
     };
     try derivation_debug.write(io, use_color, ev.hostAllocator(), debug_options, ev.derivationDebugRecords());
@@ -83,10 +82,16 @@ pub const Source = struct {
     /// for `-e`, `--flake`, and `-A`/`--arg`-wrapped text whose byte offsets no
     /// longer map to the file.
     abs_path: ?[]const u8 = null,
+    /// Directory against which relative paths in this source are resolved.
+    /// Owned when non-null. Kept separately from `abs_path` because selector
+    /// wrapping makes source positions synthetic but does not change the file's
+    /// relative-path base.
+    base_path: ?[]const u8 = null,
 
     pub fn deinit(self: Source, allocator: std.mem.Allocator) void {
         if (self.owned) allocator.free(self.text);
         if (self.abs_path) |p| allocator.free(p);
+        if (self.base_path) |p| allocator.free(p);
     }
 };
 
@@ -137,21 +142,19 @@ pub fn buildFailure(last_store_error: ?[]const u8, err: anyerror) u8 {
 pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Source {
     const allocator = ev.hostAllocator();
     // Load the base source text (borrowed for expr/file, owned for flake).
-    const base: Source = switch (source) {
+    var base: Source = switch (source) {
         .expr => |text| .{ .text = text, .owned = false },
         .file => |path| blk: {
             const text = try ev.readSourceFile(path);
-            // The evaluator base path is still the process cwd here (configure set it,
-            // and the setBasePathToFileDir below hasn't repointed it yet), so
-            // resolve `path` against it to get the file's absolute path.
+            // Resolve against the configured process cwd. Each Source keeps
+            // its own directory instead of repointing evaluator-global state.
             const abs = try std.fs.path.resolve(allocator, &.{ ev.basePath() orelse ".", path });
-            // Roll back `abs` if the base-path repoint below fails; otherwise it
-            // would leak (the Source that would own it is never constructed).
+            // Roll back `abs` if allocating the per-source base fails.
             errdefer allocator.free(abs);
-            // Resolve the file's relative path literals (`./x`, `import ./y`)
-            // against the file's directory, like Nix — not the process cwd.
-            try ev.setBasePathToFileDir(path);
-            break :blk .{ .text = text, .owned = false, .abs_path = abs };
+            const dir = std.fs.path.dirname(abs) orelse ".";
+            const source_base = try allocator.dupe(u8, dir);
+            errdefer allocator.free(source_base);
+            break :blk .{ .text = text, .owned = false, .abs_path = abs, .base_path = source_base };
         },
         .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable), .owned = true },
     };
@@ -166,8 +169,11 @@ pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Sour
     // `text`: drop the whole base (freeing its text and abs_path).
     const selected = try applySelectors(ev, base.text, options);
     if (selected.owned) {
+        var wrapped = selected;
+        wrapped.base_path = base.base_path;
+        base.base_path = null;
         base.deinit(allocator);
-        return selected;
+        return wrapped;
     }
     return base;
 }

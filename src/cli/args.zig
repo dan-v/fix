@@ -170,6 +170,9 @@ pub const Options = struct {
     /// `fix shell -p <names>`: package attr-paths in `<nixpkgs>`. Borrowed from
     /// argv; the list backing is owned (caller frees via `deinit`).
     packages: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Source arguments in command-line order. `source` below mirrors the first
+    /// entry for the single-input commands; `build` consumes the whole list.
+    sources: std.ArrayListUnmanaged(SourceArg) = .empty,
     /// `-I`/`--include` search-path entries (`[prefix=]path`), in argv order.
     /// Prepended to `$NIX_PATH` at setup (they take precedence, as in Nix).
     /// Borrowed from argv; the list backing is owned (caller frees via `deinit`).
@@ -180,6 +183,9 @@ pub const Options = struct {
     /// `-A`/`--attr`: dotted attribute path to select from the evaluated value
     /// (as in `nix-build -A`). Borrowed from argv.
     attr: ?[]const u8 = null,
+    /// Attribute selectors in command-line order. `attr` above mirrors the last
+    /// entry for the existing single-selector commands; `build` consumes all.
+    attrs: std.ArrayListUnmanaged([]const u8) = .empty,
     /// `--arg`/`--argstr` top-level function arguments, in argv order. Borrowed
     /// from argv; the list backing is owned (caller frees via `deinit`).
     arg_defs: std.ArrayListUnmanaged(ArgDef) = .empty,
@@ -235,14 +241,16 @@ pub const Options = struct {
     /// (default), N>1 = keep 1/N (flows are ~half the trace by event count).
     timeline_flows: u32 = 1,
 
-    fn setSource(self: *Options, source: SourceArg) !void {
-        if (self.source != null) return error.TooManySources;
-        self.source = source;
+    fn addSource(self: *Options, allocator: std.mem.Allocator, source: SourceArg) !void {
+        try self.sources.append(allocator, source);
+        if (self.source == null) self.source = source;
     }
 
     pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.packages.deinit(allocator);
+        self.sources.deinit(allocator);
         self.include.deinit(allocator);
+        self.attrs.deinit(allocator);
         self.arg_defs.deinit(allocator);
         self.option_overrides.deinit(allocator);
     }
@@ -520,11 +528,13 @@ fn findShort(name: []const u8) ?*const Spec {
 
 pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Options {
     var options: Options = .{};
+    errdefer options.deinit(allocator);
 
-    // A bare (non-flag) token is the source path/installable. Resolved into
-    // `options.source` after the loop, once `--flake` (which may appear on
-    // either side of it) has been seen.
-    var positional: ?[]const u8 = null;
+    // Bare sources are appended immediately to preserve argv order. Remember
+    // their indexes so a later `--flake` can reinterpret only bare inputs (an
+    // explicit `--file` remains a file).
+    var positional_indexes: std.ArrayListUnmanaged(usize) = .empty;
+    defer positional_indexes.deinit(allocator);
 
     var carried = first;
     parse_loop: while (true) {
@@ -558,10 +568,8 @@ pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
                 }
             }
         } else {
-            // A bare token: the source path (or flake installable under
-            // `--flake`). Only one is allowed.
-            if (positional != null) return error.TooManySources;
-            positional = arg;
+            try positional_indexes.append(allocator, options.sources.items.len);
+            try options.addSource(allocator, .{ .file = arg });
             continue;
         }
 
@@ -594,10 +602,13 @@ pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
         try apply(&options, allocator, s.id, v0, v1);
     }
 
-    // Fold the positional into the source, respecting `--flake`. An explicit
-    // `-e`/`--file` plus a positional is contradictory (`setSource` rejects it).
-    if (positional) |p|
-        try options.setSource(if (options.flake_mode) .{ .flake = p } else .{ .file = p });
+    if (options.flake_mode) {
+        for (positional_indexes.items) |index| {
+            const path = options.sources.items[index].file;
+            options.sources.items[index] = .{ .flake = path };
+        }
+        if (options.sources.items.len != 0) options.source = options.sources.items[0];
+    }
 
     return options;
 }
@@ -607,11 +618,14 @@ pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
 /// the specific `Invalid*` errors.
 fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]const u8, v1: ?[:0]const u8) !void {
     switch (id) {
-        .expr => try options.setSource(.{ .expr = v0.? }),
-        .file => try options.setSource(.{ .file = v0.? }),
+        .expr => try options.addSource(allocator, .{ .expr = v0.? }),
+        .file => try options.addSource(allocator, .{ .file = v0.? }),
         .flake => options.flake_mode = true,
         .include => try options.include.append(allocator, v0.?),
-        .attr => options.attr = v0.?,
+        .attr => {
+            try options.attrs.append(allocator, v0.?);
+            options.attr = v0.?;
+        },
         .arg => try options.arg_defs.append(allocator, .{ .name = v0.?, .value = v1.?, .is_string = false }),
         .argstr => try options.arg_defs.append(allocator, .{ .name = v0.?, .value = v1.?, .is_string = true }),
 
