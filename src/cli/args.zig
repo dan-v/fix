@@ -139,6 +139,9 @@ pub const Options = struct {
     /// `fix build --dry-run`: evaluate and instantiate, then report the daemon's
     /// missing build/substitution plan without realizing it.
     dry_run: bool = false,
+    /// `fix instantiate --find-file`: resolve each source argument as a name in
+    /// NIX_PATH and print its absolute path without parsing or evaluating it.
+    find_file: bool = false,
     /// `-Q`/`--no-build-output`: consume daemon build log messages silently.
     no_build_output: bool = false,
     /// `--out-link NAME`/`-o`: name of the result symlink (default `result`).
@@ -303,6 +306,7 @@ const Opt = enum {
     // Build outputs / links.
     no_link,
     dry_run,
+    find_file,
     no_build_output,
     out_link,
     drv_link,
@@ -424,6 +428,10 @@ const derivation_debug_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell
 const drv_cmds = &[_]Cmd{ .build, .instantiate };
 /// Commands that realize (build/substitute) derivations via the daemon.
 const realize_cmds = &[_]Cmd{ .build, .run, .shell, .@"switch" };
+/// Legacy nix-instantiate accepts daemon build settings in all of its modes;
+/// eval can use them for IFD, while parse/find-file simply accept them as
+/// process-wide compatibility settings. Realizing commands use them directly.
+const daemon_setting_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .@"switch" };
 
 const specs = [_]Spec{
     .{ .id = .expr, .short = "-E", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text; repeatable", .show_in = source_cmds },
@@ -450,6 +458,7 @@ const specs = [_]Spec{
     .{ .id = .no_link, .long = "--no-out-link", .help = "do not create the result symlink", .show_in = &.{.build} },
     .{ .id = .no_link, .long = "--no-link", .show_in = &.{.build}, .hidden = true }, // alias of --no-out-link
     .{ .id = .dry_run, .long = "--dry-run", .help = "show what would be built or substituted", .show_in = &.{.build} },
+    .{ .id = .find_file, .long = "--find-file", .help = "look up source arguments in NIX_PATH and print\ntheir absolute paths", .show_in = &.{.instantiate} },
     .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .show_in = drv_cmds },
     .{ .id = .add_drv_link, .long = "--add-drv-link", .help = "also create a symlink to the .drv", .show_in = drv_cmds },
     .{ .id = .add_root, .long = "--add-root", .arg = .req, .metavar = "PATH", .help = "create the link at PATH and register it as a GC root", .show_in = drv_cmds },
@@ -457,15 +466,15 @@ const specs = [_]Spec{
 
     .{ .id = .check, .long = "--check", .help = "rebuild and check that outputs are unchanged", .show_in = realize_cmds },
     .{ .id = .repair, .long = "--repair", .help = "rebuild and repair corrupted store paths", .show_in = realize_cmds },
-    .{ .id = .max_jobs, .short = "-j", .long = "--max-jobs", .arg = .req, .metavar = "N", .help = "maximum number of parallel build jobs (or `auto`)", .show_in = realize_cmds },
-    .{ .id = .cores, .long = "--cores", .arg = .req, .metavar = "N", .help = "build cores per job (0 = all available)", .show_in = realize_cmds },
-    .{ .id = .fallback, .long = "--fallback", .help = "build from source if a substitute fails", .show_in = realize_cmds },
-    .{ .id = .keep_failed, .short = "-K", .long = "--keep-failed", .help = "keep the build tree of failed builds", .show_in = realize_cmds },
-    .{ .id = .keep_going, .short = "-k", .long = "--keep-going", .help = "keep building other derivations if one fails", .show_in = realize_cmds },
-    .{ .id = .max_silent_time, .long = "--max-silent-time", .arg = .req, .metavar = "SECS", .help = "abort a build silent for SECS seconds (0 = no limit)", .show_in = realize_cmds },
-    .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = realize_cmds },
-    .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase daemon build verbosity (repeatable)", .show_in = realize_cmds },
-    .{ .id = .no_build_output, .short = "-Q", .long = "--no-build-output", .help = "suppress builder output", .show_in = &[_]Cmd{ .instantiate, .build, .run, .shell, .@"switch" } },
+    .{ .id = .max_jobs, .short = "-j", .long = "--max-jobs", .arg = .req, .metavar = "N", .help = "maximum number of parallel build jobs (or `auto`)", .show_in = daemon_setting_cmds },
+    .{ .id = .cores, .long = "--cores", .arg = .req, .metavar = "N", .help = "build cores per job (0 = all available)", .show_in = daemon_setting_cmds },
+    .{ .id = .fallback, .long = "--fallback", .help = "build from source if a substitute fails", .show_in = daemon_setting_cmds },
+    .{ .id = .keep_failed, .short = "-K", .long = "--keep-failed", .help = "keep the build tree of failed builds", .show_in = daemon_setting_cmds },
+    .{ .id = .keep_going, .short = "-k", .long = "--keep-going", .help = "keep building other derivations if one fails", .show_in = daemon_setting_cmds },
+    .{ .id = .max_silent_time, .long = "--max-silent-time", .arg = .req, .metavar = "SECS", .help = "abort a build silent for SECS seconds (0 = no limit)", .show_in = daemon_setting_cmds },
+    .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = daemon_setting_cmds },
+    .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase daemon build verbosity (repeatable)", .show_in = daemon_setting_cmds },
+    .{ .id = .no_build_output, .short = "-Q", .long = "--no-build-output", .help = "suppress builder output", .show_in = daemon_setting_cmds },
 
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error", .show_in = eval_cmds },
     .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{ .eval, .repl } },
@@ -657,6 +666,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
 
         .no_link => options.no_link = true,
         .dry_run => options.dry_run = true,
+        .find_file => options.find_file = true,
         .no_build_output => options.no_build_output = true,
         .out_link => options.out_link = v0.?,
         .drv_link => options.drv_link = v0.?,
@@ -668,8 +678,16 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         // Build-setting sugar: fold into the nix.conf override list so
         // `setup.configure` applies them via `set_options` (same path as
         // `--option`). `--cores 4` == `--option cores 4`.
-        .max_jobs => try options.option_overrides.append(allocator, .{ .name = "max-jobs", .value = v0.? }),
-        .cores => try options.option_overrides.append(allocator, .{ .name = "cores", .value = v0.? }),
+        .max_jobs => {
+            const value = v0.?;
+            if (!std.mem.eql(u8, value, "auto")) _ = std.fmt.parseInt(u64, value, 10) catch return error.InvalidMaxJobs;
+            try options.option_overrides.append(allocator, .{ .name = "max-jobs", .value = value });
+        },
+        .cores => {
+            const value = v0.?;
+            _ = std.fmt.parseInt(u64, value, 10) catch return error.InvalidCores;
+            try options.option_overrides.append(allocator, .{ .name = "cores", .value = value });
+        },
         .max_silent_time => try options.option_overrides.append(allocator, .{ .name = "max-silent-time", .value = v0.? }),
         .timeout => try options.option_overrides.append(allocator, .{ .name = "timeout", .value = v0.? }),
         .fallback => try options.option_overrides.append(allocator, .{ .name = "fallback", .value = "true" }),
@@ -841,6 +859,8 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
         error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators, fetch-tree, flakes)",
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
+        error.InvalidMaxJobs => "expected --max-jobs to be `auto` or a non-negative integer",
+        error.InvalidCores => "expected --cores to be a non-negative integer",
         error.InvalidMaxMemory => "expected --max-memory to be a size like 4096, 512m, or 4g",
         error.InvalidHugetlbMode => "expected --hugetlb to be auto, on, or off",
         error.InvalidTimelineFlows => "expected --timeline-flows to be off, all, or a non-negative integer",
@@ -891,4 +911,47 @@ test "package list returns to ordinary option parsing" {
 
     try std.testing.expectEqualSlices([]const u8, &.{ "hello", "jq" }, options.packages.items);
     try std.testing.expectEqual(presentation.When.never, options.progress);
+}
+
+test "find-file keeps ordered lookup names and is instantiate-only" {
+    const argv = [_][*:0]const u8{ "fix", "--find-file", "nixpkgs/default.nix", "-E", "second/name", "-f", "third/name" };
+    var options = try parseForTest(&argv, .instantiate);
+    defer options.deinit(std.testing.allocator);
+
+    try std.testing.expect(options.find_file);
+    try std.testing.expectEqual(@as(usize, 3), options.sources.items.len);
+    try std.testing.expectEqualStrings("nixpkgs/default.nix", options.sources.items[0].file);
+    try std.testing.expectEqualStrings("second/name", options.sources.items[1].expr);
+    try std.testing.expectEqualStrings("third/name", options.sources.items[2].file);
+
+    const wrong_command = [_][*:0]const u8{ "fix", "--find-file", "nixpkgs" };
+    try std.testing.expectError(error.OptionNotValidForCommand, parseForTest(&wrong_command, .eval));
+}
+
+test "legacy daemon settings are accepted by nix-instantiate modes" {
+    const argv = [_][*:0]const u8{ "fix", "-jauto", "--cores", "3", "-k", "-K", "--fallback", "-Q" };
+    for ([_]Cmd{ .eval, .parse, .instantiate }) |cmd| {
+        var options = try parseForTest(&argv, cmd);
+        defer options.deinit(std.testing.allocator);
+        try std.testing.expect(options.no_build_output);
+        try std.testing.expectEqual(@as(usize, 5), options.option_overrides.items.len);
+        const expected = [_]OptionOverride{
+            .{ .name = "max-jobs", .value = "auto" },
+            .{ .name = "cores", .value = "3" },
+            .{ .name = "keep-going", .value = "true" },
+            .{ .name = "keep-failed", .value = "true" },
+            .{ .name = "fallback", .value = "true" },
+        };
+        for (expected, options.option_overrides.items) |want, got| {
+            try std.testing.expectEqualStrings(want.name, got.name);
+            try std.testing.expectEqualStrings(want.value, got.value);
+        }
+    }
+
+    try std.testing.expectError(error.OptionNotValidForCommand, parseForTest(&argv, .disasm));
+
+    const bad_jobs = [_][*:0]const u8{ "fix", "--max-jobs", "many" };
+    try std.testing.expectError(error.InvalidMaxJobs, parseForTest(&bad_jobs, .build));
+    const bad_cores = [_][*:0]const u8{ "fix", "--cores", "all" };
+    try std.testing.expectError(error.InvalidCores, parseForTest(&bad_cores, .build));
 }

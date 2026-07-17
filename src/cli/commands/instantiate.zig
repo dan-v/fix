@@ -14,6 +14,7 @@ const Evaluator = engine.Evaluator;
 
 pub const synopsis =
     \\usage: fix instantiate [options] [paths... | -E <expr>... | --flake <installable>...]
+    \\       fix instantiate --find-file [options] names...
     \\
     \\evaluate to derivations, add their .drv closures to the store, and print
     \\the top-level .drv paths in input order. With no source, uses ./default.nix.
@@ -38,6 +39,8 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
+
+    if (options.find_file) return findFiles(init.io, &ev, options.sources.items);
 
     const input_plan = eval_support.InputPlan.init(options, init.io);
     input_plan.validate(&ev) catch |err| {
@@ -65,6 +68,30 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         ok = (try instantiateOne(allocator, init, term, options, &ev, input, index)) and ok;
     }
     return if (ok) 0 else 1;
+}
+
+fn findFiles(io: std.Io, ev: *Evaluator, sources: []const args.SourceArg) !u8 {
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
+    for (sources) |source| {
+        const name = switch (source) {
+            .expr => |text| text,
+            .file => |path| path,
+            .flake => |installable| installable,
+        };
+        const path = ev.resolveLookupPath(name) catch |err| {
+            try stdout.interface.flush();
+            if (err == error.FileNotFound)
+                std.debug.print("error: file '{s}' was not found in the Nix search path (add it using $NIX_PATH or -I)\n", .{name})
+            else
+                std.debug.print("error: looking up file '{s}': {s}\n", .{ name, @errorName(err) });
+            return 1;
+        };
+        defer ev.hostAllocator().free(path);
+        try stdout.interface.print("{s}\n", .{path});
+        try stdout.interface.flush();
+    }
+    return 0;
 }
 
 fn instantiateOne(

@@ -116,6 +116,7 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 | `--arg NAME EXPR` / `--argstr NAME STR` | pass an expression / a string as top-level function argument NAME |
 | `-I, --include PATH` | prepend a search-path entry (as in `NIX_PATH`; `prefix=path` form allowed). Repeatable. |
 | `--option NAME VALUE` | override a nix.conf setting |
+| `--find-file` | (`instantiate`) resolve each source argument as a `NIX_PATH` name and print its absolute path, without evaluation |
 
 `FILEISH` follows the legacy `nix-build`/`nix-instantiate` forms: a regular
 path; a directory (loads `default.nix`); a lookup path such as `<nixpkgs>`;
@@ -157,8 +158,9 @@ explicit typed flake-output/installable form.
 | `--drv-link NAME` / `--add-drv-link` | name of / also create the `.drv` symlink (`build`/`instantiate`; default `derivation`) |
 | `--add-root PATH` / `--indirect` | create the link at PATH and register it as a (optionally indirect) GC root (`build`/`instantiate`) |
 | `--check` / `--repair` | rebuild and verify outputs are unchanged / repair corrupted store paths |
-| `-j, --max-jobs N\|auto` / `--cores N` | daemon build parallelism (folded into `--option` overrides, applied via the worker protocol) |
+| `-j, --max-jobs N\|auto` / `--cores N` | daemon build parallelism (folded into `--option` overrides, applied via the worker protocol); also accepted by `eval`/`parse`/`instantiate` like legacy `nix-instantiate` |
 | `--fallback` | build from source if a substitute fails |
+| `-k, --keep-going` | continue with independent builds after a failure |
 | `-K, --keep-failed` | keep the build tree of failed builds |
 | `--max-silent-time SECS` / `--timeout SECS` | abort builds silent/running too long (`0` = no limit) |
 | `-v, --verbose` | increase daemon build verbosity (repeatable) |
