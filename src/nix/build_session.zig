@@ -6,8 +6,8 @@
 const std = @import("std");
 const host = @import("host.zig");
 const build_protocol = @import("build_protocol.zig");
-const RealizationStore = @import("realization.zig").RealizationStore;
-const execution = @import("execution.zig");
+const realization = @import("realization.zig");
+const RealizationStore = realization.RealizationStore;
 
 /// Explicit process-owned work to run after evaluator language state has been
 /// released. Passed to a release operation rather than stored on Evaluator.
@@ -28,7 +28,7 @@ pub const StoreState = struct {
         errdefer runtime_ptr.deinit();
 
         var realization_store = RealizationStore.init(allocator);
-        realization_store.setExecution(runtime_ptr, execution.fiber_executor);
+        realization_store.setExecution(runtime_ptr, realization.daemon_execution.fiber_executor);
         return .{ .allocator = allocator, .realization = realization_store, .daemon_runtime = runtime_ptr };
     }
 

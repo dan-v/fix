@@ -17,7 +17,7 @@ const eval_memo = @import("eval_memo.zig");
 const recipe_graph = @import("recipe_graph.zig");
 const daemon_client = @import("daemon_client.zig");
 const eval_progress = @import("../observ.zig").progress;
-const execution_port = @import("../execution/port.zig");
+const daemon_execution = @import("daemon_execution.zig");
 const build_protocol = @import("../build_protocol.zig");
 
 pub const SpanGroup = recipe_graph.SpanGroup;
@@ -259,7 +259,7 @@ pub const RealizationStore = struct {
 
     /// Install the fiber-aware execution capability. Must be set before forcing
     /// begins and cleared before the daemon runtime is torn down.
-    pub fn setExecution(self: *RealizationStore, rt: *DaemonRuntime, executor: execution_port.FiberExecutor) void {
+    pub fn setExecution(self: *RealizationStore, rt: *DaemonRuntime, executor: daemon_execution.Executor) void {
         self.daemon.setExecution(rt, executor);
     }
 

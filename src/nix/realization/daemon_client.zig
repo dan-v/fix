@@ -7,7 +7,7 @@ const host = @import("../host.zig");
 const rstore = host.store;
 const DaemonRuntime = host.DaemonRuntime;
 const Future = @import("runtime").future.Future;
-const execution_port = @import("../execution/port.zig");
+const daemon_execution = @import("daemon_execution.zig");
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -20,7 +20,7 @@ pub const Client = struct {
     options: ?rstore.BuildSettings = null,
     overrides: std.ArrayListUnmanaged(rstore.Setting) = .empty,
     writes_enabled: bool = false,
-    fiber_executor: ?execution_port.FiberExecutor = null,
+    pool_executor: ?daemon_execution.Executor = null,
     runtime: ?*DaemonRuntime = null,
     pool: ?*rstore.DaemonPool = null,
     pool_mu: sync.BlockingMutex = .{},
@@ -99,13 +99,13 @@ pub const Client = struct {
         _ = self.ensurePool() catch {};
     }
 
-    pub fn setExecution(self: *Client, runtime: *DaemonRuntime, executor: execution_port.FiberExecutor) void {
+    pub fn setExecution(self: *Client, runtime: *DaemonRuntime, executor: daemon_execution.Executor) void {
         self.runtime = runtime;
-        self.fiber_executor = executor;
+        self.pool_executor = executor;
     }
 
     pub fn clearExecution(self: *Client) void {
-        self.fiber_executor = null;
+        self.pool_executor = null;
         self.runtime = null;
         self.pool = null;
     }
@@ -129,7 +129,7 @@ pub const Client = struct {
 
     pub fn run(self: *Client, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) !void {
         const pool = try self.ensurePool();
-        if (self.fiber_executor) |executor| {
+        if (self.pool_executor) |executor| {
             executor.runPool(pool, work, work_ctx);
         } else {
             pool.submitBlocking(work, work_ctx);
@@ -165,6 +165,6 @@ pub const Client = struct {
     }
 
     pub fn parkClaim(self: *Client, future: *Future) bool {
-        return if (self.fiber_executor) |executor| executor.parkFuture(future) else false;
+        return if (self.pool_executor) |executor| executor.parkFuture(future) else false;
     }
 };
