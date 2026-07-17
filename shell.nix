@@ -8,5 +8,9 @@ pkgs.mkShell {
   packages = [
     pkgs.zig_0_16
     pkgs.pkg-config
+    pkgs.curl
+    pkgs.libgit2
+    pkgs.mercurial
+    pkgs.gnutar
   ];
 }
