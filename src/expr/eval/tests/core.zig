@@ -213,6 +213,18 @@ test "evaluate fully applied operator-equivalent builtins" {
     try std.testing.expectEqualStrings("42", shadowed);
 }
 
+test "evaluate shared inherit-from sources in let plain and recursive sets" {
+    const output = try renderForTest(
+        \\builtins.toJSON [
+        \\  (let inherit ({ a = 1; b = 2; }) a b; in a + b)
+        \\  ({ inherit ({ a = 3; b = 4; }) a b; }.b)
+        \\  (rec { inherit ({ a = c; b = 6; }) a b; c = 5; }.a)
+        \\]
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("\"[3,4,5]\"", output);
+}
+
 test "evaluate checks attribute paths without forcing final value" {
     const present = try renderForTest("({ a.b = 1 / 0; } ? a.b)");
     defer std.testing.allocator.free(present);

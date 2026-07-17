@@ -174,6 +174,9 @@ pub const Node = struct {
         path: []Atom,
         expr: *Node,
         inherit_outer: bool = false,
+        /// Non-zero for entries originating in the same `inherit (expr)`
+        /// clause. The compiler uses this to share one lazy source binding.
+        inherit_group: u32 = 0,
     };
 
     pub const IfElse = struct {
@@ -197,6 +200,7 @@ pub const Node = struct {
         dynamic_name: ?*Node = null,
         expr: *Node,
         inherit_outer: bool = false,
+        inherit_group: u32 = 0,
     };
 
     pub const AttrSet = struct {
@@ -514,6 +518,7 @@ fn cloneBindings(arena: *AstArena, bindings: []const Node.Binding) anyerror![]No
             .path = try cloneAtoms(arena, binding.path),
             .expr = try cloneNode(arena, binding.expr),
             .inherit_outer = binding.inherit_outer,
+            .inherit_group = binding.inherit_group,
         };
     }
     return cloned;
@@ -527,6 +532,7 @@ fn cloneAttrSetEntries(arena: *AstArena, entries: []const Node.AttrSetEntry) any
             .dynamic_name = if (entry.dynamic_name) |name| try cloneNode(arena, name) else null,
             .expr = try cloneNode(arena, entry.expr),
             .inherit_outer = entry.inherit_outer,
+            .inherit_group = entry.inherit_group,
         };
     }
     return cloned;

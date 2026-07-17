@@ -32,9 +32,9 @@ Three path forms, all emitted as single tokens:
 `inherit` is **lowered by the parser's semantic actions** — there is no `inherit` node in the AST. Both forms lower to ordinary attribute-set entries (`inheritEntries`), valid identically in attribute-set braces and in `let`/`rec` binds:
 
 - **Outer-scope** `{ inherit a b; }` → entries `a = a; b = b;` where each entry has `inherit_outer = true` and its expr is an `identifier` referencing the same-named variable in the enclosing scope.
-- **From-expr** `{ inherit (src) a b; }` → entries `a = src.a; b = src.b;`, with `inherit_outer = false` and the expr an `attr_path` selecting the name off a clone of the source expression.
+- **From-expr** `{ inherit (src) a b; }` → entries `a = src.a; b = src.b;`, with `inherit_outer = false`, the expr an `attr_path`, and a shared non-zero `inherit_group` id. The compiler uses that id to create one hidden lazy source binding for the whole clause.
 
-The discriminator is exactly `inherit_outer = (source == null)`. In an attribute set these come from the `tclause_inherit` / `tclause_inherit_from` clauses; in `let`/`rec` from the `bind_inherit` / `bind_inherit_from` productions. An empty `inherit ;` (no names) is a diagnostic, and a missing `;` triggers panic-mode recovery (see [parsing](parsing.md)) rather than a cascade.
+The outer-scope discriminator is exactly `inherit_outer = (source == null)`; from-expression clauses additionally carry `inherit_group`. In an attribute set these come from the `tclause_inherit` / `tclause_inherit_from` clauses; in `let`/`rec` from the `bind_inherit` / `bind_inherit_from` productions. An empty `inherit ;` (no names) is a diagnostic, and a missing `;` triggers panic-mode recovery (see [parsing](parsing.md)) rather than a cascade.
 
 ## Lambda parameter patterns
 

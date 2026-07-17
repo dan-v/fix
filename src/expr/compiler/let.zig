@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const compiler_mod = @import("context.zig");
+const ast = @import("syntax").ast;
 const types = @import("runtime").types;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
@@ -15,6 +16,7 @@ const access = @import("access.zig");
 const strictness = @import("strictness.zig");
 const refs_mod = @import("refs.zig");
 const lambda = @import("lambda.zig");
+const thunks = @import("thunks.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -125,6 +127,21 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
         }
     }
 
+    // Hidden locals for `inherit (expr)` sources. They are declared after all
+    // user bindings (so they cannot affect lexical resolution) and initialized
+    // lazily at the first live member's source position in pass 2.
+    const InheritState = struct { slot: u16, initialized: bool = false };
+    var inherit_states: std.AutoHashMapUnmanaged(u32, InheritState) = .empty;
+    defer inherit_states.deinit(self.allocator);
+    const inherit_name = "\x00inherit-source";
+    const inherit_name_id = try self.intern.intern(inherit_name);
+    for (let_in.bindings, kinds) |binding, kind| {
+        if (binding.inherit_group == 0 or kind == .unreferenced or inherit_states.contains(binding.inherit_group)) continue;
+        try inherit_states.put(self.allocator, binding.inherit_group, .{
+            .slot = try scope.declareLocal(self, inherit_name, inherit_name_id),
+        });
+    }
+
     for (let_in.bindings, kinds, 0..) |binding, kind, index| {
         if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
         if (kind == .literal or kind == .unreferenced) continue;
@@ -135,7 +152,7 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
         // body unconditionally forces, with a computational RHS that
         // references no later binding — evaluate it straight into the
         // slot, skipping the thunk alloc + force + frame entirely.
-        if (kind == .uncaptured and must_force_flags[index] and
+        if (binding.inherit_group == 0 and kind == .uncaptured and must_force_flags[index] and
             first_demanded != null and binding_name_ids[index] == first_demanded.?)
         {
             if (eligibleEagerLeaf(self, let_in.bindings, binding.path[0], &earliest_index, index)) |leaf| {
@@ -147,8 +164,21 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
             }
         }
 
+        var inherit_source_slot: ?u16 = null;
+        if (binding.inherit_group != 0) {
+            const state = inherit_states.getPtr(binding.inherit_group) orelse return error.InvalidAttributePath;
+            if (!state.initialized) {
+                const inherited = ast.unwrapParens(binding.expr);
+                if (inherited.tag != .attr_path or inherited.data.attr_path.segments.len != 1) return error.InvalidAttributePath;
+                try thunks.compileThunk(self, inherited.data.attr_path.root);
+                try emit.emitSetLocal(self, state.slot);
+                state.initialized = true;
+            }
+            inherit_source_slot = state.slot;
+        }
+
         self.armRecursiveName(binding_name_ids[index]);
-        try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot, eager_flags[index]);
+        try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot, eager_flags[index], inherit_source_slot);
         switch (kind) {
             .needs_cell => try emit.emitSetCellLocal(self, slot),
             .uncaptured => try emit.emitSetLocal(self, slot),
@@ -320,7 +350,7 @@ fn singleLeafBinding(self: *Compiler, bindings: []const Node.Binding, root: Node
     return found;
 }
 
-fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16, eager: bool) !void {
+fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16, eager: bool, inherit_source_slot: ?u16) !void {
     var leaf: ?Node.Binding = null;
     var tail_count: usize = 0;
 
@@ -343,6 +373,15 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
 
     if (tail_count == 0) {
         const binding = leaf orelse return error.UndefinedVariable;
+        if (inherit_source_slot) |source_slot| {
+            try emit.emitThunkAttr(self, .{
+                .name = "\x00inherit-source",
+                .name_id = try self.intern.intern("\x00inherit-source"),
+                .kind = .local,
+                .index = source_slot,
+            }, try attrs.attrSegmentNameId(self, binding.path[0]));
+            return;
+        }
         const previous_skip = self.skip_local_slot;
         if (binding.inherit_outer) self.skip_local_slot = slot;
         const compile_result = access.compileContainerValue(self, binding.expr, .{ .eager = eager });
@@ -359,6 +398,7 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
             .path = binding.path[1..],
             .expr = binding.expr,
             .inherit_outer = binding.inherit_outer,
+            .inherit_group = binding.inherit_group,
         };
         i += 1;
     }
@@ -372,6 +412,7 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
             .path = root_leaf.path,
             .expr = root_leaf.expr,
             .inherit_outer = root_leaf.inherit_outer,
+            .inherit_group = root_leaf.inherit_group,
         }};
         return attrs.compileExtendedAttrSetLiteralThunk(self, &leaves, tails);
     }

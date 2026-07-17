@@ -97,13 +97,17 @@ fn compileMixedRecursiveAttrEntryViews(self: *Compiler, entries: []const AttrEnt
         }
     }
 
-    var grouped = try attrEntryGroups(self, static_entries);
-    defer grouped.deinit(self.allocator);
+    var initial = try attrEntryGroups(self, static_entries);
+    defer initial.deinit(self.allocator);
 
     scope.beginScope(self);
     errdefer scope.endScope(self);
 
-    try declareRecursiveAttrLocals(self, grouped.groups);
+    try declareRecursiveAttrLocals(self, initial.groups);
+    const prepared = try prepareInheritSourcesInCurrentScope(self, static_entries);
+    defer if (prepared) |p| self.allocator.free(p);
+    var grouped = if (prepared) |p| try attrEntryGroups(self, p) else initial;
+    defer if (prepared != null) grouped.deinit(self.allocator);
     try compileRecursiveAttrCells(self, grouped.groups);
     try emitRecursiveAttrObject(self, grouped.groups);
     try maybeEmitRecursiveOverrides(self, grouped.groups);
@@ -154,6 +158,8 @@ fn compileDynamicAttrViewValueThunk(self: *Compiler, entry: AttrEntryView) !void
             .path = entry.path,
             .expr = entry.expr,
             .inherit_outer = entry.inherit_outer,
+            .inherit_group = entry.inherit_group,
+            .inherit_slot = entry.inherit_slot,
             .origin = entry.origin,
         }};
         return compileAttrEntriesThunk(self, &nested, false);
@@ -165,6 +171,8 @@ fn compileDynamicAttrViewValueThunk(self: *Compiler, entry: AttrEntryView) !void
             .path = entry.path[1..],
             .expr = entry.expr,
             .inherit_outer = entry.inherit_outer,
+            .inherit_group = entry.inherit_group,
+            .inherit_slot = entry.inherit_slot,
         },
     };
     try compileAttrEntriesThunk(self, &views, false);
@@ -330,7 +338,14 @@ fn deferLeaf(self: *Compiler, body: *const Node, name: InternId, snapshot: Defer
 }
 
 fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
-    var grouped = try attrEntryGroups(self, entries);
+    const prepared = try prepareInheritSources(self, entries);
+    defer if (prepared) |p| {
+        self.allocator.free(p);
+        scope.endScope(self);
+    };
+    const effective_entries = prepared orelse entries;
+
+    var grouped = try attrEntryGroups(self, effective_entries);
     defer grouped.deinit(self.allocator);
 
     // Emit groups in ascending interned-name order (groups are unique by
@@ -374,7 +389,7 @@ fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anye
         try compilePlainAttrGroup(self, &positions, grouped.groups[group_idx], defer_scope);
     }
 
-    const count = try diagnostics.requireU16At(self, grouped.groups.len, attrEntriesDiagnosticAtom(entries), "too many attributes in set");
+    const count = try diagnostics.requireU16At(self, grouped.groups.len, attrEntriesDiagnosticAtom(effective_entries), "too many attributes in set");
     try emit.emitBuildAttrsSorted(self, count, names.items, positions.items);
 }
 
@@ -392,13 +407,21 @@ fn groupIndexLessThan(groups: []const AttrEntryGroup, lhs: u32, rhs: u32) bool {
 }
 
 fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
-    var grouped = try attrEntryGroups(self, entries);
-    defer grouped.deinit(self.allocator);
-
     scope.beginScope(self);
     errdefer scope.endScope(self);
 
-    try declareRecursiveAttrLocals(self, grouped.groups);
+    // Recursive names must exist as cells before the inherit-source thunk is
+    // created, so a source expression can safely capture any sibling.
+    var initial = try attrEntryGroups(self, entries);
+    defer initial.deinit(self.allocator);
+    try declareRecursiveAttrLocals(self, initial.groups);
+
+    const prepared = try prepareInheritSourcesInCurrentScope(self, entries);
+    defer if (prepared) |p| self.allocator.free(p);
+    const effective_entries = prepared orelse entries;
+    var grouped = if (prepared != null) try attrEntryGroups(self, effective_entries) else initial;
+    defer if (prepared != null) grouped.deinit(self.allocator);
+
     try compileRecursiveAttrCells(self, grouped.groups);
     try emitRecursiveAttrObject(self, grouped.groups);
     try maybeEmitRecursiveOverrides(self, grouped.groups);
@@ -460,7 +483,8 @@ fn compilePlainAttrGroup(
     var body = leaf.?.expr;
     if (body.tag == .elided) body = try literals.materializeElided(self, body);
     self.armName(group.name_id);
-    try access.compileContainerValue(self, body, .{ .raw_identifier = true });
+    if (!try compileInheritedLeaf(self, leaf.?))
+        try access.compileContainerValue(self, body, .{ .raw_identifier = true });
     try appendAttrPosition(self, positions, group.first, group.name_id);
 }
 
@@ -517,7 +541,8 @@ fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) an
         const previous_skip = self.skip_local_slot;
         if (leaf.?.inherit_outer) self.skip_local_slot = slot;
         self.armName(group.name_id);
-        const compile_result = access.compileContainerValue(self, leaf.?.expr, .{});
+        const inherited = try compileInheritedLeaf(self, leaf.?);
+        const compile_result = if (inherited) @as(anyerror!void, {}) else access.compileContainerValue(self, leaf.?.expr, .{});
         self.skip_local_slot = previous_skip;
         try compile_result;
         try emit.emitSetCellLocal(self, slot);
@@ -572,6 +597,7 @@ pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrE
                 .dynamic_name = entry.dynamic_name,
                 .expr = entry.expr,
                 .inherit_outer = entry.inherit_outer,
+                .inherit_group = entry.inherit_group,
             };
         }
         index += attr_set.entries.len;
@@ -581,6 +607,8 @@ pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrE
             .path = tail.path,
             .expr = tail.expr,
             .inherit_outer = tail.inherit_outer,
+            .inherit_group = tail.inherit_group,
+            .inherit_slot = tail.inherit_slot,
             .origin = tail.origin,
         };
     }
@@ -670,9 +698,77 @@ fn attrEntryViews(self: *Compiler, entries: []const Node.AttrSetEntry) ![]AttrEn
             .dynamic_name = entry.dynamic_name,
             .expr = entry.expr,
             .inherit_outer = entry.inherit_outer,
+            .inherit_group = entry.inherit_group,
         };
     }
     return views;
+}
+
+/// Prepare one lazy phantom local for every `inherit (expr)` clause and stamp
+/// its slot onto each normalized entry. Plain sets get a private compiler
+/// scope; recursive sets call the in-current-scope variant after declaring
+/// their binding cells.
+fn prepareInheritSources(self: *Compiler, entries: []const AttrEntryView) !?[]AttrEntryView {
+    for (entries) |entry| {
+        if (entry.inherit_group != 0 and entry.inherit_slot == null) {
+            scope.beginScope(self);
+            errdefer scope.endScope(self);
+            return prepareInheritSourcesInCurrentScope(self, entries);
+        }
+    }
+    return null;
+}
+
+fn prepareInheritSourcesInCurrentScope(self: *Compiler, entries: []const AttrEntryView) !?[]AttrEntryView {
+    var any = false;
+    for (entries) |entry| if (entry.inherit_group != 0 and entry.inherit_slot == null) {
+        any = true;
+        break;
+    };
+    if (!any) return null;
+
+    const prepared = try self.allocator.dupe(AttrEntryView, entries);
+    errdefer self.allocator.free(prepared);
+    var slots: std.AutoHashMapUnmanaged(u32, u16) = .empty;
+    defer slots.deinit(self.allocator);
+    const phantom_name = "\x00inherit-source";
+    const phantom_id = try self.intern.intern(phantom_name);
+
+    for (prepared) |*entry| {
+        if (entry.inherit_group == 0 or entry.inherit_slot != null) continue;
+        if (slots.get(entry.inherit_group)) |slot| {
+            entry.inherit_slot = slot;
+            continue;
+        }
+        const slot = try scope.declareLocal(self, phantom_name, phantom_id);
+        const source = try inheritSource(entry.expr);
+        try thunks.compileThunk(self, source);
+        try emit.emitSetLocal(self, slot);
+        try slots.put(self.allocator, entry.inherit_group, slot);
+        entry.inherit_slot = slot;
+    }
+    return prepared;
+}
+
+fn inheritSource(expr_raw: *const Node) !*const Node {
+    const expr = ast.unwrapParens(expr_raw);
+    if (expr.tag != .attr_path or expr.data.attr_path.segments.len != 1) return error.InvalidAttributePath;
+    return expr.data.attr_path.root;
+}
+
+/// Emit the inherited member as a frameless attr-access thunk over the shared
+/// source local. Returns false for an ordinary entry.
+fn compileInheritedLeaf(self: *Compiler, leaf: AttrEntryView) !bool {
+    const source_slot = leaf.inherit_slot orelse return false;
+    if (leaf.path.len != 1) return error.InvalidAttributePath;
+    const name_id = try attrSegmentNameId(self, leaf.path[0]);
+    try emit.emitThunkAttr(self, .{
+        .name = "\x00inherit-source",
+        .name_id = try self.intern.intern("\x00inherit-source"),
+        .kind = .local,
+        .index = source_slot,
+    }, name_id);
+    return true;
 }
 
 const AttrEntryGroupBuild = struct {
@@ -777,6 +873,8 @@ fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGr
             .path = entry.path[1..],
             .expr = entry.expr,
             .inherit_outer = entry.inherit_outer,
+            .inherit_group = entry.inherit_group,
+            .inherit_slot = entry.inherit_slot,
             // Keep the outermost segment so the nested set reports the attr
             // path's start position for its desugared segments.
             .origin = entry.origin orelse entry.path[0],

@@ -49,7 +49,7 @@ fn isAggregateOp(op: OpCode) bool {
 
 fn isThunkFamilyOp(op: OpCode) bool {
     return switch (op) {
-        .thunk, .thunk_w, .thunk_arg, .thunk_shell, .thunk_defer, .thunk_attr, .thunk_st, .thunk_st_cell, .thunk_w_st, .thunk_w_st_cell, .closure, .closure_w, .closure_cap, .closure_cap_w => true,
+        .thunk, .thunk_w, .thunk_arg, .thunk_shell, .thunk_defer, .thunk_attr, .thunk_attr_w, .thunk_st, .thunk_st_cell, .thunk_w_st, .thunk_w_st_cell, .closure, .closure_w, .closure_cap, .closure_cap_w => true,
         else => false,
     };
 }

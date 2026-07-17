@@ -192,6 +192,8 @@ pub const OpCode = enum(u8) {
     /// chunk shape on a NixOS eval), which the runtime never dispatched
     /// anyway. Operand: kind:1 + index:2 + name:2.
     thunk_attr,
+    /// Wide-intern-id form of thunk_attr. Operand: kind:1 + index:2 + name:4.
+    thunk_attr_w,
 
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.
@@ -492,6 +494,7 @@ pub fn layout(op: OpCode) []const Operand {
         .thunk_st, .thunk_st_cell => comptime &[_]Operand{ .{ .chunk_id = .b2 }, .captures_slot },
         .thunk_w_st, .thunk_w_st_cell => comptime &[_]Operand{ .{ .chunk_id = .b4 }, .captures_slot },
         .thunk_attr => comptime &[_]Operand{ .cap1, .{ .intern = .b2 } },
+        .thunk_attr_w => comptime &[_]Operand{ .cap1, .{ .intern = .b4 } },
 
         // Fused slot/upvalue + attribute.
         .up_get_attr => comptime &[_]Operand{ slot(.b2, .upvalue), .{ .intern = .b2 } },

@@ -279,7 +279,7 @@ inline fn shortCircuitAttrAccess(self: *VM, descriptors: []const u8, frame: *con
 
 /// `thunk_attr`: the compile-time-elided form of the attr_access shape — one
 /// descriptor resolves the base, the thunk is frameless attr access over it.
-pub fn makeAttrAccessThunk(self: *VM, descriptors: []const u8, name: u16, frame: *const Frame) !void {
+pub fn makeAttrAccessThunk(self: *VM, descriptors: []const u8, name: types.InternId, frame: *const Frame) !void {
     const base = try resolveDescriptorValue(self, descriptors, frame, 0);
     const id = try self.heap.addThunk(Thunk.initAttrAccess(base, name));
     recordBytecodeThunkCreate(self, id, frame, frame.chunk_id);

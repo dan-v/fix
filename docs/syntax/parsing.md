@@ -90,7 +90,7 @@ The tag families (27 tags):
 - **Functions & binding forms**: `apply` (`Apply { func, arg, pipe }`), `lambda` (`Lambda { param_offset, param_len, body }`), `lambda_attrs` (`*LambdaAttrs { bind_name?, params[], allow_extra, body }`), `let_in` (`LetIn { bindings[], body }`), `with_expr`, `if_else`, `assert`.
 - **Attribute access & sets**: `attr_path` (`AttrPath { root, segments[] }`), `attr_dynamic`, `attr_or`, `has_attr` / `has_attr_mixed`, `attr_set` (`AttrSet { entries[], recursive }`), `list`, `parens`.
 
-Two shared records recur: `Binding { name_offset, name_len, path[], expr, inherit_outer }` for each `let`/`rec` binding, and `AttrSetEntry { path[], dynamic_name?, expr, inherit_outer }` for each attribute-set entry; `LambdaAttrParam { name, default? }` describes each formal in a pattern. The Nix-surface meaning of these — `inherit` desugaring, dynamic attr paths, pattern semantics — is documented in [nix-syntax](nix-syntax.md); this doc covers only how the tree is shaped and walked.
+Two shared records recur: `Binding { name_offset, name_len, path[], expr, inherit_outer, inherit_group }` for each `let`/`rec` binding, and `AttrSetEntry { path[], dynamic_name?, expr, inherit_outer, inherit_group }` for each attribute-set entry; `LambdaAttrParam { name, default? }` describes each formal in a pattern. `inherit_group` is zero except for entries sharing one `inherit (expr)` clause. The Nix-surface meaning of these — `inherit` desugaring, dynamic attr paths, pattern semantics — is documented in [nix-syntax](nix-syntax.md); this doc covers only how the tree is shaped and walked.
 
 ## Diagnostics and recovery
 

@@ -35,6 +35,14 @@ const Disassembly = struct {
     fn contains(self: *const Disassembly, name: []const u8) bool {
         return self.find(name) != null;
     }
+
+    fn count(self: *const Disassembly, name: []const u8) usize {
+        var total: usize = 0;
+        for (self.lines) |line| if (std.mem.eql(u8, line.name, name)) {
+            total += 1;
+        };
+        return total;
+    }
 };
 
 fn disassemble(ev: *Evaluator, source: []const u8) !Disassembly {
@@ -148,6 +156,18 @@ test "builtin opcode lowering requires saturation and the global builtins set" {
     defer shadowed.deinit(testing.allocator);
     try testing.expect(shadowed.contains("call_n") or shadowed.contains("call_tail_n"));
     try testing.expect(!shadowed.contains("int_sub"));
+}
+
+test "inherit-from group compiles one shared source thunk" {
+    var ev = try Evaluator.init(testing.allocator, 0);
+    defer ev.deinit();
+
+    var d = try disassemble(&ev, "let inherit (builtins.trace \"once\" { a = 1; b = 2; }) a b; in a + b");
+    defer d.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), d.count("thunk_attr"));
+    // The source application exists in one child chunk, not one clone per
+    // inherited name.
+    try testing.expectEqual(@as(usize, 1), d.count("push_builtins"));
 }
 
 test "compileBinary folds literal-on-literal arithmetic to a constant instead of emitting an opcode" {

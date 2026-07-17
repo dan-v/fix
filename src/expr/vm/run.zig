@@ -698,13 +698,18 @@ fn opDeferAttrValue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_de
 
 /// `thunk_attr`: one capture descriptor resolves the attr-access base; the
 /// frameless thunk is created without any wrapper chunk.
-fn opThunkAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    if (ip + 5 > code.len) return error.InvalidBytecode;
-    const descriptors = code[ip .. ip + 3];
-    const name = readU16(code, ip + 3);
-    try closures.makeAttrAccessThunk(vm, descriptors, name, frame);
-    return dispatch(vm, frame, code, ip + 5, stop_depth);
+fn thunkAttrOp(comptime wide: bool) HandlerFn {
+    return struct {
+        fn op(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+            frame.ip = ip;
+            const name_len: usize = if (wide) 4 else 2;
+            if (ip + 3 + name_len > code.len) return error.InvalidBytecode;
+            const descriptors = code[ip .. ip + 3];
+            const name: InternId = if (wide) readU32(code, ip + 3) else readU16(code, ip + 3);
+            try closures.makeAttrAccessThunk(vm, descriptors, name, frame);
+            return dispatch(vm, frame, code, ip + 3 + name_len, stop_depth);
+        }
+    }.op;
 }
 
 // ---- handlers: calls ----
@@ -1211,7 +1216,8 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .loc_get_attr_w => slotOp(.get_attr, true),
         .cell_new => opMakeCell,
         .thunk_shell => opMakeLazyShell,
-        .thunk_attr => opThunkAttr,
+        .thunk_attr => thunkAttrOp(false),
+        .thunk_attr_w => thunkAttrOp(true),
         .cell_init => slotOp(.cell_init, false),
         .cell_init_w => slotOp(.cell_init, true),
         .attr_get => internOp(.get_attr, false),

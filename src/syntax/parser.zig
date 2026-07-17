@@ -170,6 +170,9 @@ pub const Parser = struct {
     /// the scanner after driving. The compile chokepoint gates it on the
     /// `cr-line-endings` deprecated feature, like `used_pipe_operators`.
     first_cr_offset: ?u32 = null,
+    /// Clause identity for preserving `inherit (expr) a b` as one source
+    /// group through the otherwise entry-oriented AST.
+    next_inherit_group: u32 = 1,
     /// Deprecated-syntax warnings recorded during parsing (feature-agnostic);
     /// the consumer emits the ones whose feature is disabled.
     warnings: std.ArrayListUnmanaged(DeprecationWarning) = .empty,
@@ -773,6 +776,7 @@ pub const Parser = struct {
                         .path = path,
                         .expr = entry.expr,
                         .inherit_outer = entry.inherit_outer,
+                        .inherit_group = entry.inherit_group,
                     };
                 }
                 entries.deinit(a);
@@ -1233,6 +1237,12 @@ pub const Parser = struct {
         _ = inherit_tok;
         const a = self.arenaAllocator();
         const entries = try a.alloc(Node.AttrSetEntry, names.items.len);
+        const inherit_group = if (source != null) blk: {
+            const id = self.next_inherit_group;
+            self.next_inherit_group +%= 1;
+            if (self.next_inherit_group == 0) self.next_inherit_group = 1;
+            break :blk id;
+        } else 0;
         for (names.items, entries) |name, *entry| {
             const path = try a.alloc(Node.Atom, 1);
             path[0] = name;
@@ -1244,6 +1254,7 @@ pub const Parser = struct {
                 .path = path,
                 .expr = expr,
                 .inherit_outer = source == null,
+                .inherit_group = inherit_group,
             };
         }
         return entries;

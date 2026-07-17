@@ -307,6 +307,8 @@ test "parser desugars inherit from source expression" {
     }));
     try std.testing.expectEqual(NodeTag.attr_path, entries[1].expr.tag);
     try std.testing.expectEqual(NodeTag.identifier, entries[1].expr.data.attr_path.root.tag);
+    try std.testing.expect(entries[0].inherit_group != 0);
+    try std.testing.expectEqual(entries[0].inherit_group, entries[1].inherit_group);
 }
 
 test "parser recognizes contextual or attr names" {
@@ -358,6 +360,7 @@ test "parser desugars inherit in let bindings" {
     try std.testing.expectEqual(NodeTag.attr_path, bindings[1].expr.tag);
     try std.testing.expectEqual(NodeTag.identifier, bindings[1].expr.data.attr_path.root.tag);
     try std.testing.expect(!bindings[1].inherit_outer);
+    try std.testing.expect(bindings[1].inherit_group != 0);
 }
 
 test "parser recognizes attr path or default" {
@@ -768,6 +771,7 @@ fn nodeEq(a: *const Node, b: *const Node) bool {
             for (la.bindings, lb.bindings) |ba, bb| {
                 if (ba.name_offset != bb.name_offset or ba.name_len != bb.name_len) return false;
                 if (ba.inherit_outer != bb.inherit_outer) return false;
+                if (ba.inherit_group != bb.inherit_group) return false;
                 if (!atomsEq(ba.path, bb.path)) return false;
                 if (!nodeEq(ba.expr, bb.expr)) return false;
             }
@@ -787,6 +791,7 @@ fn nodeEq(a: *const Node, b: *const Node) bool {
             if (sa.entries.len != sb.entries.len) return false;
             for (sa.entries, sb.entries) |ea, eb| {
                 if (ea.inherit_outer != eb.inherit_outer) return false;
+                if (ea.inherit_group != eb.inherit_group) return false;
                 if (!atomsEq(ea.path, eb.path)) return false;
                 if (!optNodeEq(ea.dynamic_name, eb.dynamic_name)) return false;
                 if (!nodeEq(ea.expr, eb.expr)) return false;

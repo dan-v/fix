@@ -40,6 +40,9 @@ pub const AttrEntryView = struct {
     dynamic_name: ?*const Node = null,
     expr: *const Node,
     inherit_outer: bool = false,
+    inherit_group: u32 = 0,
+    /// Compiler-local slot holding the one shared lazy source for this group.
+    inherit_slot: ?u16 = null,
     /// The outermost attr-path segment this view was desugared from, threaded
     /// through nested-set splits. Nix reports the *start* of an attr path as the
     /// position of every desugared segment, so `{ foo.bar = 1; }` gives `bar`
