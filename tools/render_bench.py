@@ -41,6 +41,20 @@ SUITE_COLORS = {
     "realworld": "#7557C5",
     "json": "#138E83",
 }
+PARAMETER_GROUPS = (
+    {
+        "prefix": "detsys-",
+        "label": "DETERMINATE",
+        "parameter": "EVAL CORES",
+        "color": "#C66A1A",
+    },
+    {
+        "prefix": "fix-",
+        "label": "FIX",
+        "parameter": "WORKERS",
+        "color": "#08766B",
+    },
+)
 RATIO_STYLES = (
     (1.0, "#147D74", "#FFFFFF", "fastest"),
     (1.25, "#D9F0EC", TEXT, "≤ 1.25×"),
@@ -88,6 +102,62 @@ def color_for(name: str) -> str:
     return COLORS.get(name, "#667085")
 
 
+def parameter_group(name: str) -> dict | None:
+    return next(
+        (group for group in PARAMETER_GROUPS if name.startswith(group["prefix"])),
+        None,
+    )
+
+
+def row_layout(names: list[str]) -> tuple[list[float], list[dict]]:
+    """Lay out tool rows with a small break around parameterized families."""
+    positions = []
+    groups = []
+    position = 0.0
+    previous_key = None
+    for name in names:
+        group = parameter_group(name)
+        key = group["prefix"] if group is not None else name
+        if previous_key is not None and key != previous_key:
+            position += 0.42
+        positions.append(position)
+        if group is not None:
+            if not groups or groups[-1]["prefix"] != group["prefix"]:
+                groups.append({**group, "start": position, "end": position})
+            else:
+                groups[-1]["end"] = position
+        position += 1.0
+        previous_key = key
+    return positions, groups
+
+
+def mark_parameter_groups(ax: plt.Axes, groups: list[dict], *, labels: bool) -> None:
+    for group in groups:
+        ax.axhspan(
+            group["start"] - 0.43,
+            group["end"] + 0.43,
+            facecolor=group["color"],
+            alpha=0.035,
+            linewidth=0,
+            zorder=0,
+        )
+        if not labels:
+            continue
+        heading = f"{group['label']} · {group['parameter']}"
+        ax.text(
+            -0.012,
+            group["start"] - 0.56,
+            heading,
+            transform=ax.get_yaxis_transform(),
+            ha="right",
+            va="center",
+            fontsize=7,
+            color=group["color"],
+            fontweight="bold",
+            clip_on=False,
+        )
+
+
 def style_axis(ax: plt.Axes) -> None:
     ax.set_facecolor("#FFFFFF")
     ax.grid(axis="x", color=GRID, linewidth=0.75)
@@ -110,9 +180,9 @@ def axis_break(rows: list[dict]) -> tuple[float, float] | None:
     return (lower, upper) if ratio >= 4.0 else None
 
 
-def bars_on(ax: plt.Axes, rows: list[dict]) -> list:
+def bars_on(ax: plt.Axes, rows: list[dict], positions: list[float]) -> list:
     return ax.barh(
-        list(range(len(rows))),
+        positions,
         [row["mean"] for row in rows],
         xerr=[row["stddev"] for row in rows],
         color=[color_for(row["name"]) for row in rows],
@@ -146,12 +216,12 @@ def draw_workload(fig: plt.Figure, slots, workload: dict) -> None:
     rows = workload["rows"]
     fastest = min(row["mean"] for row in rows)
     upper = max(row["mean"] + row["stddev"] for row in rows)
-    y = list(range(len(rows)))
+    y, parameter_groups = row_layout([row["name"] for row in rows])
     gap = axis_break(rows)
 
     if gap is None:
         ax = fig.add_subplot(slots[0])
-        bars = bars_on(ax, rows)
+        bars = bars_on(ax, rows, y)
         label_room = max(upper * 0.38, fastest * 0.9)
         ax.set_xlim(0, upper + label_room)
         label_rows(ax, bars, rows, fastest, lambda _row: True)
@@ -161,8 +231,8 @@ def draw_workload(fig: plt.Figure, slots, workload: dict) -> None:
         split = (lower + higher) / 2
         ax = fig.add_subplot(slots[1])
         right = fig.add_subplot(slots[2], sharey=ax)
-        left_bars = bars_on(ax, rows)
-        right_bars = bars_on(right, rows)
+        left_bars = bars_on(ax, rows, y)
+        right_bars = bars_on(right, rows, y)
         ax.set_xlim(0, lower * 1.55)
         right_start = max(lower * 1.7, higher * 0.88)
         right_room = max(upper * 0.16, (upper - right_start) * 0.5)
@@ -193,6 +263,7 @@ def draw_workload(fig: plt.Figure, slots, workload: dict) -> None:
     title = workload.get("display_name", workload["name"]).replace("-", " ")
     ax.set_title(title, loc="left", fontsize=11, fontweight="bold", color=TEXT, pad=8)
     for chart_axis in axes:
+        mark_parameter_groups(chart_axis, parameter_groups, labels=chart_axis is ax)
         style_axis(chart_axis)
     ax.invert_yaxis()
     if gap is not None:
@@ -294,15 +365,17 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
     row_maps = [{row["name"]: row for row in workload["rows"]} for workload in workloads]
     fastest = [min(row["mean"] for row in workload["rows"]) for workload in workloads]
     runs = max((row["runs"] for workload in workloads for row in workload["rows"]), default=0)
+    row_positions, parameter_groups = row_layout(tool_names)
 
     width = max(14.5, 2.8 + 1.08 * len(workloads))
-    height = max(7.0, 2.8 + 0.39 * len(tool_names))
+    row_extent = row_positions[-1] + 1 if row_positions else 0
+    height = max(7.0, 2.8 + 0.39 * row_extent)
     fig, ax = plt.subplots(figsize=(width, height), facecolor=BACKGROUND)
     ax.set_facecolor("#FFFFFF")
     fig.subplots_adjust(left=max(0.12, 2.15 / width), right=0.985, bottom=0.07, top=0.70)
 
     for column, (rows_by_name, best) in enumerate(zip(row_maps, fastest)):
-        for row_index, tool_name in enumerate(tool_names):
+        for tool_name, row_position in zip(tool_names, row_positions):
             row = rows_by_name.get(tool_name)
             if row is None:
                 background, foreground, label = "#F3F5F8", "#98A2B3", "—"
@@ -312,7 +385,7 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
                 label = ratio_label(ratio)
             ax.add_patch(
                 Rectangle(
-                    (column - 0.47, row_index - 0.43),
+                    (column - 0.47, row_position - 0.43),
                     0.94,
                     0.86,
                     facecolor=background,
@@ -322,7 +395,7 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
             )
             ax.text(
                 column,
-                row_index,
+                row_position,
                 label,
                 ha="center",
                 va="center",
@@ -332,16 +405,17 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
             )
 
     ax.set_xlim(-0.5, len(workloads) - 0.5)
-    ax.set_ylim(len(tool_names) - 0.5, -0.5)
+    ax.set_ylim(row_extent - 0.5, -0.5)
     ax.set_xticks(range(len(workloads)), [wrapped_workload_label(item) for item in workloads])
-    ax.set_yticks(range(len(tool_names)), tool_names)
+    ax.set_yticks(row_positions, tool_names)
     ax.tick_params(axis="x", top=True, labeltop=True, bottom=False, labelbottom=False, length=0, pad=11, labelsize=8)
     ax.tick_params(axis="y", length=0, pad=10, labelsize=8.5, colors=TEXT)
     for label in ax.get_xticklabels():
         label.set_color("#344054")
         label.set_linespacing(1.3)
-    for row_index, tool_name in enumerate(tool_names):
-        ax.scatter(-0.535, row_index, s=24, color=color_for(tool_name), clip_on=False, zorder=3)
+    for row_position, tool_name in zip(row_positions, tool_names):
+        ax.scatter(-0.535, row_position, s=24, color=color_for(tool_name), clip_on=False, zorder=3)
+    mark_parameter_groups(ax, parameter_groups, labels=True)
     for spine in ax.spines.values():
         spine.set_visible(False)
 

@@ -32,11 +32,13 @@ the harness without creating a `result` link. Useful environment variables are:
 
 The result root contains a compact landscape `summary.svg` / `summary.png`
 covering every selected suite. Its comparison matrix shows relative wall time
-per evaluator and the absolute best time for each workload. Each suite directory
-contains Hyperfine Markdown and JSON, an SVG and PNG for each workload, and its
-own detailed `summary.svg` / `summary.png`. When one evaluator would flatten
-the rest of a detailed bar chart, the renderer marks and uses a broken time
-axis while keeping the exact times and relative ratios.
+per evaluator and the absolute best time for each workload. Parameter sweeps,
+such as Fix workers and Determinate evaluator cores, remain expanded but are
+visually grouped. Each suite directory contains Hyperfine Markdown and JSON, an
+SVG and PNG for each workload, and its own detailed `summary.svg` /
+`summary.png`. When one evaluator would flatten the rest of a detailed bar
+chart, the renderer marks and uses a broken time axis while keeping the exact
+times and relative ratios.
 
 ## Running workloads directly
 
