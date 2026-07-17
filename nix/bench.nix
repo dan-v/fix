@@ -89,6 +89,30 @@
 
   shellArray = tools: builtins.concatStringsSep " " (map lib.escapeShellArg tools);
   plotPython = pkgs.python3.withPackages (ps: [ps.matplotlib]);
+  reclaimMemoryAsRoot = pkgs.writeShellScript "fix-bench-reclaim-memory-root" ''
+    set -euo pipefail
+
+    if [[ "$EUID" -ne 0 ]]; then
+      echo "fix-bench memory preparation must run as root" >&2
+      exit 1
+    fi
+    if [[ ! -w /proc/sys/vm/drop_caches || ! -w /proc/sys/vm/compact_memory ]]; then
+      echo "fix-bench memory preparation requires Linux VM sysctls" >&2
+      exit 1
+    fi
+
+    # Release clean page-cache/slab pages, then coalesce the resulting free
+    # pages so every run starts with the same opportunity to obtain THPs.
+    # Explicit hugetlb mappings return to their configured pool at process
+    # exit, so deliberately leave vm.nr_hugepages unchanged.
+    ${pkgs.coreutils}/bin/sync
+    printf '3\n' > /proc/sys/vm/drop_caches
+    printf '1\n' > /proc/sys/vm/compact_memory
+  '';
+  prepareMemory = pkgs.writeShellScript "fix-bench-prepare-memory" ''
+    set -euo pipefail
+    exec sudo -n ${reclaimMemoryAsRoot}
+  '';
 in
   pkgs.writeShellApplication {
     name = "fix-bench";
@@ -105,6 +129,7 @@ in
       environment:
         RUNS=N              measured runs per command (default: 10)
         WARMUP=N            warmup runs per command (default: 1)
+        RECLAIM_MEMORY=0    skip per-run cache reclaim and memory compaction
         OUT=DIR             output directory (default: /tmp/fix-bench.XXXXXX)
         TOOLS=RULE,...      select evaluator rows: exact name or /Bash ERE/;
                             prefix a rule with - to exclude it. If every rule
@@ -124,6 +149,25 @@ in
 
       runs="''${RUNS:-10}"
       warmup="''${WARMUP:-1}"
+      reclaim_memory="''${RECLAIM_MEMORY:-1}"
+      prepare_args=()
+      case "$reclaim_memory" in
+        1|true|yes)
+          if ! command -v sudo >/dev/null; then
+            echo "RECLAIM_MEMORY requires sudo in PATH (or set RECLAIM_MEMORY=0)" >&2
+            exit 1
+          fi
+          echo "authorizing per-run memory reclaim with sudo"
+          sudo -v
+          prepare_args=(--prepare ${prepareMemory})
+          ;;
+        0|false|no)
+          ;;
+        *)
+          echo "invalid RECLAIM_MEMORY value: $reclaim_memory (expected 0 or 1)" >&2
+          exit 2
+          ;;
+      esac
       if [[ -n "''${OUT:-}" ]]; then
         out="$OUT"
         mkdir -p "$out"
@@ -284,6 +328,7 @@ in
           fi
 
           hyperfine --shell=none --warmup "$warmup" --runs "$runs" --sort command \
+            "''${prepare_args[@]}" \
             --export-json "$suite_out/$name.json" \
             --export-markdown "$suite_out/$name.md" \
             "''${args[@]}"

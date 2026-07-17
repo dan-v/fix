@@ -21,6 +21,10 @@ With no suite, all suites run. `bench.sh` is a convenience wrapper that builds
 the harness without creating a `result` link. Useful environment variables are:
 
 - `RUNS` and `WARMUP` control Hyperfine sampling.
+- `RECLAIM_MEMORY=0` disables the default per-run `sudo` preparation, which
+  drops reclaimable caches and compacts normal memory before every measured
+  run. The harness obtains credentials once with `sudo -v`; explicit hugetlb
+  pages remain in the configured pool and are reused after each evaluator exits.
 - `TOOLS=nix,lix,fix-1core` selects evaluator rows.
 - `WORKLOADS=call-heavy,string-heavy` selects workloads by basename.
 - `OUT=/path` selects the result directory instead of `/tmp/fix-bench.XXXXXX`.
