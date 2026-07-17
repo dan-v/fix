@@ -48,21 +48,33 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
     vm_force.forceListAccelerate(self, list_id, items);
     const item_values = try self.allocator.alloc(Value, items.len);
     defer self.allocator.free(item_values);
-    // gc: re-fetch — range may move across coerceStringContextValue's force
-    for (item_values, 0..) |*value, i| value.* = try coerceStringContextValue(self, try self.heap.getListItem(list_id, i));
-
-    const sep = self.intern.get(try stringTextInternId(self, sep_value));
-
-    // GC: `item_values` holds freshly-coerced string/context-string values that
-    // are NOT on the VM stack; the loop below forces (via appendContextEntry ->
-    // mergeContextValues). Root each coerced value across those forces.
+    const item_text_ids = try self.allocator.alloc(InternId, items.len);
+    defer self.allocator.free(item_text_ids);
+    // GC: each coerced path/attr can be a fresh context string held only in
+    // item_values. Root it immediately, before coercing the next item (which
+    // may force user code and collect), and retain all items through context
+    // merging below.
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
-    for (item_values) |item_value| vm_force.rootKeep(self, item_value);
     vm_force.rootKeep(self, sep_value);
+    const sep = self.intern.get(try stringTextInternId(self, sep_value));
+    var item_bytes: usize = 0;
+    // gc: re-fetch — range may move across coerceStringContextValue's force
+    for (item_values, item_text_ids, 0..) |*value, *text_id, i| {
+        value.* = try coerceStringContextValue(self, try self.heap.getListItem(list_id, i));
+        vm_force.rootKeep(self, value.*);
+        text_id.* = try stringTextInternId(self, value.*);
+        item_bytes = try std.math.add(usize, item_bytes, self.intern.get(text_id.*).len);
+    }
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(self.allocator);
+    const separator_bytes: usize = if (item_values.len > 1)
+        try std.math.mul(usize, sep.len, item_values.len - 1)
+    else
+        0;
+    const total = try std.math.add(usize, item_bytes, separator_bytes);
+    const out = try self.allocator.alloc(u8, total);
+    defer self.allocator.free(out);
+
     var ctx: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer ctx.deinit(self.allocator);
 
@@ -72,16 +84,22 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
         try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
     }
 
-    for (item_values, 0..) |item_value, i| {
-        if (i > 0) try out.appendSlice(self.allocator, sep);
-        const item_id = try stringTextInternId(self, item_value);
-        try out.appendSlice(self.allocator, self.intern.get(item_id));
+    var out_at: usize = 0;
+    for (item_values, item_text_ids, 0..) |item_value, text_id, i| {
+        if (i > 0) {
+            @memcpy(out[out_at..][0..sep.len], sep);
+            out_at += sep.len;
+        }
+        const text = self.intern.get(text_id);
+        @memcpy(out[out_at..][0..text.len], text);
+        out_at += text.len;
         for (try string_context.contextEntriesForValue(self, item_value)) |entry| {
             try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
         }
     }
+    std.debug.assert(out_at == out.len);
 
-    const text_id = try self.intern.intern(out.items);
+    const text_id = try self.intern.intern(out);
     if (ctx.items.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
 }
