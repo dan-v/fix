@@ -70,11 +70,7 @@ in
         for t in "''${tools[@]}"; do
           cmd="''${t#*|} $f"
           # shellcheck disable=SC2086  # word-splitting the command is intended
-          if timeout 300 $cmd >/dev/null 2>&1; then
-            args+=(-n "''${t%%|*}" "$cmd")
-          else
-            echo "   dropped ''${t%%|*} (could not evaluate this workload)"
-          fi
+          args+=(-n "''${t%%|*}" "$cmd")
         done
         [ "''${#args[@]}" -gt 0 ] &&
           hyperfine --shell=none --warmup 1 --runs "$runs" \
