@@ -314,17 +314,16 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
         try emit.emitSetLocal(&child, slot);
     }
 
-    var wide_params = false;
-    for (lambda.params) |param| {
-        const name = self.source[param.name.offset .. param.name.offset + param.name.len];
-        if (try self.intern.intern(name) > std.math.maxInt(u16)) wide_params = true;
-    }
-
-    try emit.emitGetLocal(&child, arg_slot);
-    try emit.emitOp(&child, if (wide_params) .attr_check_w else .attr_check);
-    try child.builder.writeByte(child.allocator, if (lambda.allow_extra) 1 else 0);
     const param_count = try diagnostics.requireU16At(self, lambda.params.len, diagnosticAtom(node), "too many function parameters");
-    try child.builder.writeU16(child.allocator, param_count);
+    const ParamBinding = struct {
+        name_id: InternId,
+        slot: u16,
+        has_default: bool,
+    };
+    const param_bindings = try self.allocator.alloc(ParamBinding, lambda.params.len);
+    defer self.allocator.free(param_bindings);
+
+    var wide_params = false;
     var function_args: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer function_args.deinit(self.allocator);
     try function_args.ensureTotalCapacity(self.allocator, lambda.params.len);
@@ -333,10 +332,15 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     var function_arg_pos: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
     defer function_arg_pos.deinit(self.allocator);
     const record_positions = self.source_path != null;
-    for (lambda.params) |param| {
+    for (lambda.params, param_bindings) |param, *binding| {
         const name = self.source[param.name.offset .. param.name.offset + param.name.len];
         const name_id = try self.intern.intern(name);
-        try emit.writeInternId(&child, name_id, wide_params);
+        if (name_id > std.math.maxInt(u16)) wide_params = true;
+        binding.* = .{
+            .name_id = name_id,
+            .slot = try scope.declareLocal(&child, name, name_id),
+            .has_default = param.default != null,
+        };
         function_args.appendAssumeCapacity(.{
             .name = name_id,
             .value = Value.boolVal(param.default != null),
@@ -370,34 +374,43 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     // The overwhelmingly common case — no defaults at all, or defaults
     // that don't reference sibling formals (every NixOS module function,
     // `{ config, lib, pkgs, ... }`) — needs no cells: each formal binds
-    // directly to its lookup thunk via `loc_set`, skipping a per-formal
-    // binding-cell heap alloc plus a force-indirection on every param
-    // access. This lands on the hot critical path (module application,
+    // directly to the raw argument value, skipping a per-formal binding-cell
+    // heap alloc plus a force-indirection on every param access. This lands on
+    // the hot critical path (module application,
     // modules.nix:450). The check only walks DEFAULTS (tiny / absent),
     // never bodies, so it adds negligible compile cost.
     const needs_cells = attrParamsNeedCells(self, lambda.params);
+    if (needs_cells) for (param_bindings) |binding| try emit.emitInitCellSlot(&child, binding.slot);
 
-    if (needs_cells) {
-        for (lambda.params) |param| {
-            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
-            const name_id = try self.intern.intern(name);
-            const slot = try scope.declareLocal(&child, name, name_id);
-            try emit.emitInitCellSlot(&child, slot);
+    // One sorted merge walk validates the argument set and installs every
+    // required formal. Optional names use the 0xffff slot sentinel: they still
+    // participate in unexpected-attribute validation, then the default path
+    // below chooses the supplied raw value or its lazy fallback.
+    const sorted_bindings = try self.allocator.dupe(ParamBinding, param_bindings);
+    defer self.allocator.free(sorted_bindings);
+    std.mem.sort(ParamBinding, sorted_bindings, {}, struct {
+        fn lessThan(_: void, a: ParamBinding, b: ParamBinding) bool {
+            return a.name_id < b.name_id;
         }
-        for (lambda.params) |param| {
-            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
-            const name_id = try self.intern.intern(name);
-            const slot = scope.resolveLocal(&child, name) orelse return error.UndefinedVariable;
-            try compileAttrParam(&child, arg_slot, name_id, param.default);
-            try emit.emitSetCellLocal(&child, slot);
-        }
-    } else {
-        for (lambda.params) |param| {
-            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
-            const name_id = try self.intern.intern(name);
-            const slot = try scope.declareLocal(&child, name, name_id);
-            try compileAttrParam(&child, arg_slot, name_id, param.default);
-            try emit.emitSetLocal(&child, slot);
+    }.lessThan);
+
+    try emit.emitCaptureLocal(&child, arg_slot);
+    try emit.emitOp(&child, if (wide_params) .attr_bind_w else .attr_bind);
+    try child.builder.writeByte(child.allocator, if (lambda.allow_extra) 1 else 0);
+    try child.builder.writeByte(child.allocator, if (needs_cells) 1 else 0);
+    try child.builder.writeU16(child.allocator, param_count);
+    for (sorted_bindings) |binding| {
+        try emit.writeInternId(&child, binding.name_id, wide_params);
+        try child.builder.writeU16(child.allocator, if (binding.has_default) std.math.maxInt(u16) else binding.slot);
+    }
+
+    for (lambda.params, param_bindings) |param, binding| {
+        if (!binding.has_default) continue;
+        try compileAttrParam(&child, arg_slot, binding.name_id, param.default);
+        if (needs_cells) {
+            try emit.emitSetCellLocal(&child, binding.slot);
+        } else {
+            try emit.emitSetLocal(&child, binding.slot);
         }
     }
 

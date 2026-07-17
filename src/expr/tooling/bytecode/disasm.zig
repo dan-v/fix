@@ -889,20 +889,26 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.glue(" entries (named)", .{});
             return 2;
         },
-        .attr_check, .attr_check_w => {
+        .attr_bind, .attr_bind_w => {
             const allow = code[start + 1];
-            const expected = readU16(code, start + 2);
+            const cells = code[start + 2];
+            const expected = readU16(code, start + 3);
             const c_a = hueColor(seq.*);
-            const c_n = hueColor(seq.* + 1);
-            seq.* += 2;
+            const c_c = hueColor(seq.* + 1);
+            const c_n = hueColor(seq.* + 2);
+            seq.* += 3;
             l.groupPinned(1, 1, c_a, "#{d}", .{allow});
             l.glue(" ", .{});
-            l.groupPinned(2, 2, c_n, "#{d}", .{expected});
+            l.groupPinned(2, 1, c_c, "#{d}", .{cells});
+            l.glue(" ", .{});
+            l.groupPinned(3, 2, c_n, "#{d}", .{expected});
             l.comment();
             l.tint(c_n, "{d}", .{expected});
-            l.glue(" expected, ", .{});
+            l.glue(" formals, ", .{});
             l.tint(c_a, "extra {s}", .{if (allow != 0) "allowed" else "rejected"});
-            return 3;
+            l.glue(", ", .{});
+            l.tint(c_c, "{s}", .{if (cells != 0) "cells" else "locals"});
+            return 4;
         },
         .attr_get_path_or, .attr_get_path_dyn_or, .attr_has_path => return buildAttrPathHead(l, code, start, false, symbols, seq),
         .attr_get_path_or_w, .attr_get_path_dyn_or_w, .attr_has_path_w => return buildAttrPathHead(l, code, start, true, symbols, seq),
@@ -991,7 +997,7 @@ fn buildMixPathHead(l: *Line, code: []const u8, start: usize, symbols: Symbols, 
 /// `writeOperandTail`) rather than on the mnemonic row.
 fn fieldIsList(f: Operand) bool {
     return switch (f) {
-        .captures, .captures_slot, .attr_path, .check, .mix => true,
+        .captures, .captures_slot, .attr_path, .bind, .mix => true,
         else => false,
     };
 }
@@ -1350,16 +1356,17 @@ fn writeOperandTail(
             try emitCountLine(writer, code, &off, "env", seq, g[0..1], if (n == 0) 0b01 else 0, stripe, env);
             try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], 0b11, up_names, symbols, stripe, env);
         },
-        .attr_check, .attr_check_w => {
-            // The flag + count rode the mnemonic line (count = its last 2 head
-            // bytes); one row per expected attribute name, each with its
-            // `str[…] → "name"` chain in the intern id's identity color.
-            const wide = op == .attr_check_w;
+        .attr_bind, .attr_bind_w => {
+            // The header rode the mnemonic line; each child is one sorted
+            // (formal name, destination slot) pair. 0xffff marks an optional
+            // formal filled by its default path after this instruction.
+            const wide = op == .attr_bind_w;
             const id_len: u16 = if (wide) 4 else 2;
             const expected = readU16(code, off - 2);
             var k: usize = 0;
             while (k < expected) : (k += 1) {
                 const id: InternId = if (wide) readU32(code, off) else @intCast(readU16(code, off));
+                const slot = readU16(code, off + id_len);
                 const c = internColor(id);
                 var esc: [128]u8 = undefined;
                 var ew: std.Io.Writer = .fixed(&esc);
@@ -1367,11 +1374,18 @@ fn writeOperandTail(
                 var l: Line = undefined;
                 l.reset();
                 l.groupPinned(0, id_len, c, "0x{x}", .{id});
+                l.glue(" ", .{});
+                l.group(id_len, 2, "#{d}", .{slot});
                 l.comment();
                 l.storeRef("str", c, "0x{x}", .{id});
                 if (ew.end > 0) {
                     l.glue(" → ", .{});
                     l.tint(c, "\"{s}\"", .{esc[0..ew.end]});
+                }
+                if (slot == std.math.maxInt(u16)) {
+                    l.glue(" → optional", .{});
+                } else {
+                    l.glue(" → local[{d}]", .{slot});
                 }
                 try emitLine(writer, code, &off, &l, seq, g[0..1], if (k == expected - 1) 0b01 else 0, takeBg(stripe, env.use_color), env);
             }
@@ -1414,8 +1428,8 @@ fn isMultiline(op: OpCode) bool {
         .attrs_new_named_pos_srt,
         // .thunk_defer is now single-line: its captures are interned in the
         // chunk side table, no inline descriptor child rows.
-        .attr_check,
-        .attr_check_w,
+        .attr_bind,
+        .attr_bind_w,
         => true,
         else => false,
     };
@@ -1636,7 +1650,7 @@ fn writeFieldRaw(writer: *std.Io.Writer, f: Operand, code: []const u8, ip: usize
         .jump => try writer.print("+{d}", .{readU32(code, ip)}),
         .captures, .captures_slot => try writer.print("#{d}", .{readU16(code, ip)}),
         .attr_path => try writer.print("#{d}", .{code[ip]}),
-        .check => try writer.print("#{d}", .{readU16(code, ip + 1)}),
+        .bind => try writer.print("#{d}", .{readU16(code, ip + 2)}),
         .mix => try writer.print("#{d} #{d}", .{ code[ip], code[ip + 1] }),
     }
 }
@@ -1696,10 +1710,15 @@ fn writeFieldInterp(
             const segments = code[ip];
             try writeAttrPath(writer, code, ip + 1, segments, w == .b4, symbols);
         },
-        .check => {
+        .bind => {
             const allow = code[ip];
-            const expected = readU16(code, ip + 1);
-            try writer.print("{d} expected (allow_extra={s})", .{ expected, if (allow != 0) "true" else "false" });
+            const cells = code[ip + 1];
+            const expected = readU16(code, ip + 2);
+            try writer.print("{d} formals (allow_extra={s}, {s})", .{
+                expected,
+                if (allow != 0) "true" else "false",
+                if (cells != 0) "cells" else "locals",
+            });
         },
         .mix => try writer.print("{d} segments ({d} dynamic)", .{ code[ip], code[ip + 1] }),
     }

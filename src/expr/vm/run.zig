@@ -875,7 +875,7 @@ fn opGetAttrDynamicOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
-const StaticPathOp = enum { dynamic_or, or_value, has, validate };
+const StaticPathOp = enum { dynamic_or, or_value, has };
 
 /// Attribute-path encodings differ only in the width of each static intern id.
 fn staticPathOp(comptime operation: StaticPathOp, comptime wide: bool) HandlerFn {
@@ -909,13 +909,75 @@ fn staticPathOp(comptime operation: StaticPathOp, comptime wide: bool) HandlerFn
                     vm.stack[vm.sp - 1] = Value.boolVal(try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], wide));
                     return dispatch(vm, frame, code, names_end, stop_depth);
                 },
-                .validate => {
-                    const names_start = ip + 3;
-                    const names_end = names_start + @as(usize, readU16(code, ip + 1)) * name_len;
-                    try access.validateAttrs(vm, stack.pop(vm), code[ip] != 0, code[names_start..names_end], wide);
-                    return dispatch(vm, frame, code, names_end, stop_depth);
-                },
             }
+        }
+    }.op;
+}
+
+/// Attrset-pattern call entry: validate allowed/required formals and install
+/// every supplied required value directly into its destination local. The
+/// encoded pairs and heap entries are both sorted by InternId, so this is one
+/// O(args + formals) merge walk. Optional pairs carry slot=0xffff and are
+/// filled by their default-expression bytecode after this op.
+fn attrBindOp(comptime wide: bool) HandlerFn {
+    return struct {
+        fn op(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+            frame.ip = ip;
+            const allow_extra = code[ip] != 0;
+            const cells = code[ip + 1] != 0;
+            const count: usize = readU16(code, ip + 2);
+            const name_len: usize = if (wide) 4 else 2;
+            const stride = name_len + 2;
+            const pairs_start = ip + 4;
+            const pairs_end = pairs_start + count * stride;
+            if (pairs_end > code.len or vm.sp == 0) return error.InvalidBytecode;
+
+            // Keep the argument rooted on the operand stack across force and
+            // possible merge flattening; replace it with WHNF for the walk.
+            const attrs = try force.forceValue(vm, vm.stack[vm.sp - 1]);
+            vm.stack[vm.sp - 1] = attrs;
+            if (!attrs.isAttrs()) return trace.typeErrorExpected(vm, "attrs", attrs);
+            const entries = try vm.heap.getAttrs(attrs.asObjectId());
+
+            var entry_i: usize = 0;
+            var pair_i: usize = 0;
+            while (entry_i < entries.len and pair_i < count) {
+                const pair_at = pairs_start + pair_i * stride;
+                const name: InternId = if (wide) readU32(code, pair_at) else @intCast(readU16(code, pair_at));
+                const slot = readU16(code, pair_at + name_len);
+                const entry = entries[entry_i];
+                if (entry.name < name) {
+                    if (!allow_extra) return error.UnexpectedAttribute;
+                    entry_i += 1;
+                } else if (entry.name > name) {
+                    if (slot != std.math.maxInt(u16)) return error.MissingAttribute;
+                    pair_i += 1;
+                } else {
+                    if (slot != std.math.maxInt(u16)) {
+                        if (slot >= frame.local_count) return error.InvalidBytecode;
+                        if (cells) {
+                            const cell_val = vm.stack[frame.frame_base + slot];
+                            if (!cell_val.isThunk()) return error.InvalidBytecode;
+                            const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
+                            if (vm.solo) thunk.publishCellBindingSolo(entry.value) else thunk.publishCellBinding(entry.value);
+                            vm.heap.gcRecordEdge(cell_val.asObjectId(), entry.value);
+                        } else {
+                            stack.setStack(vm, frame.frame_base + slot, entry.value);
+                        }
+                    }
+                    entry_i += 1;
+                    pair_i += 1;
+                }
+            }
+            while (pair_i < count) : (pair_i += 1) {
+                const pair_at = pairs_start + pair_i * stride;
+                const slot = readU16(code, pair_at + name_len);
+                if (slot != std.math.maxInt(u16)) return error.MissingAttribute;
+            }
+            if (!allow_extra and entry_i < entries.len) return error.UnexpectedAttribute;
+
+            _ = stack.pop(vm);
+            return dispatch(vm, frame, code, pairs_end, stop_depth);
         }
     }.op;
 }
@@ -1158,8 +1220,8 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .attr_has_path => staticPathOp(.has, false),
         .attr_has_path_w => staticPathOp(.has, true),
         .attr_has_path_mix => opHasAttrPathMixed,
-        .attr_check => staticPathOp(.validate, false),
-        .attr_check_w => staticPathOp(.validate, true),
+        .attr_bind => attrBindOp(false),
+        .attr_bind_w => attrBindOp(true),
         .with_lookup => internOp(.lookup_with, false),
         .with_lookup_w => internOp(.lookup_with, true),
         .thunk_defer => opDeferAttrValue,

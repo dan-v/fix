@@ -321,27 +321,6 @@ pub fn hasAttrPathMixed(self: *VM, attrs_val: Value, dynamic_names: []const Valu
     return false;
 }
 
-pub fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_names: []const u8, wide: bool) !void {
-    const value = try force.forceValue(self, attrs_val);
-    if (!value.isAttrs()) return trace.typeErrorExpected(self, "attrs", value);
-    if (allow_extra) return;
-
-    const entries = try self.heap.getAttrs(value.asObjectId());
-    const stride: usize = if (wide) 4 else 2;
-    for (entries) |entry| {
-        var found = false;
-        var offset: usize = 0;
-        while (offset < encoded_names.len) : (offset += stride) {
-            const name_id = readInternId(encoded_names, offset, wide);
-            if (entry.name == name_id) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return error.UnexpectedAttribute;
-    }
-}
-
 pub fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {
     const start = self.sp - scope_count;
     const scopes = self.stack[start..self.sp];

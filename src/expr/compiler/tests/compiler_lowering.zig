@@ -209,8 +209,8 @@ test "compileLambda and compileLambdaAttrs produce different chunk shapes" {
     defer attrs_lambda.deinit(testing.allocator);
 
     // Only the attrset-pattern lambda validates its argument shape.
-    try testing.expect(!value_lambda.contains("attr_check"));
-    try testing.expect(attrs_lambda.contains("attr_check"));
+    try testing.expect(!value_lambda.contains("attr_bind"));
+    try testing.expect(attrs_lambda.contains("attr_bind"));
 
     // Both compile to a top-level closure creation over a nested body chunk.
     try testing.expect(value_lambda.contains("closure"));

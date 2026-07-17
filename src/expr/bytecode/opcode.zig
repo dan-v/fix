@@ -312,13 +312,16 @@ pub const OpCode = enum(u8) {
     /// Operand: same segment stream as attr_get_path_mix_or.
     /// Stack layout before: [attrs, dynamic_name_thunk...].
     attr_has_path_mix,
-    /// Validate an attrset function argument.
-    /// Operand: 1-byte allow_extra flag, 2-byte expected count, then expected InternIds.
-    /// Stack layout before: [attrs].
-    attr_check,
-    /// Wide-intern-id form of attr_check.
-    /// Operand: 1-byte allow_extra flag, 2-byte expected count, then 4-byte InternIds.
-    attr_check_w,
+    /// Validate an attrset function argument and bind every required formal
+    /// directly from the argument set into its frame local. Optional formals
+    /// use the sentinel slot 0xffff and are filled by their default path after
+    /// this op. Pairs are name-sorted, so validation and binding are one merge
+    /// walk over the argument set instead of one lookup thunk per formal.
+    /// Operand: allow_extra:u8, cells:u8, count:u16, then count pairs of
+    /// (InternId:u16, slot:u16). Stack layout before: [attrs]; after: [].
+    attr_bind,
+    /// Wide-intern-id form of attr_bind (InternId:u32 in each pair).
+    attr_bind_w,
     /// Look up a variable name through active with-scopes.
     /// Operand: 2-byte InternId, 1-byte scope count.
     /// Stack layout before: [scope1, ..., scopeN], ordered nearest to farthest.
@@ -427,8 +430,9 @@ pub const Operand = union(enum) {
     captures_slot,
     /// u8 segment count then `count×width` interned ids → `"a.b.c"`.
     attr_path: Width,
-    /// u8 allow-extra flag, u16 count, then `count×width` ids → `N expected`.
-    check: Width,
+    /// u8 allow-extra, u8 cell-mode, u16 count, then
+    /// `count×(width-byte InternId + u16 slot)` sorted binding pairs.
+    bind: Width,
     /// Irregular static/dynamic tagged path stream (`attr_*_mix`).
     mix,
 
@@ -496,8 +500,8 @@ pub fn layout(op: OpCode) []const Operand {
         .attr_get_path_or_w, .attr_get_path_dyn_or_w, .attr_has_path_w => comptime &[_]Operand{.{ .attr_path = .b4 }},
         .attr_get_path_mix_or, .attr_has_path_mix => comptime &[_]Operand{.mix},
         .arg_or_lit => comptime &[_]Operand{.{ .intern = .b2 }},
-        .attr_check => comptime &[_]Operand{.{ .check = .b2 }},
-        .attr_check_w => comptime &[_]Operand{.{ .check = .b4 }},
+        .attr_bind => comptime &[_]Operand{.{ .bind = .b2 }},
+        .attr_bind_w => comptime &[_]Operand{.{ .bind = .b4 }},
         .with_lookup => comptime &[_]Operand{ .{ .intern = .b2 }, cnt(.b1, "scopes") },
         .with_lookup_w => comptime &[_]Operand{ .{ .intern = .b4 }, cnt(.b1, "scopes") },
         .thunk_defer => comptime &[_]Operand{ .{ .raw = .b4 }, .{ .skip = .b4 }, cnt(.b2, "env") },
@@ -534,7 +538,7 @@ pub fn fieldLen(f: Operand, code: []const u8, at: usize) usize {
         .captures => 2 + @as(usize, rdU16(code, at)) * 3,
         .captures_slot => 2 + @as(usize, rdU16(code, at)) * 3 + 1,
         .attr_path => |w| 1 + @as(usize, code[at]) * w.bytes(),
-        .check => |w| 1 + 2 + @as(usize, rdU16(code, at + 1)) * w.bytes(),
+        .bind => |w| 1 + 1 + 2 + @as(usize, rdU16(code, at + 2)) * (w.bytes() + 2),
         .mix => mixLen(code, at),
     };
 }

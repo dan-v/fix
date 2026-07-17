@@ -245,6 +245,7 @@ test "evaluate attrset function defaults ellipsis and binding" {
 
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
+    try std.testing.expectError(error.MissingAttribute, ev.evaluate("({ x }: 1) { }"));
     try std.testing.expectError(error.UnexpectedAttribute, ev.evaluate("({ x }: x) { x = 1; y = 2; }"));
 }
 
