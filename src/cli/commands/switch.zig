@@ -161,7 +161,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options.*);
 
-    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
+    if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }

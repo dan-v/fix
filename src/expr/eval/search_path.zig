@@ -97,15 +97,20 @@ pub const Paths = struct {
         intern: *InternTable,
         name: []const u8,
     ) !Value {
-        if (std.mem.eql(u8, name, "nix/fetchurl.nix")) {
-            return Value.path(try intern.intern("/__corepkgs__/fetchurl.nix"));
-        }
+        const resolved = try self.resolveName(allocator, files, name);
+        defer allocator.free(resolved);
+        return Value.path(try intern.intern(resolved));
+    }
+
+    /// Resolve a lookup-path name to an owned host path. This is the same
+    /// search used by `<name>` in the language, exposed separately for legacy
+    /// CLI fileish arguments which must load and parse the resolved file.
+    pub fn resolveName(self: *const Paths, allocator: std.mem.Allocator, files: *FileCache, name: []const u8) ![]u8 {
+        if (std.mem.eql(u8, name, "nix/fetchurl.nix"))
+            return allocator.dupe(u8, "/__corepkgs__/fetchurl.nix");
 
         for (self.entries) |entry| {
-            if (try candidate(allocator, files, entry.path, entry.prefix, name)) |c| {
-                defer allocator.free(c);
-                return Value.path(try intern.intern(c));
-            }
+            if (try candidate(allocator, files, entry.path, entry.prefix, name)) |c| return c;
         }
         return error.FileNotFound;
     }

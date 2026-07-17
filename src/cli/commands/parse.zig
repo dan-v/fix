@@ -14,6 +14,7 @@ const std = @import("std");
 const engine = @import("expr");
 const syntax = @import("syntax");
 const args = @import("../args.zig");
+const fileish = @import("../fileish.zig");
 const setup = @import("../setup.zig");
 
 const Evaluator = engine.Evaluator;
@@ -48,17 +49,22 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         return 2;
     }
 
+    setup.applyMemoryBacking(null);
+    var ev = try Evaluator.init(allocator, 1);
+    defer ev.deinit();
+    _ = setup.configure(&ev, init, options) catch |err| {
+        std.debug.print("error: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
     const source_arg = options.source orelse options.defaultSource();
-    const loaded = loadSource(allocator, init, source_arg) catch |err| {
+    const loaded = loadSource(&ev, init.io, source_arg) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
-    defer if (loaded.owned) allocator.free(loaded.text);
+    defer loaded.deinit(allocator);
     const source = loaded.text;
-    const source_path: ?[]const u8 = switch (source_arg) {
-        .file => |p| if (std.mem.eql(u8, p, "-")) null else p,
-        else => null,
-    };
+    const source_path = loaded.abs_path;
 
     // 1. Syntactic parse — the AST we print, and the syntax-error gate.
     var arena = AstArena.init(allocator);
@@ -83,13 +89,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // exactly as `fix eval` would report them. `source_path = null` forces
     // eager, whole-expression compilation (no lazy body deferral), so an
     // unbound variable in any position is caught, matching `bindVars`.
-    setup.applyMemoryBacking(null);
-    var ev = try Evaluator.init(allocator, 1);
-    defer ev.deinit();
-    _ = setup.configure(&ev, init, options) catch |err| {
-        std.debug.print("error: {s}\n", .{@errorName(err)});
-        return 1;
-    };
     _ = ev.compileSource(source, null) catch {
         try writeDiagnostics(init, source, ev.getDiagnostics());
         return 1;
@@ -128,24 +127,15 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     return 0;
 }
 
-const Loaded = struct { text: []const u8, owned: bool };
+const DeprecationWarning = syntax.parser.DeprecationWarning;
 
-fn loadSource(allocator: std.mem.Allocator, init: std.process.Init, source_arg: args.SourceArg) !Loaded {
-    return switch (source_arg) {
-        .expr => |text| .{ .text = text, .owned = false },
-        .file => |path| if (std.mem.eql(u8, path, "-")) blk: {
-            var stdin_buffer: [64 * 1024]u8 = undefined;
-            var stdin = std.Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
-            break :blk .{ .text = try stdin.interface.allocRemaining(allocator, .limited(64 << 20)), .owned = true };
-        } else .{
-            .text = try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(64 << 20)),
-            .owned = true,
-        },
+fn loadSource(ev: *Evaluator, io: std.Io, source: args.SourceArg) !fileish.Source {
+    return switch (source) {
+        .expr => |text| .{ .text = text },
+        .file => |path| try fileish.load(ev, io, path),
         .flake => error.FlakeParseUnsupported,
     };
 }
-
-const DeprecationWarning = syntax.parser.DeprecationWarning;
 
 fn emitWarnings(init: std.process.Init, allocator: std.mem.Allocator, parser: *Parser, options: args.Options, source: []const u8, source_path: ?[]const u8) !void {
     if (parser.warnings.items.len == 0) return;

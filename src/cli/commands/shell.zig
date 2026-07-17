@@ -143,7 +143,7 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
 /// Build the `-E`/`--file`/`--flake` derivation, appending its outPath.
 fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, release_action: ?engine.ReleaseAction, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const source_arg = options.source.?;
-    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
+    if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }

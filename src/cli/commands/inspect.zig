@@ -7,6 +7,9 @@
 const std = @import("std");
 const engine = @import("expr");
 const presentation = @import("../presentation.zig");
+const cli_args = @import("../args.zig");
+const fileish = @import("../fileish.zig");
+const setup = @import("../setup.zig");
 const bytecode = engine.bytecode;
 const builtin = @import("builtin");
 
@@ -26,7 +29,7 @@ const usage =
     \\
 ;
 
-const SourceArg = @import("../args.zig").SourceArg;
+const SourceArg = cli_args.SourceArg;
 
 const Options = struct {
     source: ?SourceArg = null,
@@ -59,40 +62,31 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         options.workers orelse @intCast(@min(@as(u32, 8), @as(u32, @intCast(try std.Thread.getCpuCount()))));
 
     // No `--hugetlb` in this command's parser; use automatic selection.
-    @import("../setup.zig").applyMemoryBacking(null);
+    setup.applyMemoryBacking(null);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    ev.setEnvironment(init.environ_map);
-    try ev.setBasePathFromCurrentPath(init.io);
-    if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
+    var shared_options: cli_args.Options = .{};
+    defer shared_options.deinit(allocator);
+    _ = try setup.configure(&ev, init, shared_options);
 
-    var stdin_source: ?[]u8 = null;
-    defer if (stdin_source) |text| allocator.free(text);
-    const source = switch (source_arg) {
-        .expr => |text| text,
-        .file => |path| if (std.mem.eql(u8, path, "-")) blk: {
-            var stdin_buffer: [64 * 1024]u8 = undefined;
-            var stdin = std.Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
-            stdin_source = try stdin.interface.allocRemaining(allocator, .limited(128 << 20));
-            break :blk stdin_source.?;
-        } else try ev.readSourceFile(path),
+    const loaded: fileish.Source = switch (source_arg) {
+        .expr => |text| .{ .text = text },
+        .file => |path| try fileish.load(&ev, init.io, path),
         .flake => {
             std.debug.print("error: --flake is not supported by this subcommand\n", .{});
             return 1;
         },
     };
+    defer loaded.deinit(allocator);
+    const source = loaded.text;
 
     if (options.no_eval) {
-        _ = ev.compileSource(source, switch (source_arg) {
-            .expr => null,
-            .file => |path| if (std.mem.eql(u8, path, "-")) null else path,
-            .flake => unreachable,
-        }) catch |err| {
+        _ = ev.compileSourceAt(source, loaded.base_path, loaded.abs_path) catch |err| {
             std.debug.print("error: compilation failed: {s}\n", .{@errorName(err)});
             return 1;
         };
     } else {
-        const value = ev.evaluate(source) catch |err| {
+        const value = ev.evaluatePathAt(source, loaded.base_path, loaded.abs_path) catch |err| {
             std.debug.print("error: evaluation failed: {s}\n", .{@errorName(err)});
             return 1;
         };

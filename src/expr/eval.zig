@@ -742,6 +742,46 @@ pub const Evaluator = struct {
         return self.files.readFile(resolved.text);
     }
 
+    /// Resolve `<name>` through the configured NIX_PATH to an owned host path.
+    pub fn resolveLookupPath(self: *Evaluator, name: []const u8) ![]u8 {
+        return self.search_paths.resolveName(self.allocator, &self.files, name);
+    }
+
+    /// Fetch and unpack a legacy fileish tarball, returning its owned cache path.
+    pub fn fetchTarballPath(self: *Evaluator, url: []const u8) ![]u8 {
+        const result = try self.fetchers.fetchTarball(&self.files, .{ .url = url, .name = "source" }, null);
+        if (result.nar_payload) |payload| self.allocator.free(payload.bytes);
+        return result.path;
+    }
+
+    pub fn isSourceDirectory(self: *Evaluator, path: []const u8) !bool {
+        const resolved = try self.resolveHostPath(path);
+        defer if (resolved.owned) self.allocator.free(resolved.text);
+        return self.files.isDirectoryFollowing(resolved.text);
+    }
+
+    /// Fetch a flake source without evaluating its outputs. `parseFlakeRef`
+    /// performs registry resolution, `fetchTree` materializes the source, and
+    /// `dir` selects a nested flake before legacy fileish default.nix loading.
+    pub fn fetchFlakeSourcePath(self: *Evaluator, ref: []const u8) ![]u8 {
+        if (!self.policy.flakes_enabled) return error.FlakesFeatureRequired;
+        var escaped: std.ArrayListUnmanaged(u8) = .empty;
+        defer escaped.deinit(self.allocator);
+        for (ref) |c| {
+            if (c == '\\' or c == '"' or c == '$') try escaped.append(self.allocator, '\\');
+            try escaped.append(self.allocator, c);
+        }
+        const source = try std.fmt.allocPrint(
+            self.allocator,
+            "let r = builtins.parseFlakeRef \"{s}\"; t = builtins.fetchTree r; in t.outPath + (if r ? dir then \"/\" + r.dir else \"\")",
+            .{escaped.items},
+        );
+        defer self.allocator.free(source);
+        const value = try self.forceValue(try self.evaluate(source));
+        if (!value.isPath() and !value.isString()) return error.TypeError;
+        return self.allocator.dupe(u8, self.intern.get(value.asInternId()));
+    }
+
     fn clearDiagnostics(self: *Evaluator) void {
         self.report.clear();
     }

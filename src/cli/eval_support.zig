@@ -4,6 +4,7 @@
 const std = @import("std");
 const render = @import("render.zig");
 const args = @import("args.zig");
+const fileish = @import("fileish.zig");
 const derivation_debug = @import("derivation_debug.zig");
 const engine = @import("expr");
 const runtime = @import("runtime");
@@ -72,29 +73,15 @@ fn writeResult(io: std.Io, mode: EvaluationMode, ev: *Evaluator, result: Value) 
     try stdout.interface.flush();
 }
 
-pub const Source = struct {
-    text: []const u8,
-    /// True when `text` was freshly allocated on the evaluator's host allocator (a `--flake`
-    /// lowering and/or `-A`/`--arg` wrapping); the caller must free it.
-    owned: bool = false,
-    /// The file's absolute path, recorded as the evaluation's source path so
-    /// positions (`unsafeGetAttrPos`, `__curPos`) and error traces match Nix,
-    /// which always reports absolute paths. Allocated on the host allocator; null
-    /// for `-E`, `--flake`, and `-A`/`--arg`-wrapped text whose byte offsets no
-    /// longer map to the file.
-    abs_path: ?[]const u8 = null,
-    /// Directory against which relative paths in this source are resolved.
-    /// Owned when non-null. Kept separately from `abs_path` because selector
-    /// wrapping makes source positions synthetic but does not change the file's
-    /// relative-path base.
-    base_path: ?[]const u8 = null,
+pub const Source = fileish.Source;
 
-    pub fn deinit(self: Source, allocator: std.mem.Allocator) void {
-        if (self.owned) allocator.free(self.text);
-        if (self.abs_path) |p| allocator.free(p);
-        if (self.base_path) |p| allocator.free(p);
-    }
-};
+pub fn sourceRequiresFlakes(source: SourceArg) bool {
+    return switch (source) {
+        .flake => true,
+        .file => |path| fileish.requiresFlakes(path),
+        .expr => false,
+    };
+}
 
 /// One ordered CLI input after expanding sources × `-A` selectors. The options
 /// value borrows all list storage from the command's parsed Options and changes
@@ -155,7 +142,7 @@ pub const InputPlan = struct {
         if (ev.languagePolicy().flakes_enabled) return;
         const input_count = try self.count();
         for (0..input_count) |index| {
-            if (self.selected(index).source_arg == .flake) return error.FlakesFeatureRequired;
+            if (sourceRequiresFlakes(self.selected(index).source_arg)) return error.FlakesFeatureRequired;
         }
     }
 
@@ -243,26 +230,7 @@ pub fn getSource(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Op
     // Load the base source text (borrowed for expr/file, owned for flake).
     var base: Source = switch (source) {
         .expr => |text| .{ .text = text, .owned = false },
-        .file => |path| blk: {
-            if (std.mem.eql(u8, path, "-")) {
-                var stdin_buffer: [64 * 1024]u8 = undefined;
-                var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
-                const text = try stdin.interface.allocRemaining(allocator, .limited(128 << 20));
-                errdefer allocator.free(text);
-                const source_base = if (ev.basePath()) |base| try allocator.dupe(u8, base) else null;
-                break :blk .{ .text = text, .owned = true, .base_path = source_base };
-            }
-            const text = try ev.readSourceFile(path);
-            // Resolve against the configured process cwd. Each Source keeps
-            // its own directory instead of repointing evaluator-global state.
-            const abs = try std.fs.path.resolve(allocator, &.{ ev.basePath() orelse ".", path });
-            // Roll back `abs` if allocating the per-source base fails.
-            errdefer allocator.free(abs);
-            const dir = std.fs.path.dirname(abs) orelse ".";
-            const source_base = try allocator.dupe(u8, dir);
-            errdefer allocator.free(source_base);
-            break :blk .{ .text = text, .owned = false, .abs_path = abs, .base_path = source_base };
-        },
+        .file => |path| try fileish.load(ev, io, path),
         .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable), .owned = true },
     };
 

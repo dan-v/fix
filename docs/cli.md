@@ -108,14 +108,23 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 
 | Flag | Meaning |
 |---|---|
-| `PATH` (positional) | append a file input; without any source, `./default.nix` |
+| `FILEISH` (positional) | append a legacy fileish input; without any source, `./default.nix` |
 | `-E, --expr EXPR` | append expression text; repeatable |
-| `-f, --file PATH` | append a file input (same as a bare `PATH`); `-` reads stdin; repeatable |
+| `-f, --file FILEISH` | append a fileish input (same as a bare argument); `-` reads stdin; repeatable |
 | `--flake INSTALLABLE` | append one flake output `<flakeref>[#<attrpath>]`; repeatable; requires the `flakes` feature |
 | `-A, --attr ATTR` | select attribute path ATTR from the result |
 | `--arg NAME EXPR` / `--argstr NAME STR` | pass an expression / a string as top-level function argument NAME |
 | `-I, --include PATH` | prepend a search-path entry (as in `NIX_PATH`; `prefix=path` form allowed). Repeatable. |
 | `--option NAME VALUE` | override a nix.conf setting |
+
+`FILEISH` follows the legacy `nix-build`/`nix-instantiate` forms: a regular
+path; a directory (loads `default.nix`); a lookup path such as `<nixpkgs>`;
+an HTTP(S) tarball URL; `channel:NAME` (the corresponding
+`channels.nixos.org/NAME/nixexprs.tar.xz`); or `flake:FLAKEREF` (fetch the
+flake source and load its `default.nix`, requiring the `flakes` feature).
+Prefix a special-looking local filename with `./` to disambiguate it. These
+are source inputs and can be mixed freely; `--flake`, by contrast, is the
+explicit typed flake-output/installable form.
 
 ### Evaluation / output
 

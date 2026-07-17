@@ -427,7 +427,7 @@ const realize_cmds = &[_]Cmd{ .build, .run, .shell, .@"switch" };
 
 const specs = [_]Spec{
     .{ .id = .expr, .short = "-E", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text; repeatable", .show_in = source_cmds },
-    .{ .id = .file, .short = "-f", .long = "--file", .arg = .req, .metavar = "PATH", .help = "evaluate a file (`-` reads stdin); repeatable", .show_in = source_cmds },
+    .{ .id = .file, .short = "-f", .long = "--file", .arg = .req, .metavar = "FILEISH", .help = "evaluate a legacy fileish input (`-` reads stdin);\nrepeatable", .show_in = source_cmds },
     .{ .id = .flake, .long = "--flake", .arg = .req, .metavar = "INSTALLABLE", .help = "evaluate one flake output <flakeref>[#<attrpath>];\nrepeatable; requires the flakes feature", .show_in = selected_source_cmds },
     .{ .id = .include, .short = "-I", .long = "--include", .arg = .req, .metavar = "PATH", .help = "prepend a search-path entry (as in NIX_PATH);\nPATH may be `prefix=path`. Repeatable.", .show_in = source_cmds },
     .{ .id = .attr, .short = "-A", .long = "--attr", .arg = .req, .metavar = "ATTR", .help = "select attribute path ATTR from the result", .show_in = selected_source_cmds },
@@ -832,7 +832,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.MissingValue => "missing value after that option",
         error.MissingSecondValue => "that option expects two values (NAME and VALUE)",
         error.UnexpectedValue => "that option does not take a value",
-        error.FlakesFeatureRequired => "--flake requires the flakes experimental feature; pass --extra-experimental-features flakes",
+        error.FlakesFeatureRequired => "flake inputs require the flakes experimental feature; pass --extra-experimental-features flakes",
         error.TooManySources => "provide only one expression or file",
         error.InvalidColorMode => "expected --color to be auto, always, or never",
         error.InvalidProgressMode => "expected --progress to be auto, always, or never",

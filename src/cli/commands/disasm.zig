@@ -70,7 +70,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // `chunk #42 fetchGit`. Safe here — disasm compiles single-threaded.
     ev.setCaptureChunkNames(true);
 
-    if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
+    if (runner.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }
