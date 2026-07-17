@@ -87,12 +87,13 @@ pub const Context = switch (builtin.cpu.arch) {
 const Switch = extern struct { old: *Context, new: *Context };
 
 /// Save the current CPU state into `s.old`, restore `s.new`, and continue at
-/// `s.new`'s resume address. Vendored verbatim from Zig 0.16 `std.Io.fiber`:
-/// only sp/fp/pc are stored; the full clobber list (callee-saved GPRs, the
-/// vector file, `mxcsr`/`fpcr`/`fpsr`, the direction flag) forces the compiler
-/// to preserve any live state around the emitted swap. MUST stay `inline` — the
-/// clobbers only bind at the real call site, never behind a call boundary. The
-/// returned `*const Switch` is the resumer's message (unused here).
+/// `s.new`'s resume address. Based on Zig 0.16 `std.Io.fiber`, with the message
+/// register removed from each architecture's clobber list: it is already an
+/// input and output operand, and declaring all three roles miscompiles optimized
+/// builds (ziglang/zig#35724). Only sp/fp/pc are stored; the remaining clobbers
+/// force the compiler to preserve live state around the emitted swap. MUST stay
+/// `inline` — the clobbers only bind at the real call site, never behind a call
+/// boundary. The returned `*const Switch` is the resumer's message (unused here).
 inline fn contextSwitch(s: *const Switch) *const Switch {
     return switch (builtin.cpu.arch) {
         .x86_64 => asm volatile (
@@ -113,7 +114,6 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
               .rcx = true,
               .rdx = true,
               .rbx = true,
-              .rsi = true,
               .rdi = true,
               .r8 = true,
               .r9 = true,
@@ -185,7 +185,6 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
             : [message_to_send] "{x1}" (s),
             : .{
               .x0 = true,
-              .x1 = true,
               .x2 = true,
               .x3 = true,
               .x4 = true,
