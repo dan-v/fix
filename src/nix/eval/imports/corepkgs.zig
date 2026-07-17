@@ -1,4 +1,4 @@
-//! Synthetic compatibility sources traditionally provided by Nix corepkgs.
+//! Synthetic import sources traditionally provided by Nix corepkgs.
 
 const std = @import("std");
 
