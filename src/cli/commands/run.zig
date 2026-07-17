@@ -12,17 +12,16 @@ const eval_support = @import("../eval_support.zig");
 const Evaluator = engine.Evaluator;
 
 pub const synopsis =
-    \\usage: fix run [options] [path | -e <expr>] [-- args...]
+    \\usage: fix run [options] [path | -E <expr> | --flake <installable>] [-- args...]
     \\
     \\evaluate to a derivation, build it, and run $out/bin/<program> (from
     \\meta.mainProgram, else pname, else name). Arguments after `--` are passed
-    \\to the program. With no source, uses ./default.nix (or, with --flake, the
-    \\flake in the current directory).
+    \\to the program. With no source, uses ./default.nix.
 ;
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null, .run) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .run);
             return 0;
@@ -51,7 +50,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         return 2;
     }
 
-    const source = eval_support.getSource(&ev, source_arg, options) catch |err| {
+    const source = eval_support.getSource(&ev, init.io, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };

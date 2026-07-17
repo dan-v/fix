@@ -55,7 +55,7 @@ const prompt_cont = "...> ";
 /// `fix repl` subcommand entry point.
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null, .repl) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .repl);
             return 0;
@@ -556,6 +556,7 @@ const Repl = struct {
         const write_err: ?anyerror = blk: {
             switch (mode.output) {
                 .nix => self.ev.writeValue(w, value) catch |err| break :blk err,
+                .raw => self.ev.writeRawValue(w, value) catch |err| break :blk err,
                 .json => self.ev.writeJsonValue(w, value) catch |err| break :blk err,
                 .xml => self.ev.writeXmlValue(w, value) catch |err| break :blk err,
             }
@@ -567,7 +568,7 @@ const Repl = struct {
             try render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
             return;
         }
-        if (mode.output != .xml) try w.writeByte('\n');
+        if (mode.output != .xml and mode.output != .raw) try w.writeByte('\n');
     }
 
     /// `:l PATH` — evaluate a file (auto-calling a top-level function with

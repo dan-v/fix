@@ -18,7 +18,7 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` share the compile
 
 | Subcommand | Purpose | Link |
 |---|---|---|
-| `eval` | evaluate an expression/file/flake output → render value (the `-e`/`--file`/`--flake` flags live here) | — |
+| `eval` | evaluate mixed expression/file/flake inputs and render each value | — |
 | `instantiate` | evaluate to a derivation and add its `.drv` closure to the store (à la `nix-instantiate`) | [derivation/model.md](derivation/model.md) |
 | `build` | evaluate to a derivation, build its outputs via the nix-daemon, and link `./result` | [derivation/model.md](derivation/model.md) |
 | `run` | build a derivation and run a program from its output | — |
@@ -80,7 +80,7 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 Frames show names when chunk-name capture is on (`--debugger` enables it), so a backtrace reads like `pkgs/hello.nix:12:3 hello (chunk #42)`. Console expressions run on a fresh nested VM sharing the registry, heap, and intern table, so inspecting a value never disturbs the pause point.
 
-**Source snippet & color.** Each pause prints the source line at the current span (a line of context on each side, `▶` on the current line, a caret under the span), syntax-highlighted through the `syntax` scanner — keywords magenta, strings/paths green, numbers yellow. The source comes from the FileCache (imported files) or the stashed `-e` entry text. Rendered values are colored in the same palette (green strings, yellow numbers, magenta `true`/`false`/`null`, cyan attr names) whenever the terminal takes color — the same `writeValue` coloring `fix eval`/`fix repl` use for their output. All of it no-ops under `--no-color`.
+**Source snippet & color.** Each pause prints the source line at the current span (a line of context on each side, `▶` on the current line, a caret under the span), syntax-highlighted through the `syntax` scanner — keywords magenta, strings/paths green, numbers yellow. The source comes from the FileCache (imported files) or the stashed `-E` entry text. Rendered values are colored in the same palette (green strings, yellow numbers, magenta `true`/`false`/`null`, cyan attr names) whenever the terminal takes color — the same `writeValue` coloring `fix eval`/`fix repl` use for their output. All of it no-ops under `--no-color`.
 
 **Scope-accurate evaluation.** A console expression resolves the breakpoint's lexical bindings — `let` bindings, lambda params, captured upvalues, and `with`-scopes — not just globals. The compiler records a slot→name table per chunk (gated on the same capture flag, so normal builds pay nothing), and the console reconstructs an ambient scope from the frame stack: named locals and upvalues (inner frames shadow outer), plus each in-effect `with` attrset merged at lowest precedence (a `with` subject is a nameless local slot or a `"\x00with"` upvalue; lexical bindings shadow it, inner `with` shadows outer), plus `it` = the break value. Because a break often lands in a small argument thunk whose own frame has no locals, the scope merges *all* live frames, so `base`, a param `n`, or an attr `hello` from `with pkgs;` all resolve.
 
@@ -108,10 +108,10 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 
 | Flag | Meaning |
 |---|---|
-| `PATH` (positional) | evaluate a file; without any source, `./default.nix` (or the flake `.` under `--flake`) |
-| `-e, --expr EXPR` | evaluate expression text |
-| `--file PATH` | evaluate a file (same as a bare PATH; mutually exclusive with `-e`) |
-| `--flake [INSTALLABLE]` | evaluate a flake output `<flakeref>[#<attrpath>]` (default flakeref `.`); lowered to `(builtins.getFlake "<ref>").<attrpath>`. `.`/relative refs resolve against cwd; `github:`/`path:`/… pass through. Requires the `flakes` feature. |
+| `PATH` (positional) | append a file input; without any source, `./default.nix` |
+| `-E, --expr EXPR` | append expression text; repeatable |
+| `-f, --file PATH` | append a file input (same as a bare `PATH`); `-` reads stdin; repeatable |
+| `--flake INSTALLABLE` | append one flake output `<flakeref>[#<attrpath>]`; repeatable; requires the `flakes` feature |
 | `-A, --attr ATTR` | select attribute path ATTR from the result |
 | `--arg NAME EXPR` / `--argstr NAME STR` | pass an expression / a string as top-level function argument NAME |
 | `-I, --include PATH` | prepend a search-path entry (as in `NIX_PATH`; `prefix=path` form allowed). Repeatable. |
@@ -122,6 +122,7 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 | Flag | Meaning |
 |---|---|
 | `--json` / `--xml` | render the value as JSON / XML instead of Nix |
+| `--raw` | (`eval`) coerce to a string and write it without quotes or a trailing newline |
 | `--strict` | recursively force attr values + list items before writing |
 | `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call; `flakes` — gates the flake builtins (`getFlake`, `parseFlakeRef`, `flakeRefToString`) and the `--flake` installable, and implies `fetch-tree`. All off by default; a disabled builtin raises a hard (tryEval-uncatchable) error. |
 | `--workers N` | worker threads; default `min(8, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |
@@ -142,6 +143,8 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 | Flag | Meaning |
 |---|---|
 | `-o, --out-link NAME` | name of the result symlink (`build`; default `result`); `--no-out-link` (alias `--no-link`) skips it |
+| `--dry-run` | (`build`) report the daemon's build/substitution plan without realizing or linking it |
+| `-Q, --no-build-output` | suppress builder stdout/stderr |
 | `--drv-link NAME` / `--add-drv-link` | name of / also create the `.drv` symlink (`build`/`instantiate`; default `derivation`) |
 | `--add-root PATH` / `--indirect` | create the link at PATH and register it as a (optionally indirect) GC root (`build`/`instantiate`) |
 | `--check` / `--repair` | rebuild and verify outputs are unchanged / repair corrupted store paths |

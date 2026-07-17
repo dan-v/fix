@@ -19,11 +19,10 @@ const Evaluator = engine.Evaluator;
 const ChunkId = runtime.types.ChunkId;
 
 pub const synopsis =
-    \\usage: fix disasm [options] [path | -e <expression>]
+    \\usage: fix disasm [options] [path | -E <expression> | --flake <installable>]
     \\
     \\compile a Nix expression, file, or flake output and disassemble its
-    \\bytecode. With no source, uses ./default.nix (or, with --flake, the flake
-    \\in the current directory).
+    \\bytecode. With no source, uses ./default.nix.
     \\
     \\When stdout is a terminal the output is piped to $PAGER (disable with
     \\--no-pager). For color through the pager, set e.g. PAGER='less -R' or LESS=R.
@@ -31,7 +30,7 @@ pub const synopsis =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null, .disasm) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .disasm);
             return 0;
@@ -85,7 +84,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         .auto => presentation.autoColor(stdout_tty, init.environ_map),
     };
 
-    const source = runner.getSource(&ev, source_arg, options) catch |err| {
+    const source = runner.getSource(&ev, init.io, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };

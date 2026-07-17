@@ -41,6 +41,27 @@ pub const Setting = build_options.Setting;
 /// daemon applies the map after the fixed fields, so an override wins.
 pub const BuildSettings = build_options.Settings;
 
+pub const MissingPlan = struct {
+    allocator: std.mem.Allocator,
+    will_build: [][]u8,
+    will_substitute: [][]u8,
+    unknown: [][]u8,
+    download_size: u64,
+    nar_size: u64,
+
+    pub fn deinit(self: *MissingPlan) void {
+        freeStrings(self.allocator, self.will_build);
+        freeStrings(self.allocator, self.will_substitute);
+        freeStrings(self.allocator, self.unknown);
+        self.* = undefined;
+    }
+
+    fn freeStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
+        for (strings) |item| allocator.free(item);
+        allocator.free(strings);
+    }
+};
+
 pub const DaemonStore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -59,6 +80,7 @@ pub const DaemonStore = struct {
     /// While true, STDERR_NEXT build-log lines are forwarded to our stderr
     /// (set during `buildPaths`) instead of being discarded.
     log_build: bool = false,
+    suppress_build_output: bool = false,
     /// Set during `buildPaths` to forward the activity/log stream (progress
     /// nodes). When set, logs go to the sink instead of stderr.
     build_sink: ?BuildSink = null,
@@ -253,13 +275,37 @@ pub const DaemonStore = struct {
         try wire.writeStrings(self.w(), derived_paths);
         try wire.writeInt(self.w(), @intFromEnum(mode));
         self.build_sink = sink;
-        self.log_build = sink == null; // sink consumes logs itself
+        self.log_build = sink == null and !self.suppress_build_output; // sink consumes logs itself
         defer {
             self.build_sink = null;
             self.log_build = false;
         }
         try self.flushAndDrain();
         _ = try wire.readInt(self.r()); // dummy result int
+    }
+
+    /// Ask the daemon what realizing `derived_paths` would require without
+    /// starting any builds or substitutions (`nix-build --dry-run`).
+    pub fn queryMissing(self: *DaemonStore, allocator: std.mem.Allocator, derived_paths: []const []const u8) !MissingPlan {
+        try self.beginOp(.query_missing);
+        try wire.writeStrings(self.w(), derived_paths);
+        try self.flushAndDrain();
+        var result: MissingPlan = .{
+            .allocator = allocator,
+            .will_build = try wire.readStrings(allocator, self.r()),
+            .will_substitute = undefined,
+            .unknown = undefined,
+            .download_size = 0,
+            .nar_size = 0,
+        };
+        errdefer MissingPlan.freeStrings(allocator, result.will_build);
+        result.will_substitute = try wire.readStrings(allocator, self.r());
+        errdefer MissingPlan.freeStrings(allocator, result.will_substitute);
+        result.unknown = try wire.readStrings(allocator, self.r());
+        errdefer MissingPlan.freeStrings(allocator, result.unknown);
+        result.download_size = try wire.readInt(self.r());
+        result.nar_size = try wire.readInt(self.r());
+        return result;
     }
 
     /// Register an indirect GC root (`add_indirect_root`, op 12): the daemon
@@ -276,6 +322,7 @@ pub const DaemonStore = struct {
     /// matches Nix's `RemoteStore::setOptions`: the fixed settings, four obsolete
     /// placeholders, then (protocol minor >= 12) the `name/value` overrides map.
     pub fn setOptions(self: *DaemonStore, s: BuildSettings) !void {
+        self.suppress_build_output = s.suppress_build_output;
         try self.beginOp(.set_options);
         const out = self.w();
         try wire.writeBool(out, s.keep_failed);

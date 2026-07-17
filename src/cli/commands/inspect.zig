@@ -14,11 +14,11 @@ const Evaluator = engine.Evaluator;
 const SchedulerStats = engine.workers.Scheduler.Stats;
 
 const usage =
-    \\usage: fix inspect [options] (-e <expression> | --file <path>)
+    \\usage: fix inspect [options] (-E <expression> | --file <path>)
     \\
     \\options:
-    \\  -e, --expr EXPR    expression to evaluate
-    \\  --file PATH        read expression from PATH
+    \\  -E, --expr EXPR    expression to evaluate
+    \\  -f, --file PATH    read expression from PATH
     \\  --strict           recursively force values before reporting
     \\  --no-eval          only compile, skip evaluation (faster but less heap info)
     \\  --top N            show top-N interned strings by length (default 0)
@@ -66,9 +66,16 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     try ev.setBasePathFromCurrentPath(init.io);
     if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
 
+    var stdin_source: ?[]u8 = null;
+    defer if (stdin_source) |text| allocator.free(text);
     const source = switch (source_arg) {
         .expr => |text| text,
-        .file => |path| try ev.readSourceFile(path),
+        .file => |path| if (std.mem.eql(u8, path, "-")) blk: {
+            var stdin_buffer: [64 * 1024]u8 = undefined;
+            var stdin = std.Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
+            stdin_source = try stdin.interface.allocRemaining(allocator, .limited(128 << 20));
+            break :blk stdin_source.?;
+        } else try ev.readSourceFile(path),
         .flake => {
             std.debug.print("error: --flake is not supported by this subcommand\n", .{});
             return 1;
@@ -78,7 +85,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     if (options.no_eval) {
         _ = ev.compileSource(source, switch (source_arg) {
             .expr => null,
-            .file => |path| path,
+            .file => |path| if (std.mem.eql(u8, path, "-")) null else path,
             .flake => unreachable,
         }) catch |err| {
             std.debug.print("error: compilation failed: {s}\n", .{@errorName(err)});
@@ -332,11 +339,11 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             return error.Help;
-        } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--expr")) {
+        } else if (std.mem.eql(u8, arg, "-E") or std.mem.eql(u8, arg, "--expr")) {
             const text = args_iter.next() orelse return error.MissingExpression;
             if (options.source != null) return error.TooManySources;
             options.source = .{ .expr = text };
-        } else if (std.mem.eql(u8, arg, "--file")) {
+        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
             const path = args_iter.next() orelse return error.MissingPath;
             if (options.source != null) return error.TooManySources;
             options.source = .{ .file = path };
@@ -361,7 +368,7 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
 
 fn optionErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.MissingExpression => "missing expression after -e or --expr",
+        error.MissingExpression => "missing expression after -E or --expr",
         error.MissingPath => "missing path after --file",
         error.MissingTop => "missing N after --top",
         error.InvalidTop => "expected --top to be a non-negative integer",

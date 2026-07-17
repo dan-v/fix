@@ -35,6 +35,10 @@ pub const StoreState = struct {
         return self.realization.buildPaths(paths, sink, mode);
     }
 
+    pub fn queryMissing(self: *StoreState, paths: []const []const u8) !store.daemon.MissingPlan {
+        return self.realization.queryMissing(paths);
+    }
+
     pub fn submitBuild(self: *StoreState, request: *AsyncBuildRequest) void {
         self.realization.submitBuild(request);
     }

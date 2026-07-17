@@ -15,17 +15,16 @@ const timeline = engine.probe.timeline;
 const Evaluator = engine.Evaluator;
 
 pub const synopsis =
-    \\usage: fix eval [options] [paths... | -e <expression>...]
+    \\usage: fix eval [options] [paths... | -E <expression>... | --flake <installable>...]
     \\
     \\evaluate Nix expressions, files, or flake outputs and print each value in
     \\input order.
-    \\with no source, evaluates ./default.nix (or, with --flake, the flake in the
-    \\current directory).
+    \\with no source, evaluates ./default.nix.
 ;
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null, .eval) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .eval);
             return 0;
@@ -54,7 +53,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         console.install(&ev);
     }
 
-    const input_plan = eval_support.InputPlan.init(options);
+    const input_plan = eval_support.InputPlan.init(options, init.io);
     input_plan.validate(&ev) catch |err| {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
         return 2;

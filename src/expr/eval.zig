@@ -21,6 +21,7 @@ const VM = vm_mod.VM;
 const LanguagePolicy = @import("policy.zig").LanguagePolicy;
 const vm_force = @import("vm.zig").force;
 const vm_builtins = @import("vm.zig").builtins;
+const vm_strings = @import("vm.zig").strings;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_collector = @import("runtime").heap_collector;
 const FileCache = store_domain.FileCache;
@@ -119,7 +120,7 @@ pub const DebugSession = struct {
     }
 
     /// The source text for frame `i` — the file it runs (from the FileCache),
-    /// or the entry `-e` source. Null if neither is available. The frame's span
+    /// or the entry `-E` source. Null if neither is available. The frame's span
     /// (`frame(i).span`) offsets into this text. Used to show a code snippet at
     /// the pause.
     pub fn frameSourceText(self: *DebugSession, i: usize) ?[]const u8 {
@@ -939,7 +940,7 @@ pub const Evaluator = struct {
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
         // The top-level chunk registers outside `registerChunk`; name it after
         // the file (a useful `while evaluating 'configuration.nix'`). A bare
-        // `-e` expression stays anonymous so its trace reads plain. disasm adds
+        // `-E` expression stays anonymous so its trace reads plain. disasm adds
         // its own `(top)` tag for pathless chunks.
         const top_name: bytecode.NameId = if (source_path) |p|
             (self.registry.childName(bytecode.root_name_id, try self.intern.intern(std.fs.path.basename(p)), false) catch bytecode.root_name_id)
@@ -1430,6 +1431,17 @@ pub const Evaluator = struct {
         defer self.progressEnd(.render, "result");
         self.report.trace.clear();
         return self.runWithVm(vm_builtins.writeJsonValue, .{ writer, value });
+    }
+
+    /// Legacy `nix-instantiate --eval --raw` rendering: coerce exactly as a
+    /// Nix string interpolation would (strings, paths, `outPath`,
+    /// `__toString`; never integers), then emit the bytes verbatim.
+    pub fn writeRawValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+        self.progressBegin(.render, "result");
+        timeline.instant(.render, "result");
+        defer self.progressEnd(.render, "result");
+        self.report.trace.clear();
+        return self.runWithVm(writeRawValueBody, .{ writer, value });
     }
 
     pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
@@ -2178,6 +2190,12 @@ fn ReturnPayload(comptime F: type) type {
 /// fresh VM here ourselves.
 fn writeValueBody(_: *VM, ev: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
     return eval_print.writeValue(valuePrintHost(ev), writer, value);
+}
+
+fn writeRawValueBody(vm: *VM, writer: *std.Io.Writer, value: Value) !void {
+    const string_value = try vm_strings.coerceLanguageStringValue(vm, value);
+    const text_id = try vm_strings.stringTextInternId(vm, string_value);
+    try writer.writeAll(vm.intern.get(text_id));
 }
 
 fn valuePrintHost(ev: *Evaluator) eval_print.Host {

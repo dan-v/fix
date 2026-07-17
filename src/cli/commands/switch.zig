@@ -11,7 +11,7 @@
 //!
 //! Like `nixos-rebuild`, the configuration is supplied exactly as it is for the
 //! nix CLI: the default source (`<nixpkgs/nixos>`, with `-I nixos-config=…`) or
-//! the user's own `-e`/`--file`/`--flake`/`-A`. We append the conventional
+//! the user's own `-E`/`--file`/`--flake`/`-A`. We append the conventional
 //! toplevel attribute, build it (reusing the `fix build` machinery), create a
 //! profile generation, and run the activation script.
 //!
@@ -71,7 +71,7 @@ pub const synopsis =
     \\build a NixOS / nix-darwin / home-manager configuration and activate it.
     \\action (first argument) is one of: switch (default), boot, test, build,
     \\dry-activate. The configuration is given like nixos-rebuild — the default
-    \\source with -I nixos-config=…, or your own -e/--file/--flake/-A. The
+    \\source with -I nixos-config=…, or your own -E/--file/--flake/-A. The
     \\profile-set and activation run under sudo when not already root, or on a
     \\remote host with --target-host (build stays local; the closure is copied).
 ;
@@ -88,7 +88,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         } else first = t0;
     }
 
-    var options = args.parse(allocator, args_iter, first) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, first, .@"switch") catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .@"switch");
             return 0;
@@ -133,11 +133,8 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
     var flake_installable: ?[]const u8 = null;
     defer if (flake_installable) |s| allocator.free(s);
 
-    const source_arg: args.SourceArg = if (options.flake_mode) blk: {
-        const raw: []const u8 = if (options.source) |s| switch (s) {
-            .flake => |f| f,
-            else => ".",
-        } else ".";
+    const source_arg: args.SourceArg = if (options.source != null and options.source.? == .flake) blk: {
+        const raw = options.source.?.flake;
         const hash = std.mem.indexOfScalar(u8, raw, '#');
         const ref = if (hash) |i| raw[0..i] else raw;
         const frag = if (hash) |i| raw[i + 1 ..] else "";
@@ -169,7 +166,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
         return 2;
     }
 
-    const source = eval_support.getSource(&ev, source_arg, options.*) catch |err| {
+    const source = eval_support.getSource(&ev, init.io, source_arg, options.*) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };

@@ -13,16 +13,15 @@ const build = @import("build.zig");
 const Evaluator = engine.Evaluator;
 
 pub const synopsis =
-    \\usage: fix instantiate [options] [paths... | -e <expr>...]
+    \\usage: fix instantiate [options] [paths... | -E <expr>... | --flake <installable>...]
     \\
     \\evaluate to derivations, add their .drv closures to the store, and print
-    \\the top-level .drv paths in input order. With no source, uses ./default.nix
-    \\(or, with --flake, the flake in the current directory).
+    \\the top-level .drv paths in input order. With no source, uses ./default.nix.
 ;
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null, .instantiate) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .instantiate);
             return 0;
@@ -40,7 +39,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
 
-    const input_plan = eval_support.InputPlan.init(options);
+    const input_plan = eval_support.InputPlan.init(options, init.io);
     input_plan.validate(&ev) catch |err| {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
         return 2;

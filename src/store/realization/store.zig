@@ -390,6 +390,31 @@ pub const RealizationStore = struct {
         return cell.err;
     }
 
+    pub fn queryMissing(self: *RealizationStore, derived_paths: []const []const u8) !rstore.MissingPlan {
+        var cell: MissingCell = .{ .store = self, .paths = derived_paths };
+        try self.runOnDaemon(MissingCell.run, &cell);
+        return cell.result;
+    }
+
+    const MissingCell = struct {
+        store: *RealizationStore,
+        paths: []const []const u8,
+        result: anyerror!rstore.MissingPlan = error.StoreUnavailable,
+
+        fn run(conn: ?*anyopaque, raw: *anyopaque) void {
+            const self: *MissingCell = @ptrCast(@alignCast(raw));
+            const daemon = daemonConn(conn) catch |err| {
+                self.result = err;
+                return;
+            };
+            self.result = daemon.queryMissing(self.store.allocator, self.paths) catch |err| {
+                self.store.captureDaemonError(daemon);
+                self.result = err;
+                return;
+            };
+        }
+    };
+
     /// Caller-owned asynchronous build request. Its path slices and sink must
     /// remain valid through `wait`; the daemon pool signals `done` after the
     /// connection is released back to the pool.

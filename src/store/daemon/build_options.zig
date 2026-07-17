@@ -9,6 +9,7 @@ pub const Settings = struct {
     keep_going: bool = false,
     fallback: bool = false,
     verbosity: u64 = 0,
+    suppress_build_output: bool = false,
     max_build_jobs: u64 = 1,
     max_silent_time: u64 = 0,
     build_cores: u64 = 0,

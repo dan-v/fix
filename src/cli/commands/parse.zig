@@ -22,7 +22,7 @@ const AstArena = syntax.ast.AstArena;
 const Diagnostic = syntax.diagnostic.Diagnostic;
 
 pub const synopsis =
-    \\usage: fix parse [options] [path | -e <expression>]
+    \\usage: fix parse [options] [path | -E <expression>]
     \\
     \\parse a Nix expression, file, or the default file and print its AST as
     \\JSON (the schema of `nix-instantiate --parse`). Output always JSON;
@@ -32,7 +32,7 @@ pub const synopsis =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null, .parse) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .parse);
             return 0;
@@ -56,7 +56,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer if (loaded.owned) allocator.free(loaded.text);
     const source = loaded.text;
     const source_path: ?[]const u8 = switch (source_arg) {
-        .file => |p| p,
+        .file => |p| if (std.mem.eql(u8, p, "-")) null else p,
         else => null,
     };
 
@@ -133,7 +133,11 @@ const Loaded = struct { text: []const u8, owned: bool };
 fn loadSource(allocator: std.mem.Allocator, init: std.process.Init, source_arg: args.SourceArg) !Loaded {
     return switch (source_arg) {
         .expr => |text| .{ .text = text, .owned = false },
-        .file => |path| .{
+        .file => |path| if (std.mem.eql(u8, path, "-")) blk: {
+            var stdin_buffer: [64 * 1024]u8 = undefined;
+            var stdin = std.Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
+            break :blk .{ .text = try stdin.interface.allocRemaining(allocator, .limited(64 << 20)), .owned = true };
+        } else .{
             .text = try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(64 << 20)),
             .owned = true,
         },

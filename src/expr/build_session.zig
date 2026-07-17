@@ -21,6 +21,10 @@ pub const BuildSession = struct {
         return self.store.buildPaths(paths, sink, mode);
     }
 
+    pub fn queryMissing(self: *BuildSession, paths: []const []const u8) !store_domain.daemon.MissingPlan {
+        return self.store.queryMissing(paths);
+    }
+
     pub fn lastStoreError(self: *BuildSession) ?[]const u8 {
         return self.store.lastError();
     }

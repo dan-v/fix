@@ -64,10 +64,11 @@ fn writeResult(io: std.Io, mode: EvaluationMode, ev: *Evaluator, result: Value) 
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     switch (mode.output) {
         .nix => try ev.writeValue(&stdout.interface, result),
+        .raw => try ev.writeRawValue(&stdout.interface, result),
         .json => try ev.writeJsonValue(&stdout.interface, result),
         .xml => try ev.writeXmlValue(&stdout.interface, result),
     }
-    if (mode.output != .xml) try stdout.interface.writeByte('\n');
+    if (mode.output != .xml and mode.output != .raw) try stdout.interface.writeByte('\n');
     try stdout.interface.flush();
 }
 
@@ -79,7 +80,7 @@ pub const Source = struct {
     /// The file's absolute path, recorded as the evaluation's source path so
     /// positions (`unsafeGetAttrPos`, `__curPos`) and error traces match Nix,
     /// which always reports absolute paths. Allocated on the host allocator; null
-    /// for `-e`, `--flake`, and `-A`/`--arg`-wrapped text whose byte offsets no
+    /// for `-E`, `--flake`, and `-A`/`--arg`-wrapped text whose byte offsets no
     /// longer map to the file.
     abs_path: ?[]const u8 = null,
     /// Directory against which relative paths in this source are resolved.
@@ -120,12 +121,14 @@ pub const LoadedInput = struct {
 /// source-major, with repeated `-A` selectors kept in their command-line order.
 pub const InputPlan = struct {
     parsed: args.Options,
+    io: std.Io,
     default_source: SourceArg,
     selector_count: usize,
 
-    pub fn init(options: args.Options) InputPlan {
+    pub fn init(options: args.Options, io: std.Io) InputPlan {
         return .{
             .parsed = options,
+            .io = io,
             .default_source = options.defaultSource(),
             .selector_count = if (options.attrs.items.len == 0) 1 else options.attrs.items.len,
         };
@@ -160,7 +163,7 @@ pub const InputPlan = struct {
         const input = self.selected(index);
         return .{
             .source_arg = input.source_arg,
-            .source = try getSource(ev, input.source_arg, input.options),
+            .source = try getSource(ev, self.io, input.source_arg, input.options),
         };
     }
 };
@@ -180,7 +183,7 @@ test "input plan shares ordered source and selector expansion" {
     try options.attrs.append(std.testing.allocator, "first");
     try options.attrs.append(std.testing.allocator, "second");
 
-    const plan = InputPlan.init(options);
+    const plan = InputPlan.init(options, std.testing.io);
     try std.testing.expectEqual(@as(usize, 4), try plan.count());
     const expected_sources = [_][]const u8{ "one", "one", "two", "two" };
     const expected_attrs = [_][]const u8{ "first", "second", "first", "second" };
@@ -235,12 +238,20 @@ pub fn buildFailure(last_store_error: ?[]const u8, err: anyerror) u8 {
     return 1;
 }
 
-pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Source {
+pub fn getSource(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Options) !Source {
     const allocator = ev.hostAllocator();
     // Load the base source text (borrowed for expr/file, owned for flake).
     var base: Source = switch (source) {
         .expr => |text| .{ .text = text, .owned = false },
         .file => |path| blk: {
+            if (std.mem.eql(u8, path, "-")) {
+                var stdin_buffer: [64 * 1024]u8 = undefined;
+                var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
+                const text = try stdin.interface.allocRemaining(allocator, .limited(128 << 20));
+                errdefer allocator.free(text);
+                const source_base = if (ev.basePath()) |base| try allocator.dupe(u8, base) else null;
+                break :blk .{ .text = text, .owned = true, .base_path = source_base };
+            }
             const text = try ev.readSourceFile(path);
             // Resolve against the configured process cwd. Each Source keeps
             // its own directory instead of repointing evaluator-global state.

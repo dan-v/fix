@@ -12,16 +12,15 @@ const eval_support = @import("../eval_support.zig");
 const Evaluator = engine.Evaluator;
 
 pub const synopsis =
-    \\usage: fix build [options] [paths... | -e <expr>...]
+    \\usage: fix build [options] [paths... | -E <expr>... | --flake <installable>...]
     \\
     \\evaluate to a derivation, build (or substitute) its outputs, link ./result,
-    \\and print the output path. With no source, uses ./default.nix (or, with
-    \\--flake, the flake in the current directory).
+    \\and print the output path. With no source, uses ./default.nix.
 ;
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null, .build) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .build);
             return 0;
@@ -41,7 +40,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     ev.enableStoreWrites();
 
-    const input_plan = eval_support.InputPlan.init(options);
+    const input_plan = eval_support.InputPlan.init(options, init.io);
     input_plan.validate(&ev) catch |err| {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
         return 2;
@@ -61,6 +60,8 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         };
     }
 
+    if (options.dry_run)
+        return realization_workflow.dryRunMany(allocator, init.io, &ev, process.eval_release, term, options, inputs);
     return realization_workflow.realizeMany(allocator, init.io, &ev, process.eval_release, term, options, inputs);
 }
 

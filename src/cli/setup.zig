@@ -167,6 +167,7 @@ fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_con
         .keep_going = boolSetting(settings, "keep-going", false),
         .fallback = boolSetting(settings, "fallback", false),
         .verbosity = @min(7, options.verbose),
+        .suppress_build_output = options.no_build_output,
         .max_build_jobs = jobsSetting(settings, "max-jobs", 1),
         .max_silent_time = settings.getUint("max-silent-time") orelse 0,
         .build_cores = settings.getUint("cores") orelse 0,

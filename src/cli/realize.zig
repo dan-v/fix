@@ -244,6 +244,82 @@ pub fn realizeMany(
     return if (ok) 0 else 1;
 }
 
+/// Evaluate and instantiate build inputs, then ask the daemon for its missing
+/// path plan. No build/substitution operation is issued and no result links are
+/// created.
+pub fn dryRunMany(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ev: *Evaluator,
+    release_action: ?@import("expr").ReleaseAction,
+    terminal: setup.Terminal,
+    options: args.Options,
+    inputs: []const BuildInput,
+) !u8 {
+    var progress = EvalProgress.init(io, terminal.show_progress);
+    var progress_ok = false;
+    defer progress.deinit(progress_ok);
+    if (terminal.show_progress) ev.setProgressSink(progress.sink());
+    ev.progressSessionBegin("dry-run inputs");
+    defer ev.progressSessionEnd();
+    ev.startProgressSampler();
+    var sampler_running = true;
+    defer if (sampler_running) ev.stopProgressSampler();
+
+    const derived = try allocator.alloc([]const u8, inputs.len);
+    var derived_count: usize = 0;
+    defer {
+        for (derived[0..derived_count]) |path| allocator.free(path);
+        allocator.free(derived);
+    }
+
+    for (inputs, 0..) |input, index| {
+        const value = ev.evaluatePathAt(input.source.text, input.source.base_path, input.source.abs_path) catch |err| {
+            _ = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, input.source.text, err);
+            return 1;
+        };
+        const paths = (ev.derivationBuildPaths(value) catch |err| {
+            _ = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, input.source.text, err);
+            return 1;
+        }) orelse {
+            std.debug.print("error: input {d} did not evaluate to a derivation\n", .{index + 1});
+            return 1;
+        };
+        derived[derived_count] = try std.fmt.allocPrint(allocator, "{s}!*", .{paths.drv_path});
+        derived_count += 1;
+    }
+
+    ev.stopProgressSampler();
+    sampler_running = false;
+    var session = ev.beginBuildPhase(derived[0..derived_count], release_action) catch |err| {
+        return eval_support.buildFailure(ev.lastStoreError(), err);
+    };
+    defer session.deinit();
+    var plan = session.queryMissing(derived[0..derived_count]) catch |err| {
+        return eval_support.buildFailure(session.lastStoreError(), err);
+    };
+    defer plan.deinit();
+
+    writeMissingGroup("derivations will be built", plan.will_build);
+    if (plan.will_substitute.len != 0) {
+        std.debug.print("these {d} paths will be fetched ({d} bytes download, {d} bytes unpacked):\n", .{
+            plan.will_substitute.len,
+            plan.download_size,
+            plan.nar_size,
+        });
+        for (plan.will_substitute) |path| std.debug.print("  {s}\n", .{path});
+    }
+    writeMissingGroup("paths are unknown", plan.unknown);
+    progress_ok = plan.unknown.len == 0;
+    return if (progress_ok) 0 else 1;
+}
+
+fn writeMissingGroup(label: []const u8, paths: []const []const u8) void {
+    if (paths.len == 0) return;
+    std.debug.print("these {d} {s}:\n", .{ paths.len, label });
+    for (paths) |path| std.debug.print("  {s}\n", .{path});
+}
+
 pub fn realize(
     allocator: std.mem.Allocator,
     io: std.Io,

@@ -26,7 +26,7 @@ const usage =
     \\  dump PATH   pretty-print a binary trace as text.
     \\
     \\To record a trace:
-    \\  fix eval --vm-trace=PATH --vm-trace-format=binary -e EXPR
+    \\  fix eval --vm-trace=PATH --vm-trace-format=binary -E EXPR
     \\
 ;
 

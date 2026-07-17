@@ -30,7 +30,7 @@ const usage =
     \\             outcomes differs.
     \\
     \\to record a log:
-    \\  fix eval --thunks-log=PATH -e EXPR
+    \\  fix eval --thunks-log=PATH -E EXPR
     \\
     \\options for diff:
     \\  --asymmetric          show only locations where one side has

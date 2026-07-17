@@ -12,6 +12,7 @@ const hugetlb = @import("base").hugetlb;
 
 pub const OutputFormat = enum {
     nix,
+    raw,
     json,
     xml,
 };
@@ -135,6 +136,11 @@ pub const Options = struct {
     derivation_debug: derivation_debug.Options = .{},
     /// `fix build --no-link`/`--no-out-link`: skip creating the result symlink.
     no_link: bool = false,
+    /// `fix build --dry-run`: evaluate and instantiate, then report the daemon's
+    /// missing build/substitution plan without realizing it.
+    dry_run: bool = false,
+    /// `-Q`/`--no-build-output`: consume daemon build log messages silently.
+    no_build_output: bool = false,
     /// `--out-link NAME`/`-o`: name of the result symlink (default `result`).
     out_link: ?[]const u8 = null,
     /// `--drv-link NAME`: name of the derivation symlink (default `derivation`).
@@ -177,9 +183,6 @@ pub const Options = struct {
     /// Prepended to `$NIX_PATH` at setup (they take precedence, as in Nix).
     /// Borrowed from argv; the list backing is owned (caller frees via `deinit`).
     include: std.ArrayListUnmanaged([]const u8) = .empty,
-    /// `--flake`: interpret the (positional or default) source as a flake
-    /// installable rather than a file. See `defaultSource`.
-    flake_mode: bool = false,
     /// `-A`/`--attr`: dotted attribute path to select from the evaluated value
     /// (as in `nix-build -A`). Borrowed from argv.
     attr: ?[]const u8 = null,
@@ -256,12 +259,11 @@ pub const Options = struct {
     }
 
     /// The source to evaluate when none was given on the command line: the
-    /// flake in the current directory under `--flake`, else `./default.nix`
-    /// (matching `nix-build`/`nix-instantiate`). Subcommands that want a
-    /// no-source default (`eval`, `build`, `instantiate`, `run`) call this;
-    /// `repl`/`shell` handle a null source themselves.
+    /// `./default.nix`, matching `nix-build`/`nix-instantiate`. Flakes are
+    /// explicit typed inputs (`--flake REF`), so they never change this default.
     pub fn defaultSource(self: Options) SourceArg {
-        return if (self.flake_mode) .{ .flake = "." } else .{ .file = "default.nix" };
+        _ = self;
+        return .{ .file = "default.nix" };
     }
 
     pub fn evaluationMode(self: Options) EvaluationMode {
@@ -288,6 +290,7 @@ const Opt = enum {
     argstr,
     // Output.
     json,
+    raw,
     xml,
     strict,
     no_location,
@@ -299,6 +302,8 @@ const Opt = enum {
     option,
     // Build outputs / links.
     no_link,
+    dry_run,
+    no_build_output,
     out_link,
     drv_link,
     add_drv_link,
@@ -377,8 +382,9 @@ const Arg = enum {
     req,
     /// Two required values: `--x NAME VALUE`.
     req2,
-    /// Consumes every following token until `--` or end (`-p pkg1 pkg2`).
-    greedy,
+    /// Consumes following non-option tokens (`-p pkg1 pkg2`), then returns to
+    /// ordinary option parsing at the next option.
+    multi,
 };
 
 const Spec = struct {
@@ -387,8 +393,7 @@ const Spec = struct {
     short: ?[]const u8 = null,
     arg: Arg = .flag,
     /// Placeholder shown in help (`PATH`, `NAME EXPR`, `WHEN`, ...). For `.flag`
-    /// options a non-empty metavar renders as an optional operand, e.g.
-    /// `--flake [INSTALLABLE]`.
+    /// options a non-empty metavar renders as an optional operand.
     metavar: []const u8 = "",
     /// One-line (or multi-line, `\n`-separated) help text.
     help: []const u8 = "",
@@ -400,8 +405,11 @@ const Spec = struct {
 
 /// Commands that take a source expression and its selectors (everything but the
 /// bare `repl`). `disasm` compiles rather than evaluates, but shares the same
-/// source model (bare path / `-e` / `--file` / `--flake` / `-A` / `-I`).
+/// source model (bare path / `-E` / `--file` / `--flake` / `-A` / `-I`).
 const source_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .disasm, .@"switch" };
+/// Source wrappers/selectors operate on evaluated text. `parse` consumes the
+/// original file/expression bytes and therefore intentionally excludes these.
+const selected_source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .disasm, .@"switch" };
 /// Commands that run the evaluator, so diagnostics (`--show-trace`, `--color`),
 /// progress, and the GC memory budget apply. `disasm` stops at compilation, so
 /// it is excluded.
@@ -409,7 +417,7 @@ const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .@"
 /// Commands that print an evaluated value, so the output format (`--json`,
 /// `--xml`) and `--strict` apply. The realizing commands print store paths, not
 /// a value, and `disasm` prints bytecode.
-const value_cmds = &[_]Cmd{ .eval, .parse, .repl };
+const value_cmds = &[_]Cmd{ .eval, .repl };
 /// Commands that evaluate to a derivation whose debug records make sense.
 const derivation_debug_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .@"switch" };
 /// Commands that produce a top-level `.drv` a link/root can point at.
@@ -418,15 +426,16 @@ const drv_cmds = &[_]Cmd{ .build, .instantiate };
 const realize_cmds = &[_]Cmd{ .build, .run, .shell, .@"switch" };
 
 const specs = [_]Spec{
-    .{ .id = .expr, .short = "-e", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text", .show_in = source_cmds },
-    .{ .id = .file, .long = "--file", .arg = .req, .metavar = "PATH", .help = "evaluate a file (same as a bare PATH)", .show_in = source_cmds },
-    .{ .id = .flake, .long = "--flake", .arg = .flag, .metavar = "INSTALLABLE", .help = "evaluate a flake output <flakeref>[#<attrpath>]\n(default flakeref `.`; requires the flakes feature)", .show_in = source_cmds },
+    .{ .id = .expr, .short = "-E", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text; repeatable", .show_in = source_cmds },
+    .{ .id = .file, .short = "-f", .long = "--file", .arg = .req, .metavar = "PATH", .help = "evaluate a file (`-` reads stdin); repeatable", .show_in = source_cmds },
+    .{ .id = .flake, .long = "--flake", .arg = .req, .metavar = "INSTALLABLE", .help = "evaluate one flake output <flakeref>[#<attrpath>];\nrepeatable; requires the flakes feature", .show_in = selected_source_cmds },
     .{ .id = .include, .short = "-I", .long = "--include", .arg = .req, .metavar = "PATH", .help = "prepend a search-path entry (as in NIX_PATH);\nPATH may be `prefix=path`. Repeatable.", .show_in = source_cmds },
-    .{ .id = .attr, .short = "-A", .long = "--attr", .arg = .req, .metavar = "ATTR", .help = "select attribute path ATTR from the result", .show_in = source_cmds },
-    .{ .id = .arg, .long = "--arg", .arg = .req2, .metavar = "NAME EXPR", .help = "pass EXPR as top-level function argument NAME", .show_in = source_cmds },
-    .{ .id = .argstr, .long = "--argstr", .arg = .req2, .metavar = "NAME STR", .help = "pass string STR as top-level function argument NAME", .show_in = source_cmds },
+    .{ .id = .attr, .short = "-A", .long = "--attr", .arg = .req, .metavar = "ATTR", .help = "select attribute path ATTR from the result", .show_in = selected_source_cmds },
+    .{ .id = .arg, .long = "--arg", .arg = .req2, .metavar = "NAME EXPR", .help = "pass EXPR as top-level function argument NAME", .show_in = selected_source_cmds },
+    .{ .id = .argstr, .long = "--argstr", .arg = .req2, .metavar = "NAME STR", .help = "pass string STR as top-level function argument NAME", .show_in = selected_source_cmds },
 
     .{ .id = .json, .long = "--json", .help = "write the evaluated value as JSON", .show_in = value_cmds },
+    .{ .id = .raw, .long = "--raw", .help = "write a string value without quoting or a newline", .show_in = &.{.eval} },
     .{ .id = .xml, .long = "--xml", .help = "write the evaluated value as XML", .show_in = value_cmds },
     .{ .id = .no_location, .long = "--no-location", .help = "omit source positions from --xml output", .show_in = value_cmds },
     .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing", .show_in = value_cmds },
@@ -439,7 +448,8 @@ const specs = [_]Spec{
 
     .{ .id = .out_link, .short = "-o", .long = "--out-link", .arg = .req, .metavar = "NAME", .help = "name of the result symlink (default: result)", .show_in = &.{.build} },
     .{ .id = .no_link, .long = "--no-out-link", .help = "do not create the result symlink", .show_in = &.{.build} },
-    .{ .id = .no_link, .long = "--no-link", .hidden = true }, // alias of --no-out-link
+    .{ .id = .no_link, .long = "--no-link", .show_in = &.{.build}, .hidden = true }, // alias of --no-out-link
+    .{ .id = .dry_run, .long = "--dry-run", .help = "show what would be built or substituted", .show_in = &.{.build} },
     .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .show_in = drv_cmds },
     .{ .id = .add_drv_link, .long = "--add-drv-link", .help = "also create a symlink to the .drv", .show_in = drv_cmds },
     .{ .id = .add_root, .long = "--add-root", .arg = .req, .metavar = "PATH", .help = "create the link at PATH and register it as a GC root", .show_in = drv_cmds },
@@ -455,6 +465,7 @@ const specs = [_]Spec{
     .{ .id = .max_silent_time, .long = "--max-silent-time", .arg = .req, .metavar = "SECS", .help = "abort a build silent for SECS seconds (0 = no limit)", .show_in = realize_cmds },
     .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = realize_cmds },
     .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase daemon build verbosity (repeatable)", .show_in = realize_cmds },
+    .{ .id = .no_build_output, .short = "-Q", .long = "--no-build-output", .help = "suppress builder output", .show_in = &[_]Cmd{ .instantiate, .build, .run, .shell, .@"switch" } },
 
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error", .show_in = eval_cmds },
     .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{ .eval, .repl } },
@@ -472,12 +483,12 @@ const specs = [_]Spec{
 
     .{ .id = .bare, .long = "--bare", .help = "plain line-based input: no editor, no escape\nsequences (for pipes and expect-style automation)", .show_in = &.{.repl} },
 
-    .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .greedy, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell} },
+    .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .multi, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell} },
 
     .{ .id = .nixos, .long = "--nixos", .help = "build/activate a NixOS system configuration", .show_in = &.{.@"switch"} },
     .{ .id = .darwin, .long = "--darwin", .help = "build/activate a nix-darwin configuration", .show_in = &.{.@"switch"} },
     .{ .id = .home_manager, .long = "--home-manager", .help = "build/activate a home-manager configuration", .show_in = &.{.@"switch"} },
-    .{ .id = .home_manager, .long = "--hm", .hidden = true }, // alias for --home-manager
+    .{ .id = .home_manager, .long = "--hm", .show_in = &.{.@"switch"}, .hidden = true }, // alias for --home-manager
     .{ .id = .target_host, .long = "--target-host", .arg = .req, .metavar = "[USER@]HOST", .help = "build locally, then copy the closure and activate on\nthis remote host over SSH", .show_in = &.{.@"switch"} },
     .{ .id = .use_remote_sudo, .long = "--use-remote-sudo", .help = "run the remote profile-set/activation under sudo", .show_in = &.{.@"switch"} },
     .{ .id = .activate_toplevel, .long = "--activate-toplevel", .arg = .req, .metavar = "PATH", .hidden = true },
@@ -526,15 +537,9 @@ fn findShort(name: []const u8) ?*const Spec {
 // Parsing
 // ---------------------------------------------------------------------------
 
-pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Options {
+pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, first: ?[:0]const u8, cmd: Cmd) !Options {
     var options: Options = .{};
     errdefer options.deinit(allocator);
-
-    // Bare sources are appended immediately to preserve argv order. Remember
-    // their indexes so a later `--flake` can reinterpret only bare inputs (an
-    // explicit `--file` remains a file).
-    var positional_indexes: std.ArrayListUnmanaged(usize) = .empty;
-    defer positional_indexes.deinit(allocator);
 
     var carried = first;
     parse_loop: while (true) {
@@ -568,21 +573,30 @@ pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
                 }
             }
         } else {
-            try positional_indexes.append(allocator, options.sources.items.len);
             try options.addSource(allocator, .{ .file = arg });
             continue;
         }
 
         const s = spec orelse return error.UnknownOption;
+        if (s.show_in.len != 0 and std.mem.indexOfScalar(Cmd, s.show_in, cmd) == null)
+            return error.OptionNotValidForCommand;
 
-        // Greedy options drain the rest of argv themselves.
-        if (s.arg == .greedy) {
+        // Multi-value options consume non-options, then return the next option
+        // to the ordinary parse loop (`-p hello jq --no-progress`).
+        if (s.arg == .multi) {
             if (inline_value != null) return error.UnexpectedValue;
+            var found = false;
             while (args_iter.next()) |name| {
                 if (std.mem.eql(u8, name, "--")) break :parse_loop;
+                if (name.len >= 2 and name[0] == '-') {
+                    carried = name;
+                    break;
+                }
                 try options.packages.append(allocator, name);
+                found = true;
             }
-            break :parse_loop;
+            if (!found) return error.MissingValue;
+            continue;
         }
 
         // Gather the option's value(s) per arity.
@@ -596,18 +610,10 @@ pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
                 v0 = inline_value orelse (args_iter.next() orelse return error.MissingValue);
                 v1 = args_iter.next() orelse return error.MissingSecondValue;
             },
-            .greedy => unreachable,
+            .multi => unreachable,
         }
 
         try apply(&options, allocator, s.id, v0, v1);
-    }
-
-    if (options.flake_mode) {
-        for (positional_indexes.items) |index| {
-            const path = options.sources.items[index].file;
-            options.sources.items[index] = .{ .flake = path };
-        }
-        if (options.sources.items.len != 0) options.source = options.sources.items[0];
     }
 
     return options;
@@ -620,7 +626,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
     switch (id) {
         .expr => try options.addSource(allocator, .{ .expr = v0.? }),
         .file => try options.addSource(allocator, .{ .file = v0.? }),
-        .flake => options.flake_mode = true,
+        .flake => try options.addSource(allocator, .{ .flake = v0.? }),
         .include => try options.include.append(allocator, v0.?),
         .attr => {
             try options.attrs.append(allocator, v0.?);
@@ -630,6 +636,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .argstr => try options.arg_defs.append(allocator, .{ .name = v0.?, .value = v1.?, .is_string = true }),
 
         .json => options.output = .json,
+        .raw => options.output = .raw,
         .xml => options.output = .xml,
         .no_location => options.no_location = true,
         .strict => options.strict = true,
@@ -649,6 +656,8 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .option => try options.option_overrides.append(allocator, .{ .name = v0.?, .value = v1.? }),
 
         .no_link => options.no_link = true,
+        .dry_run => options.dry_run = true,
+        .no_build_output => options.no_build_output = true,
         .out_link => options.out_link = v0.?,
         .drv_link => options.drv_link = v0.?,
         .add_drv_link => options.add_drv_link = true,
@@ -786,7 +795,7 @@ fn writeOptionLine(w: *std.Io.Writer, s: *const Spec) !void {
                 try w.print("[={s}]", .{s.metavar});
                 col += s.metavar.len + 3;
             },
-            .req, .req2, .greedy => {
+            .req, .req2, .multi => {
                 try w.print(" {s}", .{s.metavar});
                 col += s.metavar.len + 1;
             },
@@ -837,6 +846,49 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.InvalidTimelineFlows => "expected --timeline-flows to be off, all, or a non-negative integer",
         error.InvalidChunkId => "expected --chunk to be a chunk id (decimal, or 0x-prefixed hex)",
         error.UnknownOption => "unknown option",
+        error.OptionNotValidForCommand => "that option is not valid for this command",
         else => @errorName(err),
     };
+}
+
+fn parseForTest(argv: std.process.Args.Vector, cmd: Cmd) !Options {
+    var process_args: std.process.Args = .{ .vector = argv };
+    var iter = try process_args.iterateAllocator(std.testing.allocator);
+    defer iter.deinit();
+    _ = iter.next();
+    return parse(std.testing.allocator, &iter, null, cmd);
+}
+
+test "typed sources preserve mixed command-line order" {
+    const argv = [_][*:0]const u8{ "fix", "bare.nix", "--flake", ".#hello", "-E", "1 + 2", "-f", "other.nix" };
+    var options = try parseForTest(&argv, .build);
+    defer options.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), options.sources.items.len);
+    try std.testing.expectEqualStrings("bare.nix", options.sources.items[0].file);
+    try std.testing.expectEqualStrings(".#hello", options.sources.items[1].flake);
+    try std.testing.expectEqualStrings("1 + 2", options.sources.items[2].expr);
+    try std.testing.expectEqualStrings("other.nix", options.sources.items[3].file);
+}
+
+test "lowercase expression short flag is rejected and flake requires a value" {
+    const lowercase = [_][*:0]const u8{ "fix", "-e", "1" };
+    try std.testing.expectError(error.UnknownOption, parseForTest(&lowercase, .eval));
+
+    const missing_flake = [_][*:0]const u8{ "fix", "--flake" };
+    try std.testing.expectError(error.MissingValue, parseForTest(&missing_flake, .build));
+}
+
+test "parser enforces command option scope" {
+    const argv = [_][*:0]const u8{ "fix", "--dry-run" };
+    try std.testing.expectError(error.OptionNotValidForCommand, parseForTest(&argv, .eval));
+}
+
+test "package list returns to ordinary option parsing" {
+    const argv = [_][*:0]const u8{ "fix", "-p", "hello", "jq", "--no-progress" };
+    var options = try parseForTest(&argv, .shell);
+    defer options.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices([]const u8, &.{ "hello", "jq" }, options.packages.items);
+    try std.testing.expectEqual(presentation.When.never, options.progress);
 }

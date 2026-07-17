@@ -3,7 +3,7 @@
 //! everyday `nix-shell -p` analogue.
 //!
 //!   fix shell -p ripgrep jq            # packages from <nixpkgs>
-//!   fix shell -e '(import <nixpkgs> {}).hello'
+//!   fix shell -E '(import <nixpkgs> {}).hello'
 //!   fix shell -p ripgrep -- rg --version
 
 const std = @import("std");
@@ -20,7 +20,7 @@ const EnvMap = std.process.Environ.Map;
 const BuildSink = store.daemon.BuildSink;
 
 pub const synopsis =
-    \\usage: fix shell [options] (-p <pkgs...> | path | -e <expr> | --flake) [-- cmd args...]
+    \\usage: fix shell [options] (-p <pkgs...> | path | -E <expr> | --flake <installable>) [-- cmd args...]
     \\
     \\build one or more derivations and start a shell with their $out/bin on PATH.
     \\With `-- cmd args`, run that command in the environment instead of a shell.
@@ -28,7 +28,7 @@ pub const synopsis =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null, .shell) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .shell);
             return 0;
@@ -45,7 +45,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     }
 
     if (options.packages.items.len == 0 and options.source == null) {
-        std.debug.print("error: give packages (-p) or an expression (-e/--file/--flake)\n\n{s}\n", .{synopsis});
+        std.debug.print("error: give packages (-p) or a source (-E/--file/--flake)\n\n{s}\n", .{synopsis});
         return 2;
     }
 
@@ -140,14 +140,14 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     return null;
 }
 
-/// Build the `-e`/`--file`/`--flake` derivation, appending its outPath.
+/// Build the `-E`/`--file`/`--flake` derivation, appending its outPath.
 fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, release_action: ?engine.ReleaseAction, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const source_arg = options.source.?;
     if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
-    const source = eval_support.getSource(ev, source_arg, options) catch |err| {
+    const source = eval_support.getSource(ev, init.io, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
