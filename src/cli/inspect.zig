@@ -5,13 +5,13 @@
 //! Use `--no-eval` to inspect what compilation alone produces.
 
 const std = @import("std");
-const engine = @import("nix");
+const engine = @import("expr");
 const presentation = @import("presentation.zig");
-const bytecode = engine.tooling.bytecode;
+const bytecode = engine.bytecode;
 const builtin = @import("builtin");
 
 const Evaluator = engine.Evaluator;
-const SchedulerStats = engine.tooling.workers.Scheduler.Stats;
+const SchedulerStats = engine.workers.Scheduler.Stats;
 
 const usage =
     \\usage: fix inspect [options] (-e <expression> | --file <path>)

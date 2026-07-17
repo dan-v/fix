@@ -7,7 +7,7 @@
 const std = @import("std");
 const presentation = @import("presentation.zig");
 const derivation_debug = @import("derivation_debug.zig");
-const engine = @import("nix");
+const engine = @import("expr");
 const hugetlb = @import("base").hugetlb;
 
 pub const OutputFormat = enum {

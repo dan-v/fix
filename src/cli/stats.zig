@@ -6,10 +6,10 @@
 //! are imported here at the top of the file rather than inline at each use.
 
 const std = @import("std");
-const engine = @import("nix");
+const engine = @import("expr");
 const Evaluator = engine.Evaluator;
-const prof = engine.tooling.probe.prof;
-const prof_path = engine.tooling.probe.prof_path;
+const prof = engine.probe.prof;
+const prof_path = engine.probe.prof_path;
 
 pub fn report(ev: *Evaluator) void {
     const s = ev.schedulerStats();
@@ -64,7 +64,7 @@ pub fn report(ev: *Evaluator) void {
 }
 
 fn reportSchedulerScanCensus() void {
-    const t = engine.tooling.workers.scanCensus() orelse return;
+    const t = engine.workers.scanCensus() orelse return;
     const total = t.ready_pop_cy + t.ready_steal_cy + t.pop_own_cy +
         t.urgent_steal_cy + t.novel_steal_cy + t.spec_steal_cy;
     if (total == 0) return;

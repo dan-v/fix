@@ -369,7 +369,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
 /// A throwaway `Vma` instantiation for the tests below: the cache is generic
 /// over its Vma, and these tests only exercise the reuse/passthrough logic, so
 /// the attribution taxonomy is irrelevant. The evaluator's real instantiation
-/// lives in `nix`'s `mem_tag.zig`.
+/// lives in `runtime`'s `mem_tag.zig`.
 const TestTag = enum { none };
 const TestVma = @import("vma.zig").Vma(TestTag, .none, struct {
     fn n(_: TestTag) [:0]const u8 {

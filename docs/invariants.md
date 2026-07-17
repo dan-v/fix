@@ -46,5 +46,5 @@ These span subsystems, so they're collected here. Violating one usually shows up
 ## Build & structure
 
 - **LLVM is forced** (`use_llvm=true`) because the threaded dispatcher relies on `@call(.always_tail)`; other backends would unbounded-recurse. → [build](build.md), [vm/dispatch](vm/dispatch.md)
-- **Module-boundary hygiene.** Import the durable groups (`base`, `syntax`, `runtime`, `nix`, `cli`) by name. Inside `nix`, import subsystem facades as ordinary relative files so each type has one canonical instance. → [build](build.md)
+- **Module-boundary hygiene.** Import the durable groups (`base`, `syntax`, `runtime`, `store`, `fetchers`, `expr`, `cli`) by name. Inside a durable module, use ordinary relative imports so each type has one canonical instance. → [build](build.md)
 - **Chunks are immutable after registration**, and their constants are permanent GC roots (never swept). Per-thread inline caches/memos are guarded by `heap_token`. → [vm/dispatch](vm/dispatch.md)

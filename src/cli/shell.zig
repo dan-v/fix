@@ -7,7 +7,8 @@
 //!   fix shell -p ripgrep -- rg --version
 
 const std = @import("std");
-const engine = @import("nix");
+const engine = @import("expr");
+const store = @import("store");
 const progress_ui = @import("progress.zig");
 const build_progress_ui = @import("build_progress.zig");
 const args = @import("args.zig");
@@ -16,7 +17,7 @@ const eval_support = @import("eval_support.zig");
 
 const Evaluator = engine.Evaluator;
 const EnvMap = std.process.Environ.Map;
-const BuildSink = engine.BuildSink;
+const BuildSink = store.daemon.BuildSink;
 
 pub const synopsis =
     \\usage: fix shell [options] (-p <pkgs...> | path | -e <expr> | --flake) [-- cmd args...]

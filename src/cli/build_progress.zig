@@ -4,7 +4,7 @@
 //! `EvalProgress`, so eval and build render as one tree.
 
 const std = @import("std");
-const engine = @import("nix");
+const daemon = @import("store").daemon;
 const EvalProgress = @import("progress.zig").EvalProgress;
 
 pub const BuildProgress = struct {
@@ -26,14 +26,14 @@ pub const BuildProgress = struct {
         self.nodes = .empty;
     }
 
-    pub fn sink(self: *BuildProgress) engine.BuildSink {
+    pub fn sink(self: *BuildProgress) daemon.BuildSink {
         return .{
             .context = self,
             .emit_fn = emit,
         };
     }
 
-    fn emit(context: *anyopaque, event: engine.BuildEvent) void {
+    fn emit(context: *anyopaque, event: daemon.BuildEvent) void {
         const self: *BuildProgress = @ptrCast(@alignCast(context));
         switch (event) {
             .start => |activity| {

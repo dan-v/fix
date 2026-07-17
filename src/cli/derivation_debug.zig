@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const presentation = @import("presentation.zig");
-const derivation = @import("nix").tooling.derivation;
+const derivation = @import("store").derivation;
 
 pub const Mode = enum {
     off,

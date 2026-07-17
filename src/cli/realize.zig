@@ -1,7 +1,7 @@
 //! Shared evaluation-to-build workflow for realizing CLI commands.
 
 const std = @import("std");
-const Evaluator = @import("nix").Evaluator;
+const Evaluator = @import("expr").Evaluator;
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const eval_support = @import("eval_support.zig");
@@ -26,7 +26,7 @@ pub fn realize(
     allocator: std.mem.Allocator,
     io: std.Io,
     ev: *Evaluator,
-    release_action: ?@import("nix").ReleaseAction,
+    release_action: ?@import("expr").ReleaseAction,
     terminal: setup.Terminal,
     options: args.Options,
     source_arg: args.SourceArg,

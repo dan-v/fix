@@ -1,7 +1,7 @@
 const std = @import("std");
-const fix = @import("../../nix.zig");
-const Evaluator = fix.Evaluator;
-const value = fix.tooling.runtime.value;
+const expr = @import("expr");
+const Evaluator = expr.Evaluator;
+const value = @import("runtime").value;
 const ValueType = value.ValueType;
 
 test "end-to-end: eager let-elision preserves error order under tryEval (§G)" {

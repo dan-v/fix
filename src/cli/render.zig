@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const presentation = @import("presentation.zig");
-const engine = @import("nix");
+const engine = @import("expr");
 const Evaluator = engine.Evaluator;
 const EvalTrace = engine.EvalTrace;
 

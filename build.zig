@@ -116,18 +116,6 @@ pub fn build(b: *std.Build) void {
     expr_mod.addImport("store", store_mod);
     expr_mod.addImport("fetchers", fetchers_mod);
 
-    const nix_mod = b.addModule("nix", .{
-        .root_source_file = b.path("src/nix.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = strip,
-        .omit_frame_pointer = omit_frame_pointer,
-    });
-    nix_mod.addImport("expr", expr_mod);
-    nix_mod.addImport("runtime", runtime_mod);
-    nix_mod.addImport("store", store_mod);
-    nix_mod.addImport("fetchers", fetchers_mod);
-
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli/cli.zig"),
         .target = target,
@@ -135,8 +123,11 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
-    cli_mod.addImport("nix", nix_mod);
     cli_mod.addImport("base", base_mod);
+    cli_mod.addImport("expr", expr_mod);
+    cli_mod.addImport("runtime", runtime_mod);
+    cli_mod.addImport("syntax", syntax_mod);
+    cli_mod.addImport("store", store_mod);
 
     const process_support_mod = b.createModule(.{
         .root_source_file = b.path("src/process_support.zig"),
@@ -155,7 +146,6 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
         .imports = &.{
-            .{ .name = "nix", .module = nix_mod },
             .{ .name = "cli", .module = cli_mod },
             .{ .name = "process_support", .module = process_support_mod },
         },
@@ -199,17 +189,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_syntax_tests = b.addRunArtifact(syntax_tests);
 
-    const nix_tests = b.addTest(.{
-        .root_module = nix_mod,
-        .use_llvm = true,
-    });
-    const run_nix_tests = b.addRunArtifact(nix_tests);
-
     const expr_tests = b.addTest(.{
         .root_module = expr_mod,
         .use_llvm = true,
     });
     const run_expr_tests = b.addRunArtifact(expr_tests);
+
+    const integration_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/integration/expr_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "expr", .module = expr_mod },
+            .{ .name = "runtime", .module = runtime_mod },
+        },
+    });
+    const integration_tests = b.addTest(.{
+        .root_module = integration_test_mod,
+        .use_llvm = true,
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
 
     const fetchers_tests = b.addTest(.{
         .root_module = fetchers_mod,
@@ -236,7 +235,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_fetchers_tests.step);
     test_step.dependOn(&run_expr_tests.step);
-    test_step.dependOn(&run_nix_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_cli_tests.step);
 
     const format_check = b.addFmt(.{

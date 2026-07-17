@@ -4,8 +4,8 @@
 //! force_thunk path is actually traversed.
 
 const std = @import("std");
-const fix = @import("../../nix.zig");
-const Evaluator = fix.Evaluator;
+const expr = @import("expr");
+const Evaluator = expr.Evaluator;
 
 test "parallel: arithmetic with 4 workers" {
     const alloc = std.testing.allocator;

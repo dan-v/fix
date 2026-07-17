@@ -12,12 +12,13 @@
 //! `cli`-side implementation, so no VM internals leak below the facade.
 
 const std = @import("std");
-const engine = @import("nix");
+const engine = @import("expr");
+const runtime = @import("runtime");
 const presentation = @import("presentation.zig");
-const syntax = engine.tooling.syntax;
+const syntax = @import("syntax");
 
 const DebugSession = engine.DebugSession;
-const Value = engine.Value;
+const Value = runtime.Value;
 const TokenType = syntax.token.TokenType;
 
 // Syntax-highlight palette (matches the value-render palette in eval/print.zig).

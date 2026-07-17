@@ -5,7 +5,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const engine = @import("nix");
+const engine = @import("expr");
+const store = @import("store");
 const presentation = @import("presentation.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
@@ -135,7 +136,7 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
 /// actually connects (build/instantiate/run/shell), never for plain `eval`.
 fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_conf.Settings) !void {
     const allocator = ev.hostAllocator();
-    var overrides: std.ArrayListUnmanaged(engine.BuildSetting) = .empty;
+    var overrides: std.ArrayListUnmanaged(store.daemon.Setting) = .empty;
     defer overrides.deinit(allocator);
     // Owned `extra-<key>` names for keys with no explicit base; freed after the
     // (duping) setDaemonBuildSettings call below.

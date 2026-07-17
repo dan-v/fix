@@ -3,7 +3,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli");
-const engine = @import("nix");
 const process_support = @import("process_support");
 const repl = cli.repl;
 const disasm_cmd = cli.disasm;

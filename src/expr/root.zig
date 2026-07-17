@@ -3,16 +3,19 @@
 
 const eval = @import("eval.zig");
 const policy = @import("policy.zig");
-const observ = @import("observ.zig");
+const observ_mod = @import("observ.zig");
 const memory_config = @import("memory_config.zig");
 
-pub const tooling = @import("tooling.zig");
+pub const bytecode = @import("tooling/bytecode.zig");
+pub const workers = @import("eval/workers.zig");
+pub const vm = @import("vm.zig");
+pub const probe = @import("probe.zig");
 
 pub const Evaluator = eval.Evaluator;
 pub const BuildSession = eval.BuildSession;
 pub const Diagnostic = eval.Diagnostic;
 pub const EvalTrace = eval.EvalTrace;
-pub const EvalProgress = observ.progress;
+pub const EvalProgress = observ_mod.progress;
 pub const DebugSession = eval.DebugSession;
 pub const DebugFrame = eval.DebugFrame;
 pub const BreakReason = eval.BreakReason;
@@ -30,6 +33,5 @@ test {
     _ = @import("vm.zig");
     _ = eval;
     _ = @import("support.zig");
-    _ = @import("probe.zig");
-    _ = tooling;
+    _ = probe;
 }

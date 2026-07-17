@@ -1,7 +1,7 @@
 //! Evaluation progress rendering for the CLI.
 
 const std = @import("std");
-const eval_progress = @import("nix").EvalProgress;
+const eval_progress = @import("expr").EvalProgress;
 const Mutex = @import("base").sync.BlockingMutex;
 
 pub const EvalProgress = struct {

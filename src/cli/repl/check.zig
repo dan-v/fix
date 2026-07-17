@@ -6,7 +6,7 @@
 //! trapping the user in continuation lines.
 
 const std = @import("std");
-const engine = @import("nix");
+const syntax = @import("syntax");
 
 /// True when `source` should be submitted on Enter; false to continue on a
 /// new line. Empty input is complete (the repl skips it).
@@ -14,9 +14,9 @@ pub fn isComplete(allocator: std.mem.Allocator, source: []const u8) bool {
     const trimmed = std.mem.trim(u8, source, " \t\r\n");
     if (trimmed.len == 0) return true;
 
-    var arena = engine.tooling.syntax.ast.AstArena.init(allocator);
+    var arena = syntax.ast.AstArena.init(allocator);
     defer arena.deinit();
-    var parser = engine.tooling.syntax.parser.Parser.init(allocator, &arena, source);
+    var parser = syntax.parser.Parser.init(allocator, &arena, source);
     defer parser.deinit();
 
     _ = parser.parse() catch {

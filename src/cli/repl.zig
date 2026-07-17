@@ -24,9 +24,10 @@ const args = @import("args.zig");
 const setup = @import("setup.zig");
 const debugger = @import("debugger.zig");
 const render_err = @import("render.zig");
-const engine = @import("nix");
-const future_mod = engine.tooling.runtime.future;
-const types = engine.tooling.runtime.types;
+const engine = @import("expr");
+const runtime = @import("runtime");
+const future_mod = runtime.future;
+const types = runtime.types;
 
 const commands = @import("repl/commands.zig");
 const check = @import("repl/check.zig");
@@ -40,7 +41,7 @@ const pager_mod = @import("repl/pager.zig");
 
 const Options = args.Options;
 const Evaluator = engine.Evaluator;
-const Value = engine.Value;
+const Value = runtime.Value;
 
 pub const synopsis =
     \\usage: fix repl [options]

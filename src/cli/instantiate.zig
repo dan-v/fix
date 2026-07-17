@@ -3,7 +3,7 @@
 //! print the top-level `.drv` path. The nix-instantiate analogue.
 
 const std = @import("std");
-const engine = @import("nix");
+const engine = @import("expr");
 const progress_ui = @import("progress.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
