@@ -10,7 +10,14 @@ const renderStrictForTest = helpers.renderStrictForTest;
 const renderForTestFromCurrentPath = helpers.renderForTestFromCurrentPath;
 const renderXmlForTest = helpers.renderXmlForTest;
 
-test "release hook is evaluator-owned and runs once" {
+test "language release is evaluator-owned and idempotent" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    ev.releaseEvalState();
+    ev.releaseEvalState();
+    ev.deinit();
+}
+
+test "build transition runs its explicit post-release action once" {
     const Counter = struct {
         value: usize = 0,
 
@@ -21,9 +28,8 @@ test "release hook is evaluator-owned and runs once" {
     };
     var counter: Counter = .{};
     var ev = try Evaluator.init(std.testing.allocator, 0);
-    ev.setReleaseHook(.{ .context = &counter, .run = Counter.run });
-    ev.releaseEvalState();
-    ev.releaseEvalState();
+    var session = try ev.beginBuildPhase(&.{}, .{ .context = &counter, .run = Counter.run });
+    session.deinit();
     ev.deinit();
     try std.testing.expectEqual(@as(usize, 1), counter.value);
 }

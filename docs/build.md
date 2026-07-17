@@ -2,7 +2,7 @@
 
 *The build graph, module layout, and hygiene that keep the fast paths honest.*
 
-`fix` builds with `zig build` from a single `build.zig`. Five durable groups are Zig modules; evaluator subsystems inside `nix` are ordinary file namespaces exported by its facade. The installed artifact is named `fix`. The build also forces LLVM because the threaded dispatcher needs it.
+`fix` builds with `zig build` from a single `build.zig`. Five durable groups are Zig modules; evaluator subsystems inside `nix` are ordinary file namespaces. An executable-only `process_support` module composes allocator policy without adding it to the engine API. The installed artifact is named `fix`. The build also forces LLVM because the threaded dispatcher needs it.
 
 ## Module model
 
@@ -10,15 +10,16 @@ The build-module graph follows independently reusable or consumed groups. Within
 
 | Module | Facade | Imports | Notes |
 |---|---|---|---|
-| `base` | `src/base/base.zig` | `base_options` | generic containers, fibers, synchronization, allocators, regex, TOML |
+| `base` | `src/base/base.zig` | `base_options` | generic containers, fibers, synchronization, allocators, clocks, memory backing |
 | `syntax` | `src/syntax/syntax.zig` | `base`, `parser_tables` | independently consumed lexer, parser, and AST |
 | `runtime` | `src/runtime/runtime.zig` | `build_options`, `base` | value model, heap, interning, thunk/Future, GC, memory tags |
-| `nix` | `src/nix/root.zig` | `build_options`, `base`, `syntax`, `runtime` | bytecode, compiler, scheduler, derivations, services, VM, evaluator |
-| `cli` | `src/cli/cli.zig` | `nix` | command surface, argument parsing, rendering, progress |
+| `nix` | `src/nix/root.zig` | `build_options`, `base`, `syntax`, `runtime` | narrow evaluator API plus explicit `tooling` access to internal subsystems |
+| `cli` | `src/cli/cli.zig` | `nix`, `base` | command surface, argument parsing, rendering, progress |
+| `process_support` | `src/process_support.zig` | `base`, `runtime` | executable-only allocator composition |
 
-`nix` exports its internal namespaces (`bytecode`, `compiler`, `scheduler`, `derivation`, `host`, `realization`, `probe`, `vm`, and `observ`) as well as its app-facing evaluator API. They remain meaningful source boundaries without each requiring a build module, dependency wiring, and a separate test artifact.
+`nix` exports a narrow evaluator API, including stable build/evaluation progress protocols, diagnostic views, memory configuration parsing, and language policy. The CLI's ordinary path does not import daemon wire, syntax, or evaluator implementation namespaces. Diagnostics that intentionally inspect representation details use `nix.tooling`, which groups the internal namespaces (`bytecode`, `compiler`, `scheduler`, `execution`, `derivation`, `host`, `realization`, `probe`, `vm`, and `observ`). They remain meaningful source boundaries without each requiring a build module, dependency wiring, and a separate test artifact.
 
-`cli` imports only `nix`, so command code consumes evaluator capabilities through one stable facade. The executable (`src/main.zig`) imports `nix` and `cli`; it creates process-level resources and dispatches.
+`cli` imports `nix` plus generic synchronization from `base`; ordinary workflows use the stable evaluator API while diagnostics opt into `nix.tooling`. The executable (`src/main.zig`) imports `nix`, `cli`, and the private `process_support` composition module.
 
 ## Parser-table codegen
 
@@ -59,7 +60,7 @@ test → base_tests, syntax_tests, runtime_tests, nix_tests, cli_tests
 
 Relative imports inside `nix` let its single test artifact discover subsystem tests recursively. `zig build test-syntax` runs the front-end tests alone; `zig build bench -- <file.nix>` runs the parse microbenchmark against `syntax`.
 
-Evaluator integration tests live under `src/nix/root/tests` and `src/nix/eval/tests`; the `nix` test root also imports the socket-backed realization tests and their fake daemon. `test/*.nix` holds pathology and spec fixtures driven through evaluation.
+Evaluator integration tests live under `src/nix/root/tests` and `src/nix/eval/tests`. Compiler and VM tests live with those subsystems, while the realization facade owns its socket-backed tests and fake daemon. `test/*.nix` holds pathology and spec fixtures driven through evaluation.
 
 ## The correctness gate
 

@@ -14,7 +14,7 @@
 const std = @import("std");
 const engine = @import("nix");
 const presentation = @import("presentation.zig");
-const syntax = engine.syntax;
+const syntax = engine.tooling.syntax;
 
 const DebugSession = engine.DebugSession;
 const Value = engine.Value;

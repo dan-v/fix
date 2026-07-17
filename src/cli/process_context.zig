@@ -5,9 +5,5 @@ const engine = @import("nix");
 
 pub const ProcessContext = struct {
     allocator: std.mem.Allocator,
-    eval_release: ?engine.ReleaseHook = null,
-
-    pub fn bindEvaluator(self: ProcessContext, ev: *engine.Evaluator) void {
-        ev.setReleaseHook(self.eval_release);
-    }
+    eval_release: ?engine.ReleaseAction = null,
 };

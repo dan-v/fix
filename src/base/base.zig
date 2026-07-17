@@ -2,12 +2,12 @@
 //! coupling.
 //!
 //! Sits at the very bottom of the module dependency graph (depends only on
-//! `std` and `build_options`) so every higher subsystem can import it without
+//! `std` and `base_options`) so every higher subsystem can import it without
 //! creating a cycle. Absorbs what used to be the `containers` and `fiber`
 //! modules plus the generic primitives that lived in `runtime`: the lock-free
 //! work-stealing `Deque`, the stack-switching `Fiber`, the mutual-exclusion
 //! primitives, the segmented storage, the RSS region-tracker, the block reuse
-//! cache, and the regex/TOML/worker-id helpers. Consumers import this module
+//! cache, and worker-id helpers. Consumers import this module
 //! by name (`@import("base")`) and reach submodules through it.
 
 pub const deque = @import("deque.zig");
@@ -20,8 +20,6 @@ pub const segments = @import("segments.zig");
 pub const vma = @import("vma.zig");
 pub const block_cache = @import("block_cache.zig");
 pub const hugetlb = @import("hugetlb.zig");
-pub const regex = @import("regex.zig");
-pub const toml = @import("toml.zig");
 pub const arena = @import("arena.zig");
 pub const worker_id = @import("worker_id.zig");
 
@@ -42,7 +40,6 @@ test {
     _ = vma;
     _ = block_cache;
     _ = hugetlb;
-    _ = regex;
-    _ = toml;
+    _ = arena;
     _ = worker_id;
 }

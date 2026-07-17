@@ -5,7 +5,7 @@ const RealizationStore = @import("../../realization.zig").RealizationStore;
 const Value = @import("runtime").value.Value;
 const ObjectId = @import("runtime").types.ObjectId;
 const nar = @import("../../host.zig").nar;
-const FakeDaemon = @import("../../test_daemon.zig").FakeDaemon;
+const FakeDaemon = @import("../../realization/testing/fake_daemon.zig").FakeDaemon;
 
 fn recipeInspectionAvailable() bool {
     return @hasDecl(RealizationStore, "RecipeVariantForTest") and

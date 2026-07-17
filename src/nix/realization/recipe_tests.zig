@@ -3,7 +3,7 @@ const sync = @import("base").sync;
 const RealizationStore = @import("../realization.zig").RealizationStore;
 const FileCache = @import("../host.zig").FileCache;
 const DaemonRuntime = @import("../host.zig").DaemonRuntime;
-const FakeDaemon = @import("../test_daemon.zig").FakeDaemon;
+const FakeDaemon = @import("testing/fake_daemon.zig").FakeDaemon;
 
 const root_path = "/nix/store/00000000000000000000000000000000-root.drv";
 const dep_text_path = "/nix/store/11111111111111111111111111111111-dep-text";

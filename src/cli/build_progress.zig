@@ -4,7 +4,7 @@
 //! `EvalProgress`, so eval and build render as one tree.
 
 const std = @import("std");
-const store = @import("nix").host.store;
+const engine = @import("nix");
 const EvalProgress = @import("progress.zig").EvalProgress;
 
 pub const BuildProgress = struct {
@@ -26,40 +26,26 @@ pub const BuildProgress = struct {
         self.nodes = .empty;
     }
 
-    pub fn sink(self: *BuildProgress) store.BuildSink {
+    pub fn sink(self: *BuildProgress) engine.BuildSink {
         return .{
             .context = self,
-            .on_start = onStart,
-            .on_stop = onStop,
-            .on_progress = onProgress,
-            .on_log = onLog,
+            .emit_fn = emit,
         };
     }
 
-    fn onStart(context: *anyopaque, id: u64, activity_type: u64, text: []const u8) void {
-        _ = activity_type;
+    fn emit(context: *anyopaque, event: engine.BuildEvent) void {
         const self: *BuildProgress = @ptrCast(@alignCast(context));
-        const node = self.progress.childNode(text);
-        self.nodes.put(self.allocator, id, node) catch node.end();
-    }
-
-    fn onStop(context: *anyopaque, id: u64) void {
-        const self: *BuildProgress = @ptrCast(@alignCast(context));
-        if (self.nodes.fetchRemove(id)) |kv| kv.value.end();
-    }
-
-    fn onProgress(context: *anyopaque, id: u64, done: u64, expected: u64) void {
-        const self: *BuildProgress = @ptrCast(@alignCast(context));
-        if (self.nodes.get(id)) |node| {
-            if (expected != 0) node.setEstimatedTotalItems(expected);
-            node.setCompletedItems(done);
+        switch (event) {
+            .start => |activity| {
+                const node = self.progress.childNode(activity.text);
+                self.nodes.put(self.allocator, activity.id, node) catch node.end();
+            },
+            .stop => |id| if (self.nodes.fetchRemove(id)) |kv| kv.value.end(),
+            .progress => |update| if (self.nodes.get(update.id)) |node| {
+                if (update.expected != 0) node.setEstimatedTotalItems(update.expected);
+                node.setCompletedItems(update.done);
+            },
+            .log => {},
         }
-    }
-
-    fn onLog(context: *anyopaque, line: []const u8) void {
-        // The activity nodes are the progress display; raw log lines (available
-        // via `nix log`) are dropped so they don't fight the progress bar.
-        _ = context;
-        _ = line;
     }
 };

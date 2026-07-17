@@ -19,8 +19,8 @@ const commands = @import("commands.zig");
 
 const Evaluator = engine.Evaluator;
 const Value = engine.Value;
-const builtins_mod = engine.runtime.builtins;
-const future_mod = engine.runtime.future;
+const builtins_mod = engine.tooling.runtime.builtins;
+const future_mod = engine.tooling.runtime.future;
 
 pub const Ctx = struct {
     ev: *Evaluator,
@@ -132,7 +132,7 @@ fn sortItems(items: [][]const u8) void {
 /// The builtins attrset's entries (always fully built, never thunked).
 /// `builtinsValue` constructs it on first use, so completion works before
 /// the session's first evaluation.
-fn builtinsAttrs(ctx: *Ctx) ?[]const engine.runtime.heap.AttrEntry {
+fn builtinsAttrs(ctx: *Ctx) ?[]const engine.tooling.runtime.heap.AttrEntry {
     const b = ctx.ev.builtinsValue() catch return null;
     if (!b.isAttrs()) return null;
     return ctx.ev.tooling().attrs(b) catch null;

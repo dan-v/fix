@@ -39,4 +39,5 @@ pub const with_capture_name = context.with_capture_name;
 test {
     _ = driver;
     _ = deferred;
+    _ = @import("compiler/tests.zig");
 }

@@ -13,4 +13,7 @@ pub const SpanGroup = store.SpanGroup;
 test {
     _ = store;
     _ = source_path;
+    _ = @import("realization/tests.zig");
+    _ = @import("realization/recipe_tests.zig");
+    _ = @import("realization/testing/fake_daemon.zig");
 }

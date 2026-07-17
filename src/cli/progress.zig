@@ -1,7 +1,7 @@
 //! Evaluation progress rendering for the CLI.
 
 const std = @import("std");
-const eval_progress = @import("nix").observ.progress;
+const eval_progress = @import("nix").EvalProgress;
 const Mutex = @import("base").sync.BlockingMutex;
 
 pub const EvalProgress = struct {
@@ -164,7 +164,7 @@ pub const EvalProgress = struct {
     /// `label [done/total]`. A `std.Progress.Node` is just its `index`, so we
     /// round-trip it through the opaque token with no allocation; node-storage
     /// exhaustion yields `Node.none`, whose `.end()` is a safe no-op.
-    fn beginSpan(context: *anyopaque, group: eval_progress.SpanGroup, subject: []const u8) eval_progress.Span {
+    fn beginSpan(context: *anyopaque, group: eval_progress.SpanGroup, subject: []const u8) usize {
         const self: *EvalProgress = @ptrCast(@alignCast(context));
         self.span_mu.lock();
         defer self.span_mu.unlock();
@@ -176,12 +176,12 @@ pub const EvalProgress = struct {
         };
         parent.increaseEstimatedTotalItems(1);
         const node = parent.start(subject[0..@min(subject.len, std.Progress.Node.max_name_len)], 0);
-        return .{ .token = @intFromEnum(node.index) };
+        return @intFromEnum(node.index);
     }
 
-    fn endSpan(context: *anyopaque, span: eval_progress.Span) void {
+    fn endSpan(context: *anyopaque, token: usize) void {
         _ = context;
-        const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(span.token))) };
+        const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(token))) };
         node.end();
     }
 
@@ -189,9 +189,9 @@ pub const EvalProgress = struct {
     /// `subject [downloaded/total]`; nodes are updated lock-free, so this is safe
     /// from the off-demand fetch thread. `total` 0 means the size isn't known yet
     /// (no Content-Length), leaving a bare downloaded count.
-    fn updateSpan(context: *anyopaque, span: eval_progress.Span, downloaded: u64, total: u64) void {
+    fn updateSpan(context: *anyopaque, token: usize, downloaded: u64, total: u64) void {
         _ = context;
-        const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(span.token))) };
+        const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(token))) };
         if (total != 0) node.setEstimatedTotalItems(@intCast(@min(total, std.math.maxInt(usize))));
         node.setCompletedItems(@intCast(@min(downloaded, std.math.maxInt(usize))));
     }

@@ -101,6 +101,16 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("nix", nix_mod);
     cli_mod.addImport("base", base_mod);
 
+    const process_support_mod = b.createModule(.{
+        .root_source_file = b.path("src/process_support.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "base", .module = base_mod },
+            .{ .name = "runtime", .module = runtime_mod },
+        },
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -110,6 +120,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "nix", .module = nix_mod },
             .{ .name = "cli", .module = cli_mod },
+            .{ .name = "process_support", .module = process_support_mod },
         },
     });
 

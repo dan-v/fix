@@ -88,4 +88,4 @@ For *why* all this parallelism buys a bounded speedup — the serial critical-pa
 
 ---
 
-Code: `src/nix/vm/worker.zig`, `src/nix/scheduler.zig`
+Code: `src/nix/execution/worker.zig`, `src/nix/execution/context.zig`, `src/nix/scheduler/core.zig`

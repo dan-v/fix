@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const presentation = @import("presentation.zig");
-const host = @import("nix").host;
+const host = @import("nix").tooling.host;
 const store = host.store;
 const nar = host.nar;
 const FileCache = host.FileCache;

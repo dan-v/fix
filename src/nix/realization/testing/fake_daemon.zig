@@ -7,7 +7,7 @@
 const std = @import("std");
 const owned_strings = @import("base").owned_strings;
 const sync = @import("base").sync;
-const runtime_store = @import("host.zig").store;
+const runtime_store = @import("../../host.zig").store;
 const wire = runtime_store.wire;
 
 pub const FakeDaemon = struct {

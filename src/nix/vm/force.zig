@@ -14,10 +14,8 @@ const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
-const fiber_mod = @import("base").fiber;
 const clock = @import("base").clock;
 const sched_mod = @import("../scheduler.zig");
-const worker_mod = @import("worker.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");
@@ -991,11 +989,9 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // Every real call path now runs inside a fiber. If
                 // we're somehow here without a current fiber, that's a
                 // bug.
-                const inner = fiber_mod.currentFiber() orelse
+                const park = self.ctx.park orelse
                     @panic("forceThunkImpl hit .busy outside a fiber — every caller must run on a worker fiber");
-                const worker_fiber: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-                if (thunk.enrollWaiter(&worker_fiber.waiter)) {
-                    worker_fiber.state = .suspended;
+                if (thunk.enrollWaiter(park.waiter)) {
                     // Timeline: if the DEMAND fiber blocks here, this wait is on
                     // the critical path — time it and record a labelled span on
                     // the crit track (the "main stalls on a giant file" signal).
@@ -1020,9 +1016,8 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                         pw.set(force_label.demandFrameText(self, &sbuf));
                     }
                     const ty = prof.start(.wait_busy_thunk);
-                    fiber_mod.Fiber.yield();
+                    park.yield();
                     prof.end(.wait_busy_thunk, ty);
-                    worker_fiber.state = .running;
                     if (crit_start != 0) timeline.critWaitEnd(crit_label, crit_start);
                     if (self.ctx.progress_wait) |pw| pw.clear();
                 }

@@ -2,10 +2,9 @@
 
 const std = @import("std");
 const presentation = @import("presentation.zig");
-const diagnostic = @import("nix").syntax.diagnostic;
-const eval = @import("nix").eval;
-const Evaluator = eval.Evaluator;
-const EvalTrace = eval.EvalTrace;
+const engine = @import("nix");
+const Evaluator = engine.Evaluator;
+const EvalTrace = engine.EvalTrace;
 
 const default_trace_limit = 8;
 
@@ -23,7 +22,7 @@ pub fn evalFailure(
         var stderr_buffer: [4096]u8 = undefined;
         var stderr = try presentation.lockStderr(io, &stderr_buffer);
         defer stderr.deinit();
-        try diagnostic.writeAllWithOptions(stderr.writer(), source, ev.getDiagnostics(), .{ .color = use_color });
+        try ev.writeDiagnostics(stderr.writer(), source, use_color);
         try stderr.flush();
     } else {
         try evaluationError(io, use_color, show_trace, ev, source, err);
@@ -87,7 +86,7 @@ fn writeTraceFrames(
 fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) !void {
     if (frame.diagnostic) |diag| {
         if (traceFrameSource(ev, source, frame)) |frame_source| {
-            try diagnostic.writeAllWithOptions(writer, frame_source, &.{diag}, .{ .color = use_color });
+            try ev.writeDiagnostic(writer, frame_source, diag, use_color);
             return;
         }
         if (frame.source_path) |path| {

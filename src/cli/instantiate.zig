@@ -40,7 +40,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    const term = try setup.configure(&ev, process, init, options);
+    const term = try setup.configure(&ev, init, options);
 
     if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });

@@ -7,8 +7,8 @@
 const std = @import("std");
 const presentation = @import("presentation.zig");
 const derivation_debug = @import("derivation_debug.zig");
-const eval_memory = @import("nix").eval.memory;
-const hugetlb = @import("nix").process_support.memory_backing;
+const engine = @import("nix");
+const hugetlb = @import("base").hugetlb;
 
 pub const OutputFormat = enum {
     nix,
@@ -18,56 +18,13 @@ pub const OutputFormat = enum {
 
 /// Nix-style experimental features. Names match Nix's spelling so that the
 /// same `--experimental-features pipe-operators` invocation works here.
-pub const ExperimentalFeature = enum {
-    pipe_operators,
-    fetch_tree,
-    flakes,
-    coerce_integers,
-
-    pub fn fromName(name: []const u8) ?ExperimentalFeature {
-        if (std.mem.eql(u8, name, "pipe-operators")) return .pipe_operators;
-        if (std.mem.eql(u8, name, "fetch-tree")) return .fetch_tree;
-        if (std.mem.eql(u8, name, "flakes")) return .flakes;
-        if (std.mem.eql(u8, name, "coerce-integers")) return .coerce_integers;
-        return null;
-    }
-};
-
-pub const ExperimentalFeatures = std.EnumSet(ExperimentalFeature);
+pub const ExperimentalFeature = engine.ExperimentalFeature;
+pub const ExperimentalFeatures = engine.ExperimentalFeatures;
 
 /// Nix-style deprecated features (Lix `--extra-deprecated-features`). Enabling
 /// one re-permits behaviour that fix rejects by default. Names match Lix.
-pub const DeprecatedFeature = enum {
-    nul_bytes,
-    floor_ceil_corrupt_integers,
-    // Accepted for compatibility but not gated — fix is already lenient here,
-    // so enabling them is a no-op (the corresponding syntax/behaviour always
-    // works). Kept so `--extra-deprecated-features <name>` doesn't error.
-    floating_without_zero,
-    cr_line_endings,
-    or_as_identifier,
-    rec_set_merges,
-    rec_set_overrides,
-    rec_set_dynamic_attrs,
-    tokens_no_whitespace,
-    nix_path_shadow,
-
-    pub fn fromName(name: []const u8) ?DeprecatedFeature {
-        if (std.mem.eql(u8, name, "nul-bytes")) return .nul_bytes;
-        if (std.mem.eql(u8, name, "floor-ceil-corrupt-integers")) return .floor_ceil_corrupt_integers;
-        if (std.mem.eql(u8, name, "floating-without-zero")) return .floating_without_zero;
-        if (std.mem.eql(u8, name, "cr-line-endings")) return .cr_line_endings;
-        if (std.mem.eql(u8, name, "or-as-identifier")) return .or_as_identifier;
-        if (std.mem.eql(u8, name, "rec-set-merges")) return .rec_set_merges;
-        if (std.mem.eql(u8, name, "rec-set-overrides")) return .rec_set_overrides;
-        if (std.mem.eql(u8, name, "rec-set-dynamic-attrs")) return .rec_set_dynamic_attrs;
-        if (std.mem.eql(u8, name, "tokens-no-whitespace")) return .tokens_no_whitespace;
-        if (std.mem.eql(u8, name, "nix-path-shadow")) return .nix_path_shadow;
-        return null;
-    }
-};
-
-pub const DeprecatedFeatures = std.EnumSet(DeprecatedFeature);
+pub const DeprecatedFeature = engine.DeprecatedFeature;
+pub const DeprecatedFeatures = engine.DeprecatedFeatures;
 
 fn parseDeprecatedList(set: *DeprecatedFeatures, list: []const u8) !void {
     var it = std.mem.tokenizeScalar(u8, list, ' ');
@@ -710,7 +667,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .debug_derivation_filter => options.derivation_debug.filter = v0.?,
         .debug_derivation_name => options.derivation_debug.name = v0.?,
         .debug_derivation_drv => options.derivation_debug.drv_path = v0.?,
-        .max_memory => options.max_memory = eval_memory.parseSize(v0.?) orelse return error.InvalidMaxMemory,
+        .max_memory => options.max_memory = engine.parseMemorySize(v0.?) orelse return error.InvalidMaxMemory,
         .hugetlb => options.hugetlb = hugetlb.parseMode(v0.?) orelse return error.InvalidHugetlbMode,
         .help => return error.Help,
 

@@ -5,16 +5,15 @@ const std = @import("std");
 const render = @import("render.zig");
 const args = @import("args.zig");
 const derivation_debug = @import("derivation_debug.zig");
-const eval = @import("nix").eval;
-const Evaluator = eval.Evaluator;
-const Value = @import("nix").Value;
-const rstore = @import("nix").host.store;
+const engine = @import("nix");
+const Evaluator = engine.Evaluator;
+const Value = engine.Value;
 const EvaluationMode = args.EvaluationMode;
 const SourceArg = args.SourceArg;
 
 /// The build realization mode selected by `--check`/`--repair` (`--check`
 /// takes precedence). `--repair`/`--check` require a trusted daemon user.
-pub fn buildMode(options: args.Options) rstore.BuildMode {
+pub fn buildMode(options: args.Options) engine.BuildMode {
     if (options.check) return .check;
     if (options.repair) return .repair;
     return .normal;

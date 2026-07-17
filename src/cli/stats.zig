@@ -8,8 +8,8 @@
 const std = @import("std");
 const engine = @import("nix");
 const Evaluator = engine.Evaluator;
-const prof = engine.probe.prof;
-const prof_path = engine.probe.prof_path;
+const prof = engine.tooling.probe.prof;
+const prof_path = engine.tooling.probe.prof_path;
 
 pub fn report(ev: *Evaluator) void {
     const s = ev.schedulerStats();
@@ -55,10 +55,29 @@ pub fn report(ev: *Evaluator) void {
     }
     if (comptime prof.enabled) {
         prof.report(ev.chunkRegistry(), ev.internTable());
-        engine.reportSchedulerScanCensus();
+        reportSchedulerScanCensus();
         // Demand-prediction de-risk censuses (see heap.zig): junk ratios
         // for demand-descendant scavenging and sibling prefetch.
         ev.tooling().reportCreationCensus();
     }
     if (comptime prof_path.enabled) prof_path.report(ev.chunkRegistry(), ev.internTable());
+}
+
+fn reportSchedulerScanCensus() void {
+    const t = engine.tooling.scheduler.scanCensus() orelse return;
+    const total = t.ready_pop_cy + t.ready_steal_cy + t.pop_own_cy +
+        t.urgent_steal_cy + t.novel_steal_cy + t.spec_steal_cy;
+    if (total == 0) return;
+    std.debug.print("prof scan-census (all workers, drain-loop probe cycles, total={d}):\n", .{total});
+    inline for (.{ "ready_pop", "ready_steal", "pop_own", "urgent_steal", "novel_steal", "spec_steal" }) |name| {
+        const cy = @field(t, name ++ "_cy");
+        const calls = @field(t, name ++ "_calls");
+        const hits = @field(t, name ++ "_hits");
+        std.debug.print("  {s}: cy={d} ({d:.1}%) calls={d} hits={d} ({d:.2}% hit) avg_cy={d}\n", .{
+            name,                                                                 cy,
+            100.0 * @as(f64, @floatFromInt(cy)) / @as(f64, @floatFromInt(total)), calls,
+            hits,                                                                 if (calls == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(calls)),
+            if (calls == 0) 0 else cy / calls,
+        });
+    }
 }

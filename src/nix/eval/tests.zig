@@ -14,21 +14,11 @@ test {
     _ = @import("tests/closures.zig");
     _ = @import("tests/forcing.zig");
     _ = @import("tests/deferred_compile.zig");
-    _ = @import("tests/compiler_access.zig");
-    _ = @import("tests/compiler_attrs.zig");
-    _ = @import("tests/compiler_control.zig");
-    _ = @import("tests/compiler_diagnostics.zig");
-    _ = @import("tests/compiler_emit.zig");
-    _ = @import("tests/compiler_literals.zig");
-    _ = @import("tests/compiler_lowering.zig");
-    _ = @import("tests/compiler_scope.zig");
-    _ = @import("tests/compiler_thunks.zig");
     _ = @import("tests/attrsets.zig");
     _ = @import("tests/builtin_errors.zig");
     _ = @import("tests/io_builtins.zig");
     _ = @import("tests/lists.zig");
     _ = @import("tests/paths.zig");
     _ = @import("tests/predicates.zig");
-    _ = @import("tests/vm_dispatch.zig");
     _ = @import("tests/debugger.zig");
 }

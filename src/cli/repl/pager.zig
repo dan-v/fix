@@ -14,9 +14,9 @@ const term_mod = @import("term.zig");
 const keys_mod = @import("keys.zig");
 
 const Evaluator = engine.Evaluator;
-const ChunkId = engine.runtime.types.ChunkId;
-const bytecode = engine.bytecode;
-const disasm = engine.bytecode.disasm;
+const ChunkId = engine.tooling.runtime.types.ChunkId;
+const bytecode = engine.tooling.bytecode;
+const disasm = engine.tooling.bytecode.disasm;
 
 const disasm_options: disasm.Options = .{
     .show_constants = true,

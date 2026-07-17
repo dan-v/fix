@@ -35,7 +35,7 @@ The source tree has five durable module groups. `base`, `syntax`, and `runtime` 
 ```
 src/base/       base → base_options
                 Generic containers, synchronization, fibers, allocators,
-                regex, and TOML.
+                clocks, and memory backing.
 
 src/syntax/     syntax → base, parser_tables
                 Scanner, parser, AST; independently benchmarked.
@@ -45,18 +45,21 @@ src/runtime/    runtime → base, build_options
 
 src/nix/        nix → base, syntax, runtime, build_options
                 Exports bytecode, compiler, scheduler, derivation, host,
-                realization, observability, probes, VM, and Evaluator.
+                realization, execution, language support, observability,
+                probes, VM, and Evaluator.
 
-src/cli/        cli → nix
+src/cli/        cli → nix, base
                 Commands, options, rendering, debugger.
 
-src/main.zig       → nix, cli
+src/main.zig       → nix, cli, process_support
                 Process composition; executable `fix`.
 ```
 
 `base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and `nix` supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
 
-Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `eval.zig` composes those services into `Evaluator`. `root.zig` is the narrow facade visible to the CLI. Language semantics do not import concrete host effects. Realization may use the host, the VM may compose both, and command code cannot reach around the `nix` boundary. Deferred-body compilation calls from `vm` into `compiler`, while the fiber worker that drives forcing lives inside `vm` next to the force path. See [build](build.md).
+Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `eval.zig` composes those services into `Evaluator`. `execution/` owns fiber workers, fiber-scoped context, and the capability that parks blocking host work away from compute workers; the VM borrows that context and capability without owning the worker machinery. `root.zig` is the narrow stable facade visible to ordinary consumers, including typed build/evaluation progress protocols and diagnostic views; commands that intentionally inspect representation details opt into the explicitly unstable `nix.tooling` surface. Language semantics do not import concrete host effects. Realization may use the host through `execution/port.zig`. Deferred-body compilation calls from `vm` into `compiler`, while import orchestration remains evaluator-owned and `eval/imports.zig` owns only the concurrent registry/entry state. See [build](build.md).
+
+Callbacks mark real ownership, policy, or execution-domain changes: CLI debugger/progress/build sinks, heap/scheduler GC dispatch, fiber wakeups, blocking execution, and leaf policies such as NAR filters. File extraction alone is not a boundary. Evaluator helper files therefore receive concrete state views (for example debugger `Context`) or remain evaluator-owned instead of back-calling through opaque “host” bundles. Concurrent progress `Span` handles retain the sink that created them, so a sink replacement cannot misroute an in-flight token.
 
 ## Laziness and parallelism are one primitive
 

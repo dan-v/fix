@@ -1,7 +1,7 @@
 const std = @import("std");
 const fix = @import("../../root.zig");
 const Evaluator = fix.Evaluator;
-const value = fix.runtime.value;
+const value = fix.tooling.runtime.value;
 const ValueType = value.ValueType;
 
 test "end-to-end: simple arithmetic" {

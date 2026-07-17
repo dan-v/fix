@@ -7,18 +7,7 @@ const host = @import("../host.zig");
 const rstore = host.store;
 const DaemonRuntime = host.DaemonRuntime;
 const Future = @import("runtime").future.Future;
-const SpanGroup = @import("recipe_graph.zig").SpanGroup;
-
-pub const OffloadFn = *const fn (ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void;
-pub const FiberParkFn = *const fn (future: *Future) bool;
-pub const SpanBeginFn = *const fn (ctx: *anyopaque, group: SpanGroup, label: []const u8) usize;
-pub const SpanEndFn = *const fn (ctx: *anyopaque, token: usize) void;
-
-const SpanHooks = struct {
-    ctx: *anyopaque,
-    begin: SpanBeginFn,
-    end: SpanEndFn,
-};
+const execution_port = @import("../execution/port.zig");
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -31,9 +20,7 @@ pub const Client = struct {
     options: ?rstore.BuildSettings = null,
     overrides: std.ArrayListUnmanaged(rstore.Setting) = .empty,
     writes_enabled: bool = false,
-    span_hooks: ?SpanHooks = null,
-    offload_run: ?OffloadFn = null,
-    fiber_park: ?FiberParkFn = null,
+    fiber_executor: ?execution_port.FiberExecutor = null,
     runtime: ?*DaemonRuntime = null,
     pool: ?*rstore.DaemonPool = null,
     pool_mu: sync.BlockingMutex = .{},
@@ -112,30 +99,13 @@ pub const Client = struct {
         _ = self.ensurePool() catch {};
     }
 
-    pub fn setSpanHooks(self: *Client, context: ?*anyopaque, begin: SpanBeginFn, end: SpanEndFn) void {
-        self.span_hooks = if (context) |ctx| .{ .ctx = ctx, .begin = begin, .end = end } else null;
-    }
-
-    pub fn beginSpan(self: *Client, group: SpanGroup, label: []const u8) ?usize {
-        const hooks = self.span_hooks orelse return null;
-        return hooks.begin(hooks.ctx, group, label);
-    }
-
-    pub fn endSpan(self: *Client, token: ?usize) void {
-        const value = token orelse return;
-        const hooks = self.span_hooks orelse return;
-        hooks.end(hooks.ctx, value);
-    }
-
-    pub fn setOffload(self: *Client, runtime: *DaemonRuntime, offload: OffloadFn, fiber_park: FiberParkFn) void {
+    pub fn setExecution(self: *Client, runtime: *DaemonRuntime, executor: execution_port.FiberExecutor) void {
         self.runtime = runtime;
-        self.offload_run = offload;
-        self.fiber_park = fiber_park;
+        self.fiber_executor = executor;
     }
 
-    pub fn clearOffload(self: *Client) void {
-        self.offload_run = null;
-        self.fiber_park = null;
+    pub fn clearExecution(self: *Client) void {
+        self.fiber_executor = null;
         self.runtime = null;
         self.pool = null;
     }
@@ -159,8 +129,8 @@ pub const Client = struct {
 
     pub fn run(self: *Client, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) !void {
         const pool = try self.ensurePool();
-        if (self.offload_run) |offload| {
-            offload(pool, work, work_ctx);
+        if (self.fiber_executor) |executor| {
+            executor.runPool(pool, work, work_ctx);
         } else {
             pool.submitBlocking(work, work_ctx);
         }
@@ -195,6 +165,6 @@ pub const Client = struct {
     }
 
     pub fn parkClaim(self: *Client, future: *Future) bool {
-        return if (self.fiber_park) |park| park(future) else false;
+        return if (self.fiber_executor) |executor| executor.parkFuture(future) else false;
     }
 };

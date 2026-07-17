@@ -1,7 +1,8 @@
 //! Small POSIX-ERE-style matcher for Nix regex builtins.
 
 const std = @import("std");
-const SpinMutex = @import("sync.zig").SpinMutex;
+const arena = @import("base").arena;
+const SpinMutex = @import("base").sync.SpinMutex;
 
 pub const Match = struct {
     start: usize,
@@ -14,21 +15,21 @@ pub const Match = struct {
 };
 
 pub const Pattern = struct {
-    arena: @import("arena.zig").ArenaAllocator,
+    arena: arena.ArenaAllocator,
     root: *Node,
     capture_count: usize,
 
     pub fn compile(allocator: std.mem.Allocator, source: []const u8) !Pattern {
-        var arena = @import("arena.zig").ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
+        var pattern_arena = arena.ArenaAllocator.init(allocator);
+        errdefer pattern_arena.deinit();
 
         var parser = Parser{
             .source = source,
-            .allocator = arena.allocator(),
+            .allocator = pattern_arena.allocator(),
         };
         const root = try parser.parse();
         return .{
-            .arena = arena,
+            .arena = pattern_arena,
             .root = root,
             .capture_count = parser.capture_count,
         };
@@ -51,7 +52,7 @@ pub const Pattern = struct {
     }
 
     fn matchAt(self: *const Pattern, allocator: std.mem.Allocator, text: []const u8, start: usize, require_end: bool) !?Match {
-        var scratch_arena = @import("arena.zig").ArenaAllocator.init(allocator);
+        var scratch_arena = arena.ArenaAllocator.init(allocator);
         defer scratch_arena.deinit();
         const scratch = scratch_arena.allocator();
 

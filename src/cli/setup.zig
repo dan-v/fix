@@ -9,9 +9,7 @@ const engine = @import("nix");
 const presentation = @import("presentation.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
-const rstore = engine.host.store;
-const hugetlb = engine.process_support.memory_backing;
-const ProcessContext = @import("process_context.zig").ProcessContext;
+const hugetlb = @import("base").hugetlb;
 
 const Evaluator = engine.Evaluator;
 
@@ -54,8 +52,7 @@ pub fn applyMemoryBacking(cli_mode: ?hugetlb.Mode) void {
 /// Apply the shared `Options → Evaluator` configuration (feature toggles,
 /// parallelism, environment, base path, NIX_PATH) and resolve the terminal
 /// color/progress policy. Enables ANSI on stderr when coloring.
-pub fn configure(ev: *Evaluator, process: ProcessContext, init: std.process.Init, options: args.Options) !Terminal {
-    process.bindEvaluator(ev);
+pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) !Terminal {
     // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap is
     // pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.setLazyShellsVisible(options.output == .xml);
@@ -90,23 +87,10 @@ pub fn configure(ev: *Evaluator, process: ProcessContext, init: std.process.Init
     http_conn = settings.getUint("http-connections") orelse 25;
 
     var policy = ev.languagePolicy();
-    policy.pipe_operators_enabled = features.contains(.pipe_operators);
-    policy.flakes_enabled = features.contains(.flakes);
-    policy.coerce_integers_enabled = features.contains(.coerce_integers);
-    // Deprecated features (Lix `--extra-deprecated-features`) re-permit
-    // behaviour fix rejects by default.
-    policy.allow_nul_bytes = options.deprecated_features.contains(.nul_bytes);
-    policy.allow_floor_ceil_corrupt = options.deprecated_features.contains(.floor_ceil_corrupt_integers);
-    policy.allow_rec_set_overrides = options.deprecated_features.contains(.rec_set_overrides);
-    policy.allow_rec_set_merges = options.deprecated_features.contains(.rec_set_merges);
-    policy.allow_cr_line_endings = options.deprecated_features.contains(.cr_line_endings);
-    policy.allow_tokens_no_whitespace = options.deprecated_features.contains(.tokens_no_whitespace);
-    policy.allow_nix_path_shadow = options.deprecated_features.contains(.nix_path_shadow);
+    policy.applyFeatureSets(features, options.deprecated_features);
     // `--option max-call-depth N` (Nix's call-recursion bound). Clamp to u32.
     if (settings.getUint("max-call-depth")) |n|
         policy.max_call_depth = @intCast(@min(n, @as(u64, std.math.maxInt(u32))));
-    // `flakes` implies `fetch-tree` (as in Nix).
-    policy.fetch_tree_enabled = features.contains(.fetch_tree) or policy.flakes_enabled;
     ev.configureLanguage(policy);
     ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
     if (settings.getUint("download-attempts")) |n|
@@ -140,7 +124,7 @@ pub fn configure(ev: *Evaluator, process: ProcessContext, init: std.process.Init
 /// actually connects (build/instantiate/run/shell), never for plain `eval`.
 fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_conf.Settings) !void {
     const allocator = ev.hostAllocator();
-    var overrides: std.ArrayListUnmanaged(rstore.Setting) = .empty;
+    var overrides: std.ArrayListUnmanaged(engine.BuildSetting) = .empty;
     defer overrides.deinit(allocator);
     // Owned `extra-<key>` names for keys with no explicit base; freed after the
     // (duping) setDaemonBuildSettings call below.

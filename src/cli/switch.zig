@@ -158,7 +158,7 @@ fn buildAndSwitch(process: @import("process_context.zig").ProcessContext, init: 
     setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    const term = try setup.configure(&ev, process, init, options.*);
+    const term = try setup.configure(&ev, init, options.*);
 
     if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
@@ -173,7 +173,7 @@ fn buildAndSwitch(process: @import("process_context.zig").ProcessContext, init: 
 
     ev.enableStoreWrites();
 
-    const realized = switch (try realization_workflow.realize(allocator, init.io, &ev, term, options.*, source_arg, source, false)) {
+    const realized = switch (try realization_workflow.realize(allocator, init.io, &ev, process.eval_release, term, options.*, source_arg, source, false)) {
         .failed => |code| return code,
         .ok => |r| r,
     };

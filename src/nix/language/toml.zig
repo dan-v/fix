@@ -3,6 +3,7 @@
 //! by the returned `Parsed` arena.
 
 const std = @import("std");
+const arena = @import("base").arena;
 
 pub const Entry = struct {
     key: []const u8,
@@ -30,7 +31,7 @@ pub const Value = union(enum) {
 };
 
 pub const Parsed = struct {
-    arena: @import("arena.zig").ArenaAllocator,
+    arena: arena.ArenaAllocator,
     root: *Table,
 
     pub fn deinit(self: *Parsed) void {
@@ -39,17 +40,17 @@ pub const Parsed = struct {
 };
 
 pub fn parse(allocator: std.mem.Allocator, text: []const u8) !Parsed {
-    var arena = @import("arena.zig").ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
+    var parsed_arena = arena.ArenaAllocator.init(allocator);
+    errdefer parsed_arena.deinit();
 
     var parser = Parser{
-        .allocator = arena.allocator(),
+        .allocator = parsed_arena.allocator(),
         .text = text,
-        .root = try newTable(arena.allocator()),
+        .root = try newTable(parsed_arena.allocator()),
     };
     try parser.parseDocument();
 
-    return .{ .arena = arena, .root = parser.root };
+    return .{ .arena = parsed_arena, .root = parser.root };
 }
 
 const Parser = struct {

@@ -26,6 +26,7 @@ pub fn realize(
     allocator: std.mem.Allocator,
     io: std.Io,
     ev: *Evaluator,
+    release_action: ?@import("nix").ReleaseAction,
     terminal: setup.Terminal,
     options: args.Options,
     source_arg: args.SourceArg,
@@ -74,7 +75,7 @@ pub fn realize(
 
     var build_progress_state = build_progress.BuildProgress.init(allocator, &progress);
     const build_sink = if (terminal.show_progress) build_progress_state.sink() else null;
-    var build_session = ev.beginBuildPhase(&.{derived}) catch |err| {
+    var build_session = ev.beginBuildPhase(&.{derived}, release_action) catch |err| {
         build_progress_state.deinit();
         ev.progressSessionEnd();
         return .{ .failed = eval_support.buildFailure(ev.lastStoreError(), err) };

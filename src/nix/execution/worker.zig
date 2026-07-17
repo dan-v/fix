@@ -42,13 +42,13 @@ const clock = @import("base").clock;
 const scheduler_mod = @import("../scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
-const vm_mod = @import("context.zig");
-const vm_driver = @import("driver.zig").driver;
+const vm_mod = @import("../vm/context.zig");
+const vm_driver = @import("../vm/driver.zig").driver;
 const VM = vm_mod.VM;
-const exec_context = @import("exec_context.zig");
+const exec_context = @import("context.zig");
 const ExecutionContext = exec_context.ExecutionContext;
-const vm_force = @import("force.zig");
-const vm_errors = @import("errors.zig");
+const vm_force = @import("../vm/force.zig");
+const vm_errors = @import("../vm/errors.zig");
 const fiber_mod = @import("base").fiber;
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("base").worker_id;
@@ -114,7 +114,7 @@ pub const WorkerFiber = struct {
     fiber_id: u32,
     inner: InnerFiber,
     vm: VM,
-    /// Fiber-scoped execution identity (see `vm/exec_context.zig`): the
+    /// Fiber-scoped execution identity (see `execution/context.zig`): the
     /// claim id (permanent, baked at allocation) plus the demand-role
     /// fields (`is_demand` + the demand-only progress handles — set by
     /// `runTopLevel` on the top fiber, reset when the fiber recycles).
@@ -180,7 +180,7 @@ pub const WorkerFiber = struct {
     /// Reused for IO waits too (a fiber never waits on a thunk and an IO
     /// completion at the same time).
     waiter: future_mod.Waiter,
-    /// Completion cell for a daemon/fetch IO offload (see `vm/io_offload.zig`).
+    /// Completion cell for a daemon/fetch IO offload (see `execution.zig`).
     /// Lives on the (stable) WorkerFiber rather than the fiber's stack because
     /// the IO thread touches it inside `publish()` *after* the woken fiber may
     /// have already resumed and reused its stack frame. Re-`initClaimed`ed
@@ -196,6 +196,13 @@ pub const WorkerFiber = struct {
     fn wakeImpl(w: *future_mod.Waiter) void {
         const self: *WorkerFiber = @fieldParentPtr("waiter", w);
         self.worker.scheduler.enqueueReady(self.worker.worker_id, &self.ready_node);
+    }
+
+    fn yieldImpl(context: *anyopaque) void {
+        const self: *WorkerFiber = @ptrCast(@alignCast(context));
+        self.state = .suspended;
+        fiber_mod.Fiber.yield();
+        self.state = .running;
     }
 
     /// Sweep the per-fiber scratch arena when the fiber goes back on the
@@ -828,6 +835,7 @@ pub const Worker = struct {
             .io_future = future_mod.Future.initClaimed(future_mod.makeClaimer(fiber_id)),
             .local_trace = eval_trace.Trace.init(self.allocator),
         };
+        f.ctx.park = .{ .waiter = &f.waiter, .context = f, .yield_fn = WorkerFiber.yieldImpl };
         errdefer f.scratch.deinit();
         errdefer f.local_trace.deinit();
 

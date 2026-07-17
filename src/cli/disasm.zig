@@ -8,14 +8,14 @@
 
 const std = @import("std");
 const engine = @import("nix");
-const bytecode = engine.bytecode;
+const bytecode = engine.tooling.bytecode;
 const presentation = @import("presentation.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const runner = @import("eval_support.zig");
 
 const Evaluator = engine.Evaluator;
-const ChunkId = engine.runtime.types.ChunkId;
+const ChunkId = engine.tooling.runtime.types.ChunkId;
 
 pub const synopsis =
     \\usage: fix disasm [options] [path | -e <expression>]
@@ -59,7 +59,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     // Configure features (pipe-operators/flakes), base path, and NIX_PATH so the
     // compile matches what `eval`/`build` would see. No progress: disasm prints
     // bytecode, not a progress bar.
-    _ = try setup.configure(&ev, process, init, options);
+    _ = try setup.configure(&ev, init, options);
     if (options.disasm_eval) ev.setParallelismToggles(true, true);
     // Best-effort chunk naming: attribute each lambda/thunk chunk to the attr
     // or let binding it was compiled for, so the disassembly headers read like

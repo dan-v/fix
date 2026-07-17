@@ -4,7 +4,7 @@
 //! The **pool** (`store/pool.zig`) is a set of hot daemon connections, each on
 //! its own background IO thread, draining a shared job queue. Every store op —
 //! `.drv`/source writes, `isValidPath` queries, builds, GC roots — is submitted
-//! to the pool while the calling fiber parks (`vm/io_offload`); a worker runs it
+//! to the pool while the calling fiber parks (`execution.zig`); a worker runs it
 //! on a warm connection and wakes the fiber. Connections stay hot and reused
 //! across the whole run (eval, on-demand closure writes, the terminal build).
 //! These threads are IO-bound (parked on the socket), separate from and not

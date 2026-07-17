@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli");
 const engine = @import("nix");
+const process_support = @import("process_support");
 const repl = cli.repl;
 const disasm_cmd = cli.disasm;
 const inspect_cmd = cli.inspect;
@@ -72,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
     // maps/unmaps every >=64KB allocation, and the eval's ~9K large
     // temporaries otherwise re-minor-fault ~2GB of pages per run (>20% of
     // w=1 wall in fault handling). See runtime/block_cache.zig.
-    var big_blocks = engine.process_support.LargeBlockAllocator.init(init.gpa);
+    var big_blocks = process_support.LargeBlockAllocator.init(init.gpa);
     defer big_blocks.deinit();
     const allocator = if (comptime builtin.mode == .Debug) debug_gpa.allocator() else big_blocks.allocator();
     const process: cli.ProcessContext = .{
@@ -120,6 +121,6 @@ fn runSubcommand(name: []const u8, process: cli.ProcessContext, init: std.proces
 }
 
 fn trimLargeBlocks(context: *anyopaque) void {
-    const blocks: *engine.process_support.LargeBlockAllocator = @ptrCast(@alignCast(context));
+    const blocks: *process_support.LargeBlockAllocator = @ptrCast(@alignCast(context));
     blocks.trim();
 }

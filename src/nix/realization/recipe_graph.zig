@@ -6,8 +6,9 @@ const sync = @import("base").sync;
 const owned_strings = @import("base").owned_strings;
 const runtime = @import("runtime");
 const FileCache = @import("../host.zig").FileCache;
+const progress = @import("../observ.zig").progress;
 
-pub const SpanGroup = enum { store, source };
+pub const SpanGroup = progress.SpanGroup;
 
 pub const RootClaimHook = struct {
     ctx: *anyopaque,

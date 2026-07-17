@@ -14,9 +14,9 @@ pub fn isComplete(allocator: std.mem.Allocator, source: []const u8) bool {
     const trimmed = std.mem.trim(u8, source, " \t\r\n");
     if (trimmed.len == 0) return true;
 
-    var arena = engine.syntax.ast.AstArena.init(allocator);
+    var arena = engine.tooling.syntax.ast.AstArena.init(allocator);
     defer arena.deinit();
-    var parser = engine.syntax.parser.Parser.init(allocator, &arena, source);
+    var parser = engine.tooling.syntax.parser.Parser.init(allocator, &arena, source);
     defer parser.deinit();
 
     _ = parser.parse() catch {

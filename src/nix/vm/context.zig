@@ -36,13 +36,14 @@ const ChunkRegistrationSink = @import("../compiler/context.zig").ChunkRegistrati
 const ThunkTrace = @import("../probe.zig").thunk_trace.ThunkTrace;
 const LanguagePolicy = @import("../policy.zig").LanguagePolicy;
 
-pub const exec_context = @import("exec_context.zig");
+pub const exec_context = @import("../execution/context.zig");
 pub const ExecutionContext = exec_context.ExecutionContext;
 
 pub const thunks_log_enabled = build_options.thunks_log;
 const SpinMutex = @import("base").sync.SpinMutex;
 const vma = @import("runtime").mem_tag.vma;
-const PatternCache = @import("base").regex.PatternCache;
+const PatternCache = @import("../language.zig").regex.PatternCache;
+const FiberExecutor = @import("../execution/port.zig").FiberExecutor;
 
 pub const Driver = struct {
     eval: *const fn (*VM, ChunkId) anyerror!Value,
@@ -186,7 +187,7 @@ pub const VM = struct {
     deferred_table: ?*DeferredTable = null,
     registration_sink: ?ChunkRegistrationSink = null,
     /// Evaluator-owned compiled-regex cache for `builtins.match`/`split`
-    /// (see `runtime.regex.PatternCache`). Set post-init by
+    /// (see `language/regex.zig`). Set post-init by
     /// `Evaluator.initVm`; null in standalone test VMs, which fall back
     /// to compiling per call.
     regexes: ?*PatternCache = null,
@@ -221,6 +222,9 @@ pub const VM = struct {
     /// the only progress channel available off the demand fiber. Null when
     /// progress isn't drawn.
     progress_spans: ?eval_progress.SpanSink,
+    /// Fiber-aware blocking capability supplied by the evaluator. Standalone
+    /// VMs leave this null and execute blocking work inline.
+    executor: ?FiberExecutor,
     /// Fiber-scoped execution identity: claim id, demand role, and the
     /// demand-only progress handles (stage stack + "waiting on" record).
     /// Points at the owning `WorkerFiber`'s context; nested VMs created on
@@ -228,7 +232,7 @@ pub const VM = struct {
     /// diverge from their fiber's identity. Standalone test VMs (no fiber)
     /// point at the static neutral default. Read-only from the VM's side —
     /// only the fiber's driving worker dresses/resets it, between resumes.
-    /// See `vm/exec_context.zig`.
+    /// See `execution/context.zig`.
     ctx: *const ExecutionContext = &ExecutionContext.default_instance,
     /// Optional VM execution tracer.
     vm_trace: ?*VmTrace,
@@ -390,6 +394,7 @@ pub const VM = struct {
         scheduler: *Scheduler,
         trace_sink: ?*eval_trace.Trace = null,
         progress_spans: ?eval_progress.SpanSink = null,
+        executor: ?FiberExecutor = null,
         vm_trace: ?*VmTrace = null,
         thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void = if (thunks_log_enabled) null else {},
         import_host: ?ImportHost = null,
@@ -430,6 +435,7 @@ pub const VM = struct {
             .scheduler = options.scheduler,
             .trace = options.trace_sink,
             .progress_spans = options.progress_spans,
+            .executor = options.executor,
             .vm_trace = options.vm_trace,
             .thunk_trace = options.thunk_trace,
             .import_host = options.import_host,

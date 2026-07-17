@@ -1,6 +1,6 @@
 //! DaemonPool: N background threads, each owning a warm connection, draining a
 //! shared job queue. You submit a job and park the caller (a compute fiber via
-//! `vm/io_offload`, or the main thread blocking) while a worker runs
+//! `execution.zig`, or the main thread blocking) while a worker runs
 //! `job.run(conn)` on its connection and wakes you.
 //!
 //! This is the one execution path for every nix-daemon store op — `.drv`/source
@@ -90,7 +90,7 @@ pub const DaemonPool = struct {
     /// Submit `work(conn)` and block the CALLING thread until a worker has run it.
     /// For callers with no fiber to park — the main-thread terminal build, and
     /// tests — which have nothing else to do meanwhile. (Fiber callers park
-    /// instead; see `vm/io_offload.runOnPool`.)
+    /// instead; see `execution.runOnPool`.)
     pub fn submitBlocking(self: *DaemonPool, work: *const fn (conn: ?*anyopaque, ctx: *anyopaque) void, ctx: *anyopaque) void {
         var cell: BlockingCell = .{ .work = work, .ctx = ctx };
         var job: Job = .{ .run = BlockingCell.run, .ctx = &cell };

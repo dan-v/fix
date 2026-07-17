@@ -10,7 +10,7 @@ const eval_support = @import("eval_support.zig");
 const debugger = @import("debugger.zig");
 const trace_setup = @import("trace_setup.zig");
 const stats = @import("stats.zig");
-const timeline = engine.probe.timeline;
+const timeline = engine.tooling.probe.timeline;
 
 const Evaluator = engine.Evaluator;
 
@@ -44,7 +44,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    const term = try setup.configure(&ev, process, init, options);
+    const term = try setup.configure(&ev, init, options);
 
     var console: debugger.Console = undefined;
     if (options.debugger) {

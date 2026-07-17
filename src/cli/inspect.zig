@@ -7,12 +7,11 @@
 const std = @import("std");
 const engine = @import("nix");
 const presentation = @import("presentation.zig");
-const eval = engine.eval;
-const bytecode = engine.bytecode;
+const bytecode = engine.tooling.bytecode;
 const builtin = @import("builtin");
 
-const Evaluator = eval.Evaluator;
-const SchedulerStats = engine.scheduler.Scheduler.Stats;
+const Evaluator = engine.Evaluator;
+const SchedulerStats = engine.tooling.scheduler.Scheduler.Stats;
 
 const usage =
     \\usage: fix inspect [options] (-e <expression> | --file <path>)
@@ -63,7 +62,6 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     @import("setup.zig").applyMemoryBacking(null);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    process.bindEvaluator(&ev);
     ev.setEnvironment(init.environ_map);
     try ev.setBasePathFromCurrentPath(init.io);
     if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);

@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const engine = @import("nix");
-const syntax = engine.syntax;
+const syntax = engine.tooling.syntax;
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 
@@ -82,7 +82,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     setup.applyMemoryBacking(null);
     var ev = try Evaluator.init(allocator, 1);
     defer ev.deinit();
-    _ = setup.configure(&ev, process, init, options) catch |err| {
+    _ = setup.configure(&ev, init, options) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});
         return 1;
     };

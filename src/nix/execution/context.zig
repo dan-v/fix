@@ -75,6 +75,9 @@ pub const ExecutionContext = struct {
     /// it on another worker. Frames themselves live on the suspended fiber's
     /// stack and are popped before that stack can be recycled.
     scoped_import_top: ?*const ScopedImportFrame = null,
+    /// Fiber-owned waiter and yield operation used by VM force paths without
+    /// importing the concrete WorkerFiber representation.
+    park: ?ParkHandle = null,
 
     /// Neutral identity for VMs not bound to any fiber (standalone test
     /// VMs, tools). Static and immutable — never dressed.
@@ -90,6 +93,16 @@ pub const ExecutionContext = struct {
         self.is_demand = false;
         self.progress_stage = null;
         self.progress_wait = null;
+    }
+};
+
+pub const ParkHandle = struct {
+    waiter: *future_mod.Waiter,
+    context: *anyopaque,
+    yield_fn: *const fn (context: *anyopaque) void,
+
+    pub fn yield(self: ParkHandle) void {
+        self.yield_fn(self.context);
     }
 };
 

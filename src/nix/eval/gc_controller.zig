@@ -19,12 +19,12 @@ const future_mod = @import("runtime").future;
 const vm_force = @import("../vm.zig").force;
 const vm_access = @import("../vm.zig").access;
 const timeline = @import("../probe.zig").timeline;
-const memory = @import("memory.zig");
+const memory_config = @import("../memory_config.zig");
 const clock = @import("base").clock;
 const SpinMutex = @import("base").sync.SpinMutex;
 const Value = @import("runtime").value.Value;
 const VM = @import("../vm/context.zig").VM;
-const Worker = @import("../vm/worker.zig").Worker;
+const Worker = @import("../execution/worker.zig").Worker;
 const Scheduler = @import("../scheduler.zig").Scheduler;
 const ChunkRegistry = @import("../bytecode.zig").ChunkRegistry;
 const RealizationStore = @import("../realization.zig").RealizationStore;
@@ -78,8 +78,8 @@ pub fn unregisterVm(ev: Context, vm: *VM) void {
 }
 
 /// Body of the scheduler's parallel-mark hook: a parked peer helps drain
-/// marker slot `worker_id` to termination. The `eval.zig` trampoline
-/// (`gcHelpMarkThunk`) casts `*anyopaque` and calls this.
+/// marker slot `worker_id` to termination. `GcCoordinator` owns the low-level
+/// scheduler callback and dispatches here.
 pub fn helpMark(ev: Context, worker_id: u8) void {
     _ = worker_id;
     // Grab a marker slot. The collection is capped at GC_PAR_CAP
@@ -379,7 +379,7 @@ fn autoCollectLine(ev: Context) u64 {
 
 /// A `SIZE`-syntax env override (same grammar as `--max-memory`), or null.
 fn envSize(ev: Context, key: []const u8) ?u64 {
-    if (ev.env_map) |em| if (em.get(key)) |s| return memory.parseSize(s);
+    if (ev.env_map) |em| if (em.get(key)) |s| return memory_config.parseSize(s);
     return null;
 }
 

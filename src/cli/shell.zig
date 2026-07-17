@@ -16,7 +16,7 @@ const eval_support = @import("eval_support.zig");
 
 const Evaluator = engine.Evaluator;
 const EnvMap = std.process.Environ.Map;
-const BuildSink = engine.host.store.BuildSink;
+const BuildSink = engine.BuildSink;
 
 pub const synopsis =
     \\usage: fix shell [options] (-p <pkgs...> | path | -e <expr> | --flake) [-- cmd args...]
@@ -48,7 +48,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    const term = try setup.configure(&ev, process, init, options);
+    const term = try setup.configure(&ev, init, options);
     ev.enableStoreWrites();
 
     var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
@@ -72,9 +72,9 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     }
 
     const failed = if (options.packages.items.len > 0)
-        try realizePackages(allocator, init, &ev, term, options, build_sink, &out_paths)
+        try realizePackages(allocator, init, &ev, process.eval_release, term, options, build_sink, &out_paths)
     else
-        try realizeSource(allocator, init, &ev, term, options, build_sink, &out_paths);
+        try realizeSource(allocator, init, &ev, process.eval_release, term, options, build_sink, &out_paths);
 
     // Tear the progress bar down before the shell/command takes over.
     build_progress.deinit();
@@ -88,7 +88,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
 
 /// Build each `-p` package from `<nixpkgs>`, appending its outPath. Returns a
 /// non-null exit code on failure (already reported).
-fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
+fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, release_action: ?engine.ReleaseAction, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const nixpkgs = ev.evaluate("import <nixpkgs> { }") catch |err| {
         ev.stopProgressSampler();
         return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, "import <nixpkgs> {}", err);
@@ -125,7 +125,7 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     // Evaluation is done and its results are copied out: drop the language
     // heap (see build.zig) concurrently with the build phase, which can run
     // for minutes and needs only the daemon connection.
-    var build_session = ev.beginBuildPhase(derived.items) catch |err| {
+    var build_session = ev.beginBuildPhase(derived.items, release_action) catch |err| {
         return eval_support.buildFailure(ev.lastStoreError(), err);
     };
     defer build_session.deinit();
@@ -136,7 +136,7 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
 }
 
 /// Build the `-e`/`--file`/`--flake` derivation, appending its outPath.
-fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
+fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, release_action: ?engine.ReleaseAction, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const source_arg = options.source.?;
     if (source_arg == .flake and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
@@ -167,7 +167,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     defer allocator.free(derived);
     // See realizePackages: results are copied out, so free the language heap
     // concurrently with the build phase.
-    var build_session = ev.beginBuildPhase(&.{derived}) catch |err| {
+    var build_session = ev.beginBuildPhase(&.{derived}, release_action) catch |err| {
         return eval_support.buildFailure(ev.lastStoreError(), err);
     };
     defer build_session.deinit();

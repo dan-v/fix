@@ -10,8 +10,8 @@
 const std = @import("std");
 const engine = @import("nix");
 const presentation = @import("presentation.zig");
-const bytecode = engine.bytecode;
-const trace_log = engine.vm.trace_log;
+const bytecode = engine.tooling.bytecode;
+const trace_log = engine.tooling.vm.trace_log;
 
 const OpCode = bytecode.OpCode;
 const EventKind = trace_log.EventKind;

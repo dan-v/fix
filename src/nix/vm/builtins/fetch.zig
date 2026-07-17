@@ -140,7 +140,6 @@ pub fn fetchSpanEnd(self: *VM, span: ?eval_progress.Span) void {
     if (span) |sp| if (self.progress_spans) |spans| spans.endSpan(sp);
 }
 
-const io_offload = @import("../io_offload.zig");
 const FetchCache = fetch_cache.FetchCache;
 const FileCache = file_cache.FileCache;
 
@@ -189,7 +188,10 @@ pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype, span: ?eva
         break :reporter .{ .ctx = &report_store, .report = FetchReport.report };
     };
     var cell: Cell = .{ .fetchers = self.fetchers, .files = self.files, .spec = spec, .reporter = reporter };
-    io_offload.runFetch(self.fetchers.connSem(), Cell.run, &cell);
+    if (self.executor) |executor|
+        executor.runBlocking(self.fetchers.connSem(), Cell.run, &cell)
+    else
+        Cell.run(&cell);
     if (cell.err) |e| return e;
     return cell.res;
 }

@@ -12,7 +12,7 @@
 //!     plain state a happens-before edge.
 //!   * Parse/compile arenas (`AstArena`, deferred-compile scratch, evaluator
 //!     scratch) are locals of a single logical operation on one fiber.
-//!   * The remaining arenas (regex pattern, toml config, run diagnostics) are
+//!   * The remaining arenas (language parsing and run diagnostics) are
 //!     either single-threaded by phase or already guarded by their own mutex.
 //!
 //! Single-owner-at-a-time usage of THIS type is a requirement, not a hint:

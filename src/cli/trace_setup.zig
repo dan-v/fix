@@ -6,12 +6,11 @@
 
 const std = @import("std");
 const engine = @import("nix");
-const eval = engine.eval;
-const Evaluator = eval.Evaluator;
+const Evaluator = engine.Evaluator;
 const Options = @import("args.zig").Options;
-const vm_trace_mod = engine.vm.trace_log;
-const thunk_trace_mod = engine.probe.thunk_trace;
-const thunks_log_enabled = engine.vm.thunks_log_enabled;
+const vm_trace_mod = engine.tooling.vm.trace_log;
+const thunk_trace_mod = engine.tooling.probe.thunk_trace;
+const thunks_log_enabled = engine.tooling.vm.thunks_log_enabled;
 
 pub const ThunkTraceSetup = struct {
     trace: ?*thunk_trace_mod.ThunkTrace = null,

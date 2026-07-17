@@ -27,7 +27,7 @@ pub const FetchCache = struct {
     /// that never call `setEnvironment`) it falls back to `./.zig-cache/fix`.
     cache_root: ?[]u8 = null,
     /// Max concurrent fetches (`http-connections`; 0 = unlimited). The offload
-    /// path (`vm.io_offload.runFetch`) acquires `conn_sem` when this is > 0.
+    /// path (`FiberExecutor.runBlocking`) acquires `conn_sem` when this is > 0.
     max_connections: u32 = 0,
     conn_sem: sync.Semaphore = sync.Semaphore.init(0),
     /// `download-attempts` (nix default 5): how many times to try a download

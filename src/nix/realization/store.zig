@@ -16,30 +16,11 @@ const Waiter = runtime.future.Waiter;
 const eval_memo = @import("eval_memo.zig");
 const recipe_graph = @import("recipe_graph.zig");
 const daemon_client = @import("daemon_client.zig");
+const eval_progress = @import("../observ.zig").progress;
+const execution_port = @import("../execution/port.zig");
+const build_protocol = @import("../build_protocol.zig");
 
-/// Injected `vm.io_offload.runOnPool`: submit `work(conn)` to the pool and park
-/// the caller. `ctx` is the `*DaemonPool`; `conn` is the worker's connection.
-const OffloadFn = daemon_client.OffloadFn;
-
-/// Injected `vm.io_offload.fiberPark`: park the current compute fiber on `future`
-/// (a realization claim). Returns false if not on a fiber — the caller then waits
-/// on the thread itself (the main-thread realize / tests).
-const FiberParkFn = daemon_client.FiberParkFn;
-
-/// The progress-span groups the realization service reports. Mirrors the
-/// evaluator's `SpanGroup`, but is named locally to keep this layer independent
-/// from evaluator progress types.
 pub const SpanGroup = recipe_graph.SpanGroup;
-
-/// Injected concurrent progress-span hooks for the store's real writes: a
-/// `.store` span around a `.drv` transfer and a `.source` span around a source
-/// copy, both reported in `applyDaemonOp` past the `isValidPath` guard (so the
-/// counts are actual writes, not per-coercion / per-recorded-recipe). The eval
-/// layer adapts its observ `SpanSink` into these opaque fn pointers. `begin`
-/// opens a span labeled with `label` and returns its token; `end` closes it.
-/// A span may open on a pool worker / compute fiber and close after the write.
-const SpanBeginFn = daemon_client.SpanBeginFn;
-const SpanEndFn = daemon_client.SpanEndFn;
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
@@ -67,6 +48,7 @@ pub const RealizationStore = struct {
     memo: eval_memo.EvalMemo,
     graph: recipe_graph.Graph,
     daemon: daemon_client.Client,
+    progress_spans: ?eval_progress.SpanSink = null,
 
     pub const RootClaimHook = recipe_graph.RootClaimHook;
 
@@ -219,7 +201,7 @@ pub const RealizationStore = struct {
 
     /// Set the per-connection daemon settings to apply on connect. Dupes the
     /// overrides into owned storage (freed in `deinit`).
-    pub fn setBuildSettings(self: *RealizationStore, settings: rstore.BuildSettings) !void {
+    pub fn setBuildSettings(self: *RealizationStore, settings: build_protocol.Settings) !void {
         return self.daemon.setBuildSettings(settings);
     }
 
@@ -255,34 +237,34 @@ pub const RealizationStore = struct {
         self.daemon.enableWrites();
     }
 
-    /// Install (or clear) the concurrent progress-span hooks. A null `ctx` clears
-    /// them (progress not drawn). Set by the evaluator when a progress sink is
-    /// (re)installed; safe to change between top-level runs.
-    pub fn setSpanHooks(self: *RealizationStore, ctx: ?*anyopaque, begin: SpanBeginFn, end: SpanEndFn) void {
-        self.daemon.setSpanHooks(ctx, begin, end);
+    /// Install the thread-safe progress channel used for real store work.
+    /// Individual Span handles retain this sink, so replacing it between runs
+    /// cannot misroute an in-flight span's end/update.
+    pub fn setProgressSpans(self: *RealizationStore, spans: ?eval_progress.SpanSink) void {
+        self.progress_spans = spans;
     }
 
     /// Open a concurrent progress span for real store work, or null when progress
     /// isn't drawn. Pair with `endSpan` (defer). The label is borrowed for the
-    /// call only. See `SpanHooks`.
-    pub fn beginSpan(self: *RealizationStore, group: SpanGroup, label: []const u8) ?usize {
-        return self.daemon.beginSpan(group, label);
+    /// call only. The returned handle retains its originating sink.
+    pub fn beginSpan(self: *RealizationStore, group: SpanGroup, label: []const u8) ?eval_progress.Span {
+        const spans = self.progress_spans orelse return null;
+        return spans.beginSpan(group, label);
     }
 
     /// Close a span opened by `beginSpan` (no-op on null / no hooks).
-    pub fn endSpan(self: *RealizationStore, token: ?usize) void {
-        self.daemon.endSpan(token);
+    pub fn endSpan(_: *RealizationStore, span: ?eval_progress.Span) void {
+        if (span) |handle| handle.end();
     }
 
-    /// Install the pool-offload entry (from the vm layer). Must be set before any
-    /// forcing begins, and cleared (`clearOffload`) before the runtime is torn
-    /// down. `rt` owns the connection pool this store submits to.
-    pub fn setOffload(self: *RealizationStore, rt: *DaemonRuntime, run: OffloadFn, fiber_park: FiberParkFn) void {
-        self.daemon.setOffload(rt, run, fiber_park);
+    /// Install the fiber-aware execution capability. Must be set before forcing
+    /// begins and cleared before the daemon runtime is torn down.
+    pub fn setExecution(self: *RealizationStore, rt: *DaemonRuntime, executor: execution_port.FiberExecutor) void {
+        self.daemon.setExecution(rt, executor);
     }
 
-    pub fn clearOffload(self: *RealizationStore) void {
-        self.daemon.clearOffload();
+    pub fn clearExecution(self: *RealizationStore) void {
+        self.daemon.clearExecution();
     }
 
     /// Test-only: hand this store a `DaemonRuntime` to use (as its pool source)
@@ -404,7 +386,7 @@ pub const RealizationStore = struct {
     /// daemon, forwarding the build activity/log stream to `sink` if given.
     /// Dispatched to the pool (fiber parks / main thread blocks) so the whole
     /// build runs on a warm worker connection, not a compute worker.
-    pub fn buildPaths(self: *RealizationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+    pub fn buildPaths(self: *RealizationStore, derived_paths: []const []const u8, sink: ?build_protocol.Sink, mode: build_protocol.Mode) !void {
         var cell: BuildCell = .{ .store = self, .paths = derived_paths, .sink = sink, .mode = mode };
         try self.runOnDaemon(BuildCell.run, &cell);
         return cell.err;
@@ -412,12 +394,12 @@ pub const RealizationStore = struct {
 
     /// Realize `derived_paths` for import-from-derivation. Same as `buildPaths`;
     /// kept as a distinct entry for the `run`/`shell` realize call sites.
-    pub fn realizePaths(self: *RealizationStore, derived_paths: []const []const u8, mode: rstore.BuildMode) !void {
+    pub fn realizePaths(self: *RealizationStore, derived_paths: []const []const u8, mode: build_protocol.Mode) !void {
         return self.buildPaths(derived_paths, null, mode);
     }
 
     /// Build against the connection supplied by the pool worker.
-    fn buildOnConn(self: *RealizationStore, conn: *rstore.DaemonStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+    fn buildOnConn(self: *RealizationStore, conn: *rstore.DaemonStore, derived_paths: []const []const u8, sink: ?build_protocol.Sink, mode: build_protocol.Mode) !void {
         conn.buildPaths(derived_paths, sink, mode) catch |err| {
             self.captureDaemonError(conn);
             return err;
@@ -427,8 +409,8 @@ pub const RealizationStore = struct {
     const BuildCell = struct {
         store: *RealizationStore,
         paths: []const []const u8,
-        sink: ?rstore.BuildSink = null,
-        mode: rstore.BuildMode,
+        sink: ?build_protocol.Sink = null,
+        mode: build_protocol.Mode,
         err: anyerror!void = {},
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
@@ -510,8 +492,8 @@ pub const RealizationStore = struct {
         // a fetch (shown under `.fetch` at download). Reporting here — only past the
         // validity guard — means the count is actual writes, not coercions/records.
         // The span may open here (on a pool worker) and close after the write.
-        const span_token: ?usize = if (span_group) |group| self.beginSpan(group, storePathName(store_path)) else null;
-        defer self.endSpan(span_token);
+        const span = if (span_group) |group| self.beginSpan(group, storePathName(store_path)) else null;
+        defer self.endSpan(span);
         const written = switch (op) {
             .text => |o| daemon.addTextToStore(self.allocator, storePathName(store_path), o.text, o.references),
             .path => |o| daemon.addPath(self.allocator, storePathName(store_path), o.nar_bytes, &.{}),

@@ -1,9 +1,9 @@
-//! Parsing helpers for evaluator memory limits.
+//! Shared parsing for evaluator memory-limit configuration.
 
 const std = @import("std");
 
-/// Parse a byte size with optional K/M/G suffix. A bare integer is MiB, matching
-/// the command-line and environment configuration accepted by the evaluator.
+/// Parse a byte size with optional K/M/G suffix. A bare integer is MiB,
+/// matching both command-line and evaluator environment configuration.
 pub fn parseSize(text: []const u8) ?u64 {
     if (text.len == 0) return null;
     var number = text;

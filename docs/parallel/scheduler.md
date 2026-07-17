@@ -110,8 +110,8 @@ The steal scan is further short-circuited by **per-lane stealable-work summaries
 
 ## Garbage collection
 
-The scheduler hosts the collector's **stop-the-world barrier**: a worker that crosses the collection threshold at a safepoint CASes `gc_stop_requested`, becomes the sole collector, waits for every peer to park at its own safepoint, then (for `--workers>1`) opens a parallel-mark gate so parked peers drain the mark graph through an installed hook instead of spinning idle. It is a full two-phase barrier — the collector waits for all peers to *clear* their parked flag before returning — so a slow peer can never carry a stale state into the next collection. The scheduler also exposes `gcMarkPendingTasks`, marking every heap object referenced by a queued task (a queued force is a live reference).
+The scheduler hosts the collector's **stop-the-world barrier**: a worker that crosses the collection threshold at a safepoint CASes `gc_stop_requested`, becomes the sole collector, waits for every peer to park at its own safepoint, then (for `--workers>1`) opens a parallel-mark gate so parked peers drain the mark graph through an installed hook instead of spinning idle. The evaluator-owned `GcCoordinator` installs that hook together with the heap's collection callback as one lifecycle operation. It is a full two-phase barrier — the collector waits for all peers to *clear* their parked flag before returning — so a slow peer can never carry a stale state into the next collection. The scheduler also exposes `gcMarkPendingTasks`, marking every heap object referenced by a queued task (a queued force is a live reference).
 
 ---
 
-Code: `src/nix/scheduler.zig`, `src/nix/vm/worker.zig`
+Code: `src/nix/scheduler/core.zig`, `src/nix/execution/worker.zig`

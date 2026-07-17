@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const wire = @import("wire.zig");
+const build_protocol = @import("../../build_protocol.zig");
 
 pub const default_socket_path = "/nix/var/nix/daemon-socket/socket";
 
@@ -19,18 +20,7 @@ const res_progress: u64 = 105;
 
 /// A consumer of the daemon's build activity/log stream (see `buildPaths`).
 /// Callbacks run on the calling thread while the build is in progress.
-pub const BuildSink = struct {
-    context: *anyopaque,
-    /// An activity started: `id`, its Nix `ActivityType`, and a description
-    /// (e.g. "building '/nix/store/….drv'", "substituting …").
-    on_start: *const fn (context: *anyopaque, id: u64, activity_type: u64, text: []const u8) void,
-    /// An activity finished.
-    on_stop: *const fn (context: *anyopaque, id: u64) void,
-    /// Progress for activity `id`: `done`/`expected` units.
-    on_progress: *const fn (context: *anyopaque, id: u64, done: u64, expected: u64) void,
-    /// A raw log line.
-    on_log: *const fn (context: *anyopaque, line: []const u8) void,
-};
+pub const BuildSink = build_protocol.Sink;
 
 /// Whether the daemon considers this client trusted (from the >=1.35
 /// handshake). Trusted clients may perform privileged ops without restriction.
@@ -39,27 +29,16 @@ pub const Trust = enum { unknown, trusted, not_trusted };
 /// Build realization mode sent with `build_paths` (Nix's `BuildMode`): the
 /// default build, `--repair` (rebuild and fix corrupted paths), or `--check`
 /// (rebuild and verify outputs are unchanged).
-pub const BuildMode = enum(u64) { normal = 0, repair = 1, check = 2 };
+pub const BuildMode = build_protocol.Mode;
 
 /// A `name = value` daemon setting carried in the `set_options` overrides map.
-pub const Setting = struct { name: []const u8, value: []const u8 };
+pub const Setting = build_protocol.Setting;
 
 /// Per-connection daemon settings applied via `set_options` (op 19). Mirrors
 /// the client settings Nix sends after the handshake: the fixed fields plus a
 /// trailing overrides map for any other `nix.conf` key (e.g. `timeout`). The
 /// daemon applies the map after the fixed fields, so an override wins.
-pub const BuildSettings = struct {
-    keep_failed: bool = false,
-    keep_going: bool = false,
-    fallback: bool = false,
-    /// Daemon log verbosity (Nix `Verbosity`: 0 = error … 7 = vomit).
-    verbosity: u64 = 0,
-    max_build_jobs: u64 = 1,
-    max_silent_time: u64 = 0,
-    build_cores: u64 = 0,
-    use_substitutes: bool = true,
-    overrides: []const Setting = &.{},
-};
+pub const BuildSettings = build_protocol.Settings;
 
 pub const DaemonStore = struct {
     allocator: std.mem.Allocator,
@@ -344,7 +323,7 @@ pub const DaemonStore = struct {
                 wire.stderr_next => if (self.build_sink) |s| {
                     const line = try wire.readString(self.allocator, self.r());
                     defer self.allocator.free(line);
-                    s.on_log(s.context, line);
+                    s.emit(.{ .log = line });
                 } else if (self.log_build) {
                     const line = try wire.readString(self.allocator, self.r());
                     defer self.allocator.free(line);
@@ -353,7 +332,7 @@ pub const DaemonStore = struct {
                 wire.stderr_start_activity => try self.readStartActivity(),
                 wire.stderr_stop_activity => {
                     const act = try wire.readInt(self.r());
-                    if (self.build_sink) |s| s.on_stop(s.context, act);
+                    if (self.build_sink) |s| s.emit(.{ .stop = act });
                 },
                 wire.stderr_result => try self.readResult(),
                 // Legacy non-framed source/sink: not used by the ops we issue.
@@ -402,12 +381,12 @@ pub const DaemonStore = struct {
     fn readStartActivity(self: *DaemonStore) !void {
         const act = try wire.readInt(self.r());
         _ = try wire.readInt(self.r()); // level
-        const activity_type = try wire.readInt(self.r());
+        _ = try wire.readInt(self.r()); // daemon ActivityType; presentation uses text
         const text = try wire.readString(self.allocator, self.r());
         defer self.allocator.free(text);
         try self.skipFields();
         _ = try wire.readInt(self.r()); // parent
-        if (self.build_sink) |s| if (text.len != 0) s.on_start(s.context, act, activity_type, text);
+        if (self.build_sink) |s| if (text.len != 0) s.emit(.{ .start = .{ .id = act, .text = text } });
     }
 
     fn readResult(self: *DaemonStore) !void {
@@ -431,6 +410,6 @@ pub const DaemonStore = struct {
                 else => return error.UnknownActivityField,
             }
         }
-        if (self.build_sink) |s| if (result_type == res_progress) s.on_progress(s.context, act, ints[0], ints[1]);
+        if (self.build_sink) |s| if (result_type == res_progress) s.emit(.{ .progress = .{ .id = act, .done = ints[0], .expected = ints[1] } });
     }
 };

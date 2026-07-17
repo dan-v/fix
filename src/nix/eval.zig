@@ -15,6 +15,7 @@ const ChunkBuilder = bytecode.ChunkBuilder;
 const ChunkId = types.ChunkId;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const vm_mod = @import("vm.zig");
+const execution = @import("execution.zig");
 const VM = vm_mod.VM;
 const LanguagePolicy = @import("policy.zig").LanguagePolicy;
 const vm_force = @import("vm.zig").force;
@@ -23,10 +24,10 @@ const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_collector = @import("runtime").heap_collector;
 const FileCache = host.FileCache;
 const FetchCache = host.FetchCache;
-const regex_mod = @import("base").regex;
+const regex_mod = @import("language.zig").regex;
+const corepkgs = @import("language.zig").corepkgs;
 const vma_mod = @import("runtime").mem_tag.vma;
 const realization = @import("realization.zig");
-const RealizationStore = realization.RealizationStore;
 const derivation = @import("derivation.zig");
 const Value = @import("runtime").value.Value;
 const builtins = @import("runtime").builtins;
@@ -46,12 +47,14 @@ const mem_report = @import("eval/mem_report.zig");
 const tuning = @import("eval/tuning.zig");
 const progress_controller = @import("eval/progress_controller.zig");
 const debugger_state = @import("eval/debugger_state.zig");
+const debug_session = @import("eval/debug_session.zig");
 
-const worker_mod = @import("vm.zig").worker;
-const io_offload = @import("vm.zig").io_offload;
-const daemon_runtime_mod = host.daemon_runtime;
+const worker_mod = execution.worker;
 const gc_controller = @import("eval/gc_controller.zig");
-pub const memory = @import("eval/memory.zig");
+const gc_coordinator = @import("eval/gc_coordinator.zig");
+const build_session = @import("build_session.zig");
+const build_protocol = @import("build_protocol.zig");
+const tooling_adapter = @import("eval/tooling.zig");
 const fiber_mod = @import("base").fiber;
 const prof = @import("probe.zig").prof;
 const compiler_mod = @import("compiler.zig");
@@ -59,19 +62,14 @@ const VmTrace = @import("vm.zig").trace_log.VmTrace;
 const ThunkTrace = @import("probe.zig").thunk_trace.ThunkTrace;
 const SpinMutex = @import("base").sync.SpinMutex;
 const gc = @import("runtime").gc;
+const future_mod = @import("runtime").future;
 const thunk_mod = @import("runtime").thunk;
 const worker_id_mod = @import("base").worker_id;
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
 
-/// Process-composition callback run after language state has been torn down.
-/// The executable uses it to trim its concrete large-block allocator without
-/// making the evaluator discover allocator ownership through a global hook.
-pub const ReleaseHook = struct {
-    context: *anyopaque,
-    run: *const fn (context: *anyopaque) void,
-};
+pub const ReleaseAction = build_session.ReleaseAction;
 
 /// Why the debugger was entered (re-exported from the VM layer so the CLI can
 /// switch on it without reaching into `vm`).
@@ -87,15 +85,7 @@ const DebuggerState = debugger_state.State(DebugUi, bytecode.BreakpointTable);
 
 /// One rendered backtrace frame: the running chunk and its source anchor.
 /// `line`/`column` are 1-based; `file`/all fields are 0 when unavailable.
-pub const DebugFrame = struct {
-    chunk_id: ChunkId,
-    /// Source file path, or null when the chunk carries no file.
-    file: ?[]const u8,
-    line: u32,
-    column: u32,
-    /// The best (narrowest) source span covering the frame's live ip, if any.
-    span: ?bytecode.chunk.Chunk.SourceSpan,
-};
+pub const DebugFrame = debug_session.DebugFrame;
 
 /// A live handle to a paused evaluation, handed to the debugger UI. It exposes
 /// only facade-level operations (backtrace, scope inspection, evaluate-in-place,
@@ -117,20 +107,7 @@ pub const DebugSession = struct {
 
     /// Frame `i` (0 = outermost, `frameCount()-1` = innermost/current).
     pub fn frame(self: *const DebugSession, i: usize) DebugFrame {
-        const f = &self.vm.frames[i];
-        const symbols: bytecode.disasm.Symbols = .{ .intern = &self.ev.intern, .registry = &self.ev.registry };
-        // `frameSpan` (inclusive end + body_span fallback) so a caller frame,
-        // whose ip sits past the call it's suspended on, still resolves to a
-        // source location instead of showing nothing.
-        const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip);
-        const file_id = if (span) |s| s.file else bytecode.inspect.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, symbols.registry);
-        return .{
-            .chunk_id = f.chunk_id,
-            .file = if (file_id) |fid| self.ev.intern.get(fid) else null,
-            .line = if (span) |s| s.line else 0,
-            .column = if (span) |s| s.column else 0,
-            .span = span,
-        };
+        return debug_session.frame(debugContext(self), i);
     }
 
     /// The current (innermost) frame, or null if the stack is empty.
@@ -144,12 +121,7 @@ pub const DebugSession = struct {
     /// (`frame(i).span`) offsets into this text. Used to show a code snippet at
     /// the pause.
     pub fn frameSourceText(self: *DebugSession, i: usize) ?[]const u8 {
-        const f = &self.vm.frames[i];
-        const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip) orelse return self.ev.debugger.source;
-        if (span.file) |fid| {
-            return self.ev.files.readFile(self.ev.intern.get(fid)) catch self.ev.debugger.source;
-        }
-        return self.ev.debugger.source;
+        return debug_session.frameSourceText(debugContext(self), i);
     }
 
     /// Local slots of frame `i` (the values in `vm.stack[base..base+count]`).
@@ -179,14 +151,14 @@ pub const DebugSession = struct {
     pub fn localName(self: *const DebugSession, i: usize, slot: usize) ?[]const u8 {
         const names = self.ev.registry.localNamesOf(self.vm.frames[i].chunk_id) orelse return null;
         if (slot >= names.len) return null;
-        return displayName(self.ev.intern.get(names[slot]));
+        return debug_session.displayName(self.ev.intern.get(names[slot]));
     }
 
     /// The source name of upvalue `idx` in frame `i`, if recorded.
     pub fn upvalueName(self: *const DebugSession, i: usize, idx: usize) ?[]const u8 {
         const names = self.ev.registry.upvalueNamesOf(self.vm.frames[i].chunk_id) orelse return null;
         if (idx >= names.len) return null;
-        return displayName(self.ev.intern.get(names[idx]));
+        return debug_session.displayName(self.ev.intern.get(names[idx]));
     }
 
     pub fn upvalueCount(self: *const DebugSession, i: usize) usize {
@@ -240,62 +212,12 @@ pub const DebugSession = struct {
         return false;
     }
 
-    pub const StepKind = enum {
-        /// Stop at the next line in this frame, or when it returns.
-        over,
-        /// Like `over`, but also stop on entry to a function it calls.
-        into,
-        /// Run until the current frame returns.
-        out,
-    };
+    pub const StepKind = debug_session.StepKind;
 
     /// Arm a single step. It takes effect once the console resumes; the next
     /// pause is the step's landing point. See `clearStep`.
     pub fn step(self: *DebugSession, kind: StepKind) !void {
-        if (self.ev.debugger.breakpoints == null) return;
-        const depth = self.vm.frames_len;
-        if (depth == 0) return;
-        const cur = &self.vm.frames[depth - 1];
-
-        var sites: std.ArrayListUnmanaged(bytecode.BreakpointTable.Site) = .empty;
-        defer sites.deinit(self.ev.allocator);
-
-        const max_depth: u32 = switch (kind) {
-            .out => if (depth >= 1) depth - 1 else 0,
-            .over => depth,
-            .into => std.math.maxInt(u32),
-        };
-
-        // Next-line sites in the current chunk (not for a pure step-out).
-        if (kind != .out) {
-            const cur_line: u32 = if (bytecode.inspect.frameSpan(cur.chunk_ptr, cur.ip)) |s| s.line else 0;
-            for (cur.chunk_ptr.source_map) |entry| {
-                if (entry.span.line == cur_line) continue;
-                try sites.append(self.ev.allocator, .{ .chunk_id = cur.chunk_id, .offset = entry.start });
-            }
-        }
-        // The frame's return point (the caller's resume ip): catches "step past
-        // the last line" and realizes step-out.
-        if (depth >= 2) {
-            const caller = &self.vm.frames[depth - 2];
-            try sites.append(self.ev.allocator, .{ .chunk_id = caller.chunk_id, .offset = @intCast(caller.ip) });
-        }
-        // Step-into also arms the entry of every chunk this one may call/force,
-        // so entering one stops at its first line. Over-arms (all potential
-        // callees) — cleaned up on the next pause.
-        if (kind == .into) {
-            var refs: std.ArrayListUnmanaged(ChunkId) = .empty;
-            defer refs.deinit(self.ev.allocator);
-            bytecode.inspect.collectRefs(self.ev.allocator, cur.chunk_ptr, &refs) catch {};
-            for (refs.items) |rid| {
-                const rc = self.ev.registry.get(rid) orelse continue;
-                if (firstMappedOffset(rc)) |off| {
-                    try sites.append(self.ev.allocator, .{ .chunk_id = rid, .offset = off });
-                }
-            }
-        }
-
-        if (self.ev.debugger.breakpoints) |*bp| try bp.armStep(&self.ev.registry, sites.items, max_depth);
+        return debug_session.step(debugContext(self), kind);
     }
 
     /// Disarm any in-progress step (called at each pause before prompting).
@@ -320,172 +242,26 @@ pub const DebugSession = struct {
     /// recorded names (`--debugger` turns capture on); with no frame or no names
     /// it degrades to just `it`.
     pub fn scopeAttrs(self: *DebugSession) !Value {
-        if (self.vm.frames_len == 0) return self.bindValueScope("it");
-
-        var map: std.AutoArrayHashMapUnmanaged(types.InternId, Value) = .empty;
-        defer map.deinit(self.ev.allocator);
-
-        // Walk the frame stack outermost→innermost so nearer frames shadow
-        // farther ones. A break often lands in a small argument thunk whose own
-        // frame has no locals — the enclosing frame carries the `let`/param
-        // bindings the user means, so all frames contribute.
-        var fi: usize = 0;
-        // Pass 1: `with`-scope attrsets (lowest precedence — lexical bindings
-        // shadow `with`). Merged first so pass 2 overrides them.
-        while (fi < self.vm.frames_len) : (fi += 1) {
-            self.collectWithScopes(&map, fi) catch {};
-        }
-        // Pass 2: named locals + upvalues (override `with`).
-        fi = 0;
-        while (fi < self.vm.frames_len) : (fi += 1) {
-            try self.collectFrameBindings(&map, fi);
-        }
-        // `it` = the break value, overriding any same-named binding.
-        try map.put(self.ev.allocator, try self.ev.intern.intern("it"), self.value);
-
-        var entries: std.ArrayListUnmanaged(runtime.heap.AttrEntry) = .empty;
-        defer entries.deinit(self.ev.allocator);
-        var mit = map.iterator();
-        while (mit.next()) |e| try entries.append(self.ev.allocator, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
-        return Value.attrs(try self.ev.heap.addAttrs(entries.items));
-    }
-
-    /// Merge frame `i`'s in-effect `with` attrsets into `map` (each attr's
-    /// name→value), lowest precedence. A `with` subject is a local slot with an
-    /// empty name (declared by `with`) or an upvalue named `"\x00with"` (a
-    /// `with` captured from an enclosing chunk). Best-effort: a subject that
-    /// errors on force or isn't an attrset is skipped.
-    fn collectWithScopes(self: *DebugSession, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), i: usize) !void {
-        const f = &self.vm.frames[i];
-        // Captured `with`s from enclosing chunks (outer) first, then this
-        // chunk's own `with`s (inner) so inner shadows outer.
-        if (self.ev.registry.upvalueNamesOf(f.chunk_id)) |names| {
-            if (f.upvalues) |ups| {
-                for (names, 0..) |nid, idx| {
-                    if (idx >= ups.len) break;
-                    if (std.mem.eql(u8, self.ev.intern.get(nid), compiler_mod.with_capture_name)) {
-                        try self.mergeWithAttrs(map, ups[idx]);
-                    }
-                }
-            }
-        }
-        if (self.ev.registry.localNamesOf(f.chunk_id)) |names| {
-            for (names, 0..) |nid, slot| {
-                if (slot >= f.local_count) break;
-                if (self.ev.intern.get(nid).len == 0) {
-                    try self.mergeWithAttrs(map, self.vm.stack[f.frame_base + slot]);
-                }
-            }
-        }
-    }
-
-    fn mergeWithAttrs(self: *DebugSession, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), subject: Value) !void {
-        const forced = vm_force.forceValue(self.vm, subject) catch return;
-        if (!forced.isAttrs()) return;
-        const entries = self.ev.heap.getAttrs(forced.asObjectId()) catch return;
-        for (entries) |e| try map.put(self.ev.allocator, e.name, e.value);
-    }
-
-    /// Add frame `i`'s named upvalues then locals (locals shadow upvalues) into
-    /// `map`. Later frames overwrite earlier — call outermost→innermost.
-    fn collectFrameBindings(self: *DebugSession, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), i: usize) !void {
-        const f = &self.vm.frames[i];
-        if (self.ev.registry.upvalueNamesOf(f.chunk_id)) |names| {
-            if (f.upvalues) |ups| {
-                for (names, 0..) |nid, idx| {
-                    if (idx >= ups.len) break;
-                    if (displayName(self.ev.intern.get(nid)) != null) try map.put(self.ev.allocator, nid, ups[idx]);
-                }
-            }
-        }
-        if (self.ev.registry.localNamesOf(f.chunk_id)) |names| {
-            for (names, 0..) |nid, slot| {
-                if (slot >= f.local_count) break;
-                if (displayName(self.ev.intern.get(nid)) != null) {
-                    try map.put(self.ev.allocator, nid, self.vm.stack[f.frame_base + slot]);
-                }
-            }
-        }
+        return debug_session.scopeAttrs(debugContext(self));
     }
 };
 
-/// Hide compiler-internal binding names (`\x00`-prefixed sentinels like the
-/// `with`-capture marker) from debugger scope/locals views.
-fn displayName(text: []const u8) ?[]const u8 {
-    if (text.len == 0 or text[0] == 0) return null;
-    return text;
+const StoreState = build_session.StoreState;
+pub const BuildSession = build_session.BuildSession;
+
+fn debugContext(session: *const DebugSession) debug_session.Context {
+    return .{
+        .allocator = session.ev.allocator,
+        .heap = &session.ev.heap,
+        .intern = &session.ev.intern,
+        .registry = &session.ev.registry,
+        .files = &session.ev.files,
+        .breakpoints = if (session.ev.debugger.breakpoints) |*bp| bp else null,
+        .source = session.ev.debugger.source,
+        .vm = session.vm,
+        .value = session.value,
+    };
 }
-
-/// The earliest source-mapped code offset in a chunk — a callee's "first line"
-/// entry point for step-into. Null if the chunk carries no source map.
-fn firstMappedOffset(chunk: *const bytecode.chunk.Chunk) ?u32 {
-    var best: ?u32 = null;
-    for (chunk.source_map) |entry| {
-        if (best == null or entry.start < best.?) best = entry.start;
-    }
-    return best;
-}
-
-/// Store/daemon ownership that remains valid after the language runtime has
-/// been released. Keeping this state in one object makes the terminal build
-/// phase independent of the evaluator heap, scheduler, bytecode, and intern
-/// table by construction.
-pub const StoreState = struct {
-    allocator: std.mem.Allocator,
-    realization: RealizationStore,
-    daemon_runtime: *daemon_runtime_mod.DaemonRuntime,
-
-    fn init(allocator: std.mem.Allocator) !StoreState {
-        const runtime_ptr = try allocator.create(daemon_runtime_mod.DaemonRuntime);
-        errdefer allocator.destroy(runtime_ptr);
-        runtime_ptr.* = daemon_runtime_mod.DaemonRuntime.init();
-        errdefer runtime_ptr.deinit();
-
-        var realization_store = RealizationStore.init(allocator);
-        realization_store.setOffload(runtime_ptr, io_offload.runOnPool, io_offload.fiberPark);
-        return .{ .allocator = allocator, .realization = realization_store, .daemon_runtime = runtime_ptr };
-    }
-
-    fn deinit(self: *StoreState) void {
-        self.realization.clearOffload();
-        self.daemon_runtime.deinit();
-        self.allocator.destroy(self.daemon_runtime);
-        self.realization.deinit();
-    }
-
-    pub fn buildPaths(self: *StoreState, paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
-        return self.realization.buildPaths(paths, sink, mode);
-    }
-
-    pub fn lastError(self: *StoreState) ?[]const u8 {
-        return self.realization.lastStoreError();
-    }
-
-    pub fn addIndirectRoot(self: *StoreState, link_path: []const u8) !void {
-        return self.realization.addIndirectRoot(link_path);
-    }
-};
-
-/// Handle for the terminal build phase. Creating it starts language teardown;
-/// thereafter build callers need only this store-side object. `deinit` joins
-/// teardown before the owning Evaluator itself can be destroyed.
-pub const BuildSession = struct {
-    store: *StoreState,
-    release_thread: ?std.Thread,
-
-    pub fn deinit(self: *BuildSession) void {
-        if (self.release_thread) |thread| thread.join();
-        self.release_thread = null;
-    }
-
-    pub fn buildPaths(self: *BuildSession, paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
-        return self.store.buildPaths(paths, sink, mode);
-    }
-
-    pub fn lastStoreError(self: *BuildSession) ?[]const u8 {
-        return self.store.lastError();
-    }
-};
 
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
@@ -579,6 +355,7 @@ pub const Evaluator = struct {
     /// Evaluator-local cap on parallel GC participants. Environment tuning of
     /// one evaluator must not alter another evaluator in the same process.
     gc_parallel_cap: u32 = gc_controller.default_parallel_cap,
+    gc_coord: gc_coordinator.Coordinator = .{},
     /// Caller-held root values (the repl's scope bindings and
     /// last results live outside any VM between evaluations). Marked by
     /// `markRoots`; replaced wholesale via `gcSetExternalRoots`.
@@ -588,7 +365,6 @@ pub const Evaluator = struct {
     /// Whether `releaseEvalState` already ran (the build-phase memory
     /// release). Makes the release idempotent so `deinit` can share it.
     eval_released: bool = false,
-    release_hook: ?ReleaseHook = null,
 
     /// Speculative import prefetch (`FIX_IMPORT_PREFETCH`): `.nix` path
     /// constants discovered by `ChunkRegistry.register` are submitted as
@@ -748,14 +524,6 @@ pub const Evaluator = struct {
         // Dangling Value into the freed heap; never read again, but don't
         // keep it findable.
         self.builtins_value = null;
-        // The teardown above just flooded the process allocator with dead
-        // segment blocks. The composition root owns that concrete allocator,
-        // so ask it explicitly to release retained memory before the build.
-        if (self.release_hook) |hook| hook.run(hook.context);
-    }
-
-    pub fn setReleaseHook(self: *Evaluator, hook: ?ReleaseHook) void {
-        self.release_hook = hook;
     }
 
     /// Allocator for app-layer values whose ownership is explicitly returned
@@ -796,6 +564,16 @@ pub const Evaluator = struct {
 
     pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {
         return self.report.diagnosticsView();
+    }
+
+    /// Render recorded parser/compiler diagnostics without exposing the syntax
+    /// subsystem through the application facade.
+    pub fn writeDiagnostics(self: *const Evaluator, writer: *std.Io.Writer, source: []const u8, use_color: bool) !void {
+        try diagnostic.writeAllWithOptions(writer, source, self.getDiagnostics(), .{ .color = use_color });
+    }
+
+    pub fn writeDiagnostic(_: *const Evaluator, writer: *std.Io.Writer, source: []const u8, item: Diagnostic, use_color: bool) !void {
+        try diagnostic.writeAllWithOptions(writer, source, &.{item}, .{ .color = use_color });
     }
 
     pub fn getTrace(self: *const Evaluator) *const EvalTrace {
@@ -913,40 +691,11 @@ pub const Evaluator = struct {
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
         self.progress_control.setSink(progress);
-        // The realization service does its real store work (`.drv` writes, source
-        // serializes) off the demand fiber, so it reports via the thread-safe span
-        // sink. It must not import observ (same module layer), so hand it opaque
-        // hooks bound to this evaluator; they map its groups onto the live sink's
-        // and read the spans half. A null ctx clears them.
-        self.store.realization.setSpanHooks(
-            if (progress != null) self else null,
-            realizationSpanBegin,
-            realizationSpanEnd,
-        );
+        self.store.realization.setProgressSpans(if (progress) |p| p.spans else null);
         // Nothing to sync on the worker: the demand-only handles are passed
         // per top-level entry (`runWithVm` → `runTopLevel`), so a sink
         // (re)set between runs — e.g. across REPL inputs — takes effect on
         // the next entry automatically.
-    }
-
-    /// Adapters bridging the realization service's opaque span hooks to this
-    /// evaluator's live `SpanSink` (the store can't name observ types), mapping the
-    /// store's local `SpanGroup` onto the observ group. `ctx` is the `*Evaluator`;
-    /// both no-op if the sink was cleared mid-run.
-    fn realizationSpanBegin(ctx: *anyopaque, group: realization.SpanGroup, label: []const u8) usize {
-        const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        const spans = (self.progress_control.sink orelse return 0).spans;
-        const observ_group: eval_progress.SpanGroup = switch (group) {
-            .store => .store,
-            .source => .source,
-        };
-        return spans.beginSpan(observ_group, label).token;
-    }
-
-    fn realizationSpanEnd(ctx: *anyopaque, token: usize) void {
-        const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        const spans = (self.progress_control.sink orelse return).spans;
-        spans.endSpan(.{ .token = token });
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
@@ -1208,42 +957,7 @@ pub const Evaluator = struct {
     /// Explicit diagnostic surface for CLI tooling. Runtime representation is
     /// intentionally available here, but ordinary command workflows do not get
     /// direct mutable access to the Evaluator's heap/intern/registry fields.
-    pub const Tooling = struct {
-        ev: *Evaluator,
-
-        pub fn attrs(self: Tooling, value: Value) ![]const runtime.heap.AttrEntry {
-            return self.ev.heap.getAttrs(value.asObjectId());
-        }
-
-        pub fn listLen(self: Tooling, value: Value) !usize {
-            return self.ev.heap.getListLen(value.asObjectId());
-        }
-
-        pub fn internText(self: Tooling, id: types.InternId) []const u8 {
-            return self.ev.intern.get(id);
-        }
-
-        pub fn intern(self: Tooling, text_value: []const u8) !types.InternId {
-            return self.ev.intern.intern(text_value);
-        }
-
-        pub fn attrValueOpt(self: Tooling, value: Value, name: types.InternId) !?Value {
-            return self.ev.heap.getAttrValueOpt(value.asObjectId(), name);
-        }
-
-        pub fn thunk(self: Tooling, value: Value) !*thunk_mod.Thunk {
-            return self.ev.heap.getThunk(value.asObjectId());
-        }
-
-        pub fn closure(self: Tooling, value: Value) !runtime.heap.Closure {
-            return self.ev.heap.getClosure(value.asObjectId());
-        }
-
-        pub fn reportCreationCensus(self: Tooling) void {
-            self.ev.heap.profCreationCensus();
-            self.ev.heap.profSiblingCensus();
-        }
-    };
+    pub const Tooling = tooling_adapter.Adapter(Evaluator);
 
     pub fn tooling(self: *Evaluator) Tooling {
         return .{ .ev = self };
@@ -1538,6 +1252,7 @@ pub const Evaluator = struct {
             // `Worker.runTopLevel`; nested VMs share the ctx pointer, see
             // below), so a helper has no way to touch `active[]`.
             .progress_spans = if (self.progress_control.sink) |p| p.spans else null,
+            .executor = execution.fiber_executor,
             .vm_trace = if (worker_id == 0) self.vm_trace else null,
             // The thunk trace IS shared across workers — diagnosing
             // concurrency-shaped wrong-result bugs needs to see every
@@ -1667,7 +1382,7 @@ pub const Evaluator = struct {
     /// Finish evaluation and return the only state needed by the build phase.
     /// Language teardown overlaps daemon work once the returned session starts
     /// a build; callers must keep the session alive until that work completes.
-    pub fn beginBuildPhase(self: *Evaluator, derived_paths: []const []const u8) !BuildSession {
+    pub fn beginBuildPhase(self: *Evaluator, derived_paths: []const []const u8, after_release: ?ReleaseAction) !BuildSession {
         // Writes are demand-driven: materialize each target's `.drv` closure now,
         // BEFORE releasing eval state — `ensureClosure` walks the recipe graph,
         // which `releaseEvalState` frees. (Cheap, and inherently sequential: the
@@ -1679,16 +1394,16 @@ pub const Evaluator = struct {
         // Now release on a helper thread so the build launches immediately and
         // the ~2 GB heap teardown overlaps it. If the thread can't spawn, fall
         // back to serial release-then-build.
-        const releaser = std.Thread.spawn(.{}, releaseEvalState, .{self}) catch blk: {
-            self.releaseEvalState();
+        const releaser = std.Thread.spawn(.{}, releaseForBuild, .{ self, after_release }) catch blk: {
+            releaseForBuild(self, after_release);
             break :blk null;
         };
-        return .{ .store = &self.store, .release_thread = releaser };
+        return BuildSession.init(&self.store, releaser);
     }
 
     /// Set the per-connection daemon settings (`--cores`/`--max-jobs`/… via
     /// `set_options`) applied when the store connects. See `setup.configure`.
-    pub fn setDaemonBuildSettings(self: *Evaluator, settings: host.store.BuildSettings) !void {
+    pub fn setDaemonBuildSettings(self: *Evaluator, settings: build_protocol.Settings) !void {
         return self.store.realization.setBuildSettings(settings);
     }
 
@@ -1794,10 +1509,11 @@ pub const Evaluator = struct {
         // park at safepoints) before marking. Register worker 0 so the
         // collector can walk its fibers for roots.
         self.gc_workers[0].store(w, .release);
-        self.heap.setGcHook(.{ .ctx = self, .sample = gcCollectThunk });
-        // Parallel STW mark (--workers>1): parked peers call this to help
-        // drain the graph. Inert at --workers=1 (no peer ever parks).
-        self.scheduler.gcSetMarkHook(.{ .ctx = self, .help = gcHelpMarkThunk });
+        self.gc_coord.install(&self.heap, &self.scheduler, .{
+            .context = self,
+            .collect = gcCollect,
+            .help_mark = gcHelpMark,
+        });
         if (self.env_map) |em|
             if (em.get("FIX_GC_NOREUSE") != null) self.heap.gcSetDisableReuse(true);
         if (self.env_map) |em|
@@ -1830,11 +1546,7 @@ pub const Evaluator = struct {
         return w;
     }
 
-    /// Type-erased trampoline for the heap's collect callback. Kept here
-    /// (next to `setGcHook`) so the `*const fn(*anyopaque, u8) void` ABI
-    /// stays exact; the body lives in `eval/gc_controller.zig`. `collector_id` is the
-    /// worker that won the collection (its parallel-mark slot).
-    fn gcCollectThunk(ctx: *anyopaque, collector_id: u8) void {
+    fn gcCollect(ctx: *anyopaque, collector_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
         gc_controller.collect(gcContext(self), collector_id);
     }
@@ -1915,17 +1627,92 @@ pub const Evaluator = struct {
         return result;
     }
 
-    /// Type-erased trampoline for the scheduler's parallel-mark hook: a parked
-    /// peer helps drain marker slot `worker_id` to termination. Kept here for
-    /// the exact fn-pointer ABI; the body lives in `eval/gc_controller.zig`.
-    fn gcHelpMarkThunk(ctx: *anyopaque, worker_id: u8) void {
+    fn gcHelpMark(ctx: *anyopaque, worker_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
         gc_controller.helpMark(gcContext(self), worker_id);
     }
 
     fn importValue(context: *anyopaque, path: []const u8, parent_depth: u32) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return imports_mod.importPath(importHost(self), path, parent_depth);
+        return self.importPath(path, parent_depth);
+    }
+
+    fn importPath(self: *Evaluator, path: []const u8, parent_depth: u32) !Value {
+        const resolved = try self.resolveHostPath(path);
+        defer if (resolved.owned) self.allocator.free(resolved.text);
+        return self.importResolvedPath(resolved.text, parent_depth);
+    }
+
+    fn importResolvedPath(self: *Evaluator, path: []const u8, parent_depth: u32) anyerror!Value {
+        const entry = try self.imports.lookupOrCreate(self.allocator, path);
+        return self.forceImportEntry(path, entry, parent_depth);
+    }
+
+    fn forceImportEntry(self: *Evaluator, path: []const u8, entry: *imports_mod.ImportEntry, parent_depth: u32) anyerror!Value {
+        const me = currentImportClaimer();
+        while (true) {
+            switch (entry.future.tryClaim(me)) {
+                .already_resolved => return entry.result,
+                .blackhole => return error.ImportCycle,
+                .errored => return entry.error_info.?.err,
+                .busy => {
+                    const inner = fiber_mod.currentFiber() orelse
+                        @panic("import entry became busy outside an evaluator fiber");
+                    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
+                    if (entry.future.enrollWaiter(&wf.waiter)) {
+                        wf.state = .suspended;
+                        fiber_mod.Fiber.yield();
+                        wf.state = .running;
+                    }
+                    continue;
+                },
+                .claimed => {
+                    const value = self.compileImportPath(path, parent_depth) catch |err| {
+                        self.publishImportFailure(entry, err);
+                        return err;
+                    };
+                    entry.result = value;
+                    entry.future.publish();
+                    return value;
+                },
+            }
+        }
+    }
+
+    fn publishImportFailure(self: *Evaluator, entry: *imports_mod.ImportEntry, err: anyerror) void {
+        switch (err) {
+            error.OutOfMemory, error.StackOverflow => {
+                entry.future.reset();
+                return;
+            },
+            else => {},
+        }
+        const info = self.allocator.create(thunk_mod.ErrorInfo) catch {
+            entry.future.reset();
+            return;
+        };
+        info.* = .{ .err = err, .message = null };
+        entry.error_info = info;
+        entry.future.publishErrored();
+    }
+
+    fn compileImportPath(self: *Evaluator, path: []const u8, parent_depth: u32) anyerror!Value {
+        const stable_path = try self.allocator.dupe(u8, path);
+        defer self.allocator.free(stable_path);
+
+        self.progressBegin(.import, stable_path);
+        defer self.progressEnd(.import, stable_path);
+        timeline.instant(.import, stable_path);
+
+        const source = if (corepkgs.source(stable_path)) |core_source|
+            core_source
+        else
+            self.files.readFile(stable_path) catch |err| switch (err) {
+                error.IsDir => return self.importDirectory(stable_path, parent_depth),
+                else => return err,
+            };
+        const source_base = std.fs.path.dirname(stable_path) orelse "/";
+        return self.evaluateSource(source, source_base, stable_path, null, parent_depth);
     }
 
     /// Explicit post-registration phase: compiler code reports a newly
@@ -1966,7 +1753,53 @@ pub const Evaluator = struct {
 
     fn scopedImportValue(context: *anyopaque, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return imports_mod.scopedImportPath(importHost(self), scope, path, parent_depth);
+        return self.scopedImportPath(scope, path, parent_depth);
+    }
+
+    fn scopedImportPath(self: *Evaluator, scope: Value, path: []const u8, parent_depth: u32) !Value {
+        const resolved = try self.resolveHostPath(path);
+        defer if (resolved.owned) self.allocator.free(resolved.text);
+        return self.scopedImportResolvedPath(scope, resolved.text, parent_depth);
+    }
+
+    fn scopedImportResolvedPath(self: *Evaluator, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
+        const stable_path = try self.allocator.dupe(u8, path);
+        defer self.allocator.free(stable_path);
+
+        var cursor = currentExecutionContext().scoped_import_top;
+        while (cursor) |node| {
+            if (std.mem.eql(u8, node.path, stable_path)) return error.ImportCycle;
+            cursor = node.next;
+        }
+        var frame: execution.ScopedImportFrame = .{ .path = stable_path, .next = currentExecutionContext().scoped_import_top };
+        currentExecutionContext().scoped_import_top = &frame;
+        defer currentExecutionContext().scoped_import_top = frame.next;
+
+        self.progressBegin(.import, stable_path);
+        defer self.progressEnd(.import, stable_path);
+        timeline.instant(.import, stable_path);
+
+        const source = if (corepkgs.source(stable_path)) |core_source|
+            core_source
+        else
+            self.files.readFile(stable_path) catch |err| switch (err) {
+                error.IsDir => return self.scopedImportDirectory(scope, stable_path, parent_depth),
+                else => return err,
+            };
+        const source_base = std.fs.path.dirname(stable_path) orelse "/";
+        return self.evaluateSource(source, source_base, stable_path, scope, parent_depth);
+    }
+
+    fn importDirectory(self: *Evaluator, path: []const u8, parent_depth: u32) anyerror!Value {
+        const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
+        defer self.allocator.free(default_path);
+        return self.importResolvedPath(default_path, parent_depth);
+    }
+
+    fn scopedImportDirectory(self: *Evaluator, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
+        const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
+        defer self.allocator.free(default_path);
+        return self.scopedImportResolvedPath(scope, default_path, parent_depth);
     }
 
     fn findFile(context: *anyopaque, name: []const u8) anyerror!Value {
@@ -2150,6 +1983,11 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
     worker.deinit();
 }
 
+fn releaseForBuild(ev: *Evaluator, after_release: ?ReleaseAction) void {
+    ev.releaseEvalState();
+    if (after_release) |action| action.run(action.context);
+}
+
 fn initVmForWorkerSlot(ctx: *anyopaque, worker_id: u8, _: u32, scratch: std.mem.Allocator) anyerror!VM {
     const ev: *Evaluator = @ptrCast(@alignCast(ctx));
     return ev.initVm(worker_id, scratch);
@@ -2209,37 +2047,17 @@ fn printProgressStep(context: *anyopaque, completed: usize, total: usize) void {
     ev.progressStep(completed, total);
 }
 
-fn importHost(ev: *Evaluator) imports_mod.Host {
-    return .{
-        .allocator = ev.allocator,
-        .imports = &ev.imports,
-        .files = &ev.files,
-        .context = ev,
-        .resolve_host_path = importResolveHostPath,
-        .evaluate_source = importEvaluateSource,
-        .progress_begin = importProgressBegin,
-        .progress_end = importProgressEnd,
-    };
+fn currentImportClaimer() future_mod.ClaimerId {
+    const inner = fiber_mod.currentFiber() orelse return future_mod.invalid_claimer;
+    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
+    return wf.ctx.claimer_id;
 }
 
-fn importResolveHostPath(context: *anyopaque, path: []const u8) anyerror!search_path_mod.ResolvedPath {
-    const ev: *Evaluator = @ptrCast(@alignCast(context));
-    return ev.resolveHostPath(path);
-}
-
-fn importEvaluateSource(context: *anyopaque, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value, parent_depth: u32) anyerror!Value {
-    const ev: *Evaluator = @ptrCast(@alignCast(context));
-    return ev.evaluateSource(source, base_path, source_path, scope, parent_depth);
-}
-
-fn importProgressBegin(context: *anyopaque, stage: eval_progress.Stage, subject: []const u8) void {
-    const ev: *Evaluator = @ptrCast(@alignCast(context));
-    ev.progressBegin(stage, subject);
-}
-
-fn importProgressEnd(context: *anyopaque, stage: eval_progress.Stage, subject: []const u8) void {
-    const ev: *Evaluator = @ptrCast(@alignCast(context));
-    ev.progressEnd(stage, subject);
+fn currentExecutionContext() *execution.ExecutionContext {
+    const inner = fiber_mod.currentFiber() orelse
+        @panic("scoped import ran outside an evaluator fiber");
+    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
+    return &wf.ctx;
 }
 
 fn gcContext(ev: *Evaluator) gc_controller.Context {

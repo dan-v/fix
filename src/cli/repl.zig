@@ -25,8 +25,8 @@ const setup = @import("setup.zig");
 const debugger = @import("debugger.zig");
 const render_err = @import("render.zig");
 const engine = @import("nix");
-const future_mod = engine.runtime.future;
-const types = engine.runtime.types;
+const future_mod = engine.tooling.runtime.future;
+const types = engine.tooling.runtime.types;
 
 const commands = @import("repl/commands.zig");
 const check = @import("repl/check.zig");
@@ -83,7 +83,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
     setup.applyMemoryBacking(options.hugetlb);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    const term = try setup.configure(&ev, process, init, options);
+    const term = try setup.configure(&ev, init, options);
 
     var console: debugger.Console = undefined;
     if (options.debugger) {

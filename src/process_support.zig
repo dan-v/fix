@@ -7,4 +7,3 @@ const base = @import("base");
 const mem_tag = @import("runtime").mem_tag;
 
 pub const LargeBlockAllocator = base.block_cache.BlockCacheAllocator(mem_tag.vma);
-pub const memory_backing = base.hugetlb;
