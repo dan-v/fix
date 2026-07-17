@@ -8,11 +8,12 @@
 #   RUNS=3 ./result/bin/fix-bench json
 #
 # With no suite (or with `all`), all three run into one /tmp/fix-bench.* tree.
-# `TOOLS=nix,detsys-1core,fix-1core` selects rows by name, `WORKLOADS=...`
-# selects workload basenames, `OUT=/path` selects the output directory, and
-# `BENCH_NIX_PATH=...` overrides the pinned search path. Workloads themselves use
-# <nixpkgs> / <home-manager>, so they are directly runnable with any suitable
-# NIX_PATH.
+# `TOOLS=nix,detsys-1core,fix-1core` selects exact rows; `/fix-.*/` selects by
+# Bash ERE, and a leading `-` excludes (`TOOLS=-snix`). `WORKLOADS=...` selects
+# workload basenames, `OUT=/path` selects the output directory, and
+# `BENCH_NIX_PATH=...` overrides the pinned search path. Workloads themselves
+# use <nixpkgs> / <home-manager>, so they are directly runnable with any
+# suitable NIX_PATH.
 {
   pkgs,
   lib,
@@ -29,10 +30,34 @@
   nixpkgs = sources.nixpkgs;
   homeManager = pkgs.home-manager.src;
   workloads = ../bench/workloads;
+  fixWorkerCounts = [
+    1
+    2
+    4
+    8
+    12
+    16
+    32
+  ];
+  fixTools = json:
+    optionals (fix != null) (
+      let
+        base = "${fix}/bin/fix eval${
+          if json
+          then " --json"
+          else ""
+        } --strict";
+      in
+        map (
+          workers: "fix-${toString workers}core|${base} --workers=${toString workers} --no-progress --file"
+        )
+        fixWorkerCounts
+        ++ ["fix-autocore|${base} --no-progress --file"]
+    );
 
   # Torture keeps explicit one-core rows for core-efficiency comparisons while
   # also showing whether each parallel evaluator can exploit the workload.
-  tortureTools =
+  scalarTools =
     optional (nix != null) "nix|${nix}/bin/nix-instantiate --eval --strict"
     ++ optionals (detsys != null) [
       "detsys-1core|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 1"
@@ -41,28 +66,13 @@
     ]
     ++ optional (lix != null) "lix|${lix}/bin/nix-instantiate --eval --strict"
     ++ optional (snix != null) "snix|${snix}/bin/snix-eval -qqqq --no-warnings --strict"
-    ++ optionals (fix != null) [
-      "fix-1core|${fix}/bin/fix eval --strict --workers=1 --no-progress --file"
-      "fix-2core|${fix}/bin/fix eval --strict --workers=2 --no-progress --file"
-      "fix-autocore|${fix}/bin/fix eval --strict --no-progress --file"
-    ];
+    ++ fixTools false;
+
+  tortureTools = scalarTools;
 
   # Real-world scalar evaluation includes the scaling rows even though
   # Determinate's evaluator cores primarily help wide/deep result forcing.
-  realworldTools =
-    optional (nix != null) "nix|${nix}/bin/nix-instantiate --eval --strict"
-    ++ optionals (detsys != null) [
-      "detsys-1core|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 1"
-      "detsys-2core|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 2"
-      "detsys-allcore|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 0"
-    ]
-    ++ optional (lix != null) "lix|${lix}/bin/nix-instantiate --eval --strict"
-    ++ optional (snix != null) "snix|${snix}/bin/snix-eval -qqqq --no-warnings --strict"
-    ++ optionals (fix != null) [
-      "fix-1core|${fix}/bin/fix eval --strict --workers=1 --no-progress --file"
-      "fix-2core|${fix}/bin/fix eval --strict --workers=2 --no-progress --file"
-      "fix-autocore|${fix}/bin/fix eval --strict --no-progress --file"
-    ];
+  realworldTools = scalarTools;
 
   # JSON workloads return wide trees of independent values. `nix eval --json`
   # is the path on which Determinate performs parallel deep forcing. Snix is
@@ -75,18 +85,18 @@
       "detsys-allcore|${detsys}/bin/nix eval --json --eval-cores 0 --file"
     ]
     ++ optional (lix != null) "lix|${lix}/bin/nix eval --json --file"
-    ++ optionals (fix != null) [
-      "fix-1core|${fix}/bin/fix eval --json --strict --workers=1 --no-progress --file"
-      "fix-2core|${fix}/bin/fix eval --json --strict --workers=2 --no-progress --file"
-      "fix-autocore|${fix}/bin/fix eval --json --strict --no-progress --file"
-    ];
+    ++ fixTools true;
 
   shellArray = tools: builtins.concatStringsSep " " (map lib.escapeShellArg tools);
   plotPython = pkgs.python3.withPackages (ps: [ps.matplotlib]);
 in
   pkgs.writeShellApplication {
     name = "fix-bench";
-    runtimeInputs = [pkgs.hyperfine pkgs.coreutils plotPython];
+    runtimeInputs = [
+      pkgs.hyperfine
+      pkgs.coreutils
+      plotPython
+    ];
     text = ''
       usage() {
         cat <<'EOF'
@@ -96,7 +106,12 @@ in
         RUNS=N              measured runs per command (default: 10)
         WARMUP=N            warmup runs per command (default: 1)
         OUT=DIR             output directory (default: /tmp/fix-bench.XXXXXX)
-        TOOLS=a,b,c         include only these evaluator rows
+        TOOLS=RULE,...      select evaluator rows: exact name or /Bash ERE/;
+                            prefix a rule with - to exclude it. If every rule
+                            is negative, all tools start included.
+                            Examples: TOOLS='/fix-.*/,lix'
+                                      TOOLS='/fix-.*/,-/fix-..core/'
+                                      TOOLS=-snix
         WORKLOADS=a,b,c     include only these workload names
         BENCH_NIX_PATH=...  override the pinned benchmark NIX_PATH
       EOF
@@ -126,9 +141,97 @@ in
       fi
       all_json_files=()
 
+      tool_rules=()
+      tool_has_include=0
+
+      trim_tool_rule() {
+        trimmed_tool_rule="$1"
+        trimmed_tool_rule="''${trimmed_tool_rule#"''${trimmed_tool_rule%%[![:space:]]*}"}"
+        trimmed_tool_rule="''${trimmed_tool_rule%"''${trimmed_tool_rule##*[![:space:]]}"}"
+      }
+
+      tool_rule_is_regex() {
+        local selector="$1"
+        [[ "''${#selector}" -ge 2 && "$selector" == /*/ ]]
+      }
+
+      tool_rule_regex() {
+        local selector="$1"
+        selector="''${selector#/}"
+        printf '%s' "''${selector%/}"
+      }
+
+      validate_tool_rule() {
+        local selector="$1"
+        if [[ "$selector" == /* || "$selector" == */ ]]; then
+          if ! tool_rule_is_regex "$selector"; then
+            echo "invalid TOOLS regex rule (expected /ERE/): $selector" >&2
+            exit 2
+          fi
+          local regex
+          regex="$(tool_rule_regex "$selector")"
+          set +e
+          [[ "" =~ $regex ]]
+          local status=$?
+          set -e
+          if [[ "$status" -eq 2 ]]; then
+            echo "invalid TOOLS regular expression: $selector" >&2
+            exit 2
+          fi
+        fi
+      }
+
+      if [[ -n "''${TOOLS:-}" ]]; then
+        IFS=',' read -r -a tool_rules <<< "$TOOLS"
+        for i in "''${!tool_rules[@]}"; do
+          trim_tool_rule "''${tool_rules[$i]}"
+          rule="$trimmed_tool_rule"
+          if [[ -z "$rule" ]]; then
+            echo "TOOLS contains an empty rule" >&2
+            exit 2
+          fi
+          tool_rules[i]="$rule"
+          selector="''${rule#-}"
+          if [[ -z "$selector" ]]; then
+            echo "TOOLS contains an empty exclusion rule" >&2
+            exit 2
+          fi
+          if [[ "$rule" != -* ]]; then
+            tool_has_include=1
+          fi
+          validate_tool_rule "$selector"
+        done
+      fi
+
+      tool_rule_matches() {
+        local name="$1"
+        local selector="$2"
+        if tool_rule_is_regex "$selector"; then
+          local regex
+          regex="$(tool_rule_regex "$selector")"
+          [[ "$name" =~ $regex ]]
+        else
+          [[ "$name" == "$selector" ]]
+        fi
+      }
+
       tool_selected() {
         local name="$1"
-        [[ -z "''${TOOLS:-}" ]] || [[ ",''${TOOLS}," == *",$name,"* ]]
+        local rule selector
+        local included=1
+        if [[ "$tool_has_include" -eq 1 ]]; then
+          included=0
+        fi
+        for rule in "''${tool_rules[@]}"; do
+          selector="''${rule#-}"
+          if tool_rule_matches "$name" "$selector"; then
+            if [[ "$rule" == -* ]]; then
+              return 1
+            fi
+            included=1
+          fi
+        done
+        [[ "$included" -eq 1 ]]
       }
 
       workload_selected() {
