@@ -7,12 +7,13 @@
 //! closure/thunk opcodes.
 
 const std = @import("std");
-const Chunk = @import("chunk.zig").Chunk;
-const ChunkRegistry = @import("chunk.zig").ChunkRegistry;
-const opcode_mod = @import("opcode.zig");
+const bytecode = @import("../../bytecode.zig");
+const Chunk = bytecode.Chunk;
+const ChunkRegistry = bytecode.ChunkRegistry;
+const opcode_mod = bytecode.opcode;
 const OpCode = opcode_mod.OpCode;
-const encoding = @import("encoding.zig");
-const inspect = @import("inspect.zig");
+const encoding = bytecode.encoding;
+const inspect = bytecode.inspect;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const intern_mod = @import("runtime").intern;
@@ -1925,7 +1926,7 @@ fn readU32(code: []const u8, ip: usize) u32 {
     return encoding.readU32(code, ip);
 }
 
-const ChunkBuilder = @import("chunk.zig").ChunkBuilder;
+const ChunkBuilder = bytecode.ChunkBuilder;
 
 test "disassembling a chunk prints arithmetic opcode names and jump targets" {
     const allocator = std.testing.allocator;

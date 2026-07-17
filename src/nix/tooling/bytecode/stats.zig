@@ -1,10 +1,11 @@
 //! Corpus-level bytecode analysis and reporting for `fix disasm --stats`.
 
 const std = @import("std");
-const opcode_mod = @import("opcode.zig");
-const encoding = @import("encoding.zig");
+const bytecode = @import("../../bytecode.zig");
+const opcode_mod = bytecode.opcode;
+const encoding = bytecode.encoding;
 const OpCode = opcode_mod.OpCode;
-const ChunkRegistry = @import("chunk.zig").ChunkRegistry;
+const ChunkRegistry = bytecode.ChunkRegistry;
 const ChunkId = @import("runtime").types.ChunkId;
 
 /// One row of counts + code bytes.

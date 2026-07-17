@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Evaluator = @import("../../eval.zig").Evaluator;
-const disasm = @import("../../bytecode.zig").disasm;
+const disasm = @import("../../tooling/bytecode.zig").disasm;
 
 /// One decoded disassembler line: the opcode name and its 0-based position
 /// in the (depth-first, recursive) disassembly of `source`'s compiled

@@ -6,7 +6,7 @@
 
 pub const runtime = @import("runtime");
 pub const syntax = @import("syntax");
-pub const bytecode = @import("bytecode.zig");
+pub const bytecode = @import("tooling/bytecode.zig");
 pub const compiler = @import("compiler.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const execution = @import("execution.zig");

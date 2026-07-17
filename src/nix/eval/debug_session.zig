@@ -37,9 +37,8 @@ pub const DebugFrame = struct {
 
 pub fn frame(ctx: Context, i: usize) DebugFrame {
     const f = &ctx.vm.frames[i];
-    const symbols: bytecode.disasm.Symbols = .{ .intern = ctx.intern, .registry = ctx.registry };
     const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip);
-    const file_id = if (span) |s| s.file else bytecode.inspect.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, symbols.registry);
+    const file_id = if (span) |s| s.file else bytecode.inspect.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, ctx.registry);
     return .{
         .chunk_id = f.chunk_id,
         .file = if (file_id) |fid| ctx.intern.get(fid) else null,
