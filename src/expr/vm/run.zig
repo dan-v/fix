@@ -574,7 +574,7 @@ fn opPushBuiltins(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dept
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
-const InternOp = enum { find_file, get_attr, lookup_with };
+const InternOp = enum { find_file, get_attr, has_attr_strict, lookup_with };
 
 /// Handlers whose only encoding distinction is a u16/u32 intern id.
 fn internOp(comptime operation: InternOp, comptime wide: bool) HandlerFn {
@@ -592,6 +592,12 @@ fn internOp(comptime operation: InternOp, comptime wide: bool) HandlerFn {
                 .get_attr => {
                     const attrs_val = vm.stack[vm.sp - 1];
                     vm.stack[vm.sp - 1] = try access.getAttrValue(vm, attrs_val, name_id);
+                    return dispatch(vm, frame, code, ip + operand_len, stop_depth);
+                },
+                .has_attr_strict => {
+                    const attrs = try force.forceValue(vm, vm.stack[vm.sp - 1]);
+                    if (!attrs.isAttrs()) return trace.typeErrorExpected(vm, "attrs", attrs);
+                    vm.stack[vm.sp - 1] = Value.boolVal((try vm.heap.getAttrValueOpt(attrs.asObjectId(), name_id)) != null);
                     return dispatch(vm, frame, code, ip + operand_len, stop_depth);
                 },
                 .lookup_with => {
@@ -1210,6 +1216,8 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .cell_init_w => slotOp(.cell_init, true),
         .attr_get => internOp(.get_attr, false),
         .attr_get_w => internOp(.get_attr, true),
+        .attr_has_strict => internOp(.has_attr_strict, false),
+        .attr_has_strict_w => internOp(.has_attr_strict, true),
         .attr_get_dyn => opGetAttrDynamic,
         .attr_get_dyn_or => opGetAttrDynamicOr,
         .attr_get_path_dyn_or => staticPathOp(.dynamic_or, false),

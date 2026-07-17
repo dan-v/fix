@@ -194,6 +194,25 @@ test "evaluate compares strings lexically" {
     try std.testing.expectEqualStrings("true", output);
 }
 
+test "evaluate fully applied operator-equivalent builtins" {
+    const output = try renderForTest(
+        \\builtins.toJSON [
+        \\  (builtins.sub 9 4)
+        \\  (builtins.mul 3 7)
+        \\  (builtins.div 20 4)
+        \\  (builtins.lessThan 2 3)
+        \\  (builtins.getAttr "x" { x = 11; })
+        \\  (builtins.hasAttr "x" { x = 1 / 0; })
+        \\]
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("\"[5,21,5,true,11,true]\"", output);
+
+    const shadowed = try renderForTest("let builtins = { sub = a: b: 42; }; in builtins.sub 9 4");
+    defer std.testing.allocator.free(shadowed);
+    try std.testing.expectEqualStrings("42", shadowed);
+}
+
 test "evaluate checks attribute paths without forcing final value" {
     const present = try renderForTest("({ a.b = 1 / 0; } ? a.b)");
     defer std.testing.allocator.free(present);

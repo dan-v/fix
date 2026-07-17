@@ -272,6 +272,11 @@ pub const OpCode = enum(u8) {
     /// Select an attribute from attrset on stack top with a wide intern id.
     /// Operand: 4-byte InternId.
     attr_get_w,
+    /// Strict single-name existence test used by saturated builtins.hasAttr.
+    /// Unlike attr_has_path, a non-attrset operand raises TypeError.
+    attr_has_strict,
+    /// Wide-intern-id form of attr_has_strict.
+    attr_has_strict_w,
     /// Select an attribute by a runtime string name.
     /// Stack layout before: [attrs, name].
     attr_get_dyn,
@@ -496,6 +501,8 @@ pub fn layout(op: OpCode) []const Operand {
         // Attribute access.
         .attr_get => comptime &[_]Operand{.{ .intern = .b2 }},
         .attr_get_w => comptime &[_]Operand{.{ .intern = .b4 }},
+        .attr_has_strict => comptime &[_]Operand{.{ .intern = .b2 }},
+        .attr_has_strict_w => comptime &[_]Operand{.{ .intern = .b4 }},
         .attr_get_path_or, .attr_get_path_dyn_or, .attr_has_path => comptime &[_]Operand{.{ .attr_path = .b2 }},
         .attr_get_path_or_w, .attr_get_path_dyn_or_w, .attr_has_path_w => comptime &[_]Operand{.{ .attr_path = .b4 }},
         .attr_get_path_mix_or, .attr_has_path_mix => comptime &[_]Operand{.mix},

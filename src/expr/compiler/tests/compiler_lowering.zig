@@ -113,6 +113,43 @@ test "compileBinary emits comparison opcodes for non-literal operands" {
     try testing.expect(eq_d.contains("cmp_eq"));
 }
 
+test "fully applied operator-equivalent builtins lower to VM opcodes" {
+    var ev = try Evaluator.init(testing.allocator, 0);
+    defer ev.deinit();
+
+    const cases = [_]struct { source: []const u8, opcode: []const u8 }{
+        .{ .source = "a: b: builtins.sub a b", .opcode = "int_sub" },
+        .{ .source = "a: b: builtins.mul a b", .opcode = "int_mul" },
+        .{ .source = "a: b: builtins.div a b", .opcode = "int_div" },
+        .{ .source = "a: b: builtins.lessThan a b", .opcode = "cmp_lt" },
+        .{ .source = "s: builtins.getAttr \"x\" s", .opcode = "loc_get_attr" },
+        .{ .source = "s: builtins.hasAttr \"x\" s", .opcode = "attr_has_strict" },
+    };
+    for (cases) |case| {
+        var d = try disassemble(&ev, case.source);
+        defer d.deinit(testing.allocator);
+        try testing.expect(d.contains(case.opcode));
+        try testing.expect(!d.contains("call_n"));
+        try testing.expect(!d.contains("call_tail_n"));
+        try testing.expect(!d.contains("push_builtins"));
+    }
+}
+
+test "builtin opcode lowering requires saturation and the global builtins set" {
+    var ev = try Evaluator.init(testing.allocator, 0);
+    defer ev.deinit();
+
+    var partial = try disassemble(&ev, "builtins.sub 1");
+    defer partial.deinit(testing.allocator);
+    try testing.expect(partial.contains("push_builtins"));
+    try testing.expect(partial.contains("call") or partial.contains("call_tail"));
+
+    var shadowed = try disassemble(&ev, "let builtins = { sub = a: b: 42; }; in builtins.sub 1 2");
+    defer shadowed.deinit(testing.allocator);
+    try testing.expect(shadowed.contains("call_n") or shadowed.contains("call_tail_n"));
+    try testing.expect(!shadowed.contains("int_sub"));
+}
+
 test "compileBinary folds literal-on-literal arithmetic to a constant instead of emitting an opcode" {
     var ev = try Evaluator.init(testing.allocator, 0);
     defer ev.deinit();

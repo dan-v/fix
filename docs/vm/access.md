@@ -11,6 +11,7 @@ Attrsets are stored as arrays of `(InternId, Value)` entries kept **sorted by na
 | op | stack / operand | behavior |
 |---|---|---|
 | `attr_get` (`_w`) | `[attrs]`, name id operand | force attrs, binary-search name, force + push the value. |
+| `attr_has_strict` (`_w`) | `[attrs]`, name id operand | strict single-name existence test for lowered `builtins.hasAttr`; rejects non-attrsets and does not force the member. |
 | `attr_get_dyn` | `[attrs, name]` | name is a runtime string; force it to an `InternId`, then as `attr_get`. |
 | `attr_get_dyn_or` | `[attrs, name, default]` | dynamic select with a lazy default if missing / non-attrs. |
 | `attr_get_path_or` (`_w`) | `[attrs, default]`, N static ids | walk N segments; any missing segment ⇒ force+return the default. |

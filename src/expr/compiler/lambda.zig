@@ -24,6 +24,7 @@ const control = @import("control.zig");
 const strictness = @import("strictness.zig");
 const let = @import("let.zig");
 const refs_mod = @import("refs.zig");
+const fold = @import("fold.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -100,6 +101,7 @@ fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
             k += 1;
             head = unwrapParens(head.data.apply.func);
         }
+        if (k == 2 and head.tag != .apply and try compileFullyAppliedBuiltin(self, head, args[1], args[0])) return;
         if (k >= 2 and head.tag != .apply) {
             // `args` is in reverse (last-applied first); emit head then
             // a1..aK in application order.
@@ -135,6 +137,72 @@ fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
         try thunks.compileApplyArgThunk(self, ap.arg);
     }
     try emit.emitOp(self, op);
+}
+
+const InlineBuiltin = enum { sub, mul, div, less_than, get_attr, has_attr };
+
+/// Recognize `builtins.<name>` only when `builtins` really denotes the global
+/// set. A local/ancestor binding shadows it, and scopedImport replaces the
+/// whole base environment, so neither case may use this intrinsic path.
+fn inlineBuiltinHead(self: *Compiler, head_raw: *const Node) !?InlineBuiltin {
+    if (self.scoped_base) return null;
+    const head = unwrapParens(head_raw);
+    if (head.tag != .attr_path or head.data.attr_path.segments.len != 1) return null;
+    const root = unwrapParens(head.data.attr_path.root);
+    if (root.tag != .identifier) return null;
+    const root_name = self.source[root.data.atom.offset .. root.data.atom.offset + root.data.atom.len];
+    if (!std.mem.eql(u8, root_name, "builtins")) return null;
+
+    const builtins_id = try self.intern.intern("builtins");
+    if (scope.resolveLocalId(self, builtins_id) != null) return null;
+    var parent = self.parent;
+    while (parent) |p| : (parent = p.parent) {
+        if (scope.resolveLocalId(p, builtins_id) != null) return null;
+    }
+
+    const segment = head.data.attr_path.segments[0];
+    if (attrs_mod.attrSegmentHasInterpolation(self, segment)) return null;
+    const name = self.intern.get(try attrs_mod.attrSegmentNameId(self, segment));
+    if (std.mem.eql(u8, name, "sub")) return .sub;
+    if (std.mem.eql(u8, name, "mul")) return .mul;
+    if (std.mem.eql(u8, name, "div")) return .div;
+    if (std.mem.eql(u8, name, "lessThan")) return .less_than;
+    if (std.mem.eql(u8, name, "getAttr")) return .get_attr;
+    if (std.mem.eql(u8, name, "hasAttr")) return .has_attr;
+    return null;
+}
+
+/// Lower saturated builtins with exact VM-operator equivalents. Arithmetic
+/// operands are evaluated in builtin argument order. Attribute operations are
+/// limited to a compile-time string name, which removes both applications and
+/// the builtins-set lookup without changing name-vs-set error ordering.
+fn compileFullyAppliedBuiltin(self: *Compiler, head: *const Node, first: *const Node, second: *const Node) !bool {
+    const builtin = try inlineBuiltinHead(self, head) orelse return false;
+    switch (builtin) {
+        .sub, .mul, .div, .less_than => {
+            try self.compileNode(first);
+            try self.compileNode(second);
+            try emit.emitOp(self, switch (builtin) {
+                .sub => .int_sub,
+                .mul => .int_mul,
+                .div => .int_div,
+                .less_than => .cmp_lt,
+                else => unreachable,
+            });
+        },
+        .get_attr, .has_attr => {
+            const name = (try fold.tryFoldConstant(self, first)) orelse return false;
+            if (!name.isString()) return false;
+            const name_id = name.asInternId();
+            try self.compileNode(second);
+            if (builtin == .get_attr) {
+                try emit.emitGetAttr(self, name_id);
+            } else {
+                try emit.emitInternOp(self, .attr_has_strict, .attr_has_strict_w, name_id);
+            }
+        },
+    }
+    return true;
 }
 
 /// Detect the forwarding shape `param: f param` where `f` is a captured
