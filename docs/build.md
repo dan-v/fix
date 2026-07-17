@@ -16,7 +16,7 @@ The build-module graph follows independently reusable or consumed groups. Within
 | `store` | `src/store/root.zig` | `base`, `runtime` | derivations, file snapshots, NAR, realization, daemon protocol/runtime |
 | `fetchers` | `src/fetchers/root.zig` | `base`, `runtime`, `store`, libcurl, libgit2 | forge planning, remote-source cache and transports |
 | `expr` | `src/expr/root.zig` | `build_options`, `base`, `syntax`, `runtime`, `store`, `fetchers` | bytecode/compiler/VM, builtins, evaluator workers and diagnostics |
-| `cli` | `src/cli/cli.zig` | `base`, `expr`, `runtime`, `syntax`, `store` | command surface, argument parsing, rendering, progress |
+| `cli` | `src/cli/root.zig` | `base`, `expr`, `runtime`, `syntax`, `store` | command surface, argument parsing, rendering, progress |
 | `process_support` | `src/process_support.zig` | `base`, `runtime` | executable-only allocator composition |
 
 `cli` is the in-repository consumer, so it imports the durable modules it uses directly. Evaluation commands use `expr`; value inspection uses `runtime`; parsing and debugger highlighting use `syntax`; realization and daemon commands use `store`. The executable (`src/main.zig`) imports `cli` and the private `process_support` composition module.

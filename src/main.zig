@@ -4,19 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli");
 const process_support = @import("process_support");
-const repl = cli.repl;
-const disasm_cmd = cli.disasm;
-const inspect_cmd = cli.inspect;
-const trace_cmd = cli.trace;
-const thunks_cmd = cli.thunks;
-const store_cmd = cli.store;
-const eval_cmd = cli.eval;
-const parse_cmd = cli.parse;
-const instantiate_cmd = cli.instantiate;
-const build_cmd = cli.build;
-const run_cmd = cli.run;
-const shell_cmd = cli.shell;
-const switch_cmd = cli.@"switch";
+const commands = cli.commands;
 
 const ArgsIterator = std.process.Args.Iterator;
 const SubcommandRun = *const fn (cli.ProcessContext, std.process.Init, *ArgsIterator) anyerror!u8;
@@ -27,19 +15,19 @@ const Subcommand = struct {
 };
 
 const subcommands = [_]Subcommand{
-    .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = eval_cmd.run },
-    .{ .name = "parse", .summary = "parse an expression and print its AST as JSON", .run = parse_cmd.run },
-    .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = instantiate_cmd.run },
-    .{ .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .run = build_cmd.run },
-    .{ .name = "run", .summary = "build a derivation and run a program from its output", .run = run_cmd.run },
-    .{ .name = "shell", .summary = "build a derivation and open a shell with its bin/ on PATH", .run = shell_cmd.run },
-    .{ .name = "switch", .summary = "build and activate a NixOS/nix-darwin/home-manager configuration", .run = switch_cmd.run },
-    .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = repl.run },
-    .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = disasm_cmd.run },
-    .{ .name = "inspect", .summary = "evaluate and dump evaluator statistics", .run = inspect_cmd.run },
-    .{ .name = "trace", .summary = "work with binary VM trace files", .run = trace_cmd.run },
-    .{ .name = "thunks", .summary = "diff thunks-logs to find divergent resolutions", .run = thunks_cmd.run },
-    .{ .name = "store", .summary = "query the nix-daemon (protocol version, path validity)", .run = store_cmd.run },
+    .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = commands.eval.run },
+    .{ .name = "parse", .summary = "parse an expression and print its AST as JSON", .run = commands.parse.run },
+    .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = commands.instantiate.run },
+    .{ .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .run = commands.build.run },
+    .{ .name = "run", .summary = "build a derivation and run a program from its output", .run = commands.run.run },
+    .{ .name = "shell", .summary = "build a derivation and open a shell with its bin/ on PATH", .run = commands.shell.run },
+    .{ .name = "switch", .summary = "build and activate a NixOS/nix-darwin/home-manager configuration", .run = commands.@"switch".run },
+    .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = commands.repl.run },
+    .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = commands.disasm.run },
+    .{ .name = "inspect", .summary = "evaluate and dump evaluator statistics", .run = commands.inspect.run },
+    .{ .name = "trace", .summary = "work with binary VM trace files", .run = commands.trace.run },
+    .{ .name = "thunks", .summary = "diff thunks-logs to find divergent resolutions", .run = commands.thunks.run },
+    .{ .name = "store", .summary = "query the nix-daemon (protocol version, path validity)", .run = commands.store.run },
 };
 
 fn writeTopUsage(writer: *std.Io.Writer) !void {

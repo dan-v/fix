@@ -13,8 +13,8 @@
 const std = @import("std");
 const engine = @import("expr");
 const syntax = @import("syntax");
-const args = @import("args.zig");
-const setup = @import("setup.zig");
+const args = @import("../args.zig");
+const setup = @import("../setup.zig");
 
 const Evaluator = engine.Evaluator;
 const Parser = syntax.parser.Parser;
@@ -30,7 +30,7 @@ pub const synopsis =
     \\deprecated features are reported as errors, as in `nix-instantiate --parse`.
 ;
 
-pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {

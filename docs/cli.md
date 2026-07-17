@@ -2,7 +2,7 @@
 
 *The command surface and the introspection tools that read the machine's mind.*
 
-The command surface lives in the `cli` module (`src/cli/cli.zig` is a module-only facade over `src/cli/`). It consumes `expr`, `runtime`, `syntax`, and `store` directly according to each command's needs. Commands import their focused siblings: `presentation.zig` owns terminal policy and styling, `progress.zig` renders evaluation progress, and `realize.zig` owns the shared evaluation-to-build workflow. `src/main.zig` is composition only; it imports `cli`, sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar, and `src/cli/setup.zig` folds common `Options → Evaluator` configuration through `expr` and `store` types. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
+The command surface lives in the `cli` module (`src/cli/root.zig`). User-facing entry points are grouped under `src/cli/commands/`; the module exposes them as `cli.commands`, while shared CLI infrastructure stays at the module root. It consumes `expr`, `runtime`, `syntax`, and `store` directly according to each command's needs. Commands import focused helpers: `presentation.zig` owns terminal policy and styling, `progress.zig` renders evaluation progress, and `realize.zig` owns the shared evaluation-to-build workflow. `src/main.zig` is composition only; it imports `cli`, sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar, and `src/cli/setup.zig` folds common `Options → Evaluator` configuration through `expr` and `store` types. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
 
 ## Invocation
 
@@ -34,7 +34,7 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 ## The repl
 
-`fix repl` (`src/cli/repl.zig` + `src/cli/repl/`) has two strictly separated modes, decided once at startup:
+`fix repl` (`src/cli/commands/repl.zig` + `src/cli/repl/`) has two strictly separated modes, decided once at startup:
 
 - **Interactive** — stdin *and* stdout are a tty and `--bare` was not given. A hand-rolled raw-mode line editor: emacs-style editing (C-a/C-e/C-k/C-u/C-w/C-y + kill ring, M-b/M-f word motion), persistent history (`$XDG_STATE_HOME/fix/repl-history`, multiline entries round-trip) with C-r incremental search, Tab completion, bracketed paste (pasted text never triggers completion or submission), SIGWINCH-aware minimal-repaint rendering, and C-z suspend/resume. Raw mode is restored on **every** exit path — orderly return, panic (SIGABRT), fatal signal — via a saved-termios global + chained signal handlers (`repl/term.zig`).
 - **Bare** — `--bare`, or any non-tty end: a plain read-a-line loop with zero escape sequences (prompts only when stdin is a tty), for pipes and expect-style automation. Lines still accumulate until they parse as a complete expression, so multiline scripts pipe fine.

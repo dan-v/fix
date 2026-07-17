@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const engine = @import("expr");
-const presentation = @import("presentation.zig");
+const presentation = @import("../presentation.zig");
 const bytecode = engine.bytecode;
 const builtin = @import("builtin");
 
@@ -26,7 +26,7 @@ const usage =
     \\
 ;
 
-const SourceArg = @import("args.zig").SourceArg;
+const SourceArg = @import("../args.zig").SourceArg;
 
 const Options = struct {
     source: ?SourceArg = null,
@@ -36,7 +36,7 @@ const Options = struct {
     workers: ?u8 = null,
 };
 
-pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
     const options = parseOptions(args_iter) catch |err| switch (err) {
         error.Help => {
@@ -59,7 +59,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
         options.workers orelse @intCast(@min(@as(u32, 8), @as(u32, @intCast(try std.Thread.getCpuCount()))));
 
     // No `--hugetlb` in this command's parser; use automatic selection.
-    @import("setup.zig").applyMemoryBacking(null);
+    @import("../setup.zig").applyMemoryBacking(null);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     ev.setEnvironment(init.environ_map);

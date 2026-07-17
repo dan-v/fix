@@ -117,7 +117,7 @@ pub fn build(b: *std.Build) void {
     expr_mod.addImport("fetchers", fetchers_mod);
 
     const cli_mod = b.addModule("cli", .{
-        .root_source_file = b.path("src/cli/cli.zig"),
+        .root_source_file = b.path("src/cli/root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,

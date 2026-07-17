@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const engine = @import("expr");
-const presentation = @import("presentation.zig");
+const presentation = @import("../presentation.zig");
 const bytecode = engine.bytecode;
 const trace_log = engine.vm.trace_log;
 
@@ -30,7 +30,7 @@ const usage =
     \\
 ;
 
-pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
     _ = allocator;
     const sub = args_iter.next() orelse {

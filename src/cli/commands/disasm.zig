@@ -10,10 +10,10 @@ const std = @import("std");
 const engine = @import("expr");
 const runtime = @import("runtime");
 const bytecode = engine.bytecode;
-const presentation = @import("presentation.zig");
-const args = @import("args.zig");
-const setup = @import("setup.zig");
-const runner = @import("eval_support.zig");
+const presentation = @import("../presentation.zig");
+const args = @import("../args.zig");
+const setup = @import("../setup.zig");
+const runner = @import("../eval_support.zig");
 
 const Evaluator = engine.Evaluator;
 const ChunkId = runtime.types.ChunkId;
@@ -29,7 +29,7 @@ pub const synopsis =
     \\--no-pager). For color through the pager, set e.g. PAGER='less -R' or LESS=R.
 ;
 
-pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {

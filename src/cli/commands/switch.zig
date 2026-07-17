@@ -25,10 +25,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const engine = @import("expr");
-const realization_workflow = @import("realize.zig");
-const args = @import("args.zig");
-const setup = @import("setup.zig");
-const eval_support = @import("eval_support.zig");
+const realization_workflow = @import("../realize.zig");
+const args = @import("../args.zig");
+const setup = @import("../setup.zig");
+const eval_support = @import("../eval_support.zig");
 const build = @import("build.zig");
 
 const Evaluator = engine.Evaluator;
@@ -76,7 +76,7 @@ pub const synopsis =
     \\remote host with --target-host (build stays local; the closure is copied).
 ;
 
-pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
     // The action is the first positional (like nixos-rebuild). Peek it before
     // the shared parser, which would otherwise treat it as a source path.
@@ -121,7 +121,7 @@ pub fn run(process: @import("process_context.zig").ProcessContext, init: std.pro
 // Phase A: build the toplevel, then activate (in-process or via sudo re-exec)
 // ---------------------------------------------------------------------------
 
-fn buildAndSwitch(process: @import("process_context.zig").ProcessContext, init: std.process.Init, target: Target, action: Action, options: *args.Options) !u8 {
+fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, target: Target, action: Action, options: *args.Options) !u8 {
     const allocator = process.allocator;
     // Construct the installable per target, unless the user fully specified one
     // with `-A`. For flakes, the whole attr path is baked into the fragment; for

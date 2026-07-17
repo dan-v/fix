@@ -3,7 +3,7 @@
 //! answer store-validity questions without shelling out to `nix`.
 
 const std = @import("std");
-const presentation = @import("presentation.zig");
+const presentation = @import("../presentation.zig");
 const store_domain = @import("store");
 const store = store_domain.daemon;
 const nar = store_domain.nar;
@@ -23,7 +23,7 @@ const usage =
     \\
 ;
 
-pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
     const sub = args_iter.next() orelse {
         std.debug.print("{s}", .{usage});

@@ -18,26 +18,26 @@
 //! not accrete across evaluations.
 
 const std = @import("std");
-const presentation = @import("presentation.zig");
-const progress_ui = @import("progress.zig");
-const args = @import("args.zig");
-const setup = @import("setup.zig");
-const debugger = @import("debugger.zig");
-const render_err = @import("render.zig");
+const presentation = @import("../presentation.zig");
+const progress_ui = @import("../progress.zig");
+const args = @import("../args.zig");
+const setup = @import("../setup.zig");
+const debugger = @import("../debugger.zig");
+const render_err = @import("../render.zig");
 const engine = @import("expr");
 const runtime = @import("runtime");
 const future_mod = runtime.future;
 const types = runtime.types;
 
-const commands = @import("repl/commands.zig");
-const check = @import("repl/check.zig");
-const history_mod = @import("repl/history.zig");
-const editor_mod = @import("repl/editor.zig");
-const keys_mod = @import("repl/keys.zig");
-const render_mod = @import("repl/render.zig");
-const term_mod = @import("repl/term.zig");
-const complete_mod = @import("repl/complete.zig");
-const pager_mod = @import("repl/pager.zig");
+const commands = @import("../repl/commands.zig");
+const check = @import("../repl/check.zig");
+const history_mod = @import("../repl/history.zig");
+const editor_mod = @import("../repl/editor.zig");
+const keys_mod = @import("../repl/keys.zig");
+const render_mod = @import("../repl/render.zig");
+const term_mod = @import("../repl/term.zig");
+const complete_mod = @import("../repl/complete.zig");
+const pager_mod = @import("../repl/pager.zig");
 
 const Options = args.Options;
 const Evaluator = engine.Evaluator;
@@ -53,7 +53,7 @@ const prompt_main = "fix> ";
 const prompt_cont = "...> ";
 
 /// `fix repl` subcommand entry point.
-pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
@@ -822,15 +822,15 @@ fn parseBinding(input: []const u8) ?Binding {
 }
 
 test {
-    _ = @import("repl/keys.zig");
-    _ = @import("repl/width.zig");
-    _ = @import("repl/editor.zig");
-    _ = @import("repl/render.zig");
-    _ = @import("repl/history.zig");
-    _ = @import("repl/check.zig");
-    _ = @import("repl/commands.zig");
-    _ = @import("repl/complete.zig");
-    _ = @import("repl/pager.zig");
+    _ = @import("../repl/keys.zig");
+    _ = @import("../repl/width.zig");
+    _ = @import("../repl/editor.zig");
+    _ = @import("../repl/render.zig");
+    _ = @import("../repl/history.zig");
+    _ = @import("../repl/check.zig");
+    _ = @import("../repl/commands.zig");
+    _ = @import("../repl/complete.zig");
+    _ = @import("../repl/pager.zig");
 }
 
 const testing = std.testing;

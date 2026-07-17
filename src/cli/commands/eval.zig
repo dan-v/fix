@@ -3,13 +3,13 @@
 
 const std = @import("std");
 const engine = @import("expr");
-const progress_ui = @import("progress.zig");
-const args = @import("args.zig");
-const setup = @import("setup.zig");
-const eval_support = @import("eval_support.zig");
-const debugger = @import("debugger.zig");
-const trace_setup = @import("trace_setup.zig");
-const stats = @import("stats.zig");
+const progress_ui = @import("../progress.zig");
+const args = @import("../args.zig");
+const setup = @import("../setup.zig");
+const eval_support = @import("../eval_support.zig");
+const debugger = @import("../debugger.zig");
+const trace_setup = @import("../trace_setup.zig");
+const stats = @import("../stats.zig");
 const timeline = engine.probe.timeline;
 
 const Evaluator = engine.Evaluator;
@@ -22,7 +22,7 @@ pub const synopsis =
     \\current directory).
 ;
 
-pub fn run(process: @import("process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
