@@ -1,8 +1,9 @@
 //! Attribute-set and list access: getAttr / getAttrPath / hasAttrPath, functor
-//! (`__functor`) calls, and `with`-scope lookup, fronted by a thread-local inline
+//! (`__functor`) calls, and `with`-scope lookup, fronted by a per-worker inline
 //! attr cache. Also the demand-sibling-sweep trigger — a cache miss speculatively
 //! prefetches the set's other members.
-//! Concurrency: the attr cache is per-worker thread-local, registered so the STW collector marks its live entries.
+//! Concurrency: the attr cache is private to an evaluator OS thread and its
+//! lazily allocated bundle is registered so the STW collector marks live entries.
 const std = @import("std");
 const vm_mod = @import("context.zig");
 const types = @import("runtime").types;
@@ -22,6 +23,7 @@ const prof_census = @import("../probe.zig").prof_census;
 const gc = @import("runtime").gc;
 const sched_mod = @import("../eval/workers/scheduler.zig");
 const heap_mod = @import("runtime").heap;
+const thread_caches = @import("thread_caches.zig");
 
 const VM = vm_mod.VM;
 const readU32 = vm_mod.readU32;
@@ -81,13 +83,13 @@ pub fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
     return force.forceValue(self, try cachedAttrLookup(self, attrs.asObjectId(), name_id));
 }
 
-/// Thread-local inline cache: (heap_token, obj_id, name_id) → raw
+/// Per-worker-thread inline cache: (heap_token, obj_id, name_id) → raw
 /// attr value. Hits skip the binary search inside
 /// `heap.getAttrValue`. The cached value is pre-force; callers force
 /// the result if they need a resolved value.
 inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId) !Value {
     const slot_idx = attrCacheIndex(obj_id, name_id);
-    const slot = &attr_cache[slot_idx];
+    const slot = &thread_caches.get().attr_cache[slot_idx];
     const token = self.heap.token;
     if (slot.heap_token == token and slot.obj_id == obj_id and slot.name_id == name_id) {
         if (comptime prof.enabled) {
@@ -170,39 +172,14 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
     }
 }
 
-const attr_cache_size: usize = 8192;
-
-const AttrCacheSlot = struct {
-    heap_token: u64 = 0,
-    obj_id: types.ObjectId = 0,
-    name_id: InternId = 0,
-    value: Value = Value.null_val,
-};
-
-threadlocal var attr_cache: [attr_cache_size]AttrCacheSlot = @splat(.{});
-
 /// GC: the attr cache holds attr Values keyed by heap token. Its
-/// entries can be the momentary sole reference to a shared attr value, so
-/// valid entries (token match) are roots. Thread-local (per worker), so each
-/// worker publishes its cache address into a registry the stop-the-world
-/// collector walks (it can't reach other threads' TLS otherwise).
-const gc_max_workers = 256;
-var attr_cache_registry: [gc_max_workers]?*[attr_cache_size]AttrCacheSlot = @splat(null);
-
-/// Called by each worker (on its own thread) before it can allocate.
-pub fn gcRegisterAttrCache(worker_id: u8) void {
-    attr_cache_registry[worker_id] = &attr_cache;
-}
-
-pub fn gcUnregisterAttrCache(worker_id: u8) void {
-    attr_cache_registry[worker_id] = null;
-}
-
-/// Mark every registered worker's live attr-cache entries. STW-only.
+/// entries can be the momentary sole reference to a shared attr value, so valid
+/// entries (token match) are roots. Mark every registered worker's entries at
+/// the stop-the-world point.
 pub fn gcMarkAttrCache(tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
-    for (attr_cache_registry) |maybe| {
-        const cache = maybe orelse continue;
-        for (cache) |*slot| {
+    for (thread_caches.registered()) |maybe| {
+        const caches = maybe orelse continue;
+        for (&caches.attr_cache) |*slot| {
             if (slot.heap_token == heap.token) tr.markValue(heap, slot.value);
         }
     }
@@ -213,7 +190,7 @@ inline fn attrCacheIndex(obj_id: types.ObjectId, name_id: InternId) usize {
     // hits the same slot, but different lookups on the same object
     // (e.g. `.x` and `.y`) land in different slots.
     const mixed: u64 = (@as(u64, obj_id) *% 0x9E3779B97F4A7C15) ^ @as(u64, name_id);
-    return @intCast(mixed % attr_cache_size);
+    return @intCast(mixed % thread_caches.attr_cache_size);
 }
 
 pub fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {

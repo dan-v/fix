@@ -2,7 +2,8 @@
 //! from capture descriptors (with trivial-body short-circuits), and function calls
 //! (doCall / callValue / doCallN, tail calls, partial applications), fronted by a
 //! per-call-site inline cache.
-//! Concurrency: the call IC is per-worker thread-local, heap-token-gated across evaluator instances.
+//! Concurrency: the call IC is private to each evaluator OS thread's lazily
+//! allocated cache bundle and heap-token-gated across evaluator instances.
 const std = @import("std");
 const vm_mod = @import("context.zig");
 const rt_builtins = @import("runtime").builtins;
@@ -27,6 +28,7 @@ const force = @import("force.zig");
 const trace_log = @import("trace_log.zig");
 const prof = @import("../probe.zig").prof;
 const run_mod = @import("run.zig");
+const thread_caches = @import("thread_caches.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -344,24 +346,13 @@ inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const
 /// (chunk_id, ip). On hit the registry hashtable lookup is skipped.
 ///
 /// Heap-token gated: chunk_ids aren't unique across Evaluator
-/// instances (each registry starts at 0), and the IC is threadlocal,
+/// instances (each registry starts at 0), and the IC outlives individual VMs,
 /// so a stale `ch_ptr` from a prior eval would point at a freed
 /// chunk. Matching `heap_token` invalidates the cache when the
 /// evaluator changes — same trick the attr IC uses.
-const CallICSlot = struct {
-    heap_token: u64 = 0,
-    caller_chunk_id: ChunkId = 0,
-    caller_ip: u32 = 0,
-    callee_chunk_id: ChunkId = 0,
-    callee_ch_ptr: ?*const Chunk = null,
-};
-
-const call_ic_size: usize = 256;
-threadlocal var call_ic: [call_ic_size]CallICSlot = @splat(.{});
-
 inline fn callICIndex(caller_chunk_id: ChunkId, caller_ip: u32) usize {
     const mixed: u64 = (@as(u64, caller_chunk_id) *% 0x9E3779B97F4A7C15) ^ @as(u64, caller_ip);
-    return @intCast(mixed % call_ic_size);
+    return @intCast(mixed % thread_caches.call_ic_size);
 }
 
 /// Resolve a closure's Chunk*, consulting the per-call-site IC keyed
@@ -371,7 +362,7 @@ inline fn closureChunkViaIC(self: *VM, callee_chunk_id: ChunkId) !*const Chunk {
     const caller = stack.currentFrame(self);
     const token = self.heap.token;
     const idx = callICIndex(caller.chunk_id, @intCast(caller.ip));
-    const slot = &call_ic[idx];
+    const slot = &thread_caches.get().call_ic[idx];
     if (slot.heap_token == token and
         slot.caller_chunk_id == caller.chunk_id and
         slot.caller_ip == caller.ip and

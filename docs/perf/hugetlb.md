@@ -9,7 +9,10 @@ With `--hugetlb` engaged, the two structures that dominate the eval's memory
 traffic are backed by explicit `MAP_HUGETLB` mappings instead of 4 KB pages:
 
 - the **flat object store** (`base/segments.zig FlatStore`) — a reserved
-  huge-page *prefix* grown chunk-wise (32 MB) ahead of the bump cursor;
+  huge-page *prefix* grown chunk-wise (32 MB) ahead of the bump cursor when
+  explicit hugetlb is engaged. Otherwise its ordinary `MAP_NORESERVE`
+  mapping is advised with `MADV_HUGEPAGE`, allowing transparent huge pages
+  with automatic 4 KB fallback;
 - the **value/attr/attr-pos segment stores** — their ≥64 MB doubling-tail
   segments are self-mapped with the same chunk-grown prefix scheme
   (`StableSegments` `huge_overlay_min`), so a mostly-empty 128–256 MB tail
@@ -23,8 +26,10 @@ One 2 MB TLB entry replaces 512 4 KB entries and first-touch faults drop
 wall (exact, 3/3 interleaved pairs), w=8 **page faults −57% / dTLB misses
 −47%**, and it eliminates a +202 ms bimodal slow mode under memory-pressure
 co-load entirely (w=16 co-loaded −20%). Output is byte-identical on/off.
-Transparent huge pages never fire on this mapping pattern (fresh `mmap`s,
-not long-lived faulted ranges), so the explicit pool is the only route.
+Transparent huge pages do cover the advised, sequentially-grown flat store
+(~750 MB `AnonHugePages` on the NixOS workload), but the short-lived block and
+segment mappings remain unreliable candidates. Explicit hugetlb also retains
+lower fault overhead and deterministic backing under memory pressure.
 
 ## Provisioning
 
@@ -74,12 +79,13 @@ Failure at any step unmaps the candidate and uses ordinary pages:
   allocator for that block; ownership of live hugetlb blocks is tracked so
   frees/resizes route to `munmap` and never poison the backing allocator.
 - **flat store** — the giant virtual reservation stays an ordinary
-  `MAP_NORESERVE` mapping; only its low prefix is overlaid (`MAP_FIXED`)
-  with reserved huge pages, extended under the store's write lock *before*
-  the cursor moves past it. A failed extension permanently degrades the
-  store's tail to normal 4 KB pages (the same invariant guarantees a later
-  overlay can never cover handed-out slots). Draining the pool mid-run can
-  only stop future extensions.
+  `MAP_NORESERVE` mapping, advised for transparent huge pages; only its low
+  prefix is overlaid (`MAP_FIXED`) with reserved huge pages, extended under
+  the store's write lock *before* the cursor moves past it. A failed extension
+  permanently degrades the store's tail to the ordinary advised mapping (THP
+  where available, 4 KB pages otherwise). The same invariant guarantees a
+  later overlay can never cover handed-out slots. Draining the pool mid-run
+  can only stop future extensions.
 
 Shrinking the pool (`vm.nr_hugepages=0`) under a running eval is safe:
 accepted mappings are already instantiated; new mappings fail and fall back.

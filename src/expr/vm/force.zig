@@ -2,8 +2,8 @@
 //! drives lazy evaluation, plus speculative (demand-invisible) forcing,
 //! collection fan-out, and the GC safepoints — the VM's hot serial path.
 //! Concurrency: a demander CAS-claims a thunk and spins then enrolls as a waiter
-//! on a peer-owned `.busy` one; the per-worker thunk-result memo and cache
-//! registries are thread-local, published for the STW collector to mark.
+//! on a peer-owned `.busy` one; each evaluator OS thread owns a lazily allocated
+//! thunk-result memo, published for the STW collector to mark.
 const std = @import("std");
 const builtin = @import("builtin");
 const vm_mod = @import("context.zig");
@@ -35,6 +35,7 @@ const ChunkId = types.ChunkId;
 const deferred_compile = @import("../compiler/deferred.zig");
 const force_label = @import("force_label.zig");
 const speculate = @import("force_speculate.zig");
+const thread_caches = @import("thread_caches.zig");
 
 /// Timeline source labels for thunks live in `force_label.zig`; re-exported
 /// so `vm_force.thunkLabel` keeps resolving for worker.zig.
@@ -76,7 +77,7 @@ const VM = vm_mod.VM;
 // the per-object thunk memoization can't share. ~10.8% of bytecode-thunk
 // computations on the NixOS toplevel are such duplicates.
 //
-// This is a bounded, **thread-local** (per-worker, zero-contention) cache
+// This is a bounded, per-worker-thread (zero-contention) cache
 // mapping (heap_token, chunk_id, ≤2 upvalues) → resolved Value. Before
 // computing a freshly-claimed bytecode thunk we check it; a hit resolves
 // the thunk to the cached value and skips re-running the body. Pure
@@ -84,52 +85,29 @@ const VM = vm_mod.VM;
 // entries across Evaluator instances (same trick as the attr inline
 // cache). Limited to ≤2-upvalue thunks so the key compares exactly with
 // no allocation — that's the inline-storage majority.
-const memo_index_bits = 14;
-const memo_size = 1 << memo_index_bits;
-const MemoSlot = struct {
-    token: u64 = 0, // 0 = empty (heap tokens start at 1)
-    chunk: u32 = 0,
-    count: u8 = 0,
-    up0: u64 = 0,
-    up1: u64 = 0,
-    value: Value = Value.null_val,
-};
-threadlocal var thunk_memo: [memo_size]MemoSlot = @splat(.{});
+const memo_size = thread_caches.memo_size;
 
 /// GC: the thunk-result memo holds Values keyed by heap token. An
 /// entry can be the momentary sole reference to a shared result, so valid
-/// entries (token match) are roots. The memo is thread-local (per worker),
-/// so each worker publishes the address of *its* memo into a registry the
-/// stop-the-world collector walks — it can't reach other threads' TLS
-/// otherwise. Bounded by worker id (u8).
-const gc_max_workers = 256;
-var thunk_memo_registry: [gc_max_workers]?*[memo_size]MemoSlot = @splat(null);
-
-/// Called by each worker (on its own thread) before it can allocate, so the
-/// collector can mark this worker's memo entries.
-pub fn gcRegisterThunkMemo(worker_id: u8) void {
-    thunk_memo_registry[worker_id] = &thunk_memo;
-}
-
+/// entries (token match) are roots. Each worker publishes its lazy cache bundle
+/// into a registry the stop-the-world collector walks.
 /// Register this worker's thread-local GC caches (thunk memo + attr cache)
 /// so the collector can mark them. Called once per worker before it runs.
 pub fn gcRegisterWorkerCaches(worker_id: u8) void {
-    gcRegisterThunkMemo(worker_id);
-    access.gcRegisterAttrCache(worker_id);
+    thread_caches.register(worker_id);
 }
 
 /// Remove cache pointers before a helper thread exits; its TLS storage becomes
 /// invalid immediately afterward and must not remain visible to a later GC.
 pub fn gcUnregisterWorkerCaches(worker_id: u8) void {
-    thunk_memo_registry[worker_id] = null;
-    access.gcUnregisterAttrCache(worker_id);
+    thread_caches.unregister(worker_id);
 }
 
 /// Mark every registered worker's live memo entries. STW-only (peers parked).
 pub fn gcMarkThunkMemo(tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
-    for (thunk_memo_registry) |maybe| {
-        const memo = maybe orelse continue;
-        for (memo) |*slot| {
+    for (thread_caches.registered()) |maybe| {
+        const caches = maybe orelse continue;
+        for (&caches.thunk_memo) |*slot| {
             if (slot.token == heap.token) tr.markValue(heap, slot.value);
         }
     }
@@ -792,7 +770,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     }
                 }
                 if (memo_key) |k| {
-                    const s = &thunk_memo[k.idx];
+                    const s = &thread_caches.get().thunk_memo[k.idx];
                     // Memo census: 14.8% hit rate over 2.07M probes (w=1
                     // NixOS toplevel) — hits save ~306K body runs, well
                     // over the probe's TLS-miss cost. A 4x smaller table
@@ -905,7 +883,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // same way via the resolved fast path. Almost always not a
                 // thunk → no work.
                 const whnf = if (result.isThunk()) derefForwarder(self, result, demand) else result;
-                if (memo_key) |k| thunk_memo[k.idx] = .{
+                if (memo_key) |k| thread_caches.get().thunk_memo[k.idx] = .{
                     .token = self.heap.token,
                     .chunk = k.chunk,
                     .count = k.count,

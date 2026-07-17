@@ -7,8 +7,10 @@
 //! first-touch faults 512x — measured −8.3% wall at w=1 on the NixOS
 //! toplevel, −57% faults / −47% dTLB misses at w=8, and it removes a +202 ms
 //! bimodal slow mode under memory-pressure co-load. Transparent huge pages
-//! don't fire on this workload's mapping pattern, so the explicit pool
-//! (`vm.nr_hugepages`) is the only route.
+//! work well for the flat store when its long sequential reservation is
+//! explicitly advised, but do not reliably cover the evaluator's shorter-
+//! lived block and segment mappings; the reserved pool is the deterministic
+//! route for those mappings and remains faster for the flat store too.
 //!
 //! Policy lives here; the two consumers are `block_cache.zig` (class blocks
 //! ≥2 MB and >64 MB pass-throughs) and `segments.zig` (the flat store's

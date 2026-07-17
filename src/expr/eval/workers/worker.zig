@@ -303,6 +303,7 @@ pub const Worker = struct {
     }
 
     pub fn deinit(self: *Worker) void {
+        vm_force.gcUnregisterWorkerCaches(self.worker_id);
         // By the time we get here `scheduler.deinit()` has already
         // joined all helpers and freed `scheduler.ready_queues`, so
         // there's no one left to steal from us and nothing safe to
