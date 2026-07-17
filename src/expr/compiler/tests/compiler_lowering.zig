@@ -170,6 +170,48 @@ test "inherit-from group compiles one shared source thunk" {
     try testing.expectEqual(@as(usize, 1), d.count("push_builtins"));
 }
 
+test "static literal selection skips attrset construction" {
+    var ev = try Evaluator.init(testing.allocator, 0);
+    defer ev.deinit();
+
+    var selected = try disassemble(&ev, "({ a = 1; b = builtins.throw \"unused\"; }).a");
+    defer selected.deinit(testing.allocator);
+    try testing.expect(!selected.contains("attrs_new"));
+    try testing.expect(!selected.contains("attrs_new_srt"));
+    try testing.expect(!selected.contains("attrs_new_named_srt"));
+    try testing.expect(!selected.contains("attr_get"));
+    try testing.expect(!selected.contains("push_builtins"));
+
+    var nested = try disassemble(&ev, "({ a = { b = 2; c = 3; }; x = 4; }).a.b");
+    defer nested.deinit(testing.allocator);
+    try testing.expect(!nested.contains("attrs_new"));
+    try testing.expect(!nested.contains("attr_get"));
+
+    // Dynamic keys and recursive sets keep the general construction path.
+    var dynamic = try disassemble(&ev, "name: ({ ${name} = 1; a = 2; }).a");
+    defer dynamic.deinit(testing.allocator);
+    try testing.expect(dynamic.contains("attrs_new"));
+    var recursive = try disassemble(&ev, "(rec { a = 1; }).a");
+    defer recursive.deinit(testing.allocator);
+    try testing.expect(recursive.contains("attrs_new_named_srt") or recursive.contains("attrs_new_named_pos_srt"));
+}
+
+test "static literal membership emits a boolean without member code" {
+    var ev = try Evaluator.init(testing.allocator, 0);
+    defer ev.deinit();
+
+    var present = try disassemble(&ev, "({ a = builtins.throw \"unused\"; } ? a)");
+    defer present.deinit(testing.allocator);
+    try testing.expect(present.contains("push_true"));
+    try testing.expect(!present.contains("attr_has_path"));
+    try testing.expect(!present.contains("push_builtins"));
+
+    var missing = try disassemble(&ev, "({ a = 1; } ? b)");
+    defer missing.deinit(testing.allocator);
+    try testing.expect(missing.contains("push_false"));
+    try testing.expect(!missing.contains("attr_has_path"));
+}
+
 test "compileBinary folds literal-on-literal arithmetic to a constant instead of emitting an opcode" {
     var ev = try Evaluator.init(testing.allocator, 0);
     defer ev.deinit();

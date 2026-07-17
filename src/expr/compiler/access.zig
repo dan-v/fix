@@ -29,6 +29,7 @@ const unwrapParens = ast.unwrapParens;
 
 pub fn compileAttrPath(self: *Compiler, node: *const Node) !void {
     const apath = node.data.attr_path;
+    if (try compileLiteralAttrSelection(self, apath.root, apath.segments)) return;
     try self.compileNode(apath.root);
 
     for (apath.segments) |seg| {
@@ -150,6 +151,15 @@ fn flattenAttrPath(self: *Compiler, node: *const Node, segments: *std.ArrayListU
 
 pub fn compileHasAttr(self: *Compiler, node: *const Node) !void {
     const has_attr = node.data.has_attr;
+    // Keep the packed bytecode format's existing source-level limit even when
+    // a literal path can be answered without emitting that bytecode.
+    _ = try diagnostics.requireU8At(self, has_attr.segments.len, hasAttrDiagnosticAtom(has_attr), "attribute path has too many segments");
+    if (!hasInterpolatedAttrSegment(self, has_attr.segments)) {
+        if (try literalHasAttrPath(self, has_attr.root, has_attr.segments)) |present| {
+            try emit.emitOp(self, if (present) .push_true else .push_false);
+            return;
+        }
+    }
     try self.compileNode(has_attr.root);
     if (hasInterpolatedAttrSegment(self, has_attr.segments)) {
         var dynamic_count: usize = 0;
@@ -197,6 +207,67 @@ fn hasInterpolatedAttrSegment(self: *Compiler, segments: []const Node.Atom) bool
         if (attrs.attrSegmentHasInterpolation(self, segment)) return true;
     }
     return false;
+}
+
+/// Select directly from a safe static attr literal instead of materializing
+/// the set and all of its lazy members. Restricting the shape to non-recursive,
+/// single-segment static entries means no dynamic collision, nested merge, or
+/// recursive environment can affect the selected member. Nested literal paths
+/// recurse, so `{ a = { b = e; }; }.a.b` compiles just `e`.
+fn compileLiteralAttrSelection(self: *Compiler, root_raw: *const Node, segments: []const Node.Atom) !bool {
+    if (segments.len == 0 or hasInterpolatedAttrSegment(self, segments)) return false;
+    const root = unwrapParens(root_raw);
+    if (root.tag != .attr_set) return false;
+    const entries = root.data.attr_set.entries;
+    if (!try literalSetHasSimpleStaticShape(self, root.data.attr_set)) return false;
+
+    const wanted = try attrs.attrSegmentNameId(self, segments[0]);
+    var selected: ?*const Node = null;
+    for (entries) |entry| {
+        if (try attrs.attrSegmentNameId(self, entry.path[0]) == wanted) {
+            selected = entry.expr;
+            break;
+        }
+    }
+    const expr = selected orelse return false; // preserve normal missing-attr diagnostics
+    if (segments.len > 1 and try compileLiteralAttrSelection(self, expr, segments[1..])) return true;
+
+    try self.compileNode(expr);
+    for (segments[1..]) |segment| {
+        const name_id = try attrs.attrSegmentNameId(self, segment);
+        try emit.emitGetAttr(self, name_id);
+    }
+    return true;
+}
+
+/// Resolve `literal ? static.path` at compile time when every traversed set is
+/// a simple literal. The final member is never compiled or forced; membership
+/// alone determines the result, matching `?` laziness.
+fn literalHasAttrPath(self: *Compiler, root_raw: *const Node, segments: []const Node.Atom) !?bool {
+    if (segments.len == 0) return null;
+    const root = unwrapParens(root_raw);
+    if (root.tag != .attr_set or !try literalSetHasSimpleStaticShape(self, root.data.attr_set)) return null;
+    const wanted = try attrs.attrSegmentNameId(self, segments[0]);
+    for (root.data.attr_set.entries) |entry| {
+        if (try attrs.attrSegmentNameId(self, entry.path[0]) != wanted) continue;
+        if (segments.len == 1) return true;
+        return literalHasAttrPath(self, entry.expr, segments[1..]);
+    }
+    return false;
+}
+
+fn literalSetHasSimpleStaticShape(self: *Compiler, set: Node.AttrSet) !bool {
+    if (set.recursive) return false;
+    var names: std.AutoHashMapUnmanaged(InternId, void) = .empty;
+    defer names.deinit(self.allocator);
+    for (set.entries) |entry| {
+        if (entry.dynamic_name != null or entry.path.len != 1 or attrs.attrSegmentHasInterpolation(self, entry.path[0])) return false;
+        const result = try names.getOrPut(self.allocator, try attrs.attrSegmentNameId(self, entry.path[0]));
+        // Repeated leaf names may merge attrset literals or diagnose a
+        // duplicate; either way the selected value is not this one RHS.
+        if (result.found_existing) return false;
+    }
+    return true;
 }
 
 pub fn compileList(self: *Compiler, node: *const Node) !void {

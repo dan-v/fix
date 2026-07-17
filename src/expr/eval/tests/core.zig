@@ -225,6 +225,19 @@ test "evaluate shared inherit-from sources in let plain and recursive sets" {
     try std.testing.expectEqualStrings("\"[3,4,5]\"", output);
 }
 
+test "evaluate static literal selection and membership lazily" {
+    const output = try renderForTest(
+        \\builtins.toJSON [
+        \\  ({ a = 1; b = builtins.throw "unused"; }.a)
+        \\  ({ a = { b = 2; c = builtins.throw "unused"; }; }.a.b)
+        \\  ({ a = builtins.throw "unused"; } ? a)
+        \\  ({ a = 1; } ? b)
+        \\]
+    );
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("\"[1,2,true,false]\"", output);
+}
+
 test "evaluate checks attribute paths without forcing final value" {
     const present = try renderForTest("({ a.b = 1 / 0; } ? a.b)");
     defer std.testing.allocator.free(present);
