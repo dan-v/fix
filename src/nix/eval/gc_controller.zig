@@ -27,7 +27,7 @@ const VM = @import("../vm/context.zig").VM;
 const Worker = @import("workers/worker.zig").Worker;
 const Scheduler = @import("workers/scheduler.zig").Scheduler;
 const ChunkRegistry = @import("../bytecode.zig").ChunkRegistry;
-const RealizationStore = @import("../realization.zig").RealizationStore;
+const RealizationStore = @import("store").RealizationStore;
 const ImportRegistry = @import("imports.zig").Registry;
 
 pub const Context = struct {

@@ -5,6 +5,11 @@
 //! those events become a status line, log lines, or nothing at all.
 
 const std = @import("std");
+const store_progress = @import("store").progress;
+
+pub const SpanGroup = store_progress.SpanGroup;
+pub const Span = store_progress.Span;
+pub const SpanSink = store_progress.SpanSink;
 
 pub const Stage = enum {
     parse,
@@ -110,43 +115,6 @@ pub const Count = struct {
     total: usize,
 };
 
-/// A category of concurrent work that gets its own grouping node with a live
-/// `[done/total]` count; individual activities nest under it (rather than a flat
-/// list under the run node). Add categories here as new off-demand work appears.
-pub const SpanGroup = enum {
-    fetch,
-    store,
-    source,
-    build,
-
-    pub fn label(self: SpanGroup) []const u8 {
-        return switch (self) {
-            .fetch => "fetching",
-            .store => "writing to store",
-            .source => "copying sources",
-            .build => "building",
-        };
-    }
-};
-
-/// Opaque handle to a concurrent progress span. It retains the sink that
-/// created it, so replacing an evaluator's live sink cannot route an old token
-/// to a new consumer. The handle may be ended or updated from any thread.
-pub const Span = struct {
-    context: *anyopaque,
-    token: usize,
-    end_fn: *const fn (*anyopaque, usize) void,
-    update_fn: *const fn (*anyopaque, usize, u64, u64) void,
-
-    pub fn end(self: Span) void {
-        self.end_fn(self.context, self.token);
-    }
-
-    pub fn update(self: Span, downloaded: u64, total: u64) void {
-        self.update_fn(self.context, self.token, downloaded, total);
-    }
-};
-
 /// The demand-path half of the progress protocol: the single-writer LIFO
 /// stage stack (`begin`/`end`/`instant`/`count`) plus the per-run session and
 /// metrics events. The stage stack is NOT thread-safe — exactly one logical
@@ -194,45 +162,6 @@ pub const StageSink = struct {
 
     pub fn sessionEnd(self: StageSink) void {
         self.emit(.{ .session_end = {} });
-    }
-};
-
-/// The thread-safe half of the progress protocol: independent concurrent
-/// spans (fetches, store writes, source copies — see `Span`). This is the
-/// ONLY progress channel available off the demand fiber; every VM holds one
-/// (`VM.progress_spans`). A span may be opened on one thread/fiber and closed
-/// on another.
-pub const SpanSink = struct {
-    context: *anyopaque,
-    begin_span_fn: *const fn (*anyopaque, SpanGroup, []const u8) usize,
-    end_span_fn: *const fn (*anyopaque, usize) void,
-    /// Set byte progress (`downloaded`/`total`, `total` 0 = unknown) on an open
-    /// span — e.g. a fetch reporting download bytes. Thread-safe; called from
-    /// the off-demand fetch thread.
-    update_span_fn: *const fn (*anyopaque, usize, u64, u64) void,
-
-    /// Open a concurrent span nested under `group`'s counting node. Thread-safe:
-    /// the returned handle can be closed with `endSpan` from any thread.
-    pub fn beginSpan(self: SpanSink, group: SpanGroup, subject: []const u8) Span {
-        return .{
-            .context = self.context,
-            .token = self.begin_span_fn(self.context, group, subject),
-            .end_fn = self.end_span_fn,
-            .update_fn = self.update_span_fn,
-        };
-    }
-
-    /// Close a span opened by `beginSpan`. Idempotent-safe only once per span.
-    pub fn endSpan(self: SpanSink, span: Span) void {
-        _ = self;
-        span.end();
-    }
-
-    /// Report byte progress on an open span (`total` 0 = size not yet known).
-    /// Safe to call from any thread.
-    pub fn updateSpan(self: SpanSink, span: Span, downloaded: u64, total: u64) void {
-        _ = self;
-        span.update(downloaded, total);
     }
 };
 

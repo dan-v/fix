@@ -4,22 +4,22 @@
 //! realization-owned adapter that parks daemon work off compute fibers.
 
 const std = @import("std");
-const host = @import("../host.zig");
-const realization = @import("../realization.zig");
+const store = @import("store");
+const realization = store.realization;
 
 pub const StoreState = struct {
     allocator: std.mem.Allocator,
     realization: realization.RealizationStore,
-    daemon_runtime: *host.DaemonRuntime,
+    daemon_runtime: *store.DaemonRuntime,
 
     pub fn init(allocator: std.mem.Allocator) !StoreState {
-        const runtime_ptr = try allocator.create(host.DaemonRuntime);
+        const runtime_ptr = try allocator.create(store.DaemonRuntime);
         errdefer allocator.destroy(runtime_ptr);
-        runtime_ptr.* = host.DaemonRuntime.init();
+        runtime_ptr.* = store.DaemonRuntime.init();
         errdefer runtime_ptr.deinit();
 
         var realization_store = realization.RealizationStore.init(allocator);
-        realization_store.setExecution(runtime_ptr, realization.daemon_execution.fiber_executor);
+        realization_store.setExecution(runtime_ptr, @import("workers.zig").daemon_executor);
         return .{ .allocator = allocator, .realization = realization_store, .daemon_runtime = runtime_ptr };
     }
 
@@ -30,7 +30,7 @@ pub const StoreState = struct {
         self.realization.deinit();
     }
 
-    pub fn buildPaths(self: *StoreState, paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
+    pub fn buildPaths(self: *StoreState, paths: []const []const u8, sink: ?store.daemon.BuildSink, mode: store.daemon.BuildMode) !void {
         return self.realization.buildPaths(paths, sink, mode);
     }
 

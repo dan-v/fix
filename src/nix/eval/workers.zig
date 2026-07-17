@@ -6,6 +6,7 @@ pub const context = @import("workers/context.zig");
 pub const port = @import("workers/port.zig");
 pub const worker = @import("workers/worker.zig");
 pub const fiber_executor = @import("workers/fiber_executor.zig").fiber_executor;
+pub const daemon_executor = @import("workers/daemon_executor.zig").executor;
 
 pub const Config = scheduler.Config;
 pub const GcMarkHook = scheduler.GcMarkHook;
@@ -28,5 +29,6 @@ test {
     _ = scheduler;
     _ = worker;
     _ = fiber_executor;
+    _ = daemon_executor;
     _ = @import("workers/tests/worker.zig");
 }

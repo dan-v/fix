@@ -1,11 +1,11 @@
 //! nix-daemon store client: worker-protocol framing (`wire`) and the
 //! `DaemonStore` connection. See `store/daemon.zig`.
 
-pub const wire = @import("store/wire.zig");
-pub const daemon = @import("store/daemon.zig");
-pub const pool = @import("store/pool.zig");
-pub const build_events = @import("store/build_events.zig");
-pub const build_options = @import("store/build_options.zig");
+pub const wire = @import("daemon/wire.zig");
+pub const daemon = @import("daemon/daemon.zig");
+pub const pool = @import("daemon/pool.zig");
+pub const build_events = @import("daemon/build_events.zig");
+pub const build_options = @import("daemon/build_options.zig");
 
 pub const DaemonStore = daemon.DaemonStore;
 pub const BuildEvent = build_events.Event;

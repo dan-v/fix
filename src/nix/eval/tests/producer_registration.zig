@@ -1,11 +1,11 @@
 const std = @import("std");
 const eval_mod = @import("../../eval.zig");
 const Evaluator = eval_mod.Evaluator;
-const RealizationStore = @import("../../realization.zig").RealizationStore;
+const RealizationStore = @import("store").RealizationStore;
 const Value = @import("runtime").value.Value;
 const ObjectId = @import("runtime").types.ObjectId;
 const nar = @import("../../host.zig").nar;
-const FakeDaemon = @import("../../realization/testing/fake_daemon.zig").FakeDaemon;
+const FakeDaemon = @import("store").realization.testing.FakeDaemon;
 
 fn recipeInspectionAvailable() bool {
     return @hasDecl(RealizationStore, "RecipeVariantForTest") and

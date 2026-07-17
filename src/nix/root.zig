@@ -6,7 +6,7 @@
 const runtime = @import("runtime");
 const policy = @import("policy.zig");
 const eval = @import("eval.zig");
-const store_protocol = @import("host.zig").store;
+const store_protocol = @import("store").daemon;
 const eval_progress = @import("observ.zig").progress;
 const memory_config = @import("memory_config.zig");
 

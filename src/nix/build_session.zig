@@ -1,7 +1,7 @@
 //! Terminal build-session lifecycle after evaluator language state is released.
 
 const std = @import("std");
-const host = @import("host.zig");
+const store_domain = @import("store");
 const StoreState = @import("eval/store_state.zig").StoreState;
 
 pub const BuildSession = struct {
@@ -17,7 +17,7 @@ pub const BuildSession = struct {
         self.release_thread = null;
     }
 
-    pub fn buildPaths(self: *BuildSession, paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
+    pub fn buildPaths(self: *BuildSession, paths: []const []const u8, sink: ?store_domain.daemon.BuildSink, mode: store_domain.daemon.BuildMode) !void {
         return self.store.buildPaths(paths, sink, mode);
     }
 

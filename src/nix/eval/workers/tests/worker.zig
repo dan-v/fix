@@ -6,7 +6,7 @@ const worker_mod = @import("../worker.zig");
 const vm_mod = @import("../../../vm.zig");
 const runtime = @import("runtime");
 const host = @import("../../../host.zig");
-const RealizationStore = @import("../../../realization.zig").RealizationStore;
+const RealizationStore = @import("store").RealizationStore;
 const arena_mod = @import("base").arena;
 
 test "Worker basic init/deinit" {

@@ -6,8 +6,9 @@
 
 const std = @import("std");
 const nix_hash = @import("runtime").hash;
-const nar = @import("nar.zig");
-const FileCache = @import("file_cache.zig").FileCache;
+const store = @import("store");
+const nar = store.nar;
+const FileCache = store.FileCache;
 const sync = @import("base").sync;
 const curl_transport = @import("curl_transport.zig");
 const git_transport = @import("git_transport.zig");

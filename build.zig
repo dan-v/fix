@@ -78,6 +78,16 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("build_options", build_options_mod);
     runtime_mod.addImport("base", base_mod);
 
+    const store_mod = b.addModule("store", .{
+        .root_source_file = b.path("src/store/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    store_mod.addImport("runtime", runtime_mod);
+    store_mod.addImport("base", base_mod);
+
     const fetchers_mod = b.addModule("fetchers", .{
         .root_source_file = b.path("src/fetchers/root.zig"),
         .target = target,
@@ -87,6 +97,7 @@ pub fn build(b: *std.Build) void {
     });
     fetchers_mod.addImport("runtime", runtime_mod);
     fetchers_mod.addImport("base", base_mod);
+    fetchers_mod.addImport("store", store_mod);
     fetchers_mod.linkSystemLibrary("libcurl", .{ .use_pkg_config = .force });
     fetchers_mod.linkSystemLibrary("libgit2", .{ .use_pkg_config = .force });
     fetchers_mod.link_libc = true;
@@ -102,6 +113,7 @@ pub fn build(b: *std.Build) void {
     nix_mod.addImport("syntax", syntax_mod);
     nix_mod.addImport("runtime", runtime_mod);
     nix_mod.addImport("base", base_mod);
+    nix_mod.addImport("store", store_mod);
     nix_mod.addImport("fetchers", fetchers_mod);
 
     const cli_mod = b.addModule("cli", .{
@@ -187,6 +199,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_fetchers_tests = b.addRunArtifact(fetchers_tests);
 
+    const store_tests = b.addTest(.{
+        .root_module = store_mod,
+        .use_llvm = true,
+    });
+    const run_store_tests = b.addRunArtifact(store_tests);
+
     const cli_tests = b.addTest(.{
         .root_module = cli_mod,
         .use_llvm = true,
@@ -197,6 +215,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_base_tests.step);
     test_step.dependOn(&run_syntax_tests.step);
     test_step.dependOn(&run_runtime_tests.step);
+    test_step.dependOn(&run_store_tests.step);
     test_step.dependOn(&run_fetchers_tests.step);
     test_step.dependOn(&run_nix_tests.step);
     test_step.dependOn(&run_cli_tests.step);

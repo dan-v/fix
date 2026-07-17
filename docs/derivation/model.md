@@ -85,4 +85,4 @@ The value returned by the lazy build (`buildValue`) is an attrs with:
 
 At the [value](../runtime/values.md) layer each output is a `ValueOutput{ name: InternId, out_path: InternId }` — both [interned](../runtime/interning.md) strings. In the built value every output appears **twice**: once as a **direct attr** (`drv.out`, `drv.bin`) and once as an element of the **`all` list**. `drvPath` and every `outPath` are [context strings](./context.md), not plain strings: `drvPath`'s context maps the `.drv` path → `{ allOutputs = true }`; each `outPath`'s context maps the `.drv` path → `{ outputs = [ <thisOutput> ]; }`. That embedded context is exactly what makes a *consuming* derivation record this one as an input.
 
-Code: `src/nix/derivation/`
+Code: `src/store/derivation/`

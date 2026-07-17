@@ -15,7 +15,7 @@ source text
   → threaded VM forces lazy thunks            → Value          [vm + runtime]
   → derivation builtins hash the drv graph    → .drv + store paths  [derivation]
   → realization recipes + nix-daemon client  → .drv files in the store, built
-                                                outputs, result links  [realization + host]
+                                                outputs, result links  [store]
 ```
 
 Each stage is lazy at the seams: the compiler emits **thunks** for anything not needed immediately, and the VM forces them only on demand (or *speculatively*, ahead of demand, on idle cores).
@@ -24,14 +24,13 @@ Each stage is lazy at the seams: the compiler emits **thunks** for anything not 
 - **[compiler](compiler/pipeline.md)** — walks the AST once and lowers it to immutable **bytecode chunks**. It resolves names to stack slots and [upvalue captures](compiler/scopes.md), computes [strictness](compiler/strictness.md) masks, and decides what to make lazy vs eager vs [deferred](compiler/lazy-compile.md).
 - **[runtime](runtime/values.md)** — the data model: an 8-byte NaN-boxed [`Value`](runtime/values.md), a flat [object heap](runtime/heap.md), string [interning](runtime/interning.md), and the [thunk](runtime/thunks.md) that carries laziness.
 - **[vm](vm/dispatch.md)** — a direct-threaded bytecode interpreter that [forces thunks](runtime/thunks.md), [calls closures](vm/calls.md), [reads attrsets/lists](vm/access.md), and runs the [builtins](vm/builtins.md).
-- **[derivation](derivation/model.md)** — the domain model: `Drv`, canonical hashing and paths, string context, and the evaluation-scoped registry of computed derivations. The `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths.
-- **realization** — turns derivation records and source-path recipes into concrete store actions. It owns the evaluation's `DerivationStore`, lazy derivation cache, source ingestion, closure planning, and realization claims; it depends on the pure derivation model and the host interfaces.
-- **fetchers** — source acquisition outside the expression engine: filesystem snapshots, remote-source caching, NAR serialization of fetched trees, Git/curl transports, and provider-specific GitHub/GitLab/SourceHut request planning. VM builtins only decode Nix values and map fetch results back to values.
-- **host / daemon** — the nix-daemon worker-protocol client (`host/store/daemon.zig`, wire framing in `host/store/wire.zig`). Store-writing commands configure and warm the daemon connection pool before evaluation begins, so its worker threads perform the 10–30 ms handshakes concurrently with useful evaluator work. The pool remains host machinery; command policy only decides whether to enable store writes.
+- **[store / derivation](derivation/model.md)** — the domain model: `Drv`, canonical hashing and paths, string context, and the evaluation-scoped registry of computed derivations. The `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths.
+- **store / realization** — turns derivation records and source-path recipes into concrete store actions. It owns the evaluation's `RealizationStore`, lazy derivation cache, source snapshots and NAR encoding, closure planning, realization claims, and nix-daemon protocol/runtime. An explicit executor capability lets evaluator fibers park without making the store depend on evaluator workers.
+- **fetchers** — remote source acquisition outside the expression engine: remote-source caching, Git/curl transports, and provider-specific GitHub/GitLab/SourceHut request planning. VM builtins only decode Nix values and map fetch results back to values.
 
 ## The module DAG
 
-The source tree has six durable module groups. `base`, `syntax`, and `runtime` are reusable foundations; `fetchers` owns source acquisition; `nix` contains the cooperating evaluator subsystems; `cli` is the application layer. Subsystems under each durable root keep their own facades and namespaces, but use ordinary file imports rather than each restating the same graph as a build module.
+The source tree has seven durable module groups. `base`, `syntax`, and `runtime` are reusable foundations; `store` owns derivations and concrete store behavior; `fetchers` owns remote source acquisition; `nix` contains the cooperating evaluator subsystems; `cli` is the application layer. Subsystems under each durable root keep their own facades and namespaces, but use ordinary file imports rather than each restating the same graph as a build module.
 
 ```
 src/base/       base → base_options
@@ -44,13 +43,15 @@ src/syntax/     syntax → base, parser_tables
 src/runtime/    runtime → base, build_options
                 Value, heap, thunk/Future, interning, GC.
 
-src/fetchers/   fetchers → base, runtime, libcurl, libgit2
-                File/source cache, provider planning, transports, fetched-tree
-                NAR serialization.
+src/store/      store → base, runtime
+                Derivations, source snapshots, NAR, realization recipes,
+                daemon protocol and runtime.
 
-src/nix/        nix → base, syntax, runtime, fetchers, build_options
-                Exports bytecode, compiler, scheduler, derivation, host,
-                realization, evaluator workers, language support, observability,
+src/fetchers/   fetchers → base, runtime, store, libcurl, libgit2
+                Remote-source cache, provider planning, transports.
+
+src/nix/        nix → base, syntax, runtime, store, fetchers, build_options
+                Exports bytecode, compiler, evaluator workers, language support, observability,
                 probes, VM, and Evaluator.
 
 src/cli/        cli → nix, base
@@ -62,7 +63,7 @@ src/main.zig       → nix, cli, process_support
 
 `base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and `nix` supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
 
-Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `eval.zig` composes those services into `Evaluator`. `eval/workers/` owns the scheduler, fiber workers, fiber-scoped context, and capabilities for parking futures and blocking work away from compute workers; the VM borrows that context and capability without owning worker machinery. Daemon-pool submission is adapted in `realization/daemon_execution.zig`, where the concrete host pool is actually known. `root.zig` is the narrow stable facade visible to ordinary consumers, including typed build/evaluation progress protocols and diagnostic views; commands that intentionally inspect representation details opt into the explicitly unstable `nix.tooling` surface. Language semantics do not import concrete host effects. Deferred-body compilation calls from `vm` into `compiler`, while import orchestration and synthetic corepkgs sources remain evaluator-owned and `eval/imports.zig` owns only the concurrent registry/entry state. See [build](build.md).
+Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `eval.zig` composes those services into `Evaluator`. `eval/workers/` owns the scheduler, fiber workers, fiber-scoped context, and capabilities for parking futures and blocking work away from compute workers; the VM borrows that context and capability without owning worker machinery. `store/realization/daemon_execution.zig` defines the store-facing executor capability, while `eval/workers/daemon_executor.zig` supplies its fiber implementation. `root.zig` is the narrow stable facade visible to ordinary consumers, including typed build/evaluation progress protocols and diagnostic views; commands that intentionally inspect representation details opt into the explicitly unstable `nix.tooling` surface. Deferred-body compilation calls from `vm` into `compiler`, while import orchestration and synthetic corepkgs sources remain evaluator-owned and `eval/imports.zig` owns only the concurrent registry/entry state. See [build](build.md).
 
 Callbacks mark real ownership, policy, or execution-domain changes: CLI debugger/progress/build sinks, heap/scheduler GC dispatch, fiber wakeups, blocking execution, and leaf policies such as NAR filters. File extraction alone is not a boundary. Evaluator helper files therefore receive concrete state views (for example debugger `Context`) or remain evaluator-owned instead of back-calling through opaque “host” bundles. Concurrent progress `Span` handles retain the sink that created them, so a sink replacement cannot misroute an in-flight token.
 

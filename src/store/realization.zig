@@ -10,6 +10,9 @@ pub const daemon_execution = @import("realization/daemon_execution.zig");
 
 pub const RealizationStore = store.RealizationStore;
 pub const SpanGroup = store.SpanGroup;
+pub const testing = struct {
+    pub const FakeDaemon = @import("realization/testing/fake_daemon.zig").FakeDaemon;
+};
 
 test {
     _ = store;

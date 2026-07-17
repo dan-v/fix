@@ -3,9 +3,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const sync = @import("base").sync;
-const host = @import("../host.zig");
-const rstore = host.store;
-const DaemonRuntime = host.DaemonRuntime;
+const rstore = @import("../daemon.zig");
+const DaemonRuntime = @import("../daemon_runtime.zig").DaemonRuntime;
 const Future = @import("runtime").future.Future;
 const daemon_execution = @import("daemon_execution.zig");
 

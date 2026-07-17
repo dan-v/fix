@@ -7,8 +7,8 @@
 const std = @import("std");
 const drv_paths = @import("../derivation.zig").paths;
 const RealizationStore = @import("store.zig").RealizationStore;
-const FileCache = @import("../host.zig").FileCache;
-const nar = @import("../host.zig").nar;
+const FileCache = @import("../file_cache.zig").FileCache;
+const nar = @import("../nar.zig");
 const path_ops = @import("runtime").paths;
 const sync = @import("base").sync;
 

@@ -1,19 +1,19 @@
 //! Compatibility facade for host-effect services used by the evaluator and CLI.
 //!
-//! Source acquisition is owned by the independent `fetchers` module. Store
-//! protocol and daemon runtime remain here until the store-domain extraction.
+//! Source acquisition and store behavior are owned by independent modules.
 
 const fetchers = @import("fetchers");
+const store_domain = @import("store");
 
-pub const file_cache = fetchers.file_cache;
+pub const file_cache = store_domain.file_cache;
 pub const fetch_cache = fetchers.fetch_cache;
-pub const nar = fetchers.nar;
-pub const store = @import("host/store.zig");
-pub const daemon_runtime = @import("host/daemon_runtime.zig");
+pub const nar = store_domain.nar;
+pub const store = store_domain.daemon;
+pub const daemon_runtime = store_domain.daemon_runtime;
 
-pub const FileCache = fetchers.FileCache;
+pub const FileCache = store_domain.FileCache;
 pub const FetchCache = fetchers.FetchCache;
-pub const DaemonRuntime = daemon_runtime.DaemonRuntime;
+pub const DaemonRuntime = store_domain.DaemonRuntime;
 
 test {
     _ = file_cache;

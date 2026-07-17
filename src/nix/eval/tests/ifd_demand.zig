@@ -6,7 +6,7 @@ const heap_mod = @import("runtime").heap;
 const vm = @import("../../vm.zig");
 const vm_builtins = vm.builtins;
 const vm_force = vm.force;
-const FakeDaemon = @import("../../realization/testing/fake_daemon.zig").FakeDaemon;
+const FakeDaemon = @import("store").realization.testing.FakeDaemon;
 
 /// Task 5 GREEN exposes the one shared path-demand integration through the VM
 /// builtin facade. Until then every regression below reports this exact RED,

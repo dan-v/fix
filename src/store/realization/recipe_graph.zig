@@ -5,8 +5,8 @@ const builtin = @import("builtin");
 const sync = @import("base").sync;
 const owned_strings = @import("base").owned_strings;
 const runtime = @import("runtime");
-const FileCache = @import("../host.zig").FileCache;
-const progress = @import("../observ.zig").progress;
+const FileCache = @import("../file_cache.zig").FileCache;
+const progress = @import("../progress.zig");
 
 pub const SpanGroup = progress.SpanGroup;
 

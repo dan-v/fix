@@ -153,4 +153,4 @@ Any drift here silently produces the wrong store path. The oracle enforces exact
 
 For value-shape and interned string handling see [runtime values](../runtime/values.md).
 
-Code: `src/nix/derivation/`
+Code: `src/store/derivation/`

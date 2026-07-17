@@ -1,6 +1,6 @@
 //! DaemonPool: N background threads, each owning a warm connection, draining a
 //! shared job queue. You submit a job and park the caller (a compute fiber via
-//! `execution.zig`, or the main thread blocking) while a worker runs
+//! an evaluator executor, or the main thread blocking) while a worker runs
 //! `job.run(conn)` on its connection and wakes you.
 //!
 //! This is the one execution path for every nix-daemon store op — `.drv`/source
