@@ -155,3 +155,21 @@ pub fn concatLists(self: *VM, left: Value, right: Value) !Value {
     if (!right.isList()) return trace.typeErrorExpected(self, "list", right);
     return Value.list(try self.heap.addConcatenatedLists(left.asObjectId(), right.asObjectId()));
 }
+
+/// `list_cat_n`: validate a right-associated concat chain in the same order as
+/// the original binary operations, then build the final immutable list once.
+/// For `a ++ (b ++ (c ++ d))`, binary evaluation checks c,d,b,a.
+pub fn concatStackLists(self: *VM, count: u16) !Value {
+    std.debug.assert(count >= 3 and self.sp >= count);
+    const base = self.sp - count;
+
+    var i: u32 = count - 2;
+    if (!self.stack[base + i].isList()) return trace.typeErrorExpected(self, "list", self.stack[base + i]);
+    if (!self.stack[base + i + 1].isList()) return trace.typeErrorExpected(self, "list", self.stack[base + i + 1]);
+    while (i > 0) {
+        i -= 1;
+        if (!self.stack[base + i].isList()) return trace.typeErrorExpected(self, "list", self.stack[base + i]);
+    }
+
+    return Value.list(try self.heap.addConcatenatedListValues(self.stack[base..self.sp]));
+}

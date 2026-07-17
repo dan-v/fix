@@ -1839,6 +1839,42 @@ pub const ObjectHeap = struct {
         return self.add(.{ .list = range });
     }
 
+    /// Concatenate already-validated list Values directly into one heap
+    /// range. Unlike staging through an ArrayList and then `addList`, every
+    /// element is copied exactly once. Empty inputs are identities; if only
+    /// one input is non-empty its immutable list object is reused.
+    pub fn addConcatenatedListValues(self: *ObjectHeap, lists: []const Value) !ObjectId {
+        if (lists.len == 0) return self.addList(&.{});
+
+        var total: usize = 0;
+        var non_empty: usize = 0;
+        var sole_non_empty: ObjectId = undefined;
+        for (lists) |list| {
+            std.debug.assert(list.isList());
+            const id = list.asObjectId();
+            const items = try self.getList(id);
+            total = try std.math.add(usize, total, items.len);
+            if (items.len != 0) {
+                non_empty += 1;
+                sole_non_empty = id;
+            }
+        }
+        if (non_empty == 0) return lists[lists.len - 1].asObjectId();
+        if (non_empty == 1) return sole_non_empty;
+
+        const range = try self.reserveValuesLocal(@intCast(total));
+        const dst = self.values.sliceMut(range);
+        var out: usize = 0;
+        for (lists) |list| {
+            // Re-fetch after reserving: heap storage may have grown or reused
+            // a range, while the operand objects remain rooted by the caller.
+            const items = try self.getList(list.asObjectId());
+            @memcpy(dst[out..][0..items.len], items);
+            out += items.len;
+        }
+        return self.add(.{ .list = range });
+    }
+
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         const range = try self.prepareAttrsRange(entries);
         return self.add(.{ .attrs = .{ .range = range } });

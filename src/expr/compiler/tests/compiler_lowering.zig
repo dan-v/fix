@@ -223,6 +223,23 @@ test "repeated constants share one chunk-pool index" {
     try testing.expect(std.mem.indexOf(u8, d.text, "push_const #1") == null);
 }
 
+test "right-associated list concatenation lowers to one n-ary opcode" {
+    var ev = try Evaluator.init(testing.allocator, 0);
+    defer ev.deinit();
+
+    var chain = try disassemble(&ev, "a: b: c: a ++ b ++ c");
+    defer chain.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), chain.count("list_cat_n"));
+    try testing.expectEqual(@as(usize, 0), chain.count("list_cat"));
+
+    // Explicit left grouping retains its two binary operations: flattening it
+    // would change when the first concatenation's type error is observed.
+    var grouped = try disassemble(&ev, "a: b: c: (a ++ b) ++ c");
+    defer grouped.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), grouped.count("list_cat_n"));
+    try testing.expectEqual(@as(usize, 2), grouped.count("list_cat"));
+}
+
 test "compileBinary folds literal-on-literal arithmetic to a constant instead of emitting an opcode" {
     var ev = try Evaluator.init(testing.allocator, 0);
     defer ev.deinit();

@@ -28,6 +28,12 @@ test "concatLists on an empty list and rejects non-list elements" {
     try std_testing.expectError(error.TypeError, renderForTest("builtins.concatLists [ 1 ]"));
 }
 
+test "right-associated list concatenation preserves lazy elements" {
+    const result = try renderForTest("[ 1 ] ++ [ (builtins.throw \"unused\") ] ++ [ 3 ]");
+    defer std_testing.allocator.free(result);
+    try std_testing.expectEqualStrings("[ 1 <CODE> 3 ]", result);
+}
+
 test "listToAttrs on an empty list and rejects non-attrs elements" {
     const empty = try renderForTest("builtins.listToAttrs [ ]");
     defer std_testing.allocator.free(empty);

@@ -47,6 +47,11 @@ pub fn compileBinary(self: *Compiler, node: *const Node) !void {
         }
     }
 
+    // `++` is right-associative. Flatten its common unparenthesized chain so
+    // the VM can reserve and fill the final list once instead of copying each
+    // intermediate suffix. Parenthesized/left-nested groups remain explicit.
+    if (bin.op == .concat and try compileListConcatChain(self, node)) return;
+
     // Compile-time fold pure literal-on-literal expressions. Skips
     // operations that can error (`/`, `%`) since `{x = 1/0;}` is
     // valid Nix — only forcing `.x` is supposed to throw.
@@ -86,6 +91,28 @@ pub fn compileBinary(self: *Compiler, node: *const Node) !void {
         .impl => unreachable,
         .concat => try emit.emitOp(self, .list_cat),
     }
+}
+
+const max_list_concat_parts: usize = 4096;
+
+fn compileListConcatChain(self: *Compiler, node: *const Node) !bool {
+    const first_right = node.data.binary.right;
+    if (first_right.tag != .binary_op or first_right.data.binary.op != .concat) return false;
+
+    var parts: std.ArrayListUnmanaged(*const Node) = .empty;
+    defer parts.deinit(self.allocator);
+    var current = node;
+    while (current.tag == .binary_op and current.data.binary.op == .concat) {
+        if (parts.items.len == max_list_concat_parts - 1) return false;
+        try parts.append(self.allocator, current.data.binary.left);
+        current = current.data.binary.right;
+    }
+    try parts.append(self.allocator, current);
+    std.debug.assert(parts.items.len >= 3);
+
+    for (parts.items) |part| try self.compileNode(part);
+    try emit.emitOpU16(self, .list_cat_n, @intCast(parts.items.len));
+    return true;
 }
 
 /// Attempt to compute a pure-arithmetic / comparison / logical

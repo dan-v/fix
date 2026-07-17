@@ -48,7 +48,7 @@ Both ops take `[left, right] → [merged]`. The operands arrive in WHNF (whateve
 
 ## List concatenation
 
-`list_cat` (`[left, right] → [result]`, from `++`) type-checks both operands as lists (they arrive forced) and allocates the concatenation (`heap.addConcatenatedLists`), keeping both on the stack as roots across the allocation. Elements are carried across unforced — `++` does not force list contents.
+`list_cat` (`[left, right] → [result]`, from `++`) type-checks both operands as lists (they arrive forced) and allocates the concatenation (`heap.addConcatenatedLists`), keeping both on the stack as roots across the allocation. The compiler flattens an unparenthesized right-associated chain such as `a ++ b ++ c` to `list_cat_n`: all operands remain rooted on the stack and one exact-size heap range is filled, avoiding the suffix intermediate and its repeated copies. Explicit grouping retains binary operations so error timing is unchanged. Elements are carried across unforced — `++` does not force list contents.
 
 ## Deep equality
 

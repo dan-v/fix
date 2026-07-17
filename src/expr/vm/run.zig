@@ -546,6 +546,15 @@ fn opConcatLists(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
+fn opConcatListsN(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const count = readU16(code, ip);
+    const result = try objects.concatStackLists(vm, count);
+    stack.dropN(vm, count);
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
 fn opConcatStrings(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const count = readU16(code, ip);
@@ -1187,6 +1196,7 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .attrs_merge_strict => opMergeAttrsStrict,
         .attrs_merge => opMergeAttrs,
         .list_cat => opConcatLists,
+        .list_cat_n => opConcatListsN,
         .str_cat => opConcatStrings,
         .path_cat => opConcatPath,
         .push_builtins => opPushBuiltins,

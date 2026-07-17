@@ -296,6 +296,25 @@ test "list_cat concatenates two lists in order" {
     try testing.expectEqual(@as(i64, 4), items[3].asInt());
 }
 
+test "list_cat_n concatenates stack lists once and preserves order" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const a = Value.list(try h.vm.heap.addList(&.{Value.int(1)}));
+    const empty = Value.list(try h.vm.heap.addList(&.{}));
+    const c = Value.list(try h.vm.heap.addList(&.{ Value.int(2), Value.int(3) }));
+    try stack.push(&h.vm, a);
+    try stack.push(&h.vm, empty);
+    try stack.push(&h.vm, c);
+
+    const result = try objects_mod.concatStackLists(&h.vm, 3);
+    const items = try h.vm.heap.getList(result.asObjectId());
+    try testing.expectEqual(@as(usize, 3), items.len);
+    try testing.expectEqual(@as(i64, 1), items[0].asInt());
+    try testing.expectEqual(@as(i64, 2), items[1].asInt());
+    try testing.expectEqual(@as(i64, 3), items[2].asInt());
+}
+
 // ---- equality semantics (equality.zig) ----
 
 test "NaN is never equal to itself" {

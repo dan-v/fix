@@ -108,6 +108,10 @@ pub const OpCode = enum(u8) {
     attrs_merge,
     /// Concatenate two lists.
     list_cat,
+    /// Concatenate N lists in one allocation/copy pass. Emitted for an
+    /// unparenthesized right-associated `++` chain; operand: 2-byte list count
+    /// (N >= 3). Stack before: [list1, ..., listN]; after: [result].
+    list_cat_n,
     /// Concatenate N string-like values in a single pass. Stack before:
     /// [part1, ..., partN] (part1 lowest); after: [result]. Each part is
     /// coerced exactly like the binary `+` string path (string / path /
@@ -480,6 +484,7 @@ pub fn layout(op: OpCode) []const Operand {
         .attrs_new_named_srt => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 } },
         .attrs_new_named_pos_srt => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 }, cnt(.b2, "positions"), .{ .skip = .b4 } },
         .list_new => comptime &[_]Operand{cnt(.b2, "items")},
+        .list_cat_n => comptime &[_]Operand{cnt(.b2, "lists")},
         .str_cat, .path_cat => comptime &[_]Operand{cnt(.b2, "parts")},
         .call_n, .call_tail_n => comptime &[_]Operand{cnt(.b1, "args")},
 
