@@ -1,56 +1,8 @@
-//! Store-side state and terminal build-session lifecycle.
-//!
-//! These objects deliberately outlive evaluator language state, but are
-//! composed by the evaluator from realization, host, and execution services.
+//! Terminal build-session lifecycle after evaluator language state is released.
 
 const std = @import("std");
 const host = @import("host.zig");
-const build_protocol = @import("build_protocol.zig");
-const realization = @import("realization.zig");
-const RealizationStore = realization.RealizationStore;
-
-/// Explicit process-owned work to run after evaluator language state has been
-/// released. Passed to a release operation rather than stored on Evaluator.
-pub const ReleaseAction = struct {
-    context: *anyopaque,
-    run: *const fn (context: *anyopaque) void,
-};
-
-pub const StoreState = struct {
-    allocator: std.mem.Allocator,
-    realization: RealizationStore,
-    daemon_runtime: *host.DaemonRuntime,
-
-    pub fn init(allocator: std.mem.Allocator) !StoreState {
-        const runtime_ptr = try allocator.create(host.DaemonRuntime);
-        errdefer allocator.destroy(runtime_ptr);
-        runtime_ptr.* = host.DaemonRuntime.init();
-        errdefer runtime_ptr.deinit();
-
-        var realization_store = RealizationStore.init(allocator);
-        realization_store.setExecution(runtime_ptr, realization.daemon_execution.fiber_executor);
-        return .{ .allocator = allocator, .realization = realization_store, .daemon_runtime = runtime_ptr };
-    }
-
-    pub fn deinit(self: *StoreState) void {
-        self.realization.clearExecution();
-        self.daemon_runtime.deinit();
-        self.allocator.destroy(self.daemon_runtime);
-        self.realization.deinit();
-    }
-
-    pub fn buildPaths(self: *StoreState, paths: []const []const u8, sink: ?build_protocol.Sink, mode: build_protocol.Mode) !void {
-        return self.realization.buildPaths(paths, sink, mode);
-    }
-
-    pub fn lastError(self: *StoreState) ?[]const u8 {
-        return self.realization.lastStoreError();
-    }
-
-    pub fn addIndirectRoot(self: *StoreState, link_path: []const u8) !void {
-        return self.realization.addIndirectRoot(link_path);
-    }
-};
+const StoreState = @import("eval/store_state.zig").StoreState;
 
 pub const BuildSession = struct {
     store: *StoreState,
@@ -65,7 +17,7 @@ pub const BuildSession = struct {
         self.release_thread = null;
     }
 
-    pub fn buildPaths(self: *BuildSession, paths: []const []const u8, sink: ?build_protocol.Sink, mode: build_protocol.Mode) !void {
+    pub fn buildPaths(self: *BuildSession, paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
         return self.store.buildPaths(paths, sink, mode);
     }
 

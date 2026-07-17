@@ -53,7 +53,8 @@ const worker_mod = execution.worker;
 const gc_controller = @import("eval/gc_controller.zig");
 const gc_coordinator = @import("eval/gc_coordinator.zig");
 const build_session = @import("build_session.zig");
-const build_protocol = @import("build_protocol.zig");
+const store_state = @import("eval/store_state.zig");
+const lifecycle = @import("eval/lifecycle.zig");
 const tooling_adapter = @import("eval/tooling.zig");
 const fiber_mod = @import("base").fiber;
 const prof = @import("probe.zig").prof;
@@ -69,7 +70,7 @@ const worker_id_mod = @import("base").worker_id;
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
 
-pub const ReleaseAction = build_session.ReleaseAction;
+pub const ReleaseAction = lifecycle.ReleaseAction;
 
 /// Why the debugger was entered (re-exported from the VM layer so the CLI can
 /// switch on it without reaching into `vm`).
@@ -246,7 +247,7 @@ pub const DebugSession = struct {
     }
 };
 
-const StoreState = build_session.StoreState;
+const StoreState = store_state.StoreState;
 pub const BuildSession = build_session.BuildSession;
 
 fn debugContext(session: *const DebugSession) debug_session.Context {
@@ -1403,7 +1404,7 @@ pub const Evaluator = struct {
 
     /// Set the per-connection daemon settings (`--cores`/`--max-jobs`/… via
     /// `set_options`) applied when the store connects. See `setup.configure`.
-    pub fn setDaemonBuildSettings(self: *Evaluator, settings: build_protocol.Settings) !void {
+    pub fn setDaemonBuildSettings(self: *Evaluator, settings: host.store.BuildSettings) !void {
         return self.store.realization.setBuildSettings(settings);
     }
 

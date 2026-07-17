@@ -6,7 +6,7 @@
 const runtime = @import("runtime");
 const policy = @import("policy.zig");
 const eval = @import("eval.zig");
-const build_protocol = @import("build_protocol.zig");
+const store_protocol = @import("host.zig").store;
 const eval_progress = @import("observ.zig").progress;
 const memory_config = @import("memory_config.zig");
 
@@ -24,11 +24,11 @@ pub const DebugSession = eval.DebugSession;
 pub const DebugFrame = eval.DebugFrame;
 pub const BreakReason = eval.BreakReason;
 pub const ReleaseAction = eval.ReleaseAction;
-pub const BuildMode = build_protocol.Mode;
-pub const BuildEvent = build_protocol.Event;
-pub const BuildSink = build_protocol.Sink;
-pub const BuildSettings = build_protocol.Settings;
-pub const BuildSetting = build_protocol.Setting;
+pub const BuildMode = store_protocol.BuildMode;
+pub const BuildEvent = store_protocol.BuildEvent;
+pub const BuildSink = store_protocol.BuildSink;
+pub const BuildSettings = store_protocol.BuildSettings;
+pub const BuildSetting = store_protocol.Setting;
 pub const LanguagePolicy = policy.LanguagePolicy;
 pub const ExperimentalFeature = policy.ExperimentalFeature;
 pub const ExperimentalFeatures = policy.ExperimentalFeatures;

@@ -11,7 +11,8 @@
 
 const std = @import("std");
 const wire = @import("wire.zig");
-const build_protocol = @import("../../build_protocol.zig");
+const build_events = @import("build_events.zig");
+const build_options = @import("build_options.zig");
 
 pub const default_socket_path = "/nix/var/nix/daemon-socket/socket";
 
@@ -20,7 +21,7 @@ const res_progress: u64 = 105;
 
 /// A consumer of the daemon's build activity/log stream (see `buildPaths`).
 /// Callbacks run on the calling thread while the build is in progress.
-pub const BuildSink = build_protocol.Sink;
+pub const BuildSink = build_events.Sink;
 
 /// Whether the daemon considers this client trusted (from the >=1.35
 /// handshake). Trusted clients may perform privileged ops without restriction.
@@ -29,16 +30,16 @@ pub const Trust = enum { unknown, trusted, not_trusted };
 /// Build realization mode sent with `build_paths` (Nix's `BuildMode`): the
 /// default build, `--repair` (rebuild and fix corrupted paths), or `--check`
 /// (rebuild and verify outputs are unchanged).
-pub const BuildMode = build_protocol.Mode;
+pub const BuildMode = build_options.Mode;
 
 /// A `name = value` daemon setting carried in the `set_options` overrides map.
-pub const Setting = build_protocol.Setting;
+pub const Setting = build_options.Setting;
 
 /// Per-connection daemon settings applied via `set_options` (op 19). Mirrors
 /// the client settings Nix sends after the handshake: the fixed fields plus a
 /// trailing overrides map for any other `nix.conf` key (e.g. `timeout`). The
 /// daemon applies the map after the fixed fields, so an override wins.
-pub const BuildSettings = build_protocol.Settings;
+pub const BuildSettings = build_options.Settings;
 
 pub const DaemonStore = struct {
     allocator: std.mem.Allocator,

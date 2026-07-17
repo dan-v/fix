@@ -18,7 +18,6 @@ const recipe_graph = @import("recipe_graph.zig");
 const daemon_client = @import("daemon_client.zig");
 const eval_progress = @import("../observ.zig").progress;
 const daemon_execution = @import("daemon_execution.zig");
-const build_protocol = @import("../build_protocol.zig");
 
 pub const SpanGroup = recipe_graph.SpanGroup;
 
@@ -201,7 +200,7 @@ pub const RealizationStore = struct {
 
     /// Set the per-connection daemon settings to apply on connect. Dupes the
     /// overrides into owned storage (freed in `deinit`).
-    pub fn setBuildSettings(self: *RealizationStore, settings: build_protocol.Settings) !void {
+    pub fn setBuildSettings(self: *RealizationStore, settings: rstore.BuildSettings) !void {
         return self.daemon.setBuildSettings(settings);
     }
 
@@ -386,7 +385,7 @@ pub const RealizationStore = struct {
     /// daemon, forwarding the build activity/log stream to `sink` if given.
     /// Dispatched to the pool (fiber parks / main thread blocks) so the whole
     /// build runs on a warm worker connection, not a compute worker.
-    pub fn buildPaths(self: *RealizationStore, derived_paths: []const []const u8, sink: ?build_protocol.Sink, mode: build_protocol.Mode) !void {
+    pub fn buildPaths(self: *RealizationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
         var cell: BuildCell = .{ .store = self, .paths = derived_paths, .sink = sink, .mode = mode };
         try self.runOnDaemon(BuildCell.run, &cell);
         return cell.err;
@@ -394,12 +393,12 @@ pub const RealizationStore = struct {
 
     /// Realize `derived_paths` for import-from-derivation. Same as `buildPaths`;
     /// kept as a distinct entry for the `run`/`shell` realize call sites.
-    pub fn realizePaths(self: *RealizationStore, derived_paths: []const []const u8, mode: build_protocol.Mode) !void {
+    pub fn realizePaths(self: *RealizationStore, derived_paths: []const []const u8, mode: rstore.BuildMode) !void {
         return self.buildPaths(derived_paths, null, mode);
     }
 
     /// Build against the connection supplied by the pool worker.
-    fn buildOnConn(self: *RealizationStore, conn: *rstore.DaemonStore, derived_paths: []const []const u8, sink: ?build_protocol.Sink, mode: build_protocol.Mode) !void {
+    fn buildOnConn(self: *RealizationStore, conn: *rstore.DaemonStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
         conn.buildPaths(derived_paths, sink, mode) catch |err| {
             self.captureDaemonError(conn);
             return err;
@@ -409,8 +408,8 @@ pub const RealizationStore = struct {
     const BuildCell = struct {
         store: *RealizationStore,
         paths: []const []const u8,
-        sink: ?build_protocol.Sink = null,
-        mode: build_protocol.Mode,
+        sink: ?rstore.BuildSink = null,
+        mode: rstore.BuildMode,
         err: anyerror!void = {},
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
