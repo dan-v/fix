@@ -1,5 +1,21 @@
 {
   "pins": {
+    "determinate-nix": {
+      "type": "GitRelease",
+      "repository": {
+        "type": "GitHub",
+        "owner": "DeterminateSystems",
+        "repo": "nix-src"
+      },
+      "pre_releases": false,
+      "version_upper_bound": null,
+      "release_prefix": null,
+      "submodules": false,
+      "version": "v3.21.7",
+      "revision": "469a08e76a130e51b7a9f5df1fcc48b7d4d4cd42",
+      "url": "https://api.github.com/repos/DeterminateSystems/nix-src/tarball/refs/tags/v3.21.7",
+      "hash": "sha256-2/DfNkCVKAv/Zbj7bW+8+aH39Ybc5DE3OEUZCEzzqc4="
+    },
     "lix": {
       "type": "Git",
       "repository": {

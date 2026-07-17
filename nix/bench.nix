@@ -1,7 +1,7 @@
-# Differential performance benchmark: fix vs nix vs lix vs snix.
+# Differential performance benchmark: fix vs Nix implementations.
 #
 # `nix-build -A bench && ./result/bin/fix-bench` runs hyperfine over every
-# workload in ../bench/workloads for all four evaluators. The script closes
+# workload in ../bench/workloads for each configured evaluator. The script closes
 # over each evaluator and over a store copy of the workloads with the pinned
 # nixpkgs / home-manager paths baked in, so it needs no network, build, search
 # path, or ambient tooling at run time. It must run outside the sandbox (real
@@ -11,15 +11,16 @@
 # Every workload is one Nix file forced to a single value — torture cases to an
 # int, real-world cases to the toplevel .drvPath (a string, so `--strict` never
 # recurses into the derivation graph) — and each evaluator forces it the same
-# way, so hyperfine compares like with like. A one-shot preflight drops any
-# evaluator that cannot drive a given workload (printing why) rather than
-# recording a misleading fast-failure time. `RUNS=N` overrides the run count.
+# way, so hyperfine compares like with like. `RUNS=N` overrides the run count.
 {
   pkgs,
   lib,
   sources ? import ../npins,
   fix ? pkgs.callPackage ./fix.nix {release = "fast";},
   nix ? pkgs.nixVersions.latest,
+  detsys ?
+    (builtins.getFlake (builtins.unsafeDiscardStringContext (toString sources.determinate-nix)))
+    .packages.${pkgs.stdenv.hostPlatform.system}.nix-cli,
   lix ? pkgs.lix,
   snix ? null, #(import sources.snix { }).snix.cli.eval,
 }: let
@@ -42,6 +43,7 @@
   tools =
     # name|command-prefix (the workload file is appended to each).
     optional (nix != null) "nix|${nix}/bin/nix-instantiate --eval --strict"
+    ++ optional (detsys != null) "detsys|${detsys}/bin/nix-instantiate --eval --strict"
     ++ optional (lix != null) "lix|${lix}/bin/nix-instantiate --eval --strict"
     ++ optional (snix != null) "snix|${snix}/bin/snix-eval -qq --strict"
     ++ optionals (fix != null) [
