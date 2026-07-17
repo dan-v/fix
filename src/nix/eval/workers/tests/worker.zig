@@ -1,12 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
-const bytecode = @import("../../bytecode.zig");
-const scheduler_mod = @import("../../scheduler.zig");
+const bytecode = @import("../../../bytecode.zig");
+const scheduler_mod = @import("../scheduler.zig");
 const worker_mod = @import("../worker.zig");
-const vm_mod = @import("../../vm.zig");
+const vm_mod = @import("../../../vm.zig");
 const runtime = @import("runtime");
-const host = @import("../../host.zig");
-const RealizationStore = @import("../../realization.zig").RealizationStore;
+const host = @import("../../../host.zig");
+const RealizationStore = @import("../../../realization.zig").RealizationStore;
 const arena_mod = @import("base").arena;
 
 test "Worker basic init/deinit" {

@@ -114,4 +114,4 @@ The scheduler hosts the collector's **stop-the-world barrier**: a worker that cr
 
 ---
 
-Code: `src/nix/scheduler/core.zig`, `src/nix/execution/worker.zig`
+Code: `src/nix/eval/workers/scheduler.zig`, `src/nix/eval/workers/worker.zig`

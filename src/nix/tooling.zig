@@ -10,6 +10,7 @@ pub const bytecode = @import("tooling/bytecode.zig");
 pub const compiler = @import("compiler.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const execution = @import("execution.zig");
+pub const workers = @import("eval/workers.zig");
 pub const host = @import("host.zig");
 pub const vm = @import("vm.zig");
 pub const probe = @import("probe.zig");

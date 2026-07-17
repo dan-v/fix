@@ -2,7 +2,7 @@
 //! component: heap collection requests and parked-scheduler mark assistance.
 
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
-const Scheduler = @import("../scheduler.zig").Scheduler;
+const Scheduler = @import("workers/scheduler.zig").Scheduler;
 
 pub const Driver = struct {
     context: *anyopaque,

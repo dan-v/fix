@@ -34,8 +34,8 @@ const heap_mod = @import("runtime").heap;
 const containers = @import("base");
 const clock = @import("base").clock;
 const build_options = @import("build_options");
-pub const Config = @import("config.zig").Config;
-const gc_barrier_mod = @import("gc_barrier.zig");
+pub const Config = @import("scheduler/config.zig").Config;
+const gc_barrier_mod = @import("scheduler/gc_barrier.zig");
 pub const GcMarkHook = gc_barrier_mod.MarkHook;
 const GcBarrier = gc_barrier_mod.Barrier;
 

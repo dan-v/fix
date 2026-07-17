@@ -28,7 +28,7 @@
 const std = @import("std");
 const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
-const eval_progress = @import("../observ.zig").progress;
+const eval_progress = @import("../../observ.zig").progress;
 
 /// Native-stack headroom reserved below `stack_limit`: the guard trips this
 /// far from the mapping's end so the deepest single force step between two

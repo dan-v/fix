@@ -6,7 +6,7 @@
 const future_mod = @import("runtime").future;
 const fiber_mod = @import("base").fiber;
 const execution = @import("../execution.zig");
-const worker_mod = @import("../execution/worker.zig");
+const worker_mod = @import("../eval/workers/worker.zig");
 const DaemonPool = @import("../host.zig").store.DaemonPool;
 
 pub const WorkFn = *const fn (connection: ?*anyopaque, context: *anyopaque) void;

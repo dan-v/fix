@@ -8,7 +8,7 @@
 //! because it references evaluator-private callbacks.
 
 const std = @import("std");
-const scheduler_mod = @import("../scheduler.zig");
+const scheduler_mod = @import("workers/scheduler.zig");
 
 /// Resolve scheduler/speculation tuning into one immutable policy value.
 pub fn resolve(

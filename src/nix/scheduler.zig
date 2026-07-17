@@ -1,6 +1,6 @@
-//! Work-stealing scheduler subsystem facade.
+//! Compatibility facade for the evaluator-owned worker scheduler.
 
-const core = @import("scheduler/core.zig");
+const core = @import("eval/workers.zig").scheduler;
 
 pub const Config = core.Config;
 pub const GcMarkHook = core.GcMarkHook;
@@ -10,7 +10,3 @@ pub const Lane = core.Lane;
 pub const ReadyNode = core.ReadyNode;
 pub const Scheduler = core.Scheduler;
 pub const scanCensus = core.scanCensus;
-
-test {
-    _ = core;
-}

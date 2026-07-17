@@ -21,7 +21,7 @@ const chunk = bytecode_mod.chunk;
 const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
 const InternTable = @import("runtime").intern.InternTable;
-const Scheduler = @import("../scheduler.zig").Scheduler;
+const Scheduler = @import("../eval/workers/scheduler.zig").Scheduler;
 const heap_mod = @import("runtime").heap;
 const ObjectHeap = heap_mod.ObjectHeap;
 const FileCache = @import("../host.zig").FileCache;
@@ -36,14 +36,14 @@ const ChunkRegistrationSink = @import("../compiler/context.zig").ChunkRegistrati
 const ThunkTrace = @import("../probe.zig").thunk_trace.ThunkTrace;
 const LanguagePolicy = @import("../policy.zig").LanguagePolicy;
 
-pub const exec_context = @import("../execution/context.zig");
+pub const exec_context = @import("../eval/workers/context.zig");
 pub const ExecutionContext = exec_context.ExecutionContext;
 
 pub const thunks_log_enabled = build_options.thunks_log;
 const SpinMutex = @import("base").sync.SpinMutex;
 const vma = @import("runtime").mem_tag.vma;
 const PatternCache = @import("../language.zig").regex.PatternCache;
-const FiberExecutor = @import("../execution/port.zig").FiberExecutor;
+const FiberExecutor = @import("../eval/workers/port.zig").FiberExecutor;
 
 pub const Driver = struct {
     eval: *const fn (*VM, ChunkId) anyerror!Value,
@@ -232,7 +232,7 @@ pub const VM = struct {
     /// diverge from their fiber's identity. Standalone test VMs (no fiber)
     /// point at the static neutral default. Read-only from the VM's side —
     /// only the fiber's driving worker dresses/resets it, between resumes.
-    /// See `execution/context.zig`.
+    /// See `eval/workers/context.zig`.
     ctx: *const ExecutionContext = &ExecutionContext.default_instance,
     /// Optional VM execution tracer.
     vm_trace: ?*VmTrace,

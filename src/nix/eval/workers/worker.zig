@@ -39,25 +39,25 @@ const future_mod = @import("runtime").future;
 const sync = @import("base").sync;
 const arena_mod = @import("base").arena;
 const clock = @import("base").clock;
-const scheduler_mod = @import("../scheduler.zig");
+const scheduler_mod = @import("scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
-const vm_mod = @import("../vm/context.zig");
-const vm_driver = @import("../vm/driver.zig").driver;
+const vm_mod = @import("../../vm/context.zig");
+const vm_driver = @import("../../vm/driver.zig").driver;
 const VM = vm_mod.VM;
 const exec_context = @import("context.zig");
 const ExecutionContext = exec_context.ExecutionContext;
-const vm_force = @import("../vm/force.zig");
-const vm_errors = @import("../vm/errors.zig");
+const vm_force = @import("../../vm/force.zig");
+const vm_errors = @import("../../vm/errors.zig");
 const fiber_mod = @import("base").fiber;
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("base").worker_id;
 const mem_tag = @import("runtime").mem_tag;
 const gc = @import("runtime").gc;
-const eval_trace = @import("../observ.zig").trace;
-const eval_progress = @import("../observ.zig").progress;
-const prof = @import("../probe.zig").prof;
-const timeline = @import("../probe.zig").timeline;
+const eval_trace = @import("../../observ.zig").trace;
+const eval_progress = @import("../../observ.zig").progress;
+const prof = @import("../../probe.zig").prof;
+const timeline = @import("../../probe.zig").timeline;
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker repoints
@@ -107,7 +107,7 @@ pub const WorkerFiber = struct {
     fiber_id: u32,
     inner: InnerFiber,
     vm: VM,
-    /// Fiber-scoped execution identity (see `execution/context.zig`): the
+    /// Fiber-scoped execution identity (see `eval/workers/context.zig`): the
     /// claim id (permanent, baked at allocation) plus the demand-role
     /// fields (`is_demand` + the demand-only progress handles — set by
     /// `runTopLevel` on the top fiber, reset when the fiber recycles).

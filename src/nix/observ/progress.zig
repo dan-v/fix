@@ -154,7 +154,7 @@ pub const Span = struct {
 /// the demand fiber (which emits sequentially even if a steal migrates it
 /// across workers). That is why this is a separate type from `SpanSink`: the
 /// evaluator hands it out only to the demand fiber's execution context
-/// (`execution/context.zig`, read via `VM.ctx`), so an off-demand stage emit
+/// (`eval/workers/context.zig`, read via `VM.ctx`), so an off-demand stage emit
 /// has no handle to call
 /// through — helpers only ever hold the thread-safe `SpanSink`. Don't add a
 /// bypass. (`metrics` is the sampler thread's channel and `session_*`

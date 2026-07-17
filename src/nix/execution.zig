@@ -1,21 +1,16 @@
-//! Evaluator execution substrate: fiber workers, fiber-scoped context, and
-//! capabilities for parking blocking host work off compute workers.
+//! Compatibility facade for the evaluator-owned worker runtime.
 
-pub const context = @import("execution/context.zig");
-pub const port = @import("execution/port.zig");
-pub const worker = @import("execution/worker.zig");
-pub const fiber_executor = @import("execution/fiber_executor.zig").fiber_executor;
-pub const BlockingPool = @import("base").BlockingPool;
+const workers = @import("eval/workers.zig");
 
-pub const ExecutionContext = context.ExecutionContext;
-pub const DemandRole = context.DemandRole;
-pub const ScopedImportFrame = context.ScopedImportFrame;
-pub const FiberExecutor = port.FiberExecutor;
-pub const Worker = worker.Worker;
-pub const WorkerFiber = worker.WorkerFiber;
+pub const context = workers.context;
+pub const port = workers.port;
+pub const worker = workers.worker;
+pub const fiber_executor = workers.fiber_executor;
+pub const BlockingPool = workers.BlockingPool;
 
-test {
-    _ = worker;
-    _ = fiber_executor;
-    _ = @import("execution/tests/worker.zig");
-}
+pub const ExecutionContext = workers.ExecutionContext;
+pub const DemandRole = workers.DemandRole;
+pub const ScopedImportFrame = workers.ScopedImportFrame;
+pub const FiberExecutor = workers.FiberExecutor;
+pub const Worker = workers.Worker;
+pub const WorkerFiber = workers.WorkerFiber;

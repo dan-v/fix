@@ -15,7 +15,7 @@ const future_mod = @import("runtime").future;
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
 const clock = @import("base").clock;
-const sched_mod = @import("../scheduler.zig");
+const sched_mod = @import("../eval/workers/scheduler.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");
