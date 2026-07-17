@@ -980,24 +980,20 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     const crit_start = if (self.ctx.is_demand) timeline.critWaitBegin() else 0;
                     var lbuf: [128]u8 = undefined;
                     const crit_label: timeline.Subject = if (crit_start != 0) force_label.critWaitLabel(self, thunk_id, &lbuf) else .{};
-                    // Progress "waiting on" line: the handle exists only on the
-                    // demand fiber's ExecutionContext and only when progress is
-                    // drawn (free otherwise) — precise by construction, no
-                    // compensating is_demand gate. Labelled from THIS
-                    // fiber's own current frame span — a stable read — NOT the
-                    // target thunk's union, which a concurrent resolver can flip
-                    // `.target → .result` mid-decode (a union-field panic in a
-                    // safe build; `critWaitLabel` above tolerates it only because
-                    // `--timeline` rarely runs, whereas progress blocks here often).
-                    if (self.ctx.progress_wait) |pw| {
+                    // Progress "waiting on" line: `progress_stage` exists only
+                    // on the demand fiber and only when progress is drawn.
+                    // Label it from this fiber's stable current frame span, not
+                    // the target thunk's union, which a concurrent resolver can
+                    // flip `.target → .result` mid-decode.
+                    if (self.ctx.progress_stage) |sink| {
                         var sbuf: [64]u8 = undefined;
-                        pw.set(force_label.demandFrameText(self, &sbuf));
+                        sink.waitBegin(force_label.demandFrameText(self, &sbuf));
                     }
                     const ty = prof.start(.wait_busy_thunk);
                     park.yield();
                     prof.end(.wait_busy_thunk, ty);
                     if (crit_start != 0) timeline.critWaitEnd(crit_label, crit_start);
-                    if (self.ctx.progress_wait) |pw| pw.clear();
+                    if (self.ctx.progress_stage) |sink| sink.waitEnd();
                 }
                 continue;
             },

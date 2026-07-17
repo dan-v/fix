@@ -129,13 +129,13 @@ pub fn mercurialResultValue(self: *VM, name: []const u8, result: fetch_cache.Fet
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-/// Open a concurrent "fetching <subject>" progress span. Fetches run on
+/// Open a concurrent fetch progress span. Fetches run on
 /// whatever fiber forces them (often off the demand path), so this uses the
 /// thread-safe concurrent-span channel — its node is independent of the demand
 /// LIFO stage stack. Null (and a no-op `end`) when progress isn't drawn.
 pub fn fetchSpanBegin(self: *VM, subject: []const u8) ?eval_progress.Span {
     const spans = self.progress_spans orelse return null;
-    return spans.beginSpan(.fetch, subject);
+    return spans.beginSpan(subject);
 }
 
 pub fn fetchSpanEnd(self: *VM, span: ?eval_progress.Span) void {
@@ -416,8 +416,9 @@ pub fn flatFetchOutPath(self: *VM, cache_path: []const u8, hash_hex: []const u8,
         // `readFile`/`import` on the returned store path stays zero-copy.
         try self.files.provideRegular(store_path, contents);
     }
-    // A fetched flat file reports under `.fetch` (at download), not `.source`.
-    try self.realization.recordFlatRecipe(store_path, contents, null);
+    // The download span already represents this fetched flat file, so its
+    // eventual store write does not open a second activity.
+    try self.realization.recordFlatRecipe(store_path, contents, false);
     return store_path;
 }
 

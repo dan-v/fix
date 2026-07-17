@@ -62,6 +62,15 @@ pub const Style = enum {
     warning,
 };
 
+pub const Accent = enum {
+    red,
+    green,
+    yellow,
+    blue,
+    magenta,
+    cyan,
+};
+
 pub fn styleCode(use_color: bool, which: Style) []const u8 {
     if (!use_color) return "";
     return switch (which) {
@@ -90,6 +99,21 @@ pub fn style(writer: *std.Io.Writer, use_color: bool, which: Style) !void {
 
 pub fn reset(writer: *std.Io.Writer, use_color: bool) !void {
     if (use_color) try writer.writeAll(resetCode(true));
+}
+
+pub fn accent(writer: *std.Io.Writer, use_color: bool, which: Accent, bold: bool) !void {
+    if (!use_color) return;
+    const code: u8 = switch (which) {
+        .red => '1',
+        .green => '2',
+        .yellow => '3',
+        .blue => '4',
+        .magenta => '5',
+        .cyan => '6',
+    };
+    if (bold) try writer.writeAll("\x1b[1;3") else try writer.writeAll("\x1b[3");
+    try writer.writeByte(code);
+    try writer.writeByte('m');
 }
 
 pub fn writeLabel(writer: *std.Io.Writer, use_color: bool, label: []const u8) !void {

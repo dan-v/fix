@@ -532,8 +532,6 @@ const Repl = struct {
     fn evalExpr(self: *Repl, source: []const u8) !?Value {
         self.ev.progressSessionBegin("input");
         defer self.ev.progressSessionEnd();
-        self.ev.startProgressSampler();
-        defer self.ev.stopProgressSampler();
 
         const value = self.ev.evaluateWithScope(source, self.scope) catch |err| {
             try render_err.evalFailure(self.io, self.use_color, self.options.show_trace, self.ev, source, err);

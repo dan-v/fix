@@ -366,8 +366,8 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         /// `appendAtomic` for a caller that guarantees NO concurrent writer
         /// exists (a `--workers=1` evaluator): the same cursor/segment
         /// protocol with plain-cost monotonic accesses instead of the CAS.
-        /// Concurrent readers (`get`/`count` from samplers or post-eval
-        /// walkers) stay well-defined — monotonic keeps the accesses atomic,
+        /// Concurrent readers (`get`/`count` from post-eval walkers) stay
+        /// well-defined — monotonic keeps the accesses atomic,
         /// it just drops the RMW and fences.
         pub fn appendSerial(self: *Self, allocator: std.mem.Allocator, value: T) !u32 {
             std.debug.assert(self.nursery_segs == 0);

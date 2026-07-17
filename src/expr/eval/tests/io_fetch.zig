@@ -1037,7 +1037,7 @@ test "releaseEvalState releases retained flat recipe payload" {
         tracking.track(payload);
         var handle = try FileCache.ImmutableBytes.fromOwned(allocator, payload);
 
-        try ev.store.realization.recordFlatRecipe("/nix/store/44444444444444444444444444444444-flat", handle, null);
+        try ev.store.realization.recordFlatRecipe("/nix/store/44444444444444444444444444444444-flat", handle, false);
         try std.testing.expectEqual(payload_ptr, @intFromPtr(handle.bytes().ptr));
         handle.release();
         try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());

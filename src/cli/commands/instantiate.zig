@@ -105,8 +105,6 @@ fn instantiateOne(
 ) !bool {
     ev.progressSessionBegin(input.label());
     defer ev.progressSessionEnd();
-    ev.startProgressSampler();
-    defer ev.stopProgressSampler();
 
     const source = input.source;
     const result = ev.evaluatePathAt(source.text, source.base_path, source.abs_path) catch |err| {

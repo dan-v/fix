@@ -239,7 +239,7 @@ pub fn flatStorePathForFile(
 
     const store_path = try drv_paths.fixedOutputPath(allocator, realization.store_dir, name, "out", "sha256", hex[0..]);
     errdefer allocator.free(store_path);
-    try realization.recordFlatRecipe(store_path, contents, .source);
+    try realization.recordFlatRecipe(store_path, contents, true);
 
     return .{ .store_path = store_path, .hash_hex = hex };
 }

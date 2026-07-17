@@ -60,8 +60,7 @@ pub const AttrPosEntry = struct {
 
 /// Per-heap collector diagnostics. These counters used to be process globals,
 /// which made independently configured Evaluators overwrite one another's
-/// policy and reports. Atomics keep the progress sampler's advisory reads
-/// data-race-free while the collection coordinator updates them.
+/// policy and reports. Atomics keep worker/coordinator updates data-race-free.
 pub const GcReportState = struct {
     collections: std.atomic.Value(u64) = .init(0),
     objects_freed_total: std.atomic.Value(u64) = .init(0),

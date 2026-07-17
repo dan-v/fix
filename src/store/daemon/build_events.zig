@@ -3,9 +3,17 @@
 //! The daemon transport decodes its stderr sideband into these values; higher
 //! layers may re-export them without depending on wire framing details.
 
+pub const ActivityKind = enum {
+    build,
+    substitute,
+    post_build_hook,
+};
+
 pub const Activity = struct {
     id: u64,
-    text: []const u8,
+    kind: ActivityKind,
+    subject: []const u8,
+    detail: []const u8,
 };
 
 pub const Progress = struct {
@@ -14,11 +22,23 @@ pub const Progress = struct {
     expected: u64,
 };
 
+pub const LogKind = enum {
+    daemon,
+    build,
+    post_build,
+};
+
+pub const Log = struct {
+    activity_id: ?u64,
+    kind: LogKind,
+    text: []const u8,
+};
+
 pub const Event = union(enum) {
     start: Activity,
     stop: u64,
     progress: Progress,
-    log: []const u8,
+    log: Log,
 };
 
 pub const Sink = struct {

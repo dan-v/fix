@@ -7,7 +7,6 @@
 const std = @import("std");
 const store_progress = @import("store").progress;
 
-pub const SpanGroup = store_progress.SpanGroup;
 pub const Span = store_progress.Span;
 pub const SpanSink = store_progress.SpanSink;
 
@@ -27,78 +26,15 @@ pub const Step = struct {
     subject: []const u8 = "",
 };
 
-/// A periodic snapshot of live evaluator counters. Deliberately a plain
-/// bag of numbers with no formatting knowledge — the producer (a worker-0
-/// safepoint sampler, reusing the same reads that feed the `--timeline`
-/// counter tracks) fills it, and the CLI decides how to render it. GC
-/// fields are 0 until the first collection.
-pub const Metrics = struct {
-    // Heap object stores (live slot counts + committed bytes).
-    objects: u64 = 0,
-    values: u64 = 0,
-    attrs: u64 = 0,
-    reserved_bytes: u64 = 0,
-    /// Current memory footprint: resident set (/proc statm) plus
-    /// hugetlb-backed bytes, which the kernel keeps out of RSS (see
-    /// `runtime/gc.zig:currentFootprintBytes`).
-    rss_bytes: u64 = 0,
-    // Scheduler activity.
-    pending: u64 = 0,
-    /// Thunks forced (scheduler pops) — cumulative throughput.
-    forced: u64 = 0,
-    steals: u64 = 0,
-    spec_submitted: u64 = 0,
-    spec_rejected: u64 = 0,
-    // Collector.
-    gc_collections: u64 = 0,
-    gc_live_bytes: u64 = 0,
-    gc_freed_objects: u64 = 0,
-    /// What the demand path is currently blocked on (a source loc like
-    /// "modules.nix:545"), or empty when it isn't blocked. Inline so the
-    /// snapshot is self-contained when handed across the sampler boundary.
-    wait_buf: [ProgressWait.cap]u8 = undefined,
-    wait_len: u8 = 0,
-
-    pub fn wait(self: *const Metrics) []const u8 {
-        return self.wait_buf[0..self.wait_len];
-    }
-};
-
-/// A shared, single-writer / single-reader record of what the demand path is
-/// currently blocked on. Written by the demand fiber (worker 0) at a blocking
-/// safepoint and read by the progress sampler thread — so the empty-stage-tree
-/// windows (demand blocked while helpers churn) still say what's being waited
-/// on. Deliberately lock-free and best-effort: a torn read is cosmetic only,
-/// so no seqlock. Only touched when progress is actually being drawn.
-pub const ProgressWait = struct {
-    pub const cap = 56;
-
-    buf: [cap]u8 = undefined,
-    len: std.atomic.Value(u8) = .init(0),
-
-    pub fn set(self: *ProgressWait, text: []const u8) void {
-        const n = @min(text.len, cap);
-        @memcpy(self.buf[0..n], text[0..n]);
-        self.len.store(@intCast(n), .release);
-    }
-
-    pub fn clear(self: *ProgressWait) void {
-        self.len.store(0, .release);
-    }
-
-    /// Copy the current subject into `out`; returns the byte count written.
-    pub fn read(self: *const ProgressWait, out: []u8) usize {
-        const n = @min(@as(usize, self.len.load(.acquire)), out.len, cap);
-        @memcpy(out[0..n], self.buf[0..n]);
-        return n;
-    }
-};
-
 pub const Event = union(enum) {
     begin: Step,
     end: Step,
     instant: Step,
-    metrics: Metrics,
+    /// Show what the demand fiber is blocked on until `wait_end`. Emitted by
+    /// that fiber immediately before and after it parks, so no polling or
+    /// cross-thread snapshot is needed.
+    wait_begin: []const u8,
+    wait_end: void,
     /// Set the item count `[completed/total]` on the *current* (innermost) stage
     /// span — e.g. the render node while the top-level result is walked. `total`
     /// 0 means "unknown" (renders a bare count). Emitted on the demand path only.
@@ -106,7 +42,7 @@ pub const Event = union(enum) {
     /// Open the always-visible run node (parent for the coarse phase spans);
     /// payload is a human label for what's being evaluated.
     session_begin: []const u8,
-    /// Close the run node and the per-run metric lines.
+    /// Close the run node and any per-run child nodes.
     session_end: void,
 };
 
@@ -116,8 +52,8 @@ pub const Count = struct {
 };
 
 /// The demand-path half of the progress protocol: the single-writer LIFO
-/// stage stack (`begin`/`end`/`instant`/`count`) plus the per-run session and
-/// metrics events. The stage stack is NOT thread-safe — exactly one logical
+/// stage stack (`begin`/`end`/`instant`/`count`) plus wait and per-run session
+/// events. The stage stack is NOT thread-safe — exactly one logical
 /// writer may drive it: the main thread during single-threaded setup, then
 /// the demand fiber (which emits sequentially even if a steal migrates it
 /// across workers). That is why this is a separate type from `SpanSink`: the
@@ -125,9 +61,8 @@ pub const Count = struct {
 /// (`eval/workers/context.zig`, read via `VM.ctx`), so an off-demand stage emit
 /// has no handle to call
 /// through — helpers only ever hold the thread-safe `SpanSink`. Don't add a
-/// bypass. (`metrics` is the sampler thread's channel and `session_*`
-/// bracket the run on the main thread; they share `emit_fn` but mutate
-/// sampler-/main-owned nodes, never the stage stack — see the CLI impl.)
+/// bypass. (`session_*` bracket the run on the main thread; wait events are
+/// emitted serially by the same demand fiber that owns the stage stack.)
 pub const StageSink = struct {
     context: *anyopaque,
     emit_fn: *const fn (*anyopaque, Event) void,
@@ -148,8 +83,12 @@ pub const StageSink = struct {
         self.emit(.{ .instant = .{ .stage = stage, .subject = subject } });
     }
 
-    pub fn metrics(self: StageSink, m: Metrics) void {
-        self.emit(.{ .metrics = m });
+    pub fn waitBegin(self: StageSink, subject: []const u8) void {
+        self.emit(.{ .wait_begin = subject });
+    }
+
+    pub fn waitEnd(self: StageSink) void {
+        self.emit(.{ .wait_end = {} });
     }
 
     pub fn count(self: StageSink, completed: usize, total: usize) void {

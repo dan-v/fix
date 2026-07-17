@@ -18,8 +18,6 @@ const daemon_client = @import("daemon_client.zig");
 const eval_progress = @import("../progress.zig");
 const daemon_execution = @import("daemon_execution.zig");
 
-pub const SpanGroup = recipe_graph.SpanGroup;
-
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
 const Drv = drv_mod.Drv;
@@ -258,9 +256,9 @@ pub const RealizationStore = struct {
     /// Open a concurrent progress span for real store work, or null when progress
     /// isn't drawn. Pair with `endSpan` (defer). The label is borrowed for the
     /// call only. The returned handle retains its originating sink.
-    pub fn beginSpan(self: *RealizationStore, group: SpanGroup, label: []const u8) ?eval_progress.Span {
+    pub fn beginSpan(self: *RealizationStore, label: []const u8) ?eval_progress.Span {
         const spans = self.progress_spans orelse return null;
-        return spans.beginSpan(group, label);
+        return spans.beginSpan(label);
     }
 
     /// Close a span opened by `beginSpan` (no-op on null / no hooks).
@@ -322,7 +320,7 @@ pub const RealizationStore = struct {
     /// gated on `store_writes_enabled` (off during plain eval).
     pub fn instantiateText(self: *RealizationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
         if (!self.daemon.writes_enabled) return;
-        return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } }, .store);
+        return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } }, true);
     }
 
     /// Write a NAR-serialized source tree, gated on `store_writes_enabled`.
@@ -330,15 +328,16 @@ pub const RealizationStore = struct {
     /// references them — so `input_srcs` are valid in time.
     pub fn instantiatePath(self: *RealizationStore, store_path: []const u8, nar_bytes: []const u8) !void {
         if (!self.daemon.writes_enabled) return;
-        // Used by `ingestSerializedNar` (fetchTarball) — a fetch, shown under `.fetch`.
-        return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }, null);
+        // Used by `ingestSerializedNar` (fetchTarball), whose fetch span already
+        // reports the operation.
+        return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }, false);
     }
 
     /// Add a flat file's raw bytes to the store (fetchurl), gated on
     /// `store_writes_enabled`.
     pub fn instantiateFlat(self: *RealizationStore, store_path: []const u8, bytes: []const u8) !void {
         if (!self.daemon.writes_enabled) return;
-        return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } }, null);
+        return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } }, false);
     }
 
     /// Is `store_path` already valid in the store? Used to skip fetching an
@@ -538,10 +537,9 @@ pub const RealizationStore = struct {
     /// Dispatch a store write to the pool (parking the caller) or inline. The op's
     /// args are borrowed and stay valid across the transfer because the calling
     /// fiber parks (its stack — holding the NAR/text buffers — is preserved).
-    /// `span_group` is the progress group the actual transfer reports under (null
-    /// for writes shown elsewhere, e.g. fetches under `.fetch`).
-    fn runDaemonOp(self: *RealizationStore, op: DaemonOp, span_group: ?SpanGroup) !void {
-        var cell: OpCell = .{ .store = self, .op = op, .span_group = span_group };
+    /// `report_progress` is false for writes already shown by a fetch span.
+    fn runDaemonOp(self: *RealizationStore, op: DaemonOp, report_progress: bool) !void {
+        var cell: OpCell = .{ .store = self, .op = op, .report_progress = report_progress };
         try self.runOnDaemon(OpCell.run, &cell);
         return cell.err;
     }
@@ -549,7 +547,7 @@ pub const RealizationStore = struct {
     const OpCell = struct {
         store: *RealizationStore,
         op: DaemonOp,
-        span_group: ?SpanGroup = null,
+        report_progress: bool = false,
         err: anyerror!void = {},
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
@@ -558,25 +556,24 @@ pub const RealizationStore = struct {
                 self.err = e;
                 return;
             };
-            self.err = self.store.applyDaemonOp(daemon, self.op, self.span_group);
+            self.err = self.store.applyDaemonOp(daemon, self.op, self.report_progress);
         }
     };
 
     /// Perform a store write against the supplied connection. Skips the transfer
     /// when the path is already valid (cache or a daemon check). Cache touches are
     /// briefly guarded; the daemon round-trips run without `daemon_mu`.
-    fn applyDaemonOp(self: *RealizationStore, daemon: *rstore.DaemonStore, op: DaemonOp, span_group: ?SpanGroup) !void {
+    fn applyDaemonOp(self: *RealizationStore, daemon: *rstore.DaemonStore, op: DaemonOp, report_progress: bool) !void {
         const store_path = switch (op) {
             inline else => |o| o.store_path,
         };
         if (self.cacheContains(store_path)) return;
         if (try daemon.isValidPath(store_path)) return self.cacheMark(store_path);
-        // Report a progress span around the actual transfer, under the caller's
-        // group: `.store` for a `.drv`, `.source` for a local source copy, null for
-        // a fetch (shown under `.fetch` at download). Reporting here — only past the
-        // validity guard — means the count is actual writes, not coercions/records.
+        // Report a progress span around the actual transfer unless a fetch span
+        // already represents it. Reporting here — only past the validity guard —
+        // means the visible activity is an actual write, not a coercion/record.
         // The span may open here (on a pool worker) and close after the write.
-        const span = if (span_group) |group| self.beginSpan(group, storePathName(store_path)) else null;
+        const span = if (report_progress) self.beginSpan(storePathName(store_path)) else null;
         defer self.endSpan(span);
         const written = switch (op) {
             .text => |o| daemon.addTextToStore(self.allocator, storePathName(store_path), o.text, o.references),
@@ -609,11 +606,10 @@ pub const RealizationStore = struct {
         return self.graph.recordOwnedNar(store_path, nar_bytes);
     }
 
-    /// `span_group` names the progress group the eventual write reports under —
-    /// `.source` for a flat local source (`builtins.path { recursive = false; }`),
-    /// null for a fetched flat file (shown under `.fetch` at download time).
-    pub fn recordFlatRecipe(self: *RealizationStore, store_path: []const u8, handle: FileCache.ImmutableBytes, span_group: ?SpanGroup) !void {
-        return self.graph.recordFlat(store_path, handle, span_group);
+    /// `report_progress` is false for a fetched flat file whose download span
+    /// already represents the work.
+    pub fn recordFlatRecipe(self: *RealizationStore, store_path: []const u8, handle: FileCache.ImmutableBytes, report_progress: bool) !void {
+        return self.graph.recordFlat(store_path, handle, report_progress);
     }
 
     pub fn releaseRecipePayloads(self: *RealizationStore) void {
@@ -757,12 +753,11 @@ pub const RealizationStore = struct {
 
         for (recipe.references()) |reference| try self.ensureClosureInner(reference, visit);
         // References are on disk now; write this path (offloaded to the pool). The
-        // recipe's `span_group` picks the progress group for the actual transfer.
-        const group = recipe.span_group;
+        const report_progress = recipe.report_progress;
         switch (recipe.payload) {
-            .text => |text| try self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }, group),
-            .nar => |nar_bytes| try self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }, group),
-            .flat => |bytes| try self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }, group),
+            .text => |text| try self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }, report_progress),
+            .nar => |nar_bytes| try self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }, report_progress),
+            .flat => |bytes| try self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }, report_progress),
         }
         self.releaseRecipeForPath(store_path);
     }

@@ -68,8 +68,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
     errdefer progress.deinit(false);
-    // Only wire the sink when we'll actually draw: it drives a ~100ms counter
-    // sampler, so a null sink keeps that fully out of the hot path when off.
+    // Only wire the sink when we'll actually draw progress.
     if (term.show_progress) ev.setProgressSink(progress.sink());
 
     var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, options);

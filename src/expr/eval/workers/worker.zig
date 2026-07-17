@@ -416,7 +416,6 @@ pub const Worker = struct {
         // inexpressible). `runFiber`'s finished arm resets the role.
         top.ctx.is_demand = true;
         top.ctx.progress_stage = demand.progress_stage;
-        top.ctx.progress_wait = demand.progress_wait;
         top.inner.reset(entry, arg);
         if (comptime census_on) {
             self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
@@ -454,9 +453,9 @@ pub const Worker = struct {
 
     /// Drive several independent demanded entries at once. Each gets its own
     /// demand fiber and is queued onto a different worker when possible. The
-    /// multi-entry path deliberately omits the single-writer stage/progress-wait
-    /// handles; concurrent demand fibers still report through the thread-safe
-    /// span channel.
+    /// multi-entry path deliberately omits the single-writer stage handle;
+    /// concurrent demand fibers still report through the thread-safe span
+    /// channel.
     pub fn runTopLevels(self: *Worker, entries: []const TopLevelEntry) !void {
         if (entries.len == 0) return;
         worker_id_mod.current = self.worker_id;
@@ -481,7 +480,6 @@ pub const Worker = struct {
             top.ctx.is_demand = true;
             top.ctx.parallel_demand = true;
             top.ctx.progress_stage = null;
-            top.ctx.progress_wait = null;
             top.inner.reset(entry.entry, entry.arg);
             if (comptime census_on) {
                 self.census.tasks += 1;
@@ -630,8 +628,7 @@ pub const Worker = struct {
     /// Timeline: sample heap cursors, RSS, and scheduler state as counter tracks
     /// (time-series graphs in Perfetto) so memory growth, the speculation flood,
     /// and steal activity are visible over the eval and correlatable with GC
-    /// pauses. Throttled to ~1ms; RSS is a /proc read. The progress indicator
-    /// surfaces the same numbers via its own sampler (`Evaluator.readMetrics`).
+    /// pauses. Throttled to ~1ms; RSS is a /proc read.
     fn sampleTimelineCounters(f: *WorkerFiber) void {
         if (!timeline.shouldSample(1_000_000)) return;
         const heap = f.vm.heap;

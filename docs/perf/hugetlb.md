@@ -96,10 +96,8 @@ Hardware-poison SIGBUS remains possible, as it does for memory generally.
 Hugetlb pages are **invisible to every kernel RSS figure** (`VmRSS`, `VmHWM`,
 `ru_maxrss`, `statm`) — a run with 1.6 GB of hugetlb heap reports ~280 MB
 VmHWM. `base/hugetlb.zig` tracks mapped/peak bytes internally, and the
-consumers fold them in:
+diagnostic consumers fold them in:
 
-- `runtime/gc.zig` exposes `currentFootprintBytes`/`peakFootprintBytes`
-  (= RSS + hugetlb); the progress "rss" counter and `readMetrics` use them.
 - `--mem-report` prints the hugetlb peak, a combined footprint line, and
   the kernel-truth faulted figure from smaps (`Private_Hugetlb`).
 - the `--timeline` `rss_mb` counter carries a separate `hugetlb` series.

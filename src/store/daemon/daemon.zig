@@ -10,14 +10,26 @@
 //! reader/writer and drains the `STDERR_*` sideband after every op.
 
 const std = @import("std");
+const terminal_text = @import("base").terminal_text;
 const wire = @import("wire.zig");
 const build_events = @import("build_events.zig");
 const build_options = @import("build_options.zig");
 
 pub const default_socket_path = "/nix/var/nix/daemon-socket/socket";
 
-/// Result type `resProgress` (Nix logging.hh) — a `[done, expected, ...]` update.
-const res_progress: u64 = 105;
+const ActivityType = enum(u64) {
+    build = 105,
+    substitute = 108,
+    post_build_hook = 110,
+    _,
+};
+
+const ResultType = enum(u64) {
+    build_log_line = 101,
+    progress = 105,
+    post_build_log_line = 107,
+    _,
+};
 
 /// A consumer of the daemon's build activity/log stream (see `buildPaths`).
 /// Callbacks run on the calling thread while the build is in progress.
@@ -77,12 +89,12 @@ pub const DaemonStore = struct {
     /// Last daemon-reported error message (owned), surfaced with
     /// `error.DaemonError`. Freed on deinit / overwritten on the next error.
     last_error: ?[]u8 = null,
-    /// While true, STDERR_NEXT build-log lines are forwarded to our stderr
-    /// (set during `buildPaths`) instead of being discarded.
+    /// While true, daemon and structured build-log lines are forwarded to our
+    /// stderr (set during `buildPaths`) instead of being discarded.
     log_build: bool = false,
     suppress_build_output: bool = false,
-    /// Set during `buildPaths` to forward the activity/log stream (progress
-    /// nodes). When set, logs go to the sink instead of stderr.
+    /// Set during `buildPaths` to forward typed activities and logs to the CLI.
+    /// When set, logs go to the sink instead of directly to stderr.
     build_sink: ?BuildSink = null,
 
     /// Connect to the daemon socket and complete the handshake. Heap-allocated
@@ -268,8 +280,8 @@ pub const DaemonStore = struct {
 
     /// Realize `derived_paths` (each a legacy `<drvpath>!<outputs>` string, e.g.
     /// `/nix/store/xxx.drv!*` for all outputs). The daemon builds or substitutes
-    /// the outputs; build logs stream over STDERR_NEXT and are forwarded to our
-    /// stderr while this runs. Errors (with the daemon's message) on failure.
+    /// the outputs; build logs are forwarded to our stderr while this runs.
+    /// Errors (with the daemon's message) are surfaced on failure.
     pub fn buildPaths(self: *DaemonStore, derived_paths: []const []const u8, sink: ?BuildSink, mode: BuildMode) !void {
         try self.beginOp(.build_paths);
         try wire.writeStrings(self.w(), derived_paths);
@@ -359,24 +371,29 @@ pub const DaemonStore = struct {
         try self.processStderr();
     }
 
-    /// Consume the STDERR_* message stream until STDERR_LAST. Log lines are
-    /// discarded; a STDERR_ERROR is captured into `last_error` and surfaced as
-    /// `error.DaemonError`. Activity/result records are skipped structurally so
-    /// the stream stays in sync.
+    /// Consume the STDERR_* message stream until STDERR_LAST. During builds,
+    /// typed activities and actual log records are forwarded while daemon
+    /// presentation strings are discarded. A STDERR_ERROR is captured into
+    /// `last_error` and surfaced as `error.DaemonError`.
     fn processStderr(self: *DaemonStore) !void {
         while (true) {
             switch (try wire.readInt(self.r())) {
                 wire.stderr_last => return,
                 wire.stderr_error => return self.readError(),
-                wire.stderr_next => if (self.build_sink) |s| {
+                wire.stderr_next => {
+                    if (self.build_sink == null and !self.log_build) {
+                        try wire.skipString(self.r());
+                        continue;
+                    }
                     const line = try wire.readString(self.allocator, self.r());
                     defer self.allocator.free(line);
-                    s.emit(.{ .log = line });
-                } else if (self.log_build) {
-                    const line = try wire.readString(self.allocator, self.r());
-                    defer self.allocator.free(line);
-                    std.debug.print("{s}", .{line});
-                } else try wire.skipString(self.r()),
+                    const clean = terminal_text.stripAnsiInPlace(line);
+                    if (self.build_sink) |s| {
+                        s.emit(.{ .log = .{ .activity_id = null, .kind = .daemon, .text = clean } });
+                    } else if (self.log_build) {
+                        std.debug.print("{s}", .{clean});
+                    }
+                },
                 wire.stderr_start_activity => try self.readStartActivity(),
                 wire.stderr_stop_activity => {
                     const act = try wire.readInt(self.r());
@@ -396,10 +413,9 @@ pub const DaemonStore = struct {
         try wire.skipString(self.r()); // type ("Error")
         _ = try wire.readInt(self.r()); // level
         try wire.skipString(self.r()); // name (ignored)
-        const msg = try wire.readString(self.allocator, self.r());
-        // Deliberately no errdefer-free on `msg`: it becomes `last_error`, which
-        // we keep across the `error.DaemonError` return (an errdefer here would
-        // free the buffer we just stored and leave a dangling `last_error`).
+        const raw_msg = try wire.readString(self.allocator, self.r());
+        var raw_msg_owned = true;
+        errdefer if (raw_msg_owned) self.allocator.free(raw_msg);
         _ = try wire.readInt(self.r()); // havePos (0)
         const n_traces = try wire.readInt(self.r());
         if (n_traces > wire.max_wire_len) return error.WireListTooLong;
@@ -408,56 +424,118 @@ pub const DaemonStore = struct {
             _ = try wire.readInt(self.r()); // havePos
             try wire.skipString(self.r()); // trace hint
         }
+        const msg = try terminal_text.stripAnsiAlloc(self.allocator, raw_msg);
+        self.allocator.free(raw_msg);
+        raw_msg_owned = false;
         if (self.last_error) |old| self.allocator.free(old);
         self.last_error = msg;
         return error.DaemonError;
     }
 
-    fn skipFields(self: *DaemonStore) !void {
+    const FieldString = struct {
+        allocation: []u8,
+        text_len: usize,
+
+        fn text(self: FieldString) []const u8 {
+            return self.allocation[0..self.text_len];
+        }
+    };
+
+    const Fields = struct {
+        strings: [4]?FieldString = .{null} ** 4,
+        ints: [4]?u64 = .{null} ** 4,
+
+        fn deinit(self: *Fields, allocator: std.mem.Allocator) void {
+            for (self.strings) |field| if (field) |value| allocator.free(value.allocation);
+            self.* = undefined;
+        }
+
+        fn string(self: *const Fields, index: usize) []const u8 {
+            return if (self.strings[index]) |value| value.text() else "";
+        }
+
+        fn int(self: *const Fields, index: usize) u64 {
+            return self.ints[index] orelse 0;
+        }
+    };
+
+    fn readFields(self: *DaemonStore) !Fields {
+        var fields: Fields = .{};
+        errdefer fields.deinit(self.allocator);
         const n = try wire.readInt(self.r());
         if (n > wire.max_wire_len) return error.WireListTooLong;
         var i: u64 = 0;
         while (i < n) : (i += 1) {
             switch (try wire.readInt(self.r())) {
-                0 => _ = try wire.readInt(self.r()), // int field
-                1 => try wire.skipString(self.r()), // string field
+                0 => {
+                    const value = try wire.readInt(self.r());
+                    if (i < fields.ints.len) fields.ints[@intCast(i)] = value;
+                },
+                1 => {
+                    if (i >= fields.strings.len) {
+                        try wire.skipString(self.r());
+                        continue;
+                    }
+                    const value = try wire.readString(self.allocator, self.r());
+                    fields.strings[@intCast(i)] = .{
+                        .allocation = value,
+                        .text_len = terminal_text.stripAnsiInPlace(value).len,
+                    };
+                },
                 else => return error.UnknownActivityField,
             }
         }
+        return fields;
     }
 
     fn readStartActivity(self: *DaemonStore) !void {
         const act = try wire.readInt(self.r());
         _ = try wire.readInt(self.r()); // level
-        _ = try wire.readInt(self.r()); // daemon ActivityType; presentation uses text
-        const text = try wire.readString(self.allocator, self.r());
-        defer self.allocator.free(text);
-        try self.skipFields();
+        const activity_type: ActivityType = @enumFromInt(try wire.readInt(self.r()));
+        try wire.skipString(self.r()); // daemon-rendered text; presentation owns labels
+        var fields = try self.readFields();
+        defer fields.deinit(self.allocator);
         _ = try wire.readInt(self.r()); // parent
-        if (self.build_sink) |s| if (text.len != 0) s.emit(.{ .start = .{ .id = act, .text = text } });
+        const kind: build_events.ActivityKind = switch (activity_type) {
+            .build => .build,
+            .substitute => .substitute,
+            .post_build_hook => .post_build_hook,
+            else => return,
+        };
+        const subject = fields.string(0);
+        if (self.build_sink) |s| if (subject.len != 0) s.emit(.{ .start = .{
+            .id = act,
+            .kind = kind,
+            .subject = subject,
+            .detail = fields.string(1),
+        } });
     }
 
     fn readResult(self: *DaemonStore) !void {
         const act = try wire.readInt(self.r());
-        const result_type = try wire.readInt(self.r());
-        // Capture the first two int fields; for `resProgress` they are
-        // done/expected. Consume the rest to stay in sync.
-        const n = try wire.readInt(self.r());
-        if (n > wire.max_wire_len) return error.WireListTooLong;
-        var ints: [2]u64 = .{ 0, 0 };
-        var int_count: usize = 0;
-        var i: u64 = 0;
-        while (i < n) : (i += 1) {
-            switch (try wire.readInt(self.r())) {
-                0 => {
-                    const v = try wire.readInt(self.r());
-                    if (int_count < ints.len) ints[int_count] = v;
-                    int_count += 1;
-                },
-                1 => try wire.skipString(self.r()),
-                else => return error.UnknownActivityField,
-            }
+        const result_type: ResultType = @enumFromInt(try wire.readInt(self.r()));
+        var fields = try self.readFields();
+        defer fields.deinit(self.allocator);
+        switch (result_type) {
+            .progress => if (self.build_sink) |s| s.emit(.{ .progress = .{
+                .id = act,
+                .done = fields.int(0),
+                .expected = fields.int(1),
+            } }),
+            .build_log_line, .post_build_log_line => {
+                if (self.suppress_build_output) return;
+                const line = fields.string(0);
+                if (self.build_sink) |s| {
+                    s.emit(.{ .log = .{
+                        .activity_id = act,
+                        .kind = if (result_type == .build_log_line) .build else .post_build,
+                        .text = line,
+                    } });
+                } else if (self.log_build) {
+                    std.debug.print("{s}", .{line});
+                }
+            },
+            else => {},
         }
-        if (self.build_sink) |s| if (result_type == res_progress) s.emit(.{ .progress = .{ .id = act, .done = ints[0], .expected = ints[1] } });
     }
 };

@@ -6,9 +6,6 @@ const sync = @import("base").sync;
 const owned_strings = @import("base").owned_strings;
 const runtime = @import("runtime");
 const FileCache = @import("../file_cache.zig").FileCache;
-const progress = @import("../progress.zig");
-
-pub const SpanGroup = progress.SpanGroup;
 
 pub const RootClaimHook = struct {
     ctx: *anyopaque,
@@ -39,7 +36,7 @@ pub const PendingFetch = struct {
 
 pub const Recipe = struct {
     payload: Payload,
-    span_group: ?SpanGroup = null,
+    report_progress: bool = false,
 
     pub const TextPayload = struct {
         bytes: []u8,
@@ -222,7 +219,7 @@ pub const Graph = struct {
         errdefer self.allocator.destroy(recipe);
         const owned_refs = try owned_strings.clone(self.allocator, references);
         errdefer owned_strings.free(self.allocator, owned_refs);
-        recipe.* = .{ .payload = .{ .text = .{ .bytes = text, .references = owned_refs } }, .span_group = .store };
+        recipe.* = .{ .payload = .{ .text = .{ .bytes = text, .references = owned_refs } }, .report_progress = true };
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
         try self.recipes.put(self.allocator, key, recipe);
@@ -239,13 +236,13 @@ pub const Graph = struct {
         errdefer self.allocator.free(nar_bytes);
         const recipe = try self.allocator.create(Recipe);
         errdefer self.allocator.destroy(recipe);
-        recipe.* = .{ .payload = .{ .nar = nar_bytes }, .span_group = .source };
+        recipe.* = .{ .payload = .{ .nar = nar_bytes }, .report_progress = true };
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
         try self.recipes.put(self.allocator, key, recipe);
     }
 
-    pub fn recordFlat(self: *Graph, store_path: []const u8, handle: FileCache.ImmutableBytes, span_group: ?SpanGroup) !void {
+    pub fn recordFlat(self: *Graph, store_path: []const u8, handle: FileCache.ImmutableBytes, report_progress: bool) !void {
         self.mu.lock();
         defer self.mu.unlock();
         var retained = handle.retain();
@@ -257,7 +254,7 @@ pub const Graph = struct {
         errdefer retained.release();
         const recipe = try self.allocator.create(Recipe);
         errdefer self.allocator.destroy(recipe);
-        recipe.* = .{ .payload = .{ .flat = retained }, .span_group = span_group };
+        recipe.* = .{ .payload = .{ .flat = retained }, .report_progress = report_progress };
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
         try self.recipes.put(self.allocator, key, recipe);

@@ -35,15 +35,11 @@ pub fn evaluateAndWrite(
     label: []const u8,
 ) !bool {
     // Bracket the whole run (evaluate + force + render) so the progress bar
-    // keeps an always-open "evaluating <label>" node and a ~100ms counter
-    // sampler running across every phase. Defers are LIFO: the sampler stops
-    // (and joins) before the session's nodes are torn down.
+    // keeps an always-open "evaluating <label>" node across every phase.
     // Values render in the same palette as diagnostics when writing to a tty.
     ev.setValueColor(use_color);
     ev.progressSessionBegin(label);
     defer ev.progressSessionEnd();
-    ev.startProgressSampler();
-    defer ev.stopProgressSampler();
 
     const result = ev.evaluatePathAt(source.text, source.base_path, source.abs_path) catch |err| {
         try render.evalFailure(io, use_color, show_trace, ev, source.text, err);

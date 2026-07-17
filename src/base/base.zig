@@ -23,6 +23,7 @@ pub const hugetlb = @import("hugetlb.zig");
 pub const arena = @import("arena.zig");
 pub const worker_id = @import("worker_id.zig");
 pub const blocking_pool = @import("blocking_pool.zig");
+pub const terminal_text = @import("terminal_text.zig");
 
 // Common flat re-exports for the most-used types.
 pub const Deque = deque.Deque;
@@ -45,4 +46,5 @@ test {
     _ = arena;
     _ = worker_id;
     _ = blocking_pool;
+    _ = terminal_text;
 }

@@ -193,17 +193,17 @@ pub fn realizeMany(
     var progress = EvalProgress.init(io, terminal.show_progress);
     if (terminal.show_progress) ev.setProgressSink(progress.sink());
     ev.progressSessionBegin("build inputs");
-    ev.startProgressSampler();
     var progress_closed = false;
     defer if (!progress_closed) {
-        ev.stopProgressSampler();
         ev.progressSessionEnd();
         progress.deinit(false);
     };
 
-    var build_progress_state = build_progress.BuildProgress.init(allocator, &progress);
+    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.use_color, terminal.show_progress, &progress);
     defer build_progress_state.deinit();
-    const sink = if (terminal.show_progress) build_progress_state.sink() else null;
+    // Keep the typed daemon sink active even when the progress tree is hidden:
+    // it also owns build-log labeling and terminal-safe color boundaries.
+    const sink = build_progress_state.sink();
 
     const slots = try allocator.alloc(BuildSlot, inputs.len);
     defer allocator.free(slots);
@@ -231,7 +231,6 @@ pub fn realizeMany(
 
     // Every demand fiber has either enqueued its build or completed its request
     // with an error. Nothing below reads language values.
-    ev.stopProgressSampler();
     ev.releaseEvalState();
     if (release_action) |action| action.run(action.context);
 
@@ -262,9 +261,6 @@ pub fn dryRunMany(
     if (terminal.show_progress) ev.setProgressSink(progress.sink());
     ev.progressSessionBegin("dry-run inputs");
     defer ev.progressSessionEnd();
-    ev.startProgressSampler();
-    var sampler_running = true;
-    defer if (sampler_running) ev.stopProgressSampler();
 
     const derived = try allocator.alloc([]const u8, inputs.len);
     var derived_count: usize = 0;
@@ -289,8 +285,6 @@ pub fn dryRunMany(
         derived_count += 1;
     }
 
-    ev.stopProgressSampler();
-    sampler_running = false;
     var session = ev.beginBuildPhase(derived[0..derived_count], release_action) catch |err| {
         return eval_support.buildFailure(ev.lastStoreError(), err);
     };
@@ -336,32 +330,26 @@ pub fn realize(
     defer if (!torn_down) progress.deinit(false);
     if (terminal.show_progress) ev.setProgressSink(progress.sink());
     ev.progressSessionBegin(eval_support.sourceLabel(source_arg));
-    ev.startProgressSampler();
 
     const value = ev.evaluatePathAt(source.text, source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
-        ev.stopProgressSampler();
         ev.progressSessionEnd();
         return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.text, err) };
     };
     const drv_path = (ev.derivationDrvPath(value) catch |err| {
-        ev.stopProgressSampler();
         ev.progressSessionEnd();
         return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.text, err) };
     }) orelse {
-        ev.stopProgressSampler();
         ev.progressSessionEnd();
         std.debug.print("error: that did not evaluate to a derivation\n", .{});
         return .{ .failed = 1 };
     };
     const out_path = (try ev.derivationOutPath(value)) orelse drv_path;
     const program: ?[]const u8 = if (want_program) ((try ev.derivationProgram(value)) orelse {
-        ev.stopProgressSampler();
         ev.progressSessionEnd();
         std.debug.print("error: could not determine a program name to run\n", .{});
         return .{ .failed = 1 };
     }) else null;
 
-    ev.stopProgressSampler();
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
     var realized: Realized = .{
@@ -371,8 +359,8 @@ pub fn realize(
     };
     errdefer realized.deinit(allocator);
 
-    var build_progress_state = build_progress.BuildProgress.init(allocator, &progress);
-    const build_sink = if (terminal.show_progress) build_progress_state.sink() else null;
+    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.use_color, terminal.show_progress, &progress);
+    const build_sink = build_progress_state.sink();
     var build_session = ev.beginBuildPhase(&.{derived}, release_action) catch |err| {
         build_progress_state.deinit();
         ev.progressSessionEnd();

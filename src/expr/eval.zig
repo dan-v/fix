@@ -47,7 +47,6 @@ const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
 const mem_report = @import("eval/mem_report.zig");
 const tuning = @import("eval/tuning.zig");
-const progress_controller = @import("eval/progress_controller.zig");
 const debugger_state = @import("eval/debugger_state.zig");
 const debug_session = @import("eval/debug_session.zig");
 
@@ -300,7 +299,7 @@ pub const Evaluator = struct {
     value_color: bool = false,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
-    progress_control: progress_controller.Controller = .{},
+    progress_sink: ?eval_progress.Sink = null,
     vm_trace: ?*VmTrace,
     thunk_trace: if (vm_mod.thunks_log_enabled) ?*ThunkTrace else void,
     worker_count: u8,
@@ -428,7 +427,7 @@ pub const Evaluator = struct {
             .builtins_value = null,
             .base_path = null,
             .env_map = null,
-            .progress_control = .{},
+            .progress_sink = null,
             .vm_trace = null,
             .thunk_trace = if (vm_mod.thunks_log_enabled) null else {},
             .worker_count = worker_count,
@@ -472,9 +471,6 @@ pub const Evaluator = struct {
     pub fn releaseEvalState(self: *Evaluator) void {
         if (self.eval_released) return;
         self.eval_released = true;
-        // The sampler reads the heap + scheduler; callers stop it before the
-        // build phase already, but be structural about it.
-        self.stopProgressSampler();
         mem_report.report(&self.heap, &self.intern, &self.registry, self.retained_arenas.items, self.mem_report_mode);
         gc.recordFinalTotal(&self.heap.gc_report, self.heap.totalReservedBytes());
         if (self.gc_report_on) gc.report(&self.heap.gc_report, self.heap.gc_budget_bytes);
@@ -717,7 +713,7 @@ pub const Evaluator = struct {
     }
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
-        self.progress_control.setSink(progress);
+        self.progress_sink = progress;
         self.store.realization.setProgressSpans(if (progress) |p| p.spans else null);
         // Nothing to sync on the worker: the demand-only handles are passed
         // per top-level entry (`runWithVm` → `runTopLevel`), so a sink
@@ -1427,7 +1423,7 @@ pub const Evaluator = struct {
             // the demand fiber's ExecutionContext (installed by
             // `Worker.runTopLevel`; nested VMs share the ctx pointer, see
             // below), so a helper has no way to touch `active[]`.
-            .progress_spans = if (self.progress_control.sink) |p| p.spans else null,
+            .progress_spans = if (self.progress_sink) |p| p.spans else null,
             .executor = execution.fiber_executor,
             .vm_trace = if (worker_id == 0) self.vm_trace else null,
             // The thunk trace IS shared across workers — diagnosing
@@ -1708,12 +1704,11 @@ pub const Evaluator = struct {
         const worker = try self.ensureMainWorker();
         // Demand-role handles for the top fiber's execution context, read
         // fresh per entry (a progress sink (re)installed between runs — the
-        // repl — is picked up here with no worker-side bookkeeping). Both
-        // stay null when progress isn't drawn, so the demand fiber's
-        // stage/wait writes remain structurally free in benchmark/piped runs.
+        // repl — is picked up here with no worker-side bookkeeping). It stays
+        // null when progress isn't drawn, so demand-fiber progress writes are
+        // structurally free in benchmark/piped runs.
         try worker.runTopLevel(Ctx.entry, @ptrCast(&ctx), .{
-            .progress_stage = if (self.progress_control.sink) |p| p.stage else null,
-            .progress_wait = if (self.progress_control.sink != null) &self.progress_control.wait else null,
+            .progress_stage = if (self.progress_sink) |p| p.stage else null,
         });
         if (ctx.err) |e| return e;
         return ctx.result;
@@ -2090,7 +2085,7 @@ pub const Evaluator = struct {
     /// single-threaded setup on the main thread (parse/compile before the
     /// run enters a fiber) — allowed, the demand fiber doesn't exist yet.
     fn stageSink(self: *Evaluator) ?eval_progress.StageSink {
-        const progress = self.progress_control.sink orelse return null;
+        const progress = self.progress_sink orelse return null;
         const inner = fiber_mod.currentFiber() orelse return progress.stage;
         const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
         return wf.ctx.progress_stage;
@@ -2108,51 +2103,6 @@ pub const Evaluator = struct {
         if (self.stageSink()) |sink| sink.instant(stage, subject);
     }
 
-    /// Build a live counter snapshot for the progress indicator. Cheap — a
-    /// handful of plain/atomic loads plus one /proc RSS read. Runs on the
-    /// sampler thread; every read here is advisory, so no locking.
-    fn readMetrics(self: *Evaluator) eval_progress.Metrics {
-        const st = self.scheduler.stats();
-        const g = gc.liveReport(&self.heap.gc_report);
-        var m: eval_progress.Metrics = .{
-            .objects = self.heap.objects.count(),
-            .values = self.heap.values.count(),
-            .attrs = self.heap.attrs.count(),
-            .reserved_bytes = self.heap.totalReservedBytes(),
-            // Footprint, not raw RSS: hugetlb-backed heap bytes are invisible
-            // to statm (see base/hugetlb.zig) and would make the live memory
-            // counter read near-zero on a --hugetlb run.
-            .rss_bytes = gc.currentFootprintBytes(),
-            .pending = self.scheduler.pending_tasks.v.load(.monotonic),
-            .forced = st.pops,
-            .steals = st.steals,
-            .spec_submitted = st.speculative_submitted,
-            .spec_rejected = st.speculative_rejected,
-            .gc_collections = g.collections,
-            .gc_live_bytes = g.live_bytes,
-            .gc_freed_objects = g.freed_objects,
-        };
-        m.wait_len = @intCast(self.progress_control.wait.read(&m.wait_buf));
-        return m;
-    }
-
-    fn progressSample(context: *anyopaque) void {
-        const self: *Evaluator = @ptrCast(@alignCast(context));
-        if (self.progress_control.sink) |p| p.stage.metrics(self.readMetrics());
-    }
-
-    /// Start the background progress sampler. No-op unless progress is drawn,
-    /// so it never spins up in benchmark / piped runs.
-    pub fn startProgressSampler(self: *Evaluator) void {
-        self.progress_control.start(self, progressSample);
-    }
-
-    /// Stop and join the sampler, then push one final snapshot so the last
-    /// numbers (final heap / GC tally) land before the bar is torn down.
-    pub fn stopProgressSampler(self: *Evaluator) void {
-        self.progress_control.stop();
-    }
-
     /// Writer-side `[i/N]` item count. `progressCountBegin` sets the render
     /// node's total (once, per top-level collection) and returns whether
     /// counting is live; `progressStep` advances it per element (cheap — no
@@ -2164,16 +2114,15 @@ pub const Evaluator = struct {
     }
 
     pub fn progressStep(self: *Evaluator, completed: usize, total: usize) void {
-        if (self.progress_control.sink) |p| p.stage.count(completed, total);
+        if (self.progress_sink) |p| p.stage.count(completed, total);
     }
 
     pub fn progressSessionBegin(self: *Evaluator, label: []const u8) void {
-        if (self.progress_control.sink) |p| p.stage.sessionBegin(label);
+        if (self.progress_sink) |p| p.stage.sessionBegin(label);
     }
 
     pub fn progressSessionEnd(self: *Evaluator) void {
-        self.progress_control.wait.clear();
-        if (self.progress_control.sink) |p| p.stage.sessionEnd();
+        if (self.progress_sink) |p| p.stage.sessionEnd();
     }
 };
 

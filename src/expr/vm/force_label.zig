@@ -38,8 +38,8 @@ pub fn thunkLabel(self: *VM, thunk_id: ObjectId, buf: []u8) timeline.Subject {
 /// fiber's own frames), used for the progress "waiting on" line. Deliberately
 /// NOT the target thunk's def-site: decoding that touches the thunk's payload
 /// union, which a concurrent resolver can clobber mid-read. Returns "" when
-/// there's no frame / no source map. The result is copied immediately by the
-/// caller (into `ProgressWait`), so borrowing `buf` is safe.
+/// there's no frame / no source map. The progress sink consumes the result
+/// synchronously, so borrowing `buf` is safe.
 pub fn demandFrameText(self: *VM, buf: []u8) []const u8 {
     if (self.frames_len == 0) return "";
     const frame = self.frames[self.frames_len - 1];

@@ -18,12 +18,6 @@
 //!     fiber recycles. Readers (the VM run paths) only see it while the fiber
 //!     runs, sequenced by the same handoff that publishes all other fiber
 //!     state.
-//!
-//! Because it is fiber-lifetime, single-writer, and at a stable address,
-//! this record is the natural future home for a sampler-readable "current
-//! activity" slot (the `ProgressWait` pattern: fiber writes at a
-//! safepoint, sampler thread reads lock-free). Not built yet — add it here
-//! when needed, not on the VM.
 
 const std = @import("std");
 const thunk_mod = @import("runtime").thunk;
@@ -67,13 +61,6 @@ pub const ExecutionContext = struct {
     /// work reports via the thread-safe `VM.progress_spans` instead — don't
     /// add a bypass.
     progress_stage: ?eval_progress.StageSink = null,
-    /// Shared "what is the demand path blocked on" record for the progress
-    /// indicator. Non-null ONLY on the demand fiber and only while progress
-    /// is drawn; the demand fiber writes its blocking source loc at a busy
-    /// safepoint and the progress sampler thread reads it. Precise by
-    /// construction — no compensating `is_demand` gate needed at the use
-    /// site, and it stays with the fiber across a steal.
-    progress_wait: ?*eval_progress.ProgressWait = null,
     /// Head of the in-progress `builtins.scopedImport` path chain. Unlike an
     /// OS-thread-local, this travels with the fiber when work stealing resumes
     /// it on another worker. Frames themselves live on the suspended fiber's
@@ -97,7 +84,6 @@ pub const ExecutionContext = struct {
         self.is_demand = false;
         self.parallel_demand = false;
         self.progress_stage = null;
-        self.progress_wait = null;
     }
 };
 
@@ -126,5 +112,4 @@ pub const ScopedImportFrame = struct {
 /// bookkeeping).
 pub const DemandRole = struct {
     progress_stage: ?eval_progress.StageSink = null,
-    progress_wait: ?*eval_progress.ProgressWait = null,
 };

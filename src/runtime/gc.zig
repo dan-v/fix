@@ -607,10 +607,9 @@ pub fn recordCollection(state: *ReportState, objects_freed: u64, live_bytes: u64
     _ = state.peak_total_bytes.fetchMax(total_after, .monotonic);
 }
 
-/// Live collector counters for the progress indicator: how many collections
-/// have run, the surviving live bytes after the last one, and the cumulative
-/// objects freed. Cheap (plain global loads); all zero in a build that never
-/// collects. See `observ/progress.zig`.
+/// Collector counter snapshot used by diagnostics and tests: how many
+/// collections have run, the surviving live bytes after the last one, and the
+/// cumulative objects freed.
 pub const LiveReport = struct {
     collections: u64,
     live_bytes: u64,
@@ -649,22 +648,10 @@ pub fn peakRssBytes() u64 {
 
 // Hugetlb-backed bytes are invisible to every kernel RSS figure (ru_maxrss,
 // VmRSS/VmHWM, statm) — with `--hugetlb` most of the heap moves off-RSS, so
-// any consumer that means "how much memory is this process using" must use
-// the footprint variants below, which fold in the hugetlb byte tracking
-// from base/hugetlb.zig. (The GC budget itself is immune: it gates on
+// any diagnostic that means "how much memory is this process using" must fold
+// in the hugetlb byte tracking from base/hugetlb.zig. (The GC budget itself is
+// immune: it gates on
 // `ObjectHeap.totalReservedBytes()`, internal slot counting.)
-
-/// `currentRssBytes` + currently mapped hugetlb bytes.
-pub fn currentFootprintBytes() u64 {
-    return currentRssBytes() + containers.hugetlb.mappedBytes();
-}
-
-/// `peakRssBytes` + the hugetlb high-water. The two peaks need not have
-/// coincided in time, so this can overshoot slightly — acceptable for the
-/// reporting consumers (a truthful lower bound is impossible post-hoc).
-pub fn peakFootprintBytes() u64 {
-    return peakRssBytes() + containers.hugetlb.peakMappedBytes();
-}
 
 /// Current resident set size in bytes, read from /proc/self/statm (field 2
 /// = resident pages). Returns 0 if unavailable.
