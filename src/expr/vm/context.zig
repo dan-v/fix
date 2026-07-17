@@ -220,7 +220,7 @@ pub const VM = struct {
     /// The thread-safe concurrent-span half of the progress protocol
     /// (fetches, store writes, source copies). Installed on EVERY VM — it is
     /// the only progress channel available off the demand fiber. Null when
-    /// progress isn't drawn.
+    /// progress is disabled.
     progress_spans: ?eval_progress.SpanSink,
     /// Fiber-aware blocking capability supplied by the evaluator. Standalone
     /// VMs leave this null and execute blocking work inline.

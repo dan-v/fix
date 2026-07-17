@@ -8,9 +8,9 @@
 
 One number decides when the collector runs: a heap-reserved-bytes budget, defended against.
 
-- Resolution order: `--max-memory=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemAvailable** (fallbacks: half MemTotal, then 2 GiB). Half, because the budget bounds only the four heap stores — side allocations (chunks, interner, strings, thread stacks) ride on top, and other processes need headroom. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
+- Resolution order: `--gc-budget=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemTotal**, clamped to 256 MiB–8 GiB (fallback: half of an assumed 4 GiB). The budget covers the evaluator heap stores, not total process RSS; side allocations such as chunks, interned strings, and thread stacks sit outside it. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
 - **Lazy arming**: below budget/2 the heap only compares its reserved-bytes cursor against the threshold once per TLAB refill — no young-slot tracking, no write barrier, no free-list probes. The first budget/2 crossing runs an arming stop-the-world safepoint (`armLazy`): everything allocated so far becomes untracked/old (the unreclaimable floor, ≈ reserved at budget/2 by construction), and real collections start at the full budget, re-armed to `max(budget, reserved + clamp(budget/8, 64MB, 1GB))` after each.
-- Consequence: on a big-RAM machine the default budget dwarfs any eval → **zero collections, zero arming, rooting-tax only**; on a small-RAM device collections start well before OOM and peak reserved stays bounded near the budget (measured: `--max-memory=512m` holds nixos_toplevel at ~850 MB reserved vs ~1.4 GB unbounded, byte-identical).
+- Consequence: on a big-RAM machine the default budget dwarfs any eval → **zero collections, zero arming, rooting-tax only**; on a small-RAM device collections start well before OOM and peak reserved stays bounded near the budget (measured: `--gc-budget=512m` holds nixos_toplevel at ~850 MB reserved vs ~1.4 GB unbounded, byte-identical).
 
 ## Why non-moving + precise
 

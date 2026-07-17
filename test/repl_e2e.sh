@@ -136,7 +136,7 @@ gc_soak() {
             printf 'builtins.length (builtins.genList (x: { v = x * 2; }) 200000)\n'
             printf ':gc\n'
         done
-    } | "$FIX" repl --max-memory=4096 2>/dev/null | grep '^gc:' | tail -1
+    } | "$FIX" repl --gc-budget=4096 2>/dev/null | grep '^gc:' | tail -1
 }
 first=$(gc_soak 3)
 last=$(gc_soak 24)

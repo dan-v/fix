@@ -190,8 +190,8 @@ pub fn realizeMany(
     options: args.Options,
     inputs: []const BuildInput,
 ) !u8 {
-    var progress = EvalProgress.init(io, terminal.show_progress);
-    if (terminal.show_progress) ev.setProgressSink(progress.sink());
+    var progress = EvalProgress.init(io, terminal.show_progress, terminal.log_progress, terminal.use_color);
+    if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
     ev.progressSessionBegin("build inputs");
     var progress_closed = false;
     defer if (!progress_closed) {
@@ -199,10 +199,10 @@ pub fn realizeMany(
         progress.deinit(false);
     };
 
-    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.use_color, terminal.show_progress, &progress);
+    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.use_color, terminal.log_progress, &progress);
     defer build_progress_state.deinit();
-    // Keep the typed daemon sink active even when the progress tree is hidden:
-    // it also owns build-log labeling and terminal-safe color boundaries.
+    // Keep the typed daemon sink active even when progress is disabled: it
+    // still owns build-log labeling and terminal-safe color boundaries.
     const sink = build_progress_state.sink();
 
     const slots = try allocator.alloc(BuildSlot, inputs.len);
@@ -255,10 +255,10 @@ pub fn dryRunMany(
     options: args.Options,
     inputs: []const BuildInput,
 ) !u8 {
-    var progress = EvalProgress.init(io, terminal.show_progress);
+    var progress = EvalProgress.init(io, terminal.show_progress, terminal.log_progress, terminal.use_color);
     var progress_ok = false;
     defer progress.deinit(progress_ok);
-    if (terminal.show_progress) ev.setProgressSink(progress.sink());
+    if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
     ev.progressSessionBegin("dry-run inputs");
     defer ev.progressSessionEnd();
 
@@ -325,10 +325,10 @@ pub fn realize(
     source: eval_support.Source,
     want_program: bool,
 ) !Result {
-    var progress = EvalProgress.init(io, terminal.show_progress);
+    var progress = EvalProgress.init(io, terminal.show_progress, terminal.log_progress, terminal.use_color);
     var torn_down = false;
     defer if (!torn_down) progress.deinit(false);
-    if (terminal.show_progress) ev.setProgressSink(progress.sink());
+    if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
     ev.progressSessionBegin(eval_support.sourceLabel(source_arg));
 
     const value = ev.evaluatePathAt(source.text, source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
@@ -359,7 +359,7 @@ pub fn realize(
     };
     errdefer realized.deinit(allocator);
 
-    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.use_color, terminal.show_progress, &progress);
+    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.use_color, terminal.log_progress, &progress);
     const build_sink = build_progress_state.sink();
     var build_session = ev.beginBuildPhase(&.{derived}, release_action) catch |err| {
         build_progress_state.deinit();

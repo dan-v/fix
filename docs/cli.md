@@ -30,8 +30,6 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` share the compile
 | `trace dump PATH` / `trace diff A B` | read binary VM-execution trace files: `dump` pretty-prints one as text; `diff` walks two in lockstep to the first divergent event | [vm/dispatch.md](vm/dispatch.md) |
 | `thunks diff A B` | diff two thunk-resolution logs → first divergence by source location | below |
 
-Note: `derivation-debug` is **not** a subcommand — derivation records are filtered/rendered inline via the `--debug-derivation*` flags below. See [derivation/model.md](derivation/model.md).
-
 ## The repl
 
 `fix repl` (`src/cli/commands/repl.zig` + `src/cli/repl/`) has two strictly separated modes, decided once at startup:
@@ -137,16 +135,12 @@ explicit typed flake-output/installable form.
 | `--read-write-mode` | (`eval`) register evaluated derivations and store-backed fetched sources while still printing the evaluated value |
 | `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call; `flakes` — gates the flake builtins (`getFlake`, `parseFlakeRef`, `flakeRefToString`) and the `--flake` installable, and implies `fetch-tree`. All off by default; a disabled builtin raises a hard (tryEval-uncatchable) error. |
 | `--workers N` | worker threads; default `min(8, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |
-| `--max-memory SIZE` | GC budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default half of `MemAvailable`) → [gc.md](gc.md) |
+| `--gc-budget SIZE` | evaluator-heap budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default RAM-scaled) → [gc.md](gc.md) |
 | `--hugetlb auto\|on\|off` | back the evaluation heap with explicit 2 MB huge pages (default `auto`: only when the kernel pool has ≥256 MB unreserved capacity). Provision the pool with `sysctl vm.nr_hugepages=N` → [perf/hugetlb.md](perf/hugetlb.md) |
 | `--show-trace` | full evaluation traces on error |
 | `--debugger` (eval, repl) | pause into the interactive debug console at `builtins.break` and on evaluation errors; forces `--workers=1`. See [The debugger](#the-debugger). |
 | `--color[=auto\|always\|never]` / `--no-color` | color diagnostics |
-| `--progress[=auto\|always\|never]` / `--no-progress` | eval progress on stderr |
-| `--debug-derivations[=summary\|full]` | write derivation debug records to stderr |
-| `--debug-derivation-filter TEXT` | only derivations whose name/path/input mentions TEXT |
-| `--debug-derivation-name NAME` | only the derivation with exactly NAME |
-| `--debug-derivation-drv PATH` | only the derivation with exactly PATH |
+| `--progress[=log]` / `--no-progress` | automatic eval progress on stderr; `=log` forces durable lines instead of the live TTY tree |
 | `--bare` (repl) | plain line-based input: no editor, no escape sequences — for pipes and expect-style automation |
 
 ### Store links & realization (`instantiate`/`build`/`run`/`shell`)

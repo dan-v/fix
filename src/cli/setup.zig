@@ -37,6 +37,11 @@ pub fn workerCount(options: args.Options) !u8 {
 pub const Terminal = struct {
     use_color: bool,
     show_progress: bool,
+    log_progress: bool,
+
+    pub fn progressEnabled(self: Terminal) bool {
+        return self.show_progress or self.log_progress;
+    }
 };
 
 /// Resolve process-level memory-backing policy that must be decided BEFORE
@@ -58,8 +63,7 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.setLazyShellsVisible(options.output == .xml);
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
-    ev.setDerivationDebug(options.derivation_debug.enabled());
-    ev.configureMemory(options.max_memory, options.mem_report, options.gc_report);
+    ev.configureMemory(options.gc_budget, options.mem_report, options.gc_report);
     ev.setEnvironment(init.environ_map);
 
     // Experimental features and the concurrent-fetch cap both come from
@@ -120,9 +124,13 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     try applyNixPath(ev, init, options);
 
     const use_color = presentation.shouldColor(options.color, init.io, init.environ_map);
-    const show_progress = presentation.shouldProgress(options.progress, init.io, init.environ_map);
+    const progress = presentation.progressPolicy(options.progress, init.io, init.environ_map);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
-    return .{ .use_color = use_color, .show_progress = show_progress };
+    return .{
+        .use_color = use_color,
+        .show_progress = progress.show,
+        .log_progress = progress.log,
+    };
 }
 
 /// Send per-connection daemon settings via `set_options` when the store

@@ -5,7 +5,6 @@ const std = @import("std");
 const render = @import("render.zig");
 const args = @import("args.zig");
 const fileish = @import("fileish.zig");
-const derivation_debug = @import("derivation_debug.zig");
 const engine = @import("expr");
 const runtime = @import("runtime");
 const store = @import("store");
@@ -22,14 +21,13 @@ pub fn buildMode(options: args.Options) store.daemon.BuildMode {
     return .normal;
 }
 
-/// Evaluate `source`, write the result (or render the failure), and emit any
-/// requested derivation-debug records. Returns whether evaluation succeeded.
+/// Evaluate `source` and write the result, or render the failure. Returns
+/// whether evaluation succeeded.
 pub fn evaluateAndWrite(
     io: std.Io,
     mode: EvaluationMode,
     use_color: bool,
     show_trace: bool,
-    debug_options: derivation_debug.Options,
     ev: *Evaluator,
     source: Source,
     label: []const u8,
@@ -50,7 +48,6 @@ pub fn evaluateAndWrite(
         try render.evaluationError(io, use_color, show_trace, ev, source.text, err);
         return false;
     };
-    try derivation_debug.write(io, use_color, ev.hostAllocator(), debug_options, ev.derivationDebugRecords());
     return true;
 }
 

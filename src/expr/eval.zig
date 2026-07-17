@@ -345,11 +345,11 @@ pub const Evaluator = struct {
     /// every minor was ~77% of the serial root-scan. A future MAJOR resets this
     /// to 0 (a full mark re-scans every constant).
     gc_chunks_scanned: ChunkId = 0,
-    /// `--max-memory` override for the collector's memory
-    /// budget, in bytes (0 = never collect). `null` = resolve the default
-    /// (otherwise half of MemAvailable) — see `eval/gc_controller.zig:memoryBudget`.
+    /// `--gc-budget` override for the collector's heap budget, in bytes
+    /// (0 = never collect). `null` resolves the RAM-scaled default; see
+    /// `eval/gc_controller.zig:memoryBudget`.
     /// Set by the CLI before evaluation.
-    max_memory_bytes: ?u64 = null,
+    gc_budget_bytes: ?u64 = null,
     /// Optional teardown memory report (`"dump"` also lists registered VMAs).
     mem_report_mode: ?[]const u8 = null,
     /// Print the collector summary during teardown.
@@ -543,8 +543,8 @@ pub const Evaluator = struct {
         return self.policy;
     }
 
-    pub fn configureMemory(self: *Evaluator, max_memory: ?u64, report_mode: ?[]const u8, gc_report: bool) void {
-        self.max_memory_bytes = max_memory;
+    pub fn configureMemory(self: *Evaluator, gc_budget: ?u64, report_mode: ?[]const u8, gc_report: bool) void {
+        self.gc_budget_bytes = gc_budget;
         self.mem_report_mode = report_mode;
         self.gc_report_on = gc_report;
     }
@@ -1705,8 +1705,8 @@ pub const Evaluator = struct {
         // Demand-role handles for the top fiber's execution context, read
         // fresh per entry (a progress sink (re)installed between runs — the
         // repl — is picked up here with no worker-side bookkeeping). It stays
-        // null when progress isn't drawn, so demand-fiber progress writes are
-        // structurally free in benchmark/piped runs.
+        // null when progress is disabled, so demand-fiber progress writes are
+        // structurally free in explicitly quiet runs.
         try worker.runTopLevel(Ctx.entry, @ptrCast(&ctx), .{
             .progress_stage = if (self.progress_sink) |p| p.stage else null,
         });
@@ -1754,7 +1754,7 @@ pub const Evaluator = struct {
         }
         // Collection line: no collection runs until heap-reserved bytes
         // cross it (automatic `clamp(½·MemTotal, 256MB, 8GB)`, overridable
-        // via `--max-memory`; see `gc_controller.memoryBudget`).
+        // via `--gc-budget`; see `gc_controller.memoryBudget`).
         // On a roomy machine that line dwarfs the eval → never fires: zero
         // pauses AND zero tracking (lazy arming at line/2, see
         // `heap_collector.enableBudget`); on a tight machine it fires before the
@@ -1782,7 +1782,7 @@ pub const Evaluator = struct {
     }
 
     pub const CollectNowResult = struct {
-        /// False when collection is disabled by policy (`--max-memory=0`)
+        /// False when collection is disabled by policy (`--gc-budget=0`)
         /// or nothing has run yet.
         ran: bool,
         reserved_before: u64,
@@ -2255,7 +2255,7 @@ fn gcContext(ev: *Evaluator) gc_controller.Context {
         .builtins_value = &ev.builtins_value,
         .env_map = ev.env_map,
         .worker_count = ev.worker_count,
-        .max_memory_bytes = ev.max_memory_bytes,
+        .gc_budget_bytes = ev.gc_budget_bytes,
         .tracer = &ev.gc_tracer,
         .import_vms = &ev.gc_import_vms,
         .import_vms_mu = &ev.gc_import_vms_mu,

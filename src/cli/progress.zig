@@ -2,11 +2,16 @@
 
 const std = @import("std");
 const eval_progress = @import("expr").EvalProgress;
+const terminal_text = @import("base").terminal_text;
+const presentation = @import("presentation.zig");
 
 pub const EvalProgress = struct {
     const max_active = 128;
 
     root: std.Progress.Node,
+    io: std.Io,
+    use_color: bool,
+    log_progress: bool,
     active: [max_active]Active = undefined,
     active_len: usize = 0,
     /// Always-open parent for the coarse phase spans, opened on `session_begin`.
@@ -23,11 +28,14 @@ pub const EvalProgress = struct {
         node: std.Progress.Node,
     };
 
-    pub fn init(io: std.Io, enabled: bool) EvalProgress {
+    pub fn init(io: std.Io, show_progress: bool, log_progress: bool, use_color: bool) EvalProgress {
         return .{
+            .io = io,
+            .use_color = use_color,
+            .log_progress = log_progress,
             .root = std.Progress.start(io, .{
                 .root_name = "",
-                .disable_printing = !enabled,
+                .disable_printing = !show_progress,
                 .initial_delay_ns = .fromMilliseconds(180),
                 .refresh_rate_ns = .fromMilliseconds(100),
             }),
@@ -85,12 +93,17 @@ pub const EvalProgress = struct {
     /// round-trip it through the opaque token with no allocation.
     fn beginSpan(context: *anyopaque, subject: []const u8) usize {
         const self: *EvalProgress = @ptrCast(@alignCast(context));
+        if (self.log_progress) {
+            self.writeProgressLog("processing", .cyan, subject, false);
+            return 0;
+        }
         const node = self.childNode(subject);
         return @intFromEnum(node.index);
     }
 
     fn endSpan(context: *anyopaque, token: usize) void {
-        _ = context;
+        const self: *EvalProgress = @ptrCast(@alignCast(context));
+        if (self.log_progress) return;
         const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(token))) };
         node.end();
     }
@@ -100,7 +113,8 @@ pub const EvalProgress = struct {
     /// from the off-demand fetch thread. `total` 0 means the size isn't known yet
     /// (no Content-Length), leaving a bare downloaded count.
     fn updateSpan(context: *anyopaque, token: usize, downloaded: u64, total: u64) void {
-        _ = context;
+        const self: *EvalProgress = @ptrCast(@alignCast(context));
+        if (self.log_progress) return;
         const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(token))) };
         if (total != 0) node.setEstimatedTotalItems(@intCast(@min(total, std.math.maxInt(usize))));
         node.setCompletedItems(@intCast(@min(downloaded, std.math.maxInt(usize))));
@@ -108,6 +122,7 @@ pub const EvalProgress = struct {
 
     fn emit(context: *anyopaque, event: eval_progress.Event) void {
         const self: *EvalProgress = @ptrCast(@alignCast(context));
+        if (self.log_progress) return self.logEvent(event);
         switch (event) {
             .begin => |step| self.beginStep(step),
             .end => |step| self.endStep(step.stage),
@@ -118,6 +133,55 @@ pub const EvalProgress = struct {
             .session_begin => |label| self.sessionBegin(label),
             .session_end => self.endSessionNodes(),
         }
+    }
+
+    fn logEvent(self: *EvalProgress, event: eval_progress.Event) void {
+        switch (event) {
+            .session_begin => |label| self.writeProgressLog("evaluating", .magenta, label, false),
+            .begin, .instant => |step| self.writeProgressLog(
+                stageVerb(step.stage),
+                stageAccent(step.stage),
+                step.subject,
+                true,
+            ),
+            .wait_begin => |subject| self.writeProgressLog("waiting", .yellow, subject, false),
+            .end, .wait_end, .count, .session_end => {},
+        }
+    }
+
+    fn writeProgressLog(
+        self: *EvalProgress,
+        verb: []const u8,
+        verb_accent: presentation.Accent,
+        raw_subject: []const u8,
+        basename: bool,
+    ) void {
+        const subject = if (basename and raw_subject.len != 0) std.fs.path.basename(raw_subject) else raw_subject;
+        var subject_buffer: [1024]u8 = undefined;
+        const copied_len = @min(subject.len, subject_buffer.len);
+        @memcpy(subject_buffer[0..copied_len], subject[0..copied_len]);
+        const clean = terminal_text.stripAnsiInPlace(subject_buffer[0..copied_len]);
+
+        var stderr_buffer: [4096]u8 = undefined;
+        var stderr = presentation.lockStderr(self.io, &stderr_buffer) catch return;
+        defer stderr.deinit();
+        const writer = stderr.writer();
+
+        presentation.reset(writer, self.use_color) catch return;
+        defer {
+            presentation.reset(writer, self.use_color) catch {};
+            stderr.flush() catch {};
+        }
+        presentation.accent(writer, self.use_color, verb_accent, false) catch return;
+        writer.writeAll(verb) catch return;
+        presentation.reset(writer, self.use_color) catch return;
+        if (clean.len != 0) {
+            writer.writeByte(' ') catch return;
+            presentation.accent(writer, self.use_color, presentation.stableNounAccent(clean), true) catch return;
+            writer.writeAll(clean) catch return;
+            presentation.reset(writer, self.use_color) catch return;
+        }
+        writer.writeByte('\n') catch return;
     }
 
     /// Apply an `[completed/total]` item count to the innermost stage span (the
@@ -191,6 +255,28 @@ pub const EvalProgress = struct {
     }
 };
 
+fn stageVerb(stage: eval_progress.Stage) []const u8 {
+    return switch (stage) {
+        .parse => "parsing",
+        .compile => "compiling",
+        .evaluate => "evaluating",
+        .import => "importing",
+        .derivation => "instantiating",
+        .store => "storing",
+        .build => "building",
+        .render => "rendering",
+    };
+}
+
+fn stageAccent(stage: eval_progress.Stage) presentation.Accent {
+    return switch (stage) {
+        .parse, .compile, .render => .cyan,
+        .evaluate, .import => .magenta,
+        .derivation, .store => .green,
+        .build => .magenta,
+    };
+}
+
 fn startStepNode(parent: std.Progress.Node, step: eval_progress.Step) std.Progress.Node {
     if (step.subject.len == 0) return parent.start(eval_progress.stageName(step.stage), 0);
     var buffer: [std.Progress.Node.max_name_len]u8 = undefined;
@@ -199,4 +285,10 @@ fn startStepNode(parent: std.Progress.Node, step: eval_progress.Step) std.Progre
         std.fs.path.basename(step.subject),
     }) catch eval_progress.stageName(step.stage);
     return parent.start(name, 0);
+}
+
+test "logged stage verbs are actions" {
+    try std.testing.expectEqualStrings("parsing", stageVerb(.parse));
+    try std.testing.expectEqualStrings("instantiating", stageVerb(.derivation));
+    try std.testing.expectEqualStrings("rendering", stageVerb(.render));
 }

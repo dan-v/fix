@@ -838,7 +838,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 //   • w>1 safe: arming happens only inside STW (all peers parked);
                 //     a `false` read here means no peer has armed-and-resumed.
                 // Captured ONCE so push and pop agree even if a peer arms
-                // mid-body. Once armed (`--max-memory` small), this is true
+                // mid-body. Once armed (`--gc-budget` small), this is true
                 // forever and the chain is maintained exactly as before.
                 const gc_root_chain = self.heap.gc_root_active;
                 if (gc_root_chain) self.gc_force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
@@ -981,7 +981,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     var lbuf: [128]u8 = undefined;
                     const crit_label: timeline.Subject = if (crit_start != 0) force_label.critWaitLabel(self, thunk_id, &lbuf) else .{};
                     // Progress "waiting on" line: `progress_stage` exists only
-                    // on the demand fiber and only when progress is drawn.
+                    // on the demand fiber and only when progress is enabled.
                     // Label it from this fiber's stable current frame span, not
                     // the target thunk's union, which a concurrent resolver can
                     // flip `.target → .result` mid-decode.

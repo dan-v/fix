@@ -4,10 +4,26 @@ const std = @import("std");
 
 pub const When = enum { auto, always, never };
 
+pub const ProgressMode = enum { auto, log, disabled };
+
+pub const ProgressPolicy = struct {
+    show: bool,
+    log: bool,
+
+    pub fn enabled(self: ProgressPolicy) bool {
+        return self.show or self.log;
+    }
+};
+
 pub fn parseWhen(text: []const u8) ?When {
     if (std.mem.eql(u8, text, "auto")) return .auto;
     if (std.mem.eql(u8, text, "always")) return .always;
     if (std.mem.eql(u8, text, "never")) return .never;
+    return null;
+}
+
+pub fn parseProgressMode(text: []const u8) ?ProgressMode {
+    if (std.mem.eql(u8, text, "log")) return .log;
     return null;
 }
 
@@ -39,21 +55,24 @@ pub fn autoColor(interactive: bool, env: *const std.process.Environ.Map) bool {
     return interactive and env.get("NO_COLOR") == null;
 }
 
-pub fn shouldProgress(mode: When, io: std.Io, env: *const std.process.Environ.Map) bool {
+pub fn progressPolicy(mode: ProgressMode, io: std.Io, env: *const std.process.Environ.Map) ProgressPolicy {
+    return progressPolicyForTerminal(mode, isStderrInteractive(io, env));
+}
+
+pub fn progressPolicyForTerminal(mode: ProgressMode, interactive: bool) ProgressPolicy {
     return switch (mode) {
-        .always => true,
-        .never => false,
-        .auto => isStderrInteractive(io, env),
+        .disabled => .{ .show = false, .log = false },
+        .log => .{ .show = false, .log = true },
+        .auto => if (interactive)
+            .{ .show = true, .log = false }
+        else
+            .{ .show = false, .log = true },
     };
 }
 
 pub const Style = enum {
-    heading,
-    section,
-    label,
     name,
     path,
-    hash,
     dim,
     error_label,
     note_label,
@@ -74,12 +93,8 @@ pub const Accent = enum {
 pub fn styleCode(use_color: bool, which: Style) []const u8 {
     if (!use_color) return "";
     return switch (which) {
-        .heading => "\x1b[1;35m",
-        .section => "\x1b[1;36m",
-        .label => "\x1b[36m",
         .name => "\x1b[1m",
         .path => "\x1b[32m",
-        .hash => "\x1b[33m",
         .dim => "\x1b[2m",
         .error_label => "\x1b[1;31m",
         .note_label => "\x1b[1;36m",
@@ -116,10 +131,11 @@ pub fn accent(writer: *std.Io.Writer, use_color: bool, which: Accent, bold: bool
     try writer.writeByte('m');
 }
 
-pub fn writeLabel(writer: *std.Io.Writer, use_color: bool, label: []const u8) !void {
-    try style(writer, use_color, .label);
-    try writer.writeAll(label);
-    try reset(writer, use_color);
+pub fn stableNounAccent(noun: []const u8) Accent {
+    // Keep noun colors disjoint from the progress-verb palette so grammar is
+    // still obvious when both spans are adjacent.
+    const palette = [_]Accent{ .red, .yellow, .blue };
+    return palette[std.hash.Wyhash.hash(0, noun) % palette.len];
 }
 
 pub const Stderr = struct {
@@ -143,18 +159,14 @@ pub fn lockStderr(io: std.Io, buffer: []u8) std.Io.Cancelable!Stderr {
     return .{ .io = io, .locked = try io.lockStderr(buffer, null) };
 }
 
-pub fn writeMaybePath(writer: *std.Io.Writer, use_color: bool, value: []const u8) !void {
-    const is_path = isPathLike(value);
-    if (is_path) try style(writer, use_color, .path);
-    try writer.writeAll(value);
-    if (is_path) try reset(writer, use_color);
-}
-
-pub fn isPathLike(value: []const u8) bool {
-    return std.mem.startsWith(u8, value, "/nix/store/") or std.mem.endsWith(u8, value, ".drv");
-}
-
 test "parse terminal policy" {
     try std.testing.expectEqual(When.auto, parseWhen("auto").?);
     try std.testing.expect(parseWhen("sometimes") == null);
+    try std.testing.expectEqual(ProgressMode.log, parseProgressMode("log").?);
+    try std.testing.expect(parseProgressMode("sometimes") == null);
+
+    try std.testing.expect(progressPolicyForTerminal(.auto, true).show);
+    try std.testing.expect(progressPolicyForTerminal(.auto, false).log);
+    try std.testing.expect(progressPolicyForTerminal(.log, true).log);
+    try std.testing.expect(!progressPolicyForTerminal(.disabled, true).enabled());
 }

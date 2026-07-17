@@ -396,7 +396,7 @@ pub const Worker = struct {
         entry: fiber_mod.EntryFn,
         arg: *anyopaque,
         /// The demand-only progress handles to dress the top fiber's
-        /// execution context with (null fields when progress isn't drawn).
+        /// execution context with (null fields when progress is disabled).
         /// Supplied fresh per entry by the embedder, so a sink installed
         /// between runs (the repl) needs no worker-side bookkeeping.
         demand: exec_context.DemandRole,

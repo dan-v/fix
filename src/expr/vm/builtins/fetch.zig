@@ -132,7 +132,7 @@ pub fn mercurialResultValue(self: *VM, name: []const u8, result: fetch_cache.Fet
 /// Open a concurrent fetch progress span. Fetches run on
 /// whatever fiber forces them (often off the demand path), so this uses the
 /// thread-safe concurrent-span channel — its node is independent of the demand
-/// LIFO stage stack. Null (and a no-op `end`) when progress isn't drawn.
+/// LIFO stage stack. Null (and a no-op `end`) when progress is disabled.
 pub fn fetchSpanBegin(self: *VM, subject: []const u8) ?eval_progress.Span {
     const spans = self.progress_spans orelse return null;
     return spans.beginSpan(subject);

@@ -94,10 +94,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         console.install(&ev);
     }
 
-    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
+    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress, term.log_progress, term.use_color);
     var repl_ok = false;
     defer progress.deinit(repl_ok);
-    if (term.show_progress) ev.setProgressSink(progress.sink());
+    if (term.progressEnabled()) ev.setProgressSink(progress.sink());
 
     // Normal repl output suppresses color in bare mode; the debugger console
     // colors by the resolved terminal decision (its banner/snippet do too).
@@ -514,7 +514,7 @@ const Repl = struct {
                 var out = self.stdout();
                 defer out.interface.flush() catch {};
                 if (!r.ran) {
-                    try out.interface.writeAll("gc: collector inactive (non-gc build, --max-memory=0, or nothing evaluated yet)\n");
+                    try out.interface.writeAll("gc: collector inactive (non-gc build, --gc-budget=0, or nothing evaluated yet)\n");
                 } else {
                     try out.interface.print("gc: heap reserved {d:.1} MiB -> {d:.1} MiB\n", .{
                         @as(f64, @floatFromInt(r.reserved_before)) / (1 << 20),

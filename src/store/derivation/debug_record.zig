@@ -1,4 +1,4 @@
-//! Builds a self-owned DebugRecord snapshot of a Drv for the derivation-debug
+//! Builds a self-owned DebugRecord snapshot of a Drv for derivation diagnostics
 //! CLI: deep-clones every field and precomputes the ATerm, text hash,
 //! references, and both (masked/unmasked) hash-modulo steps.
 

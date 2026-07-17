@@ -78,7 +78,7 @@ Cumulative session ~-5.5% w=32. The cheap and medium on-chain work-elimination w
 Both are large by **count / bytes**, not by wall — the opposite shape of an on-chain win — and both are caveated.
 
 - **Deforestation.** The module fixpoint builds single-use intermediate lists and attrsets by the million and consumes most exactly once. The ceiling is by **count, not wall**; realizing it needs an optimizer with reach (targeted fusion, or a trace deforester), and a naive lazy-materialization attempt already regressed (see dead-ends).
-- **GC for peak RSS.** The live set plateaus (~228 MB on nixos_toplevel) while total allocation grows linearly (~1.2 GB), so a collector bounds peak reserved memory (measured: `--max-memory=512m` holds nixos_toplevel at ~850 MB reserved vs ~1.4 GB unbounded; see [gc](../gc.md)). Mark is a wall tax, so the win is **RSS, not wall**.
+- **GC for peak RSS.** The live set plateaus (~228 MB on nixos_toplevel) while total allocation grows linearly (~1.2 GB), so a collector bounds peak reserved memory (measured: `--gc-budget=512m` holds nixos_toplevel at ~850 MB reserved vs ~1.4 GB unbounded; see [gc](../gc.md)). Mark is a wall tax, so the win is **RSS, not wall**.
 
 ## Methodology
 

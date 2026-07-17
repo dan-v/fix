@@ -254,7 +254,7 @@ pub const RealizationStore = struct {
     }
 
     /// Open a concurrent progress span for real store work, or null when progress
-    /// isn't drawn. Pair with `endSpan` (defer). The label is borrowed for the
+    /// is disabled. Pair with `endSpan` (defer). The label is borrowed for the
     /// call only. The returned handle retains its originating sink.
     pub fn beginSpan(self: *RealizationStore, label: []const u8) ?eval_progress.Span {
         const spans = self.progress_spans orelse return null;

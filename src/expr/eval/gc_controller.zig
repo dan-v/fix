@@ -40,7 +40,7 @@ pub const Context = struct {
     builtins_value: *?Value,
     env_map: ?*const std.process.Environ.Map,
     worker_count: u8,
-    max_memory_bytes: ?u64,
+    gc_budget_bytes: ?u64,
     tracer: *gc.Tracer,
     import_vms: *std.ArrayListUnmanaged(*VM),
     import_vms_mu: *SpinMutex,
@@ -119,7 +119,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
     //
     // MAJOR IS `--workers=1`-ONLY (gated pending a w>1 fix). At w>1 the full
     // sweep occasionally frees a LIVE object it never marked → UAF (detector
-    // `gcAssertLive` "read after sweep" ~1/60 under a tight `--max-memory
+    // `gcAssertLive` "read after sweep" ~1/60 under a tight `--gc-budget
     // --workers=12`; release segv/`InvalidObjectType` ~1/80). It's a
     // MISSING-ROOT/EDGE class that only bites the full mark at w>1: seeding the
     // remembered set in `collectMajor` (below) closed the biggest one — a
@@ -315,18 +315,18 @@ pub const nowNs = clock.monotonicNs;
 
 /// Fraction of RAM the stores may reach before collecting (num/den), and the
 /// default clamp bounds. The bounds are overridable per run via `FIX_GC_FLOOR`
-/// / `FIX_GC_CEILING` (same SIZE syntax as `--max-memory`).
+/// / `FIX_GC_CEILING` (same SIZE syntax as `--gc-budget`).
 pub const gc_limit_numerator: u64 = 1;
 pub const gc_limit_denominator: u64 = 2; // half of RAM
 pub const gc_limit_floor: u64 = 256 << 20; // 256 MB — below this, don't bother
 pub const gc_limit_ceiling: u64 = 8 << 30; // 8 GB — cap absolute garbage on big boxes
 
-/// Resolve the collection line: `--max-memory` if given, else the automatic
+/// Resolve the collection line: `--gc-budget` if given, else the automatic
 /// `clamp(fraction × MemTotal, floor, ceiling)`. An explicit
 /// value is taken verbatim (including `0` = never collect) — a hard override of
 /// the auto policy; the auto path never returns `0`.
 pub fn memoryBudget(ev: Context) u64 {
-    if (ev.max_memory_bytes) |b| return b;
+    if (ev.gc_budget_bytes) |b| return b;
     return autoCollectLine(ev);
 }
 
@@ -334,12 +334,12 @@ pub fn memoryBudget(ev: Context) u64 {
 /// ARM (cross budget/2 during a real eval)? Only then does the pre-arming
 /// reclaim matter — and only then is it worth keeping the transient-root gates
 /// live from eval start (~1.9%, `heap.gc_root_active`) to make that reclaim
-/// sound. True iff an explicit `--max-memory` was given (the
+/// sound. True iff an explicit `--gc-budget` was given (the
 /// user opted into a limit), OR the auto line came in below the default ceiling
 /// (a RAM-limited box). A roomy auto machine (line clamped to the ceiling) never
 /// arms → stays exactly zero-cost with the reclaim off (moot there anyway).
 pub fn constrainedMode(ev: Context, budget: u64) bool {
-    const explicit = ev.max_memory_bytes != null;
+    const explicit = ev.gc_budget_bytes != null;
     const ceiling = envSize(ev, "FIX_GC_CEILING") orelse gc_limit_ceiling;
     return constrainedFor(budget, explicit, ceiling);
 }
@@ -377,7 +377,7 @@ fn autoCollectLine(ev: Context) u64 {
     return lineFor(systemMemoryTotal() orelse (4 << 30), floor, ceiling);
 }
 
-/// A `SIZE`-syntax env override (same grammar as `--max-memory`), or null.
+/// A `SIZE`-syntax env override (same grammar as `--gc-budget`), or null.
 fn envSize(ev: Context, key: []const u8) ?u64 {
     if (ev.env_map) |em| if (em.get(key)) |s| return memory_config.parseSize(s);
     return null;

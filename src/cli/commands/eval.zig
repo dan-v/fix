@@ -66,10 +66,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
     const input_count = try input_plan.count();
 
-    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
+    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress, term.log_progress, term.use_color);
     errdefer progress.deinit(false);
-    // Only wire the sink when we'll actually draw progress.
-    if (term.show_progress) ev.setProgressSink(progress.sink());
+    if (term.progressEnabled()) ev.setProgressSink(progress.sink());
 
     var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, options);
     defer vm_trace.deinit(allocator);
@@ -109,7 +108,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
             options.evaluationMode(),
             term.use_color,
             options.show_trace,
-            options.derivation_debug,
             &ev,
             input.source,
             input.label(),

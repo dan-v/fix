@@ -62,18 +62,18 @@ pub const BuildProgress = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     use_color: bool,
-    show_progress: bool,
+    log_progress: bool,
     /// Active activity id -> its node.
     nodes: std.AutoHashMapUnmanaged(u64, Active) = .empty,
     mu: sync.BlockingMutex = .{},
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, use_color: bool, show_progress: bool, progress: *EvalProgress) BuildProgress {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, use_color: bool, log_progress: bool, progress: *EvalProgress) BuildProgress {
         return .{
             .progress = progress,
             .allocator = allocator,
             .io = io,
             .use_color = use_color,
-            .show_progress = show_progress,
+            .log_progress = log_progress,
         };
     }
 
@@ -111,7 +111,7 @@ pub const BuildProgress = struct {
                 const node = self.progress.childNode(label);
                 if (self.nodes.fetchRemove(activity.id)) |old| old.value.node.end();
                 self.nodes.put(self.allocator, activity.id, Active.init(node, action, noun)) catch node.end();
-                if (!self.show_progress) self.writeActivity(action, noun);
+                if (self.log_progress) self.writeActivity(action, noun);
             },
             .stop => |id| if (self.nodes.fetchRemove(id)) |kv| kv.value.node.end(),
             .progress => |update| if (self.nodes.get(update.id)) |active| {
@@ -171,7 +171,7 @@ pub const BuildProgress = struct {
         try presentation.reset(writer, self.use_color);
         if (noun.len == 0) return;
         try writer.writeByte(' ');
-        try presentation.accent(writer, self.use_color, nounAccent(noun), true);
+        try presentation.accent(writer, self.use_color, presentation.stableNounAccent(noun), true);
         try writer.writeAll(noun);
         try presentation.reset(writer, self.use_color);
     }
@@ -195,12 +195,6 @@ fn activityNoun(activity: daemon.build_events.Activity) []const u8 {
 
 fn activityLabel(buffer: []u8, action: Action, noun: []const u8) []const u8 {
     return std.fmt.bufPrint(buffer, "{s} {s}", .{ action.verb(), noun }) catch noun[0..@min(noun.len, buffer.len)];
-}
-
-fn nounAccent(noun: []const u8) presentation.Accent {
-    // Keep noun colors disjoint from the verb palette so grammar stays clear.
-    const palette = [_]presentation.Accent{ .red, .yellow, .blue };
-    return palette[std.hash.Wyhash.hash(0, noun) % palette.len];
 }
 
 fn storePathName(path: []const u8) []const u8 {
@@ -236,5 +230,5 @@ test "build activity labels are owned presentation" {
         .detail = "https://cache.example",
     };
     try std.testing.expectEqualStrings("fetching source", activityLabel(&buffer, activityAction(fetch), activityNoun(fetch)));
-    try std.testing.expectEqual(nounAccent("source"), nounAccent("source"));
+    try std.testing.expectEqual(presentation.stableNounAccent("source"), presentation.stableNounAccent("source"));
 }

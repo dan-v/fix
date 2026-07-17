@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interleaved RSS-vs-wall curve across --max-memory settings.
+# Interleaved RSS-vs-wall curve across --gc-budget settings.
 # Usage: ab_curve.sh <workers> <rounds> <budget>...   (budget "nongc" = non-gc build, "default" = no flag)
 set -uo pipefail
 w="$1"; rounds="$2"; shift 2
@@ -13,7 +13,7 @@ for i in $(seq 1 "$rounds"); do
       echo "$b $out 0"
     else
       flag=()
-      [ "$b" != "default" ] && flag=(--max-memory="$b")
+      [ "$b" != "default" ] && flag=(--gc-budget="$b")
       err=$(mktemp)
       out=$($TIME -f "%e %M" ./zig-out/bin/fix eval --file "$file" --workers="$w" "${flag[@]}" 2>"$err" >/dev/null; tail -1 "$err")
       cols=$(grep -oP 'collections: \K\d+' "$err" || echo "?")

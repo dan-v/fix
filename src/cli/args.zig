@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const presentation = @import("presentation.zig");
-const derivation_debug = @import("derivation_debug.zig");
 const engine = @import("expr");
 const hugetlb = @import("base").hugetlb;
 
@@ -127,7 +126,7 @@ pub const Options = struct {
     /// Borrowed from argv; the list backing is owned (caller frees via `deinit`).
     option_overrides: std.ArrayListUnmanaged(OptionOverride) = .empty,
     color: presentation.When = .auto,
-    progress: presentation.When = .auto,
+    progress: presentation.ProgressMode = .auto,
     /// `fix repl --bare`: plain line-based input (no raw mode, no escape
     /// sequences), regardless of whether stdin/stdout are a terminal. The
     /// non-tty repl path is always bare; this forces it for automation.
@@ -137,7 +136,6 @@ pub const Options = struct {
     /// on evaluation errors). Forces single-worker, speculation-free evaluation
     /// so the pause point is deterministic.
     debugger: bool = false,
-    derivation_debug: derivation_debug.Options = .{},
     /// `fix build --no-link`/`--no-out-link`: skip creating the result symlink.
     no_link: bool = false,
     /// `fix build --dry-run`: evaluate and instantiate, then report the daemon's
@@ -224,10 +222,10 @@ pub const Options = struct {
     vm_trace_main_only: bool = false,
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
-    /// GC collection-line override in bytes (`--max-memory`); see
+    /// GC collection-budget override in bytes (`--gc-budget`); see
     /// `eval/gc_controller.zig:memoryBudget`. `null` = the automatic RAM-scaled line;
     /// `0` = never collect.
-    max_memory: ?u64 = null,
+    gc_budget: ?u64 = null,
     /// `--hugetlb auto|on|off`: back the evaluation heap with explicit 2 MB
     /// huge pages. `null` selects `auto`; resolution happens in
     /// `setup.applyMemoryBacking`, before the heap maps.
@@ -337,11 +335,7 @@ const Opt = enum {
     no_color,
     progress,
     no_progress,
-    debug_derivations,
-    debug_derivation_filter,
-    debug_derivation_name,
-    debug_derivation_drv,
-    max_memory,
+    gc_budget,
     hugetlb,
     help,
     // Repl.
@@ -427,8 +421,6 @@ const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .@"
 /// `--xml`) and `--strict` apply. The realizing commands print store paths, not
 /// a value, and `disasm` prints bytecode.
 const value_cmds = &[_]Cmd{ .eval, .repl };
-/// Commands that evaluate to a derivation whose debug records make sense.
-const derivation_debug_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .@"switch" };
 /// Commands that produce a top-level `.drv` a link/root can point at.
 const drv_cmds = &[_]Cmd{ .build, .instantiate };
 /// Commands that realize (build/substitute) derivations via the daemon.
@@ -486,13 +478,9 @@ const specs = [_]Spec{
     .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{ .eval, .repl } },
     .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
     .{ .id = .no_color, .long = "--no-color", .help = "disable color diagnostics" },
-    .{ .id = .progress, .long = "--progress", .arg = .opt, .metavar = "WHEN", .help = "show evaluation progress: auto, always, never", .show_in = eval_cmds },
+    .{ .id = .progress, .long = "--progress", .arg = .opt, .metavar = "log", .help = "show automatic progress; `=log` forces durable lines", .show_in = eval_cmds },
     .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress", .show_in = eval_cmds },
-    .{ .id = .debug_derivations, .long = "--debug-derivations", .arg = .opt, .metavar = "MODE", .help = "write derivation debug records to stderr: summary, full", .show_in = derivation_debug_cmds },
-    .{ .id = .debug_derivation_filter, .long = "--debug-derivation-filter", .arg = .req, .metavar = "TEXT", .help = "only show derivations mentioning TEXT", .show_in = derivation_debug_cmds },
-    .{ .id = .debug_derivation_name, .long = "--debug-derivation-name", .arg = .req, .metavar = "NAME", .help = "only show derivations with exactly NAME", .show_in = derivation_debug_cmds },
-    .{ .id = .debug_derivation_drv, .long = "--debug-derivation-drv", .arg = .req, .metavar = "PATH", .help = "only show the derivation with exactly PATH", .show_in = derivation_debug_cmds },
-    .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC line (MiB, or with a\nk/m/g suffix; 0 = never collect). Default: auto,\nscaled to RAM.", .show_in = eval_cmds },
+    .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC collection budget (MiB,\nor with a k/m/g suffix; 0 = never collect).\nDefault: auto, scaled to RAM.", .show_in = eval_cmds },
     .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
@@ -706,16 +694,9 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .debugger => options.debugger = true,
         .color => options.color = if (v0) |v| (presentation.parseWhen(v) orelse return error.InvalidColorMode) else .always,
         .no_color => options.color = .never,
-        .progress => options.progress = if (v0) |v| (presentation.parseWhen(v) orelse return error.InvalidProgressMode) else .always,
-        .no_progress => options.progress = .never,
-        .debug_derivations => options.derivation_debug.mode = if (v0) |v|
-            (derivation_debug.parseMode(v) orelse return error.InvalidDerivationDebugMode)
-        else
-            .summary,
-        .debug_derivation_filter => options.derivation_debug.filter = v0.?,
-        .debug_derivation_name => options.derivation_debug.name = v0.?,
-        .debug_derivation_drv => options.derivation_debug.drv_path = v0.?,
-        .max_memory => options.max_memory = engine.parseMemorySize(v0.?) orelse return error.InvalidMaxMemory,
+        .progress => options.progress = if (v0) |v| (presentation.parseProgressMode(v) orelse return error.InvalidProgressMode) else .auto,
+        .no_progress => options.progress = .disabled,
+        .gc_budget => options.gc_budget = engine.parseMemorySize(v0.?) orelse return error.InvalidGcBudget,
         .hugetlb => options.hugetlb = hugetlb.parseMode(v0.?) orelse return error.InvalidHugetlbMode,
         .help => return error.Help,
 
@@ -860,15 +841,14 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.FlakesFeatureRequired => "flake inputs require the flakes experimental feature; pass --extra-experimental-features flakes",
         error.TooManySources => "provide only one expression or file",
         error.InvalidColorMode => "expected --color to be auto, always, or never",
-        error.InvalidProgressMode => "expected --progress to be auto, always, or never",
-        error.InvalidDerivationDebugMode => "expected --debug-derivations to be summary or full",
+        error.InvalidProgressMode => "expected bare --progress or --progress=log",
         error.InvalidVmTraceFormat => "expected --vm-trace-format to be text or binary",
         error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
         error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators, fetch-tree, flakes)",
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.InvalidMaxJobs => "expected --max-jobs to be `auto` or a non-negative integer",
         error.InvalidCores => "expected --cores to be a non-negative integer",
-        error.InvalidMaxMemory => "expected --max-memory to be a size like 4096, 512m, or 4g",
+        error.InvalidGcBudget => "expected --gc-budget to be a size like 4096, 512m, or 4g",
         error.InvalidHugetlbMode => "expected --hugetlb to be auto, on, or off",
         error.InvalidTimelineFlows => "expected --timeline-flows to be off, all, or a non-negative integer",
         error.InvalidChunkId => "expected --chunk to be a chunk id (decimal, or 0x-prefixed hex)",
@@ -917,7 +897,35 @@ test "package list returns to ordinary option parsing" {
     defer options.deinit(std.testing.allocator);
 
     try std.testing.expectEqualSlices([]const u8, &.{ "hello", "jq" }, options.packages.items);
-    try std.testing.expectEqual(presentation.When.never, options.progress);
+    try std.testing.expectEqual(presentation.ProgressMode.disabled, options.progress);
+}
+
+test "progress surface selects auto log or disabled" {
+    const automatic_argv = [_][*:0]const u8{ "fix", "--progress" };
+    var automatic = try parseForTest(&automatic_argv, .eval);
+    defer automatic.deinit(std.testing.allocator);
+    try std.testing.expectEqual(presentation.ProgressMode.auto, automatic.progress);
+
+    const log_argv = [_][*:0]const u8{ "fix", "--progress=log" };
+    var logged = try parseForTest(&log_argv, .eval);
+    defer logged.deinit(std.testing.allocator);
+    try std.testing.expectEqual(presentation.ProgressMode.log, logged.progress);
+
+    const invalid_argv = [_][*:0]const u8{ "fix", "--progress=always" };
+    try std.testing.expectError(error.InvalidProgressMode, parseForTest(&invalid_argv, .eval));
+}
+
+test "GC budget replaces max-memory and derivation debug flags are gone" {
+    const budget_argv = [_][*:0]const u8{ "fix", "--gc-budget", "512m" };
+    var budget = try parseForTest(&budget_argv, .eval);
+    defer budget.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u64, 512 << 20), budget.gc_budget);
+
+    const old_memory = [_][*:0]const u8{ "fix", "--max-memory", "512m" };
+    try std.testing.expectError(error.UnknownOption, parseForTest(&old_memory, .eval));
+
+    const old_debug = [_][*:0]const u8{ "fix", "--debug-derivations" };
+    try std.testing.expectError(error.UnknownOption, parseForTest(&old_debug, .eval));
 }
 
 test "find-file keeps ordered lookup names and is instantiate-only" {

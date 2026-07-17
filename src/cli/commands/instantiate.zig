@@ -53,10 +53,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // The daemon connects lazily on the first write.
     ev.enableStoreWrites();
 
-    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
+    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress, term.log_progress, term.use_color);
     var ok = false;
     defer progress.deinit(ok);
-    if (term.show_progress) ev.setProgressSink(progress.sink());
+    if (term.progressEnabled()) ev.setProgressSink(progress.sink());
     ok = true;
     for (0..input_count) |index| {
         const input = input_plan.load(&ev, index) catch |err| {

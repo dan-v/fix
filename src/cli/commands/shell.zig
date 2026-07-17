@@ -56,11 +56,11 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const term = try setup.configure(&ev, init, options);
     ev.enableStoreWrites();
 
-    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress);
+    var progress = progress_ui.EvalProgress.init(init.io, term.show_progress, term.log_progress, term.use_color);
     var torn = false;
     defer if (!torn) progress.deinit(false);
-    if (term.show_progress) ev.setProgressSink(progress.sink());
-    var build_progress = build_progress_ui.BuildProgress.init(allocator, init.io, term.use_color, term.show_progress, &progress);
+    if (term.progressEnabled()) ev.setProgressSink(progress.sink());
+    var build_progress = build_progress_ui.BuildProgress.init(allocator, init.io, term.use_color, term.log_progress, &progress);
     const build_sink = build_progress.sink();
 
     const label = if (options.packages.items.len > 0) "packages" else eval_support.sourceLabel(options.source.?);
