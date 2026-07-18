@@ -66,26 +66,49 @@ const zsh_script =
     \\        _files
     \\        return
     \\    fi
-    \\    local -a raw_suggestions raw_descriptions option_specs compdescribe_expl grouped_args grouped_matches grouped_display suggestions descriptions suggestions_display compadd_args
-    \\    local line suggestion description
+    \\    local -a raw_suggestions raw_displays raw_descriptions option_specs option_matches compdescribe_expl grouped_args grouped_matches grouped_display suggestions descriptions suggestions_display compadd_args
+    \\    local line rest suggestion display description combined_display escaped_display escaped_description
     \\    local base_list="$compstate[list]" grouped_list
-    \\    local display_width=0 description_width menu_width index
+    \\    local display_width=0 description_width menu_width index option_width=0 candidate_width
     \\    for line in ${response:1}; do
     \\        suggestion="${line%%$'\t'*}"
     \\        raw_suggestions+=("$suggestion")
+    \\        display="$suggestion"
     \\        if [[ $line == *$'\t'* ]]; then
-    \\            description="${line#*$'\t'}"
+    \\            rest="${line#*$'\t'}"
+    \\            if [[ $rest == *$'\t'* ]]; then
+    \\                display="${rest%%$'\t'*}"
+    \\                description="${rest#*$'\t'}"
+    \\            else
+    \\                description="$rest"
+    \\            fi
     \\        else
     \\            description=
     \\        fi
+    \\        raw_displays+=("$display")
     \\        raw_descriptions+=("$description")
     \\    done
     \\    if [[ $type == options ]]; then
     \\        for (( index = 1; index <= ${#raw_suggestions}; index++ )); do
-    \\            option_specs+=("${raw_suggestions[$index]}:${raw_descriptions[$index]//\%/%%}")
+    \\            display="${raw_displays[$index]}"
+    \\            description="${raw_descriptions[$index]}"
+    \\            if [[ ${raw_suggestions[$index]} == -? && ${raw_suggestions[$index]} != -- ]] && (( index < ${#raw_suggestions} )) && [[ ${raw_suggestions[$(( index + 1 ))]} == --* && ${raw_descriptions[$index]} == ${raw_descriptions[$(( index + 1 ))]} ]]; then
+    \\                combined_display="${raw_displays[$(( index + 1 ))]}  $display"
+    \\                escaped_display="${combined_display//:/\\:}"
+    \\                escaped_description="${description//\%/%%}"
+    \\                option_specs+=("$escaped_display:$escaped_description")
+    \\                option_matches+=("${raw_suggestions[$index]}")
+    \\                candidate_width=${#combined_display}
+    \\                (( index++ ))
+    \\            else
+    \\                option_specs+=("${display//:/\\:}:${description//\%/%%}")
+    \\                option_matches+=("${raw_suggestions[$index]}")
+    \\                candidate_width=${#display}
+    \\            fi
+    \\            (( candidate_width > option_width )) && option_width=$candidate_width
     \\        done
     \\        zmodload -i zsh/computil
-    \\        compdescribe -I "" "$(( ${COLUMNS:-100} / 2 ))" "-- " compdescribe_expl -g option_specs -V fix -o nosort
+    \\        compdescribe -I "" "$option_width" "-- " compdescribe_expl -g option_specs option_matches -V fix -o nosort
     \\        while compdescribe -g grouped_list grouped_args grouped_matches grouped_display; do
     \\            compstate[list]="$base_list $grouped_list"
     \\            compadd "${grouped_args[@]}" -d grouped_display -a grouped_matches
@@ -755,7 +778,8 @@ test "generated adapters call the live backend" {
 
 test "zsh groups option aliases and fish registers them natively" {
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compdescribe -I") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "-g option_specs -V fix -o nosort") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "combined_display") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "-g option_specs option_matches -V fix -o nosort") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "fix-aliases") == null);
 
     var buffer: [128 * 1024]u8 = undefined;
@@ -764,6 +788,7 @@ test "zsh groups option aliases and fish registers them natively" {
     const script = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, script, "complete --command fix --condition '__fix_command_is eval'") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "--short-option E --long-option expr --exclusive --arguments '(__fix_option_candidates)'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--description 'evaluate expression text (repeatable)'") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "test \"$response[1]\" = options; and return") != null);
 }
 

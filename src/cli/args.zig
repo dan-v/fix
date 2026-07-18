@@ -422,6 +422,15 @@ const Spec = struct {
     metavar: []const u8 = "",
     /// One-line (or multi-line, `\n`-separated) help text.
     help: []const u8 = "",
+    /// Concise pager text when the full help contains details better suited to
+    /// `--help`. Argument shape, defaults, and repeatability are rendered
+    /// separately.
+    completion_help: ?[]const u8 = null,
+    /// Stable default associated with this option, shown structurally by shell
+    /// completions rather than buried in prose.
+    default_value: ?[]const u8 = null,
+    /// Whether the option itself may be supplied more than once.
+    repeatable: bool = false,
     /// Subcommands whose `--help` lists this option; empty = all of them.
     show_in: []const Cmd = &.{},
     /// Internal knob: parsed everywhere but never shown in help.
@@ -460,10 +469,10 @@ const daemon_setting_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, 
 const verbose_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .repl, .@"switch" };
 
 const specs = [_]Spec{
-    .{ .id = .expr, .short = "-E", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text; repeatable", .show_in = source_cmds },
-    .{ .id = .file, .short = "-f", .long = "--file", .arg = .req, .metavar = "FILEISH", .help = "evaluate a legacy fileish input (`-` reads stdin);\nrepeatable", .show_in = source_cmds, .complete = .{ .file, .none } },
-    .{ .id = .flake, .long = "--flake", .arg = .req, .metavar = "INSTALLABLE", .help = "evaluate one flake output <flakeref>[#<attrpath>];\nrepeatable; requires the flakes feature", .show_in = selected_source_cmds, .complete = .{ .installable, .none } },
-    .{ .id = .include, .short = "-I", .long = "--include", .arg = .req, .metavar = "PATH", .help = "prepend a search-path entry (as in NIX_PATH);\nPATH may be `prefix=path`. Repeatable.", .show_in = source_cmds, .complete = .{ .file, .none } },
+    .{ .id = .expr, .short = "-E", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text; repeatable", .completion_help = "evaluate expression text", .repeatable = true, .show_in = source_cmds },
+    .{ .id = .file, .short = "-f", .long = "--file", .arg = .req, .metavar = "FILEISH", .help = "evaluate a legacy fileish input (`-` reads stdin);\nrepeatable", .completion_help = "evaluate a legacy fileish input (`-` reads stdin)", .repeatable = true, .show_in = source_cmds, .complete = .{ .file, .none } },
+    .{ .id = .flake, .long = "--flake", .arg = .req, .metavar = "INSTALLABLE", .help = "evaluate one flake output <flakeref>[#<attrpath>];\nrepeatable; requires the flakes feature", .completion_help = "evaluate a flake output; requires flakes", .repeatable = true, .show_in = selected_source_cmds, .complete = .{ .installable, .none } },
+    .{ .id = .include, .short = "-I", .long = "--include", .arg = .req, .metavar = "PATH", .help = "prepend a search-path entry (as in NIX_PATH);\nPATH may be `prefix=path`. Repeatable.", .completion_help = "prepend a NIX_PATH search-path entry", .repeatable = true, .show_in = source_cmds, .complete = .{ .file, .none } },
     .{ .id = .attr, .short = "-A", .long = "--attr", .arg = .req, .metavar = "ATTR", .help = "select attribute path ATTR from the result", .show_in = selected_source_cmds, .complete = .{ .attr, .none } },
     .{ .id = .arg, .long = "--arg", .arg = .req2, .metavar = "NAME EXPR", .help = "pass EXPR as top-level function argument NAME", .show_in = selected_source_cmds },
     .{ .id = .argstr, .long = "--argstr", .arg = .req2, .metavar = "NAME STR", .help = "pass string STR as top-level function argument NAME", .show_in = selected_source_cmds },
@@ -475,18 +484,18 @@ const specs = [_]Spec{
     .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing", .show_in = value_cmds },
     .{ .id = .read_write_mode, .long = "--read-write-mode", .help = "allow eval to register derivations and sources in\nthe store", .show_in = &.{.eval} },
 
-    .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)", .complete = .{ .experimental_feature, .none } },
+    .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)", .completion_help = "replace enabled experimental features", .complete = .{ .experimental_feature, .none } },
     .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set", .complete = .{ .experimental_feature, .none } },
-    .{ .id = .deprecated_features, .long = "--deprecated-features", .arg = .req, .metavar = "FEATS", .help = "space-separated deprecated features to re-enable,\nreplacing the current set (available: nul-bytes,\nfloor-ceil-corrupt-integers)", .complete = .{ .deprecated_feature, .none } },
+    .{ .id = .deprecated_features, .long = "--deprecated-features", .arg = .req, .metavar = "FEATS", .help = "space-separated deprecated features to re-enable,\nreplacing the current set (available: nul-bytes,\nfloor-ceil-corrupt-integers)", .completion_help = "replace deprecated features to re-enable", .complete = .{ .deprecated_feature, .none } },
     .{ .id = .extra_deprecated_features, .long = "--extra-deprecated-features", .arg = .req, .metavar = "FEATS", .help = "like --deprecated-features, but adds to the set", .complete = .{ .deprecated_feature, .none } },
     .{ .id = .option, .long = "--option", .arg = .req2, .metavar = "NAME VALUE", .help = "override a nix.conf setting", .complete = .{ .setting, .none } },
 
-    .{ .id = .out_link, .short = "-o", .long = "--out-link", .arg = .req, .metavar = "NAME", .help = "name of the result symlink (default: result)", .show_in = &.{.build}, .complete = .{ .file, .none } },
+    .{ .id = .out_link, .short = "-o", .long = "--out-link", .arg = .req, .metavar = "NAME", .help = "name of the result symlink (default: result)", .completion_help = "name of the result symlink", .default_value = "result", .show_in = &.{.build}, .complete = .{ .file, .none } },
     .{ .id = .no_link, .long = "--no-out-link", .help = "do not create the result symlink", .show_in = &.{.build} },
     .{ .id = .no_link, .long = "--no-link", .show_in = &.{.build}, .hidden = true }, // alias of --no-out-link
     .{ .id = .dry_run, .long = "--dry-run", .help = "show what would be built or substituted", .show_in = &.{.build} },
     .{ .id = .find_file, .long = "--find-file", .help = "look up source arguments in NIX_PATH and print\ntheir absolute paths", .show_in = &.{.instantiate} },
-    .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .show_in = drv_cmds, .complete = .{ .file, .none } },
+    .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .completion_help = "name of the derivation symlink", .default_value = "derivation", .show_in = drv_cmds, .complete = .{ .file, .none } },
     .{ .id = .add_drv_link, .long = "--add-drv-link", .help = "also create a symlink to the .drv", .show_in = drv_cmds },
     .{ .id = .add_root, .long = "--add-root", .arg = .req, .metavar = "PATH", .help = "create the link at PATH and register it as a GC root", .show_in = drv_cmds, .complete = .{ .file, .none } },
     .{ .id = .indirect, .long = "--indirect", .help = "make the --add-root GC root indirect", .show_in = drv_cmds },
@@ -500,20 +509,20 @@ const specs = [_]Spec{
     .{ .id = .keep_going, .short = "-k", .long = "--keep-going", .help = "keep building other derivations if one fails", .show_in = daemon_setting_cmds },
     .{ .id = .max_silent_time, .long = "--max-silent-time", .arg = .req, .metavar = "SECS", .help = "abort a build silent for SECS seconds (0 = no limit)", .show_in = daemon_setting_cmds },
     .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = daemon_setting_cmds },
-    .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase progress detail and daemon build verbosity (repeatable)", .show_in = verbose_cmds },
+    .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase progress detail and daemon build verbosity (repeatable)", .completion_help = "increase progress and build verbosity", .repeatable = true, .show_in = verbose_cmds },
     .{ .id = .no_build_output, .short = "-Q", .long = "--no-build-output", .help = "suppress builder output", .show_in = daemon_setting_cmds },
 
     .{ .id = .stats, .long = "--stats", .help = "print evaluator or bytecode corpus statistics", .show_in = stats_cmds },
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error", .show_in = eval_cmds },
     .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{ .eval, .repl } },
-    .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never", .complete = .{ .color, .none } },
+    .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never", .default_value = "auto", .complete = .{ .color, .none } },
     .{ .id = .no_color, .long = "--no-color", .help = "disable color diagnostics" },
     .{ .id = .progress, .long = "--progress", .help = "write timestamped progress records", .show_in = eval_cmds },
     .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress", .show_in = eval_cmds },
-    .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC collection budget (MiB,\nor with a k/m/g suffix; 0 = never collect).\nDefault: auto, scaled to RAM.", .show_in = eval_cmds },
-    .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds, .complete = .{ .hugetlb, .none } },
-    .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .help = "write a Perfetto timeline to PATH\n(default: fix-timeline.json)", .show_in = timeline_cmds, .complete = .{ .file, .none } },
-    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "off|all", .help = "record all scheduler steal flows or none\n(default: all)", .show_in = timeline_cmds, .complete = .{ .timeline_flows, .none } },
+    .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC collection budget (MiB,\nor with a k/m/g suffix; 0 = never collect).\nDefault: auto, scaled to RAM.", .completion_help = "set the GC collection budget", .default_value = "auto", .show_in = eval_cmds },
+    .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .completion_help = "configure 2 MB huge pages", .default_value = "auto", .show_in = eval_cmds, .complete = .{ .hugetlb, .none } },
+    .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .help = "write a Perfetto timeline to PATH\n(default: fix-timeline.json)", .completion_help = "write a Perfetto timeline", .default_value = "fix-timeline.json", .show_in = timeline_cmds, .complete = .{ .file, .none } },
+    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "off|all", .help = "record all scheduler steal flows or none\n(default: all)", .completion_help = "record scheduler steal flows", .default_value = "all", .show_in = timeline_cmds, .complete = .{ .timeline_flows, .none } },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
     .{ .id = .bare, .long = "--bare", .help = "plain line-based input: no editor, no escape\nsequences (for pipes and expect-style automation)", .show_in = &.{.repl} },
@@ -530,7 +539,7 @@ const specs = [_]Spec{
 
     // Disasm.
     .{ .id = .disasm_eval, .long = "--eval", .help = "evaluate first, then disassemble every chunk that\ncompiled (imports + whatever evaluation forces)", .show_in = &.{.disasm} },
-    .{ .id = .chunk, .long = "--chunk", .arg = .req, .metavar = "N", .help = "disassemble only chunk N (decimal or 0x hex, as\nshown in chunk headers; default: all reachable)", .show_in = &.{.disasm} },
+    .{ .id = .chunk, .long = "--chunk", .arg = .req, .metavar = "N", .help = "disassemble only chunk N (decimal or 0x hex, as\nshown in chunk headers; default: all reachable)", .completion_help = "disassemble only chunk N", .default_value = "all reachable", .show_in = &.{.disasm} },
     .{ .id = .no_recurse, .long = "--no-recurse", .help = "only show the top chunk", .show_in = &.{.disasm} },
     .{ .id = .no_bytes, .long = "--no-bytes", .help = "omit the raw bytecode hex column", .show_in = &.{.disasm} },
     .{ .id = .no_pager, .long = "--no-pager", .help = "do not pipe output to $PAGER", .show_in = &.{.disasm} },
@@ -590,24 +599,32 @@ fn optionDisplayName(spec: *const Spec) []const u8 {
     return spec.long orelse spec.short orelse "";
 }
 
-fn isNoOption(spec: *const Spec) bool {
-    return if (spec.long) |name| std.mem.startsWith(u8, name, "--no-") else false;
-}
-
-/// A `--no-foo` sorts with `--foo` only when that positive option is visible
-/// for this command. Standalone negative switches (`--no-location`,
-/// `--no-recurse`, …) retain their ordinary `no-*` alphabetical position.
-fn optionSortKey(spec: *const Spec, visible: []const *const Spec) []const u8 {
-    const name = optionDisplayName(spec);
-    if (std.mem.startsWith(u8, name, "--no-")) {
-        const suffix = name["--no-".len..];
+fn pairedModifier(spec: *const Spec, visible: []const *const Spec) ?struct { key: []const u8, rank: u2 } {
+    const name = spec.long orelse return null;
+    const ModifierPrefix = struct { text: []const u8, rank: u2 };
+    const prefixes = [_]ModifierPrefix{
+        .{ .text = "--extra-", .rank = 1 },
+        .{ .text = "--no-", .rank = 2 },
+    };
+    for (prefixes) |entry| {
+        const prefix = entry.text;
+        if (!std.mem.startsWith(u8, name, prefix)) continue;
+        const suffix = name[prefix.len..];
         for (visible) |candidate| {
             const positive = candidate.long orelse continue;
             if (std.mem.startsWith(u8, positive, "--") and std.mem.eql(u8, positive[2..], suffix))
-                return suffix;
+                return .{ .key = suffix, .rank = entry.rank };
         }
     }
-    return std.mem.trimStart(u8, name, "-");
+    return null;
+}
+
+/// A `--extra-foo` or `--no-foo` sorts with `--foo` only when that positive
+/// option is visible for this command. Standalone switches (`--no-location`,
+/// `--no-recurse`, …) retain their ordinary alphabetical position.
+fn optionSortKey(spec: *const Spec, visible: []const *const Spec) []const u8 {
+    if (pairedModifier(spec, visible)) |modifier| return modifier.key;
+    return std.mem.trimStart(u8, optionDisplayName(spec), "-");
 }
 
 const OptionSortContext = struct { visible: []const *const Spec };
@@ -620,7 +637,9 @@ fn optionLessThan(context: OptionSortContext, lhs: *const Spec, rhs: *const Spec
         .gt => return false,
         .eq => {},
     }
-    if (isNoOption(lhs) != isNoOption(rhs)) return !isNoOption(lhs);
+    const lhs_rank = if (pairedModifier(lhs, context.visible)) |modifier| modifier.rank else 0;
+    const rhs_rank = if (pairedModifier(rhs, context.visible)) |modifier| modifier.rank else 0;
+    if (lhs_rank != rhs_rank) return lhs_rank < rhs_rank;
     return std.mem.lessThan(u8, optionDisplayName(lhs), optionDisplayName(rhs));
 }
 
@@ -636,20 +655,57 @@ fn visibleSpecs(cmd: Cmd, storage: *[specs.len]*const Spec) []*const Spec {
     return visible;
 }
 
-/// Emit visible option candidates in the tab-separated format shared by bash,
-/// zsh, and fish (`value<TAB>description`).
+/// Emit visible option candidates as
+/// `value<TAB>display-signature<TAB>description`. The insertable value stays
+/// separate from structural UI such as metavariables and defaults.
 pub fn writeOptionCompletions(w: *std.Io.Writer, cmd: Cmd, prefix: []const u8) !void {
     var storage: [specs.len]*const Spec = undefined;
     for (visibleSpecs(cmd, &storage)) |spec| {
-        const description = spec.help[0 .. std.mem.indexOfScalar(u8, spec.help, '\n') orelse spec.help.len];
         if (spec.short) |short| {
             if (std.mem.startsWith(u8, short, prefix))
-                try w.print("{s}\t{s}\n", .{ short, description });
+                try writeOptionCompletion(w, spec, short);
         }
         if (spec.long) |long| {
             if (std.mem.startsWith(u8, long, prefix))
-                try w.print("{s}\t{s}\n", .{ long, description });
+                try writeOptionCompletion(w, spec, long);
         }
+    }
+}
+
+fn writeOptionCompletion(w: *std.Io.Writer, spec: *const Spec, value: []const u8) !void {
+    try w.print("{s}\t", .{value});
+    try writeCompletionSignature(w, spec, value);
+    try w.writeByte('\t');
+    try writeFlattenedHelp(w, spec.completion_help orelse spec.help);
+    try w.writeByte('\n');
+}
+
+fn writeCompletionSignature(w: *std.Io.Writer, spec: *const Spec, value: []const u8) !void {
+    try w.writeAll(value);
+    // In an alias group, put structural details on the long spelling once.
+    const show_details = spec.long == null or std.mem.eql(u8, value, spec.long.?);
+    if (!show_details) return;
+    if (spec.metavar.len != 0) {
+        switch (spec.arg) {
+            .flag => try w.print(" [{s}]", .{spec.metavar}),
+            .opt => try w.print("[={s}]", .{spec.metavar}),
+            .req, .req2, .multi => try w.print(" {s}", .{spec.metavar}),
+        }
+    }
+    if (spec.default_value) |default| try w.print(" [default: {s}]", .{default});
+    if (spec.repeatable) try w.writeAll(" [repeatable]");
+}
+
+fn writeFlattenedHelp(w: *std.Io.Writer, help: []const u8) !void {
+    var pending_space = false;
+    for (help) |byte| {
+        if (byte == '\n') {
+            pending_space = true;
+            continue;
+        }
+        if (pending_space and byte != ' ') try w.writeByte(' ');
+        pending_space = false;
+        try w.writeByte(byte);
     }
 }
 
@@ -671,22 +727,36 @@ pub fn writeFishOptionDeclarations(w: *std.Io.Writer, cmd: Cmd, command_name: []
             .opt => try w.writeAll(" --arguments '(__fix_option_candidates)'"),
             .req, .req2, .multi => try w.writeAll(" --exclusive --arguments '(__fix_option_candidates)'"),
         }
-        const description = spec.help[0 .. std.mem.indexOfScalar(u8, spec.help, '\n') orelse spec.help.len];
+        const help = spec.completion_help orelse spec.help;
+        const description = help[0 .. std.mem.indexOfScalar(u8, help, '\n') orelse help.len];
         if (description.len != 0) {
             try w.writeAll(" --description ");
-            try writeFishQuoted(w, description);
+            try writeFishDescription(w, spec, description);
         }
         try w.writeByte('\n');
     }
 }
 
-fn writeFishQuoted(w: *std.Io.Writer, text: []const u8) !void {
+fn writeFishDescription(w: *std.Io.Writer, spec: *const Spec, description: []const u8) !void {
     try w.writeByte('\'');
+    try writeFishEscaped(w, description);
+    if (spec.repeatable and std.mem.indexOf(u8, description, "repeatable") == null and std.mem.indexOf(u8, description, "Repeatable") == null)
+        try w.writeAll(" (repeatable)");
+    if (spec.default_value) |default| {
+        if (std.mem.indexOf(u8, description, "default") == null and std.mem.indexOf(u8, description, "Default") == null) {
+            try w.writeAll(" (default: ");
+            try writeFishEscaped(w, default);
+            try w.writeByte(')');
+        }
+    }
+    try w.writeByte('\'');
+}
+
+fn writeFishEscaped(w: *std.Io.Writer, text: []const u8) !void {
     for (text) |byte| {
         if (byte == '\\' or byte == '\'') try w.writeByte('\\');
         try w.writeByte(byte);
     }
-    try w.writeByte('\'');
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1214,7 @@ test "one-shot evaluator help exposes Perfetto timeline controls" {
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "--timeline") == null);
 }
 
-test "help and completions alphabetize visible options with negative pairs adjacent" {
+test "help and completions alphabetize visible options with modifiers adjacent" {
     var help_buffer: [32 * 1024]u8 = undefined;
     var help_writer = std.Io.Writer.fixed(&help_buffer);
     try writeHelpInner(&help_writer, "usage: fix eval", .eval);
@@ -1156,11 +1226,18 @@ test "help and completions alphabetize visible options with negative pairs adjac
     const color = std.mem.indexOf(u8, help, "--color[=WHEN]") orelse unreachable;
     const no_color = std.mem.indexOf(u8, help, "--no-color") orelse unreachable;
     const cores = std.mem.indexOf(u8, help, "--cores N") orelse unreachable;
+    const deprecated = std.mem.indexOf(u8, help, "--deprecated-features FEATS") orelse unreachable;
+    const extra_deprecated = std.mem.indexOf(u8, help, "--extra-deprecated-features FEATS") orelse unreachable;
+    const experimental = std.mem.indexOf(u8, help, "--experimental-features FEATS") orelse unreachable;
+    const extra_experimental = std.mem.indexOf(u8, help, "--extra-experimental-features FEATS") orelse unreachable;
+    const expr = std.mem.indexOf(u8, help, "--expr EXPR") orelse unreachable;
     const progress = std.mem.indexOf(u8, help, "--progress") orelse unreachable;
     const no_progress = std.mem.indexOf(u8, help, "--no-progress") orelse unreachable;
     const raw = std.mem.indexOf(u8, help, "--raw") orelse unreachable;
     try std.testing.expect(arg < argstr and argstr < attr);
     try std.testing.expect(color < no_color and no_color < cores);
+    try std.testing.expect(deprecated < extra_deprecated and extra_deprecated < experimental);
+    try std.testing.expect(experimental < extra_experimental and extra_experimental < expr);
     try std.testing.expect(progress < no_progress and no_progress < raw);
 
     var completion_buffer: [32 * 1024]u8 = undefined;
@@ -1170,11 +1247,31 @@ test "help and completions alphabetize visible options with negative pairs adjac
     const completion_color = std.mem.indexOf(u8, completions, "--color\t") orelse unreachable;
     const completion_no_color = std.mem.indexOf(u8, completions, "--no-color\t") orelse unreachable;
     const completion_cores = std.mem.indexOf(u8, completions, "--cores\t") orelse unreachable;
+    const completion_deprecated = std.mem.indexOf(u8, completions, "--deprecated-features\t") orelse unreachable;
+    const completion_extra_deprecated = std.mem.indexOf(u8, completions, "--extra-deprecated-features\t") orelse unreachable;
+    const completion_experimental = std.mem.indexOf(u8, completions, "--experimental-features\t") orelse unreachable;
+    const completion_extra_experimental = std.mem.indexOf(u8, completions, "--extra-experimental-features\t") orelse unreachable;
+    const completion_expr = std.mem.indexOf(u8, completions, "--expr\t") orelse unreachable;
     const completion_progress = std.mem.indexOf(u8, completions, "--progress\t") orelse unreachable;
     const completion_no_progress = std.mem.indexOf(u8, completions, "--no-progress\t") orelse unreachable;
     const completion_raw = std.mem.indexOf(u8, completions, "--raw\t") orelse unreachable;
     try std.testing.expect(completion_color < completion_no_color and completion_no_color < completion_cores);
+    try std.testing.expect(completion_deprecated < completion_extra_deprecated and completion_extra_deprecated < completion_experimental);
+    try std.testing.expect(completion_experimental < completion_extra_experimental and completion_extra_experimental < completion_expr);
     try std.testing.expect(completion_progress < completion_no_progress and completion_no_progress < completion_raw);
+}
+
+test "option completions expose argument shapes defaults and concise help" {
+    var buffer: [32 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeOptionCompletions(&writer, .eval, "--");
+    const completions = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, completions, "--arg\t--arg NAME EXPR\tpass EXPR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completions, "--color\t--color[=WHEN] [default: auto]\tcolor diagnostics") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completions, "--expr\t--expr EXPR [repeatable]\tevaluate expression text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completions, "--gc-budget\t--gc-budget SIZE [default: auto]\tset the GC collection budget") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completions, "--timeline\t--timeline[=PATH] [default: fix-timeline.json]\twrite a Perfetto timeline") != null);
 }
 
 test "help aligns long option names and wraps descriptions to its width" {
