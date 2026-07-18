@@ -1,7 +1,7 @@
-//! The `:disasm` TUI: a chunk graph beside the selected disassembly.
+//! The VM explorer TUI: a qualified-name tree beside the selected chunk view.
 //!
-//! Interactive use is deliberately a TUI rather than a pager: the chunk graph
-//! is persistent navigation, the disassembly is a separately scrollable pane,
+//! Interactive use is deliberately a TUI rather than a pager: the name tree is
+//! persistent navigation, the chunk detail is a separately scrollable pane,
 //! and a header/footer make focus and available actions explicit. It runs on
 //! the alternate screen and returns to the ordinary repl prompt on exit. The
 //! plain (`--bare`/non-tty) fallback prints the same disassembly directly.
@@ -57,7 +57,7 @@ const Page = struct {
 const Visit = struct {
     kind: Kind,
     scroll: usize = 0,
-    ref_selection: usize = 0,
+    tree_selection: usize = 0,
     x_scroll: usize = 0,
 
     const Kind = union(enum) {
@@ -73,14 +73,14 @@ pub fn browse(
     start: ChunkId,
     color_depth: ColorDepth,
 ) !void {
-    var ref_graph = try bytecode.inspect.RefGraph.build(allocator, ev.chunkRegistry());
-    defer ref_graph.deinit();
+    var name_index = try bytecode.inspect.NameIndex.build(allocator, ev.chunkRegistry());
+    defer name_index.deinit();
     var tui = Tui{
         .allocator = allocator,
         .io = io,
         .ev = ev,
         .color_depth = color_depth,
-        .ref_graph = &ref_graph,
+        .name_index = &name_index,
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
     defer tui.deinit();
@@ -92,7 +92,7 @@ const Tui = struct {
     io: std.Io,
     ev: *Evaluator,
     color_depth: ColorDepth,
-    ref_graph: *const bytecode.inspect.RefGraph,
+    name_index: *const bytecode.inspect.NameIndex,
     /// Rendered pages live here for the whole browse session.
     arena: std.heap.ArenaAllocator,
 
@@ -101,17 +101,32 @@ const Tui = struct {
     page: Page = undefined,
     scroll: usize = 0,
     search: std.ArrayListUnmanaged(u8) = .empty,
+    expanded: std.AutoHashMapUnmanaged(bytecode.name_tree.NameId, void) = .empty,
+    tree_rows: std.ArrayListUnmanaged(TreeRow) = .empty,
     status_msg: []const u8 = "",
     focus: Focus = .disassembly,
-    ref_selection: usize = 0,
+    tree_selection: usize = 0,
     x_scroll: usize = 0,
+    view: View = .code,
 
     const Focus = enum { chunks, disassembly };
+    const View = enum { code, tables, source, refs };
+
+    const TreeRow = union(enum) {
+        name: struct { id: bytecode.name_tree.NameId, depth: u16 },
+        chunk: struct { id: ChunkId, depth: u16 },
+        more: struct { count: usize, depth: u16 },
+    };
+
+    const tree_child_cap = 200;
+    const tree_chunk_cap = 100;
 
     fn deinit(self: *Tui) void {
         self.stack.deinit(self.allocator);
         self.forward.deinit(self.allocator);
         self.search.deinit(self.allocator);
+        self.expanded.deinit(self.allocator);
+        self.tree_rows.deinit(self.allocator);
         self.arena.deinit();
     }
 
@@ -131,6 +146,8 @@ const Tui = struct {
         }
 
         try self.stack.append(self.allocator, .{ .kind = .{ .chunk = start } });
+        try self.expandFocusedPath(start);
+        try self.rebuildTree(start);
         self.page = try self.buildPage(.{ .chunk = start });
 
         var decoder = keys_mod.Decoder{};
@@ -174,27 +191,35 @@ const Tui = struct {
                     };
                 };
                 var text: std.Io.Writer.Allocating = .init(arena);
-                const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
-                var options = disasm_options;
-                options.color_depth = self.color_depth;
-                options.refs = self.ref_graph;
-                options.line_width = @intCast(@min(self.layout().main_width, std.math.maxInt(u16)));
-                try disasm.writeChunk(arena, &text.writer, id, chunk, symbols, options);
+                switch (self.view) {
+                    .code, .tables => {
+                        const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
+                        var options = disasm_options;
+                        options.color_depth = self.color_depth;
+                        options.show_constants = self.view == .tables;
+                        options.show_code = self.view == .code;
+                        options.line_width = @intCast(@min(self.layout().main_width, std.math.maxInt(u16)));
+                        try disasm.writeChunk(arena, &text.writer, id, chunk, symbols, options);
+                    },
+                    .source => try self.writeSourcePage(&text.writer, id, chunk),
+                    .refs => try self.writeRefsPage(&text.writer, id, chunk),
+                }
                 const lines = try splitLines(arena, text.written());
                 return .{
-                    .title = try std.fmt.allocPrint(arena, "chunk[0x{x}]", .{id}),
+                    .title = try std.fmt.allocPrint(arena, "chunk[0x{x}] · {s}", .{ id, @tagName(self.view) }),
                     .lines = lines,
                 };
             },
             .help => {
                 const help_text =
-                    \\The disassembly TUI
+                    \\The VM explorer
                     \\
-                    \\  Tab             switch chunk/disassembly focus
+                    \\  Tab             switch tree/detail focus
                     \\  j/k, arrows     move in the focused pane
-                    \\  Enter           open the selected chunk reference
-                    \\  r               show chunk references
-                    \\  h/l             scroll disassembly horizontally
+                    \\  Enter, →        expand a name or open a chunk
+                    \\  ←               collapse a name / move to its parent
+                    \\  1/2/3/4         code / tables / source / references
+                    \\  h/l             scroll detail horizontally
                     \\  d/u, PgDn/PgUp  half/full page
                     \\  g/G             top/bottom
                     \\  b / f           back / forward through visited chunks
@@ -202,9 +227,9 @@ const Tui = struct {
                     \\  ?               this help
                     \\  q               leave the browser
                     \\
-                    \\The chunk pane shows outgoing (→) and incoming (←)
-                    \\references. On a narrow terminal, Tab switches panes
-                    \\instead of splitting them.
+                    \\The tree starts collapsed except for the focused chunk's
+                    \\ancestor path. Large child/chunk sets remain bounded. On
+                    \\a narrow terminal, Tab switches panes instead of splitting.
                 ;
                 return .{
                     .title = try arena.dupe(u8, "help"),
@@ -225,6 +250,61 @@ const Tui = struct {
             _ = lines.pop();
         }
         return lines.items;
+    }
+
+    fn writeSourcePage(self: *Tui, w: *std.Io.Writer, id: ChunkId, chunk: *const bytecode.Chunk) !void {
+        try w.print("chunk #{d}: {d} source-map entries\n", .{ id, chunk.source_map.len });
+        if (chunk.body_span) |span| {
+            try w.writeAll("body   ");
+            try self.writeSpan(w, span);
+            try w.writeByte('\n');
+        }
+        for (chunk.source_map) |entry| {
+            try w.print("{x:0>4}..{x:0>4}  ", .{ entry.start, entry.end });
+            try self.writeSpan(w, entry.span);
+            try w.writeByte('\n');
+        }
+        if (chunk.source_map.len == 0 and chunk.body_span == null) try w.writeAll("(no source information)\n");
+    }
+
+    fn writeSpan(self: *Tui, w: *std.Io.Writer, span: bytecode.Chunk.SourceSpan) !void {
+        if (span.file) |file| {
+            try w.writeAll(self.ev.internTable().get(file));
+        } else {
+            try w.writeAll("expression");
+        }
+        try w.print(":{d}:{d}  offset {d}+{d}", .{ span.line, span.column, span.offset, span.len });
+    }
+
+    fn writeRefsPage(self: *Tui, w: *std.Io.Writer, id: ChunkId, chunk: *const bytecode.Chunk) !void {
+        var refs: std.ArrayListUnmanaged(ChunkId) = .empty;
+        defer refs.deinit(self.allocator);
+        try bytecode.inspect.collectRefs(self.allocator, chunk, &refs);
+        try w.print("outgoing ({d})\n", .{refs.items.len});
+        for (refs.items) |target| try self.writeChunkLabel(w, "  →", target);
+
+        var incoming: usize = 0;
+        const total = self.ev.chunkRegistry().count();
+        var candidate: ChunkId = 0;
+        while (candidate < total) : (candidate += 1) {
+            const source = self.ev.getChunk(candidate) orelse continue;
+            refs.clearRetainingCapacity();
+            bytecode.inspect.collectRefs(self.allocator, source, &refs) catch continue;
+            if (std.mem.indexOfScalar(ChunkId, refs.items, id) == null) continue;
+            if (incoming == 0) try w.writeAll("incoming\n");
+            try self.writeChunkLabel(w, "  ←", candidate);
+            incoming += 1;
+        }
+        if (incoming == 0) try w.writeAll("incoming (0)\n");
+    }
+
+    fn writeChunkLabel(self: *Tui, w: *std.Io.Writer, marker: []const u8, id: ChunkId) !void {
+        try w.print("{s} #{d}", .{ marker, id });
+        if (self.ev.chunkRegistry().hasQualifiedName(id)) {
+            try w.writeByte(' ');
+            try self.ev.chunkRegistry().writeQualifiedName(w, id, self.ev.internTable());
+        }
+        try w.writeByte('\n');
     }
 
     // -- navigation ------------------------------------------------------------
@@ -267,38 +347,120 @@ const Tui = struct {
         };
     }
 
-    const NavEntry = struct {
-        id: ChunkId,
-        kind: enum { outgoing, incoming },
-    };
-
-    fn referenceCount(self: *const Tui) usize {
-        const id = self.currentChunk() orelse return 0;
-        return self.ref_graph.outgoing(id).len + self.ref_graph.incoming(id).len;
+    fn expandFocusedPath(self: *Tui, chunk_id: ChunkId) !void {
+        try self.expanded.put(self.allocator, bytecode.root_name_id, {});
+        var name = self.ev.chunkRegistry().nameOf(chunk_id) orelse bytecode.root_name_id;
+        while (name != bytecode.root_name_id) {
+            try self.expanded.put(self.allocator, name, {});
+            name = (self.name_index.node(name) orelse break).parent;
+        }
     }
 
-    fn navCount(self: *const Tui) usize {
-        return self.referenceCount();
+    fn rebuildTree(self: *Tui, focused_chunk: ChunkId) !void {
+        self.tree_rows.clearRetainingCapacity();
+        try self.appendNameRows(bytecode.root_name_id, 0, focused_chunk);
+        self.tree_selection = 0;
+        for (self.tree_rows.items, 0..) |row, i| switch (row) {
+            .chunk => |entry| if (entry.id == focused_chunk) {
+                self.tree_selection = i;
+                break;
+            },
+            else => {},
+        };
     }
 
-    fn navAt(self: *const Tui, index: usize) ?NavEntry {
-        const id = self.currentChunk() orelse return null;
-        const outgoing = self.ref_graph.outgoing(id);
-        if (index < outgoing.len) return .{ .id = outgoing[index], .kind = .outgoing };
-        const incoming = self.ref_graph.incoming(id);
-        const incoming_index = index -| outgoing.len;
-        if (incoming_index < incoming.len) return .{ .id = incoming[incoming_index], .kind = .incoming };
-        return null;
+    fn appendNameRows(self: *Tui, name: bytecode.name_tree.NameId, depth: u16, focused_chunk: ChunkId) !void {
+        try self.tree_rows.append(self.allocator, .{ .name = .{ .id = name, .depth = depth } });
+        if (!self.expanded.contains(name)) return;
+        const next_depth = depth +| 1;
+
+        var child_total: usize = 0;
+        var child_shown: usize = 0;
+        for (self.name_index.childrenOf(name)) |child| {
+            if (self.name_index.statsOf(child).chunks == 0) continue;
+            child_total += 1;
+            if (child_shown >= tree_child_cap) continue;
+            try self.appendNameRows(child, next_depth, focused_chunk);
+            child_shown += 1;
+        }
+
+        const chunks = self.name_index.chunksOf(name);
+        const chunk_shown = @min(chunks.len, tree_chunk_cap);
+        var focus_shown = false;
+        for (chunks[0..chunk_shown]) |id| {
+            try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = id, .depth = next_depth } });
+            focus_shown = focus_shown or id == focused_chunk;
+        }
+        if (!focus_shown and std.mem.indexOfScalar(ChunkId, chunks, focused_chunk) != null) {
+            try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = focused_chunk, .depth = next_depth } });
+        }
+
+        const omitted = (child_total -| child_shown) + (chunks.len -| chunk_shown);
+        if (omitted > 0) try self.tree_rows.append(self.allocator, .{ .more = .{ .count = omitted, .depth = next_depth } });
     }
 
-    fn moveReference(self: *Tui, forward: bool) void {
-        const count = self.navCount();
+    fn moveTree(self: *Tui, forward: bool) void {
+        const count = self.tree_rows.items.len;
         if (count == 0) return;
         if (forward) {
-            self.ref_selection = @min(self.ref_selection + 1, count - 1);
+            self.tree_selection = @min(self.tree_selection + 1, count - 1);
         } else {
-            self.ref_selection -|= 1;
+            self.tree_selection -|= 1;
         }
+    }
+
+    fn activateTreeRow(self: *Tui) !void {
+        if (self.tree_selection >= self.tree_rows.items.len) return;
+        switch (self.tree_rows.items[self.tree_selection]) {
+            .name => |entry| {
+                if (self.expanded.remove(entry.id)) {
+                    // collapsed
+                } else {
+                    try self.expanded.put(self.allocator, entry.id, {});
+                }
+                const focused = self.currentChunk() orelse 0;
+                try self.rebuildTree(focused);
+                for (self.tree_rows.items, 0..) |row, i| switch (row) {
+                    .name => |candidate| if (candidate.id == entry.id) {
+                        self.tree_selection = i;
+                        break;
+                    },
+                    else => {},
+                };
+            },
+            .chunk => |entry| try self.open(.{ .chunk = entry.id }),
+            .more => self.status_msg = "(bounded; use :vm chunks in the prompt)",
+        }
+    }
+
+    fn collapseTreeRow(self: *Tui) !void {
+        if (self.tree_selection >= self.tree_rows.items.len) return;
+        const selected = self.tree_rows.items[self.tree_selection];
+        const name: bytecode.name_tree.NameId = switch (selected) {
+            .name => |entry| entry.id,
+            .chunk => |entry| self.ev.chunkRegistry().nameOf(entry.id) orelse bytecode.root_name_id,
+            .more => return,
+        };
+        if (self.expanded.remove(name)) {
+            const focused = self.currentChunk() orelse 0;
+            try self.rebuildTree(focused);
+            for (self.tree_rows.items, 0..) |row, i| switch (row) {
+                .name => |entry| if (entry.id == name) {
+                    self.tree_selection = i;
+                    break;
+                },
+                else => {},
+            };
+            return;
+        }
+        const parent = (self.name_index.node(name) orelse return).parent;
+        for (self.tree_rows.items, 0..) |row, i| switch (row) {
+            .name => |entry| if (entry.id == parent) {
+                self.tree_selection = i;
+                return;
+            },
+            else => {},
+        };
     }
 
     fn open(self: *Tui, kind: Visit.Kind) !void {
@@ -306,14 +468,20 @@ const Tui = struct {
         if (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
             top.scroll = self.scroll;
-            top.ref_selection = self.ref_selection;
+            top.tree_selection = self.tree_selection;
             top.x_scroll = self.x_scroll;
         }
         try self.stack.append(self.allocator, .{ .kind = kind });
         self.forward.clearRetainingCapacity();
         self.page = try self.buildPage(kind);
         self.scroll = 0;
-        self.ref_selection = 0;
+        switch (kind) {
+            .chunk => |id| {
+                try self.expandFocusedPath(id);
+                try self.rebuildTree(id);
+            },
+            .help => {},
+        }
         self.x_scroll = 0;
         switch (kind) {
             .help => self.focus = .disassembly,
@@ -331,7 +499,7 @@ const Tui = struct {
         const visit = self.stack.items[self.stack.items.len - 1];
         self.page = try self.buildPage(visit.kind);
         self.scroll = visit.scroll;
-        self.ref_selection = visit.ref_selection;
+        self.tree_selection = visit.tree_selection;
         self.x_scroll = visit.x_scroll;
         self.status_msg = "";
     }
@@ -344,13 +512,13 @@ const Tui = struct {
         if (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
             top.scroll = self.scroll;
-            top.ref_selection = self.ref_selection;
+            top.tree_selection = self.tree_selection;
             top.x_scroll = self.x_scroll;
         }
         try self.stack.append(self.allocator, visit);
         self.page = try self.buildPage(visit.kind);
         self.scroll = visit.scroll;
-        self.ref_selection = visit.ref_selection;
+        self.tree_selection = visit.tree_selection;
         self.x_scroll = visit.x_scroll;
         self.status_msg = "";
     }
@@ -374,6 +542,15 @@ const Tui = struct {
         return widest -| self.layout().main_width;
     }
 
+    fn setView(self: *Tui, view: View) !void {
+        if (self.currentChunk() == null) return;
+        self.view = view;
+        self.page = try self.buildPage(self.currentKind());
+        self.scroll = 0;
+        self.x_scroll = 0;
+        self.focus = .disassembly;
+    }
+
     fn handleKey(self: *Tui, key: keys_mod.Key) !bool {
         self.status_msg = "";
         if (key.isCtrl('c') or key.isCtrl('d')) return false;
@@ -382,14 +559,14 @@ const Tui = struct {
                 'q' => return false,
                 'j' => {
                     if (self.focus == .chunks) {
-                        self.moveReference(true);
+                        self.moveTree(true);
                     } else {
                         self.scroll = @min(self.scroll + 1, self.maxScroll());
                     }
                 },
                 'k' => {
                     if (self.focus == .chunks) {
-                        self.moveReference(false);
+                        self.moveTree(false);
                     } else {
                         self.scroll -|= 1;
                     }
@@ -401,10 +578,10 @@ const Tui = struct {
                     if (self.focus == .disassembly) self.scroll -|= self.contentRows() / 2;
                 },
                 'g' => {
-                    if (self.focus == .chunks) self.ref_selection = 0 else self.scroll = 0;
+                    if (self.focus == .chunks) self.tree_selection = 0 else self.scroll = 0;
                 },
                 'G' => {
-                    if (self.focus == .chunks) self.ref_selection = self.navCount() -| 1 else self.scroll = self.maxScroll();
+                    if (self.focus == .chunks) self.tree_selection = self.tree_rows.items.len -| 1 else self.scroll = self.maxScroll();
                 },
                 'h' => {
                     if (self.focus == .disassembly) self.x_scroll -|= 4;
@@ -414,12 +591,10 @@ const Tui = struct {
                 },
                 'b' => try self.back(),
                 'f' => try self.goForward(),
-                'r' => {
-                    if (self.currentChunk() != null) {
-                        self.ref_selection = 0;
-                        self.focus = .chunks;
-                    }
-                },
+                '1' => try self.setView(.code),
+                '2' => try self.setView(.tables),
+                '3' => try self.setView(.source),
+                '4', 'r' => try self.setView(.refs),
                 '?' => try self.open(.help),
                 '/' => {
                     if (self.focus == .disassembly) try self.searchPrompt();
@@ -433,21 +608,21 @@ const Tui = struct {
                 else => {},
             },
             .up => {
-                if (self.focus == .chunks) self.moveReference(false) else self.scroll -|= 1;
+                if (self.focus == .chunks) self.moveTree(false) else self.scroll -|= 1;
             },
             .down => {
                 if (self.focus == .chunks) {
-                    self.moveReference(true);
+                    self.moveTree(true);
                 } else {
                     self.scroll = @min(self.scroll + 1, self.maxScroll());
                 }
             },
             .left => {
-                if (self.focus == .disassembly) self.x_scroll -|= 4;
+                if (self.focus == .chunks) try self.collapseTreeRow() else self.x_scroll -|= 4;
             },
             .right => {
                 if (self.focus == .chunks) {
-                    self.focus = .disassembly;
+                    try self.activateTreeRow();
                 } else {
                     self.x_scroll = @min(self.x_scroll + 4, self.maxXScroll());
                 }
@@ -459,10 +634,10 @@ const Tui = struct {
                 if (self.focus == .disassembly) self.scroll = @min(self.scroll + self.contentRows(), self.maxScroll());
             },
             .home => {
-                if (self.focus == .chunks) self.ref_selection = 0 else self.scroll = 0;
+                if (self.focus == .chunks) self.tree_selection = 0 else self.scroll = 0;
             },
             .end => {
-                if (self.focus == .chunks) self.ref_selection = self.navCount() -| 1 else self.scroll = self.maxScroll();
+                if (self.focus == .chunks) self.tree_selection = self.tree_rows.items.len -| 1 else self.scroll = self.maxScroll();
             },
             .tab, .backtab => {
                 if (self.focus == .chunks) {
@@ -472,8 +647,7 @@ const Tui = struct {
                 }
             },
             .enter => {
-                if (self.focus == .chunks) if (self.navAt(self.ref_selection)) |entry|
-                    try self.open(.{ .chunk = entry.id });
+                if (self.focus == .chunks) try self.activateTreeRow();
             },
             .escape => return false,
             else => {},
@@ -556,17 +730,15 @@ const Tui = struct {
         const layout_now = self.layout();
         const rows = layout_now.body_rows;
         self.clampScroll();
-        self.ref_selection = @min(self.ref_selection, self.navCount() -| 1);
+        self.tree_selection = @min(self.tree_selection, self.tree_rows.items.len -| 1);
 
         var header_buf: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, " fix disasm  ·  {s}  ·  {s} pane ", .{
+        const header = std.fmt.bufPrint(&header_buf, " fix vm  ·  {s}  ·  {s} pane ", .{
             self.page.title,
-            if (self.focus == .chunks) "chunks" else "disassembly",
-        }) catch " fix disasm ";
+            if (self.focus == .chunks) "tree" else "detail",
+        }) catch " fix vm ";
         try moveTo(w, 1, 1);
-        try w.writeAll("\x1b[7m");
-        try writeAnsiWindow(w, header, 0, layout_now.cols);
-        try w.writeAll("\x1b[7m\x1b[K\x1b[0m");
+        try writeBar(w, header, layout_now.cols);
 
         var row: usize = 0;
         while (row < rows) : (row += 1) {
@@ -590,7 +762,7 @@ const Tui = struct {
         else
             @min(100, (self.scroll + rows) * 100 / self.page.lines.len);
         var footer_buf: [512]u8 = undefined;
-        const footer = std.fmt.bufPrint(&footer_buf, " {d}% · {d}/{d} · x:{d}  {s}  tab focus · r refs · ↵ open · b/f history · / search · ? help · q quit ", .{
+        const footer = std.fmt.bufPrint(&footer_buf, " {d}% · {d}/{d} · x:{d}  {s}  tab focus · 1 code · 2 tables · 3 source · 4 refs · ↵ open · ? help · q quit ", .{
             pct,
             @min(self.scroll + 1, self.page.lines.len),
             self.page.lines.len,
@@ -598,9 +770,7 @@ const Tui = struct {
             self.status_msg,
         }) catch " q quit ";
         try moveTo(w, layout_now.rows, 1);
-        try w.writeAll("\x1b[7m");
-        try writeAnsiWindow(w, footer, 0, layout_now.cols);
-        try w.writeAll("\x1b[7m\x1b[K\x1b[0m");
+        try writeBar(w, footer, layout_now.cols);
     }
 
     fn drawDisasmRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize) !void {
@@ -613,9 +783,10 @@ const Tui = struct {
     }
 
     fn drawChunkRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize, rows: usize) !void {
-        var line_buf: [256]u8 = undefined;
+        var line_buf: [512]u8 = undefined;
         if (row == 0) {
-            const line = std.fmt.bufPrint(&line_buf, " CHUNK REFS  ·  {d} refs", .{self.navCount()}) catch " CHUNK REFS";
+            const root_stats = self.name_index.statsOf(bytecode.root_name_id);
+            const line = std.fmt.bufPrint(&line_buf, " VM TREE  ·  {d} chunks", .{root_stats.chunks}) catch " VM TREE";
             if (self.focus == .chunks) try w.writeAll("\x1b[1m");
             try writeAnsiWindow(w, line, 0, width);
             return;
@@ -633,45 +804,83 @@ const Tui = struct {
             return;
         }
         if (row == 2) {
-            try writeAnsiWindow(w, " ─ references ─", 0, width);
+            try writeAnsiWindow(w, " ─ names / chunks ─", 0, width);
             return;
         }
 
-        const count = self.navCount();
+        const count = self.tree_rows.items.len;
         if (count == 0) {
-            if (row == 3) try writeAnsiWindow(w, "   no incoming or outgoing chunks", 0, width);
+            if (row == 3) try writeAnsiWindow(w, "   empty registry", 0, width);
             return;
         }
         const slots = rows -| 3;
         if (slots == 0) return;
-        const start = @min(self.ref_selection -| (slots / 2), count -| slots);
+        const start = @min(self.tree_selection -| (slots / 2), count -| slots);
         const index = start + row - 3;
-        const entry = self.navAt(index) orelse return;
-        const marker: []const u8 = switch (entry.kind) {
-            .outgoing => "→",
-            .incoming => "←",
+        if (index >= count) return;
+        const selected = index == self.tree_selection;
+        const line: []const u8 = switch (self.tree_rows.items[index]) {
+            .name => |entry| blk: {
+                const stats = self.name_index.statsOf(entry.id);
+                var indent: [64]u8 = undefined;
+                const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
+                @memset(indent[0..indent_len], ' ');
+                const label = if (entry.id == bytecode.root_name_id)
+                    "<root>"
+                else if (self.name_index.node(entry.id)) |node|
+                    self.ev.internTable().get(node.segment)
+                else
+                    "?";
+                break :blk std.fmt.bufPrint(&line_buf, " {s}{s} {s}  {d}", .{
+                    indent[0..indent_len],
+                    if (self.expanded.contains(entry.id)) "▾" else "▸",
+                    label,
+                    stats.chunks,
+                }) catch " name";
+            },
+            .chunk => |entry| blk: {
+                var indent: [64]u8 = undefined;
+                const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
+                @memset(indent[0..indent_len], ' ');
+                const chunk = self.ev.getChunk(entry.id);
+                break :blk if (chunk) |ch|
+                    std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {Bi}", .{
+                        indent[0..indent_len],
+                        if (self.currentChunk() == entry.id) "●" else "·",
+                        entry.id,
+                        ch.code.len,
+                    }) catch " chunk"
+                else
+                    std.fmt.bufPrint(&line_buf, " {s}! #{d} missing", .{ indent[0..indent_len], entry.id }) catch " missing";
+            },
+            .more => |entry| blk: {
+                var indent: [64]u8 = undefined;
+                const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
+                @memset(indent[0..indent_len], ' ');
+                break :blk std.fmt.bufPrint(&line_buf, " {s}… {d} more", .{ indent[0..indent_len], entry.count }) catch " more";
+            },
         };
-        const line = if (self.ev.getChunk(entry.id)) |chunk|
-            std.fmt.bufPrint(&line_buf, " {s} {s} #0x{x}  {d}b · {d}c", .{
-                if (index == self.ref_selection) ">" else " ",
-                marker,
-                entry.id,
-                chunk.code.len,
-                chunk.constants.len,
-            }) catch " chunk"
-        else
-            std.fmt.bufPrint(&line_buf, " {s} {s} #0x{x}  missing", .{
-                if (index == self.ref_selection) ">" else " ",
-                marker,
-                entry.id,
-            }) catch " chunk";
-        if (index == self.ref_selection and self.focus == .chunks) try w.writeAll("\x1b[7m");
+        if (selected and self.focus == .chunks) try w.writeAll("\x1b[7m");
         try writeAnsiWindow(w, line, 0, width);
     }
 };
 
 fn moveTo(w: *std.Io.Writer, row: usize, col: usize) !void {
     try w.print("\x1b[{d};{d}H", .{ row, col });
+}
+
+/// A full-width reverse-video bar. Explicit spaces are emitted after the
+/// clipped content because terminals disagree on whether erase-to-EOL carries
+/// the current background/reverse attributes.
+fn writeBar(w: *std.Io.Writer, line: []const u8, width: usize) !void {
+    try w.writeAll("\x1b[7m");
+    try writeAnsiWindow(w, line, 0, width);
+    const used = @min(displayWidth(line), width);
+    if (used < width) {
+        try w.writeAll("\x1b[7m");
+        try w.splatByteAll(' ', width - used);
+    }
+    try w.writeAll("\x1b[0m");
 }
 
 /// Render a horizontal cell window without counting or splitting ANSI CSI
@@ -753,4 +962,12 @@ test "ANSI-aware window clips cells without cutting color or UTF-8" {
     out.clearRetainingCapacity();
     try writeAnsiWindow(&out.writer, line, 3, 2);
     try testing.expectEqualStrings("\x1b[31mc\x1b[0m", out.written());
+}
+
+test "full-width bars explicitly paint their trailing cells" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try writeBar(&out.writer, " vm ", 8);
+    try testing.expectEqualStrings("\x1b[7m vm \x1b[0m\x1b[7m    \x1b[0m", out.written());
 }

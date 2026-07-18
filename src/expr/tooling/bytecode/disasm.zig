@@ -36,8 +36,12 @@ pub const Symbols = struct {
 };
 
 pub const Options = struct {
-    /// Print constant pool before the code.
+    /// Print the chunk's cold side tables before the code: constants, formal
+    /// arguments, attribute metadata, captures, and upvalues.
     show_constants: bool = true,
+    /// Print the decoded instruction stream. Explorer table panes disable this
+    /// while reusing the canonical chunk/table formatting above it.
+    show_code: bool = true,
     /// Print source-map column on the right.
     show_source: bool = true,
     /// Print the raw instruction bytes as a hex column (one color per byte
@@ -153,6 +157,26 @@ fn writeChunkAt(
         }
     }
 
+    if (options.show_constants and chunk.function_args.len > 0) {
+        try writeGuide(writer, cc, null, options.color_depth);
+        try writer.writeAll("  function arguments:\n");
+        for (chunk.function_args, 0..) |arg, i| {
+            try writeTableRowHead(writer, cc, sec_function_args_color, i, i == chunk.function_args.len - 1, attrNameColor(i), options.color_depth);
+            try writeStringRef(writer, "str", arg.name, symbols, table_snippet_max, options.color_depth);
+            try setCommentFg(writer, options.color_depth);
+            try writer.writeAll(" = ");
+            if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
+            try writeValueDigest(writer, arg.value, symbols, table_snippet_max, options.color_depth);
+            if (i < chunk.function_arg_pos.len) {
+                try setCommentFg(writer, options.color_depth);
+                try writer.writeAll(" ; ");
+                if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
+                try writeAttrPosLocation(writer, chunk.function_arg_pos[i], symbols, options.color_depth);
+            }
+            try writer.writeByte('\n');
+        }
+    }
+
     // Attr-name / attr-position side tables: the names and source positions the
     // `attrs_new_named*` ops pull out of the code stream. Each op carries only a
     // `names[start..]` / `positions[start..]` reference into these tables — the
@@ -174,6 +198,18 @@ fn writeChunkAt(
             try writeTableRowHead(writer, cc, sec_attr_pos_color, i, i == chunk.attr_pos.len - 1, attrPosColor(i), options.color_depth);
             try writeAttrPosRow(writer, rec, symbols, options.color_depth);
             try writer.writeByte('\n');
+        }
+    }
+    if (options.show_constants and chunk.capture_bytes.len > 0) {
+        try writeGuide(writer, cc, null, options.color_depth);
+        try writer.writeAll("  capture descriptors:\n");
+        const count = chunk.capture_bytes.len / 3;
+        for (0..count) |i| {
+            const offset = i * 3;
+            const is_upvalue = chunk.capture_bytes[offset] != 0;
+            const index = readU16(chunk.capture_bytes, offset + 1);
+            try writeTableRowHead(writer, cc, sec_captures_color, i, i == count - 1, upvColor(i), options.color_depth);
+            try writer.print("@{d} {s}[{d}]\n", .{ offset, if (is_upvalue) "upvalue" else "local", index });
         }
     }
 
@@ -232,6 +268,8 @@ fn writeChunkAt(
             try writeRefList(writer, "outgoing", sec_outgoing_color, out, true, symbols, cc, options.color_depth);
         }
     };
+
+    if (!options.show_code) return;
 
     var ip: usize = 0;
     var referenced_chunks: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
@@ -455,6 +493,8 @@ const sec_incoming_color: [3]u8 = .{ 0xa6, 0x5c, 0xb8 };
 const sec_outgoing_color: [3]u8 = .{ 0x5c, 0x8a, 0xb8 };
 const sec_attr_names_color: [3]u8 = .{ 0x8a, 0xb8, 0x5c };
 const sec_attr_pos_color: [3]u8 = .{ 0xb8, 0x8a, 0x5c };
+const sec_function_args_color: [3]u8 = .{ 0x5c, 0xa6, 0xb8 };
+const sec_captures_color: [3]u8 = .{ 0xb8, 0x5c, 0xa6 };
 
 /// Identity color for an `attr_names` side-table row: the same hue on the row
 /// `#i` and on the `names[i..]` reference that points at it, so a reference ties
@@ -1855,6 +1895,10 @@ fn writeAttrPosRow(writer: *std.Io.Writer, rec: @import("runtime").heap.AttrPosE
     }
     try setCommentFg(writer, color_depth);
     try writer.writeAll(" @ ");
+    try writeAttrPosLocation(writer, rec, symbols, color_depth);
+}
+
+fn writeAttrPosLocation(writer: *std.Io.Writer, rec: @import("runtime").heap.AttrPosEntry, symbols: Symbols, color_depth: ColorDepth) !void {
     if (symbols.internName(rec.pos.file)) |f| {
         try setFg(writer, internColor(rec.pos.file), color_depth);
         try writer.writeAll(std.fs.path.basename(f));
@@ -2034,4 +2078,27 @@ test "disassembling omits the constant pool section when show_constants is false
     const text = out.written();
 
     try std.testing.expect(std.mem.indexOf(u8, text, "  constants:\n") == null);
+}
+
+test "table-only disassembly omits instructions" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.emitConstant(allocator, Value.int(7));
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeChunk(allocator, &out.writer, null, &chunk, .{}, .{ .show_code = false });
+
+    const text = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "  constants:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "int 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "push_const") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "halt") == null);
 }
