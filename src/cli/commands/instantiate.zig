@@ -40,23 +40,42 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
 
-    if (options.find_file) return findFiles(init.io, &ev, options.sources.items);
-
     const input_plan = eval_support.InputPlan.init(options, init.io);
-    input_plan.validate(&ev) catch |err| {
-        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
-        return 2;
-    };
-    const input_count = try input_plan.count();
+    if (!options.find_file) {
+        input_plan.validate(&ev) catch |err| {
+            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            return 2;
+        };
+    }
+    const input_count = if (options.find_file) options.sources.items.len else try input_plan.count();
+    const timeline_source = if (options.find_file)
+        "find-file"
+    else if (input_count == 1)
+        eval_support.sourceLabel(input_plan.selected(0).source_arg)
+    else
+        "multiple inputs";
+    var progress = try progress_ui.Session.init(
+        allocator,
+        init.io,
+        &ev,
+        term,
+        options,
+        timeline_source,
+    );
+    var ok = false;
+    defer progress.deinit(ok);
+    progress.install();
+
+    if (options.find_file) {
+        const code = try findFiles(init.io, &ev, options.sources.items);
+        ok = code == 0;
+        return code;
+    }
 
     // Forcing a derivation now writes its `.drv` (and sources) to the store.
     // The daemon connects lazily on the first write.
     ev.enableStoreWrites();
 
-    var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
-    var ok = false;
-    defer progress.deinit(ok);
-    if (term.progressEnabled()) ev.setObserver(progress.observer());
     ok = true;
     for (0..input_count) |index| {
         const input = input_plan.load(&ev, index) catch |err| {

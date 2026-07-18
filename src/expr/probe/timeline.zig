@@ -25,8 +25,6 @@ const Event = struct {
     category: []const u8,
     name: []const u8,
     subject: Text = .{},
-    src_file: u32 = 0,
-    src_line: u32 = 0,
     args: Text = .{},
     flow_id: u64 = 0,
     complete: bool = false,
@@ -88,9 +86,7 @@ pub const Recorder = struct {
             .kind = .span,
             .category = spec.category,
             .name = spec.name,
-            .subject = subject.text,
-            .src_file = subject.file,
-            .src_line = subject.line,
+            .subject = subject,
         };
         return index + 1;
     }
@@ -102,12 +98,7 @@ pub const Recorder = struct {
         const now = clock.monotonicNs();
         const event = &self.events[index];
         event.dur_ns = now -| event.ts_ns;
-        if (completion.details) |details| {
-            const subject = self.storeSubject(details.subject);
-            event.subject = subject.text;
-            event.src_file = subject.file;
-            event.src_line = subject.line;
-        }
+        if (completion.details) |details| event.subject = self.storeSubject(details.subject);
         event.args = self.formatArgs(spec.name, completion.details, completion.metrics, success);
         event.complete = true;
     }
@@ -128,9 +119,7 @@ pub const Recorder = struct {
             .kind = .instant,
             .category = spec.category,
             .name = spec.name,
-            .subject = subject.text,
-            .src_file = subject.file,
-            .src_line = subject.line,
+            .subject = subject,
             .args = self.formatArgs(spec.name, details, metrics, true),
             .complete = true,
         };
@@ -194,13 +183,19 @@ pub const Recorder = struct {
         return .{ .off = @intCast(offset), .len = @intCast(bytes.len) };
     }
 
-    const StoredSubject = struct { text: Text = .{}, file: u32 = 0, line: u32 = 0 };
-
-    fn storeSubject(self: *Recorder, subject: observ.Subject) StoredSubject {
+    fn storeSubject(self: *Recorder, subject: observ.Subject) Text {
         return switch (subject) {
             .none => .{},
-            .source => |source| .{ .file = source.file, .line = source.line },
-            .text, .path, .url => |bytes| .{ .text = self.storeText(bytes) },
+            .text, .path, .url => |bytes| self.storeText(bytes),
+            .source => |source| blk: {
+                if (source.file == 0) break :blk .{};
+                const path = self.intern.get(source.file);
+                const base = std.fs.path.basename(path);
+                const directory = std.fs.path.basename(std.fs.path.dirname(path) orelse "");
+                var buffer: [512]u8 = undefined;
+                const label = std.fmt.bufPrint(&buffer, "{s}/{s}:{d}", .{ directory, base, source.line }) catch base;
+                break :blk self.storeText(label);
+            },
         };
     }
 
@@ -326,8 +321,7 @@ pub const Recorder = struct {
         try writer.writeAll(",\"cat\":");
         try writeJsonString(writer, event.category);
         try writer.writeAll(",\"name\":");
-        var source_buffer: [512]u8 = undefined;
-        const subject = self.subjectText(event, &source_buffer);
+        const subject = self.text(event.subject);
         try writeJsonString(writer, if (subject.len == 0) event.name else subject);
         const args = self.text(event.args);
         if (args.len != 0) try writer.print(",\"args\":{{{s}}}", .{args});
@@ -337,14 +331,6 @@ pub const Recorder = struct {
     fn text(self: *const Recorder, stored: Text) []const u8 {
         if (stored.len == 0) return "";
         return self.names[stored.off..][0..stored.len];
-    }
-
-    fn subjectText(self: *const Recorder, event: Event, buffer: []u8) []const u8 {
-        if (event.src_file == 0) return self.text(event.subject);
-        const path = self.intern.get(event.src_file);
-        const base = std.fs.path.basename(path);
-        const directory = std.fs.path.basename(std.fs.path.dirname(path) orelse "");
-        return std.fmt.bufPrint(buffer, "{s}/{s}:{d}", .{ directory, base, event.src_line }) catch base;
     }
 };
 

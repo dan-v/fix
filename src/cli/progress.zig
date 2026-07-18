@@ -2,9 +2,13 @@
 
 const std = @import("std");
 const observ = @import("base").observ;
-const Timeline = @import("expr").probe.timeline.Recorder;
+const engine = @import("expr");
+const Evaluator = engine.Evaluator;
+const Timeline = engine.probe.timeline.Recorder;
 const terminal_text = @import("base").terminal_text;
+const args = @import("args.zig");
 const presentation = @import("presentation.zig");
+const setup = @import("setup.zig");
 
 pub const EvalProgress = struct {
     io: std.Io,
@@ -201,6 +205,65 @@ pub const EvalProgress = struct {
             .bytes => try writer.writeAll(" B"),
             .nanoseconds => try writer.writeAll(" ns"),
         }
+    }
+};
+
+/// Owns the terminal renderer and optional Perfetto sink for one command.
+/// Keeping this at the CLI boundary makes installing an evaluator observer a
+/// single local operation and lets build keep recording daemon spans after the
+/// language evaluator has released its memory.
+pub const Session = struct {
+    ev: *Evaluator,
+    io: std.Io,
+    progress: EvalProgress,
+    timeline: ?Timeline = null,
+    timeline_path: ?[]const u8,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        ev: *Evaluator,
+        terminal: setup.Terminal,
+        options: args.Options,
+        source: []const u8,
+    ) !Session {
+        var session: Session = .{
+            .ev = ev,
+            .io = io,
+            .progress = EvalProgress.init(io, ev.basePath() orelse "", terminal.log_progress, terminal.color_depth, options.verbose),
+            .timeline_path = options.timeline_path,
+        };
+        if (options.timeline_path != null) {
+            session.timeline = try Timeline.init(allocator, ev.workerCount(), 1 << 21, ev.internTable());
+            session.timeline.?.setFlowSample(options.timeline_flows);
+            session.timeline.?.setSource(source);
+        }
+        return session;
+    }
+
+    /// Call after the returned session is in its final stack location, so the
+    /// observer can safely retain pointers into it.
+    pub fn install(self: *Session) void {
+        if (self.timeline) |*recorder| {
+            self.progress.setTimeline(recorder);
+            self.ev.setTraceFlows(true);
+        }
+        if (self.progress.log_progress or self.timeline != null)
+            self.ev.setObserver(self.progress.observer());
+    }
+
+    pub fn renderer(self: *Session) *EvalProgress {
+        return &self.progress;
+    }
+
+    pub fn deinit(self: *Session, success: bool) void {
+        // Stop callbacks before serializing/freeing the sink. The evaluator can
+        // outlive command-local progress (notably realizeMany returning to
+        // `build`), so do not leave it pointing at this stack frame.
+        self.ev.setObserver(.{});
+        self.progress.deinit(success);
+        if (self.timeline_path) |path| self.timeline.?.dump(self.io, path);
+        if (self.timeline) |*recorder| recorder.deinit();
     }
 };
 

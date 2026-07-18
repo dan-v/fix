@@ -417,6 +417,8 @@ const selected_source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell,
 /// progress, and the GC memory budget apply. `disasm` stops at compilation, so
 /// it is excluded.
 const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .@"switch" };
+/// One-shot evaluator commands that can write a complete Perfetto capture.
+const timeline_cmds = &[_]Cmd{ .eval, .instantiate, .build };
 /// Commands that print an evaluated value, so the output format (`--json`,
 /// `--xml`) and `--strict` apply. The realizing commands print store paths, not
 /// a value, and `disasm` prints bytecode.
@@ -483,8 +485,8 @@ const specs = [_]Spec{
     .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress", .show_in = eval_cmds },
     .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC collection budget (MiB,\nor with a k/m/g suffix; 0 = never collect).\nDefault: auto, scaled to RAM.", .show_in = eval_cmds },
     .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds },
-    .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .help = "write a Perfetto timeline to PATH\n(default: fix-timeline.json)", .show_in = &.{.eval} },
-    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "N|off|all", .help = "record every Nth scheduler steal flow\n(default: all)", .show_in = &.{.eval} },
+    .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .help = "write a Perfetto timeline to PATH\n(default: fix-timeline.json)", .show_in = timeline_cmds },
+    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "N|off|all", .help = "record every Nth scheduler steal flow\n(default: all)", .show_in = timeline_cmds },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
     .{ .id = .bare, .long = "--bare", .help = "plain line-based input: no editor, no escape\nsequences (for pipes and expect-style automation)", .show_in = &.{.repl} },
@@ -927,18 +929,19 @@ test "progress surface selects enabled or disabled records" {
     try std.testing.expectError(error.UnexpectedValue, parseForTest(&old_log_argv, .eval));
 }
 
-test "eval help exposes Perfetto timeline controls" {
+test "one-shot evaluator help exposes Perfetto timeline controls" {
     var buffer: [32 * 1024]u8 = undefined;
+    for (timeline_cmds) |cmd| {
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writeHelpInner(&writer, "usage: fix", cmd);
+        const help = writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, help, "--timeline[=PATH]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, help, "--timeline-flows N|off|all") != null);
+        try std.testing.expect(std.mem.indexOf(u8, help, "Perfetto timeline") != null);
+    }
+
     var writer = std.Io.Writer.fixed(&buffer);
-    try writeHelpInner(&writer, "usage: fix eval", .eval);
-    const eval_help = writer.buffered();
-
-    try std.testing.expect(std.mem.indexOf(u8, eval_help, "--timeline[=PATH]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, eval_help, "--timeline-flows N|off|all") != null);
-    try std.testing.expect(std.mem.indexOf(u8, eval_help, "Perfetto timeline") != null);
-
-    writer = std.Io.Writer.fixed(&buffer);
-    try writeHelpInner(&writer, "usage: fix build", .build);
+    try writeHelpInner(&writer, "usage: fix run", .run);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "--timeline") == null);
 }
 

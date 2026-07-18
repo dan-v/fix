@@ -5,6 +5,7 @@
 const std = @import("std");
 const engine = @import("expr");
 const realization_workflow = @import("../realize.zig");
+const progress_ui = @import("../progress.zig");
 const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
@@ -46,6 +47,22 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         return 2;
     };
     const input_count = try input_plan.count();
+    const timeline_source = if (input_count == 1)
+        eval_support.sourceLabel(input_plan.selected(0).source_arg)
+    else
+        "multiple inputs";
+    var progress = try progress_ui.Session.init(
+        allocator,
+        init.io,
+        &ev,
+        term,
+        options,
+        timeline_source,
+    );
+    var ok = false;
+    defer progress.deinit(ok);
+    progress.install();
+
     const inputs = try allocator.alloc(realization_workflow.BuildInput, input_count);
     var loaded: usize = 0;
     defer {
@@ -60,9 +77,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         };
     }
 
-    if (options.dry_run)
-        return realization_workflow.dryRunMany(allocator, init.io, &ev, process.eval_release, term, options, inputs);
-    return realization_workflow.realizeMany(allocator, init.io, &ev, process.eval_release, term, options, inputs);
+    const code = if (options.dry_run)
+        try realization_workflow.dryRunMany(allocator, init.io, &ev, process.eval_release, term, options, inputs)
+    else
+        try realization_workflow.realizeMany(allocator, init.io, &ev, process.eval_release, term, options, progress.renderer(), inputs);
+    ok = code == 0;
+    return code;
 }
 
 pub const makeLink = realization_workflow.makeLink;

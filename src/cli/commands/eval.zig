@@ -10,7 +10,6 @@ const eval_support = @import("../eval_support.zig");
 const debugger = @import("../debugger.zig");
 const trace_setup = @import("../trace_setup.zig");
 const stats = @import("../stats.zig");
-const timeline = engine.probe.timeline;
 
 const Evaluator = engine.Evaluator;
 
@@ -66,8 +65,21 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
     const input_count = try input_plan.count();
 
-    var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
-    errdefer progress.deinit(false);
+    const timeline_source = if (input_count == 1)
+        eval_support.sourceLabel(input_plan.selected(0).source_arg)
+    else
+        "multiple inputs";
+    var progress = try progress_ui.Session.init(
+        allocator,
+        init.io,
+        &ev,
+        term,
+        options,
+        timeline_source,
+    );
+    var ok = false;
+    defer progress.deinit(ok);
+    progress.install();
 
     var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, options);
     defer vm_trace.deinit(allocator);
@@ -77,24 +89,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer thunks_setup.deinit(allocator);
     if (thunks_setup.trace) |t| ev.setThunkTrace(t);
 
-    const timeline_path = options.timeline_path;
-    var timeline_recorder: ?timeline.Recorder = null;
-    defer if (timeline_recorder) |*recorder| recorder.deinit();
-    if (timeline_path != null) {
-        timeline_recorder = try timeline.Recorder.init(allocator, worker_count, 1 << 21, ev.internTable());
-        const recorder = &timeline_recorder.?;
-        recorder.setFlowSample(options.timeline_flows);
-        progress.setTimeline(recorder);
-        ev.setTraceFlows(true);
-        recorder.setSource(if (input_count == 1) switch (input_plan.selected(0).source_arg) {
-            .file => |p| p,
-            .expr => "(expression)",
-            .flake => |inst| inst,
-        } else "(multiple inputs)");
-    }
-    if (term.progressEnabled() or timeline_recorder != null) ev.setObserver(progress.observer());
-
-    var ok = true;
+    ok = true;
     for (0..input_count) |index| {
         const input = input_plan.load(&ev, index) catch |err| {
             eval_support.reportInputReadError(input_count, index, err);
@@ -115,9 +110,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         );
         ok = input_ok and ok;
     }
-    progress.deinit(ok);
-
-    if (timeline_path) |path| timeline_recorder.?.dump(init.io, path);
     vm_trace.finish();
     thunks_setup.finish();
     if (options.print_sched_stats) stats.report(&ev);

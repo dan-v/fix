@@ -188,16 +188,10 @@ pub fn realizeMany(
     release_action: ?@import("expr").ReleaseAction,
     terminal: setup.Terminal,
     options: args.Options,
+    progress: *EvalProgress,
     inputs: []const BuildInput,
 ) !u8 {
-    var progress = EvalProgress.init(io, ev.basePath() orelse "", terminal.log_progress, terminal.color_depth, options.verbose);
-    if (terminal.progressEnabled()) ev.setObserver(progress.observer());
-    var progress_closed = false;
-    defer if (!progress_closed) {
-        progress.deinit(false);
-    };
-
-    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, &progress);
+    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, progress);
     defer build_progress_state.deinit();
     // Keep the typed daemon sink active even when progress is disabled: it
     // still owns build-log labeling and terminal-safe color boundaries.
@@ -235,8 +229,6 @@ pub fn realizeMany(
     printer_thread.join();
     const ok = !printer.failed.load(.acquire);
     build_progress_state.deinit();
-    progress.deinit(ok);
-    progress_closed = true;
     return if (ok) 0 else 1;
 }
 
@@ -252,11 +244,6 @@ pub fn dryRunMany(
     options: args.Options,
     inputs: []const BuildInput,
 ) !u8 {
-    var progress = EvalProgress.init(io, ev.basePath() orelse "", terminal.log_progress, terminal.color_depth, options.verbose);
-    var progress_ok = false;
-    defer progress.deinit(progress_ok);
-    if (terminal.progressEnabled()) ev.setObserver(progress.observer());
-
     const derived = try allocator.alloc([]const u8, inputs.len);
     var derived_count: usize = 0;
     defer {
@@ -299,8 +286,7 @@ pub fn dryRunMany(
         for (plan.will_substitute) |path| std.debug.print("  {s}\n", .{path});
     }
     writeMissingGroup("paths are unknown", plan.unknown);
-    progress_ok = plan.unknown.len == 0;
-    return if (progress_ok) 0 else 1;
+    return if (plan.unknown.len == 0) 0 else 1;
 }
 
 fn writeMissingGroup(label: []const u8, paths: []const []const u8) void {
