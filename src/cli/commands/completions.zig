@@ -76,7 +76,13 @@ const zsh_script =
     \\    fi
     \\    compadd -J fix "${compadd_args[@]}" -a suggestions
     \\}
-    \\_fix "$@"
+    \\# When autoloaded from a site-functions directory, run the completion.
+    \\# When sourced directly, register it instead of calling compadd outside ZLE.
+    \\if [[ $funcstack[1] == _fix ]] || (( ! $+functions[compdef] )); then
+    \\    _fix "$@"
+    \\else
+    \\    compdef _fix fix
+    \\fi
 ;
 
 const fish_script =
@@ -485,7 +491,7 @@ fn completeSourceAttrs(
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     _ = try setup.configure(&ev, init, options);
-    const source = try eval_support.getSource(&ev, init.io, source_arg, options);
+    const source = try eval_support.getCompletionSource(&ev, init.io, source_arg, options);
     defer source.deinit(ev.hostAllocator());
     const value = try ev.evaluatePathAt(source.text, source.base_path, source.abs_path);
     try writeAttrCandidates(allocator, w, &ev, value, prefix, replacement);
@@ -625,6 +631,8 @@ test "generated adapters call the live backend" {
     try std.testing.expect(std.mem.indexOf(u8, bash_script, "completions --complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "completions --complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "completions --complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compdef _fix fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "funcstack[1] == _fix") != null);
 }
 
 test "attribute prefixes retain their completed parent" {

@@ -216,6 +216,17 @@ pub fn buildFailure(io: std.Io, use_color: bool, last_store_error: ?[]const u8, 
 }
 
 pub fn getSource(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Options) !Source {
+    return getSourceMode(ev, io, source, options, false);
+}
+
+/// Load a source for attribute discovery. Unlike ordinary evaluation without
+/// selectors, completion auto-calls a top-level attrset function with `{}` so
+/// files such as `default.nix` expose outputs whose formals all have defaults.
+pub fn getCompletionSource(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Options) !Source {
+    return getSourceMode(ev, io, source, options, true);
+}
+
+fn getSourceMode(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Options, completion_auto_call: bool) !Source {
     const allocator = ev.hostAllocator();
     // Load the base source text (borrowed for expr/file, owned for flake).
     var base: Source = switch (source) {
@@ -232,7 +243,7 @@ pub fn getSource(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Op
     // Apply `-A`/`--arg`/`--argstr`. When they wrap the text, the wrapper
     // prefix shifts every byte offset, so the file path no longer describes
     // `text`: drop the whole base (freeing its text and abs_path).
-    const selected = try applySelectors(ev, base.text, options);
+    const selected = try applySelectors(ev, base.text, options, completion_auto_call);
     if (selected.owned) {
         var wrapped = selected;
         wrapped.base_path = base.base_path;
@@ -248,12 +259,12 @@ pub fn getSource(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Op
 /// with those args intersected against its formals; then select the `-A`
 /// attribute path. Returns owned wrapped text, or `base_text` borrowed when no
 /// selector applies.
-fn applySelectors(ev: *Evaluator, base_text: []const u8, options: args.Options) !Source {
+fn applySelectors(ev: *Evaluator, base_text: []const u8, options: args.Options, completion_auto_call: bool) !Source {
     const alloc = ev.hostAllocator();
     const has_args = options.arg_defs.items.len > 0;
     // A `-A` with only empty components (`.`/``) selects nothing.
     const has_attr = if (options.attr) |a| std.mem.indexOfNone(u8, a, ".") != null else false;
-    if (!has_args and !has_attr) return .{ .text = base_text, .owned = false };
+    if (!has_args and !has_attr and !completion_auto_call) return .{ .text = base_text, .owned = false };
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -416,4 +427,22 @@ fn appendNixEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
         }
         try out.append(allocator, c);
     }
+}
+
+test "completion auto-calls a top-level function with defaulted formals" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+
+    const source = try applySelectors(
+        &ev,
+        "{ pkgs ? 41 }: { answer = pkgs + 1; hello = true; }",
+        .{},
+        true,
+    );
+    defer source.deinit(ev.hostAllocator());
+    try std.testing.expect(source.owned);
+
+    const value = try ev.evaluate(source.text);
+    try std.testing.expect((try ev.attrPathValue(value, "answer")) != null);
+    try std.testing.expect((try ev.attrPathValue(value, "hello")) != null);
 }
