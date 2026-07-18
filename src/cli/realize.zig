@@ -6,6 +6,8 @@ const args = @import("args.zig");
 const setup = @import("setup.zig");
 const eval_support = @import("eval_support.zig");
 const build_progress = @import("build_progress.zig");
+const presentation = @import("presentation.zig");
+const render = @import("render.zig");
 const EvalProgress = @import("progress.zig").EvalProgress;
 
 pub const Realized = struct {
@@ -32,12 +34,14 @@ const BuildSlot = struct {
     drv_path: ?[]u8 = null,
     out_path: ?[]u8 = null,
     derived: ?[]u8 = null,
+    evaluation_failure: ?[]u8 = null,
     failure_stage: FailureStage = .none,
 
     fn deinit(self: *BuildSlot, allocator: std.mem.Allocator) void {
         if (self.drv_path) |path| allocator.free(path);
         if (self.out_path) |path| allocator.free(path);
         if (self.derived) |path| allocator.free(path);
+        if (self.evaluation_failure) |text| allocator.free(text);
     }
 };
 
@@ -45,11 +49,24 @@ const Pipeline = struct {
     allocator: std.mem.Allocator,
     ev: *Evaluator,
     slots: []BuildSlot,
+    inputs: []const BuildInput,
+    use_color: bool,
+    show_trace: bool,
 
-    fn complete(raw: *anyopaque, index: usize, value: ?@import("runtime").Value, eval_err: ?anyerror) void {
+    fn complete(raw: *anyopaque, index: usize, value: ?@import("runtime").Value, failure: ?Evaluator.ParallelFailure) void {
         const self: *Pipeline = @ptrCast(@alignCast(raw));
         const slot = &self.slots[index];
-        if (eval_err) |err| return self.fail(slot, .evaluation, err);
+        if (failure) |failed| {
+            slot.evaluation_failure = render.captureEvalFailure(
+                self.allocator,
+                self.use_color,
+                self.show_trace,
+                self.ev,
+                self.inputs[index].source.text,
+                failed,
+            ) catch null;
+            return self.fail(slot, .evaluation, failed.err);
+        }
 
         const paths = (self.ev.derivationBuildPaths(value.?) catch |err| return self.fail(slot, .derivation, err)) orelse
             return self.fail(slot, .derivation, error.NotDerivation);
@@ -76,12 +93,16 @@ const OrderedPrinter = struct {
     ev: *Evaluator,
     options: args.Options,
     slots: []BuildSlot,
-    failed: std.atomic.Value(bool) = .init(false),
+    failed: bool = false,
 
     fn run(self: *OrderedPrinter) void {
         for (self.slots, 0..) |*slot, index| {
             slot.request.wait() catch |err| {
-                self.failed.store(true, .release);
+                self.failed = true;
+                if (slot.evaluation_failure) |text| {
+                    self.writeFailure(text);
+                    continue;
+                }
                 const stage = switch (slot.failure_stage) {
                     .evaluation => "evaluation",
                     .derivation => "derivation selection",
@@ -109,11 +130,21 @@ const OrderedPrinter = struct {
             var buffer: [4096]u8 = undefined;
             var stdout = std.Io.File.stdout().writerStreaming(self.io, &buffer);
             stdout.interface.print("{s}\n", .{out_path}) catch {
-                self.failed.store(true, .release);
+                self.failed = true;
                 continue;
             };
-            stdout.interface.flush() catch self.failed.store(true, .release);
+            stdout.interface.flush() catch {
+                self.failed = true;
+            };
         }
+    }
+
+    fn writeFailure(self: *OrderedPrinter, text: []const u8) void {
+        var stderr_buffer: [4096]u8 = undefined;
+        var stderr = presentation.lockStderr(self.io, &stderr_buffer) catch return;
+        defer stderr.deinit();
+        stderr.writer().writeAll(text) catch return;
+        stderr.flush() catch {};
     }
 
     fn linkOutput(self: *OrderedPrinter, index: usize, target: []const u8) void {
@@ -177,10 +208,9 @@ fn absolutePath(io: std.Io, allocator: std.mem.Allocator, name: []const u8) ![]u
     return std.fs.path.resolve(allocator, &.{ cwd, name });
 }
 
-/// Evaluate independent build inputs on separate demand fibers, enqueue each
-/// build as soon as its derivation closure is materialized, and print completed
-/// outputs in input order. Evaluation state is released immediately after the
-/// final enqueue while daemon builds and ordered printing continue.
+/// Evaluate independent build inputs on separate demand fibers and enqueue each
+/// build as soon as its derivation closure is materialized. Once evaluator
+/// workers are quiescent, print completed outputs and failures in input order.
 pub fn realizeMany(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -216,9 +246,11 @@ pub fn realizeMany(
         .allocator = allocator,
         .ev = ev,
         .slots = slots,
+        .inputs = inputs,
+        .use_color = terminal.use_color,
+        .show_trace = options.show_trace,
     };
     var printer: OrderedPrinter = .{ .allocator = allocator, .io = io, .ev = ev, .options = options, .slots = slots };
-    const printer_thread = try std.Thread.spawn(.{}, OrderedPrinter.run, .{&printer});
     ev.evaluatePathsParallel(parallel_inputs, .{ .context = &pipeline, .complete_fn = Pipeline.complete });
 
     // Every demand fiber has either enqueued its build or completed its request
@@ -226,8 +258,8 @@ pub fn realizeMany(
     ev.releaseEvalState();
     if (release_action) |action| action.run(action.context);
 
-    printer_thread.join();
-    const ok = !printer.failed.load(.acquire);
+    printer.run();
+    const ok = !printer.failed;
     build_progress_state.deinit();
     return if (ok) 0 else 1;
 }

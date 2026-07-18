@@ -21,6 +21,7 @@
 const std = @import("std");
 const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
+const ErrorTrace = @import("../../observ.zig").trace.Trace;
 
 /// Native-stack headroom reserved below `stack_limit`: the guard trips this
 /// far from the mapping's end so the deepest single force step between two
@@ -49,9 +50,12 @@ pub const ExecutionContext = struct {
     /// `Worker.runTopLevel(s)`; cleared by the recycle reset.
     is_demand: bool = false,
     /// Parallel top-level demand entries intentionally do not contribute to
-    /// the evaluator's single-run diagnostic trace. The trace is not a
-    /// concurrent data structure, and build reports failures per input.
+    /// the evaluator's single-run diagnostic trace. Each input installs its
+    /// own trace below so build can report failures without a shared race.
     parallel_demand: bool = false,
+    /// Per-input error trace installed while a parallel demand fiber runs.
+    /// Nested import VMs inherit it through this structural fiber context.
+    error_trace: ?*ErrorTrace = null,
     /// Head of the in-progress `builtins.scopedImport` path chain. Unlike an
     /// OS-thread-local, this travels with the fiber when work stealing resumes
     /// it on another worker. Frames themselves live on the suspended fiber's
@@ -72,6 +76,7 @@ pub const ExecutionContext = struct {
         // A scoped-import frame is stack-scoped and must have unwound before
         // the fiber can finish and return to the recycle list.
         std.debug.assert(self.scoped_import_top == null);
+        std.debug.assert(self.error_trace == null);
         self.is_demand = false;
         self.parallel_demand = false;
     }

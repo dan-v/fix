@@ -18,24 +18,72 @@ pub fn evalFailure(
     source: []const u8,
     err: anyerror,
 ) !void {
-    if (ev.getDiagnostics().len > 0) {
-        var stderr_buffer: [4096]u8 = undefined;
-        var stderr = try presentation.lockStderr(io, &stderr_buffer);
-        defer stderr.deinit();
-        try ev.writeDiagnostics(stderr.writer(), source, use_color);
-        try stderr.flush();
-    } else {
-        try evaluationError(io, use_color, show_trace, ev, source, err);
-    }
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr = try presentation.lockStderr(io, &stderr_buffer);
+    defer stderr.deinit();
+    try writeEvalFailure(stderr.writer(), use_color, show_trace, ev, source, err, ev.getTrace(), true);
+    try stderr.flush();
 }
 
 pub fn evaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !void {
     var stderr_buffer: [4096]u8 = undefined;
     var stderr = try presentation.lockStderr(io, &stderr_buffer);
     defer stderr.deinit();
-    const writer = stderr.writer();
-    const trace = ev.getTrace();
+    try writeEvaluationError(stderr.writer(), use_color, show_trace, ev, source, err, ev.getTrace());
+    try stderr.flush();
+}
 
+/// Render a parallel-input failure while evaluator source and trace state are
+/// still alive. The caller can emit the owned bytes later, after workers are
+/// quiescent, without reducing the error to its Zig error-set name.
+pub fn captureEvalFailure(
+    allocator: std.mem.Allocator,
+    use_color: bool,
+    show_trace: bool,
+    ev: *Evaluator,
+    source: []const u8,
+    failure: Evaluator.ParallelFailure,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try writeEvalFailure(
+        &output.writer,
+        use_color,
+        show_trace,
+        ev,
+        source,
+        failure.err,
+        failure.trace,
+        failure.diagnostics,
+    );
+    return allocator.dupe(u8, output.written());
+}
+
+fn writeEvalFailure(
+    writer: *std.Io.Writer,
+    use_color: bool,
+    show_trace: bool,
+    ev: *Evaluator,
+    source: []const u8,
+    err: anyerror,
+    trace: *const EvalTrace,
+    diagnostics: bool,
+) !void {
+    if (diagnostics and ev.getDiagnostics().len > 0)
+        try ev.writeDiagnostics(writer, source, use_color)
+    else
+        try writeEvaluationError(writer, use_color, show_trace, ev, source, err, trace);
+}
+
+fn writeEvaluationError(
+    writer: *std.Io.Writer,
+    use_color: bool,
+    show_trace: bool,
+    ev: *Evaluator,
+    source: []const u8,
+    err: anyerror,
+    trace: *const EvalTrace,
+) !void {
     try presentation.style(writer, use_color, .error_label);
     try writer.writeAll("error");
     try presentation.reset(writer, use_color);
@@ -50,7 +98,6 @@ pub fn evaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Evalu
     }
 
     try writeTraceFrames(writer, use_color, show_trace, ev, source, trace.frames.items);
-    try stderr.flush();
 }
 
 fn writeTraceFrames(

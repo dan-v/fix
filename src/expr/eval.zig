@@ -1317,11 +1317,17 @@ pub const Evaluator = struct {
 
     pub const ParallelSink = struct {
         context: *anyopaque,
-        complete_fn: *const fn (context: *anyopaque, index: usize, value: ?Value, err: ?anyerror) void,
+        complete_fn: *const fn (context: *anyopaque, index: usize, value: ?Value, failure: ?ParallelFailure) void,
 
-        pub fn complete(self: ParallelSink, index: usize, value: ?Value, err: ?anyerror) void {
-            self.complete_fn(self.context, index, value, err);
+        pub fn complete(self: ParallelSink, index: usize, value: ?Value, failure: ?ParallelFailure) void {
+            self.complete_fn(self.context, index, value, failure);
         }
+    };
+
+    pub const ParallelFailure = struct {
+        err: anyerror,
+        trace: *const EvalTrace,
+        diagnostics: bool = false,
     };
 
     /// Compile several independent inputs, then evaluate each on its own demand
@@ -1330,7 +1336,7 @@ pub const Evaluator = struct {
     pub fn evaluatePathsParallel(self: *Evaluator, inputs: []const ParallelInput, sink: ParallelSink) void {
         if (inputs.len == 0) return;
         self.prepareEvaluations() catch |err| {
-            for (inputs, 0..) |_, index| sink.complete(index, null, err);
+            for (inputs, 0..) |_, index| sink.complete(index, null, .{ .err = err, .trace = self.getTrace() });
             return;
         };
 
@@ -1340,13 +1346,18 @@ pub const Evaluator = struct {
             index: usize,
             chunk_id: ChunkId,
             details: observ.Details,
+            trace: *EvalTrace,
 
             fn entry(raw: *anyopaque) void {
                 const ctx: *@This() = @ptrCast(@alignCast(raw));
+                const inner = fiber_mod.currentFiber().?;
+                const fiber: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
+                fiber.ctx.error_trace = ctx.trace;
+                defer fiber.ctx.error_trace = null;
                 var scratch = @import("base").arena.ArenaAllocator.init(ctx.ev.allocator);
                 defer scratch.deinit();
                 var vm = ctx.ev.initVm(0, scratch.allocator()) catch |err| {
-                    ctx.sink.complete(ctx.index, null, err);
+                    ctx.sink.complete(ctx.index, null, .{ .err = err, .trace = ctx.trace });
                     return;
                 };
                 defer vm.deinit();
@@ -1355,7 +1366,7 @@ pub const Evaluator = struct {
                 var observation = ctx.ev.observer.begin(&evaluate_observation, ctx.details);
                 defer observation.cancel();
                 const value = vm.eval(ctx.chunk_id) catch |err| {
-                    ctx.sink.complete(ctx.index, null, err);
+                    ctx.sink.complete(ctx.index, null, .{ .err = err, .trace = ctx.trace });
                     return;
                 };
                 observation.finish(.{});
@@ -1364,20 +1375,27 @@ pub const Evaluator = struct {
         };
 
         const contexts = self.allocator.alloc(Context, inputs.len) catch {
-            for (inputs, 0..) |_, index| sink.complete(index, null, error.OutOfMemory);
+            for (inputs, 0..) |_, index| sink.complete(index, null, .{ .err = error.OutOfMemory, .trace = self.getTrace() });
             return;
         };
         defer self.allocator.free(contexts);
+        const traces = self.allocator.alloc(EvalTrace, inputs.len) catch {
+            for (inputs, 0..) |_, index| sink.complete(index, null, .{ .err = error.OutOfMemory, .trace = self.getTrace() });
+            return;
+        };
+        defer self.allocator.free(traces);
+        for (traces) |*trace| trace.* = EvalTrace.init(self.allocator);
+        defer for (traces) |*trace| trace.deinit();
         var entries: std.ArrayListUnmanaged(worker_mod.Worker.TopLevelEntry) = .empty;
         defer entries.deinit(self.allocator);
         entries.ensureTotalCapacity(self.allocator, inputs.len) catch {
-            for (inputs, 0..) |_, index| sink.complete(index, null, error.OutOfMemory);
+            for (inputs, 0..) |_, index| sink.complete(index, null, .{ .err = error.OutOfMemory, .trace = self.getTrace() });
             return;
         };
 
         for (inputs, 0..) |input, index| {
             const chunk_id = self.parseAndCompile(input.source, input.base_path orelse self.base_path, input.source_path, null) catch |err| {
-                sink.complete(index, null, err);
+                sink.complete(index, null, .{ .err = err, .trace = self.getTrace(), .diagnostics = true });
                 continue;
             };
             contexts[index] = .{
@@ -1386,6 +1404,7 @@ pub const Evaluator = struct {
                 .index = index,
                 .chunk_id = chunk_id,
                 .details = observationDetails(input.source_path orelse "expression"),
+                .trace = &traces[index],
             };
             entries.appendAssumeCapacity(.{ .entry = Context.entry, .arg = &contexts[index] });
         }
@@ -1393,14 +1412,14 @@ pub const Evaluator = struct {
         const worker = self.ensureMainWorker() catch |err| {
             for (entries.items) |entry| {
                 const ctx: *Context = @ptrCast(@alignCast(entry.arg));
-                sink.complete(ctx.index, null, err);
+                sink.complete(ctx.index, null, .{ .err = err, .trace = ctx.trace });
             }
             return;
         };
         worker.runTopLevels(entries.items) catch |err| {
             for (entries.items) |entry| {
                 const ctx: *Context = @ptrCast(@alignCast(entry.arg));
-                sink.complete(ctx.index, null, err);
+                sink.complete(ctx.index, null, .{ .err = err, .trace = ctx.trace });
             }
         };
     }
@@ -1522,7 +1541,7 @@ pub const Evaluator = struct {
         if (fiber_mod.currentFiber()) |inner| {
             const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
             vm.ctx = &wf.ctx;
-            if (wf.ctx.parallel_demand) vm.trace = null;
+            if (wf.ctx.parallel_demand) vm.trace = wf.ctx.error_trace;
         }
         return vm;
     }

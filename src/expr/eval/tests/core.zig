@@ -40,10 +40,10 @@ test "parallel top-level evaluation uses one demand fiber per ordered input" {
         fibers: [3]usize = .{ 0, 0, 0 },
         errors: [3]?anyerror = .{ null, null, null },
 
-        fn complete(raw: *anyopaque, index: usize, value: ?Value, err: ?anyerror) void {
+        fn complete(raw: *anyopaque, index: usize, value: ?Value, failure: ?Evaluator.ParallelFailure) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.values[index] = value;
-            self.errors[index] = err;
+            self.errors[index] = if (failure) |failed| failed.err else null;
             self.fibers[index] = @intFromPtr(@import("base").fiber.currentFiber().?);
         }
     };
@@ -64,6 +64,32 @@ test "parallel top-level evaluation uses one demand fiber per ordered input" {
     try std.testing.expect(capture.fibers[0] != capture.fibers[1]);
     try std.testing.expect(capture.fibers[1] != capture.fibers[2]);
     try std.testing.expect(capture.fibers[0] != capture.fibers[2]);
+}
+
+test "parallel top-level failures retain isolated Nix error traces" {
+    const Capture = struct {
+        messages: [2][32]u8 = .{ undefined, undefined },
+        lengths: [2]usize = .{ 0, 0 },
+
+        fn complete(raw: *anyopaque, index: usize, _: ?Value, failure: ?Evaluator.ParallelFailure) void {
+            const failed = failure orelse return;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const message = failed.trace.message orelse return;
+            self.lengths[index] = @min(message.len, self.messages[index].len);
+            @memcpy(self.messages[index][0..self.lengths[index]], message[0..self.lengths[index]]);
+        }
+    };
+
+    var ev = try Evaluator.init(std.testing.allocator, 4);
+    defer ev.deinit();
+    var capture: Capture = .{};
+    ev.evaluatePathsParallel(&.{
+        .{ .source = "builtins.throw \"first input failed\"" },
+        .{ .source = "builtins.throw \"second input failed\"" },
+    }, .{ .context = &capture, .complete_fn = Capture.complete });
+
+    try std.testing.expectEqualStrings("first input failed", capture.messages[0][0..capture.lengths[0]]);
+    try std.testing.expectEqualStrings("second input failed", capture.messages[1][0..capture.lengths[1]]);
 }
 
 test "external scope construction and rooting is evaluator-owned" {
