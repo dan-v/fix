@@ -586,11 +586,61 @@ pub fn completionOption(name: []const u8, cmd: Cmd) ?CompletionOption {
     };
 }
 
+fn optionDisplayName(spec: *const Spec) []const u8 {
+    return spec.long orelse spec.short orelse "";
+}
+
+fn isNoOption(spec: *const Spec) bool {
+    return if (spec.long) |name| std.mem.startsWith(u8, name, "--no-") else false;
+}
+
+/// A `--no-foo` sorts with `--foo` only when that positive option is visible
+/// for this command. Standalone negative switches (`--no-location`,
+/// `--no-recurse`, …) retain their ordinary `no-*` alphabetical position.
+fn optionSortKey(spec: *const Spec, visible: []const *const Spec) []const u8 {
+    const name = optionDisplayName(spec);
+    if (std.mem.startsWith(u8, name, "--no-")) {
+        const suffix = name["--no-".len..];
+        for (visible) |candidate| {
+            const positive = candidate.long orelse continue;
+            if (std.mem.startsWith(u8, positive, "--") and std.mem.eql(u8, positive[2..], suffix))
+                return suffix;
+        }
+    }
+    return std.mem.trimStart(u8, name, "-");
+}
+
+const OptionSortContext = struct { visible: []const *const Spec };
+
+fn optionLessThan(context: OptionSortContext, lhs: *const Spec, rhs: *const Spec) bool {
+    const lhs_key = optionSortKey(lhs, context.visible);
+    const rhs_key = optionSortKey(rhs, context.visible);
+    switch (std.mem.order(u8, lhs_key, rhs_key)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    if (isNoOption(lhs) != isNoOption(rhs)) return !isNoOption(lhs);
+    return std.mem.lessThan(u8, optionDisplayName(lhs), optionDisplayName(rhs));
+}
+
+fn visibleSpecs(cmd: Cmd, storage: *[specs.len]*const Spec) []*const Spec {
+    var count: usize = 0;
+    for (&specs) |*spec| {
+        if (spec.hidden or !validForCommand(spec, cmd)) continue;
+        storage[count] = spec;
+        count += 1;
+    }
+    const visible = storage[0..count];
+    std.mem.sort(*const Spec, visible, OptionSortContext{ .visible = visible }, optionLessThan);
+    return visible;
+}
+
 /// Emit visible option candidates in the tab-separated format shared by bash,
 /// zsh, and fish (`value<TAB>description`).
 pub fn writeOptionCompletions(w: *std.Io.Writer, cmd: Cmd, prefix: []const u8) !void {
-    for (&specs) |*spec| {
-        if (spec.hidden or !validForCommand(spec, cmd)) continue;
+    var storage: [specs.len]*const Spec = undefined;
+    for (visibleSpecs(cmd, &storage)) |spec| {
         const description = spec.help[0 .. std.mem.indexOfScalar(u8, spec.help, '\n') orelse spec.help.len];
         if (spec.short) |short| {
             if (std.mem.startsWith(u8, short, prefix))
@@ -838,7 +888,8 @@ fn parseVmTraceFormat(text: []const u8) ?@TypeOf(@as(Options, undefined).vm_trac
 // Help rendering (from the table)
 // ---------------------------------------------------------------------------
 
-const help_col = 26;
+const help_width = 100;
+const max_help_col = 42;
 
 /// Print `synopsis`, then the options section for `cmd`, to stdout. Best-effort
 /// (a failed write must not change exit status), mirroring `presentation.printHelp`.
@@ -852,14 +903,34 @@ pub fn writeHelp(io: std.Io, synopsis: []const u8, cmd: Cmd) void {
 fn writeHelpInner(w: *std.Io.Writer, synopsis: []const u8, cmd: Cmd) !void {
     try w.writeAll(synopsis);
     try w.writeAll("\n\noptions:\n");
-    for (&specs) |*s| {
-        if (s.hidden) continue;
-        if (s.show_in.len != 0 and std.mem.indexOfScalar(Cmd, s.show_in, cmd) == null) continue;
-        try writeOptionLine(w, s);
+    var storage: [specs.len]*const Spec = undefined;
+    const visible = visibleSpecs(cmd, &storage);
+    var help_col: usize = 0;
+    for (visible) |spec| help_col = @max(help_col, optionHeadLen(spec) + 2);
+    help_col = @min(help_col, max_help_col);
+    for (visible) |spec| {
+        try writeOptionLine(w, spec, help_col);
     }
 }
 
-fn writeOptionLine(w: *std.Io.Writer, s: *const Spec) !void {
+fn optionHeadLen(s: *const Spec) usize {
+    var len: usize = 2;
+    if (s.short) |short| {
+        len += short.len;
+        if (s.long != null) len += 2;
+    }
+    if (s.long) |long| len += long.len;
+    if (s.metavar.len != 0) {
+        len += switch (s.arg) {
+            .flag => s.metavar.len + 3,
+            .opt => s.metavar.len + 3,
+            .req, .req2, .multi => s.metavar.len + 1,
+        };
+    }
+    return len;
+}
+
+fn writeOptionLine(w: *std.Io.Writer, s: *const Spec, help_col: usize) !void {
     try w.writeAll("  ");
     var col: usize = 2;
     if (s.short) |sh| {
@@ -902,18 +973,34 @@ fn writeOptionLine(w: *std.Io.Writer, s: *const Spec) !void {
         try w.writeByte('\n');
         try w.splatByteAll(' ', help_col);
     }
-    // Continuation lines in a multi-line `help` re-indent to the help column.
-    var lines = std.mem.splitScalar(u8, s.help, '\n');
-    var first = true;
-    while (lines.next()) |line| {
-        if (!first) {
+    try writeWrappedHelp(w, s.help, help_col);
+    try w.writeByte('\n');
+}
+
+fn writeWrappedHelp(w: *std.Io.Writer, help: []const u8, help_col: usize) !void {
+    const line_width = @max(@as(usize, 20), help_width -| help_col);
+    var logical_lines = std.mem.splitScalar(u8, help, '\n');
+    var first_logical = true;
+    while (logical_lines.next()) |logical_line| {
+        if (!first_logical) {
             try w.writeByte('\n');
             try w.splatByteAll(' ', help_col);
         }
-        try w.writeAll(line);
-        first = false;
+        first_logical = false;
+
+        var remaining = std.mem.trimStart(u8, logical_line, " ");
+        while (remaining.len > line_width) {
+            var cut = std.mem.lastIndexOfScalar(u8, remaining[0 .. line_width + 1], ' ') orelse line_width;
+            if (cut == 0) cut = line_width;
+            try w.writeAll(remaining[0..cut]);
+            remaining = std.mem.trimStart(u8, remaining[cut..], " ");
+            if (remaining.len != 0) {
+                try w.writeByte('\n');
+                try w.splatByteAll(' ', help_col);
+            }
+        }
+        try w.writeAll(remaining);
     }
-    try w.writeByte('\n');
 }
 
 pub fn errorMessage(err: anyerror) []const u8 {
@@ -1019,6 +1106,60 @@ test "one-shot evaluator help exposes Perfetto timeline controls" {
     var writer = std.Io.Writer.fixed(&buffer);
     try writeHelpInner(&writer, "usage: fix run", .run);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "--timeline") == null);
+}
+
+test "help and completions alphabetize visible options with negative pairs adjacent" {
+    var help_buffer: [32 * 1024]u8 = undefined;
+    var help_writer = std.Io.Writer.fixed(&help_buffer);
+    try writeHelpInner(&help_writer, "usage: fix eval", .eval);
+    const help = help_writer.buffered();
+
+    const arg = std.mem.indexOf(u8, help, "--arg NAME") orelse unreachable;
+    const argstr = std.mem.indexOf(u8, help, "--argstr NAME") orelse unreachable;
+    const attr = std.mem.indexOf(u8, help, "--attr ATTR") orelse unreachable;
+    const color = std.mem.indexOf(u8, help, "--color[=WHEN]") orelse unreachable;
+    const no_color = std.mem.indexOf(u8, help, "--no-color") orelse unreachable;
+    const cores = std.mem.indexOf(u8, help, "--cores N") orelse unreachable;
+    const progress = std.mem.indexOf(u8, help, "--progress") orelse unreachable;
+    const no_progress = std.mem.indexOf(u8, help, "--no-progress") orelse unreachable;
+    const raw = std.mem.indexOf(u8, help, "--raw") orelse unreachable;
+    try std.testing.expect(arg < argstr and argstr < attr);
+    try std.testing.expect(color < no_color and no_color < cores);
+    try std.testing.expect(progress < no_progress and no_progress < raw);
+
+    var completion_buffer: [32 * 1024]u8 = undefined;
+    var completion_writer = std.Io.Writer.fixed(&completion_buffer);
+    try writeOptionCompletions(&completion_writer, .eval, "--");
+    const completions = completion_writer.buffered();
+    const completion_color = std.mem.indexOf(u8, completions, "--color\t") orelse unreachable;
+    const completion_no_color = std.mem.indexOf(u8, completions, "--no-color\t") orelse unreachable;
+    const completion_cores = std.mem.indexOf(u8, completions, "--cores\t") orelse unreachable;
+    const completion_progress = std.mem.indexOf(u8, completions, "--progress\t") orelse unreachable;
+    const completion_no_progress = std.mem.indexOf(u8, completions, "--no-progress\t") orelse unreachable;
+    const completion_raw = std.mem.indexOf(u8, completions, "--raw\t") orelse unreachable;
+    try std.testing.expect(completion_color < completion_no_color and completion_no_color < completion_cores);
+    try std.testing.expect(completion_progress < completion_no_progress and completion_no_progress < completion_raw);
+}
+
+test "help aligns long option names and wraps descriptions to its width" {
+    var buffer: [32 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeHelpInner(&writer, "usage: fix eval", .eval);
+    const help = writer.buffered();
+
+    const long_name = std.mem.indexOf(u8, help, "--extra-experimental-features FEATS") orelse unreachable;
+    const long_line_end = std.mem.indexOfScalarPos(u8, help, long_name, '\n') orelse help.len;
+    try std.testing.expect(std.mem.indexOf(u8, help[long_name..long_line_end], "like --experimental-features") != null);
+
+    const flows = std.mem.indexOf(u8, help, "--timeline-flows off|all") orelse unreachable;
+    const flows_line_end = std.mem.indexOfScalarPos(u8, help, flows, '\n') orelse help.len;
+    try std.testing.expect(std.mem.indexOf(u8, help[flows..flows_line_end], "record all scheduler") != null);
+
+    var lines = std.mem.splitScalar(u8, help, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "  "))
+            try std.testing.expect(line.len <= help_width);
+    }
 }
 
 test "timeline flows are either complete or disabled" {

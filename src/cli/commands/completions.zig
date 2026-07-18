@@ -66,8 +66,9 @@ const zsh_script =
     \\        _files
     \\        return
     \\    fi
-    \\    local -a suggestions suggestions_display compadd_args
+    \\    local -a suggestions descriptions suggestions_display compadd_args
     \\    local line suggestion description
+    \\    local display_width=0 description_width menu_width index
     \\    for line in ${response:1}; do
     \\        suggestion="${line%%$'\t'*}"
     \\        suggestions+=("$suggestion")
@@ -76,8 +77,19 @@ const zsh_script =
     \\        else
     \\            description=
     \\        fi
-    \\        if [[ -n $description ]]; then
-    \\            suggestions_display+=("$suggestion -- $description")
+    \\        descriptions+=("$description")
+    \\        (( ${#suggestion} > display_width )) && display_width=${#suggestion}
+    \\    done
+    \\    menu_width=${COLUMNS:-100}
+    \\    description_width=$(( menu_width - display_width - 4 ))
+    \\    for (( index = 1; index <= ${#suggestions}; index++ )); do
+    \\        suggestion="${suggestions[$index]}"
+    \\        description="${descriptions[$index]}"
+    \\        if [[ -n $description ]] && (( description_width > 3 )); then
+    \\            if (( ${#description} > description_width )); then
+    \\                description="${description[1,$(( description_width - 3 ))]}..."
+    \\            fi
+    \\            suggestions_display+=("${(r:${display_width}:: :)suggestion} -- $description")
     \\        else
     \\            suggestions_display+=("$suggestion")
     \\        fi
@@ -85,7 +97,7 @@ const zsh_script =
     \\    if [[ $type == attrs ]]; then
     \\        compadd_args+=('-S' '')
     \\    fi
-    \\    compadd -J fix "${compadd_args[@]}" -d suggestions_display -a suggestions
+    \\    compadd -V fix "${compadd_args[@]}" -d suggestions_display -a suggestions
     \\}
     \\# When autoloaded from a site-functions directory, run the completion.
     \\# When sourced directly, register it instead of calling compadd outside ZLE.
@@ -645,7 +657,9 @@ test "generated adapters call the live backend" {
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compdef _fix fix") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "funcstack[1] == _fix") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "-d suggestions_display") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "suggestion -- $description") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "menu_width=${COLUMNS:-100}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "(r:${display_width}:: :)suggestion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compadd -V fix") != null);
 }
 
 test "attribute prefixes retain their completed parent" {
