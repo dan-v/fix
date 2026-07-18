@@ -27,6 +27,9 @@ pub const View = struct {
     /// Cursor byte offset into `text`.
     cursor: usize,
     overlay: []const []const u8 = &.{},
+    /// Bound the physical frame to this many rows, keeping the cursor visible.
+    /// Zero is unbounded (the normal scrolling line-editor behavior).
+    max_rows: usize = 0,
 };
 
 /// One display row: the bytes to print plus how many of them are prompt
@@ -93,10 +96,8 @@ pub const Renderer = struct {
 
     /// Render `view`, emitting the minimal update into `w`. Caller flushes.
     pub fn draw(self: *Renderer, w: *std.Io.Writer, view: View) !void {
-        _ = self.row_arena.reset(.retain_capacity);
-        self.rows.clearRetainingCapacity();
         var cursor_pos: Pos = .{ .row = 0, .col = 0 };
-        try self.layout(view, &cursor_pos);
+        try self.prepare(view, &cursor_pos);
 
         var phys = self.prev_cursor;
 
@@ -139,6 +140,27 @@ pub const Renderer = struct {
         }
         self.prev_row_count = self.rows.items.len;
         self.prev_cursor = cursor_pos;
+    }
+
+    /// Number of rows the next draw of `view` will occupy after applying its
+    /// viewport bound. This lets a parent full-screen layout reserve exactly
+    /// the editor's space before anchoring the relative renderer there.
+    pub fn measure(self: *Renderer, view: View) !usize {
+        var cursor_pos: Pos = .{ .row = 0, .col = 0 };
+        try self.prepare(view, &cursor_pos);
+        return self.rows.items.len;
+    }
+
+    fn prepare(self: *Renderer, view: View, cursor_pos: *Pos) !void {
+        _ = self.row_arena.reset(.retain_capacity);
+        self.rows.clearRetainingCapacity();
+        try self.layout(view, cursor_pos);
+        if (view.max_rows == 0 or self.rows.items.len <= view.max_rows) return;
+
+        const start = @min(cursor_pos.row -| (view.max_rows / 2), self.rows.items.len - view.max_rows);
+        std.mem.copyForwards(Row, self.rows.items[0..view.max_rows], self.rows.items[start .. start + view.max_rows]);
+        self.rows.items.len = view.max_rows;
+        cursor_pos.row -= start;
     }
 
     /// End the frame: cursor moves past the end of the last drawn row,
@@ -477,7 +499,7 @@ const Harness = struct {
         var fresh = Renderer.init(testing.allocator, self.term.width, false, "");
         defer fresh.deinit();
         var pos: Renderer.Pos = .{ .row = 0, .col = 0 };
-        try fresh.layout(view, &pos);
+        try fresh.prepare(view, &pos);
         for (fresh.rows.items, 0..) |row, r| {
             const got = try self.term.rowText(testing.allocator, r);
             defer testing.allocator.free(got);
@@ -601,6 +623,22 @@ test "overlay rows appear and clear" {
     v.overlay = &.{};
     try h.draw(v);
     try h.expectView(v);
+}
+
+test "bounded editor viewport keeps the cursor visible" {
+    var h = Harness.init(40);
+    defer h.deinit();
+    const v: View = .{
+        .prompt = "fix> ",
+        .cont_prompt = "...> ",
+        .text = "one\ntwo\nthree\nfour",
+        .cursor = 18,
+        .max_rows = 2,
+    };
+    try testing.expectEqual(@as(usize, 2), try h.renderer.measure(v));
+    try h.draw(v);
+    try h.expectView(v);
+    try testing.expectEqual(@as(usize, 1), h.term.row);
 }
 
 test "finish clears overlay and moves past the input" {

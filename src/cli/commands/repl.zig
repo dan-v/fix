@@ -2,11 +2,11 @@
 //!
 //! Two strictly separated modes:
 //!
-//! - **Interactive** (stdin AND stdout are a tty, and `--bare` not given): a
-//!   hand-rolled raw-mode line editor (`repl/editor.zig` + `repl/render.zig`)
-//!   with history, completion, smart-enter multiline, and the `:disasm`
-//!   chunk-browser TUI. Raw mode is restored on every exit path, including
-//!   panics and fatal signals (`repl/term.zig`).
+//! - **Interactive** (stdin AND stdout are a tty, and `--bare` not given): one
+//!   full-screen prompt/transcript/VM-explorer surface. The prompt retains the
+//!   same history, completion, and smart-enter multiline editor as bare mode's
+//!   command semantics; Ctrl-O exposes the additional tree/detail panes. Raw
+//!   mode is restored on every exit path, including fatal signals.
 //! - **Bare** (`--bare`, or any non-tty end): a plain read-a-line loop — no
 //!   escape sequences, no raw mode, no redraw tricks. Lines are accumulated
 //!   until they form a complete expression, so multiline input pipes work.
@@ -34,9 +34,6 @@ const commands = @import("../repl/commands.zig");
 const check = @import("../repl/check.zig");
 const history_mod = @import("../repl/history.zig");
 const editor_mod = @import("../repl/editor.zig");
-const keys_mod = @import("../repl/keys.zig");
-const render_mod = @import("../repl/render.zig");
-const term_mod = @import("../repl/term.zig");
 const complete_mod = @import("../repl/complete.zig");
 const pager_mod = @import("../repl/pager.zig");
 
@@ -149,6 +146,7 @@ const Repl = struct {
     /// command/result/diagnostic is routed here, preserving the shared command
     /// implementation while keeping terminal writes inside the owned screen.
     output_capture: ?*std.Io.Writer = null,
+    tui_active: bool = false,
     history: history_mod.History,
     quit: bool = false,
 
@@ -244,15 +242,6 @@ const Repl = struct {
 
     fn runInteractive(self: *Repl) !void {
         const env = self.proc_init.environ_map;
-        const hint_off = env.get("FIX_REPL_NO_HINT") != null;
-        if (!hint_off) {
-            var out = self.output();
-            defer out.flush() catch {};
-            try presentation.style(out.writer(), self.use_color, .dim);
-            try out.writer().writeAll("fix repl — :? for help, :q or Ctrl-D to quit\n");
-            try presentation.reset(out.writer(), self.use_color);
-        }
-
         self.history.open(self.io, env);
 
         var completer_ctx = complete_mod.Ctx{
@@ -267,150 +256,41 @@ const Repl = struct {
             .{ .ctx = self, .isCompleteFn = isCompleteThunk },
         );
         defer editor.deinit();
+        self.tui_active = true;
+        defer self.tui_active = false;
+        pager_mod.runSession(self.allocator, self.io, self.ev, self.color_depth, &editor, .{
+            .ctx = self,
+            .executeFn = sessionExecute,
+            .focusFn = sessionFocus,
+            .quitFn = sessionQuit,
+            .show_hint = env.get("FIX_REPL_NO_HINT") == null,
+        }) catch |err| switch (err) {
+            error.NotATerminal => return self.runBare(false),
+            else => return err,
+        };
+    }
 
-        while (!self.quit) {
-            const line = self.readLine(&editor) catch |err| switch (err) {
-                error.NotATerminal => return self.runBare(false),
-                else => return err,
-            } orelse break;
-            defer self.allocator.free(line);
+    fn sessionExecute(raw: *anyopaque, input: []const u8, sink: *std.Io.Writer) !void {
+        const self: *Repl = @ptrCast(@alignCast(raw));
+        self.output_capture = sink;
+        defer self.output_capture = null;
+        try self.history.add(input);
+        try self.processInput(input);
+    }
 
-            const trimmed = std.mem.trim(u8, line, " \t\r\n");
-            if (trimmed.len == 0) continue;
-            try self.history.add(trimmed);
-            try self.processInput(trimmed);
-        }
+    fn sessionFocus(raw: *anyopaque) ?types.ChunkId {
+        const self: *Repl = @ptrCast(@alignCast(raw));
+        return self.vm_focus;
+    }
+
+    fn sessionQuit(raw: *anyopaque) bool {
+        const self: *Repl = @ptrCast(@alignCast(raw));
+        return self.quit;
     }
 
     fn isCompleteThunk(ctx: *anyopaque, text: []const u8) bool {
         const self: *Repl = @ptrCast(@alignCast(ctx));
         return check.isComplete(self.allocator, text);
-    }
-
-    /// Read one (possibly multiline) input with the raw-mode editor.
-    /// Returns null on EOF (Ctrl-D at an empty prompt).
-    fn readLine(self: *Repl, editor: *editor_mod.Editor) !?[]u8 {
-        var raw = term_mod.RawMode.enable() catch return error.NotATerminal;
-        defer raw.disable();
-
-        var stdout_buffer: [8 * 1024]u8 = undefined;
-        var stdout_w = std.Io.File.stdout().writerStreaming(self.io, &stdout_buffer);
-        const w = &stdout_w.interface;
-
-        // Bracketed paste on for the duration of the edit.
-        try w.writeAll("\x1b[?2004h");
-        defer {
-            w.writeAll("\x1b[?2004l") catch {};
-            w.flush() catch {};
-        }
-
-        var renderer = render_mod.Renderer.init(
-            self.allocator,
-            term_mod.size().cols,
-            self.use_color,
-            presentation.styleCode(true, .trace_label),
-        );
-        defer renderer.deinit();
-
-        editor.reset();
-        var decoder = keys_mod.Decoder{};
-        var events: keys_mod.Decoder.List = .empty;
-        defer events.deinit(self.allocator);
-        var overlay_arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer overlay_arena.deinit();
-
-        var read_buf: [512]u8 = undefined;
-        while (true) {
-            // Draw the current editor state (row diffing makes repeated
-            // draws cheap; unchanged frames emit nothing).
-            _ = overlay_arena.reset(.retain_capacity);
-            try renderer.draw(w, try self.buildView(editor, overlay_arena.allocator()));
-            try w.flush();
-
-            const result = term_mod.readInput(&read_buf, if (decoder.wantsMore()) 40 else -1);
-            events.clearRetainingCapacity();
-            switch (result) {
-                .timeout => try decoder.idleFlush(self.allocator, &events),
-                .winch => {
-                    renderer.setWidth(term_mod.size().cols);
-                    renderer.invalidate();
-                    // The terminal reflowed our frame unpredictably; start
-                    // this row fresh and repaint everything below.
-                    try w.writeAll("\r\x1b[J");
-                    continue;
-                },
-                .eof => {
-                    try renderer.finish(w);
-                    return null;
-                },
-                .data => |n| for (read_buf[0..n]) |b| try decoder.feed(self.allocator, b, &events),
-            }
-
-            for (events.items) |key| {
-                switch (try editor.handleKey(key)) {
-                    .none => {},
-                    .bell => try w.writeAll("\x07"),
-                    .submit => {
-                        try closeFrame(&renderer, w, editor.text());
-                        try w.flush();
-                        return try editor.takeText();
-                    },
-                    .eof => {
-                        try closeFrame(&renderer, w, editor.text());
-                        try w.flush();
-                        return null;
-                    },
-                    .cancel => {
-                        try closeFrame(&renderer, w, editor.text());
-                        editor.reset();
-                    },
-                    .clear_screen => {
-                        try w.writeAll("\x1b[H\x1b[2J");
-                        renderer.invalidate();
-                    },
-                    .suspend_process => {
-                        try closeFrame(&renderer, w, editor.text());
-                        try w.flush();
-                        raw.suspendProcess();
-                        renderer.setWidth(term_mod.size().cols);
-                        renderer.invalidate();
-                    },
-                }
-            }
-        }
-    }
-
-    /// Leave the edit frame cleanly: one last overlay-free draw with the
-    /// cursor at the end of the text, then `finish` (clears anything below
-    /// and emits the newline). Used on submit/cancel/eof/suspend.
-    fn closeFrame(renderer: *render_mod.Renderer, w: *std.Io.Writer, text: []const u8) !void {
-        try renderer.draw(w, .{
-            .prompt = prompt_main,
-            .cont_prompt = prompt_cont,
-            .text = text,
-            .cursor = text.len,
-        });
-        try renderer.finish(w);
-    }
-
-    fn buildView(self: *Repl, editor: *editor_mod.Editor, arena: std.mem.Allocator) !render_mod.View {
-        _ = self;
-        var view: render_mod.View = .{
-            .prompt = prompt_main,
-            .cont_prompt = prompt_cont,
-            .text = editor.text(),
-            .cursor = editor.cursor,
-        };
-        var sp_buf: [96]u8 = undefined;
-        if (editor.searchPrompt(&sp_buf)) |sp| {
-            view.prompt = try arena.dupe(u8, sp);
-            view.cont_prompt = view.prompt;
-        }
-        const menu = editor.menuLines();
-        if (menu.len > 0) {
-            view.overlay = try render_mod.formatColumns(arena, menu, term_mod.size().cols, 8);
-        }
-        return view;
     }
 
     // -- input processing (shared by both modes) -------------------------------
@@ -792,6 +672,7 @@ const Repl = struct {
             try self.printError("chunk #{d} not found", .{chunk_id});
             return;
         }
+        if (self.tui_active) return;
         if (self.interactive) {
             try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id, self.color_depth);
         } else {

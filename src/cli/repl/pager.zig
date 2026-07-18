@@ -2,9 +2,8 @@
 //!
 //! Interactive use is deliberately a TUI rather than a pager: the name tree is
 //! persistent navigation, the chunk detail is a separately scrollable pane,
-//! and a header/footer make focus and available actions explicit. It runs on
-//! the alternate screen and returns to the ordinary repl prompt on exit. The
-//! plain (`--bare`/non-tty) fallback prints the same disassembly directly.
+//! and the ordinary REPL prompt/transcript occupy the same surface. The plain
+//! (`--bare`/non-tty) fallback exposes the same model through bounded commands.
 
 const std = @import("std");
 const engine = @import("expr");
@@ -12,7 +11,11 @@ const runtime = @import("runtime");
 const term_mod = @import("term.zig");
 const keys_mod = @import("keys.zig");
 const width_mod = @import("width.zig");
+const editor_mod = @import("editor.zig");
+const render_mod = @import("render.zig");
+const transcript_mod = @import("transcript.zig");
 const ColorDepth = @import("base").terminal_color.Depth;
+const sync = @import("base").sync;
 
 const Evaluator = engine.Evaluator;
 const ChunkId = runtime.types.ChunkId;
@@ -87,14 +90,124 @@ pub fn browse(
     try tui.run(start);
 }
 
+/// The REPL owns evaluation semantics; the screen owns input/output placement.
+/// This narrow interface is what lets the same prompt drive both the plain
+/// loop and the richer terminal surface without teaching the explorer about
+/// bindings, loading, GC, or value printing.
+pub const SessionHost = struct {
+    ctx: *anyopaque,
+    executeFn: *const fn (ctx: *anyopaque, input: []const u8, output: *std.Io.Writer) anyerror!void,
+    focusFn: *const fn (ctx: *anyopaque) ?ChunkId,
+    quitFn: *const fn (ctx: *anyopaque) bool,
+    show_hint: bool = true,
+
+    fn execute(self: SessionHost, input: []const u8, output: *std.Io.Writer) !void {
+        try self.executeFn(self.ctx, input, output);
+    }
+
+    fn focusedChunk(self: SessionHost) ?ChunkId {
+        return self.focusFn(self.ctx);
+    }
+
+    fn quitting(self: SessionHost) bool {
+        return self.quitFn(self.ctx);
+    }
+};
+
+/// Run the integrated prompt/transcript/explorer surface. Evaluation remains
+/// synchronous (the prompt cannot accept a second expression while the VM is
+/// using its scope), while rebuilding the potentially million-node name
+/// projection happens on a background thread after each registry growth.
+pub fn runSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ev: *Evaluator,
+    color_depth: ColorDepth,
+    editor: *editor_mod.Editor,
+    host: SessionHost,
+) !void {
+    var name_index = try bytecode.inspect.NameIndex.build(allocator, ev.chunkRegistry());
+    defer name_index.deinit();
+    var tui = Tui{
+        .allocator = allocator,
+        .io = io,
+        .ev = ev,
+        .color_depth = color_depth,
+        .name_index = &name_index,
+        .arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer tui.deinit();
+    try tui.runSession(editor, host);
+}
+
+const IndexJob = struct {
+    registry: *const bytecode.ChunkRegistry,
+    thread: ?std.Thread = null,
+    mutex: sync.BlockingMutex = .{},
+    ready: ?bytecode.inspect.NameIndex = null,
+    running: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *IndexJob) !void {
+        if (self.thread != null) return;
+        self.failed.store(false, .release);
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.running.store(false, .release);
+            return err;
+        };
+    }
+
+    fn build(self: *IndexJob) void {
+        const result = bytecode.inspect.NameIndex.build(std.heap.smp_allocator, self.registry) catch {
+            self.failed.store(true, .release);
+            self.running.store(false, .release);
+            return;
+        };
+        self.mutex.lock();
+        self.ready = result;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    fn poll(self: *IndexJob, current: *bytecode.inspect.NameIndex) bool {
+        if (self.thread == null or self.running.load(.acquire)) return false;
+        self.thread.?.join();
+        self.thread = null;
+        self.mutex.lock();
+        const next = self.ready;
+        self.ready = null;
+        self.mutex.unlock();
+        if (next) |index| {
+            current.deinit();
+            current.* = index;
+            return true;
+        }
+        return false;
+    }
+
+    fn deinit(self: *IndexJob) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        if (self.ready) |*index| index.deinit();
+        self.ready = null;
+        self.mutex.unlock();
+    }
+};
+
 const Tui = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     ev: *Evaluator,
     color_depth: ColorDepth,
-    name_index: *const bytecode.inspect.NameIndex,
-    /// Rendered pages live here for the whole browse session.
+    name_index: *bytecode.inspect.NameIndex,
+    /// Only the current rendered page lives here. Persistent REPL sessions
+    /// reset it on every view/focus change instead of accumulating every
+    /// disassembly ever visited.
     arena: std.heap.ArenaAllocator,
+    viewport_cols: usize = 80,
+    viewport_rows: usize = 22,
 
     stack: std.ArrayListUnmanaged(Visit) = .empty,
     forward: std.ArrayListUnmanaged(Visit) = .empty,
@@ -103,7 +216,9 @@ const Tui = struct {
     search: std.ArrayListUnmanaged(u8) = .empty,
     expanded: std.AutoHashMapUnmanaged(bytecode.name_tree.NameId, void) = .empty,
     tree_rows: std.ArrayListUnmanaged(TreeRow) = .empty,
+    transcript_lines: std.ArrayListUnmanaged(LineRange) = .empty,
     status_msg: []const u8 = "",
+    indexing: bool = false,
     focus: Focus = .disassembly,
     tree_selection: usize = 0,
     x_scroll: usize = 0,
@@ -117,6 +232,7 @@ const Tui = struct {
         chunk: struct { id: ChunkId, depth: u16 },
         more: struct { count: usize, depth: u16 },
     };
+    const LineRange = struct { start: usize, end: usize };
 
     const tree_child_cap = 200;
     const tree_chunk_cap = 100;
@@ -127,6 +243,7 @@ const Tui = struct {
         self.search.deinit(self.allocator);
         self.expanded.deinit(self.allocator);
         self.tree_rows.deinit(self.allocator);
+        self.transcript_lines.deinit(self.allocator);
         self.arena.deinit();
     }
 
@@ -145,10 +262,13 @@ const Tui = struct {
             w.flush() catch {};
         }
 
+        const initial_size = term_mod.size();
+        self.viewport_cols = initial_size.cols;
+        self.viewport_rows = initial_size.rows -| 2;
         try self.stack.append(self.allocator, .{ .kind = .{ .chunk = start } });
         try self.expandFocusedPath(start);
         try self.rebuildTree(start);
-        self.page = try self.buildPage(.{ .chunk = start });
+        try self.refreshPage(.{ .chunk = start });
 
         var decoder = keys_mod.Decoder{};
         var events: keys_mod.Decoder.List = .empty;
@@ -164,7 +284,10 @@ const Tui = struct {
             switch (result) {
                 .timeout => try decoder.idleFlush(self.allocator, &events),
                 .winch => {
-                    self.page = try self.buildPage(self.currentKind());
+                    const resized = term_mod.size();
+                    self.viewport_cols = resized.cols;
+                    self.viewport_rows = resized.rows -| 2;
+                    try self.refreshPage(self.currentKind());
                     self.clampScroll();
                     self.x_scroll = @min(self.x_scroll, self.maxXScroll());
                     continue;
@@ -178,7 +301,180 @@ const Tui = struct {
         }
     }
 
+    fn runSession(self: *Tui, editor: *editor_mod.Editor, host: SessionHost) !void {
+        var raw = term_mod.RawMode.enable() catch return error.NotATerminal;
+        defer raw.disable();
+
+        var out_buf: [64 * 1024]u8 = undefined;
+        var out = std.Io.File.stdout().writerStreaming(self.io, &out_buf);
+        const w = &out.interface;
+        try w.writeAll("\x1b[?1049h\x1b[?2004h");
+        defer {
+            w.writeAll("\x1b[?2004l\x1b[?1049l\x1b[?25h") catch {};
+            w.flush() catch {};
+        }
+
+        var capture = transcript_mod.Capture.init(self.allocator, 4 * 1024 * 1024);
+        defer capture.deinit();
+        if (host.show_hint) try capture.writer.writeAll("fix repl — :? for help; Ctrl-O or Esc explores the VM\n");
+        try self.rebuildTranscriptLines(capture.written());
+
+        const first_focus = host.focusedChunk();
+        const initial_kind: Visit.Kind = if (first_focus) |id| .{ .chunk = id } else .help;
+        try self.stack.append(self.allocator, .{ .kind = initial_kind });
+        if (first_focus) |id| {
+            try self.expandFocusedPath(id);
+            try self.rebuildTree(id);
+        } else {
+            try self.expanded.put(self.allocator, bytecode.root_name_id, {});
+            try self.rebuildTree(std.math.maxInt(ChunkId));
+        }
+        try self.refreshPage(initial_kind);
+
+        var index_job = IndexJob{ .registry = self.ev.chunkRegistry() };
+        defer index_job.deinit();
+        var prompt_renderer = render_mod.Renderer.init(
+            self.allocator,
+            term_mod.size().cols,
+            self.color_depth.enabled(),
+            "\x1b[1;36m",
+        );
+        defer prompt_renderer.deinit();
+        var frame_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer frame_arena.deinit();
+
+        var prompt_active = true;
+        var decoder = keys_mod.Decoder{};
+        var events: keys_mod.Decoder.List = .empty;
+        defer events.deinit(self.allocator);
+        var read_buf: [512]u8 = undefined;
+
+        while (true) {
+            if (index_job.poll(self.name_index)) {
+                self.indexing = false;
+                if (host.focusedChunk()) |id| {
+                    try self.expandFocusedPath(id);
+                    try self.rebuildTree(id);
+                }
+            }
+            const registry = self.ev.chunkRegistry();
+            const stale = self.name_index.registry_count != registry.count() or self.name_index.name_count != registry.nameCount();
+            if (stale and index_job.thread == null) {
+                index_job.start() catch {
+                    self.status_msg = "(name index failed)";
+                };
+            }
+            self.indexing = stale or index_job.running.load(.acquire);
+
+            _ = frame_arena.reset(.retain_capacity);
+            var prompt_view = try self.sessionPromptView(editor, frame_arena.allocator());
+            const size = term_mod.size();
+            prompt_renderer.setWidth(size.cols);
+            prompt_view.max_rows = size.rows -| 2;
+            const prompt_rows = try prompt_renderer.measure(prompt_view);
+            try self.drawSession(w, &prompt_renderer, prompt_view, prompt_rows, &capture, prompt_active);
+            try w.flush();
+
+            // Keep polling while a thread handle exists, even if the worker
+            // finished between drawing and this check; otherwise a very fast
+            // build could leave us in an infinite blocking read before its
+            // completed generation is adopted.
+            const timeout: i32 = if (decoder.wantsMore()) 40 else if (index_job.thread != null) 50 else -1;
+            const result = term_mod.readInput(&read_buf, timeout);
+            events.clearRetainingCapacity();
+            switch (result) {
+                .timeout => try decoder.idleFlush(self.allocator, &events),
+                .winch => {
+                    prompt_renderer.invalidate();
+                    continue;
+                },
+                .eof => return,
+                .data => |n| for (read_buf[0..n]) |b| try decoder.feed(self.allocator, b, &events),
+            }
+
+            for (events.items) |key| {
+                if (key.isCtrl('o')) {
+                    if (prompt_active and self.currentChunk() != null) {
+                        prompt_active = false;
+                    } else {
+                        prompt_active = true;
+                    }
+                    continue;
+                }
+                if (prompt_active) {
+                    if (key.code == .escape and editor.text().len == 0 and self.currentChunk() != null) {
+                        prompt_active = false;
+                        continue;
+                    }
+                    switch (try editor.handleKey(key)) {
+                        .none => {},
+                        .bell => try w.writeAll("\x07"),
+                        .submit => {
+                            const input = try editor.takeText();
+                            defer self.allocator.free(input);
+                            const trimmed = std.mem.trim(u8, input, " \t\r\n");
+                            if (trimmed.len == 0) continue;
+                            try capture.writer.writeAll("fix> ");
+                            try capture.writer.writeAll(trimmed);
+                            try capture.writer.writeByte('\n');
+                            try host.execute(trimmed, &capture.writer);
+                            if (capture.written().len > 0 and capture.written()[capture.written().len - 1] != '\n')
+                                try capture.writer.writeByte('\n');
+                            try self.rebuildTranscriptLines(capture.written());
+                            if (host.focusedChunk()) |id| {
+                                if (self.currentChunk() != id) {
+                                    try self.open(.{ .chunk = id });
+                                } else {
+                                    try self.refreshPage(.{ .chunk = id });
+                                }
+                            }
+                            if (host.quitting()) return;
+                        },
+                        .eof => return,
+                        .cancel => {
+                            editor.reset();
+                            try capture.writer.writeAll("^C\n");
+                            try self.rebuildTranscriptLines(capture.written());
+                        },
+                        .clear_screen => try w.writeAll("\x1b[2J"),
+                        .suspend_process => {
+                            try w.flush();
+                            raw.suspendProcess();
+                            prompt_renderer.invalidate();
+                        },
+                    }
+                    continue;
+                }
+
+                const leave_explorer = switch (key.code) {
+                    .escape => true,
+                    .cp => |cp| cp == 'q',
+                    else => false,
+                };
+                if (leave_explorer) {
+                    prompt_active = true;
+                    continue;
+                }
+                const enter_command = switch (key.code) {
+                    .cp => |cp| cp == ':',
+                    else => false,
+                };
+                if (enter_command) {
+                    prompt_active = true;
+                    _ = try editor.handleKey(key);
+                    continue;
+                }
+                if (!try self.handleKey(key)) prompt_active = true;
+            }
+        }
+    }
+
     // -- page construction ---------------------------------------------------
+
+    fn refreshPage(self: *Tui, kind: Visit.Kind) !void {
+        _ = self.arena.reset(.retain_capacity);
+        self.page = try self.buildPage(kind);
+    }
 
     fn buildPage(self: *Tui, kind: Visit.Kind) !Page {
         const arena = self.arena.allocator();
@@ -252,6 +548,44 @@ const Tui = struct {
         return lines.items;
     }
 
+    fn sessionPromptView(self: *Tui, editor: *editor_mod.Editor, arena: std.mem.Allocator) !render_mod.View {
+        _ = self;
+        var view: render_mod.View = .{
+            .prompt = "fix> ",
+            .cont_prompt = "...> ",
+            .text = editor.text(),
+            .cursor = editor.cursor,
+        };
+        var search_buf: [96]u8 = undefined;
+        if (editor.searchPrompt(&search_buf)) |prompt| {
+            view.prompt = try arena.dupe(u8, prompt);
+            view.cont_prompt = view.prompt;
+        }
+        const menu = editor.menuLines();
+        if (menu.len > 0) view.overlay = try render_mod.formatColumns(arena, menu, term_mod.size().cols, 8);
+        return view;
+    }
+
+    /// Index at most the newest transcript lines. The byte capture is already
+    /// bounded; bounding the line projection too prevents millions of tiny
+    /// output lines from turning into millions of UI allocations.
+    fn rebuildTranscriptLines(self: *Tui, text: []const u8) !void {
+        self.transcript_lines.clearRetainingCapacity();
+        var end = text.len;
+        while (end > 0 and self.transcript_lines.items.len < 2000) {
+            const line_end = if (text[end - 1] == '\n') end - 1 else end;
+            const newline = std.mem.lastIndexOfScalar(u8, text[0..line_end], '\n');
+            const start = if (newline) |at| at + 1 else 0;
+            try self.transcript_lines.append(self.allocator, .{ .start = start, .end = line_end });
+            if (newline) |at| {
+                end = at;
+            } else {
+                break;
+            }
+        }
+        std.mem.reverse(LineRange, self.transcript_lines.items);
+    }
+
     fn writeSourcePage(self: *Tui, w: *std.Io.Writer, id: ChunkId, chunk: *const bytecode.Chunk) !void {
         try w.print("chunk #{d}: {d} source-map entries\n", .{ id, chunk.source_map.len });
         if (chunk.body_span) |span| {
@@ -319,16 +653,15 @@ const Tui = struct {
         main_width: usize,
     };
 
-    fn layout(_: *const Tui) Layout {
-        const size = term_mod.size();
-        const cols = @max(@as(usize, 1), size.cols);
-        const rows = @max(@as(usize, 3), size.rows);
+    fn layout(self: *const Tui) Layout {
+        const cols = @max(@as(usize, 1), self.viewport_cols);
+        const body_rows = self.viewport_rows;
         const split = cols >= 96;
         const sidebar_width = if (split) @min(@max(cols / 4, 26), 38) else 0;
         return .{
             .cols = cols,
-            .rows = rows,
-            .body_rows = rows - 2,
+            .rows = body_rows + 2,
+            .body_rows = body_rows,
             .split = split,
             .sidebar_width = sidebar_width,
             .main_col = if (split) sidebar_width + 2 else 1,
@@ -473,7 +806,7 @@ const Tui = struct {
         }
         try self.stack.append(self.allocator, .{ .kind = kind });
         self.forward.clearRetainingCapacity();
-        self.page = try self.buildPage(kind);
+        try self.refreshPage(kind);
         self.scroll = 0;
         switch (kind) {
             .chunk => |id| {
@@ -497,7 +830,7 @@ const Tui = struct {
         }
         try self.forward.append(self.allocator, self.stack.pop().?);
         const visit = self.stack.items[self.stack.items.len - 1];
-        self.page = try self.buildPage(visit.kind);
+        try self.refreshPage(visit.kind);
         self.scroll = visit.scroll;
         self.tree_selection = visit.tree_selection;
         self.x_scroll = visit.x_scroll;
@@ -516,7 +849,7 @@ const Tui = struct {
             top.x_scroll = self.x_scroll;
         }
         try self.stack.append(self.allocator, visit);
-        self.page = try self.buildPage(visit.kind);
+        try self.refreshPage(visit.kind);
         self.scroll = visit.scroll;
         self.tree_selection = visit.tree_selection;
         self.x_scroll = visit.x_scroll;
@@ -545,7 +878,7 @@ const Tui = struct {
     fn setView(self: *Tui, view: View) !void {
         if (self.currentChunk() == null) return;
         self.view = view;
-        self.page = try self.buildPage(self.currentKind());
+        try self.refreshPage(self.currentKind());
         self.scroll = 0;
         self.x_scroll = 0;
         self.focus = .disassembly;
@@ -726,6 +1059,113 @@ const Tui = struct {
 
     // -- drawing -----------------------------------------------------------------
 
+    fn drawSession(
+        self: *Tui,
+        w: *std.Io.Writer,
+        prompt_renderer: *render_mod.Renderer,
+        prompt_view: render_mod.View,
+        measured_prompt_rows: usize,
+        capture: *const transcript_mod.Capture,
+        prompt_active: bool,
+    ) !void {
+        const size = term_mod.size();
+        const cols = @max(@as(usize, 1), size.cols);
+        const screen_rows = @max(@as(usize, 3), size.rows);
+        const prompt_rows = @min(measured_prompt_rows, screen_rows - 2);
+        const prompt_start = screen_rows - prompt_rows;
+        const upper_rows = prompt_start -| 2;
+
+        var explorer_rows: usize = 0;
+        var transcript_rows = upper_rows;
+        if (self.currentChunk() != null and upper_rows >= 9) {
+            transcript_rows = @min(@max(@as(usize, 3), upper_rows / 3), 7);
+            explorer_rows = upper_rows - transcript_rows - 1;
+        }
+
+        if (explorer_rows > 0 and (self.viewport_cols != cols or self.viewport_rows != explorer_rows)) {
+            self.viewport_cols = cols;
+            self.viewport_rows = explorer_rows;
+            try self.refreshPage(self.currentKind());
+        }
+
+        var header_buf: [512]u8 = undefined;
+        const header = if (self.currentChunk()) |id|
+            std.fmt.bufPrint(&header_buf, " fix repl  ·  vm #0x{x} {s}  ·  {s} ", .{
+                id,
+                @tagName(self.view),
+                if (prompt_active) "prompt" else if (self.focus == .chunks) "tree" else "detail",
+            }) catch " fix repl "
+        else
+            " fix repl  ·  prompt ";
+        try moveTo(w, 1, 1);
+        try writeBar(w, header, cols);
+
+        if (explorer_rows > 0) {
+            try self.drawExplorerBody(w, 2, explorer_rows, cols);
+            const separator_row = 2 + explorer_rows;
+            try moveTo(w, separator_row, 1);
+            try w.writeAll("\x1b[0m\x1b[K\x1b[2m ─ transcript ");
+            if (self.indexing) try w.writeAll("· indexing VM names asynchronously ");
+            try w.writeAll("\x1b[0m");
+        }
+
+        const transcript_start = 2 + explorer_rows + @intFromBool(explorer_rows > 0);
+        try self.drawTranscript(w, transcript_start, transcript_rows, cols, capture.written());
+
+        var footer_buf: [512]u8 = undefined;
+        const footer = if (prompt_active and capture.omitted() > 0)
+            std.fmt.bufPrint(&footer_buf, " Enter evaluate · Ctrl-O/Esc explore · Tab complete · {Bi} output omitted ", .{capture.omitted()}) catch " Ctrl-O explore "
+        else if (prompt_active)
+            " Enter evaluate · Ctrl-O/Esc explore · Tab complete · Ctrl-R history "
+        else
+            std.fmt.bufPrint(&footer_buf, " Ctrl-O/q prompt · Tab pane · 1 code · 2 tables · 3 source · 4 refs · ↵ open{s} ", .{
+                if (self.indexing) " · indexing" else "",
+            }) catch " Ctrl-O prompt ";
+        try moveTo(w, screen_rows, 1);
+        try writeBar(w, footer, cols);
+
+        try moveTo(w, prompt_start, 1);
+        prompt_renderer.invalidate();
+        if (prompt_active) try w.writeAll("\x1b[?25h") else try w.writeAll("\x1b[?25l");
+        try prompt_renderer.draw(w, prompt_view);
+        if (!prompt_active) try w.writeAll("\x1b[?25l");
+    }
+
+    fn drawExplorerBody(self: *Tui, w: *std.Io.Writer, first_row: usize, rows: usize, cols: usize) !void {
+        const layout_now = self.layout();
+        self.clampScroll();
+        self.tree_selection = @min(self.tree_selection, self.tree_rows.items.len -| 1);
+        for (0..rows) |row| {
+            try moveTo(w, first_row + row, 1);
+            try w.writeAll("\x1b[0m\x1b[K");
+            if (layout_now.split) {
+                try self.drawChunkRow(w, row, layout_now.sidebar_width, rows);
+                try moveTo(w, first_row + row, layout_now.sidebar_width + 1);
+                try w.writeAll("\x1b[2m│\x1b[0m");
+                try moveTo(w, first_row + row, layout_now.main_col);
+                try self.drawDisasmRow(w, row, layout_now.main_width);
+            } else if (self.focus == .chunks) {
+                try self.drawChunkRow(w, row, cols, rows);
+            } else {
+                try self.drawDisasmRow(w, row, layout_now.main_width);
+            }
+        }
+    }
+
+    fn drawTranscript(self: *Tui, w: *std.Io.Writer, first_row: usize, rows: usize, cols: usize, text: []const u8) !void {
+        const shown = @min(rows, self.transcript_lines.items.len);
+        const first_line = self.transcript_lines.items.len -| shown;
+        const top_padding = rows -| shown;
+        for (0..rows) |row| {
+            try moveTo(w, first_row + row, 1);
+            try w.writeAll("\x1b[0m\x1b[K");
+            if (row < top_padding) continue;
+            const range = self.transcript_lines.items[first_line + row - top_padding];
+            const line = std.mem.trimEnd(u8, text[range.start..range.end], "\r");
+            try writeAnsiWindow(w, line, 0, cols);
+        }
+    }
+
     fn draw(self: *Tui, w: *std.Io.Writer) !void {
         const layout_now = self.layout();
         const rows = layout_now.body_rows;
@@ -786,7 +1226,10 @@ const Tui = struct {
         var line_buf: [512]u8 = undefined;
         if (row == 0) {
             const root_stats = self.name_index.statsOf(bytecode.root_name_id);
-            const line = std.fmt.bufPrint(&line_buf, " VM TREE  ·  {d} chunks", .{root_stats.chunks}) catch " VM TREE";
+            const line = if (self.indexing)
+                std.fmt.bufPrint(&line_buf, " VM TREE  ·  {d} chunks  ·  indexing…", .{root_stats.chunks}) catch " VM TREE"
+            else
+                std.fmt.bufPrint(&line_buf, " VM TREE  ·  {d} chunks", .{root_stats.chunks}) catch " VM TREE";
             if (self.focus == .chunks) try w.writeAll("\x1b[1m");
             try writeAnsiWindow(w, line, 0, width);
             return;
