@@ -6,41 +6,70 @@ const cli = @import("cli");
 const process_support = @import("process_support");
 const commands = cli.commands;
 const command_match = cli.command_match;
+const command_meta = cli.command_meta;
 
 const ArgsIterator = std.process.Args.Iterator;
 const SubcommandRun = *const fn (cli.ProcessContext, std.process.Init, *ArgsIterator) anyerror!u8;
 const Subcommand = struct {
-    name: []const u8,
-    summary: []const u8,
+    meta: command_meta.Command,
     run: SubcommandRun,
 };
 
-const subcommands = [_]Subcommand{
-    .{ .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .run = commands.build.run },
-    .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = commands.disasm.run },
-    .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = commands.eval.run },
-    .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = commands.instantiate.run },
-    .{ .name = "parse", .summary = "parse an expression and print its AST as JSON", .run = commands.parse.run },
-    .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = commands.repl.run },
-    .{ .name = "run", .summary = "build a derivation and run a program from its output", .run = commands.run.run },
-    .{ .name = "shell", .summary = "build a derivation and open a shell with its bin/ on PATH", .run = commands.shell.run },
-    .{ .name = "switch", .summary = "build and activate a NixOS/nix-darwin/home-manager configuration", .run = commands.@"switch".run },
-} ++ (if (cli.thunks_log_enabled) [_]Subcommand{
-    .{ .name = "thunks", .summary = "diff thunks-logs to find divergent resolutions", .run = commands.thunks.run },
-} else [_]Subcommand{}) ++ (if (cli.vm_trace_enabled) [_]Subcommand{
-    .{ .name = "trace", .summary = "work with binary VM trace files", .run = commands.trace.run },
-} else [_]Subcommand{});
+fn commandEnabled(comptime kind: command_meta.Kind) bool {
+    return switch (kind) {
+        .thunks => cli.thunks_log_enabled,
+        .trace => cli.vm_trace_enabled,
+        else => true,
+    };
+}
+
+fn commandRun(comptime kind: command_meta.Kind) SubcommandRun {
+    return switch (kind) {
+        .build => commands.build.run,
+        .completions => commands.completions.run,
+        .disasm => commands.disasm.run,
+        .eval => commands.eval.run,
+        .instantiate => commands.instantiate.run,
+        .parse => commands.parse.run,
+        .repl => commands.repl.run,
+        .run => commands.run.run,
+        .shell => commands.shell.run,
+        .@"switch" => commands.@"switch".run,
+        .thunks => commands.thunks.run,
+        .trace => commands.trace.run,
+    };
+}
+
+const subcommand_count = blk: {
+    var count = 0;
+    for (command_meta.table) |command| {
+        if (commandEnabled(command.kind)) count += 1;
+    }
+    break :blk count;
+};
+
+const subcommands = blk: {
+    var result: [subcommand_count]Subcommand = undefined;
+    var index = 0;
+    for (command_meta.table) |command| {
+        if (commandEnabled(command.kind)) {
+            result[index] = .{ .meta = command, .run = commandRun(command.kind) };
+            index += 1;
+        }
+    }
+    break :blk result;
+};
 
 const subcommand_names = blk: {
     var names: [subcommands.len][]const u8 = undefined;
-    for (subcommands, 0..) |subcommand, index| names[index] = subcommand.name;
+    for (subcommands, 0..) |subcommand, index| names[index] = subcommand.meta.name;
     break :blk names;
 };
 
 fn writeTopUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll("usage: fix <command> [options]\n\ncommands:\n");
     inline for (subcommands) |c| {
-        try writer.print("  {s:<12} {s}\n", .{ c.name, c.summary });
+        try writer.print("  {s:<12} {s}\n", .{ c.meta.name, c.meta.summary });
     }
     try writer.writeAll("\nrun `fix <command> -h` for command-specific help.\n");
 }
@@ -98,8 +127,8 @@ pub fn main(init: std.process.Init) !void {
         .ambiguous => {
             std.debug.print("fix: ambiguous command '{s}' (could be:", .{command});
             for (subcommands) |candidate| {
-                if (std.mem.startsWith(u8, candidate.name, command))
-                    std.debug.print(" {s}", .{candidate.name});
+                if (std.mem.startsWith(u8, candidate.meta.name, command))
+                    std.debug.print(" {s}", .{candidate.meta.name});
             }
             std.debug.print(")\n\n{s}", .{topUsage(allocator)});
             std.process.exit(2);

@@ -96,6 +96,30 @@ pub const OptionOverride = struct {
 /// subcommand shares this one parser and accepts the whole option set).
 pub const Cmd = enum { eval, parse, instantiate, build, run, shell, repl, disasm, @"switch" };
 
+/// Semantic value classes consumed by the live shell completer. The parser's
+/// option table owns these hints so help, parsing, and completion cannot drift.
+pub const CompletionHint = enum {
+    none,
+    file,
+    installable,
+    attr,
+    package,
+    color,
+    experimental_feature,
+    deprecated_feature,
+    setting,
+    max_jobs,
+    hugetlb,
+    timeline_flows,
+};
+
+pub const CompletionArity = enum { flag, opt, req, req2, multi };
+
+pub const CompletionOption = struct {
+    arity: CompletionArity,
+    hints: [2]CompletionHint,
+};
+
 /// `fix switch` target: which activation flavour to build and switch to. Chosen
 /// by `--nixos`/`--darwin`/`--home-manager`, else auto-detected in `switch.zig`.
 pub const SwitchTarget = enum { nixos, darwin, home_manager };
@@ -402,6 +426,8 @@ const Spec = struct {
     show_in: []const Cmd = &.{},
     /// Internal knob: parsed everywhere but never shown in help.
     hidden: bool = false,
+    /// Completion class for the first and (for `.req2`) second values.
+    complete: [2]CompletionHint = .{ .none, .none },
 };
 
 /// Commands that take a source expression and its selectors (everything but the
@@ -435,10 +461,10 @@ const verbose_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell,
 
 const specs = [_]Spec{
     .{ .id = .expr, .short = "-E", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text; repeatable", .show_in = source_cmds },
-    .{ .id = .file, .short = "-f", .long = "--file", .arg = .req, .metavar = "FILEISH", .help = "evaluate a legacy fileish input (`-` reads stdin);\nrepeatable", .show_in = source_cmds },
-    .{ .id = .flake, .long = "--flake", .arg = .req, .metavar = "INSTALLABLE", .help = "evaluate one flake output <flakeref>[#<attrpath>];\nrepeatable; requires the flakes feature", .show_in = selected_source_cmds },
-    .{ .id = .include, .short = "-I", .long = "--include", .arg = .req, .metavar = "PATH", .help = "prepend a search-path entry (as in NIX_PATH);\nPATH may be `prefix=path`. Repeatable.", .show_in = source_cmds },
-    .{ .id = .attr, .short = "-A", .long = "--attr", .arg = .req, .metavar = "ATTR", .help = "select attribute path ATTR from the result", .show_in = selected_source_cmds },
+    .{ .id = .file, .short = "-f", .long = "--file", .arg = .req, .metavar = "FILEISH", .help = "evaluate a legacy fileish input (`-` reads stdin);\nrepeatable", .show_in = source_cmds, .complete = .{ .file, .none } },
+    .{ .id = .flake, .long = "--flake", .arg = .req, .metavar = "INSTALLABLE", .help = "evaluate one flake output <flakeref>[#<attrpath>];\nrepeatable; requires the flakes feature", .show_in = selected_source_cmds, .complete = .{ .installable, .none } },
+    .{ .id = .include, .short = "-I", .long = "--include", .arg = .req, .metavar = "PATH", .help = "prepend a search-path entry (as in NIX_PATH);\nPATH may be `prefix=path`. Repeatable.", .show_in = source_cmds, .complete = .{ .file, .none } },
+    .{ .id = .attr, .short = "-A", .long = "--attr", .arg = .req, .metavar = "ATTR", .help = "select attribute path ATTR from the result", .show_in = selected_source_cmds, .complete = .{ .attr, .none } },
     .{ .id = .arg, .long = "--arg", .arg = .req2, .metavar = "NAME EXPR", .help = "pass EXPR as top-level function argument NAME", .show_in = selected_source_cmds },
     .{ .id = .argstr, .long = "--argstr", .arg = .req2, .metavar = "NAME STR", .help = "pass string STR as top-level function argument NAME", .show_in = selected_source_cmds },
 
@@ -449,25 +475,25 @@ const specs = [_]Spec{
     .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing", .show_in = value_cmds },
     .{ .id = .read_write_mode, .long = "--read-write-mode", .help = "allow eval to register derivations and sources in\nthe store", .show_in = &.{.eval} },
 
-    .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)" },
-    .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set" },
-    .{ .id = .deprecated_features, .long = "--deprecated-features", .arg = .req, .metavar = "FEATS", .help = "space-separated deprecated features to re-enable,\nreplacing the current set (available: nul-bytes,\nfloor-ceil-corrupt-integers)" },
-    .{ .id = .extra_deprecated_features, .long = "--extra-deprecated-features", .arg = .req, .metavar = "FEATS", .help = "like --deprecated-features, but adds to the set" },
-    .{ .id = .option, .long = "--option", .arg = .req2, .metavar = "NAME VALUE", .help = "override a nix.conf setting" },
+    .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)", .complete = .{ .experimental_feature, .none } },
+    .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set", .complete = .{ .experimental_feature, .none } },
+    .{ .id = .deprecated_features, .long = "--deprecated-features", .arg = .req, .metavar = "FEATS", .help = "space-separated deprecated features to re-enable,\nreplacing the current set (available: nul-bytes,\nfloor-ceil-corrupt-integers)", .complete = .{ .deprecated_feature, .none } },
+    .{ .id = .extra_deprecated_features, .long = "--extra-deprecated-features", .arg = .req, .metavar = "FEATS", .help = "like --deprecated-features, but adds to the set", .complete = .{ .deprecated_feature, .none } },
+    .{ .id = .option, .long = "--option", .arg = .req2, .metavar = "NAME VALUE", .help = "override a nix.conf setting", .complete = .{ .setting, .none } },
 
-    .{ .id = .out_link, .short = "-o", .long = "--out-link", .arg = .req, .metavar = "NAME", .help = "name of the result symlink (default: result)", .show_in = &.{.build} },
+    .{ .id = .out_link, .short = "-o", .long = "--out-link", .arg = .req, .metavar = "NAME", .help = "name of the result symlink (default: result)", .show_in = &.{.build}, .complete = .{ .file, .none } },
     .{ .id = .no_link, .long = "--no-out-link", .help = "do not create the result symlink", .show_in = &.{.build} },
     .{ .id = .no_link, .long = "--no-link", .show_in = &.{.build}, .hidden = true }, // alias of --no-out-link
     .{ .id = .dry_run, .long = "--dry-run", .help = "show what would be built or substituted", .show_in = &.{.build} },
     .{ .id = .find_file, .long = "--find-file", .help = "look up source arguments in NIX_PATH and print\ntheir absolute paths", .show_in = &.{.instantiate} },
-    .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .show_in = drv_cmds },
+    .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .show_in = drv_cmds, .complete = .{ .file, .none } },
     .{ .id = .add_drv_link, .long = "--add-drv-link", .help = "also create a symlink to the .drv", .show_in = drv_cmds },
-    .{ .id = .add_root, .long = "--add-root", .arg = .req, .metavar = "PATH", .help = "create the link at PATH and register it as a GC root", .show_in = drv_cmds },
+    .{ .id = .add_root, .long = "--add-root", .arg = .req, .metavar = "PATH", .help = "create the link at PATH and register it as a GC root", .show_in = drv_cmds, .complete = .{ .file, .none } },
     .{ .id = .indirect, .long = "--indirect", .help = "make the --add-root GC root indirect", .show_in = drv_cmds },
 
     .{ .id = .check, .long = "--check", .help = "rebuild and check that outputs are unchanged", .show_in = realize_cmds },
     .{ .id = .repair, .long = "--repair", .help = "rebuild and repair corrupted store paths", .show_in = realize_cmds },
-    .{ .id = .max_jobs, .short = "-j", .long = "--max-jobs", .arg = .req, .metavar = "N", .help = "maximum number of parallel build jobs (or `auto`)", .show_in = daemon_setting_cmds },
+    .{ .id = .max_jobs, .short = "-j", .long = "--max-jobs", .arg = .req, .metavar = "N", .help = "maximum number of parallel build jobs (or `auto`)", .show_in = daemon_setting_cmds, .complete = .{ .max_jobs, .none } },
     .{ .id = .cores, .long = "--cores", .arg = .req, .metavar = "N", .help = "build cores per job (0 = all available)", .show_in = daemon_setting_cmds },
     .{ .id = .fallback, .long = "--fallback", .help = "build from source if a substitute fails", .show_in = daemon_setting_cmds },
     .{ .id = .keep_failed, .short = "-K", .long = "--keep-failed", .help = "keep the build tree of failed builds", .show_in = daemon_setting_cmds },
@@ -480,19 +506,19 @@ const specs = [_]Spec{
     .{ .id = .stats, .long = "--stats", .help = "print evaluator or bytecode corpus statistics", .show_in = stats_cmds },
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error", .show_in = eval_cmds },
     .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{ .eval, .repl } },
-    .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
+    .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never", .complete = .{ .color, .none } },
     .{ .id = .no_color, .long = "--no-color", .help = "disable color diagnostics" },
     .{ .id = .progress, .long = "--progress", .help = "write timestamped progress records", .show_in = eval_cmds },
     .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress", .show_in = eval_cmds },
     .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC collection budget (MiB,\nor with a k/m/g suffix; 0 = never collect).\nDefault: auto, scaled to RAM.", .show_in = eval_cmds },
-    .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds },
-    .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .help = "write a Perfetto timeline to PATH\n(default: fix-timeline.json)", .show_in = timeline_cmds },
-    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "off|all", .help = "record all scheduler steal flows or none\n(default: all)", .show_in = timeline_cmds },
+    .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds, .complete = .{ .hugetlb, .none } },
+    .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .help = "write a Perfetto timeline to PATH\n(default: fix-timeline.json)", .show_in = timeline_cmds, .complete = .{ .file, .none } },
+    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "off|all", .help = "record all scheduler steal flows or none\n(default: all)", .show_in = timeline_cmds, .complete = .{ .timeline_flows, .none } },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
     .{ .id = .bare, .long = "--bare", .help = "plain line-based input: no editor, no escape\nsequences (for pipes and expect-style automation)", .show_in = &.{.repl} },
 
-    .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .multi, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell} },
+    .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .multi, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell}, .complete = .{ .package, .none } },
 
     .{ .id = .nixos, .long = "--nixos", .help = "build/activate a NixOS system configuration", .show_in = &.{.@"switch"} },
     .{ .id = .darwin, .long = "--darwin", .help = "build/activate a nix-darwin configuration", .show_in = &.{.@"switch"} },
@@ -536,6 +562,45 @@ fn findShort(name: []const u8) ?*const Spec {
         if (s.short) |sh| if (std.mem.eql(u8, sh, name)) return s;
     }
     return null;
+}
+
+fn validForCommand(spec: *const Spec, cmd: Cmd) bool {
+    return spec.show_in.len == 0 or std.mem.indexOfScalar(Cmd, spec.show_in, cmd) != null;
+}
+
+/// Look up completion-relevant metadata for an exact long or short option.
+/// Hidden options remain recognizable when already typed, but are omitted from
+/// `writeOptionCompletions` suggestions.
+pub fn completionOption(name: []const u8, cmd: Cmd) ?CompletionOption {
+    const spec = (if (std.mem.startsWith(u8, name, "--")) findLong(name) else findShort(name)) orelse return null;
+    if (!validForCommand(spec, cmd)) return null;
+    return .{
+        .arity = switch (spec.arg) {
+            .flag => .flag,
+            .opt => .opt,
+            .req => .req,
+            .req2 => .req2,
+            .multi => .multi,
+        },
+        .hints = spec.complete,
+    };
+}
+
+/// Emit visible option candidates in the tab-separated format shared by bash,
+/// zsh, and fish (`value<TAB>description`).
+pub fn writeOptionCompletions(w: *std.Io.Writer, cmd: Cmd, prefix: []const u8) !void {
+    for (&specs) |*spec| {
+        if (spec.hidden or !validForCommand(spec, cmd)) continue;
+        const description = spec.help[0 .. std.mem.indexOfScalar(u8, spec.help, '\n') orelse spec.help.len];
+        if (spec.short) |short| {
+            if (std.mem.startsWith(u8, short, prefix))
+                try w.print("{s}\t{s}\n", .{ short, description });
+        }
+        if (spec.long) |long| {
+            if (std.mem.startsWith(u8, long, prefix))
+                try w.print("{s}\t{s}\n", .{ long, description });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

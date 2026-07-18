@@ -2,6 +2,7 @@
 
 pub const commands = @import("commands/root.zig");
 pub const command_match = @import("command_match.zig");
+pub const command_meta = @import("command_meta.zig");
 pub const presentation = @import("presentation.zig");
 pub const ProcessContext = @import("process_context.zig").ProcessContext;
 pub const thunks_log_enabled = @import("expr").vm.thunks_log_enabled;
@@ -10,6 +11,7 @@ pub const vm_trace_enabled = @import("expr").vm.trace_log.enabled;
 test {
     _ = commands;
     _ = command_match;
+    _ = command_meta;
     _ = @import("args.zig");
     _ = @import("build_progress.zig");
     _ = @import("debugger.zig");

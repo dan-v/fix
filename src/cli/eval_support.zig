@@ -339,6 +339,40 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// Build a source expression whose result merges the attribute sets that Nix
+/// installable lookup searches for a flake fragment: `packages.<system>`,
+/// `legacyPackages.<system>`, and the flake output root. `parent` is the fully
+/// typed portion before the final dot. Non-attr branches are ignored so a
+/// similarly named leaf in one namespace cannot suppress useful candidates
+/// from another.
+pub fn lowerFlakeCompletion(ev: *Evaluator, flake_ref: []const u8, parent: []const u8) ![]const u8 {
+    const alloc = ev.hostAllocator();
+    const resolved = try resolveFlakeRef(ev, flake_ref);
+    defer if (resolved.owned) alloc.free(resolved.ref);
+
+    var suffix: std.ArrayListUnmanaged(u8) = .empty;
+    defer suffix.deinit(alloc);
+    _ = try appendAttrPathSuffix(alloc, &suffix, parent);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "(let f = builtins.getFlake \"");
+    try appendNixEscaped(alloc, &out, resolved.ref);
+    try out.appendSlice(alloc, "\"; s = builtins.currentSystem; add = a: b: if builtins.isAttrs b then a // b else a; in add (add (add {} (f.packages.${s}");
+    try out.appendSlice(alloc, suffix.items);
+    try out.appendSlice(alloc, " or {})) (f.legacyPackages.${s}");
+    try out.appendSlice(alloc, suffix.items);
+    try out.appendSlice(alloc, " or {})) ");
+    if (suffix.items.len == 0) {
+        try out.appendSlice(alloc, "f)");
+    } else {
+        try out.appendSlice(alloc, "(f");
+        try out.appendSlice(alloc, suffix.items);
+        try out.appendSlice(alloc, " or {}))");
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 const ResolvedRef = struct { ref: []const u8, owned: bool };
 
 /// Turn a CLI flakeref into one `builtins.getFlake` accepts. Only the
