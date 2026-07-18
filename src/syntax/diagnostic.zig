@@ -149,6 +149,7 @@ pub const LineIndex = struct {
 
 pub const RenderOptions = struct {
     color: bool = false,
+    show_near: bool = true,
 };
 
 pub fn lineForOffset(source: []const u8, offset: u32) u32 {
@@ -243,17 +244,23 @@ fn writeOne(writer: *std.Io.Writer, source: []const u8, diagnostic: Diagnostic, 
     try writeSpaces(writer, diagnostic.column - 1);
 
     try style(writer, options, if (diagnostic.severity == .err) .error_caret else .note_caret);
-    const caret_count = @max(@as(u32, 1), diagnostic.len);
+    // Diagnostics normally point at a token on one line, while evaluation
+    // traces may carry the span of a whole (multi-line) expression.  This is
+    // a one-line excerpt, so never extend its caret or `near` text past the
+    // displayed line.
+    const target = offsetTarget(diagnostic_source, diagnostic.offset);
+    const remaining_on_line: u32 = @intCast(source_line.end - target);
+    const caret_count = @max(@as(u32, 1), @min(diagnostic.len, remaining_on_line));
     var i: u32 = 0;
     while (i < caret_count) : (i += 1) {
         try writer.writeByte('^');
     }
     try reset(writer, options);
 
-    if (diagnostic.token_type == null or diagnostic.token_type.? != .eof) {
-        const start: usize = @intCast(diagnostic.offset);
-        const len: usize = @intCast(diagnostic.len);
-        if (start <= diagnostic_source.len and len <= diagnostic_source.len - start) {
+    if (options.show_near and (diagnostic.token_type == null or diagnostic.token_type.? != .eof)) {
+        const start = target;
+        const len: usize = @min(@as(usize, @intCast(diagnostic.len)), source_line.end - start);
+        if (len > 0) {
             try style(writer, options, .near);
             try writer.print(" near `{s}`", .{diagnostic_source[start .. start + len]});
             try reset(writer, options);

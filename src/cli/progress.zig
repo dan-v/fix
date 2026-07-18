@@ -72,7 +72,7 @@ pub const EvalProgress = struct {
         interest: observ.Interest,
     ) usize {
         const self: *EvalProgress = @ptrCast(@alignCast(raw));
-        if (interest.log_begin) self.writeRecord(spec.category, spec.name, spec.begin_verb, details, &.{});
+        if (interest.log_begin) self.writeRecord(spec.category, spec.name, spec.begin_verb, details, &.{}, false);
         if (interest.profile) return self.timeline.?.begin(spec, details, track);
         return 0;
     }
@@ -89,13 +89,14 @@ pub const EvalProgress = struct {
     ) void {
         const self: *EvalProgress = @ptrCast(@alignCast(raw));
         if (interest.profile) self.timeline.?.finish(token, spec, completion, success);
-        if (!success or !interest.log_finish) return;
+        if (!interest.log_finish or (!success and completion.verb == null)) return;
         self.writeRecord(
             spec.category,
             spec.name,
-            spec.finish_verb,
+            completion.verb orelse spec.finish_verb,
             completion.details orelse started,
             completion.metrics,
+            !success,
         );
     }
 
@@ -116,7 +117,7 @@ pub const EvalProgress = struct {
         const self: *EvalProgress = @ptrCast(@alignCast(raw));
         if (interest.profile) self.timeline.?.instant(spec, details, track, metrics);
         if (!interest.log_finish) return;
-        self.writeRecord(spec.category, spec.name, spec.verb, details, metrics);
+        self.writeRecord(spec.category, spec.name, spec.verb, details, metrics, false);
     }
 
     fn writeCounter(raw: *anyopaque, spec: *const observ.CounterSpec, track: observ.Track, metrics: []const observ.Metric) void {
@@ -146,6 +147,7 @@ pub const EvalProgress = struct {
         verb: []const u8,
         details: observ.Details,
         metrics: []const observ.Metric,
+        is_error: bool,
     ) void {
         var stderr_buffer: [4096]u8 = undefined;
         var stderr = presentation.lockStderr(self.io, &stderr_buffer) catch return;
@@ -159,7 +161,10 @@ pub const EvalProgress = struct {
             stderr.flush() catch {};
         }
         self.writeLogPrefix(writer, category) catch return;
-        presentation.foreground(writer, self.color_depth, presentation.nounColor(identity), false) catch return;
+        if (is_error)
+            presentation.style(writer, use_color, .error_label) catch return
+        else
+            presentation.foreground(writer, self.color_depth, presentation.nounColor(identity), false) catch return;
         writer.writeAll(verb) catch return;
         presentation.reset(writer, use_color) catch return;
         self.writeSubject(writer, details.subject) catch return;

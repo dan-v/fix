@@ -104,6 +104,7 @@ test "evaluate records runtime error message and expression trace" {
     // y" thunk-force wrapper frame. See strictness-driven let elision in
     // compiler/fold.zig.
     try std.testing.expect(trace.frames.items.len >= 1);
+    try std.testing.expectEqual(.evaluation, trace.frames.items[0].kind);
     try std.testing.expect(trace.frames.items[0].diagnostic != null);
     try std.testing.expect(trace.frames.items[0].source_path == null);
     try std.testing.expectEqualStrings("while evaluating", trace.frames.items[0].message);
@@ -140,6 +141,7 @@ test "evaluate records imported file source trace" {
     try std.testing.expect(trace.message != null);
     try std.testing.expectEqualStrings("cannot coerce int to a string", trace.message.?);
     try std.testing.expect(trace.frames.items.len >= 1);
+    try std.testing.expectEqual(.evaluation, trace.frames.items[0].kind);
     try std.testing.expect(trace.frames.items[0].diagnostic != null);
     try std.testing.expect(trace.frames.items[0].source_path != null);
     try std.testing.expectEqualStrings(file_path, trace.frames.items[0].source_path.?);

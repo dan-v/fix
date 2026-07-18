@@ -11,7 +11,7 @@ pub fn setErrorMessage(self: *VM, message: []const u8) !void {
 }
 
 pub fn pushErrorContext(self: *VM, message: []const u8) !void {
-    if (self.trace) |trace| try trace.pushFrame(message);
+    if (self.trace) |trace| try trace.pushContext(message);
 }
 
 /// The logical call-depth cap (Nix's `max-call-depth`) has been exceeded.

@@ -625,8 +625,20 @@ pub const Evaluator = struct {
         try diagnostic.writeAllWithOptions(writer, source, self.getDiagnostics(), .{ .color = use_color });
     }
 
-    pub fn writeDiagnostic(_: *const Evaluator, writer: *std.Io.Writer, source: []const u8, item: Diagnostic, use_color: bool) !void {
-        try diagnostic.writeAllWithOptions(writer, source, &.{item}, .{ .color = use_color });
+    /// Render one source-backed evaluation trace frame. Parser/compiler
+    /// diagnostics keep their compact `near` excerpt; a trace already shows
+    /// the source line and should not repeat it.
+    pub fn writeTraceDiagnostic(
+        _: *const Evaluator,
+        writer: *std.Io.Writer,
+        source: []const u8,
+        item: Diagnostic,
+        use_color: bool,
+    ) !void {
+        try diagnostic.writeAllWithOptions(writer, source, &.{item}, .{
+            .color = use_color,
+            .show_near = false,
+        });
     }
 
     pub fn getTrace(self: *const Evaluator) *const EvalTrace {
@@ -804,7 +816,7 @@ pub const Evaluator = struct {
         var span = self.observer.begin(&fetch_observation, .{ .subject = .{ .url = url } });
         defer span.cancel();
         const result = try self.fetchers.fetchTarball(&self.files, .{ .url = url, .name = "source" }, null);
-        span.finish(.{});
+        span.finish(.{ .verb = if (result.cached) "cached" else null });
         return result;
     }
 

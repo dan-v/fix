@@ -8,6 +8,26 @@ const EvalTrace = engine.EvalTrace;
 
 const default_trace_limit = 8;
 
+/// Render an ordinary CLI failure with the same colored label used by
+/// evaluation diagnostics. `format` is the text after `error: ` and may
+/// contain daemon-provided continuation lines.
+pub fn messageError(io: std.Io, use_color: bool, comptime format: []const u8, args: anytype) void {
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr = presentation.lockStderr(io, &stderr_buffer) catch return;
+    defer stderr.deinit();
+    writeMessageError(stderr.writer(), use_color, format, args) catch return;
+    stderr.flush() catch {};
+}
+
+fn writeMessageError(writer: *std.Io.Writer, use_color: bool, comptime format: []const u8, args: anytype) !void {
+    try presentation.style(writer, use_color, .error_label);
+    try writer.writeAll("error");
+    try presentation.reset(writer, use_color);
+    try writer.writeAll(": ");
+    try writer.print(format, args);
+    try writer.writeByte('\n');
+}
+
 /// Render a failed evaluation: a parse/scan diagnostic if one was recorded,
 /// otherwise the evaluation error with its trace.
 pub fn evalFailure(
@@ -131,9 +151,15 @@ fn writeTraceFrames(
 }
 
 fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) !void {
-    if (frame.diagnostic) |diag| {
+    if (frame.kind == .evaluation) {
+        const diag = frame.diagnostic orelse return;
         if (traceFrameSource(ev, source, frame)) |frame_source| {
-            try ev.writeDiagnostic(writer, frame_source, diag, use_color);
+            var located_diag = diag;
+            located_diag.source_path = diag.source_path orelse frame.source_path orelse "expression";
+            // The excerpt and caret already identify the expression.  `near`
+            // is useful for terse parser diagnostics, but merely repeats (and
+            // for multi-line spans used to spill) VM trace source here.
+            try ev.writeTraceDiagnostic(writer, frame_source, located_diag, use_color);
             return;
         }
         if (frame.source_path) |path| {
@@ -144,11 +170,11 @@ fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Evaluator, sour
         return;
     }
 
-    try writer.writeAll("  ");
-    try presentation.style(writer, use_color, .trace_label);
-    try writer.writeAll("while evaluating");
-    try presentation.reset(writer, use_color);
-    try writer.print(": {s}\n", .{frame.message});
+    // Error contexts are complete, user-controlled prose.  In particular,
+    // nixpkgs often supplies messages beginning with "while evaluating";
+    // adding our own generic prefix would duplicate it.  The frame kind, not
+    // inspection of the message text, determines how it is rendered.
+    try writer.print("  {s}\n", .{frame.message});
 }
 
 fn traceFrameSource(ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) ?[]const u8 {
@@ -156,4 +182,79 @@ fn traceFrameSource(ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) 
         return ev.readSourceFile(path) catch null;
     }
     return source;
+}
+
+test "trace contexts render their complete prose once" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    var trace = EvalTrace.init(std.testing.allocator);
+    defer trace.deinit();
+    try trace.pushContext("while evaluating definitions from `module.nix`");
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeTraceFrame(&output.writer, false, &ev, "", trace.frames.items[0]);
+
+    try std.testing.expectEqualStrings(
+        "  while evaluating definitions from `module.nix`\n",
+        output.written(),
+    );
+}
+
+test "message errors use the diagnostic error-label style" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeMessageError(&output.writer, true, "input {d} build failed: {s}", .{ 1, "boom" });
+    try std.testing.expectEqualStrings(
+        "\x1b[1;31merror\x1b[0m: input 1 build failed: boom\n",
+        output.written(),
+    );
+}
+
+test "trace diagnostics include source paths and keep excerpts on one line" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = "first\nsecond\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "module.nix", .data = source });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const source_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "module.nix",
+    });
+    defer std.testing.allocator.free(source_path);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    var trace = EvalTrace.init(std.testing.allocator);
+    defer trace.deinit();
+    try trace.pushDiagnosticFrame(source_path, .{
+        .severity = .note,
+        .kind = .compile,
+        .line = 1,
+        .column = 1,
+        .offset = 0,
+        .len = source.len,
+        .token_type = null,
+        .message = "while evaluating 'root'",
+    });
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeTraceFrame(&output.writer, false, &ev, "unused", trace.frames.items[0]);
+
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "note: while evaluating 'root' at {s}:1:1\n   1 | first\n     | ^^^^^\n",
+        .{source_path},
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, output.written());
 }

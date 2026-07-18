@@ -20,9 +20,11 @@ const forge_mod = @import("forge.zig");
 /// environment is unset). This is only a place to land downloads before they
 /// are hashed/added to the real store — never a substitute for `/nix/store`.
 ///
-/// Mutable remote sources are reused for `tarball-ttl` seconds. URL metadata is
-/// only trusted after the content-addressed file is re-hashed; publication is
-/// atomic, so interrupted writers never become cache hits.
+/// Mutable remote sources are reused for `tarball-ttl` seconds. URL downloads
+/// are hashed while streaming and published atomically under that hash. The
+/// index records the published file's size, making an unchanged hit a
+/// metadata-only check; legacy entries are re-hashed once before reuse.
+/// Explicit generation markers (not filesystem mtimes) age objects for GC.
 pub const FetchCache = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,
@@ -50,6 +52,9 @@ pub const FetchCache = struct {
     /// Same-process single-flight for mutable source refreshes. Stripes keep
     /// the structure fixed-size while ensuring identical URLs cannot race.
     fetch_locks: [64]sync.BlockingMutex = @splat(.{}),
+    /// Opportunistic URL/tarball-cache pruning runs at most once per process.
+    cache_prune_mu: sync.BlockingMutex = .{},
+    cache_pruned: bool = false,
     /// `access-tokens` from `nix.conf`: `<host>[/<path>] -> <token>`, converted
     /// to the matching forge's HTTP header or Git credential convention.
     access_tokens: std.ArrayListUnmanaged(TokenEntry) = .empty,
@@ -136,6 +141,9 @@ pub const FetchCache = struct {
     pub const UrlResult = struct {
         path: []u8,
         hash: []u8,
+        /// True when a fresh URL-cache entry supplied the content without a
+        /// network transfer during this operation.
+        cached: bool = false,
 
         pub fn deinit(self: UrlResult, allocator: std.mem.Allocator) void {
             allocator.free(self.path);
@@ -152,6 +160,7 @@ pub const FetchCache = struct {
         path: []u8,
         nar_payload: ?TarballNar,
         forge_metadata: ?ForgeMetadata,
+        cached: bool = false,
 
         pub fn deinit(self: TarballResult, allocator: std.mem.Allocator) void {
             allocator.free(self.path);
@@ -530,6 +539,7 @@ pub const FetchCache = struct {
         const owned = try self.allocator.dupe(u8, root);
         if (self.cache_root) |old| self.allocator.free(old);
         self.cache_root = owned;
+        self.cache_pruned = false;
     }
 
     /// The download-cache root: the configured `cache_root`, else
@@ -554,6 +564,8 @@ pub const FetchCache = struct {
             const body = try files.readFile(local_path);
             const hash = try nix_hash.hashBytes(self.allocator, "sha256", body);
             errdefer self.allocator.free(hash);
+            const generation = std.Io.Clock.real.now(io).toSeconds();
+            try self.noteUrlGeneration(io, hash, generation);
             const path = try self.urlCachePath(io, spec.name, hash);
             errdefer self.allocator.free(path);
             try self.publishBytes(io, path, body);
@@ -564,6 +576,7 @@ pub const FetchCache = struct {
 
     pub fn fetchTarball(self: *FetchCache, files: *FileCache, spec: TarballSpec, reporter: ?Reporter) !TarballResult {
         const io = self.io orelse return error.FetchIoUnavailable;
+        var all_cached = true;
         var forge_metadata = if (spec.resolved_rev) |rev|
             try self.forgeMetadataForRev(rev, 0)
         else if (spec.metadata_url) |url| metadata: {
@@ -575,6 +588,7 @@ pub const FetchCache = struct {
                 .auth_url = spec.url,
             }, reporter);
             defer response.deinit(self.allocator);
+            all_cached = response.cached;
             break :metadata if (forge == .sourcehut)
                 try self.parseSourcehutMetadata(files, response.path, spec.metadata_ref orelse "HEAD", spec.metadata_head_url, spec.url, reporter)
             else
@@ -617,7 +631,12 @@ pub const FetchCache = struct {
             std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
             break :payload .{ .bytes = bytes, .digest = digest };
         } else null;
-        return .{ .path = out_path, .nar_payload = nar_payload, .forge_metadata = forge_metadata };
+        return .{
+            .path = out_path,
+            .nar_payload = nar_payload,
+            .forge_metadata = forge_metadata,
+            .cached = all_cached and archive.cached,
+        };
     }
 
     fn parseForgeMetadata(self: *FetchCache, files: *FileCache, forge: Forge, path: []const u8) !?ForgeMetadata {
@@ -768,6 +787,7 @@ pub const FetchCache = struct {
 
         const root = try self.cacheRootDir(io);
         defer self.allocator.free(root);
+        self.maybePruneUrlCache(io, root);
         const metadata_path = try self.urlMetadataPath(root, spec.url);
         defer self.allocator.free(metadata_path);
         if (try self.readFreshUrlCache(io, metadata_path, spec.name)) |cached| return cached;
@@ -814,10 +834,13 @@ pub const FetchCache = struct {
         const hash_array = std.fmt.bytesToHex(downloaded.digest, .lower);
         const hash = try self.allocator.dupe(u8, &hash_array);
         errdefer self.allocator.free(hash);
+        const generation = std.Io.Clock.real.now(io).toSeconds();
+        try self.noteUrlGenerationAtRoot(io, root, hash, generation);
         const path = try self.urlCachePath(io, spec.name, hash);
         errdefer self.allocator.free(path);
         try self.publishStagedFile(io, staging_path, path);
-        try self.writeUrlMetadata(io, metadata_path, hash);
+        const published = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        try self.writeUrlMetadataAt(io, metadata_path, generation, hash, published.size);
         return .{ .path = path, .hash = hash };
     }
 
@@ -843,6 +866,31 @@ pub const FetchCache = struct {
 
         const path = try self.urlCachePath(io, name, hash);
         errdefer self.allocator.free(path);
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch {
+            self.allocator.free(path);
+            return null;
+        };
+        if (stat.kind != .file) {
+            self.allocator.free(path);
+            return null;
+        }
+
+        // New entries can be trusted after a cheap stat: the file was hashed
+        // while downloading, then atomically published under that hash before
+        // this size stamp was written. Cache objects are immutable; no
+        // filesystem timestamp support is required.
+        const recorded_size = if (lines.next()) |text| std.fmt.parseInt(u64, text, 10) catch null else null;
+        if (recorded_size) |size| {
+            if (stat.size != size) {
+                self.allocator.free(path);
+                return null;
+            }
+            self.noteUrlGeneration(io, hash, written) catch {};
+            return .{ .path = path, .hash = try self.allocator.dupe(u8, hash), .cached = true };
+        }
+
+        // Legacy two-line metadata gets one full validation and is upgraded to
+        // the fast size-stamped form.
         const actual = curl_transport.fileDigest(self.allocator, path) catch {
             self.allocator.free(path);
             return null;
@@ -852,14 +900,173 @@ pub const FetchCache = struct {
             self.allocator.free(path);
             return null;
         }
-        return .{ .path = path, .hash = try self.allocator.dupe(u8, hash) };
+        self.writeUrlMetadataAt(io, metadata_path, written, hash, stat.size) catch {};
+        self.noteUrlGeneration(io, hash, written) catch {};
+        return .{ .path = path, .hash = try self.allocator.dupe(u8, hash), .cached = true };
     }
 
-    fn writeUrlMetadata(self: *FetchCache, io: std.Io, path: []const u8, hash: []const u8) !void {
-        const now = std.Io.Clock.real.now(io).toSeconds();
-        const contents = try std.fmt.allocPrint(self.allocator, "{d}\n{s}\n", .{ now, hash });
+    fn writeUrlMetadataAt(self: *FetchCache, io: std.Io, path: []const u8, written: i64, hash: []const u8, size: u64) !void {
+        const contents = try std.fmt.allocPrint(self.allocator, "{d}\n{s}\n{d}\n", .{
+            written,
+            hash,
+            size,
+        });
         defer self.allocator.free(contents);
         try self.publishBytes(io, path, contents);
+    }
+
+    /// Record object age explicitly in the path, rather than relying on mtime:
+    ///
+    ///   url-generations/<content-hash-prefix>/<unix-seconds>
+    ///
+    /// A refresh that returns identical bytes simply adds a newer generation.
+    /// This makes both bumping and pruning work on filesystems without times.
+    fn noteUrlGeneration(self: *FetchCache, io: std.Io, hash: []const u8, generation: i64) !void {
+        const root = try self.cacheRootDir(io);
+        defer self.allocator.free(root);
+        try self.noteUrlGenerationAtRoot(io, root, hash, generation);
+    }
+
+    fn noteUrlGenerationAtRoot(self: *FetchCache, io: std.Io, root: []const u8, hash: []const u8, generation: i64) !void {
+        if (!validUrlHash(hash)) return error.FetchCacheWriteFailed;
+        var generation_buffer: [32]u8 = undefined;
+        const generation_text = try std.fmt.bufPrint(&generation_buffer, "{d}", .{generation});
+        const marker = try std.fs.path.join(self.allocator, &.{ root, "url-generations", hash[0..32], generation_text });
+        defer self.allocator.free(marker);
+        if (try hostPathExists(io, marker)) return;
+        try self.publishBytes(io, marker, "1\n");
+
+        // This content hash was just refreshed. Retain a concurrently-created
+        // newer generation, but remove older markers so the directory itself
+        // is the object's single, cheaply bumpable age record.
+        const parent = std.fs.path.dirname(marker) orelse return;
+        var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{ .iterate = true });
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            const old_generation = std.fmt.parseInt(i64, entry.name, 10) catch continue;
+            if (old_generation >= generation) continue;
+            const old_marker = try std.fs.path.join(self.allocator, &.{ parent, entry.name });
+            defer self.allocator.free(old_marker);
+            std.Io.Dir.deleteFileAbsolute(io, old_marker) catch {};
+        }
+    }
+
+    fn maybePruneUrlCache(self: *FetchCache, io: std.Io, root: []const u8) void {
+        self.cache_prune_mu.lock();
+        defer self.cache_prune_mu.unlock();
+        if (self.cache_pruned) return;
+        self.cache_pruned = true;
+        self.pruneUrlCache(io, root, std.Io.Clock.real.now(io).toSeconds()) catch {};
+    }
+
+    /// Drop URL archives and their extracted tarballs after two TTL windows.
+    /// The URL index's explicit timestamp seeds generation markers for entries
+    /// written by older Fix versions, then unmarked legacy/orphaned objects are
+    /// removed. Cleanup is deliberately best-effort at the call site: a cache
+    /// permission problem must never make evaluation fail.
+    fn pruneUrlCache(self: *FetchCache, io: std.Io, root: []const u8, now: i64) !void {
+        // Zero is the explicit "always refresh" setting, not an instruction to
+        // purge every unrelated cached source on the next fetch.
+        if (self.tarball_ttl == 0) return;
+        const retention = @as(i64, self.tarball_ttl) * 2;
+        const cutoff = now - retention;
+        try self.pruneUrlIndex(io, root, now, cutoff);
+        try self.pruneUrlGenerations(io, root, cutoff);
+        try self.pruneUnmarkedObjects(io, root, "url");
+        try self.pruneUnmarkedObjects(io, root, "tarball");
+    }
+
+    fn pruneUrlIndex(self: *FetchCache, io: std.Io, root: []const u8, now: i64, cutoff: i64) !void {
+        const index_path = try std.fs.path.join(self.allocator, &.{ root, "url-index" });
+        defer self.allocator.free(index_path);
+        var dir = std.Io.Dir.openDirAbsolute(io, index_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            const metadata_path = try std.fs.path.join(self.allocator, &.{ index_path, entry.name });
+            defer self.allocator.free(metadata_path);
+            const metadata = std.Io.Dir.cwd().readFileAlloc(io, metadata_path, self.allocator, .limited(256)) catch {
+                std.Io.Dir.deleteFileAbsolute(io, metadata_path) catch {};
+                continue;
+            };
+            defer self.allocator.free(metadata);
+            var lines = std.mem.splitScalar(u8, metadata, '\n');
+            const written_text = lines.next() orelse {
+                std.Io.Dir.deleteFileAbsolute(io, metadata_path) catch {};
+                continue;
+            };
+            const hash = lines.next() orelse {
+                std.Io.Dir.deleteFileAbsolute(io, metadata_path) catch {};
+                continue;
+            };
+            const written = std.fmt.parseInt(i64, written_text, 10) catch {
+                std.Io.Dir.deleteFileAbsolute(io, metadata_path) catch {};
+                continue;
+            };
+            if (!validUrlHash(hash) or written > now or written <= cutoff) {
+                std.Io.Dir.deleteFileAbsolute(io, metadata_path) catch {};
+                continue;
+            }
+            // Migrates fresh metadata from the old, unversioned object layout.
+            self.noteUrlGenerationAtRoot(io, root, hash, written) catch {};
+        }
+    }
+
+    fn pruneUrlGenerations(self: *FetchCache, io: std.Io, root: []const u8, cutoff: i64) !void {
+        const generations_path = try std.fs.path.join(self.allocator, &.{ root, "url-generations" });
+        defer self.allocator.free(generations_path);
+        var dir = std.Io.Dir.openDirAbsolute(io, generations_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .directory or entry.name.len != 32) continue;
+            const hash_generations = try std.fs.path.join(self.allocator, &.{ generations_path, entry.name });
+            defer self.allocator.free(hash_generations);
+            var hash_dir = std.Io.Dir.openDirAbsolute(io, hash_generations, .{ .iterate = true }) catch continue;
+            var hash_iterator = hash_dir.iterate();
+            var newest: ?i64 = null;
+            while (hash_iterator.next(io) catch null) |marker| {
+                const generation = std.fmt.parseInt(i64, marker.name, 10) catch continue;
+                newest = if (newest) |value| @max(value, generation) else generation;
+            }
+            hash_dir.close(io);
+            if (newest == null or newest.? <= cutoff)
+                self.deleteCachedHash(io, root, entry.name);
+        }
+    }
+
+    fn pruneUnmarkedObjects(self: *FetchCache, io: std.Io, root: []const u8, object_kind: []const u8) !void {
+        const objects_path = try std.fs.path.join(self.allocator, &.{ root, object_kind });
+        defer self.allocator.free(objects_path);
+        var dir = std.Io.Dir.openDirAbsolute(io, objects_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .directory or entry.name.len != 32) continue;
+            const generation_path = try std.fs.path.join(self.allocator, &.{ root, "url-generations", entry.name });
+            defer self.allocator.free(generation_path);
+            if (!try hostPathExists(io, generation_path))
+                self.deleteCachedHash(io, root, entry.name);
+        }
+    }
+
+    fn deleteCachedHash(self: *FetchCache, io: std.Io, root: []const u8, hash_prefix: []const u8) void {
+        for ([_][]const u8{ "url", "tarball", "url-generations" }) |kind| {
+            const path = std.fs.path.join(self.allocator, &.{ root, kind, hash_prefix }) catch continue;
+            defer self.allocator.free(path);
+            std.Io.Dir.cwd().deleteTree(io, path) catch {};
+        }
     }
 
     fn publishBytes(self: *FetchCache, io: std.Io, path: []const u8, bytes: []const u8) !void {
@@ -1292,6 +1499,12 @@ fn validSha1(text: []const u8) bool {
     return true;
 }
 
+fn validUrlHash(text: []const u8) bool {
+    if (text.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return false;
+    for (text) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
+}
+
 fn expandRevisionTemplate(allocator: std.mem.Allocator, template: []const u8, rev: []const u8) ![]u8 {
     const marker = "{rev}";
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -1492,7 +1705,7 @@ test "fetchTarball only serializes NAR when requested" {
     try testing.expectEqualSlices(u8, &independently_hashed, &payload.digest);
 }
 
-test "URL metadata only reuses fresh, content-verified cache files" {
+test "URL metadata cheaply reuses immutable files and verifies legacy entries" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1512,16 +1725,91 @@ test "URL metadata only reuses fresh, content-verified cache files" {
     try fc.publishBytes(testing.io, path, payload);
     const metadata = try fc.urlMetadataPath(root, "https://example.invalid/source");
     defer testing.allocator.free(metadata);
-    try fc.writeUrlMetadata(testing.io, metadata, &hash);
+    const stat = try std.Io.Dir.cwd().statFile(testing.io, path, .{ .follow_symlinks = false });
+    const now = std.Io.Clock.real.now(testing.io).toSeconds();
+    try fc.writeUrlMetadataAt(testing.io, metadata, now, &hash, stat.size);
 
     const cached = (try fc.readFreshUrlCache(testing.io, metadata, "source")).?;
     defer cached.deinit(testing.allocator);
     try testing.expectEqualStrings(&hash, cached.hash);
 
+    // The old two-line format is validated once, then rewritten with the
+    // identity stamp so the following lookup can take the cheap path.
+    const legacy = try std.fmt.allocPrint(testing.allocator, "{d}\n{s}\n", .{ now, &hash });
+    defer testing.allocator.free(legacy);
+    try fc.publishBytes(testing.io, metadata, legacy);
+    const legacy_cached = (try fc.readFreshUrlCache(testing.io, metadata, "source")).?;
+    defer legacy_cached.deinit(testing.allocator);
+    const upgraded = try std.Io.Dir.cwd().readFileAlloc(testing.io, metadata, testing.allocator, .limited(256));
+    defer testing.allocator.free(upgraded);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, upgraded, "\n"));
+
+    // Legacy metadata still hashes before it is trusted, including for a
+    // same-size corruption that a size-only immutable-object check cannot see.
+    try fc.publishBytes(testing.io, metadata, legacy);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "corrupt payload!" });
+    const same_size_corrupt = try fc.readFreshUrlCache(testing.io, metadata, "source");
+    defer if (same_size_corrupt) |result| result.deinit(testing.allocator);
+    try testing.expect(same_size_corrupt == null);
+
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "corrupt" });
-    try testing.expect((try fc.readFreshUrlCache(testing.io, metadata, "source")) == null);
+    const wrong_size_corrupt = try fc.readFreshUrlCache(testing.io, metadata, "source");
+    defer if (wrong_size_corrupt) |result| result.deinit(testing.allocator);
+    try testing.expect(wrong_size_corrupt == null);
     fc.setTarballTtl(0);
     try testing.expect((try fc.readFreshUrlCache(testing.io, metadata, "source")) == null);
+}
+
+test "URL generation pruning uses explicit timestamps and removes legacy orphans" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var fc = FetchCache.init(testing.allocator);
+    defer fc.deinit();
+    fc.setIo(testing.io);
+    try fc.setCacheRoot(root);
+    fc.setTarballTtl(10);
+
+    const old_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const fresh_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const orphan_hash = "cccccccccccccccccccccccccccccccc";
+    const old_url = try fc.urlCachePath(testing.io, "source", old_hash);
+    defer testing.allocator.free(old_url);
+    const fresh_url = try fc.urlCachePath(testing.io, "source", fresh_hash);
+    defer testing.allocator.free(fresh_url);
+    try fc.publishBytes(testing.io, old_url, "old");
+    try fc.publishBytes(testing.io, fresh_url, "new");
+    try fc.noteUrlGenerationAtRoot(testing.io, root, old_hash, 79);
+    try fc.noteUrlGenerationAtRoot(testing.io, root, fresh_hash, 89);
+    try fc.noteUrlGenerationAtRoot(testing.io, root, fresh_hash, 91);
+    const superseded_marker = try std.fs.path.join(testing.allocator, &.{ root, "url-generations", fresh_hash[0..32], "89" });
+    defer testing.allocator.free(superseded_marker);
+    try testing.expect(!try hostPathExists(testing.io, superseded_marker));
+
+    const old_metadata = try fc.urlMetadataPath(root, "https://old.invalid/source");
+    defer testing.allocator.free(old_metadata);
+    const fresh_metadata = try fc.urlMetadataPath(root, "https://fresh.invalid/source");
+    defer testing.allocator.free(fresh_metadata);
+    try fc.writeUrlMetadataAt(testing.io, old_metadata, 79, old_hash, 3);
+    try fc.writeUrlMetadataAt(testing.io, fresh_metadata, 91, fresh_hash, 3);
+
+    const orphan_url = try std.fs.path.join(testing.allocator, &.{ root, "url", orphan_hash, "source" });
+    defer testing.allocator.free(orphan_url);
+    const orphan_tarball = try std.fs.path.join(testing.allocator, &.{ root, "tarball", orphan_hash, "source", "default.nix" });
+    defer testing.allocator.free(orphan_tarball);
+    try fc.publishBytes(testing.io, orphan_url, "orphan");
+    try fc.publishBytes(testing.io, orphan_tarball, "{}\n");
+
+    try fc.pruneUrlCache(testing.io, root, 100);
+    try testing.expect(!try hostPathExists(testing.io, old_url));
+    try testing.expect(!try hostPathExists(testing.io, old_metadata));
+    try testing.expect(try hostPathExists(testing.io, fresh_url));
+    try testing.expect(try hostPathExists(testing.io, fresh_metadata));
+    try testing.expect(!try hostPathExists(testing.io, orphan_url));
+    try testing.expect(!try hostPathExists(testing.io, orphan_tarball));
 }
 
 test "http-connections zero remains truly unlimited" {
@@ -1571,9 +1859,11 @@ test "remote URL retries transient status then reuses the verified TTL cache" {
 
     const first = try fc.fetchUrl(&files, .{ .url = url, .name = "source" }, null);
     defer first.deinit(testing.allocator);
+    try testing.expect(!first.cached);
     thread.join();
     const second = try fc.fetchUrl(&files, .{ .url = url, .name = "source" }, null);
     defer second.deinit(testing.allocator);
+    try testing.expect(second.cached);
     try testing.expectEqualStrings(first.hash, second.hash);
     try testing.expectEqualStrings(first.path, second.path);
 }

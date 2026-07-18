@@ -194,8 +194,8 @@ pub fn sourceLabel(source: SourceArg) []const u8 {
 /// store-writing subcommands (`instantiate`, `build`).
 pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !u8 {
     switch (err) {
-        error.DaemonError => std.debug.print("error: daemon: {s}\n", .{ev.lastStoreError() orelse "unknown"}),
-        error.StoreUnavailable => std.debug.print("error: cannot reach the nix-daemon (is it running?)\n", .{}),
+        error.DaemonError => render.messageError(io, use_color, "daemon: {s}", .{ev.lastStoreError() orelse "unknown"}),
+        error.StoreUnavailable => render.messageError(io, use_color, "cannot reach the nix-daemon (is it running?)", .{}),
         else => try render.evalFailure(io, use_color, show_trace, ev, source, err),
     }
     return 1;
@@ -206,11 +206,11 @@ pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Ev
 /// only render store-side state. Evaluation already succeeded by the time a
 /// build runs — there are no eval diagnostics to lose — and the daemon's own
 /// message (still owned by the surviving RealizationStore) is the useful part.
-pub fn buildFailure(last_store_error: ?[]const u8, err: anyerror) u8 {
+pub fn buildFailure(io: std.Io, use_color: bool, last_store_error: ?[]const u8, err: anyerror) u8 {
     switch (err) {
-        error.DaemonError => std.debug.print("error: daemon: {s}\n", .{last_store_error orelse "unknown"}),
-        error.StoreUnavailable => std.debug.print("error: cannot reach the nix-daemon (is it running?)\n", .{}),
-        else => std.debug.print("error: build failed: {s}\n", .{@errorName(err)}),
+        error.DaemonError => render.messageError(io, use_color, "daemon: {s}", .{last_store_error orelse "unknown"}),
+        error.StoreUnavailable => render.messageError(io, use_color, "cannot reach the nix-daemon (is it running?)", .{}),
+        else => render.messageError(io, use_color, "build failed: {s}", .{@errorName(err)}),
     }
     return 1;
 }

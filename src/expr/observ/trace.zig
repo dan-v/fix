@@ -5,6 +5,16 @@ const diagnostic = @import("syntax").diagnostic;
 
 pub const Trace = struct {
     pub const Frame = struct {
+        pub const Kind = enum {
+            /// A message supplied by `builtins.addErrorContext` (or an
+            /// equivalent VM operation).  It is already complete prose and
+            /// must not be prefixed by the renderer.
+            context,
+            /// A VM stack frame synthesized from a source span.
+            evaluation,
+        };
+
+        kind: Kind,
         message: []u8,
         diagnostic: ?diagnostic.Diagnostic = null,
         source_path: ?[]u8 = null,
@@ -19,7 +29,7 @@ pub const Trace = struct {
     message: ?[]u8 = null,
     frames: std.ArrayListUnmanaged(Frame) = .empty,
     captured_stack: bool = false,
-    /// When true, frame-mutating ops (pushFrame, pushDiagnosticFrame,
+    /// When true, frame-mutating ops (pushContext, pushDiagnosticFrame,
     /// captureErrorTrace's stack walk) become no-ops; only the message
     /// is captured. Used by per-fiber scratch traces during speculative
     /// thunk forces — sticky-error caching only needs the message, so
@@ -55,9 +65,10 @@ pub const Trace = struct {
         try self.setMessage(message);
     }
 
-    pub fn pushFrame(self: *Trace, frame: []const u8) !void {
+    pub fn pushContext(self: *Trace, frame: []const u8) !void {
         if (self.frames_disabled) return;
         try self.frames.append(self.allocator, .{
+            .kind = .context,
             .message = try self.allocator.dupe(u8, frame),
         });
     }
@@ -72,6 +83,7 @@ pub const Trace = struct {
         var owned_frame = frame;
         owned_frame.message = message;
         try self.frames.append(self.allocator, .{
+            .kind = .evaluation,
             .message = message,
             .diagnostic = owned_frame,
             .source_path = owned_path,

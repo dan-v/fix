@@ -61,7 +61,8 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer if (!torn) progress.deinit(false);
     if (term.progressEnabled()) ev.setObserver(progress.observer());
     var build_progress = build_progress_ui.BuildProgress.init(allocator, init.io, term.color_depth, term.log_progress, &progress);
-    const build_sink = build_progress.sink();
+    var build_operation = build_progress.operation();
+    const build_sink = build_operation.sink();
 
     // Collect the output paths whose bin/ dirs go on PATH. Owned copies —
     // they must survive the evaluator's build-phase memory release (which
@@ -78,6 +79,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         try realizeSource(allocator, init, &ev, process.eval_release, term, options, build_sink, &out_paths);
 
     // Tear progress state down before the shell/command takes over.
+    build_operation.finish(failed == null);
     build_progress.deinit();
     progress.deinit(failed == null);
     torn = true;
@@ -120,11 +122,11 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     // heap (see build.zig) concurrently with the build phase, which can run
     // for minutes and needs only the daemon connection.
     var build_session = ev.beginBuildPhase(derived.items, release_action) catch |err| {
-        return eval_support.buildFailure(ev.lastStoreError(), err);
+        return eval_support.buildFailure(init.io, term.use_color, ev.lastStoreError(), err);
     };
     defer build_session.deinit();
     build_session.buildPaths(derived.items, sink, eval_support.buildMode(options)) catch |err| {
-        return eval_support.buildFailure(build_session.lastStoreError(), err);
+        return eval_support.buildFailure(init.io, term.use_color, build_session.lastStoreError(), err);
     };
     return null;
 }
@@ -158,11 +160,11 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     // See realizePackages: results are copied out, so free the language heap
     // concurrently with the build phase.
     var build_session = ev.beginBuildPhase(&.{derived}, release_action) catch |err| {
-        return eval_support.buildFailure(ev.lastStoreError(), err);
+        return eval_support.buildFailure(init.io, term.use_color, ev.lastStoreError(), err);
     };
     defer build_session.deinit();
     build_session.buildPaths(&.{derived}, sink, eval_support.buildMode(options)) catch |err| {
-        return eval_support.buildFailure(build_session.lastStoreError(), err);
+        return eval_support.buildFailure(init.io, term.use_color, build_session.lastStoreError(), err);
     };
     return null;
 }

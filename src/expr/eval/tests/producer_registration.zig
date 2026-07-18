@@ -5,6 +5,7 @@ const RealizationStore = @import("store").RealizationStore;
 const Value = @import("runtime").value.Value;
 const ObjectId = @import("runtime").types.ObjectId;
 const nar = @import("store").nar;
+const derivation = @import("store").derivation;
 const FakeDaemon = @import("store").realization.testing.FakeDaemon;
 
 fn recipeInspectionAvailable() bool {
@@ -278,6 +279,26 @@ test "storeless fetchurl records retained flat file identity" {
         try expectEffect(fixture.fake, 0, .flat, storePathSubject(store_path), "fetch payload", &.{});
         try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.recipeCountForTest());
     } else return error.MissingRecipeInspectionApi;
+}
+
+test "hashed fetchTarball skips fetching when its derived store path is valid" {
+    var fixture = try Fixture.init(std.testing.allocator, true);
+    defer fixture.deinit();
+    const hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    const store_path = try derivation.sourcePath(fixture.allocator, fixture.store_dir, "cached-source", hash);
+    defer fixture.allocator.free(store_path);
+    try fixture.fake.markValid(store_path);
+
+    const value = try fixture.ev.evaluate(
+        \\builtins.fetchTarball {
+        \\  url = "file:///definitely/missing/fix-cache-fast-path.tar.xz";
+        \\  name = "cached-source";
+        \\  sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+        \\}
+    );
+    try std.testing.expectEqualStrings(store_path, try valueText(&fixture, value));
+    try std.testing.expectEqual(@as(usize, 1), fixture.fake.count(.query));
+    try std.testing.expectEqual(@as(usize, 0), fixture.fake.effectCount());
 }
 
 test "realizeOutput realizes a mixed producer closure before the root derivation build" {

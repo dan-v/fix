@@ -5,6 +5,8 @@
 //! or nothing. A disabled or verbosity-filtered span returns before reading a
 //! clock, copying a subject, taking a lock, or calling through the sink.
 
+const std = @import("std");
+
 pub const Level = u8;
 
 pub const SpanSpec = struct {
@@ -94,6 +96,10 @@ pub const Metric = struct {
 };
 
 pub const Finish = struct {
+    /// Override the span's ordinary successful completion verb. Used when the
+    /// operation completed with a more specific outcome such as `cached`, or
+    /// when `fail` closes it with an explicit failure record.
+    verb: ?[]const u8 = null,
     details: ?Details = null,
     metrics: []const Metric = &.{},
 };
@@ -222,6 +228,13 @@ pub const Span = struct {
 
     pub fn cancel(self: *Span) void {
         self.close(.{}, false);
+    }
+
+    /// Close unsuccessfully while retaining an explicit terminal record.
+    /// `completion.verb` must describe the failure (for example `failed`).
+    pub fn fail(self: *Span, completion: Finish) void {
+        std.debug.assert(completion.verb != null);
+        self.close(completion, false);
     }
 
     pub fn update(self: *const Span, metrics: []const Metric) void {

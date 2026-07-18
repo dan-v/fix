@@ -192,7 +192,11 @@ pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype) anyerror!@
                 .{ .name = "downloaded", .value = .{ .unsigned = report_store.downloaded }, .unit = .bytes },
                 .{ .name = "total", .value = .{ .unsigned = report_store.total }, .unit = .bytes },
             };
-            span.finish(.{ .metrics = if (report_store.reported) &metrics else &.{} });
+            const cached = if (comptime @hasField(Res, "cached")) c.res.cached else false;
+            span.finish(.{
+                .verb = if (cached) "cached" else null,
+                .metrics = if (report_store.reported) &metrics else &.{},
+            });
         }
     };
     var cell: Cell = .{ .fetchers = self.fetchers, .files = self.files, .spec = spec, .observer = self.observer };
@@ -354,14 +358,17 @@ pub fn builtinFetchurl(self: *VM, arg: Value) !Value {
     // determined by (name, sha256), so return it without fetching. The download
     // is deferred (registered as a pending fetch) and runs only if the path's
     // content is later demanded — offline for path-only use, still correct for
-    // import-from-derivation. Store writes keep the eager fetch+materialize path.
+    // import-from-derivation. With store writes, first ask the daemon whether
+    // the hash-derived path is already valid; only a miss fetches bytes.
     if (expected_hash) |expected| {
+        const store_path = try derivation.fixedOutputPath(self.allocator, self.realization.store_dir, spec.name, "out", "sha256", expected);
+        defer self.allocator.free(store_path);
         if (!self.realization.storeWritesEnabled()) {
-            const store_path = try derivation.fixedOutputPath(self.allocator, self.realization.store_dir, spec.name, "out", "sha256", expected);
-            defer self.allocator.free(store_path);
             try self.realization.recordPendingFetch(store_path, spec.url, spec.name, false, expected);
             return contextStringWithPath(self, try self.intern.intern(store_path));
         }
+        if (try self.realization.pathIsValid(store_path))
+            return contextStringWithPath(self, try self.intern.intern(store_path));
     }
 
     const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed());
@@ -479,14 +486,17 @@ pub fn builtinFetchTarball(self: *VM, arg: Value) !Value {
     // Plain eval with a known hash: the recursive fixed-output path is fully
     // determined by (name, sha256), so return it without fetching (deferred like
     // fetchurl above). Content demand (readFile into the tree, import) triggers
-    // the fetch+unpack lazily. Store writes keep the eager ingest path.
+    // the fetch+unpack lazily. With store writes, the supplied hash determines
+    // the exact store path, so a valid daemon path skips fetch and NAR hashing.
     if (expected_hash) |expected| {
+        const store_path = try derivation.sourcePath(self.allocator, self.realization.store_dir, tree_name, expected);
+        defer self.allocator.free(store_path);
         if (!self.realization.storeWritesEnabled()) {
-            const store_path = try derivation.sourcePath(self.allocator, self.realization.store_dir, tree_name, expected);
-            defer self.allocator.free(store_path);
             try self.realization.recordPendingFetch(store_path, spec.url, tree_name, true, expected);
             return contextStringWithPath(self, try self.intern.intern(store_path));
         }
+        if (try self.realization.pathIsValid(store_path))
+            return contextStringWithPath(self, try self.intern.intern(store_path));
     }
 
     const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{

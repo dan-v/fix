@@ -30,11 +30,13 @@ const FailureStage = enum { none, evaluation, derivation, closure };
 
 const BuildSlot = struct {
     request: Evaluator.AsyncBuildRequest = undefined,
+    progress_operation: build_progress.Operation = undefined,
     request_paths: [1][]const u8 = undefined,
     drv_path: ?[]u8 = null,
     out_path: ?[]u8 = null,
     derived: ?[]u8 = null,
     evaluation_failure: ?[]u8 = null,
+    build_failure: ?anyerror = null,
     failure_stage: FailureStage = .none,
 
     fn deinit(self: *BuildSlot, allocator: std.mem.Allocator) void {
@@ -93,12 +95,24 @@ const OrderedPrinter = struct {
     ev: *Evaluator,
     options: args.Options,
     slots: []BuildSlot,
+    use_color: bool,
     failed: bool = false,
+
+    fn awaitAll(self: *OrderedPrinter) void {
+        for (self.slots) |*slot| {
+            slot.request.wait() catch |err| {
+                self.failed = true;
+                slot.build_failure = err;
+                slot.progress_operation.finish(false);
+                continue;
+            };
+            slot.progress_operation.finish(true);
+        }
+    }
 
     fn run(self: *OrderedPrinter) void {
         for (self.slots, 0..) |*slot, index| {
-            slot.request.wait() catch |err| {
-                self.failed = true;
+            if (slot.build_failure) |err| {
                 if (slot.evaluation_failure) |text| {
                     self.writeFailure(text);
                     continue;
@@ -110,18 +124,18 @@ const OrderedPrinter = struct {
                     .none => "build",
                 };
                 if (err == error.NotDerivation) {
-                    std.debug.print("error: input {d} did not evaluate to a derivation\n", .{index + 1});
+                    render.messageError(self.io, self.use_color, "input {d} did not evaluate to a derivation", .{index + 1});
                 } else {
                     if (slot.failure_stage == .none) {
                         if (self.ev.lastStoreError()) |message| {
-                            std.debug.print("error: input {d} build failed: {s}\n", .{ index + 1, message });
+                            render.messageError(self.io, self.use_color, "input {d} build failed: {s}", .{ index + 1, message });
                             continue;
                         }
                     }
-                    std.debug.print("error: input {d} {s} failed: {s}\n", .{ index + 1, stage, @errorName(err) });
+                    render.messageError(self.io, self.use_color, "input {d} {s} failed: {s}", .{ index + 1, stage, @errorName(err) });
                 }
                 continue;
-            };
+            }
 
             const out_path = slot.out_path.?;
             self.linkOutput(index, out_path);
@@ -222,16 +236,17 @@ pub fn realizeMany(
     inputs: []const BuildInput,
 ) !u8 {
     var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, progress);
-    defer build_progress_state.deinit();
-    // Keep the typed daemon sink active even when progress is disabled: it
-    // still owns build-log labeling and terminal-safe color boundaries.
-    const sink = build_progress_state.sink();
+    var progress_torn_down = false;
+    defer if (!progress_torn_down) build_progress_state.deinit();
+    // Keep typed daemon sinks active even when progress is disabled: they
+    // still own build-log labeling and terminal-safe color boundaries.
 
     const slots = try allocator.alloc(BuildSlot, inputs.len);
     defer allocator.free(slots);
     for (slots) |*slot| {
         slot.* = .{};
-        slot.request = Evaluator.AsyncBuildRequest.init(slot.request_paths[0..], sink, eval_support.buildMode(options));
+        slot.progress_operation = build_progress_state.operation();
+        slot.request = Evaluator.AsyncBuildRequest.init(slot.request_paths[0..], slot.progress_operation.sink(), eval_support.buildMode(options));
     }
     defer for (slots) |*slot| slot.deinit(allocator);
 
@@ -250,7 +265,14 @@ pub fn realizeMany(
         .use_color = terminal.use_color,
         .show_trace = options.show_trace,
     };
-    var printer: OrderedPrinter = .{ .allocator = allocator, .io = io, .ev = ev, .options = options, .slots = slots };
+    var printer: OrderedPrinter = .{
+        .allocator = allocator,
+        .io = io,
+        .ev = ev,
+        .options = options,
+        .slots = slots,
+        .use_color = terminal.use_color,
+    };
     ev.evaluatePathsParallel(parallel_inputs, .{ .context = &pipeline, .complete_fn = Pipeline.complete });
 
     // Every demand fiber has either enqueued its build or completed its request
@@ -258,10 +280,11 @@ pub fn realizeMany(
     ev.releaseEvalState();
     if (release_action) |action| action.run(action.context);
 
-    printer.run();
-    const ok = !printer.failed;
+    printer.awaitAll();
     build_progress_state.deinit();
-    return if (ok) 0 else 1;
+    progress_torn_down = true;
+    printer.run();
+    return if (printer.failed) 1 else 0;
 }
 
 /// Evaluate and instantiate build inputs, then ask the daemon for its missing
@@ -300,11 +323,11 @@ pub fn dryRunMany(
     }
 
     var session = ev.beginBuildPhase(derived[0..derived_count], release_action) catch |err| {
-        return eval_support.buildFailure(ev.lastStoreError(), err);
+        return eval_support.buildFailure(io, terminal.use_color, ev.lastStoreError(), err);
     };
     defer session.deinit();
     var plan = session.queryMissing(derived[0..derived_count]) catch |err| {
-        return eval_support.buildFailure(session.lastStoreError(), err);
+        return eval_support.buildFailure(io, terminal.use_color, session.lastStoreError(), err);
     };
     defer plan.deinit();
 
@@ -368,16 +391,20 @@ pub fn realize(
     errdefer realized.deinit(allocator);
 
     var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, &progress);
-    const build_sink = build_progress_state.sink();
+    var build_operation = build_progress_state.operation();
+    const build_sink = build_operation.sink();
     var build_session = ev.beginBuildPhase(&.{derived}, release_action) catch |err| {
+        build_operation.finish(false);
         build_progress_state.deinit();
-        return .{ .failed = eval_support.buildFailure(ev.lastStoreError(), err) };
+        return .{ .failed = eval_support.buildFailure(io, terminal.use_color, ev.lastStoreError(), err) };
     };
     defer build_session.deinit();
     build_session.buildPaths(&.{derived}, build_sink, eval_support.buildMode(options)) catch |err| {
+        build_operation.finish(false);
         build_progress_state.deinit();
-        return .{ .failed = eval_support.buildFailure(build_session.lastStoreError(), err) };
+        return .{ .failed = eval_support.buildFailure(io, terminal.use_color, build_session.lastStoreError(), err) };
     };
+    build_operation.finish(true);
     build_progress_state.deinit();
     progress.deinit(true);
     torn_down = true;
