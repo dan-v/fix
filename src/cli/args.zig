@@ -483,6 +483,8 @@ const specs = [_]Spec{
     .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress", .show_in = eval_cmds },
     .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC collection budget (MiB,\nor with a k/m/g suffix; 0 = never collect).\nDefault: auto, scaled to RAM.", .show_in = eval_cmds },
     .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds },
+    .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .help = "write a Perfetto timeline to PATH\n(default: fix-timeline.json)", .show_in = &.{.eval} },
+    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "N|off|all", .help = "record every Nth scheduler steal flow\n(default: all)", .show_in = &.{.eval} },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
     .{ .id = .bare, .long = "--bare", .help = "plain line-based input: no editor, no escape\nsequences (for pipes and expect-style automation)", .show_in = &.{.repl} },
@@ -519,8 +521,6 @@ const specs = [_]Spec{
     .{ .id = .print_sched_stats, .long = "--print-sched-stats", .hidden = true },
     .{ .id = .mem_report, .long = "--mem-report", .arg = .opt, .metavar = "dump", .hidden = true },
     .{ .id = .gc_report, .long = "--gc-report", .hidden = true },
-    .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .hidden = true },
-    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "N", .hidden = true },
 };
 
 fn findLong(name: []const u8) ?*const Spec {
@@ -925,6 +925,21 @@ test "progress surface selects enabled or disabled records" {
 
     const old_log_argv = [_][*:0]const u8{ "fix", "--progress=log" };
     try std.testing.expectError(error.UnexpectedValue, parseForTest(&old_log_argv, .eval));
+}
+
+test "eval help exposes Perfetto timeline controls" {
+    var buffer: [32 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeHelpInner(&writer, "usage: fix eval", .eval);
+    const eval_help = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, eval_help, "--timeline[=PATH]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, eval_help, "--timeline-flows N|off|all") != null);
+    try std.testing.expect(std.mem.indexOf(u8, eval_help, "Perfetto timeline") != null);
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try writeHelpInner(&writer, "usage: fix build", .build);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "--timeline") == null);
 }
 
 test "verbosity accepts clustered short flags" {
