@@ -1,18 +1,17 @@
-//! The `:disasm` browser: bytecode chunks as linked pages.
+//! The `:disasm` TUI: a chunk graph beside the selected disassembly.
 //!
-//! A chunk renders as one page (via `bytecode.disasm`); every line that
-//! mentions another chunk is a link. Tab/Shift-Tab move between links, Enter
-//! follows one, `b` unwinds the visit stack, `r` opens a refs page (outgoing
-//! + incoming) for the current chunk. `/`-search, `n`/`N`, and the usual
-//! pager movement keys. Runs on the alternate screen so the shell's
-//! scrollback is untouched; the plain (`--bare`/non-tty) fallback prints the
-//! same text non-interactively.
+//! Interactive use is deliberately a TUI rather than a pager: the chunk graph
+//! is persistent navigation, the disassembly is a separately scrollable pane,
+//! and a header/footer make focus and available actions explicit. It runs on
+//! the alternate screen and returns to the ordinary repl prompt on exit. The
+//! plain (`--bare`/non-tty) fallback prints the same disassembly directly.
 
 const std = @import("std");
 const engine = @import("expr");
 const runtime = @import("runtime");
 const term_mod = @import("term.zig");
 const keys_mod = @import("keys.zig");
+const width_mod = @import("width.zig");
 const ColorDepth = @import("base").terminal_color.Depth;
 
 const Evaluator = engine.Evaluator;
@@ -23,90 +22,145 @@ const disasm = engine.bytecode.disasm;
 const disasm_options: disasm.Options = .{
     .show_constants = true,
     .show_source = true,
+    .show_bytes = true,
     .recurse = false,
 };
 
-/// Non-interactive `:d`: the chunk's disassembly plus a references footer.
+/// Dense chunk-id range captured around one repl evaluation. Unlike the CLI's
+/// fresh evaluator, a repl has a long-lived registry, so `--eval` should show
+/// the chunks produced by this input rather than every chunk in the session.
+pub const Corpus = struct {
+    first: ChunkId,
+    end: ChunkId,
+
+    pub fn count(self: Corpus) usize {
+        return @intCast(self.end -| self.first);
+    }
+
+    pub fn contains(self: Corpus, id: ChunkId) bool {
+        return id >= self.first and id < self.end;
+    }
+};
+
+/// Non-interactive `:d`: the same chunk disassembly without terminal chrome.
 pub fn writePlain(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Evaluator, chunk_id: ChunkId) !void {
+    const symbols: disasm.Symbols = .{ .intern = ev.internTable(), .registry = ev.chunkRegistry() };
+    var ref_graph: ?bytecode.inspect.RefGraph = bytecode.inspect.RefGraph.build(allocator, ev.chunkRegistry()) catch null;
+    defer if (ref_graph) |*graph| graph.deinit();
+    var options = disasm_options;
+    options.refs = if (ref_graph) |*graph| graph else null;
+    try writeChunk(allocator, w, ev, chunk_id, symbols, options);
+}
+
+/// Bare-mode `:de`: dump each chunk captured by the evaluation once, in
+/// registry order, matching `fix disasm --eval` on its fresh registry.
+pub fn writePlainCorpus(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Evaluator, corpus: Corpus) !void {
+    const symbols: disasm.Symbols = .{ .intern = ev.internTable(), .registry = ev.chunkRegistry() };
+    var ref_graph: ?bytecode.inspect.RefGraph = bytecode.inspect.RefGraph.build(allocator, ev.chunkRegistry()) catch null;
+    defer if (ref_graph) |*graph| graph.deinit();
+    var options = disasm_options;
+    options.refs = if (ref_graph) |*graph| graph else null;
+
+    var id = corpus.first;
+    var first = true;
+    while (id < corpus.end) : (id += 1) {
+        if (ev.getChunk(id) == null) continue;
+        if (!first) try w.writeByte('\n');
+        first = false;
+        try writeChunk(allocator, w, ev, id, symbols, options);
+    }
+}
+
+fn writeChunk(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    ev: *Evaluator,
+    chunk_id: ChunkId,
+    symbols: disasm.Symbols,
+    options: disasm.Options,
+) !void {
     const chunk = ev.getChunk(chunk_id) orelse {
         try w.print("chunk #{d} not found\n", .{chunk_id});
         return;
     };
-    const symbols: disasm.Symbols = .{ .intern = ev.internTable(), .registry = ev.chunkRegistry() };
-    try disasm.writeChunk(allocator, w, chunk_id, chunk, symbols, disasm_options);
-
-    var refs: std.ArrayListUnmanaged(ChunkId) = .empty;
-    defer refs.deinit(allocator);
-    bytecode.inspect.collectRefs(allocator, chunk, &refs) catch {};
-    if (refs.items.len > 0) {
-        try w.writeAll("\nreferences:");
-        for (refs.items) |id| try w.print(" #{d}", .{id});
-        try w.writeAll("\n");
-    }
+    try disasm.writeChunk(allocator, w, chunk_id, chunk, symbols, options);
 }
 
-/// One rendered page: a disasm listing or a refs listing.
+/// One rendered disassembly (or the help screen).
 const Page = struct {
     title: []u8,
     lines: [][]u8,
-    /// line index → chunk id it links to.
-    links: []Link,
-
-    const Link = struct { line: usize, target: ChunkId };
 };
 
 /// A stack entry remembers where you were on the page you left.
 const Visit = struct {
     kind: Kind,
     scroll: usize = 0,
-    link: usize = 0,
+    ref_selection: usize = 0,
+    x_scroll: usize = 0,
 
     const Kind = union(enum) {
         chunk: ChunkId,
-        refs: ChunkId,
         help,
     };
 };
 
-pub fn browse(allocator: std.mem.Allocator, io: std.Io, ev: *Evaluator, start: ChunkId, color_depth: ColorDepth) !void {
-    var pager = Pager{
+pub fn browse(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ev: *Evaluator,
+    start: ChunkId,
+    color_depth: ColorDepth,
+    corpus: ?Corpus,
+) !void {
+    var ref_graph = try bytecode.inspect.RefGraph.build(allocator, ev.chunkRegistry());
+    defer ref_graph.deinit();
+    var tui = Tui{
         .allocator = allocator,
         .io = io,
         .ev = ev,
         .color_depth = color_depth,
+        .ref_graph = &ref_graph,
+        .corpus = corpus,
+        .nav_mode = if (corpus != null) .corpus else .references,
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
-    defer pager.deinit();
-    try pager.run(start);
+    defer tui.deinit();
+    try tui.run(start);
 }
 
-const Pager = struct {
+const Tui = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     ev: *Evaluator,
     color_depth: ColorDepth,
-    /// Pages + reverse-ref cache live here for the whole browse session.
+    ref_graph: *const bytecode.inspect.RefGraph,
+    corpus: ?Corpus,
+    /// Rendered pages live here for the whole browse session.
     arena: std.heap.ArenaAllocator,
 
     stack: std.ArrayListUnmanaged(Visit) = .empty,
     forward: std.ArrayListUnmanaged(Visit) = .empty,
     page: Page = undefined,
     scroll: usize = 0,
-    /// Selected link index into page.links (or none).
-    link: usize = 0,
     search: std.ArrayListUnmanaged(u8) = .empty,
     status_msg: []const u8 = "",
-    /// Incoming-reference index, built lazily on first use.
-    incoming: ?std.AutoArrayHashMapUnmanaged(ChunkId, std.ArrayListUnmanaged(ChunkId)) = null,
+    focus: Focus = .disassembly,
+    ref_selection: usize = 0,
+    x_scroll: usize = 0,
+    nav_mode: NavMode,
 
-    fn deinit(self: *Pager) void {
+    const Focus = enum { chunks, disassembly };
+    const NavMode = enum { corpus, references };
+
+    fn deinit(self: *Tui) void {
         self.stack.deinit(self.allocator);
         self.forward.deinit(self.allocator);
         self.search.deinit(self.allocator);
         self.arena.deinit();
     }
 
-    fn run(self: *Pager, start: ChunkId) !void {
+    fn run(self: *Tui, start: ChunkId) !void {
         var raw = term_mod.RawMode.enable() catch return;
         defer raw.disable();
 
@@ -137,132 +191,73 @@ const Pager = struct {
             events.clearRetainingCapacity();
             switch (result) {
                 .timeout => try decoder.idleFlush(self.allocator, &events),
-                .winch => continue, // sizes are re-read every draw
+                .winch => {
+                    self.page = try self.buildPage(self.currentKind());
+                    self.clampScroll();
+                    self.x_scroll = @min(self.x_scroll, self.maxXScroll());
+                    continue;
+                },
                 .eof => return,
                 .data => |n| for (read_buf[0..n]) |b| try decoder.feed(self.allocator, b, &events),
             }
             for (events.items) |key| {
-                if (!try self.handleKey(w, key)) return;
+                if (!try self.handleKey(key)) return;
             }
         }
     }
 
     // -- page construction ---------------------------------------------------
 
-    fn buildPage(self: *Pager, kind: Visit.Kind) !Page {
+    fn buildPage(self: *Tui, kind: Visit.Kind) !Page {
         const arena = self.arena.allocator();
         switch (kind) {
             .chunk => |id| {
                 const chunk = self.ev.getChunk(id) orelse {
                     return .{
-                        .title = try std.fmt.allocPrint(arena, "chunk #{d} (not found)", .{id}),
+                        .title = try std.fmt.allocPrint(arena, "chunk[0x{x}] (not found)", .{id}),
                         .lines = &.{},
-                        .links = &.{},
                     };
                 };
                 var text: std.Io.Writer.Allocating = .init(arena);
                 const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
                 var options = disasm_options;
                 options.color_depth = self.color_depth;
+                options.refs = self.ref_graph;
+                options.line_width = @intCast(@min(self.layout().main_width, std.math.maxInt(u16)));
                 try disasm.writeChunk(arena, &text.writer, id, chunk, symbols, options);
                 const lines = try splitLines(arena, text.written());
                 return .{
-                    .title = try std.fmt.allocPrint(arena, "chunk #{d}", .{id}),
+                    .title = try std.fmt.allocPrint(arena, "chunk[0x{x}]", .{id}),
                     .lines = lines,
-                    .links = try scanLinks(arena, lines, id),
-                };
-            },
-            .refs => |id| {
-                var lines: std.ArrayListUnmanaged([]u8) = .empty;
-                var links: std.ArrayListUnmanaged(Page.Link) = .empty;
-
-                try lines.append(arena, try std.fmt.allocPrint(arena, "references of chunk #{d}", .{id}));
-                try lines.append(arena, try arena.dupe(u8, ""));
-
-                var out_refs: std.ArrayListUnmanaged(ChunkId) = .empty;
-                defer out_refs.deinit(self.allocator);
-                if (self.ev.getChunk(id)) |chunk| {
-                    bytecode.inspect.collectRefs(self.allocator, chunk, &out_refs) catch {};
-                }
-                try lines.append(arena, try std.fmt.allocPrint(arena, "outgoing ({d}):", .{out_refs.items.len}));
-                for (out_refs.items) |ref| {
-                    try links.append(arena, .{ .line = lines.items.len, .target = ref });
-                    try lines.append(arena, try self.chunkSummaryLine(arena, ref));
-                }
-
-                try lines.append(arena, try arena.dupe(u8, ""));
-                const in_refs = try self.incomingRefs(id);
-                try lines.append(arena, try std.fmt.allocPrint(arena, "incoming ({d}):", .{in_refs.len}));
-                for (in_refs) |ref| {
-                    try links.append(arena, .{ .line = lines.items.len, .target = ref });
-                    try lines.append(arena, try self.chunkSummaryLine(arena, ref));
-                }
-
-                return .{
-                    .title = try std.fmt.allocPrint(arena, "refs #{d}", .{id}),
-                    .lines = lines.items,
-                    .links = links.items,
                 };
             },
             .help => {
                 const help_text =
-                    \\The disassembly browser
+                    \\The disassembly TUI
                     \\
-                    \\  j/k, arrows     scroll        d/u, PgDn/PgUp  half/full page
+                    \\  Tab             switch chunk/disassembly focus
+                    \\  j/k, arrows     move in the focused pane
+                    \\  Enter           open the selected chunk reference
+                    \\  c / r           evaluation corpus / chunk references
+                    \\  h/l             scroll disassembly horizontally
+                    \\  d/u, PgDn/PgUp  half/full page
                     \\  g/G             top/bottom
-                    \\  Tab/Shift-Tab   select next/previous chunk link
-                    \\  Enter           follow the selected link
-                    \\  b / f           back / forward through visited pages
-                    \\  r               references page (outgoing + incoming)
+                    \\  b / f           back / forward through visited chunks
                     \\  /               search; n/N next/previous match
                     \\  ?               this help
                     \\  q               leave the browser
                     \\
-                    \\Every chunk mention (`chunk[0xN]` in a listing,
-                    \\`chunk #N` on a references page) is a link: the
-                    \\compiled program is a graph — browse it like pages.
+                    \\For :de, the chunk pane starts with every chunk produced
+                    \\by evaluation; `r` switches it to outgoing (→) and
+                    \\incoming (←) references. On a narrow terminal, Tab
+                    \\switches panes instead of splitting them.
                 ;
                 return .{
                     .title = try arena.dupe(u8, "help"),
                     .lines = try splitLines(arena, help_text),
-                    .links = &.{},
                 };
             },
         }
-    }
-
-    fn chunkSummaryLine(self: *Pager, arena: std.mem.Allocator, id: ChunkId) ![]u8 {
-        if (self.ev.getChunk(id)) |chunk| {
-            return std.fmt.allocPrint(arena, "  chunk #{d}  ({d} bytes, {d} consts, arity {d})", .{
-                id, chunk.code.len, chunk.constants.len, chunk.arity,
-            });
-        }
-        return std.fmt.allocPrint(arena, "  chunk #{d}", .{id});
-    }
-
-    /// Build (once) the whole-registry reverse reference index.
-    fn incomingRefs(self: *Pager, id: ChunkId) ![]const ChunkId {
-        if (self.incoming == null) {
-            const arena = self.arena.allocator();
-            var map: std.AutoArrayHashMapUnmanaged(ChunkId, std.ArrayListUnmanaged(ChunkId)) = .empty;
-            const count = self.ev.chunkRegistry().count();
-            var refs: std.ArrayListUnmanaged(ChunkId) = .empty;
-            defer refs.deinit(self.allocator);
-            var cid: ChunkId = 0;
-            while (cid < count) : (cid += 1) {
-                const chunk = self.ev.getChunk(cid) orelse continue;
-                refs.clearRetainingCapacity();
-                bytecode.inspect.collectRefs(self.allocator, chunk, &refs) catch continue;
-                for (refs.items) |target| {
-                    const gop = try map.getOrPut(arena, target);
-                    if (!gop.found_existing) gop.value_ptr.* = .empty;
-                    try gop.value_ptr.append(arena, cid);
-                }
-            }
-            self.incoming = map;
-        }
-        if (self.incoming.?.get(id)) |list| return list.items;
-        return &.{};
     }
 
     fn splitLines(arena: std.mem.Allocator, text: []const u8) ![][]u8 {
@@ -278,55 +273,116 @@ const Pager = struct {
         return lines.items;
     }
 
-    /// Every line (except the page's own header) that mentions a chunk —
-    /// `chunk #N` (the pager's own pages, decimal) or `chunk[0xN]` (disasm
-    /// listings, hex) — becomes a link to N.
-    fn scanLinks(arena: std.mem.Allocator, lines: [][]u8, self_id: ChunkId) ![]Page.Link {
-        var links: std.ArrayListUnmanaged(Page.Link) = .empty;
-        for (lines, 0..) |line, i| {
-            const id = parseChunkMention(line) orelse continue;
-            if (i == 0 and id == self_id) continue; // the header names itself
-            try links.append(arena, .{ .line = i, .target = id });
-        }
-        return links.items;
+    // -- navigation ------------------------------------------------------------
+
+    const Layout = struct {
+        cols: usize,
+        rows: usize,
+        body_rows: usize,
+        split: bool,
+        sidebar_width: usize,
+        main_col: usize,
+        main_width: usize,
+    };
+
+    fn layout(_: *const Tui) Layout {
+        const size = term_mod.size();
+        const cols = @max(@as(usize, 1), size.cols);
+        const rows = @max(@as(usize, 3), size.rows);
+        const split = cols >= 96;
+        const sidebar_width = if (split) @min(@max(cols / 4, 26), 38) else 0;
+        return .{
+            .cols = cols,
+            .rows = rows,
+            .body_rows = rows - 2,
+            .split = split,
+            .sidebar_width = sidebar_width,
+            .main_col = if (split) sidebar_width + 2 else 1,
+            .main_width = if (split) cols - sidebar_width - 1 else cols,
+        };
     }
 
-    /// First chunk mention in `line`, either form.
-    fn parseChunkMention(line: []const u8) ?ChunkId {
-        if (std.mem.indexOf(u8, line, "chunk #")) |idx| {
-            const start = idx + "chunk #".len;
-            var end = start;
-            while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
-            if (end > start) return std.fmt.parseInt(ChunkId, line[start..end], 10) catch null;
+    fn currentKind(self: *const Tui) Visit.Kind {
+        return self.stack.items[self.stack.items.len - 1].kind;
+    }
+
+    fn currentChunk(self: *const Tui) ?ChunkId {
+        return switch (self.currentKind()) {
+            .chunk => |id| id,
+            .help => null,
+        };
+    }
+
+    const NavEntry = struct {
+        id: ChunkId,
+        kind: enum { corpus, outgoing, incoming },
+    };
+
+    fn referenceCount(self: *const Tui) usize {
+        const id = self.currentChunk() orelse return 0;
+        return self.ref_graph.outgoing(id).len + self.ref_graph.incoming(id).len;
+    }
+
+    fn navCount(self: *const Tui) usize {
+        return switch (self.nav_mode) {
+            .corpus => if (self.corpus) |corpus| corpus.count() else 0,
+            .references => self.referenceCount(),
+        };
+    }
+
+    fn navAt(self: *const Tui, index: usize) ?NavEntry {
+        if (self.nav_mode == .corpus) {
+            const corpus = self.corpus orelse return null;
+            if (index >= corpus.count()) return null;
+            return .{ .id = corpus.first + @as(ChunkId, @intCast(index)), .kind = .corpus };
         }
-        if (std.mem.indexOf(u8, line, "chunk[0x")) |idx| {
-            const start = idx + "chunk[0x".len;
-            var end = start;
-            while (end < line.len and std.ascii.isHex(line[end])) end += 1;
-            if (end > start and end < line.len and line[end] == ']')
-                return std.fmt.parseInt(ChunkId, line[start..end], 16) catch null;
-        }
+        const id = self.currentChunk() orelse return null;
+        const outgoing = self.ref_graph.outgoing(id);
+        if (index < outgoing.len) return .{ .id = outgoing[index], .kind = .outgoing };
+        const incoming = self.ref_graph.incoming(id);
+        const incoming_index = index -| outgoing.len;
+        if (incoming_index < incoming.len) return .{ .id = incoming[incoming_index], .kind = .incoming };
         return null;
     }
 
-    // -- navigation ------------------------------------------------------------
+    fn moveReference(self: *Tui, forward: bool) void {
+        const count = self.navCount();
+        if (count == 0) return;
+        if (forward) {
+            self.ref_selection = @min(self.ref_selection + 1, count - 1);
+        } else {
+            self.ref_selection -|= 1;
+        }
+    }
 
-    fn open(self: *Pager, kind: Visit.Kind) !void {
+    fn open(self: *Tui, kind: Visit.Kind) !void {
         // Save current position into the top-of-stack visit.
         if (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
             top.scroll = self.scroll;
-            top.link = self.link;
+            top.ref_selection = self.ref_selection;
+            top.x_scroll = self.x_scroll;
         }
         try self.stack.append(self.allocator, .{ .kind = kind });
         self.forward.clearRetainingCapacity();
         self.page = try self.buildPage(kind);
         self.scroll = 0;
-        self.link = 0;
+        self.ref_selection = switch (kind) {
+            .chunk => |id| if (self.nav_mode == .corpus and self.corpus != null and self.corpus.?.contains(id))
+                @intCast(id - self.corpus.?.first)
+            else
+                0,
+            .help => 0,
+        };
+        self.x_scroll = 0;
+        switch (kind) {
+            .help => self.focus = .disassembly,
+            .chunk => {},
+        }
         self.status_msg = "";
     }
 
-    fn back(self: *Pager) !void {
+    fn back(self: *Tui) !void {
         if (self.stack.items.len < 2) {
             self.status_msg = "(bottom of history)";
             return;
@@ -335,11 +391,12 @@ const Pager = struct {
         const visit = self.stack.items[self.stack.items.len - 1];
         self.page = try self.buildPage(visit.kind);
         self.scroll = visit.scroll;
-        self.link = visit.link;
+        self.ref_selection = visit.ref_selection;
+        self.x_scroll = visit.x_scroll;
         self.status_msg = "";
     }
 
-    fn goForward(self: *Pager) !void {
+    fn goForward(self: *Tui) !void {
         const visit = self.forward.pop() orelse {
             self.status_msg = "(top of history)";
             return;
@@ -347,89 +404,146 @@ const Pager = struct {
         if (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
             top.scroll = self.scroll;
-            top.link = self.link;
+            top.ref_selection = self.ref_selection;
+            top.x_scroll = self.x_scroll;
         }
         try self.stack.append(self.allocator, visit);
         self.page = try self.buildPage(visit.kind);
         self.scroll = visit.scroll;
-        self.link = visit.link;
+        self.ref_selection = visit.ref_selection;
+        self.x_scroll = visit.x_scroll;
         self.status_msg = "";
     }
 
-    fn contentRows(_: *const Pager) usize {
-        const rows = term_mod.size().rows;
-        return if (rows > 1) rows - 1 else 1;
+    fn contentRows(self: *const Tui) usize {
+        return self.layout().body_rows;
     }
 
-    fn maxScroll(self: *const Pager) usize {
+    fn maxScroll(self: *const Tui) usize {
         const rows = self.contentRows();
         return if (self.page.lines.len > rows) self.page.lines.len - rows else 0;
     }
 
-    fn clampScroll(self: *Pager) void {
+    fn clampScroll(self: *Tui) void {
         if (self.scroll > self.maxScroll()) self.scroll = self.maxScroll();
     }
 
-    /// Keep the selected link visible.
-    fn scrollToLink(self: *Pager) void {
-        if (self.page.links.len == 0) return;
-        const line = self.page.links[self.link].line;
-        const rows = self.contentRows();
-        if (line < self.scroll) self.scroll = line;
-        if (line >= self.scroll + rows) self.scroll = line - rows + 1;
+    fn maxXScroll(self: *const Tui) usize {
+        var widest: usize = 0;
+        for (self.page.lines) |line| widest = @max(widest, displayWidth(line));
+        return widest -| self.layout().main_width;
     }
 
-    fn handleKey(self: *Pager, w: *std.Io.Writer, key: keys_mod.Key) !bool {
-        _ = w;
+    fn handleKey(self: *Tui, key: keys_mod.Key) !bool {
         self.status_msg = "";
         if (key.isCtrl('c') or key.isCtrl('d')) return false;
         switch (key.code) {
             .cp => |cp| switch (cp) {
                 'q' => return false,
-                'j' => self.scroll = @min(self.scroll + 1, self.maxScroll()),
-                'k' => self.scroll -|= 1,
-                'd' => self.scroll = @min(self.scroll + self.contentRows() / 2, self.maxScroll()),
-                'u' => self.scroll -|= self.contentRows() / 2,
-                'g' => self.scroll = 0,
-                'G' => self.scroll = self.maxScroll(),
+                'j' => {
+                    if (self.focus == .chunks) {
+                        self.moveReference(true);
+                    } else {
+                        self.scroll = @min(self.scroll + 1, self.maxScroll());
+                    }
+                },
+                'k' => {
+                    if (self.focus == .chunks) {
+                        self.moveReference(false);
+                    } else {
+                        self.scroll -|= 1;
+                    }
+                },
+                'd' => {
+                    if (self.focus == .disassembly) self.scroll = @min(self.scroll + self.contentRows() / 2, self.maxScroll());
+                },
+                'u' => {
+                    if (self.focus == .disassembly) self.scroll -|= self.contentRows() / 2;
+                },
+                'g' => {
+                    if (self.focus == .chunks) self.ref_selection = 0 else self.scroll = 0;
+                },
+                'G' => {
+                    if (self.focus == .chunks) self.ref_selection = self.navCount() -| 1 else self.scroll = self.maxScroll();
+                },
+                'h' => {
+                    if (self.focus == .disassembly) self.x_scroll -|= 4;
+                },
+                'l' => {
+                    if (self.focus == .disassembly) self.x_scroll = @min(self.x_scroll + 4, self.maxXScroll());
+                },
                 'b' => try self.back(),
                 'f' => try self.goForward(),
                 'r' => {
-                    const current = self.stack.items[self.stack.items.len - 1].kind;
-                    switch (current) {
-                        .chunk => |id| try self.open(.{ .refs = id }),
-                        .refs => |id| try self.open(.{ .refs = id }),
-                        .help => {},
+                    if (self.currentChunk() != null) {
+                        self.nav_mode = .references;
+                        self.ref_selection = 0;
+                        self.focus = .chunks;
+                    }
+                },
+                'c' => {
+                    if (self.corpus != null) {
+                        self.nav_mode = .corpus;
+                        if (self.currentChunk()) |id| {
+                            self.ref_selection = if (self.corpus.?.contains(id)) @intCast(id - self.corpus.?.first) else 0;
+                        }
+                        self.focus = .chunks;
                     }
                 },
                 '?' => try self.open(.help),
-                '/' => try self.searchPrompt(),
-                'n' => self.findNext(1),
-                'N' => self.findNext(-1),
+                '/' => {
+                    if (self.focus == .disassembly) try self.searchPrompt();
+                },
+                'n' => {
+                    self.findNext(1);
+                },
+                'N' => {
+                    self.findNext(-1);
+                },
                 else => {},
             },
-            .up => self.scroll -|= 1,
-            .down => self.scroll = @min(self.scroll + 1, self.maxScroll()),
-            .page_up => self.scroll -|= self.contentRows(),
-            .page_down => self.scroll = @min(self.scroll + self.contentRows(), self.maxScroll()),
-            .home => self.scroll = 0,
-            .end => self.scroll = self.maxScroll(),
-            .tab => {
-                if (self.page.links.len > 0) {
-                    self.link = (self.link + 1) % self.page.links.len;
-                    self.scrollToLink();
+            .up => {
+                if (self.focus == .chunks) self.moveReference(false) else self.scroll -|= 1;
+            },
+            .down => {
+                if (self.focus == .chunks) {
+                    self.moveReference(true);
+                } else {
+                    self.scroll = @min(self.scroll + 1, self.maxScroll());
                 }
             },
-            .backtab => {
-                if (self.page.links.len > 0) {
-                    self.link = (self.link + self.page.links.len - 1) % self.page.links.len;
-                    self.scrollToLink();
+            .left => {
+                if (self.focus == .disassembly) self.x_scroll -|= 4;
+            },
+            .right => {
+                if (self.focus == .chunks) {
+                    self.focus = .disassembly;
+                } else {
+                    self.x_scroll = @min(self.x_scroll + 4, self.maxXScroll());
+                }
+            },
+            .page_up => {
+                if (self.focus == .disassembly) self.scroll -|= self.contentRows();
+            },
+            .page_down => {
+                if (self.focus == .disassembly) self.scroll = @min(self.scroll + self.contentRows(), self.maxScroll());
+            },
+            .home => {
+                if (self.focus == .chunks) self.ref_selection = 0 else self.scroll = 0;
+            },
+            .end => {
+                if (self.focus == .chunks) self.ref_selection = self.navCount() -| 1 else self.scroll = self.maxScroll();
+            },
+            .tab, .backtab => {
+                if (self.focus == .chunks) {
+                    self.focus = .disassembly;
+                } else if (self.currentChunk() != null) {
+                    self.focus = .chunks;
                 }
             },
             .enter => {
-                if (self.page.links.len > 0) {
-                    try self.open(.{ .chunk = self.page.links[self.link].target });
-                }
+                if (self.focus == .chunks) if (self.navAt(self.ref_selection)) |entry|
+                    try self.open(.{ .chunk = entry.id });
             },
             .escape => return false,
             else => {},
@@ -438,7 +552,7 @@ const Pager = struct {
     }
 
     /// Modal one-line search input on the status row.
-    fn searchPrompt(self: *Pager) !void {
+    fn searchPrompt(self: *Tui) !void {
         self.search.clearRetainingCapacity();
         var out_buf: [1024]u8 = undefined;
         var out = std.Io.File.stdout().writerStreaming(self.io, &out_buf);
@@ -484,7 +598,7 @@ const Pager = struct {
         }
     }
 
-    fn findNext(self: *Pager, dir: i2) void {
+    fn findNext(self: *Tui, dir: i2) void {
         if (self.search.items.len == 0) {
             self.status_msg = "(no search)";
             return;
@@ -508,83 +622,218 @@ const Pager = struct {
 
     // -- drawing -----------------------------------------------------------------
 
-    fn draw(self: *Pager, w: *std.Io.Writer) !void {
-        const size = term_mod.size();
-        const rows = self.contentRows();
+    fn draw(self: *Tui, w: *std.Io.Writer) !void {
+        const layout_now = self.layout();
+        const rows = layout_now.body_rows;
         self.clampScroll();
+        self.ref_selection = @min(self.ref_selection, self.navCount() -| 1);
 
-        const selected_line: ?usize = if (self.page.links.len > 0)
-            self.page.links[self.link].line
-        else
-            null;
+        var header_buf: [512]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf, " fix disasm  ·  {s}  ·  {s} pane ", .{
+            self.page.title,
+            if (self.focus == .chunks) "chunks" else "disassembly",
+        }) catch " fix disasm ";
+        try moveTo(w, 1, 1);
+        try w.writeAll("\x1b[7m");
+        try writeAnsiWindow(w, header, 0, layout_now.cols);
+        try w.writeAll("\x1b[7m\x1b[K\x1b[0m");
 
-        try w.writeAll("\x1b[H");
         var row: usize = 0;
         while (row < rows) : (row += 1) {
-            const idx = self.scroll + row;
-            try w.writeAll("\x1b[K");
-            if (idx < self.page.lines.len) {
-                const line = self.page.lines[idx];
-                const shown = line[0..@min(line.len, size.cols)];
-                if (selected_line != null and idx == selected_line.?) {
-                    try w.writeAll("\x1b[7m");
-                    try w.writeAll(shown);
-                    try w.writeAll("\x1b[0m");
-                } else {
-                    try w.writeAll(shown);
-                }
-            } else if (idx == self.page.lines.len and self.page.lines.len != 0) {
-                try w.writeAll("\x1b[2m(end)\x1b[0m");
+            try moveTo(w, row + 2, 1);
+            try w.writeAll("\x1b[0m\x1b[K");
+            if (layout_now.split) {
+                try self.drawChunkRow(w, row, layout_now.sidebar_width, rows);
+                try moveTo(w, row + 2, layout_now.sidebar_width + 1);
+                try w.writeAll("\x1b[2m│\x1b[0m");
+                try moveTo(w, row + 2, layout_now.main_col);
+                try self.drawDisasmRow(w, row, layout_now.main_width);
+            } else if (self.focus == .chunks) {
+                try self.drawChunkRow(w, row, layout_now.cols, rows);
+            } else {
+                try self.drawDisasmRow(w, row, layout_now.main_width);
             }
-            try w.writeAll("\r\n");
         }
 
-        // Status bar (inverse): title, position, key hints.
-        var status_buf: [256]u8 = undefined;
         const pct = if (self.page.lines.len == 0)
             100
         else
             @min(100, (self.scroll + rows) * 100 / self.page.lines.len);
-        const status = std.fmt.bufPrint(&status_buf, " {s} · {d} lines · {d}% {s}· q quit · tab/enter links · b back · r refs · ? help ", .{
-            self.page.title,
-            self.page.lines.len,
+        var footer_buf: [512]u8 = undefined;
+        const footer = std.fmt.bufPrint(&footer_buf, " {d}% · {d}/{d} · x:{d}  {s}  tab focus · c corpus · r refs · ↵ open · b/f history · / search · ? help · q quit ", .{
             pct,
+            @min(self.scroll + 1, self.page.lines.len),
+            self.page.lines.len,
+            self.x_scroll,
             self.status_msg,
-        }) catch "";
+        }) catch " q quit ";
+        try moveTo(w, layout_now.rows, 1);
         try w.writeAll("\x1b[7m");
-        try w.writeAll(status[0..@min(status.len, size.cols)]);
-        try w.writeAll("\x1b[K\x1b[0m");
+        try writeAnsiWindow(w, footer, 0, layout_now.cols);
+        try w.writeAll("\x1b[7m\x1b[K\x1b[0m");
+    }
+
+    fn drawDisasmRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize) !void {
+        const idx = self.scroll + row;
+        if (idx < self.page.lines.len) {
+            try writeAnsiWindow(w, self.page.lines[idx], self.x_scroll, width);
+        } else if (idx == self.page.lines.len and self.page.lines.len != 0) {
+            try writeAnsiWindow(w, "\x1b[2m(end)\x1b[0m", 0, width);
+        }
+    }
+
+    fn drawChunkRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize, rows: usize) !void {
+        var line_buf: [256]u8 = undefined;
+        if (row == 0) {
+            const line = switch (self.nav_mode) {
+                .corpus => std.fmt.bufPrint(&line_buf, " EVAL CORPUS  ·  {d} chunks", .{self.navCount()}) catch " EVAL CORPUS",
+                .references => std.fmt.bufPrint(&line_buf, " CHUNK REFS  ·  {d} refs", .{self.navCount()}) catch " CHUNK REFS",
+            };
+            if (self.focus == .chunks) try w.writeAll("\x1b[1m");
+            try writeAnsiWindow(w, line, 0, width);
+            return;
+        }
+        if (row == 1) {
+            const id = self.currentChunk() orelse {
+                try writeAnsiWindow(w, " help", 0, width);
+                return;
+            };
+            const line = if (self.ev.getChunk(id)) |chunk|
+                std.fmt.bufPrint(&line_buf, " ● #0x{x}  {d}b · {d}c · a{d}", .{ id, chunk.code.len, chunk.constants.len, chunk.arity }) catch " current chunk"
+            else
+                std.fmt.bufPrint(&line_buf, " ● #0x{x}  missing", .{id}) catch " current chunk";
+            try writeAnsiWindow(w, line, 0, width);
+            return;
+        }
+        if (row == 2) {
+            try writeAnsiWindow(w, if (self.nav_mode == .corpus) " ─ evaluated chunks ─" else " ─ references ─", 0, width);
+            return;
+        }
+
+        const count = self.navCount();
+        if (count == 0) {
+            if (row == 3) try writeAnsiWindow(w, if (self.nav_mode == .corpus) "   no newly compiled chunks" else "   no incoming or outgoing chunks", 0, width);
+            return;
+        }
+        const slots = rows -| 3;
+        if (slots == 0) return;
+        const start = @min(self.ref_selection -| (slots / 2), count -| slots);
+        const index = start + row - 3;
+        const entry = self.navAt(index) orelse return;
+        const marker: []const u8 = switch (entry.kind) {
+            .corpus => "•",
+            .outgoing => "→",
+            .incoming => "←",
+        };
+        const line = if (self.ev.getChunk(entry.id)) |chunk|
+            std.fmt.bufPrint(&line_buf, " {s} {s} #0x{x}  {d}b · {d}c", .{
+                if (index == self.ref_selection) ">" else " ",
+                marker,
+                entry.id,
+                chunk.code.len,
+                chunk.constants.len,
+            }) catch " chunk"
+        else
+            std.fmt.bufPrint(&line_buf, " {s} {s} #0x{x}  missing", .{
+                if (index == self.ref_selection) ">" else " ",
+                marker,
+                entry.id,
+            }) catch " chunk";
+        if (index == self.ref_selection and self.focus == .chunks) try w.writeAll("\x1b[7m");
+        try writeAnsiWindow(w, line, 0, width);
     }
 };
 
-const testing = std.testing;
-
-test "scanLinks links chunk mentions but not the header" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var lines: std.ArrayListUnmanaged([]u8) = .empty;
-    try lines.append(a, try a.dupe(u8, "chunk #5 (12 bytes)"));
-    try lines.append(a, try a.dupe(u8, "  0000  closure  chunk #7, 2 upvalues"));
-    try lines.append(a, try a.dupe(u8, "  0005  int_add"));
-    try lines.append(a, try a.dupe(u8, "  0006  thunk_captures  chunk #9, 0 upvalues"));
-    const links = try Pager.scanLinks(a, lines.items, 5);
-    try testing.expectEqual(@as(usize, 2), links.len);
-    try testing.expectEqual(@as(ChunkId, 7), links[0].target);
-    try testing.expectEqual(@as(usize, 1), links[0].line);
-    try testing.expectEqual(@as(ChunkId, 9), links[1].target);
+fn moveTo(w: *std.Io.Writer, row: usize, col: usize) !void {
+    try w.print("\x1b[{d};{d}H", .{ row, col });
 }
 
-test "scanLinks links hex disasm mentions but not the hex header" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var lines: std.ArrayListUnmanaged([]u8) = .empty;
-    try lines.append(a, try a.dupe(u8, "chunk[0x1f] (12 bytes, 1 consts, 0 locals)"));
-    try lines.append(a, try a.dupe(u8, "  0000   closure #0x20              ; chunk[0x20] fetchGit"));
-    try lines.append(a, try a.dupe(u8, "  0005   int_add"));
-    const links = try Pager.scanLinks(a, lines.items, 0x1f);
-    try testing.expectEqual(@as(usize, 1), links.len);
-    try testing.expectEqual(@as(ChunkId, 0x20), links[0].target);
-    try testing.expectEqual(@as(usize, 1), links[0].line);
+/// Render a horizontal cell window without counting or splitting ANSI CSI
+/// sequences. This keeps the TUI faithful to the colorized `fix disasm`
+/// listing while clipping it safely to pane boundaries.
+fn writeAnsiWindow(w: *std.Io.Writer, line: []const u8, start: usize, width: usize) !void {
+    var i: usize = 0;
+    var col: usize = 0;
+    var written: usize = 0;
+    while (i < line.len) {
+        if (line[i] == 0x1b) {
+            const end = ansiSequenceEnd(line, i);
+            try w.writeAll(line[i..end]);
+            i = end;
+            continue;
+        }
+
+        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
+        const safe_len = if (i + len <= line.len) len else 1;
+        const cp = std.unicode.utf8Decode(line[i .. i + safe_len]) catch 0xFFFD;
+        const cell_width: usize = if (cp == '\t') 1 else width_mod.cpWidth(cp);
+        if (col + cell_width <= start) {
+            col += cell_width;
+            i += safe_len;
+            continue;
+        }
+        if (col < start) {
+            col += cell_width;
+            i += safe_len;
+            continue;
+        }
+        if (written + cell_width > width) break;
+        try w.writeAll(line[i .. i + safe_len]);
+        written += cell_width;
+        col += cell_width;
+        i += safe_len;
+    }
+    try w.writeAll("\x1b[0m");
+}
+
+fn displayWidth(line: []const u8) usize {
+    var i: usize = 0;
+    var result: usize = 0;
+    while (i < line.len) {
+        if (line[i] == 0x1b) {
+            i = ansiSequenceEnd(line, i);
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
+        const safe_len = if (i + len <= line.len) len else 1;
+        const cp = std.unicode.utf8Decode(line[i .. i + safe_len]) catch 0xFFFD;
+        result += if (cp == '\t') 1 else width_mod.cpWidth(cp);
+        i += safe_len;
+    }
+    return result;
+}
+
+fn ansiSequenceEnd(line: []const u8, start: usize) usize {
+    if (start + 1 >= line.len or line[start] != 0x1b) return @min(start + 1, line.len);
+    if (line[start + 1] != '[') return @min(start + 2, line.len);
+    var i = start + 2;
+    while (i < line.len) : (i += 1) {
+        if (line[i] >= 0x40 and line[i] <= 0x7e) return i + 1;
+    }
+    return line.len;
+}
+
+const testing = std.testing;
+
+test "evaluation corpus is a half-open chunk range" {
+    const corpus: Corpus = .{ .first = 4, .end = 7 };
+    try testing.expectEqual(@as(usize, 3), corpus.count());
+    try testing.expect(corpus.contains(4));
+    try testing.expect(corpus.contains(6));
+    try testing.expect(!corpus.contains(3));
+    try testing.expect(!corpus.contains(7));
+}
+
+test "ANSI-aware window clips cells without cutting color or UTF-8" {
+    const line = "\x1b[31mab中cd\x1b[0m";
+    try testing.expectEqual(@as(usize, 6), displayWidth(line));
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeAnsiWindow(&out.writer, line, 2, 3);
+    try testing.expectEqualStrings("\x1b[31m中c\x1b[0m", out.written());
+
+    out.clearRetainingCapacity();
+    try writeAnsiWindow(&out.writer, line, 3, 2);
+    try testing.expectEqualStrings("\x1b[31mc\x1b[0m", out.written());
 }

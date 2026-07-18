@@ -5,8 +5,8 @@
 //! - **Interactive** (stdin AND stdout are a tty, and `--bare` not given): a
 //!   hand-rolled raw-mode line editor (`repl/editor.zig` + `repl/render.zig`)
 //!   with history, completion, smart-enter multiline, and the `:disasm`
-//!   pager. Raw mode is restored on every exit path, including panics and
-//!   fatal signals (`repl/term.zig`).
+//!   chunk-browser TUI. Raw mode is restored on every exit path, including
+//!   panics and fatal signals (`repl/term.zig`).
 //! - **Bare** (`--bare`, or any non-tty end): a plain read-a-line loop — no
 //!   escape sequences, no raw mode, no redraw tricks. Lines are accumulated
 //!   until they form a complete expression, so multiline input pipes work.
@@ -495,7 +495,8 @@ const Repl = struct {
                     try self.collectBetweenInputs();
                 }
             },
-            .disasm => try self.disasm(rest),
+            .disasm => try self.disasm(rest, false),
+            .disasm_eval => try self.disasm(rest, true),
             .env => {
                 var out = self.stdout();
                 defer out.interface.flush() catch {};
@@ -724,15 +725,17 @@ const Repl = struct {
         }
     }
 
-    /// `:d EXPR` — find the chunk behind the expression: a closure or
-    /// unforced bytecode thunk exposes its own chunk; anything else
-    /// disassembles the expression's compiled top chunk.
-    fn disasm(self: *Repl, expr: []const u8) !void {
+    /// `:d EXPR` finds the chunk behind a value. `:de EXPR` snapshots the
+    /// registry around evaluation and exposes every newly compiled chunk, the
+    /// long-lived-repl equivalent of `fix disasm --eval`'s fresh registry.
+    fn disasm(self: *Repl, expr: []const u8, eval_all: bool) !void {
+        const first_new = self.ev.chunkRegistry().count();
         var chunk_id: ?types.ChunkId = null;
 
         // Value-first: `:d f` on a function should show f's body, not the
         // trivial lookup chunk.
-        if (try self.evalExpr(expr)) |value| {
+        const evaluated = try self.evalExpr(expr);
+        if (evaluated) |value| {
             switch (value.kind()) {
                 .closure => {
                     if (self.ev.tooling().closure(value)) |c| {
@@ -746,7 +749,23 @@ const Repl = struct {
                 },
                 else => {},
             }
-        } else return; // evaluation failed; error already rendered
+        } else if (!eval_all) return; // evaluation failed; error already rendered
+
+        const end_new = self.ev.chunkRegistry().count();
+        const corpus: ?pager_mod.Corpus = if (eval_all)
+            .{ .first = first_new, .end = end_new }
+        else
+            null;
+
+        if (evaluated == null and (corpus == null or corpus.?.count() == 0)) return;
+
+        if (corpus) |captured| {
+            if (captured.count() > 0) {
+                // Registration is dense. Start on the first id, matching the
+                // CLI's registry-order dump; the corpus pane exposes the rest.
+                chunk_id = captured.first;
+            }
+        }
 
         if (chunk_id == null) {
             chunk_id = self.ev.compileSourceScoped(expr, self.scope) catch |err| {
@@ -756,11 +775,20 @@ const Repl = struct {
         }
 
         if (self.interactive) {
-            try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id.?, self.color_depth);
+            try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id.?, self.color_depth, corpus);
         } else {
             var out = self.stdout();
             defer out.interface.flush() catch {};
-            try pager_mod.writePlain(self.allocator, &out.interface, self.ev, chunk_id.?);
+            if (corpus) |captured| {
+                if (captured.count() > 0) {
+                    try pager_mod.writePlainCorpus(self.allocator, &out.interface, self.ev, captured);
+                } else {
+                    try out.interface.writeAll("evaluation reused existing chunks; showing the target chunk\n");
+                    try pager_mod.writePlain(self.allocator, &out.interface, self.ev, chunk_id.?);
+                }
+            } else {
+                try pager_mod.writePlain(self.allocator, &out.interface, self.ev, chunk_id.?);
+            }
         }
         try self.collectBetweenInputs();
     }

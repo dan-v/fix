@@ -15,6 +15,7 @@ pub const Id = enum {
     print,
     inspect,
     disasm,
+    disasm_eval,
     env,
     gc,
 };
@@ -36,7 +37,8 @@ pub const table = [_]Command{
     .{ .id = .type_of, .names = &.{ ":t", ":type" }, .arg = .expr, .metavar = "EXPR", .help = "show the type of a value (forces to weak head)" },
     .{ .id = .print, .names = &.{ ":p", ":print" }, .arg = .expr, .metavar = "EXPR", .help = "deep-force a value and print it fully" },
     .{ .id = .inspect, .names = &.{ ":i", ":inspect" }, .arg = .expr, .metavar = "EXPR", .help = "inspect a value: kind, thunk state, backing chunk, size" },
-    .{ .id = .disasm, .names = &.{ ":d", ":disasm" }, .arg = .expr, .metavar = "EXPR", .help = "disassemble the chunk behind an expression and browse\nits call graph (interactive pager on a tty)" },
+    .{ .id = .disasm, .names = &.{ ":d", ":disasm" }, .arg = .expr, .metavar = "EXPR", .help = "disassemble the chunk behind an expression and browse\nits call graph (interactive TUI on a tty)" },
+    .{ .id = .disasm_eval, .names = &.{ ":de", ":disasm-eval" }, .arg = .expr, .metavar = "EXPR", .help = "evaluate an expression and browse every chunk compiled\nalong that demand path (like `fix disasm --eval`)" },
     .{ .id = .env, .names = &.{":env"}, .arg = .none, .help = "list the current scope bindings" },
     .{ .id = .gc, .names = &.{":gc"}, .arg = .none, .help = "run a garbage collection now and report heap usage" },
 };
