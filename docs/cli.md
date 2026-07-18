@@ -141,7 +141,7 @@ explicit typed flake-output/installable form.
 | `--debugger` (eval, repl) | pause into the interactive debug console at `builtins.break` and on evaluation errors; forces `--workers=1`. See [The debugger](#the-debugger). |
 | `--color[=auto\|always\|never]` / `--no-color` | color diagnostics; auto disables color off-TTY or under `NO_COLOR`, then selects truecolor from `COLORTERM`, 256-color from `TERM`, or ANSI-16 |
 | `--progress` / `--no-progress` | enable / disable timestamped progress records on stderr |
-| `-v, --verbose` | increase progress detail (checks at `-v`, parse/compile at `-vv`) and daemon build verbosity |
+| `-v, --verbose` | increase progress detail (checks at `-v`; parse/compile completions at `-vv` and openings at `-vvv`) and daemon build verbosity |
 | `--bare` (repl) | plain line-based input: no editor, no escape sequences — for pipes and expect-style automation |
 
 ### Store links & realization (`instantiate`/`build`/`run`/`shell`)
@@ -193,7 +193,7 @@ Use the disable toggles to isolate whether a wrong parallel result (or a hang) c
 - **`inspect`** — post-eval heap/intern census; `--top N` lists the N longest interned strings (string-table bloat).
 - **`--vm-trace` + `trace`** — capture a VM event stream (`--vm-trace-format binary` for volume, `--vm-trace-main-only` to drop helper noise), then inspect it with the `trace` subcommand: `trace dump` pretty-prints the binary trace as text, `trace diff` walks two binary traces to the first divergent event. The `trace` subcommand reads the binary format only.
 - **`--thunks-log` + `fix thunks diff`** — the divergence workflow. When a `--workers=N` run gives a wrong answer a `--workers=1` run doesn't, record `--thunks-log` for both, then `fix thunks diff A B`. It keys thunk outcomes by the joint `(creator, target)` source-location pair — each a `(file, line, col)` triple, stable across runs even though chunk/thunk ids are not; creator alone collides across let-bindings sharing an outer span and target alone collides at synthetic `?:0:0` spans, so the pair is unique per thunk-creation site — and reports the earliest locations whose resolve/errored/reset outcome multisets differ. Filters narrow it further: `--asymmetric` (one side produced an outcome the other never did — the speculation-race smoking gun), `--novel-in b` (only where B forced something A never reached), `--by-kind` (compare by kind+discriminant, ignoring value contents, to suppress iteration-order noise), `--max-divergences N` (default 30), `--max-outcomes N` (default 5). See [runtime/thunks.md](runtime/thunks.md).
-- **`--timeline`** — emits a Perfetto JSON timeline (parse/compile/import phases, per-worker fiber-run quanta, idle parks). Load it in Perfetto to *see* the serial critical path that bounds wall time → [perf/model.md](perf/model.md).
+- **`--timeline`** — emits the same structured spans as progress plus profile-only worker quanta, GC pauses, demand waits, metrics, counters, and steal flows as Perfetto JSON. Load it in Perfetto to *see* the serial critical path that bounds wall time → [perf/model.md](perf/model.md).
 
 The `--vm-trace` and `--thunks-log` flags only do anything on a build compiled with the matching `-D` probe (`-Dvm-trace`, `-Dthunks-log`); the `-Dprof-main` / `-Dprof-path` reports surface through `--print-sched-stats`. `--timeline` needs no rebuild — the timeline probe is always compiled in and runtime-gated. Exercising a `-Dprof-*` probe means a rebuild. See [perf/probes.md](perf/probes.md) and [build.md](build.md).
 

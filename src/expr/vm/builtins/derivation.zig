@@ -285,7 +285,7 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
         .strict => derivation.buildStrictValue(self.allocator, self.intern, self.heap, spec),
     };
     observation.finish(.{
-        .details = .{ .subject = .{ .path = computed.drv_path } },
+        .details = .{ .subject = .{ .text = computed.drv_path } },
         .metrics = &.{.{
             .name = "outputs",
             .value = .{ .unsigned = output_names.names.len },

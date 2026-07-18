@@ -25,6 +25,18 @@ pub const EventSpec = struct {
     profile: bool = true,
 };
 
+pub const CounterSpec = struct {
+    category: []const u8,
+    name: []const u8,
+};
+
+pub const FlowSpec = struct {
+    category: []const u8,
+    name: []const u8,
+};
+
+pub const FlowPhase = enum { out, in };
+
 pub const Subject = union(enum) {
     none,
     text: []const u8,
@@ -36,6 +48,22 @@ pub const Subject = union(enum) {
         file: u32,
         line: u32 = 0,
     };
+
+    pub fn literal(value: []const u8) Subject {
+        return .{ .text = value };
+    }
+
+    pub fn sourceLocation(file: u32, line: u32) Subject {
+        return .{ .source = .{ .file = file, .line = line } };
+    }
+
+    pub fn isEmpty(self: Subject) bool {
+        return switch (self) {
+            .none => true,
+            .text, .path, .url => |value| value.len == 0,
+            .source => false,
+        };
+    }
 
     pub fn bytes(self: Subject) []const u8 {
         return switch (self) {
@@ -94,6 +122,10 @@ pub const Sink = struct {
     finish_fn: *const fn (*anyopaque, usize, *const SpanSpec, Details, Track, Interest, Finish, bool) void,
     update_fn: *const fn (*anyopaque, usize, *const SpanSpec, Interest, []const Metric) void,
     event_fn: *const fn (*anyopaque, *const EventSpec, Details, Track, Interest, []const Metric) void,
+    counter_fn: *const fn (*anyopaque, *const CounterSpec, Track, []const Metric) void,
+    next_flow_id_fn: *const fn (*anyopaque) u64,
+    flow_fn: *const fn (*anyopaque, *const FlowSpec, u64, FlowPhase, Track, u64) void,
+    sample_fn: *const fn (*anyopaque, u64) bool,
 };
 
 /// A cheap, copyable capability. The sink it references must outlive all spans
@@ -140,6 +172,34 @@ pub const Observer = struct {
         };
         if (!interest.any()) return;
         sink.event_fn(sink.context, spec, details, .current, interest, metrics);
+    }
+
+    pub inline fn profiling(self: Observer) bool {
+        return self.profile_enabled and self.sink != null;
+    }
+
+    pub fn counter(self: Observer, spec: *const CounterSpec, metrics: []const Metric) void {
+        const sink = self.sink orelse return;
+        if (!self.profile_enabled) return;
+        sink.counter_fn(sink.context, spec, .current, metrics);
+    }
+
+    pub fn nextFlowId(self: Observer) u64 {
+        const sink = self.sink orelse return 0;
+        if (!self.profile_enabled) return 0;
+        return sink.next_flow_id_fn(sink.context);
+    }
+
+    pub fn flow(self: Observer, spec: *const FlowSpec, id: u64, phase: FlowPhase, track: Track, at_ns: u64) void {
+        const sink = self.sink orelse return;
+        if (!self.profile_enabled or id == 0) return;
+        sink.flow_fn(sink.context, spec, id, phase, track, at_ns);
+    }
+
+    pub fn shouldSample(self: Observer, min_gap_ns: u64) bool {
+        const sink = self.sink orelse return false;
+        if (!self.profile_enabled) return false;
+        return sink.sample_fn(sink.context, min_gap_ns);
     }
 };
 
@@ -199,6 +259,10 @@ test "verbosity-filtered spans do not enter the sink" {
                 .finish_fn = finish,
                 .update_fn = update,
                 .event_fn = event,
+                .counter_fn = counter,
+                .next_flow_id_fn = nextFlowId,
+                .flow_fn = flow,
+                .sample_fn = sample,
             };
         }
 
@@ -215,6 +279,14 @@ test "verbosity-filtered spans do not enter the sink" {
 
         fn update(_: *anyopaque, _: usize, _: *const SpanSpec, _: Interest, _: []const Metric) void {}
         fn event(_: *anyopaque, _: *const EventSpec, _: Details, _: Track, _: Interest, _: []const Metric) void {}
+        fn counter(_: *anyopaque, _: *const CounterSpec, _: Track, _: []const Metric) void {}
+        fn nextFlowId(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn flow(_: *anyopaque, _: *const FlowSpec, _: u64, _: FlowPhase, _: Track, _: u64) void {}
+        fn sample(_: *anyopaque, _: u64) bool {
+            return true;
+        }
     };
 
     const spec: SpanSpec = .{

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const observ = @import("base").observ;
+const Timeline = @import("expr").probe.timeline.Recorder;
 const terminal_text = @import("base").terminal_text;
 const presentation = @import("presentation.zig");
 
@@ -12,6 +13,7 @@ pub const EvalProgress = struct {
     color_depth: presentation.ColorDepth,
     log_progress: bool,
     verbosity: u8,
+    timeline: ?*Timeline = null,
 
     pub fn init(io: std.Io, cwd: []const u8, log_progress: bool, color_depth: presentation.ColorDepth, verbosity: u8) EvalProgress {
         return .{
@@ -26,6 +28,10 @@ pub const EvalProgress = struct {
 
     pub fn deinit(_: *EvalProgress, _: bool) void {}
 
+    pub fn setTimeline(self: *EvalProgress, timeline: *Timeline) void {
+        self.timeline = timeline;
+    }
+
     pub fn observer(self: *EvalProgress) observ.Observer {
         return .{
             .sink = .{
@@ -34,9 +40,15 @@ pub const EvalProgress = struct {
                 .finish_fn = finishSpan,
                 .update_fn = updateSpan,
                 .event_fn = writeEvent,
+                .counter_fn = writeCounter,
+                .next_flow_id_fn = nextFlowId,
+                .flow_fn = writeFlow,
+                .sample_fn = shouldSample,
             },
             .verbosity = self.verbosity,
             .log_enabled = self.log_progress,
+            .profile_enabled = self.timeline != null,
+            .capture_updates = self.timeline != null,
         };
     }
 
@@ -52,17 +64,18 @@ pub const EvalProgress = struct {
         raw: *anyopaque,
         spec: *const observ.SpanSpec,
         details: observ.Details,
-        _: observ.Track,
+        track: observ.Track,
         interest: observ.Interest,
     ) usize {
         const self: *EvalProgress = @ptrCast(@alignCast(raw));
         if (interest.log_begin) self.writeRecord(spec.category, spec.name, spec.begin_verb, details, &.{});
+        if (interest.profile) return self.timeline.?.begin(spec, details, track);
         return 0;
     }
 
     fn finishSpan(
         raw: *anyopaque,
-        _: usize,
+        token: usize,
         spec: *const observ.SpanSpec,
         started: observ.Details,
         _: observ.Track,
@@ -70,8 +83,9 @@ pub const EvalProgress = struct {
         completion: observ.Finish,
         success: bool,
     ) void {
-        if (!success or !interest.log_finish) return;
         const self: *EvalProgress = @ptrCast(@alignCast(raw));
+        if (interest.profile) self.timeline.?.finish(token, spec, completion, success);
+        if (!success or !interest.log_finish) return;
         self.writeRecord(
             spec.category,
             spec.name,
@@ -81,19 +95,44 @@ pub const EvalProgress = struct {
         );
     }
 
-    fn updateSpan(_: *anyopaque, _: usize, _: *const observ.SpanSpec, _: observ.Interest, _: []const observ.Metric) void {}
+    fn updateSpan(raw: *anyopaque, token: usize, spec: *const observ.SpanSpec, interest: observ.Interest, metrics: []const observ.Metric) void {
+        if (!interest.profile) return;
+        const self: *EvalProgress = @ptrCast(@alignCast(raw));
+        self.timeline.?.update(token, spec, metrics);
+    }
 
     fn writeEvent(
         raw: *anyopaque,
         spec: *const observ.EventSpec,
         details: observ.Details,
-        _: observ.Track,
+        track: observ.Track,
         interest: observ.Interest,
         metrics: []const observ.Metric,
     ) void {
-        if (!interest.log_finish) return;
         const self: *EvalProgress = @ptrCast(@alignCast(raw));
+        if (interest.profile) self.timeline.?.instant(spec, details, track, metrics);
+        if (!interest.log_finish) return;
         self.writeRecord(spec.category, spec.name, spec.verb, details, metrics);
+    }
+
+    fn writeCounter(raw: *anyopaque, spec: *const observ.CounterSpec, track: observ.Track, metrics: []const observ.Metric) void {
+        const self: *EvalProgress = @ptrCast(@alignCast(raw));
+        self.timeline.?.counter(spec, track, metrics);
+    }
+
+    fn nextFlowId(raw: *anyopaque) u64 {
+        const self: *EvalProgress = @ptrCast(@alignCast(raw));
+        return self.timeline.?.nextFlowId();
+    }
+
+    fn writeFlow(raw: *anyopaque, spec: *const observ.FlowSpec, id: u64, phase: observ.FlowPhase, track: observ.Track, at_ns: u64) void {
+        const self: *EvalProgress = @ptrCast(@alignCast(raw));
+        self.timeline.?.flow(spec, id, phase, track, at_ns);
+    }
+
+    fn shouldSample(raw: *anyopaque, min_gap_ns: u64) bool {
+        const self: *EvalProgress = @ptrCast(@alignCast(raw));
+        return self.timeline.?.shouldSample(min_gap_ns);
     }
 
     fn writeRecord(

@@ -15,6 +15,7 @@ const future_mod = @import("runtime").future;
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
 const clock = @import("base").clock;
+const observ = @import("base").observ;
 const sched_mod = @import("../eval/workers/scheduler.zig");
 
 const access = @import("access.zig");
@@ -24,7 +25,6 @@ const trace_log = @import("trace_log.zig");
 const BuiltinId = @import("runtime").builtins.BuiltinId;
 const prof = @import("../probe.zig").prof;
 const prof_census = @import("../probe.zig").prof_census;
-const timeline = @import("../probe.zig").timeline;
 const vm_errors = @import("errors.zig");
 const prof_path = @import("../probe.zig").prof_path;
 const Chunk = @import("../bytecode.zig").chunk.Chunk;
@@ -37,8 +37,17 @@ const force_label = @import("force_label.zig");
 const speculate = @import("force_speculate.zig");
 const thread_caches = @import("thread_caches.zig");
 
-/// Timeline source labels for thunks live in `force_label.zig`; re-exported
-/// so `vm_force.thunkLabel` keeps resolving for worker.zig.
+const critical_wait_observation: observ.SpanSpec = .{
+    .category = "scheduler",
+    .name = "wait",
+    .begin_verb = "waiting",
+    .finish_verb = "waited",
+    .begin_level = std.math.maxInt(u8),
+    .finish_level = std.math.maxInt(u8),
+};
+
+/// Source labels for thunks live in `force_label.zig`; re-exported for worker
+/// run-quantum observations.
 pub const thunkLabel = force_label.thunkLabel;
 
 /// Bounded spin a demanded fiber does on a `.busy` (helper-owned) thunk
@@ -966,20 +975,20 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 const park = self.ctx.park orelse
                     @panic("forceThunkImpl hit .busy outside a fiber — every caller must run on a worker fiber");
                 if (thunk.enrollWaiter(park.waiter)) {
-                    // Timeline: if the DEMAND fiber blocks here, this wait is on
-                    // the critical path — time it and record a labelled span on
-                    // the crit track (the "main stalls on a giant file" signal).
-                    // Resolve the label NOW (the busy thunk is still evaluating,
-                    // so its target arm is live); after the yield it may be
-                    // resolved and the union clobbered. `lbuf` lives on the fiber
-                    // stack, preserved across the yield.
-                    const crit_start = if (self.ctx.is_demand) timeline.critWaitBegin() else 0;
                     var lbuf: [128]u8 = undefined;
-                    const crit_label: timeline.Subject = if (crit_start != 0) force_label.critWaitLabel(self, thunk_id, &lbuf) else .{};
+                    var wait_span = if (self.ctx.is_demand and self.observer.profiling())
+                        self.observer.beginOn(
+                            &critical_wait_observation,
+                            .{ .subject = force_label.critWaitLabel(self, thunk_id, &lbuf) },
+                            .{ .worker = 500 },
+                        )
+                    else
+                        observ.Span{};
+                    defer wait_span.cancel();
                     const ty = prof.start(.wait_busy_thunk);
                     park.yield();
                     prof.end(.wait_busy_thunk, ty);
-                    if (crit_start != 0) timeline.critWaitEnd(crit_label, crit_start);
+                    wait_span.finish(.{});
                 }
                 continue;
             },

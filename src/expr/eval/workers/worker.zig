@@ -37,6 +37,7 @@ const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
 const sync = @import("base").sync;
+const observ = @import("base").observ;
 const arena_mod = @import("base").arena;
 const clock = @import("base").clock;
 const scheduler_mod = @import("scheduler.zig");
@@ -56,7 +57,28 @@ const mem_tag = @import("runtime").mem_tag;
 const gc = @import("runtime").gc;
 const eval_trace = @import("../../observ.zig").trace;
 const prof = @import("../../probe.zig").prof;
-const timeline = @import("../../probe.zig").timeline;
+
+const run_observation: observ.SpanSpec = .{
+    .category = "worker",
+    .name = "run",
+    .begin_verb = "running",
+    .finish_verb = "ran",
+    .begin_level = std.math.maxInt(u8),
+    .finish_level = std.math.maxInt(u8),
+};
+const park_observation: observ.SpanSpec = .{
+    .category = "worker",
+    .name = "park",
+    .begin_verb = "parking",
+    .finish_verb = "parked",
+    .begin_level = std.math.maxInt(u8),
+    .finish_level = std.math.maxInt(u8),
+};
+const heap_counter: observ.CounterSpec = .{ .category = "memory", .name = "heap_slots" };
+const rss_counter: observ.CounterSpec = .{ .category = "memory", .name = "rss_mb" };
+const backlog_counter: observ.CounterSpec = .{ .category = "scheduler", .name = "backlog" };
+const speculation_counter: observ.CounterSpec = .{ .category = "scheduler", .name = "speculation" };
+const steal_flow: observ.FlowSpec = .{ .category = "scheduler", .name = "steal" };
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker repoints
@@ -107,9 +129,8 @@ pub const WorkerFiber = struct {
     inner: InnerFiber,
     vm: VM,
     /// Fiber-scoped execution identity (see `eval/workers/context.zig`): the
-    /// claim id (permanent, baked at allocation) plus the demand-role
-    /// fields (`is_demand` + the demand-only progress handles — set by
-    /// `runTopLevel` on the top fiber, reset when the fiber recycles).
+    /// claim id (permanent, baked at allocation) plus the demand-role fields
+    /// set by `runTopLevel` on the top fiber and reset when it recycles.
     /// `vm.ctx` points here, and every nested VM created while running on
     /// this fiber shares the pointer — identity is structural, never
     /// re-dressed per VM.
@@ -519,7 +540,7 @@ pub const Worker = struct {
                 .import_prefetch => .import_prefetch,
                 .readdir_prefetch => .readdir_prefetch,
             };
-            // Timeline: a stolen task's run draws a victim→stealer arrow. Anchor
+            // A stolen task's run draws a victim→stealer arrow. Anchor
             // the producer end to `push_ts` — the moment the victim *pushed* this
             // task — so the arrow originates from the quantum that created the
             // work, not whatever the victim is running now. push_ts is nonzero
@@ -529,10 +550,10 @@ pub const Worker = struct {
             // consumer end; stays 0 (no arrow) when not traced.
             f.flow_in_id = 0;
             if (victim) |vtid| {
-                if (timeline.on() and push_ts != 0) {
-                    const fid = timeline.nextFlowId();
+                if (push_ts != 0) {
+                    const fid = f.vm.observer.nextFlowId();
                     f.flow_in_id = fid;
-                    timeline.flowOutAt(.steal, fid, vtid, push_ts);
+                    f.vm.observer.flow(&steal_flow, fid, .out, .{ .worker = vtid }, push_ts);
                 }
             }
             f.inner.reset(slotEntry, @ptrCast(f));
@@ -560,55 +581,58 @@ pub const Worker = struct {
     /// so `resume_` never overlaps with another `resume_` on the same
     /// fiber. In normal (uncontended) execution the lock/unlock is
     /// two atomic ops.
-    /// Timeline (`--timeline`): open the run quantum labelled with the task it
-    /// processes, so worker 0's track shows WHAT each quantum computes (not just
-    /// "run"). Rich `args` carry the thunk/list id for click-through.
-    fn timelineQuantumBegin(f: *WorkerFiber) void {
-        var buf: [80]u8 = undefined;
+    /// Open a run quantum labelled with the task it processes.
+    fn quantumBegin(f: *WorkerFiber) observ.Span {
+        if (!f.vm.observer.profiling()) return .{};
         var locbuf: [128]u8 = undefined;
-        if (f.current_task) |task| {
-            // Label the quantum with the Nix source location it forces (so the
-            // track reads "run: modules.nix:412", not just "force-thunk"), then
-            // the thunk/list id as click-through args.
-            const loc = timelineTaskLoc(f, &locbuf);
-            switch (task) {
-                .force_thunk => |id| timeline.beginSubj(.run, if (loc.isEmpty()) timeline.Subject.lit("force-thunk") else loc, f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
-                .force_list_range => |r| timeline.beginArgs(.run, "force-list", f.fiber_id, std.fmt.bufPrint(&buf, "\"list\":{d},\"off\":{d},\"len\":{d}", .{ r.list_id, r.offset, r.len }) catch ""),
-                .force_attrs_sweep => |id| timeline.beginArgs(.run, "sweep-attrs", f.fiber_id, std.fmt.bufPrint(&buf, "\"attrs\":{d}", .{id}) catch ""),
-                .force_attrs_range => |r| timeline.beginArgs(.run, "force-attrs", f.fiber_id, std.fmt.bufPrint(&buf, "\"attrs\":{d},\"off\":{d},\"len\":{d}", .{ r.attrs_id, r.offset, r.len }) catch ""),
-                .import_prefetch => |path_id| timeline.beginArgs(.run, "import-prefetch", f.fiber_id, std.fmt.bufPrint(&buf, "\"path\":{d}", .{path_id}) catch ""),
-                .readdir_prefetch => |r| timeline.beginArgs(.run, "readdir-prefetch", f.fiber_id, std.fmt.bufPrint(&buf, "\"dir\":{d},\"off\":{d},\"len\":{d}", .{ r.dir, r.offset, r.len }) catch ""),
-            }
-            // Consumer end of the work-stealing arrow — inside this quantum so
-            // the arrow lands on it. No-op unless this task was stolen (id != 0).
-            timeline.flowIn(.steal, f.flow_in_id, worker_id_mod.current);
-        } else {
-            const loc = timelineResumeLoc(f);
-            timeline.beginSubj(.run, if (loc.isEmpty()) timeline.Subject.lit("resume") else loc, f.fiber_id, "");
-        }
+        const subject: observ.Subject = if (f.current_task != null) blk: {
+            const location = taskLocation(f, &locbuf);
+            if (!location.isEmpty()) break :blk location;
+            break :blk switch (f.current_task.?) {
+                .force_thunk => observ.Subject.literal("force-thunk"),
+                .force_list_range => observ.Subject.literal("force-list"),
+                .force_attrs_sweep => observ.Subject.literal("sweep-attrs"),
+                .force_attrs_range => observ.Subject.literal("force-attrs"),
+                .import_prefetch => observ.Subject.literal("import-prefetch"),
+                .readdir_prefetch => observ.Subject.literal("readdir-prefetch"),
+            };
+        } else blk: {
+            const location = resumeLocation(f);
+            break :blk if (location.isEmpty()) observ.Subject.literal("resume") else location;
+        };
+        const span = f.vm.observer.begin(&run_observation, .{ .subject = subject });
+        f.vm.observer.flow(&steal_flow, f.flow_in_id, .in, .current, 0);
+        return span;
     }
 
-    /// Best-effort "basename:line" for the task this quantum forces. Returns ""
+    fn quantumFinish(f: *WorkerFiber, span: *observ.Span) void {
+        span.finish(.{ .metrics = &.{.{
+            .name = "fiber",
+            .value = .{ .unsigned = f.fiber_id },
+        }} });
+    }
+
+    /// Best-effort source location for the task this quantum forces.
     /// when unresolvable — a non-bytecode thunk, a thunk already resolved (its
     /// bare target union is dead, guarded by the state check), a missing source
     /// map, or a list-range (no single chunk). Only called when tracing is on.
-    fn timelineTaskLoc(f: *WorkerFiber, buf: []u8) timeline.Subject {
-        const task = f.current_task orelse return .{};
+    fn taskLocation(f: *WorkerFiber, buf: []u8) observ.Subject {
+        const task = f.current_task orelse return .none;
         return switch (task) {
             // Shared rich label (source loc / mapAttrs / builtins.* / applied
             // fn / …); empty when unresolvable or already resolved → the quantum
             // keeps its generic "force-thunk" name.
             .force_thunk => |id| vm_force.thunkLabel(&f.vm, id, buf),
-            .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch, .readdir_prefetch => .{},
+            .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch, .readdir_prefetch => .none,
         };
     }
 
     /// Best-effort "basename:line" for the frame a resumed fiber re-enters.
-    fn timelineResumeLoc(f: *WorkerFiber) timeline.Subject {
-        if (f.vm.frames_len == 0) return .{};
-        const span = vm_errors.sourceSpanForFrame(f.vm.frames[f.vm.frames_len - 1]) orelse return .{};
-        const file_id = span.file orelse return .{};
-        return timeline.Subject.src(file_id, span.line);
+    fn resumeLocation(f: *WorkerFiber) observ.Subject {
+        if (f.vm.frames_len == 0) return .none;
+        const span = vm_errors.sourceSpanForFrame(f.vm.frames[f.vm.frames_len - 1]) orelse return .none;
+        const file_id = span.file orelse return .none;
+        return observ.Subject.sourceLocation(file_id, span.line);
     }
 
     /// Timeline: sample heap cursors, RSS, and scheduler state as counter tracks
@@ -616,29 +640,37 @@ pub const Worker = struct {
     /// and steal activity are visible over the eval and correlatable with GC
     /// pauses. Throttled to ~1ms; RSS is a /proc read.
     fn sampleTimelineCounters(f: *WorkerFiber) void {
-        if (!timeline.shouldSample(1_000_000)) return;
+        if (!f.vm.observer.shouldSample(1_000_000)) return;
         const heap = f.vm.heap;
-        var buf: [192]u8 = undefined;
-        timeline.counter("heap_slots", std.fmt.bufPrint(&buf, "\"objects\":{d},\"values\":{d},\"attrs\":{d}", .{ heap.objects.count(), heap.values.count(), heap.attrs.count() }) catch return);
+        f.vm.observer.counter(&heap_counter, &.{
+            .{ .name = "objects", .value = .{ .unsigned = heap.objects.count() }, .unit = .items },
+            .{ .name = "values", .value = .{ .unsigned = heap.values.count() }, .unit = .items },
+            .{ .name = "attrs", .value = .{ .unsigned = heap.attrs.count() }, .unit = .items },
+        });
         // RSS (peak so far) + total bytes reserved across the object stores — the
         // memory-growth curve, correlatable with the speculation backlog below.
         // Hugetlb-backed bytes are invisible to RSS (base/hugetlb.zig), so they
         // get their own series; rss + hugetlb ≈ the true footprint curve.
-        var rbuf: [128]u8 = undefined;
-        timeline.counter("rss_mb", std.fmt.bufPrint(&rbuf, "\"rss\":{d},\"reserved\":{d},\"hugetlb\":{d}", .{
-            gc.peakRssBytes() >> 20,
-            heap.totalReservedBytes() >> 20,
-            @import("base").hugetlb.mappedBytes() >> 20,
-        }) catch return);
+        f.vm.observer.counter(&rss_counter, &.{
+            .{ .name = "rss", .value = .{ .unsigned = gc.peakRssBytes() >> 20 } },
+            .{ .name = "reserved", .value = .{ .unsigned = heap.totalReservedBytes() >> 20 } },
+            .{ .name = "hugetlb", .value = .{ .unsigned = @import("base").hugetlb.mappedBytes() >> 20 } },
+        });
         // Scheduler: live task backlog (the speculation flood as it happens) +
         // cumulative speculation submitted/rejected and steals. Together with
         // rss_mb this is the spec-flood-vs-RSS "money chart".
         const s = f.vm.scheduler;
-        var sbuf: [96]u8 = undefined;
-        timeline.counter("sched_backlog", std.fmt.bufPrint(&sbuf, "\"pending\":{d}", .{s.pending_tasks.v.load(.monotonic)}) catch return);
-        var pbuf: [160]u8 = undefined;
+        f.vm.observer.counter(&backlog_counter, &.{.{
+            .name = "pending",
+            .value = .{ .unsigned = s.pending_tasks.v.load(.monotonic) },
+            .unit = .items,
+        }});
         const st = s.stats();
-        timeline.counter("spec", std.fmt.bufPrint(&pbuf, "\"submitted\":{d},\"rejected\":{d},\"steals\":{d}", .{ st.speculative_submitted, st.speculative_rejected, st.steals }) catch return);
+        f.vm.observer.counter(&speculation_counter, &.{
+            .{ .name = "submitted", .value = .{ .unsigned = st.speculative_submitted }, .unit = .items },
+            .{ .name = "rejected", .value = .{ .unsigned = st.speculative_rejected }, .unit = .items },
+            .{ .name = "steals", .value = .{ .unsigned = st.steals }, .unit = .items },
+        });
     }
 
     fn runFiber(self: *Worker, f: *WorkerFiber) void {
@@ -652,16 +684,9 @@ pub const Worker = struct {
         defer f.run_mu.unlock();
 
         const t0 = nanoMonotonic();
-        // Runtime-gated: when tracing is off this is one predictable branch and
-        // we open the cheap unlabelled quantum; when on, sample counters + label
-        // the quantum with the task it runs (both do arg formatting / a /proc
-        // read, so they stay behind `on()`).
-        if (timeline.on()) {
-            sampleTimelineCounters(f);
-            timelineQuantumBegin(f);
-        } else {
-            timeline.begin(.run, "", f.fiber_id);
-        }
+        if (f.vm.observer.profiling()) sampleTimelineCounters(f);
+        var run_span = quantumBegin(f);
+        defer run_span.cancel();
         // Creation-context flag: creations during this quantum belong to
         // the resumed fiber's context (demand chain vs. speculative work).
         // `in_speculation` is fiber-state (saved on its VM across yields);
@@ -678,7 +703,7 @@ pub const Worker = struct {
         f.in_runfiber.store(1, .release);
         f.inner.resume_();
         f.in_runfiber.store(0, .release);
-        timeline.end(.run);
+        quantumFinish(f, &run_span);
         const t1 = nanoMonotonic();
         if (t1 > t0) self.busy_ns += t1 - t0;
         switch (f.inner.state) {
@@ -776,9 +801,10 @@ pub const Worker = struct {
         self.sweepFreeStacks();
         const t0 = nanoMonotonic();
         const pt = prof.start(.park_main_worker);
-        timeline.begin(.park, "", 0);
+        var park_span = self.fibers.items[0].vm.observer.begin(&park_observation, .{});
+        defer park_span.cancel();
         self.scheduler.parkWorker(self.worker_id);
-        timeline.end(.park);
+        park_span.finish(.{});
         prof.end(.park_main_worker, pt);
         const t1 = nanoMonotonic();
         if (t1 > t0) self.idle_ns += t1 - t0;
@@ -1155,10 +1181,11 @@ fn runTask(f: *WorkerFiber, task: Task) void {
                     if (!entry.value.isThunk()) continue;
                     const subj = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), &lbuf);
                     if (subj.isEmpty()) continue;
-                    label = if (subj.file != 0)
-                        (std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(subj.file)), subj.line }) catch "?")
-                    else
-                        subj.text;
+                    label = switch (subj) {
+                        .source => |source| std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(source.file)), source.line }) catch "?",
+                        .text, .path, .url => |text| text,
+                        .none => "?",
+                    };
                     break;
                 }
                 std.debug.print("sweep attrs={d} n={d} t_us={d} worker={d} claimer={d} first_attr={s} member={s}\n", .{
@@ -1189,9 +1216,11 @@ fn runTask(f: *WorkerFiber, task: Task) void {
                     _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
                     const created = f.vm.heap.currentLocal().thunks_created -| before;
                     if (created > 2000) {
-                        const mlabel: []const u8 = if (subj.file != 0)
-                            (std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(subj.file)), subj.line }) catch "?")
-                        else if (subj.text.len != 0) subj.text else "?";
+                        const mlabel: []const u8 = switch (subj) {
+                            .source => |source| std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(source.file)), source.line }) catch "?",
+                            .text, .path, .url => |text| if (text.len == 0) "?" else text,
+                            .none => "?",
+                        };
                         std.debug.print("sweep-member attrs={d} attr={s} member={s} created={d} t_us={d} claimer={d}\n", .{
                             attrs_id,             f.vm.intern.get(entry.name), mlabel, created,
                             vm_force.diagNowUs(), f.ctx.claimer_id,

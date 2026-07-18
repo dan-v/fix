@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const observ = @import("base").observ;
 const gc = @import("runtime").gc;
 const types = @import("runtime").types;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
@@ -18,7 +19,6 @@ const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
 const vm_force = @import("../vm.zig").force;
 const vm_access = @import("../vm.zig").access;
-const timeline = @import("../probe.zig").timeline;
 const memory_config = @import("../memory_config.zig");
 const clock = @import("base").clock;
 const SpinMutex = @import("base").sync.SpinMutex;
@@ -29,6 +29,15 @@ const Scheduler = @import("workers/scheduler.zig").Scheduler;
 const ChunkRegistry = @import("../bytecode.zig").ChunkRegistry;
 const RealizationStore = @import("store").RealizationStore;
 const ImportRegistry = @import("imports.zig").Registry;
+
+const gc_observation: observ.SpanSpec = .{
+    .category = "gc",
+    .name = "collect",
+    .begin_verb = "collecting",
+    .finish_verb = "collected",
+    .begin_level = std.math.maxInt(u8),
+    .finish_level = std.math.maxInt(u8),
+};
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -48,6 +57,7 @@ pub const Context = struct {
     chunks_scanned: *types.ChunkId,
     extra_roots: *std.ArrayListUnmanaged(Value),
     parallel_cap: u32,
+    observer: observ.Observer,
 };
 
 /// Cap on the number of participants in a single collection's mark+evac.
@@ -137,11 +147,8 @@ pub fn collect(ev: Context, collector_id: u8) void {
     }
     // Minor below: the marker slot is grabbed dynamically (capped participants),
     // so `collector_id` isn't needed past the major dispatch.
-    // Timeline (`--timeline`): a `.gc` span on the collector's track so a pause
-    // is visible in the trace, correlatable with the RSS/backlog counters. A
-    // no-op single branch when tracing is off; nests inside the running quantum.
-    timeline.begin(.gc, "minor", 0);
-    defer timeline.end(.gc);
+    var observation = ev.observer.begin(&gc_observation, .{ .subject = .{ .text = "minor" } });
+    defer observation.cancel();
     // Copying minor collection (STW). The young-gated mark runs from roots +
     // the old→young remembered set. At --workers>1 the parked peers HELP the
     // mark (parallel young-gated drain); at --workers=1 it's serial.
@@ -225,6 +232,10 @@ pub fn collect(ev: Context, collector_id: u8) void {
         .attr_live = tr.stats.attrs,
         .attr_reserved = ev.heap.attrs.reservedSlots(),
     });
+    observation.finish(.{ .metrics = &.{
+        .{ .name = "freed", .value = .{ .unsigned = st.freed }, .unit = .items },
+        .{ .name = "live", .value = .{ .unsigned = tr.stats.bytes }, .unit = .bytes },
+    } });
 }
 
 /// GC: one stop-the-world MAJOR (full) collection at a safepoint.
@@ -241,8 +252,8 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
         heap_collector.armLazy(ev.heap);
         return;
     }
-    timeline.begin(.gc, "major", 0);
-    defer timeline.end(.gc);
+    var observation = ev.observer.begin(&gc_observation, .{ .subject = .{ .text = "major" } });
+    defer observation.cancel();
     const tr = ev.tracer;
     const t0 = nowNs();
     // Full mark from all roots. Rescan EVERY chunk's constants: the incremental
@@ -289,6 +300,10 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
     gc.recordCollection(&ev.heap.gc_report, st.objects_freed, tr.stats.bytes, ev.heap.totalReservedBytes());
     gc.recordTiming(&ev.heap.gc_report, t1 - t0, t2 - t1);
+    observation.finish(.{ .metrics = &.{
+        .{ .name = "freed", .value = .{ .unsigned = st.objects_freed }, .unit = .items },
+        .{ .name = "live", .value = .{ .unsigned = tr.stats.bytes }, .unit = .bytes },
+    } });
 }
 
 pub const nowNs = clock.monotonicNs;

@@ -37,7 +37,6 @@ const parser_mod = @import("syntax").parser;
 const diagnostic = @import("syntax").diagnostic;
 const eval_trace = @import("observ.zig").trace;
 const observ = @import("base").observ;
-const timeline = @import("probe.zig").timeline;
 const ast_mod = @import("syntax").ast;
 const deferred_mod = @import("compiler.zig").deferred_table;
 const EvaluationReport = @import("eval/evaluation_report.zig").EvaluationReport;
@@ -892,8 +891,6 @@ pub const Evaluator = struct {
         const ast_node = blk: {
             var observation = self.observer.begin(&parse_observation, observationDetails(subject));
             defer observation.cancel();
-            timeline.begin(.parse, subject, 0);
-            defer timeline.end(.parse);
             const pt = prof.start(.parse);
             defer prof.end(.parse, pt);
             // RSS attribution: blocks the parse grows (AST arena chunks,
@@ -1025,8 +1022,6 @@ pub const Evaluator = struct {
         {
             var observation = self.observer.begin(&compile_observation, observationDetails(subject));
             defer observation.cancel();
-            timeline.begin(.compile, subject, 0);
-            defer timeline.end(.compile);
             const ct = prof.start(.compile);
             defer prof.end(.compile, ct);
             compiler.compileAndFinish(ast_node, scope) catch |err| {
@@ -1243,7 +1238,6 @@ pub const Evaluator = struct {
         const subject = source_path orelse "expression";
         var observation = self.observer.begin(&evaluate_observation, observationDetails(subject));
         defer observation.cancel();
-        timeline.instant(.evaluate, subject);
         const value = try self.runChunkOnMainWorker(chunk_id);
         observation.finish(.{});
         return value;
@@ -1394,7 +1388,6 @@ pub const Evaluator = struct {
                 .details = observationDetails(input.source_path orelse "expression"),
             };
             entries.appendAssumeCapacity(.{ .entry = Context.entry, .arg = &contexts[index] });
-            timeline.instant(.evaluate, input.source_path orelse "expression");
         }
 
         const worker = self.ensureMainWorker() catch |err| {
@@ -1428,7 +1421,6 @@ pub const Evaluator = struct {
         const subject = source_path orelse "expression";
         var observation = self.observer.begin(&evaluate_observation, observationDetails(subject));
         defer observation.cancel();
-        timeline.instant(.evaluate, subject);
         // Only a top-level eval (no source_path — a plain or repl-scoped
         // entry) goes through a main-thread fiber so the main thread can
         // yield on a `.busy` thunk; nested invocations (imports, scoped
@@ -1538,7 +1530,6 @@ pub const Evaluator = struct {
     pub fn writeJsonValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
-        timeline.instant(.render, "result");
         self.report.trace.clear();
         try self.runWithVm(vm_builtins.writeJsonValue, .{ writer, value });
         observation.finish(.{});
@@ -1550,7 +1541,6 @@ pub const Evaluator = struct {
     pub fn writeRawValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
-        timeline.instant(.render, "result");
         self.report.trace.clear();
         try self.runWithVm(writeRawValueBody, .{ writer, value });
         observation.finish(.{});
@@ -1559,7 +1549,6 @@ pub const Evaluator = struct {
     pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
-        timeline.instant(.render, "result");
         self.report.trace.clear();
         try self.runWithVm(vm_builtins.writeLazyXmlValue, .{ writer, value });
         observation.finish(.{});
@@ -1729,7 +1718,6 @@ pub const Evaluator = struct {
     pub fn forceDeep(self: *Evaluator, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "strict result" } });
         defer observation.cancel();
-        timeline.instant(.render, "strict result");
         self.report.trace.clear();
         try self.runWithVm(vm_force.forceDeepCounted, .{value});
         observation.finish(.{});
@@ -1995,7 +1983,6 @@ pub const Evaluator = struct {
 
         var observation = self.observer.begin(&import_observation, .{ .subject = .{ .path = stable_path } });
         defer observation.cancel();
-        timeline.instant(.import, stable_path);
 
         const source = if (corepkgs.source(stable_path)) |core_source|
             core_source
@@ -2072,7 +2059,6 @@ pub const Evaluator = struct {
 
         var observation = self.observer.begin(&import_observation, .{ .subject = .{ .path = stable_path } });
         defer observation.cancel();
-        timeline.instant(.import, stable_path);
 
         const source = if (corepkgs.source(stable_path)) |core_source|
             core_source
@@ -2138,7 +2124,6 @@ pub const Evaluator = struct {
     pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
-        timeline.instant(.render, "result");
         try self.runWithVm(writeValueBody, .{ self, writer, value });
         observation.finish(.{});
     }
@@ -2269,6 +2254,7 @@ fn gcContext(ev: *Evaluator) gc_controller.Context {
         .chunks_scanned = &ev.gc_chunks_scanned,
         .extra_roots = &ev.gc_extra_roots,
         .parallel_cap = ev.gc_parallel_cap,
+        .observer = ev.observer,
     };
 }
 

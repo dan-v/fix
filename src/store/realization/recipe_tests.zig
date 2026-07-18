@@ -51,6 +51,10 @@ const ProgressRecorder = struct {
                 .finish_fn = finish,
                 .update_fn = update,
                 .event_fn = event,
+                .counter_fn = counter,
+                .next_flow_id_fn = nextFlowId,
+                .flow_fn = flow,
+                .sample_fn = sample,
             },
             .profile_enabled = true,
         };
@@ -75,6 +79,14 @@ const ProgressRecorder = struct {
 
     fn update(_: *anyopaque, _: usize, _: *const observ.SpanSpec, _: observ.Interest, _: []const observ.Metric) void {}
     fn event(_: *anyopaque, _: *const observ.EventSpec, _: observ.Details, _: observ.Track, _: observ.Interest, _: []const observ.Metric) void {}
+    fn counter(_: *anyopaque, _: *const observ.CounterSpec, _: observ.Track, _: []const observ.Metric) void {}
+    fn nextFlowId(_: *anyopaque) u64 {
+        return 1;
+    }
+    fn flow(_: *anyopaque, _: *const observ.FlowSpec, _: u64, _: observ.FlowPhase, _: observ.Track, _: u64) void {}
+    fn sample(_: *anyopaque, _: u64) bool {
+        return true;
+    }
 
     fn count(self: *ProgressRecorder, name: []const u8) usize {
         self.mu.lock();

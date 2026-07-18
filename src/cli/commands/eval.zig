@@ -68,7 +68,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
     errdefer progress.deinit(false);
-    if (term.progressEnabled()) ev.setObserver(progress.observer());
 
     var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, options);
     defer vm_trace.deinit(allocator);
@@ -78,20 +77,22 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer thunks_setup.deinit(allocator);
     if (thunks_setup.trace) |t| ev.setThunkTrace(t);
 
-    // Timeline is always compiled in and RUNTIME-gated: `--timeline[=path]`
-    // calls `init()` which flips the runtime gate on; without it the probe
-    // stays dormant (one predictable branch at quantum granularity, ~free).
     const timeline_path = options.timeline_path;
+    var timeline_recorder: ?timeline.Recorder = null;
+    defer if (timeline_recorder) |*recorder| recorder.deinit();
     if (timeline_path != null) {
-        timeline.init(allocator, worker_count, 1 << 21, ev.internTable());
-        timeline.setFlowSample(options.timeline_flows);
+        timeline_recorder = try timeline.Recorder.init(allocator, worker_count, 1 << 21, ev.internTable());
+        const recorder = &timeline_recorder.?;
+        recorder.setFlowSample(options.timeline_flows);
+        progress.setTimeline(recorder);
         ev.setTraceFlows(true);
-        timeline.setSource(if (input_count == 1) switch (input_plan.selected(0).source_arg) {
+        recorder.setSource(if (input_count == 1) switch (input_plan.selected(0).source_arg) {
             .file => |p| p,
             .expr => "(expression)",
             .flake => |inst| inst,
         } else "(multiple inputs)");
     }
+    if (term.progressEnabled() or timeline_recorder != null) ev.setObserver(progress.observer());
 
     var ok = true;
     for (0..input_count) |index| {
@@ -116,7 +117,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     }
     progress.deinit(ok);
 
-    if (timeline_path) |p| timeline.dump(init.io, p, worker_count);
+    if (timeline_path) |path| timeline_recorder.?.dump(init.io, path);
     vm_trace.finish();
     thunks_setup.finish();
     if (options.print_sched_stats) stats.report(&ev);

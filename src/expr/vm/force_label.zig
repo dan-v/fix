@@ -1,4 +1,4 @@
-//! Human-readable source labels for thunks, as `timeline.Subject`s — the
+//! Human-readable source labels for thunks — the
 //! crit-wait track (force.zig) and run-quanta (worker.zig) diagnostics.
 //!
 //! Cold: only exercised when `--timeline`/progress is drawing. Every reader
@@ -16,10 +16,10 @@ const ChunkId = types.ChunkId;
 const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
 const vm_errors = @import("errors.zig");
-const timeline = @import("../probe.zig").timeline;
+const observ = @import("base").observ;
 const BuiltinId = @import("runtime").builtins.BuiltinId;
 
-/// Rich source label for a thunk, as a `timeline.Subject` — an interned source
+/// Rich source label for a thunk — an interned source
 /// location (file id + line, resolved to "modules.nix:545" at dump) or a
 /// literal ("mapAttrs" / "builtins.import foo.nix" / ".attr" / an applied fn's
 /// location). Shared by the crit-wait track (force.zig) and the run quanta
@@ -28,40 +28,21 @@ const BuiltinId = @import("runtime").builtins.BuiltinId;
 /// Empty when unresolvable OR when the thunk has already RESOLVED: a resolved
 /// thunk's bare target union is clobbered, so it must not be read
 /// (state-guarded). Best-effort and bounds-safe against a concurrent resolve.
-pub fn thunkLabel(self: *VM, thunk_id: ObjectId, buf: []u8) timeline.Subject {
+pub fn thunkLabel(self: *VM, thunk_id: ObjectId, buf: []u8) observ.Subject {
     const th = self.heap.getThunkAssumeValid(thunk_id);
-    if (th.future.state.load(.acquire) > @intFromEnum(future_mod.FutureState.evaluating)) return .{};
+    if (th.future.state.load(.acquire) > @intFromEnum(future_mod.FutureState.evaluating)) return .none;
     return critTargetLabel(self, th, buf, true);
 }
 
-/// "basename:line" for the demand fiber's CURRENT frame — a stable read (the
-/// fiber's own frames), used for the progress "waiting on" line. Deliberately
-/// NOT the target thunk's def-site: decoding that touches the thunk's payload
-/// union, which a concurrent resolver can clobber mid-read. Returns "" when
-/// there's no frame / no source map. The progress sink consumes the result
-/// synchronously, so borrowing `buf` is safe.
-pub fn demandFrameText(self: *VM, buf: []u8) []const u8 {
-    if (self.frames_len == 0) return "";
-    const frame = self.frames[self.frames_len - 1];
-    // Prefer the exact ip's span; fall back to the chunk's body span (set for
-    // every chunk) since source maps are sparse and the current ip is usually
-    // uncovered. Both read the immutable chunk — never the thunk union.
-    const span = vm_errors.sourceSpanForFrame(frame) orelse
-        vm_errors.chunkEntrySpan(frame.chunk_ptr) orelse return "";
-    const file_id = span.file orelse return "";
-    const base = std.fs.path.basename(self.intern.get(file_id));
-    return std.fmt.bufPrint(buf, "{s}:{d}", .{ base, span.line }) catch base;
-}
-
-pub fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) timeline.Subject {
+pub fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) observ.Subject {
     const label = thunkLabel(self, thunk_id, buf);
     if (!label.isEmpty()) return label;
     // The crit track never shows a bare "wait". thunkLabel is empty either
     // because the thunk RESOLVED mid-read (the race — a short wait, target
     // clobbered) or because it's genuinely source-less; distinguish the two.
     const th = self.heap.getThunkAssumeValid(thunk_id);
-    if (th.future.state.load(.acquire) > @intFromEnum(future_mod.FutureState.evaluating)) return timeline.Subject.lit("resolved");
-    return timeline.Subject.lit(@tagName(th.targetKind()));
+    if (th.future.state.load(.acquire) > @intFromEnum(future_mod.FutureState.evaluating)) return observ.Subject.literal("resolved");
+    return observ.Subject.literal(@tagName(th.targetKind()));
 }
 
 /// True while the thunk's `payload` is still its `.target` arm — i.e. NOT yet
@@ -86,11 +67,11 @@ inline fn rawArm(th: *const thunk_mod.Thunk, comptime T: type) T {
     return @as(*const T, @ptrCast(@alignCast(&th.payload))).*;
 }
 
-pub fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool) timeline.Subject {
+pub fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool) observ.Subject {
     return switch (th.targetKind()) {
         .bytecode => blk: {
             const b = rawArm(th, thunk_mod.BytecodeThunk);
-            if (!stillEvaluating(th)) break :blk .{}; // resolved mid-read → b is garbage
+            if (!stillEvaluating(th)) break :blk .none; // resolved mid-read → b is garbage
             const loc = critChunkLoc(self, b.chunk_id);
             if (!loc.isEmpty()) break :blk loc;
             // Source-less chunk — a compiler-generated apply-glue. The
@@ -98,7 +79,7 @@ pub fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool)
             // the operation and, where the applied function (upvalue 0) is
             // INLINE-safe to read, its location. `b` is a validated snapshot,
             // so its inline slot is safe to read.
-            if (b.chunk_id == self.registry.well_known.mapattrs_apply) break :blk timeline.Subject.lit("mapAttrs"); // 3 ups → spilled
+            if (b.chunk_id == self.registry.well_known.mapattrs_apply) break :blk observ.Subject.literal("mapAttrs"); // 3 ups → spilled
             if (b.upvalue_count >= 1 and b.upvalue_count <= thunk_mod.BytecodeThunk.inline_capacity) {
                 const fn_val: Value = @as(*const Value, @ptrCast(@alignCast(&b.storage))).*;
                 const fn_loc = critClosureLabel(self, fn_val, buf);
@@ -106,28 +87,28 @@ pub fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool)
             }
             // genlist_apply is the SHARED single-arg-application stub — used by
             // both builtins.genList AND builtins.map — so name it for both.
-            if (b.chunk_id == self.registry.well_known.genlist_apply) break :blk timeline.Subject.lit("map/genList");
-            break :blk .{};
+            if (b.chunk_id == self.registry.well_known.genlist_apply) break :blk observ.Subject.literal("map/genList");
+            break :blk .none;
         },
         .closure => blk: {
             const cv = rawArm(th, Value);
-            if (!stillEvaluating(th)) break :blk .{};
+            if (!stillEvaluating(th)) break :blk .none;
             break :blk critClosureLabel(self, cv, buf);
         },
         .attr_access => blk: {
             const aa = rawArm(th, thunk_mod.AttrAccess);
-            if (!stillEvaluating(th)) break :blk .{};
-            break :blk timeline.Subject.lit(std.fmt.bufPrint(buf, ".{s}", .{self.intern.get(aa.name)}) catch "");
+            if (!stillEvaluating(th)) break :blk .none;
+            break :blk observ.Subject.literal(std.fmt.bufPrint(buf, ".{s}", .{self.intern.get(aa.name)}) catch "");
         },
         .pass_through => blk: {
             // A cell forwards to another value; label what it points at (one
             // level, no further pass_through recursion).
-            if (!follow) break :blk .{};
+            if (!follow) break :blk .none;
             const pv = rawArm(th, Value);
-            if (!stillEvaluating(th)) break :blk .{}; // resolved mid-read → pv is garbage
-            if (!pv.isThunk()) break :blk .{};
+            if (!stillEvaluating(th)) break :blk .none; // resolved mid-read → pv is garbage
+            if (!pv.isThunk()) break :blk .none;
             const inner = self.heap.getThunkAssumeValid(pv.asObjectId());
-            if (!stillEvaluating(inner)) break :blk .{};
+            if (!stillEvaluating(inner)) break :blk .none;
             break :blk critTargetLabel(self, inner, buf, false);
         },
         // A lazy-compiled attr body — file id + line from its AST node via the
@@ -135,50 +116,50 @@ pub fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool)
         // cache-free so it's safe even while the compiler shares the index).
         .deferred => blk: {
             const d = rawArm(th, thunk_mod.DeferredThunk);
-            if (!stillEvaluating(th)) break :blk .{};
-            const table = self.deferred_table orelse break :blk timeline.Subject.lit("deferred");
+            if (!stillEvaluating(th)) break :blk .none;
+            const table = self.deferred_table orelse break :blk observ.Subject.literal("deferred");
             const entry = table.get(d.deferred_id);
-            const fid = entry.source_file_id orelse break :blk timeline.Subject.lit("deferred");
-            const off = if (entry.node.span) |s| s.offset else break :blk timeline.Subject.src(fid, 0);
-            const idx = table.lineIndexFor(entry.source) catch break :blk timeline.Subject.src(fid, 0);
-            break :blk timeline.Subject.src(fid, idx.lineForOffset(off));
+            const fid = entry.source_file_id orelse break :blk observ.Subject.literal("deferred");
+            const off = if (entry.node.span) |s| s.offset else break :blk observ.Subject.sourceLocation(fid, 0);
+            const idx = table.lineIndexFor(entry.source) catch break :blk observ.Subject.sourceLocation(fid, 0);
+            break :blk observ.Subject.sourceLocation(fid, idx.lineForOffset(off));
         },
     };
 }
 
 /// The chunk's source location as an interned ref (file id + line) — the
 /// filename is resolved from the shared intern table only at dump. No buffer.
-fn critChunkLoc(self: *VM, chunk_id: ChunkId) timeline.Subject {
-    const ch = self.registry.get(chunk_id) orelse return .{};
-    const span = vm_errors.chunkEntrySpan(ch) orelse return .{};
-    const file_id = span.file orelse return .{};
-    return timeline.Subject.src(file_id, span.line);
+fn critChunkLoc(self: *VM, chunk_id: ChunkId) observ.Subject {
+    const ch = self.registry.get(chunk_id) orelse return .none;
+    const span = vm_errors.chunkEntrySpan(ch) orelse return .none;
+    const file_id = span.file orelse return .none;
+    return observ.Subject.sourceLocation(file_id, span.line);
 }
 
-fn critClosureLabel(self: *VM, cv: Value, buf: []u8) timeline.Subject {
+fn critClosureLabel(self: *VM, cv: Value, buf: []u8) observ.Subject {
     return switch (cv.kind()) {
         .closure => blk: {
-            const cl = @import("closures.zig").closureRef(self, cv) catch break :blk .{};
+            const cl = @import("closures.zig").closureRef(self, cv) catch break :blk .none;
             break :blk critChunkLoc(self, cl.chunk_id);
         },
         .builtin_closure => blk: {
-            const bc = self.heap.getBuiltinClosure(cv.asObjectId()) catch break :blk .{};
+            const bc = self.heap.getBuiltinClosure(cv.asObjectId()) catch break :blk .none;
             break :blk critBuiltinLabel(self, @enumFromInt(bc.builtin_id), bc.args, buf);
         },
         .builtin => critBuiltinLabel(self, @enumFromInt(cv.asBuiltinId()), &.{}, buf),
-        else => .{},
+        else => .none,
     };
 }
 
-fn critBuiltinLabel(self: *VM, id: BuiltinId, args: []const Value, buf: []u8) timeline.Subject {
+fn critBuiltinLabel(self: *VM, id: BuiltinId, args: []const Value, buf: []u8) observ.Subject {
     const name = @tagName(id);
     // Path-taking builtins (import, readFile, ...) carry the file as arg[0] —
     // the "which giant file is main blocked on" bit worth surfacing.
     if (args.len > 0) {
         const a = args[0];
         if (a.kind() == .path or a.kind() == .string) {
-            return timeline.Subject.lit(std.fmt.bufPrint(buf, "builtins.{s} {s}", .{ name, std.fs.path.basename(self.intern.get(a.asInternId())) }) catch name);
+            return observ.Subject.literal(std.fmt.bufPrint(buf, "builtins.{s} {s}", .{ name, std.fs.path.basename(self.intern.get(a.asInternId())) }) catch name);
         }
     }
-    return timeline.Subject.lit(std.fmt.bufPrint(buf, "builtins.{s}", .{name}) catch name);
+    return observ.Subject.literal(std.fmt.bufPrint(buf, "builtins.{s}", .{name}) catch name);
 }
