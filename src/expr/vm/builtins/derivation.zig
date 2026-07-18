@@ -32,7 +32,8 @@ const compute_derivation_observation: observ.SpanSpec = .{
     .name = "derivation",
     .begin_verb = "computing derivation",
     .finish_verb = "computed derivation",
-    .begin_level = 1,
+    .begin_level = 3,
+    .finish_level = 2,
 };
 
 const allOutputsContextValue = string_context.allOutputsContextValue;
@@ -285,7 +286,10 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
         .strict => derivation.buildStrictValue(self.allocator, self.intern, self.heap, spec),
     };
     observation.finish(.{
-        .details = .{ .subject = .{ .text = computed.drv_path } },
+        .details = .{
+            .subject = .{ .text = drv_name },
+            .destination = .{ .path = computed.drv_path },
+        },
         .metrics = &.{.{
             .name = "outputs",
             .value = .{ .unsigned = output_names.names.len },
