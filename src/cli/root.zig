@@ -3,6 +3,8 @@
 pub const commands = @import("commands/root.zig");
 pub const presentation = @import("presentation.zig");
 pub const ProcessContext = @import("process_context.zig").ProcessContext;
+pub const thunks_log_enabled = @import("expr").vm.thunks_log_enabled;
+pub const vm_trace_enabled = @import("expr").vm.trace_log.enabled;
 
 test {
     _ = commands;

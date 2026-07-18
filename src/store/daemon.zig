@@ -13,7 +13,6 @@ pub const BuildSink = build_events.Sink;
 pub const BuildMode = build_options.Mode;
 pub const BuildSettings = build_options.Settings;
 pub const Setting = build_options.Setting;
-pub const Trust = daemon.Trust;
 pub const MissingPlan = daemon.MissingPlan;
 pub const default_socket_path = daemon.default_socket_path;
 pub const DaemonPool = pool.DaemonPool;

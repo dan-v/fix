@@ -6,7 +6,7 @@
 //! This is the one execution path for every nix-daemon store op — `.drv`/source
 //! writes, `isValidPath` queries, builds — so compute workers never block on the
 //! socket, and connections stay warm and reused across the whole run (eval,
-//! on-demand closure writes, the terminal build, `fix store`).
+//! on-demand closure writes, and the terminal build).
 //!
 //! Ordering is NOT the pool's concern. The daemon enforces referential integrity
 //! against its own committed state, so a write on ANY connection is valid once

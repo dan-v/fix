@@ -24,11 +24,11 @@ const subcommands = [_]Subcommand{
     .{ .name = "switch", .summary = "build and activate a NixOS/nix-darwin/home-manager configuration", .run = commands.@"switch".run },
     .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = commands.repl.run },
     .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = commands.disasm.run },
-    .{ .name = "inspect", .summary = "evaluate and dump evaluator statistics", .run = commands.inspect.run },
+} ++ (if (cli.vm_trace_enabled) [_]Subcommand{
     .{ .name = "trace", .summary = "work with binary VM trace files", .run = commands.trace.run },
+} else [_]Subcommand{}) ++ (if (cli.thunks_log_enabled) [_]Subcommand{
     .{ .name = "thunks", .summary = "diff thunks-logs to find divergent resolutions", .run = commands.thunks.run },
-    .{ .name = "store", .summary = "query the nix-daemon (protocol version, path validity)", .run = commands.store.run },
-};
+} else [_]Subcommand{});
 
 fn writeTopUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll("usage: fix <command> [options]\n\ncommands:\n");

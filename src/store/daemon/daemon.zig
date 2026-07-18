@@ -5,9 +5,8 @@
 //! `/nix/store` (the normal case: the store is `root:nixbld`, not user
 //! writable) must go through here rather than touching the filesystem.
 //!
-//! Phase 1 covers the read/query ops (`isValidPath`, `queryValidPaths`); the
-//! add/build ops land in later phases. The connection owns the framed
-//! reader/writer and drains the `STDERR_*` sideband after every op.
+//! The connection owns the framed reader/writer and drains the `STDERR_*`
+//! sideband after every op.
 
 const std = @import("std");
 const terminal_text = @import("base").terminal_text;
@@ -34,10 +33,6 @@ const ResultType = enum(u64) {
 /// A consumer of the daemon's build activity/log stream (see `buildPaths`).
 /// Callbacks run on the calling thread while the build is in progress.
 pub const BuildSink = build_events.Sink;
-
-/// Whether the daemon considers this client trusted (from the >=1.35
-/// handshake). Trusted clients may perform privileged ops without restriction.
-pub const Trust = enum { unknown, trusted, not_trusted };
 
 /// Build realization mode sent with `build_paths` (Nix's `BuildMode`): the
 /// default build, `--repair` (rebuild and fix corrupted paths), or `--check`
@@ -85,7 +80,6 @@ pub const DaemonStore = struct {
     /// The daemon's advertised protocol version (its own, not the negotiated
     /// minimum — version-gated wire fields key off `protocolMinor` of this).
     daemon_version: u64 = 0,
-    trusted: Trust = .unknown,
     /// Last daemon-reported error message (owned), surfaced with
     /// `error.DaemonError`. Freed on deinit / overwritten on the next error.
     last_error: ?[]u8 = null,
@@ -163,11 +157,7 @@ pub const DaemonStore = struct {
             self.allocator.free(nix_version); // informational; unused
         }
         if (minor >= 35) {
-            self.trusted = switch (try wire.readInt(self.r())) {
-                1 => .trusted,
-                2 => .not_trusted,
-                else => .unknown,
-            };
+            _ = try wire.readInt(self.r()); // trusted-client status
         }
         try self.processStderr();
     }
@@ -180,17 +170,6 @@ pub const DaemonStore = struct {
         try wire.writeString(self.w(), path);
         try self.flushAndDrain();
         return try wire.readBool(self.r());
-    }
-
-    /// Of `paths`, those the daemon considers valid. When `substitute` is true
-    /// the daemon may consult substituters. Caller frees each element and the
-    /// returned slice.
-    pub fn queryValidPaths(self: *DaemonStore, allocator: std.mem.Allocator, paths: []const []const u8, substitute: bool) ![][]u8 {
-        try self.beginOp(.query_valid_paths);
-        try wire.writeStrings(self.w(), paths);
-        if (wire.protocolMinor(self.daemon_version) >= 27) try wire.writeBool(self.w(), substitute);
-        try self.flushAndDrain();
-        return try wire.readStrings(allocator, self.r());
     }
 
     /// Add `text` to the store as a text-addressed object named `name`
