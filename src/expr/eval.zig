@@ -131,6 +131,15 @@ pub const ReleaseAction = lifecycle.ReleaseAction;
 /// switch on it without reaching into `vm`).
 pub const BreakReason = vm_mod.BreakReason;
 
+/// A top-level evaluation together with the bytecode entry that produced it.
+/// Most callers only need `value`; inspection frontends retain `entry_chunk`
+/// so concrete results (which carry no runtime code pointer) still have a
+/// useful initial location in the VM explorer.
+pub const EvaluationResult = struct {
+    value: Value,
+    entry_chunk: ChunkId,
+};
+
 /// The CLI-supplied debugger console. `run` drives one interactive pause.
 pub const DebugUi = struct {
     ctx: *anyopaque,
@@ -1241,7 +1250,16 @@ pub const Evaluator = struct {
         return self.evaluateTop(source, self.base_path, null, scope);
     }
 
+    /// `evaluateWithScope`, retaining the compiled entry chunk for tooling.
+    pub fn evaluateWithScopeResult(self: *Evaluator, source: []const u8, scope: ?Value) !EvaluationResult {
+        return self.evaluateTopResult(source, self.base_path, null, scope);
+    }
+
     fn evaluateTop(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value) !Value {
+        return (try self.evaluateTopResult(source, base_path, source_path, scope)).value;
+    }
+
+    fn evaluateTopResult(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value) !EvaluationResult {
         try self.prepareEvaluations();
         // Not routed through `evaluateSource`: its top-level detection is
         // `source_path == null`, so passing the path there would send the
@@ -1255,7 +1273,7 @@ pub const Evaluator = struct {
         defer observation.cancel();
         const value = try self.runChunkOnMainWorker(chunk_id);
         observation.finish(.{});
-        return value;
+        return .{ .value = value, .entry_chunk = chunk_id };
     }
 
     fn prepareEvaluations(self: *Evaluator) !void {

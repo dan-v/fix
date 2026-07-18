@@ -14,6 +14,8 @@ pub const Chunk = core.Chunk;
 pub const ChunkBuilder = core.ChunkBuilder;
 pub const ChunkRegistry = core.ChunkRegistry;
 pub const BreakpointTable = core.BreakpointTable;
+pub const NameId = core.NameId;
+pub const root_name_id = core.root_name_id;
 
 pub const disasm = @import("bytecode/disasm.zig");
 pub const stats = @import("bytecode/stats.zig");

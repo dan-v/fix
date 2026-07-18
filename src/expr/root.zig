@@ -14,6 +14,7 @@ pub const Evaluator = eval.Evaluator;
 pub const BuildSession = eval.BuildSession;
 pub const Diagnostic = eval.Diagnostic;
 pub const EvalTrace = eval.EvalTrace;
+pub const EvaluationResult = eval.EvaluationResult;
 pub const DebugSession = eval.DebugSession;
 pub const DebugFrame = eval.DebugFrame;
 pub const BreakReason = eval.BreakReason;

@@ -17,6 +17,15 @@ test "language release is evaluator-owned and idempotent" {
     ev.deinit();
 }
 
+test "inspection evaluation retains its entry chunk" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluateWithScopeResult("1 + 2", null);
+    try std.testing.expectEqual(@as(i64, 3), result.value.asInt());
+    try std.testing.expect(ev.getChunk(result.entry_chunk) != null);
+}
+
 test "build transition runs its explicit post-release action once" {
     const Counter = struct {
         value: usize = 0,

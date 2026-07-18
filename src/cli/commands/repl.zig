@@ -138,6 +138,13 @@ const Repl = struct {
     scope: ?Value = null,
     /// Files loaded with :l, in order, for :r. Owned.
     loaded: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Stable VM explorer focus. Ordinary evaluations update it to the
+    /// result's backing chunk (closure/thunk) or their compiled entry chunk.
+    vm_focus: ?types.ChunkId = null,
+    /// Cold hierarchy projection, rebuilt only after the append-only registry
+    /// or name tree grows. Bare queries share it instead of rescanning millions
+    /// of chunks for every command.
+    vm_index: ?engine.bytecode.inspect.NameIndex = null,
     history: history_mod.History,
     quit: bool = false,
 
@@ -168,6 +175,7 @@ const Repl = struct {
         self.bindings.deinit(self.allocator);
         for (self.loaded.items) |p| self.allocator.free(p);
         self.loaded.deinit(self.allocator);
+        if (self.vm_index) |*index| index.deinit();
         self.history.deinit();
     }
 
@@ -495,8 +503,7 @@ const Repl = struct {
                     try self.collectBetweenInputs();
                 }
             },
-            .disasm => try self.disasm(rest, false),
-            .disasm_eval => try self.disasm(rest, true),
+            .vm => try self.vm(rest),
             .env => {
                 var out = self.stdout();
                 defer out.interface.flush() catch {};
@@ -535,11 +542,12 @@ const Repl = struct {
     /// Evaluate an expression in the repl scope. Failures render to stderr
     /// and yield null.
     fn evalExpr(self: *Repl, source: []const u8) !?Value {
-        const value = self.ev.evaluateWithScope(source, self.scope) catch |err| {
+        const result = self.ev.evaluateWithScopeResult(source, self.scope) catch |err| {
             try render_err.evalFailure(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
             return null;
         };
-        return value;
+        self.vm_focus = self.focusForValue(result.value, result.entry_chunk);
+        return result.value;
     }
 
     fn printResult(self: *Repl, value: Value, source: []const u8) !void {
@@ -725,72 +733,222 @@ const Repl = struct {
         }
     }
 
-    /// `:d EXPR` finds the chunk behind a value. `:de EXPR` snapshots the
-    /// registry around evaluation and exposes every newly compiled chunk, the
-    /// long-lived-repl equivalent of `fix disasm --eval`'s fresh registry.
-    fn disasm(self: *Repl, expr: []const u8, eval_all: bool) !void {
-        const first_new = self.ev.chunkRegistry().count();
-        var chunk_id: ?types.ChunkId = null;
-
-        // Value-first: `:d f` on a function should show f's body, not the
-        // trivial lookup chunk.
-        const evaluated = try self.evalExpr(expr);
-        if (evaluated) |value| {
-            switch (value.kind()) {
-                .closure => {
-                    if (self.ev.tooling().closure(value)) |c| {
-                        chunk_id = c.chunk_id;
-                    } else |_| {}
-                },
-                .thunk => {
-                    if (self.ev.tooling().thunk(value)) |t| {
-                        if (t.targetKind() == .bytecode) chunk_id = t.payload.target.bytecode.chunk_id;
-                    } else |_| {}
-                },
-                else => {},
-            }
-        } else if (!eval_all) return; // evaluation failed; error already rendered
-
-        const end_new = self.ev.chunkRegistry().count();
-        const corpus: ?pager_mod.Corpus = if (eval_all)
-            .{ .first = first_new, .end = end_new }
-        else
-            null;
-
-        if (evaluated == null and (corpus == null or corpus.?.count() == 0)) return;
-
-        if (corpus) |captured| {
-            if (captured.count() > 0) {
-                // Registration is dense. Start on the first id, matching the
-                // CLI's registry-order dump; the corpus pane exposes the rest.
-                chunk_id = captured.first;
-            }
+    fn focusForValue(self: *Repl, value: Value, entry_chunk: types.ChunkId) types.ChunkId {
+        switch (value.kind()) {
+            .closure => if (self.ev.tooling().closure(value)) |closure| {
+                return closure.chunk_id;
+            } else |_| {},
+            .thunk => if (self.ev.tooling().thunk(value)) |thunk| {
+                if (thunk.targetKind() == .bytecode) return thunk.payload.target.bytecode.chunk_id;
+            } else |_| {},
+            else => {},
         }
+        return entry_chunk;
+    }
 
-        if (chunk_id == null) {
-            chunk_id = self.ev.compileSourceScoped(expr, self.scope) catch |err| {
-                try self.printError("compilation failed: {s}", .{@errorName(err)});
-                return;
-            };
+    /// VM explorer command family. The TUI opens on the focused chunk; bare
+    /// mode exposes the same model through bounded hierarchy queries.
+    fn vm(self: *Repl, args_text: []const u8) !void {
+        const text = std.mem.trim(u8, args_text, " \t");
+        if (text.len == 0) return self.vmShow();
+
+        const word_end = std.mem.indexOfAny(u8, text, " \t") orelse text.len;
+        const word = text[0..word_end];
+        const rest = std.mem.trim(u8, text[word_end..], " \t");
+        if (std.mem.eql(u8, word, "help") or std.mem.eql(u8, word, "?")) return self.vmHelp();
+        if (std.mem.eql(u8, word, "ls") or std.mem.eql(u8, word, "tree")) return self.vmList(rest);
+        if (std.mem.eql(u8, word, "chunks")) return self.vmChunks(rest);
+        if (std.mem.eql(u8, word, "chunk") or std.mem.eql(u8, word, "code")) {
+            if (rest.len > 0) {
+                self.vm_focus = parseChunkId(rest) orelse {
+                    try self.printError("expected a chunk id, got `{s}`", .{rest});
+                    return;
+                };
+            }
+            return self.vmShow();
         }
+        const expr = if (std.mem.eql(u8, word, "eval")) rest else text;
+        if (expr.len == 0) {
+            try self.printError(":vm eval needs an expression", .{});
+            return;
+        }
+        if (try self.evalExpr(expr) == null) return;
+        try self.vmShow();
+        try self.collectBetweenInputs();
+    }
 
+    fn vmShow(self: *Repl) !void {
+        const chunk_id = self.vm_focus orelse {
+            try self.printError("no VM focus yet — evaluate an expression or use `:vm chunk ID`", .{});
+            return;
+        };
+        if (self.ev.getChunk(chunk_id) == null) {
+            try self.printError("chunk #{d} not found", .{chunk_id});
+            return;
+        }
         if (self.interactive) {
-            try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id.?, self.color_depth, corpus);
+            try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id, self.color_depth);
         } else {
             var out = self.stdout();
             defer out.interface.flush() catch {};
-            if (corpus) |captured| {
-                if (captured.count() > 0) {
-                    try pager_mod.writePlainCorpus(self.allocator, &out.interface, self.ev, captured);
-                } else {
-                    try out.interface.writeAll("evaluation reused existing chunks; showing the target chunk\n");
-                    try pager_mod.writePlain(self.allocator, &out.interface, self.ev, chunk_id.?);
-                }
+            try pager_mod.writePlain(self.allocator, &out.interface, self.ev, chunk_id);
+        }
+    }
+
+    fn vmHelp(self: *Repl) !void {
+        var out = self.stdout();
+        defer out.interface.flush() catch {};
+        try out.interface.writeAll(
+            \\:vm [EXPR]              evaluate and focus a value's chunk
+            \\:vm                     show the focused chunk
+            \\:vm chunk ID            focus and show a chunk directly
+            \\:vm ls [@NAME] [LIMIT]  list one bounded name-tree level
+            \\:vm chunks [@NAME] [LIMIT]
+            \\                         list chunks directly attached to a name
+            \\:vm eval EXPR            disambiguate an expression starting with
+            \\                         a VM subcommand word
+            \\Name and chunk ids printed by the explorer are stable for this
+            \\REPL session. Listings default to 40 rows and never dump a whole
+            \\NixOS-scale registry implicitly.
+            \\
+        );
+    }
+
+    fn ensureVmIndex(self: *Repl) !*engine.bytecode.inspect.NameIndex {
+        const registry = self.ev.chunkRegistry();
+        if (self.vm_index) |*index| {
+            if (index.registry_count == registry.count() and index.name_count == registry.nameCount()) return index;
+            index.deinit();
+            self.vm_index = null;
+        }
+        self.vm_index = try engine.bytecode.inspect.NameIndex.build(self.allocator, registry);
+        return &self.vm_index.?;
+    }
+
+    fn vmList(self: *Repl, args_text: []const u8) !void {
+        const query = (try self.parseVmRange(args_text, .root)) orelse return;
+        const index = try self.ensureVmIndex();
+        if (index.node(query.name_id) == null) {
+            try self.printError("name @{d} not found", .{query.name_id});
+            return;
+        }
+        var out = self.stdout();
+        defer out.interface.flush() catch {};
+        try self.writeVmNameHeader(&out.interface, index, query.name_id);
+
+        var shown: usize = 0;
+        var active: usize = 0;
+        for (index.childrenOf(query.name_id)) |child| {
+            const summary = index.statsOf(child);
+            if (summary.chunks == 0) continue;
+            active += 1;
+            if (shown >= query.limit) continue;
+            const node = index.node(child).?;
+            try out.interface.print("  @{d:<8} {s}{s:<28} {d:>9} chunks  {Bi:>10} code\n", .{
+                child,
+                if (node.synthetic) "·" else "",
+                self.ev.internTable().get(node.segment),
+                summary.chunks,
+                summary.code_bytes,
+            });
+            shown += 1;
+        }
+        if (active == 0) try out.interface.writeAll("  (no named children)\n");
+        if (active > shown) try out.interface.print("  ... {d} more; increase LIMIT to show them\n", .{active - shown});
+    }
+
+    fn vmChunks(self: *Repl, args_text: []const u8) !void {
+        const default_name: VmDefaultName = if (self.vm_focus) |id|
+            .{ .chunk = id }
+        else
+            .root;
+        const query = (try self.parseVmRange(args_text, default_name)) orelse return;
+        const index = try self.ensureVmIndex();
+        if (index.node(query.name_id) == null) {
+            try self.printError("name @{d} not found", .{query.name_id});
+            return;
+        }
+        var out = self.stdout();
+        defer out.interface.flush() catch {};
+        try self.writeVmNameHeader(&out.interface, index, query.name_id);
+        const chunks = index.chunksOf(query.name_id);
+        const shown = @min(chunks.len, query.limit);
+        for (chunks[0..shown]) |id| {
+            const chunk = self.ev.getChunk(id) orelse continue;
+            try out.interface.print("  #{d:<9} {Bi:>9} code  {d:>7} constants  arity {d}\n", .{
+                id,
+                chunk.code.len,
+                chunk.constants.len,
+                chunk.arity,
+            });
+        }
+        if (chunks.len == 0) try out.interface.writeAll("  (no directly attached chunks)\n");
+        if (chunks.len > shown) try out.interface.print("  ... {d} more; increase LIMIT to show them\n", .{chunks.len - shown});
+    }
+
+    const VmDefaultName = union(enum) { root, chunk: types.ChunkId };
+    const VmRange = struct { name_id: engine.bytecode.NameId, limit: usize };
+
+    fn parseVmRange(self: *Repl, text: []const u8, default_name: VmDefaultName) !?VmRange {
+        var name_id: engine.bytecode.NameId = switch (default_name) {
+            .root => engine.bytecode.root_name_id,
+            .chunk => |id| self.ev.chunkRegistry().nameOf(id) orelse engine.bytecode.root_name_id,
+        };
+        var limit: usize = 40;
+        var tokens = std.mem.tokenizeAny(u8, text, " \t");
+        if (tokens.next()) |first| {
+            if (first.len > 1 and first[0] == '@') {
+                name_id = std.fmt.parseInt(engine.bytecode.NameId, first[1..], 10) catch {
+                    try self.printError("invalid name id `{s}`", .{first});
+                    return null;
+                };
+                if (tokens.next()) |n| limit = (try self.parseVmLimit(n)) orelse return null;
             } else {
-                try pager_mod.writePlain(self.allocator, &out.interface, self.ev, chunk_id.?);
+                limit = (try self.parseVmLimit(first)) orelse return null;
             }
         }
-        try self.collectBetweenInputs();
+        if (tokens.next() != null) {
+            try self.printError("too many VM query arguments", .{});
+            return null;
+        }
+        return .{ .name_id = name_id, .limit = limit };
+    }
+
+    fn parseVmLimit(self: *Repl, text: []const u8) !?usize {
+        const limit = std.fmt.parseInt(usize, text, 10) catch {
+            try self.printError("invalid row limit `{s}`", .{text});
+            return null;
+        };
+        if (limit == 0 or limit > 1000) {
+            try self.printError("row limit must be between 1 and 1000", .{});
+            return null;
+        }
+        return limit;
+    }
+
+    fn writeVmNameHeader(self: *Repl, w: *std.Io.Writer, index: *const engine.bytecode.inspect.NameIndex, name_id: engine.bytecode.NameId) !void {
+        try w.print("@{d} ", .{name_id});
+        try self.writeVmNamePath(w, index, name_id);
+        const summary = index.statsOf(name_id);
+        try w.print(" — {d} chunks, {Bi} code, {d} constants\n", .{ summary.chunks, summary.code_bytes, summary.constants });
+    }
+
+    fn writeVmNamePath(self: *Repl, w: *std.Io.Writer, index: *const engine.bytecode.inspect.NameIndex, name_id: engine.bytecode.NameId) !void {
+        if (name_id == engine.bytecode.root_name_id) return w.writeAll("<root>");
+        var ancestors: std.ArrayListUnmanaged(engine.bytecode.NameId) = .empty;
+        defer ancestors.deinit(self.allocator);
+        var cursor = name_id;
+        while (cursor != engine.bytecode.root_name_id) {
+            try ancestors.append(self.allocator, cursor);
+            cursor = (index.node(cursor) orelse break).parent;
+        }
+        var i = ancestors.items.len;
+        while (i > 0) {
+            i -= 1;
+            const node = index.node(ancestors.items[i]) orelse continue;
+            if (i != ancestors.items.len - 1) try w.writeAll(if (node.synthetic) "·" else ".");
+            try w.writeAll(self.ev.internTable().get(node.segment));
+        }
     }
 
     // -- small output helpers ----------------------------------------------------
@@ -824,6 +982,14 @@ const Binding = struct { name: []const u8, expr: []const u8 };
 const nix_keywords = [_][]const u8{
     "let", "in", "if", "then", "else", "with", "rec", "inherit", "assert", "or",
 };
+
+fn parseChunkId(input: []const u8) ?types.ChunkId {
+    var text = std.mem.trim(u8, input, " \t");
+    if (text.len > 0 and text[0] == '#') text = text[1..];
+    if (text.len > 2 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X'))
+        return std.fmt.parseInt(types.ChunkId, text[2..], 16) catch null;
+    return std.fmt.parseInt(types.ChunkId, text, 10) catch null;
+}
 
 /// Recognize a top-level `name = expr` binding (nix-repl style). The name
 /// must be a plain identifier (not a keyword), the `=` must not begin `==`,
@@ -877,4 +1043,11 @@ test "parseBinding recognizes bindings, rejects comparisons and keywords" {
     try testing.expect(parseBinding("x =") == null);
     try testing.expect(parseBinding("{ a = 1; }") == null);
     try testing.expect(parseBinding("x.y = 1") == null); // attr path: not a plain binding
+}
+
+test "parseChunkId accepts explorer display forms" {
+    try testing.expectEqual(@as(?types.ChunkId, 42), parseChunkId("42"));
+    try testing.expectEqual(@as(?types.ChunkId, 42), parseChunkId("#42"));
+    try testing.expectEqual(@as(?types.ChunkId, 42), parseChunkId("#0x2a"));
+    try testing.expect(parseChunkId("nope") == null);
 }

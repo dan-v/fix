@@ -26,49 +26,10 @@ const disasm_options: disasm.Options = .{
     .recurse = false,
 };
 
-/// Dense chunk-id range captured around one repl evaluation. Unlike the CLI's
-/// fresh evaluator, a repl has a long-lived registry, so `--eval` should show
-/// the chunks produced by this input rather than every chunk in the session.
-pub const Corpus = struct {
-    first: ChunkId,
-    end: ChunkId,
-
-    pub fn count(self: Corpus) usize {
-        return @intCast(self.end -| self.first);
-    }
-
-    pub fn contains(self: Corpus, id: ChunkId) bool {
-        return id >= self.first and id < self.end;
-    }
-};
-
 /// Non-interactive `:d`: the same chunk disassembly without terminal chrome.
 pub fn writePlain(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Evaluator, chunk_id: ChunkId) !void {
     const symbols: disasm.Symbols = .{ .intern = ev.internTable(), .registry = ev.chunkRegistry() };
-    var ref_graph: ?bytecode.inspect.RefGraph = bytecode.inspect.RefGraph.build(allocator, ev.chunkRegistry()) catch null;
-    defer if (ref_graph) |*graph| graph.deinit();
-    var options = disasm_options;
-    options.refs = if (ref_graph) |*graph| graph else null;
-    try writeChunk(allocator, w, ev, chunk_id, symbols, options);
-}
-
-/// Bare-mode `:de`: dump each chunk captured by the evaluation once, in
-/// registry order, matching `fix disasm --eval` on its fresh registry.
-pub fn writePlainCorpus(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Evaluator, corpus: Corpus) !void {
-    const symbols: disasm.Symbols = .{ .intern = ev.internTable(), .registry = ev.chunkRegistry() };
-    var ref_graph: ?bytecode.inspect.RefGraph = bytecode.inspect.RefGraph.build(allocator, ev.chunkRegistry()) catch null;
-    defer if (ref_graph) |*graph| graph.deinit();
-    var options = disasm_options;
-    options.refs = if (ref_graph) |*graph| graph else null;
-
-    var id = corpus.first;
-    var first = true;
-    while (id < corpus.end) : (id += 1) {
-        if (ev.getChunk(id) == null) continue;
-        if (!first) try w.writeByte('\n');
-        first = false;
-        try writeChunk(allocator, w, ev, id, symbols, options);
-    }
+    try writeChunk(allocator, w, ev, chunk_id, symbols, disasm_options);
 }
 
 fn writeChunk(
@@ -111,7 +72,6 @@ pub fn browse(
     ev: *Evaluator,
     start: ChunkId,
     color_depth: ColorDepth,
-    corpus: ?Corpus,
 ) !void {
     var ref_graph = try bytecode.inspect.RefGraph.build(allocator, ev.chunkRegistry());
     defer ref_graph.deinit();
@@ -121,8 +81,6 @@ pub fn browse(
         .ev = ev,
         .color_depth = color_depth,
         .ref_graph = &ref_graph,
-        .corpus = corpus,
-        .nav_mode = if (corpus != null) .corpus else .references,
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
     defer tui.deinit();
@@ -135,7 +93,6 @@ const Tui = struct {
     ev: *Evaluator,
     color_depth: ColorDepth,
     ref_graph: *const bytecode.inspect.RefGraph,
-    corpus: ?Corpus,
     /// Rendered pages live here for the whole browse session.
     arena: std.heap.ArenaAllocator,
 
@@ -148,10 +105,8 @@ const Tui = struct {
     focus: Focus = .disassembly,
     ref_selection: usize = 0,
     x_scroll: usize = 0,
-    nav_mode: NavMode,
 
     const Focus = enum { chunks, disassembly };
-    const NavMode = enum { corpus, references };
 
     fn deinit(self: *Tui) void {
         self.stack.deinit(self.allocator);
@@ -238,7 +193,7 @@ const Tui = struct {
                     \\  Tab             switch chunk/disassembly focus
                     \\  j/k, arrows     move in the focused pane
                     \\  Enter           open the selected chunk reference
-                    \\  c / r           evaluation corpus / chunk references
+                    \\  r               show chunk references
                     \\  h/l             scroll disassembly horizontally
                     \\  d/u, PgDn/PgUp  half/full page
                     \\  g/G             top/bottom
@@ -247,10 +202,9 @@ const Tui = struct {
                     \\  ?               this help
                     \\  q               leave the browser
                     \\
-                    \\For :de, the chunk pane starts with every chunk produced
-                    \\by evaluation; `r` switches it to outgoing (→) and
-                    \\incoming (←) references. On a narrow terminal, Tab
-                    \\switches panes instead of splitting them.
+                    \\The chunk pane shows outgoing (→) and incoming (←)
+                    \\references. On a narrow terminal, Tab switches panes
+                    \\instead of splitting them.
                 ;
                 return .{
                     .title = try arena.dupe(u8, "help"),
@@ -315,7 +269,7 @@ const Tui = struct {
 
     const NavEntry = struct {
         id: ChunkId,
-        kind: enum { corpus, outgoing, incoming },
+        kind: enum { outgoing, incoming },
     };
 
     fn referenceCount(self: *const Tui) usize {
@@ -324,18 +278,10 @@ const Tui = struct {
     }
 
     fn navCount(self: *const Tui) usize {
-        return switch (self.nav_mode) {
-            .corpus => if (self.corpus) |corpus| corpus.count() else 0,
-            .references => self.referenceCount(),
-        };
+        return self.referenceCount();
     }
 
     fn navAt(self: *const Tui, index: usize) ?NavEntry {
-        if (self.nav_mode == .corpus) {
-            const corpus = self.corpus orelse return null;
-            if (index >= corpus.count()) return null;
-            return .{ .id = corpus.first + @as(ChunkId, @intCast(index)), .kind = .corpus };
-        }
         const id = self.currentChunk() orelse return null;
         const outgoing = self.ref_graph.outgoing(id);
         if (index < outgoing.len) return .{ .id = outgoing[index], .kind = .outgoing };
@@ -367,13 +313,7 @@ const Tui = struct {
         self.forward.clearRetainingCapacity();
         self.page = try self.buildPage(kind);
         self.scroll = 0;
-        self.ref_selection = switch (kind) {
-            .chunk => |id| if (self.nav_mode == .corpus and self.corpus != null and self.corpus.?.contains(id))
-                @intCast(id - self.corpus.?.first)
-            else
-                0,
-            .help => 0,
-        };
+        self.ref_selection = 0;
         self.x_scroll = 0;
         switch (kind) {
             .help => self.focus = .disassembly,
@@ -476,17 +416,7 @@ const Tui = struct {
                 'f' => try self.goForward(),
                 'r' => {
                     if (self.currentChunk() != null) {
-                        self.nav_mode = .references;
                         self.ref_selection = 0;
-                        self.focus = .chunks;
-                    }
-                },
-                'c' => {
-                    if (self.corpus != null) {
-                        self.nav_mode = .corpus;
-                        if (self.currentChunk()) |id| {
-                            self.ref_selection = if (self.corpus.?.contains(id)) @intCast(id - self.corpus.?.first) else 0;
-                        }
                         self.focus = .chunks;
                     }
                 },
@@ -660,7 +590,7 @@ const Tui = struct {
         else
             @min(100, (self.scroll + rows) * 100 / self.page.lines.len);
         var footer_buf: [512]u8 = undefined;
-        const footer = std.fmt.bufPrint(&footer_buf, " {d}% · {d}/{d} · x:{d}  {s}  tab focus · c corpus · r refs · ↵ open · b/f history · / search · ? help · q quit ", .{
+        const footer = std.fmt.bufPrint(&footer_buf, " {d}% · {d}/{d} · x:{d}  {s}  tab focus · r refs · ↵ open · b/f history · / search · ? help · q quit ", .{
             pct,
             @min(self.scroll + 1, self.page.lines.len),
             self.page.lines.len,
@@ -685,10 +615,7 @@ const Tui = struct {
     fn drawChunkRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize, rows: usize) !void {
         var line_buf: [256]u8 = undefined;
         if (row == 0) {
-            const line = switch (self.nav_mode) {
-                .corpus => std.fmt.bufPrint(&line_buf, " EVAL CORPUS  ·  {d} chunks", .{self.navCount()}) catch " EVAL CORPUS",
-                .references => std.fmt.bufPrint(&line_buf, " CHUNK REFS  ·  {d} refs", .{self.navCount()}) catch " CHUNK REFS",
-            };
+            const line = std.fmt.bufPrint(&line_buf, " CHUNK REFS  ·  {d} refs", .{self.navCount()}) catch " CHUNK REFS";
             if (self.focus == .chunks) try w.writeAll("\x1b[1m");
             try writeAnsiWindow(w, line, 0, width);
             return;
@@ -706,13 +633,13 @@ const Tui = struct {
             return;
         }
         if (row == 2) {
-            try writeAnsiWindow(w, if (self.nav_mode == .corpus) " ─ evaluated chunks ─" else " ─ references ─", 0, width);
+            try writeAnsiWindow(w, " ─ references ─", 0, width);
             return;
         }
 
         const count = self.navCount();
         if (count == 0) {
-            if (row == 3) try writeAnsiWindow(w, if (self.nav_mode == .corpus) "   no newly compiled chunks" else "   no incoming or outgoing chunks", 0, width);
+            if (row == 3) try writeAnsiWindow(w, "   no incoming or outgoing chunks", 0, width);
             return;
         }
         const slots = rows -| 3;
@@ -721,7 +648,6 @@ const Tui = struct {
         const index = start + row - 3;
         const entry = self.navAt(index) orelse return;
         const marker: []const u8 = switch (entry.kind) {
-            .corpus => "•",
             .outgoing => "→",
             .incoming => "←",
         };
@@ -814,15 +740,6 @@ fn ansiSequenceEnd(line: []const u8, start: usize) usize {
 }
 
 const testing = std.testing;
-
-test "evaluation corpus is a half-open chunk range" {
-    const corpus: Corpus = .{ .first = 4, .end = 7 };
-    try testing.expectEqual(@as(usize, 3), corpus.count());
-    try testing.expect(corpus.contains(4));
-    try testing.expect(corpus.contains(6));
-    try testing.expect(!corpus.contains(3));
-    try testing.expect(!corpus.contains(7));
-}
 
 test "ANSI-aware window clips cells without cutting color or UTF-8" {
     const line = "\x1b[31mab中cd\x1b[0m";
