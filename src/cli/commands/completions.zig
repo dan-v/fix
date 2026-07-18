@@ -97,7 +97,7 @@ const zsh_script =
     \\    if [[ $type == attrs ]]; then
     \\        compadd_args+=('-S' '')
     \\    fi
-    \\    compadd -V fix "${compadd_args[@]}" -d suggestions_display -a suggestions
+    \\    compadd -V fix -l "${compadd_args[@]}" -d suggestions_display -a suggestions
     \\}
     \\# When autoloaded from a site-functions directory, run the completion.
     \\# When sourced directly, register it instead of calling compadd outside ZLE.
@@ -659,7 +659,7 @@ test "generated adapters call the live backend" {
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "-d suggestions_display") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "menu_width=${COLUMNS:-100}") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "(r:${display_width}:: :)suggestion") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compadd -V fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compadd -V fix -l") != null);
 }
 
 test "attribute prefixes retain their completed parent" {
