@@ -99,7 +99,6 @@ pub const Renderer = struct {
         try self.layout(view, &cursor_pos);
 
         var phys = self.prev_cursor;
-        var moved = false;
 
         // Rewrite rows that differ from the previous frame.
         const common = @min(self.rows.items.len, self.prev_rows.items.len);
@@ -110,7 +109,6 @@ pub const Renderer = struct {
             phys.col = 0;
             try self.writeRow(w, row);
             phys.col = rowWidth(row.bytes);
-            moved = true;
             // EL only when the row doesn't span the full width: after a
             // full-width row the terminal sits in the pending-wrap state,
             // where EL would erase the row's own last cell.
@@ -122,16 +120,14 @@ pub const Renderer = struct {
             try self.moveToRow(w, &phys, self.rows.items.len);
             try w.writeAll("\r\x1b[J");
             phys.col = 0;
-            moved = true;
         }
 
-        // Park the cursor where the editor says it is. After any motion use
-        // an absolute column (CHA) — it also clears a pending-wrap state.
-        if (phys.row != cursor_pos.row) moved = true;
+        // Park the cursor where the editor says it is. Keep horizontal motion
+        // relative: a few terminal implementations mishandle CHA (`CSI G`)
+        // after styled output by clearing the cells it crosses. CUB/CUF only
+        // move the cursor, which is exactly the editor contract.
         try self.moveToRow(w, &phys, cursor_pos.row);
-        if (moved or phys.col != cursor_pos.col) {
-            try w.print("\x1b[{d}G", .{cursor_pos.col + 1});
-        }
+        try self.moveToCol(w, &phys, cursor_pos.col);
 
         // Swap frames: current rows become the previous frame (owned copies).
         self.freePrevRows();
@@ -163,7 +159,8 @@ pub const Renderer = struct {
         if (end_col >= self.width) {
             try w.writeAll("\n\r\x1b[J");
         } else {
-            try w.print("\x1b[{d}G\x1b[J\r\n", .{end_col + 1});
+            try self.moveToCol(w, &phys, end_col);
+            try w.writeAll("\x1b[J\r\n");
         }
         self.invalidate();
     }
@@ -179,6 +176,15 @@ pub const Renderer = struct {
             phys.col = 0;
         }
         phys.row = row;
+    }
+
+    fn moveToCol(_: *Renderer, w: *std.Io.Writer, phys: *Pos, col: usize) !void {
+        if (col < phys.col) {
+            try w.print("\x1b[{d}D", .{phys.col - col});
+        } else if (col > phys.col) {
+            try w.print("\x1b[{d}C", .{col - phys.col});
+        }
+        phys.col = col;
     }
 
     fn writeRow(self: *Renderer, w: *std.Io.Writer, row: Row) !void {
@@ -397,6 +403,8 @@ const TestTerm = struct {
                 switch (final) {
                     'A' => self.row -|= if (has_n) n else 1,
                     'B' => self.row += if (has_n) n else 1,
+                    'C' => self.col += if (has_n) n else 1,
+                    'D' => self.col -|= if (has_n) n else 1,
                     'G' => self.col = if (has_n) n - 1 else 0,
                     'K' => {
                         try self.ensureRow(self.row);
@@ -506,7 +514,10 @@ test "draw and edit a short line" {
 
     // Cursor-only move: no content change.
     v.cursor = 2;
-    try h.draw(v);
+    h.out.clearRetainingCapacity();
+    try h.renderer.draw(&h.out.writer, v);
+    try testing.expectEqualStrings("\x1b[3D", h.out.written());
+    try h.term.feed(h.out.written());
     try h.expectView(v);
 
     // Edit in the middle.
