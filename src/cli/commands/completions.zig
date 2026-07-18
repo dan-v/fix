@@ -66,15 +66,26 @@ const zsh_script =
     \\        _files
     \\        return
     \\    fi
-    \\    local -a suggestions compadd_args
-    \\    local suggestion
-    \\    for suggestion in ${response:1}; do
-    \\        suggestions+=("${suggestion%%$'\t'*}")
+    \\    local -a suggestions suggestions_display compadd_args
+    \\    local line suggestion description
+    \\    for line in ${response:1}; do
+    \\        suggestion="${line%%$'\t'*}"
+    \\        suggestions+=("$suggestion")
+    \\        if [[ $line == *$'\t'* ]]; then
+    \\            description="${line#*$'\t'}"
+    \\        else
+    \\            description=
+    \\        fi
+    \\        if [[ -n $description ]]; then
+    \\            suggestions_display+=("$suggestion -- $description")
+    \\        else
+    \\            suggestions_display+=("$suggestion")
+    \\        fi
     \\    done
     \\    if [[ $type == attrs ]]; then
     \\        compadd_args+=('-S' '')
     \\    fi
-    \\    compadd -J fix "${compadd_args[@]}" -a suggestions
+    \\    compadd -J fix "${compadd_args[@]}" -d suggestions_display -a suggestions
     \\}
     \\# When autoloaded from a site-functions directory, run the completion.
     \\# When sourced directly, register it instead of calling compadd outside ZLE.
@@ -633,6 +644,8 @@ test "generated adapters call the live backend" {
     try std.testing.expect(std.mem.indexOf(u8, fish_script, "completions --complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compdef _fix fix") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "funcstack[1] == _fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "-d suggestions_display") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "suggestion -- $description") != null);
 }
 
 test "attribute prefixes retain their completed parent" {
