@@ -191,11 +191,9 @@ pub fn realizeMany(
     inputs: []const BuildInput,
 ) !u8 {
     var progress = EvalProgress.init(io, ev.basePath() orelse "", terminal.log_progress, terminal.color_depth, options.verbose);
-    if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
-    ev.progressSessionBegin("build inputs");
+    if (terminal.progressEnabled()) ev.setObserver(progress.observer());
     var progress_closed = false;
     defer if (!progress_closed) {
-        ev.progressSessionEnd();
         progress.deinit(false);
     };
 
@@ -237,7 +235,6 @@ pub fn realizeMany(
     printer_thread.join();
     const ok = !printer.failed.load(.acquire);
     build_progress_state.deinit();
-    ev.progressSessionEnd();
     progress.deinit(ok);
     progress_closed = true;
     return if (ok) 0 else 1;
@@ -258,9 +255,7 @@ pub fn dryRunMany(
     var progress = EvalProgress.init(io, ev.basePath() orelse "", terminal.log_progress, terminal.color_depth, options.verbose);
     var progress_ok = false;
     defer progress.deinit(progress_ok);
-    if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
-    ev.progressSessionBegin("dry-run inputs");
-    defer ev.progressSessionEnd();
+    if (terminal.progressEnabled()) ev.setObserver(progress.observer());
 
     const derived = try allocator.alloc([]const u8, inputs.len);
     var derived_count: usize = 0;
@@ -328,24 +323,19 @@ pub fn realize(
     var progress = EvalProgress.init(io, ev.basePath() orelse "", terminal.log_progress, terminal.color_depth, options.verbose);
     var torn_down = false;
     defer if (!torn_down) progress.deinit(false);
-    if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
-    ev.progressSessionBegin(eval_support.sourceLabel(source_arg));
+    if (terminal.progressEnabled()) ev.setObserver(progress.observer());
 
     const value = ev.evaluatePathAt(source.text, source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
-        ev.progressSessionEnd();
         return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.text, err) };
     };
     const drv_path = (ev.derivationDrvPath(value) catch |err| {
-        ev.progressSessionEnd();
         return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.text, err) };
     }) orelse {
-        ev.progressSessionEnd();
         std.debug.print("error: that did not evaluate to a derivation\n", .{});
         return .{ .failed = 1 };
     };
     const out_path = (try ev.derivationOutPath(value)) orelse drv_path;
     const program: ?[]const u8 = if (want_program) ((try ev.derivationProgram(value)) orelse {
-        ev.progressSessionEnd();
         std.debug.print("error: could not determine a program name to run\n", .{});
         return .{ .failed = 1 };
     }) else null;
@@ -363,17 +353,14 @@ pub fn realize(
     const build_sink = build_progress_state.sink();
     var build_session = ev.beginBuildPhase(&.{derived}, release_action) catch |err| {
         build_progress_state.deinit();
-        ev.progressSessionEnd();
         return .{ .failed = eval_support.buildFailure(ev.lastStoreError(), err) };
     };
     defer build_session.deinit();
     build_session.buildPaths(&.{derived}, build_sink, eval_support.buildMode(options)) catch |err| {
         build_progress_state.deinit();
-        ev.progressSessionEnd();
         return .{ .failed = eval_support.buildFailure(build_session.lastStoreError(), err) };
     };
     build_progress_state.deinit();
-    ev.progressSessionEnd();
     progress.deinit(true);
     torn_down = true;
     return .{ .ok = realized };

@@ -28,7 +28,7 @@ const FileCache = @import("store").FileCache;
 const FetchCache = @import("fetchers").FetchCache;
 const RealizationStore = @import("store").RealizationStore;
 const eval_trace = @import("../observ.zig").trace;
-const eval_progress = @import("../observ.zig").progress;
+const observ = @import("base").observ;
 const VmTrace = @import("trace_log.zig").VmTrace;
 const worker_id_mod = @import("base").worker_id;
 const DeferredTable = @import("../compiler/deferred_table.zig").Table;
@@ -217,16 +217,13 @@ pub const VM = struct {
     scheduler: *Scheduler,
     /// Evaluator-owned error trace collector.
     trace: ?*eval_trace.Trace,
-    /// The thread-safe concurrent-span half of the progress protocol
-    /// (fetches, store writes, source copies). Installed on EVERY VM — it is
-    /// the only progress channel available off the demand fiber. Null when
-    /// progress is disabled.
-    progress_spans: ?eval_progress.SpanSink,
+    /// Evaluator-scoped structured observation capability. Disabled handles
+    /// are cheap values and all workers may use an enabled handle safely.
+    observer: observ.Observer,
     /// Fiber-aware blocking capability supplied by the evaluator. Standalone
     /// VMs leave this null and execute blocking work inline.
     executor: ?FiberExecutor,
-    /// Fiber-scoped execution identity: claim id, demand role, and the
-    /// demand-only progress handles (stage stack + "waiting on" record).
+    /// Fiber-scoped execution identity: claim id and demand role.
     /// Points at the owning `WorkerFiber`'s context; nested VMs created on
     /// that fiber share the pointer (see `Evaluator.initVm`), so they cannot
     /// diverge from their fiber's identity. Standalone test VMs (no fiber)
@@ -393,7 +390,7 @@ pub const VM = struct {
         realization: *RealizationStore,
         scheduler: *Scheduler,
         trace_sink: ?*eval_trace.Trace = null,
-        progress_spans: ?eval_progress.SpanSink = null,
+        observer: observ.Observer = .{},
         executor: ?FiberExecutor = null,
         vm_trace: ?*VmTrace = null,
         thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void = if (thunks_log_enabled) null else {},
@@ -434,7 +431,7 @@ pub const VM = struct {
             .realization = options.realization,
             .scheduler = options.scheduler,
             .trace = options.trace_sink,
-            .progress_spans = options.progress_spans,
+            .observer = options.observer,
             .executor = options.executor,
             .vm_trace = options.vm_trace,
             .thunk_trace = options.thunk_trace,
@@ -480,16 +477,6 @@ pub const VM = struct {
         std.debug.assert(self.gc_temp_roots.items.len == 0);
         self.gc_force_chain = .empty;
         self.gc_temp_roots = .empty;
-    }
-
-    /// Report `[completed/total]` on the current render/stage node. Demand
-    /// path only by construction: `progress_stage` exists solely on the
-    /// demand fiber's ExecutionContext (helper fibers hold null), so
-    /// speculative walks stay invisible and this is free unless progress is
-    /// drawn. Cheap: a field check + one atomic store in the sink → node.
-    /// See `vm/force.zig` `forceDeepCounted`.
-    pub fn progressCount(self: *VM, completed: usize, total: usize) void {
-        if (self.ctx.progress_stage) |stage| stage.count(completed, total);
     }
 
     pub fn deinit(self: *VM) void {

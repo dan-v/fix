@@ -97,7 +97,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
     var repl_ok = false;
     defer progress.deinit(repl_ok);
-    if (term.progressEnabled()) ev.setProgressSink(progress.sink());
+    if (term.progressEnabled()) ev.setObserver(progress.observer());
 
     // Normal repl output suppresses color in bare mode; the debugger console
     // colors by the resolved terminal decision (its banner/snippet do too).
@@ -532,9 +532,6 @@ const Repl = struct {
     /// Evaluate an expression in the repl scope. Failures render to stderr
     /// and yield null.
     fn evalExpr(self: *Repl, source: []const u8) !?Value {
-        self.ev.progressSessionBegin("input");
-        defer self.ev.progressSessionEnd();
-
         const value = self.ev.evaluateWithScope(source, self.scope) catch |err| {
             try render_err.evalFailure(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
             return null;

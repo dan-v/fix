@@ -59,12 +59,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
     var torn = false;
     defer if (!torn) progress.deinit(false);
-    if (term.progressEnabled()) ev.setProgressSink(progress.sink());
+    if (term.progressEnabled()) ev.setObserver(progress.observer());
     var build_progress = build_progress_ui.BuildProgress.init(allocator, init.io, term.color_depth, term.log_progress, &progress);
     const build_sink = build_progress.sink();
-
-    const label = if (options.packages.items.len > 0) "packages" else eval_support.sourceLabel(options.source.?);
-    ev.progressSessionBegin(label);
 
     // Collect the output paths whose bin/ dirs go on PATH. Owned copies —
     // they must survive the evaluator's build-phase memory release (which
@@ -82,7 +79,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     // Tear progress state down before the shell/command takes over.
     build_progress.deinit();
-    ev.progressSessionEnd();
     progress.deinit(failed == null);
     torn = true;
     if (failed) |code| return code;

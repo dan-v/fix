@@ -7,7 +7,6 @@ pub const file_cache = @import("file_cache.zig");
 pub const nar = @import("nar.zig");
 pub const daemon = @import("daemon.zig");
 pub const daemon_runtime = @import("daemon_runtime.zig");
-pub const progress = @import("progress.zig");
 
 pub const FileCache = file_cache.FileCache;
 pub const RealizationStore = realization.RealizationStore;
@@ -20,5 +19,4 @@ test {
     _ = nar;
     _ = daemon;
     _ = DaemonRuntime;
-    _ = progress;
 }

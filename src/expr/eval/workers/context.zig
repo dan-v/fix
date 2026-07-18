@@ -5,8 +5,7 @@
 //! bodies) — reads identity through `VM.ctx`, a pointer to it. That makes
 //! identity structural: nested VMs *cannot* diverge from their fiber (the
 //! historical failure mode was a nested VM whose creation site forgot to
-//! copy a flag — 5d3b97d silently killed the derivation span, the waiting
-//! line, and the prof-main crit track for two days).
+//! copy execution identity).
 //!
 //! Lifetime and ownership:
 //!   - The record lives exactly as long as its fiber (stable memory — it is
@@ -22,7 +21,6 @@
 const std = @import("std");
 const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
-const eval_progress = @import("../../observ.zig").progress;
 
 /// Native-stack headroom reserved below `stack_limit`: the guard trips this
 /// far from the mapping's end so the deepest single force step between two
@@ -47,20 +45,13 @@ pub const ExecutionContext = struct {
     stack_limit: usize = 0,
     /// True only on a top-level DEMAND fiber for the duration of one
     /// top-level entry: its blocking waits on busy thunks are the serial
-    /// critical path (crit track, "waiting on" line). Set by
+    /// critical path. Set by
     /// `Worker.runTopLevel(s)`; cleared by the recycle reset.
     is_demand: bool = false,
     /// Parallel top-level demand entries intentionally do not contribute to
     /// the evaluator's single-run diagnostic trace. The trace is not a
     /// concurrent data structure, and build reports failures per input.
     parallel_demand: bool = false,
-    /// The demand-only stage-stack half of the progress protocol. Non-null
-    /// ONLY on the demand fiber: the stage stack is a single-writer LIFO
-    /// owned by the demand path, and a stray off-demand begin/end corrupts
-    /// it (the historical TTY-only --workers>1 SIGSEGV/hang). Off-demand
-    /// work reports via the thread-safe `VM.progress_spans` instead — don't
-    /// add a bypass.
-    progress_stage: ?eval_progress.StageSink = null,
     /// Head of the in-progress `builtins.scopedImport` path chain. Unlike an
     /// OS-thread-local, this travels with the fiber when work stealing resumes
     /// it on another worker. Frames themselves live on the suspended fiber's
@@ -83,7 +74,6 @@ pub const ExecutionContext = struct {
         std.debug.assert(self.scoped_import_top == null);
         self.is_demand = false;
         self.parallel_demand = false;
-        self.progress_stage = null;
     }
 };
 
@@ -103,13 +93,4 @@ pub const ParkHandle = struct {
 pub const ScopedImportFrame = struct {
     path: []const u8,
     next: ?*const ScopedImportFrame,
-};
-
-/// The demand-role half of an `ExecutionContext` — what `Worker.runTopLevel`
-/// installs on the top fiber's ctx for one top-level entry. Supplied per
-/// call by the embedder (eval.zig reads its progress state fresh each run,
-/// so a sink (re)installed between runs — the repl — needs no worker-side
-/// bookkeeping).
-pub const DemandRole = struct {
-    progress_stage: ?eval_progress.StageSink = null,
 };

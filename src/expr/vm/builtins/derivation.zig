@@ -6,6 +6,7 @@
 //! values keyed by attrs id + heap GC token (guards against id reuse).
 
 const std = @import("std");
+const observ = @import("base").observ;
 const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
@@ -25,6 +26,14 @@ const vm_equality = @import("../equality.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
 const prof = @import("../../probe.zig").prof;
+
+const compute_derivation_observation: observ.SpanSpec = .{
+    .category = "eval",
+    .name = "derivation",
+    .begin_verb = "computing derivation",
+    .finish_verb = "computed derivation",
+    .begin_level = 1,
+};
 
 const allOutputsContextValue = string_context.allOutputsContextValue;
 const appendContextEntry = string_context.appendContextEntry;
@@ -187,14 +196,10 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
     const drv_name = self.intern.get(drv_name_id);
     try validateDerivationName(self, drv_name);
 
-    // The `.derivation` span drives the demand fiber's single-writer LIFO stage
-    // stack — a speculative derivation force on a helper fiber interleaving
-    // pushes/pops here corrupts the stack (mis-paired `Node.end` →
-    // std.Progress render-future UAF). The gate is structural: only the demand
-    // fiber's ExecutionContext carries a `progress_stage` handle (helper
-    // fibers hold null), same as every other stage emit.
-    if (self.ctx.progress_stage) |stage| stage.begin(.derivation, drv_name);
-    defer if (self.ctx.progress_stage) |stage| stage.end(.derivation, drv_name);
+    var observation = self.observer.begin(&compute_derivation_observation, .{
+        .subject = .{ .text = drv_name },
+    });
+    defer observation.cancel();
 
     const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);
@@ -275,10 +280,19 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
     };
     const t_bv = prof.start(.drv_build_value);
     defer prof.end(.drv_build_value, t_bv);
-    return switch (mode) {
+    const value = try switch (mode) {
         .lazy => derivation.buildValue(self.allocator, self.intern, self.heap, spec),
         .strict => derivation.buildStrictValue(self.allocator, self.intern, self.heap, spec),
     };
+    observation.finish(.{
+        .details = .{ .subject = .{ .path = computed.drv_path } },
+        .metrics = &.{.{
+            .name = "outputs",
+            .value = .{ .unsigned = output_names.names.len },
+            .unit = .items,
+        }},
+    });
+    return value;
 }
 
 const NormalizedDerivation = struct {

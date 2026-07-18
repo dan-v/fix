@@ -36,7 +36,7 @@ const builtins = @import("runtime").builtins;
 const parser_mod = @import("syntax").parser;
 const diagnostic = @import("syntax").diagnostic;
 const eval_trace = @import("observ.zig").trace;
-const eval_progress = @import("observ.zig").progress;
+const observ = @import("base").observ;
 const timeline = @import("probe.zig").timeline;
 const ast_mod = @import("syntax").ast;
 const deferred_mod = @import("compiler.zig").deferred_table;
@@ -63,6 +63,58 @@ const compiler_mod = @import("compiler.zig");
 const VmTrace = @import("vm.zig").trace_log.VmTrace;
 const ThunkTrace = @import("probe.zig").thunk_trace.ThunkTrace;
 const SpinMutex = @import("base").sync.SpinMutex;
+
+const parse_observation: observ.SpanSpec = .{
+    .category = "eval",
+    .name = "parse",
+    .begin_verb = "parsing",
+    .finish_verb = "parsed",
+    .begin_level = 3,
+    .finish_level = 2,
+};
+const compile_observation: observ.SpanSpec = .{
+    .category = "eval",
+    .name = "compile",
+    .begin_verb = "compiling",
+    .finish_verb = "compiled",
+    .begin_level = 3,
+    .finish_level = 2,
+};
+const evaluate_observation: observ.SpanSpec = .{
+    .category = "eval",
+    .name = "evaluate",
+    .begin_verb = "evaluating",
+    .finish_verb = "evaluated",
+    .begin_level = 1,
+};
+const import_observation: observ.SpanSpec = .{
+    .category = "eval",
+    .name = "import",
+    .begin_verb = "importing",
+    .finish_verb = "imported",
+    .begin_level = 1,
+};
+const render_observation: observ.SpanSpec = .{
+    .category = "eval",
+    .name = "render",
+    .begin_verb = "rendering",
+    .finish_verb = "rendered",
+    .begin_level = 1,
+};
+const fetch_observation: observ.SpanSpec = .{
+    .category = "fetch",
+    .name = "fetch",
+    .begin_verb = "fetching",
+    .finish_verb = "fetched",
+};
+
+fn observationDetails(subject: []const u8) observ.Details {
+    return .{ .subject = if (std.fs.path.isAbsolute(subject))
+        .{ .path = subject }
+    else
+        .{ .text = subject } };
+}
+
 const gc = @import("runtime").gc;
 const future_mod = @import("runtime").future;
 const thunk_mod = @import("runtime").thunk;
@@ -299,7 +351,7 @@ pub const Evaluator = struct {
     value_color: bool = false,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
-    progress_sink: ?eval_progress.Sink = null,
+    observer: observ.Observer = .{},
     vm_trace: ?*VmTrace,
     thunk_trace: if (vm_mod.thunks_log_enabled) ?*ThunkTrace else void,
     worker_count: u8,
@@ -427,7 +479,7 @@ pub const Evaluator = struct {
             .builtins_value = null,
             .base_path = null,
             .env_map = null,
-            .progress_sink = null,
+            .observer = .{},
             .vm_trace = null,
             .thunk_trace = if (vm_mod.thunks_log_enabled) null else {},
             .worker_count = worker_count,
@@ -712,13 +764,9 @@ pub const Evaluator = struct {
         return ThunkTrace.init(writer, &self.intern, &self.heap, &self.registry);
     }
 
-    pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
-        self.progress_sink = progress;
-        self.store.realization.setProgressSpans(if (progress) |p| p.spans else null);
-        // Nothing to sync on the worker: the demand-only handles are passed
-        // per top-level entry (`runWithVm` → `runTopLevel`), so a sink
-        // (re)set between runs — e.g. across REPL inputs — takes effect on
-        // the next entry automatically.
+    pub fn setObserver(self: *Evaluator, observer: observ.Observer) void {
+        self.observer = observer;
+        self.store.realization.setObserver(observer);
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
@@ -751,9 +799,11 @@ pub const Evaluator = struct {
     }
 
     fn fetchTarball(self: *Evaluator, url: []const u8) !@import("fetchers").FetchCache.TarballResult {
-        const span = if (self.progress_sink) |progress| progress.spans.beginSpan(.fetch, url) else null;
-        defer if (span) |active| active.end();
-        return self.fetchers.fetchTarball(&self.files, .{ .url = url, .name = "source" }, null);
+        var span = self.observer.begin(&fetch_observation, .{ .subject = .{ .url = url } });
+        defer span.cancel();
+        const result = try self.fetchers.fetchTarball(&self.files, .{ .url = url, .name = "source" }, null);
+        span.finish(.{});
+        return result;
     }
 
     pub fn isSourceDirectory(self: *Evaluator, path: []const u8) !bool {
@@ -840,8 +890,8 @@ pub const Evaluator = struct {
         parser.elide_bodies = source_path != null;
 
         const ast_node = blk: {
-            self.progressBegin(.parse, subject);
-            defer self.progressEnd(.parse, subject);
+            var observation = self.observer.begin(&parse_observation, observationDetails(subject));
+            defer observation.cancel();
             timeline.begin(.parse, subject, 0);
             defer timeline.end(.parse);
             const pt = prof.start(.parse);
@@ -851,10 +901,16 @@ pub const Evaluator = struct {
             // retained ones live as long as the evaluator.
             const prev_tag = vma_mod.setAllocTag(.ast_arena);
             defer _ = vma_mod.setAllocTag(prev_tag);
-            break :blk parser.parse() catch {
+            const parsed = parser.parse() catch {
                 try self.copyDiagnostics(parser.diagnostics.items, source, source_path);
                 return error.ParseError;
             };
+            observation.finish(.{ .metrics = &.{.{
+                .name = "source",
+                .value = .{ .unsigned = source.len },
+                .unit = .bytes,
+            }} });
+            break :blk parsed;
         };
 
         // Compile-time feature gate. Pipe operators always parse (into tagged
@@ -967,8 +1023,8 @@ pub const Evaluator = struct {
         defer compiler.deinit();
 
         {
-            self.progressBegin(.compile, subject);
-            defer self.progressEnd(.compile, subject);
+            var observation = self.observer.begin(&compile_observation, observationDetails(subject));
+            defer observation.cancel();
             timeline.begin(.compile, subject, 0);
             defer timeline.end(.compile);
             const ct = prof.start(.compile);
@@ -977,6 +1033,7 @@ pub const Evaluator = struct {
                 try self.copyDiagnostics(compiler.diagnostics.items, source, source_path);
                 return err;
             };
+            observation.finish(.{});
         }
 
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
@@ -1184,10 +1241,12 @@ pub const Evaluator = struct {
         // main worker as usual.
         const chunk_id = try self.parseAndCompile(source, base_path, source_path, scope);
         const subject = source_path orelse "expression";
-        self.progressBegin(.evaluate, subject);
-        defer self.progressEnd(.evaluate, subject);
+        var observation = self.observer.begin(&evaluate_observation, observationDetails(subject));
+        defer observation.cancel();
         timeline.instant(.evaluate, subject);
-        return self.runChunkOnMainWorker(chunk_id);
+        const value = try self.runChunkOnMainWorker(chunk_id);
+        observation.finish(.{});
+        return value;
     }
 
     fn prepareEvaluations(self: *Evaluator) !void {
@@ -1286,6 +1345,7 @@ pub const Evaluator = struct {
             sink: ParallelSink,
             index: usize,
             chunk_id: ChunkId,
+            details: observ.Details,
 
             fn entry(raw: *anyopaque) void {
                 const ctx: *@This() = @ptrCast(@alignCast(raw));
@@ -1298,10 +1358,13 @@ pub const Evaluator = struct {
                 defer vm.deinit();
                 gc_controller.registerVm(gcContext(ctx.ev), &vm);
                 defer gc_controller.unregisterVm(gcContext(ctx.ev), &vm);
+                var observation = ctx.ev.observer.begin(&evaluate_observation, ctx.details);
+                defer observation.cancel();
                 const value = vm.eval(ctx.chunk_id) catch |err| {
                     ctx.sink.complete(ctx.index, null, err);
                     return;
                 };
+                observation.finish(.{});
                 ctx.sink.complete(ctx.index, value, null);
             }
         };
@@ -1323,7 +1386,13 @@ pub const Evaluator = struct {
                 sink.complete(index, null, err);
                 continue;
             };
-            contexts[index] = .{ .ev = self, .sink = sink, .index = index, .chunk_id = chunk_id };
+            contexts[index] = .{
+                .ev = self,
+                .sink = sink,
+                .index = index,
+                .chunk_id = chunk_id,
+                .details = observationDetails(input.source_path orelse "expression"),
+            };
             entries.appendAssumeCapacity(.{ .entry = Context.entry, .arg = &contexts[index] });
             timeline.instant(.evaluate, input.source_path orelse "expression");
         }
@@ -1357,8 +1426,8 @@ pub const Evaluator = struct {
     ) !Value {
         const chunk_id = try self.parseAndCompile(source, base_path, source_path, scope);
         const subject = source_path orelse "expression";
-        self.progressBegin(.evaluate, subject);
-        defer self.progressEnd(.evaluate, subject);
+        var observation = self.observer.begin(&evaluate_observation, observationDetails(subject));
+        defer observation.cancel();
         timeline.instant(.evaluate, subject);
         // Only a top-level eval (no source_path — a plain or repl-scoped
         // entry) goes through a main-thread fiber so the main thread can
@@ -1368,7 +1437,9 @@ pub const Evaluator = struct {
         // surrounding fiber's execution identity via the ctx pointer
         // `initVm` copies.
         if (source_path == null) {
-            return self.runChunkOnMainWorker(chunk_id);
+            const value = try self.runChunkOnMainWorker(chunk_id);
+            observation.finish(.{});
+            return value;
         }
         // Per-import scratch arena: the nested VM's run-path allocations
         // (drv hashing, builtin temp buffers) are freed wholesale when the
@@ -1386,7 +1457,9 @@ pub const Evaluator = struct {
         // This VM isn't in a Worker's fiber list; make its roots visible to GC.
         gc_controller.registerVm(gcContext(self), &vm);
         defer gc_controller.unregisterVm(gcContext(self), &vm);
-        return vm.eval(chunk_id);
+        const value = try vm.eval(chunk_id);
+        observation.finish(.{});
+        return value;
     }
 
     fn runChunkOnMainWorker(self: *Evaluator, chunk_id: ChunkId) !Value {
@@ -1421,15 +1494,10 @@ pub const Evaluator = struct {
             // it's a side effect of *real* evaluation, so speculative force
             // stays invisible to it.
             .trace_sink = if (worker_id == 0) &self.report.trace else null,
-            // All workers get the *concurrent span* half of the progress
-            // protocol (`beginSpan`/`endSpan` — store writes, fetches), whose
-            // std.Progress nodes are independent and lock-free-safe from any
-            // thread. The single-writer LIFO stage stack stays
-            // demand-fiber-only structurally: its `StageSink` handle lives on
-            // the demand fiber's ExecutionContext (installed by
-            // `Worker.runTopLevel`; nested VMs share the ctx pointer, see
-            // below), so a helper has no way to touch `active[]`.
-            .progress_spans = if (self.progress_sink) |p| p.spans else null,
+            // The observer is a cheap evaluator-scoped capability. Every VM
+            // receives it, including helper VMs, while the sink is responsible
+            // for any synchronization needed by the selected outputs.
+            .observer = self.observer,
             .executor = execution.fiber_executor,
             .vm_trace = if (worker_id == 0) self.vm_trace else null,
             // The thunk trace IS shared across workers — diagnosing
@@ -1468,30 +1536,33 @@ pub const Evaluator = struct {
     }
 
     pub fn writeJsonValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
-        self.progressBegin(.render, "result");
+        var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
+        defer observation.cancel();
         timeline.instant(.render, "result");
-        defer self.progressEnd(.render, "result");
         self.report.trace.clear();
-        return self.runWithVm(vm_builtins.writeJsonValue, .{ writer, value });
+        try self.runWithVm(vm_builtins.writeJsonValue, .{ writer, value });
+        observation.finish(.{});
     }
 
     /// Legacy `nix-instantiate --eval --raw` rendering: coerce exactly as a
     /// Nix string interpolation would (strings, paths, `outPath`,
     /// `__toString`; never integers), then emit the bytes verbatim.
     pub fn writeRawValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
-        self.progressBegin(.render, "result");
+        var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
+        defer observation.cancel();
         timeline.instant(.render, "result");
-        defer self.progressEnd(.render, "result");
         self.report.trace.clear();
-        return self.runWithVm(writeRawValueBody, .{ writer, value });
+        try self.runWithVm(writeRawValueBody, .{ writer, value });
+        observation.finish(.{});
     }
 
     pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
-        self.progressBegin(.render, "result");
+        var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
+        defer observation.cancel();
         timeline.instant(.render, "result");
-        defer self.progressEnd(.render, "result");
         self.report.trace.clear();
-        return self.runWithVm(vm_builtins.writeLazyXmlValue, .{ writer, value });
+        try self.runWithVm(vm_builtins.writeLazyXmlValue, .{ writer, value });
+        observation.finish(.{});
     }
 
     pub fn forceValue(self: *Evaluator, value: Value) !Value {
@@ -1656,11 +1727,12 @@ pub const Evaluator = struct {
     }
 
     pub fn forceDeep(self: *Evaluator, value: Value) !void {
-        self.progressBegin(.render, "strict result");
-        defer self.progressEnd(.render, "strict result");
+        var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "strict result" } });
+        defer observation.cancel();
         timeline.instant(.render, "strict result");
         self.report.trace.clear();
-        return self.runWithVm(vm_force.forceDeepCounted, .{value});
+        try self.runWithVm(vm_force.forceDeepCounted, .{value});
+        observation.finish(.{});
     }
 
     /// Run `body(vm, args...)` on this Evaluator's main worker. If we're
@@ -1708,14 +1780,7 @@ pub const Evaluator = struct {
         };
         var ctx: Ctx = .{ .ev = self, .body_args = args };
         const worker = try self.ensureMainWorker();
-        // Demand-role handles for the top fiber's execution context, read
-        // fresh per entry (a progress sink (re)installed between runs — the
-        // repl — is picked up here with no worker-side bookkeeping). It stays
-        // null when progress is disabled, so demand-fiber progress writes are
-        // structurally free in explicitly quiet runs.
-        try worker.runTopLevel(Ctx.entry, @ptrCast(&ctx), .{
-            .progress_stage = if (self.progress_sink) |p| p.stage else null,
-        });
+        try worker.runTopLevel(Ctx.entry, @ptrCast(&ctx));
         if (ctx.err) |e| return e;
         return ctx.result;
     }
@@ -1928,8 +1993,8 @@ pub const Evaluator = struct {
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
 
-        self.progressBegin(.import, stable_path);
-        defer self.progressEnd(.import, stable_path);
+        var observation = self.observer.begin(&import_observation, .{ .subject = .{ .path = stable_path } });
+        defer observation.cancel();
         timeline.instant(.import, stable_path);
 
         const source = if (corepkgs.source(stable_path)) |core_source|
@@ -1940,7 +2005,9 @@ pub const Evaluator = struct {
                 else => return err,
             };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        return self.evaluateSource(source, source_base, stable_path, null, parent_depth);
+        const value = try self.evaluateSource(source, source_base, stable_path, null, parent_depth);
+        observation.finish(.{});
+        return value;
     }
 
     /// Explicit post-registration phase: compiler code reports a newly
@@ -2003,8 +2070,8 @@ pub const Evaluator = struct {
         currentExecutionContext().scoped_import_top = &frame;
         defer currentExecutionContext().scoped_import_top = frame.next;
 
-        self.progressBegin(.import, stable_path);
-        defer self.progressEnd(.import, stable_path);
+        var observation = self.observer.begin(&import_observation, .{ .subject = .{ .path = stable_path } });
+        defer observation.cancel();
         timeline.instant(.import, stable_path);
 
         const source = if (corepkgs.source(stable_path)) |core_source|
@@ -2015,7 +2082,9 @@ pub const Evaluator = struct {
                 else => return err,
             };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        return self.evaluateSource(source, source_base, stable_path, scope, parent_depth);
+        const value = try self.evaluateSource(source, source_base, stable_path, scope, parent_depth);
+        observation.finish(.{});
+        return value;
     }
 
     fn importDirectory(self: *Evaluator, path: []const u8, parent_depth: u32) anyerror!Value {
@@ -2067,68 +2136,11 @@ pub const Evaluator = struct {
     }
 
     pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
-        self.progressBegin(.render, "result");
+        var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
+        defer observation.cancel();
         timeline.instant(.render, "result");
-        defer self.progressEnd(.render, "result");
-        return self.runWithVm(writeValueBody, .{ self, writer, value });
-    }
-
-    /// Progress stage events are a single-threaded UI concern that must be
-    /// driven only by the demand path. Imports/compiles triggered off a
-    /// speculative or fan-out force — OR off a background `import_prefetch`
-    /// task — run on arbitrary worker fibers and would reentrantly interleave
-    /// begin/end pairs into the one std `Progress` tree (whose `active[]`
-    /// stack is not thread-safe) → the `Progress.Node.init` "slot reuse"
-    /// assert / a torn stack. So the stage handle is structural, not a flag
-    /// check: only the demand fiber's ExecutionContext carries a
-    /// `progress_stage` (exactly one fiber, emitting sequentially even across
-    /// a steal — see `Worker.runTopLevel`); every other fiber's ctx holds
-    /// null and this returns null. NB: `!in_speculation` would NOT be a
-    /// sufficient gate — a
-    /// prefetch task fiber has `in_speculation == false` yet must stay
-    /// silent. begin and end share this gate (the handle is stable across a
-    /// fiber's life), so pairs stay balanced. No current fiber =
-    /// single-threaded setup on the main thread (parse/compile before the
-    /// run enters a fiber) — allowed, the demand fiber doesn't exist yet.
-    fn stageSink(self: *Evaluator) ?eval_progress.StageSink {
-        const progress = self.progress_sink orelse return null;
-        const inner = fiber_mod.currentFiber() orelse return progress.stage;
-        const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-        return wf.ctx.progress_stage;
-    }
-
-    pub fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
-        if (self.stageSink()) |sink| sink.begin(stage, subject);
-    }
-
-    pub fn progressEnd(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
-        if (self.stageSink()) |sink| sink.end(stage, subject);
-    }
-
-    pub fn progressInstant(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
-        if (self.stageSink()) |sink| sink.instant(stage, subject);
-    }
-
-    /// Writer-side `[i/N]` item count. `progressCountBegin` sets the render
-    /// node's total (once, per top-level collection) and returns whether
-    /// counting is live; `progressStep` advances it per element (cheap — no
-    /// per-element eligibility recheck). Demand path only.
-    pub fn progressCountBegin(self: *Evaluator, total: usize) bool {
-        const sink = self.stageSink() orelse return false;
-        sink.count(0, total);
-        return true;
-    }
-
-    pub fn progressStep(self: *Evaluator, completed: usize, total: usize) void {
-        if (self.progress_sink) |p| p.stage.count(completed, total);
-    }
-
-    pub fn progressSessionBegin(self: *Evaluator, label: []const u8) void {
-        if (self.progress_sink) |p| p.stage.sessionBegin(label);
-    }
-
-    pub fn progressSessionEnd(self: *Evaluator) void {
-        if (self.progress_sink) |p| p.stage.sessionEnd();
+        try self.runWithVm(writeValueBody, .{ self, writer, value });
+        observation.finish(.{});
     }
 };
 
@@ -2208,8 +2220,6 @@ fn valuePrintHost(ev: *Evaluator) eval_print.Host {
         .value_color = ev.value_color,
         .context = ev,
         .force_value = printForceValue,
-        .progress_count_begin = printProgressCountBegin,
-        .progress_step = printProgressStep,
     };
 }
 
@@ -2225,16 +2235,6 @@ fn chunkRegisteredThunk(context: *anyopaque, chunk_id: ChunkId) void {
 fn printForceValue(context: *anyopaque, value: Value) anyerror!Value {
     const ev: *Evaluator = @ptrCast(@alignCast(context));
     return ev.forceValue(value);
-}
-
-fn printProgressCountBegin(context: *anyopaque, total: usize) bool {
-    const ev: *Evaluator = @ptrCast(@alignCast(context));
-    return ev.progressCountBegin(total);
-}
-
-fn printProgressStep(context: *anyopaque, completed: usize, total: usize) void {
-    const ev: *Evaluator = @ptrCast(@alignCast(context));
-    ev.progressStep(completed, total);
 }
 
 fn currentImportClaimer() future_mod.ClaimerId {

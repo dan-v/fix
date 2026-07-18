@@ -55,7 +55,6 @@ const worker_id_mod = @import("base").worker_id;
 const mem_tag = @import("runtime").mem_tag;
 const gc = @import("runtime").gc;
 const eval_trace = @import("../../observ.zig").trace;
-const eval_progress = @import("../../observ.zig").progress;
 const prof = @import("../../probe.zig").prof;
 const timeline = @import("../../probe.zig").timeline;
 
@@ -395,11 +394,6 @@ pub const Worker = struct {
         self: *Worker,
         entry: fiber_mod.EntryFn,
         arg: *anyopaque,
-        /// The demand-only progress handles to dress the top fiber's
-        /// execution context with (null fields when progress is disabled).
-        /// Supplied fresh per entry by the embedder, so a sink installed
-        /// between runs (the repl) needs no worker-side bookkeeping.
-        demand: exec_context.DemandRole,
     ) !void {
         worker_id_mod.current = self.worker_id;
         worker_id_mod.is_worker = true;
@@ -409,13 +403,9 @@ pub const Worker = struct {
         const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
         const top = try self.acquireFreeFiber();
         top.current_task = null;
-        // Dress the top fiber's execution context — the single-entry
-        // demand-role write site. Its blocking waits are the critical path,
-        // and the demand-only progress handles exist only here (helpers' ctxs stay
-        // null, which is what makes an off-demand stage emit
-        // inexpressible). `runFiber`'s finished arm resets the role.
+        // Dress the top fiber's execution context. Its blocking waits are the
+        // critical path. `runFiber`'s finished arm resets the role.
         top.ctx.is_demand = true;
-        top.ctx.progress_stage = demand.progress_stage;
         top.inner.reset(entry, arg);
         if (comptime census_on) {
             self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
@@ -452,10 +442,7 @@ pub const Worker = struct {
     };
 
     /// Drive several independent demanded entries at once. Each gets its own
-    /// demand fiber and is queued onto a different worker when possible. The
-    /// multi-entry path deliberately omits the single-writer stage handle;
-    /// concurrent demand fibers still report through the thread-safe span
-    /// channel.
+    /// demand fiber and is queued onto a different worker when possible.
     pub fn runTopLevels(self: *Worker, entries: []const TopLevelEntry) !void {
         if (entries.len == 0) return;
         worker_id_mod.current = self.worker_id;
@@ -479,7 +466,6 @@ pub const Worker = struct {
             top.top_completion = &completed;
             top.ctx.is_demand = true;
             top.ctx.parallel_demand = true;
-            top.ctx.progress_stage = null;
             top.inner.reset(entry.entry, entry.arg);
             if (comptime census_on) {
                 self.census.tasks += 1;

@@ -329,19 +329,15 @@ pub fn forceDeepCounted(self: *VM, value: Value) !void {
         if (!try enterDeep(self, .list, id, &seen)) return;
         const items = try self.heap.getList(id);
         forceListAccelerate(self, id, items);
-        self.progressCount(0, items.len);
-        for (items, 0..) |item, i| {
+        for (items) |item| {
             try forceDeepInner(self, item, &seen);
-            self.progressCount(i + 1, items.len);
         }
     } else {
         if (!try enterDeep(self, .attrs, id, &seen)) return;
         const entries = try self.heap.getAttrs(id);
         forceAttrsAccelerate(self, id, entries);
-        self.progressCount(0, entries.len);
-        for (entries, 0..) |entry, i| {
+        for (entries) |entry| {
             try forceDeepInner(self, entry.value, &seen);
-            self.progressCount(i + 1, entries.len);
         }
     }
 }
@@ -980,20 +976,10 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     const crit_start = if (self.ctx.is_demand) timeline.critWaitBegin() else 0;
                     var lbuf: [128]u8 = undefined;
                     const crit_label: timeline.Subject = if (crit_start != 0) force_label.critWaitLabel(self, thunk_id, &lbuf) else .{};
-                    // Progress "waiting on" line: `progress_stage` exists only
-                    // on the demand fiber and only when progress is enabled.
-                    // Label it from this fiber's stable current frame span, not
-                    // the target thunk's union, which a concurrent resolver can
-                    // flip `.target → .result` mid-decode.
-                    if (self.ctx.progress_stage) |sink| {
-                        var sbuf: [64]u8 = undefined;
-                        sink.waitBegin(force_label.demandFrameText(self, &sbuf));
-                    }
                     const ty = prof.start(.wait_busy_thunk);
                     park.yield();
                     prof.end(.wait_busy_thunk, ty);
                     if (crit_start != 0) timeline.critWaitEnd(crit_label, crit_start);
-                    if (self.ctx.progress_stage) |sink| sink.waitEnd();
                 }
                 continue;
             },

@@ -1,7 +1,7 @@
 const std = @import("std");
 const sync = @import("base").sync;
+const observ = @import("base").observ;
 const RealizationStore = @import("../realization.zig").RealizationStore;
-const store_progress = @import("../progress.zig");
 const FileCache = @import("../file_cache.zig").FileCache;
 const DaemonRuntime = @import("../daemon_runtime.zig").DaemonRuntime;
 const FakeDaemon = @import("testing/fake_daemon.zig").FakeDaemon;
@@ -39,39 +39,49 @@ fn attachFake(store: *RealizationStore, fake: *FakeDaemon) void {
 
 const ProgressRecorder = struct {
     mu: sync.BlockingMutex = .{},
-    begun: [std.enums.values(store_progress.SpanKind).len]usize = @splat(0),
+    checks: usize = 0,
+    stores: usize = 0,
     ended: usize = 0,
 
-    fn sink(self: *ProgressRecorder) store_progress.SpanSink {
+    fn observer(self: *ProgressRecorder) observ.Observer {
         return .{
-            .context = self,
-            .begin_span_fn = begin,
-            .end_span_fn = end,
-            .update_span_fn = update,
+            .sink = .{
+                .context = self,
+                .begin_fn = begin,
+                .finish_fn = finish,
+                .update_fn = update,
+                .event_fn = event,
+            },
+            .profile_enabled = true,
         };
     }
 
-    fn begin(raw: *anyopaque, kind: store_progress.SpanKind, _: []const u8, _: ?[]const u8) usize {
+    fn begin(raw: *anyopaque, spec: *const observ.SpanSpec, _: observ.Details, _: observ.Track, _: observ.Interest) usize {
         const self: *ProgressRecorder = @ptrCast(@alignCast(raw));
         self.mu.lock();
         defer self.mu.unlock();
-        self.begun[@intFromEnum(kind)] += 1;
+        if (std.mem.eql(u8, spec.name, "check")) self.checks += 1;
+        if (std.mem.eql(u8, spec.name, "store")) self.stores += 1;
         return 1;
     }
 
-    fn end(raw: *anyopaque, _: usize) void {
+    fn finish(raw: *anyopaque, _: usize, _: *const observ.SpanSpec, _: observ.Details, _: observ.Track, _: observ.Interest, _: observ.Finish, success: bool) void {
+        if (!success) return;
         const self: *ProgressRecorder = @ptrCast(@alignCast(raw));
         self.mu.lock();
         defer self.mu.unlock();
         self.ended += 1;
     }
 
-    fn update(_: *anyopaque, _: usize, _: u64, _: u64) void {}
+    fn update(_: *anyopaque, _: usize, _: *const observ.SpanSpec, _: observ.Interest, _: []const observ.Metric) void {}
+    fn event(_: *anyopaque, _: *const observ.EventSpec, _: observ.Details, _: observ.Track, _: observ.Interest, _: []const observ.Metric) void {}
 
-    fn count(self: *ProgressRecorder, kind: store_progress.SpanKind) usize {
+    fn count(self: *ProgressRecorder, name: []const u8) usize {
         self.mu.lock();
         defer self.mu.unlock();
-        return self.begun[@intFromEnum(kind)];
+        if (std.mem.eql(u8, name, "check")) return self.checks;
+        if (std.mem.eql(u8, name, "store")) return self.stores;
+        return 0;
     }
 };
 
@@ -173,12 +183,12 @@ test "daemon worker spans bracket validity checks and store writes" {
         defer store.deinit();
         attachFake(&store, fake);
         var progress: ProgressRecorder = .{};
-        store.setProgressSpans(progress.sink());
+        store.setObserver(progress.observer());
         try store.recordOwnedNarRecipe(dep_nar_path, try owned(std.testing.allocator, "nar payload"));
 
         try store.ensureClosure(dep_nar_path);
-        try std.testing.expectEqual(@as(usize, 2), progress.count(.check));
-        try std.testing.expectEqual(@as(usize, 1), progress.count(.store));
+        try std.testing.expectEqual(@as(usize, 2), progress.count("check"));
+        try std.testing.expectEqual(@as(usize, 1), progress.count("store"));
         try std.testing.expectEqual(@as(usize, 3), progress.ended);
     } else return error.MissingRecipeRealizationApi;
 }

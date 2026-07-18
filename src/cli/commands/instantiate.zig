@@ -56,7 +56,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
     var ok = false;
     defer progress.deinit(ok);
-    if (term.progressEnabled()) ev.setProgressSink(progress.sink());
+    if (term.progressEnabled()) ev.setObserver(progress.observer());
     ok = true;
     for (0..input_count) |index| {
         const input = input_plan.load(&ev, index) catch |err| {
@@ -103,9 +103,6 @@ fn instantiateOne(
     input: eval_support.LoadedInput,
     index: usize,
 ) !bool {
-    ev.progressSessionBegin(input.label());
-    defer ev.progressSessionEnd();
-
     const source = input.source;
     const result = ev.evaluatePathAt(source.text, source.base_path, source.abs_path) catch |err| {
         _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);

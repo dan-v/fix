@@ -7,6 +7,7 @@ const derivation = @import("../derivation.zig");
 const drv_mod = derivation.drv;
 const types = derivation.types;
 const sync = @import("base").sync;
+const observ = @import("base").observ;
 const runtime = @import("runtime");
 const rstore = @import("../daemon.zig");
 const FileCache = @import("../file_cache.zig").FileCache;
@@ -15,8 +16,43 @@ const Waiter = runtime.future.Waiter;
 const eval_memo = @import("eval_memo.zig");
 const recipe_graph = @import("recipe_graph.zig");
 const daemon_client = @import("daemon_client.zig");
-const eval_progress = @import("../progress.zig");
 const daemon_execution = @import("daemon_execution.zig");
+
+const check_observation: observ.SpanSpec = .{
+    .category = "daemon",
+    .name = "check",
+    .begin_verb = "checking",
+    .finish_verb = "checked",
+    .begin_level = 2,
+    .finish_level = 1,
+};
+const query_observation: observ.SpanSpec = .{
+    .category = "daemon",
+    .name = "query",
+    .begin_verb = "querying",
+    .finish_verb = "queried",
+    .begin_level = 0,
+};
+const build_observation: observ.SpanSpec = .{
+    .category = "daemon",
+    .name = "build",
+    .begin_verb = "building",
+    .finish_verb = "built",
+    .begin_level = 0,
+};
+const register_observation: observ.SpanSpec = .{
+    .category = "daemon",
+    .name = "register",
+    .begin_verb = "registering",
+    .finish_verb = "registered",
+};
+const store_observation: observ.SpanSpec = .{
+    .category = "daemon",
+    .name = "store",
+    .begin_verb = "storing",
+    .finish_verb = "stored",
+    .begin_level = 1,
+};
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
@@ -56,7 +92,7 @@ pub const RealizationStore = struct {
     memo: eval_memo.EvalMemo,
     graph: recipe_graph.Graph,
     daemon: daemon_client.Client,
-    progress_spans: ?eval_progress.SpanSink = null,
+    observer: observ.Observer = .{},
     /// Legacy read-write evaluation materializes each demand-evaluated
     /// derivation immediately. Normal instantiate/build keep this false and
     /// materialize only their requested terminal closure.
@@ -258,29 +294,8 @@ pub const RealizationStore = struct {
         return self.eager_evaluation_writes;
     }
 
-    /// Install the thread-safe progress channel used for real store work.
-    /// Individual Span handles retain this sink, so replacing it between runs
-    /// cannot misroute an in-flight span's end/update.
-    pub fn setProgressSpans(self: *RealizationStore, spans: ?eval_progress.SpanSink) void {
-        self.progress_spans = spans;
-    }
-
-    /// Open a concurrent progress span for real store work, or null when progress
-    /// is disabled. Pair with `endSpan` (defer). The label is borrowed for the
-    /// call only. The returned handle retains its originating sink.
-    pub fn beginSpan(self: *RealizationStore, kind: eval_progress.SpanKind, label: []const u8) ?eval_progress.Span {
-        const spans = self.progress_spans orelse return null;
-        return spans.beginSpan(kind, label);
-    }
-
-    fn beginSpanTo(self: *RealizationStore, kind: eval_progress.SpanKind, subject: []const u8, destination: []const u8) ?eval_progress.Span {
-        const spans = self.progress_spans orelse return null;
-        return spans.beginSpanTo(kind, subject, destination);
-    }
-
-    /// Close a span opened by `beginSpan` (no-op on null / no hooks).
-    pub fn endSpan(_: *RealizationStore, span: ?eval_progress.Span) void {
-        if (span) |handle| handle.end();
+    pub fn setObserver(self: *RealizationStore, observer: observ.Observer) void {
+        self.observer = observer;
     }
 
     /// Install the fiber-aware execution capability. Must be set before forcing
@@ -400,12 +415,16 @@ pub const RealizationStore = struct {
     /// pool workers don't serialize on it.
     fn applyIsValid(self: *RealizationStore, conn: *rstore.DaemonStore, store_path: []const u8) !bool {
         if (self.cacheContains(store_path)) return true;
-        const span = self.beginSpan(.check, store_path);
-        defer self.endSpan(span);
+        var span = self.observer.begin(&check_observation, .{ .subject = .{ .path = store_path } });
+        defer span.cancel();
         const valid = try conn.isValidPath(store_path);
         // A path valid now stays valid for the eval (same assumption the cache
         // already makes for writes), so a later demand skips the round-trip.
         if (valid) self.cacheMark(store_path);
+        span.finish(.{ .metrics = &.{.{
+            .name = "valid",
+            .value = .{ .unsigned = @intFromBool(valid) },
+        }} });
         return valid;
     }
 
@@ -436,15 +455,17 @@ pub const RealizationStore = struct {
                 self.result = err;
                 return;
             };
-            var label_buffer: [std.Progress.Node.max_name_len]u8 = undefined;
+            var label_buffer: [128]u8 = undefined;
             const label = pathsLabel(&label_buffer, self.paths);
-            const span = self.store.beginSpan(.query, label);
-            defer self.store.endSpan(span);
-            self.result = daemon.queryMissing(self.store.allocator, self.paths) catch |err| {
+            var span = self.store.observer.begin(&query_observation, .{ .subject = .{ .text = label } });
+            defer span.cancel();
+            const result = daemon.queryMissing(self.store.allocator, self.paths) catch |err| {
                 self.store.captureDaemonError(daemon);
                 self.result = err;
                 return;
             };
+            self.result = result;
+            span.finish(.{});
         }
     };
 
@@ -504,17 +525,21 @@ pub const RealizationStore = struct {
 
     /// Build against the connection supplied by the pool worker.
     fn buildOnConn(self: *RealizationStore, conn: *rstore.DaemonStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
-        var label_buffer: [std.Progress.Node.max_name_len]u8 = undefined;
+        var label_buffer: [128]u8 = undefined;
         const label = pathsLabel(&label_buffer, derived_paths);
         // A typed activity sink reports the actual builds/substitutions inside
         // this request. Use a coarse fallback only for internal builds (IFD),
         // where no daemon activity stream is installed.
-        const span = if (sink == null) self.beginSpan(.build, label) else null;
-        defer self.endSpan(span);
+        var span = if (sink == null)
+            self.observer.begin(&build_observation, .{ .subject = .{ .text = label } })
+        else
+            observ.Span{};
+        defer span.cancel();
         conn.buildPaths(derived_paths, sink, mode) catch |err| {
             self.captureDaemonError(conn);
             return err;
         };
+        span.finish(.{});
     }
 
     const BuildCell = struct {
@@ -552,9 +577,14 @@ pub const RealizationStore = struct {
             const self: *RootCell = @ptrCast(@alignCast(p));
             self.err = blk: {
                 const c = daemonConn(conn) catch |e| break :blk e;
-                const span = self.store.beginSpanTo(.register, self.link_path, self.target);
-                defer self.store.endSpan(span);
-                break :blk c.addIndirectRoot(self.link_path);
+                var span = self.store.observer.begin(&register_observation, .{
+                    .subject = .{ .path = self.link_path },
+                    .destination = .{ .path = self.target },
+                });
+                defer span.cancel();
+                c.addIndirectRoot(self.link_path) catch |err| break :blk err;
+                span.finish(.{});
+                break :blk {};
             };
         }
     };
@@ -602,8 +632,11 @@ pub const RealizationStore = struct {
         // The fetch that produced this content and its store write are distinct
         // operations, so both get spans. Open this only after the validity
         // check confirms that a transfer will actually happen.
-        const span = if (report_progress) self.beginSpan(.store, store_path) else null;
-        defer self.endSpan(span);
+        var span = if (report_progress)
+            self.observer.begin(&store_observation, .{ .subject = .{ .path = store_path } })
+        else
+            observ.Span{};
+        defer span.cancel();
         const written = switch (op) {
             .text => |o| daemon.addTextToStore(self.allocator, daemonStoreName(store_path), o.text, o.references),
             .path => |o| daemon.addPath(self.allocator, daemonStoreName(store_path), o.nar_bytes, &.{}),
@@ -614,6 +647,7 @@ pub const RealizationStore = struct {
         };
         self.allocator.free(written);
         self.cacheMark(store_path);
+        span.finish(.{});
     }
 
     /// Is `store_path` known present this run? Guarded read of `instantiated`.

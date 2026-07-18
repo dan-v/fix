@@ -23,19 +23,9 @@ pub const Host = struct {
     value_color: bool,
     context: *anyopaque,
     force_value: *const fn (*anyopaque, Value) anyerror!Value,
-    progress_count_begin: *const fn (*anyopaque, usize) bool,
-    progress_step: *const fn (*anyopaque, usize, usize) void,
 
     fn forceValue(self: Host, value: Value) !Value {
         return self.force_value(self.context, value);
-    }
-
-    fn progressCountBegin(self: Host, total: usize) bool {
-        return self.progress_count_begin(self.context, total);
-    }
-
-    fn progressStep(self: Host, completed: usize, total: usize) void {
-        self.progress_step(self.context, completed, total);
     }
 };
 
@@ -231,7 +221,6 @@ const ValuePrinter = struct {
             return;
         }
 
-        const count_on = self.depth == 0 and self.host.progressCountBegin(items.len);
         self.depth += 1;
         defer self.depth -= 1;
 
@@ -239,7 +228,6 @@ const ValuePrinter = struct {
         for (items, 0..) |item, i| {
             if (i > 0) try self.writer.writeByte(' ');
             try self.write(item);
-            if (count_on) self.host.progressStep(i + 1, items.len);
         }
         try self.writer.writeAll(" ]");
     }
@@ -278,17 +266,15 @@ const ValuePrinter = struct {
         };
         std.mem.sort(Entry, entries, Cmp{ .intern = self.host.intern }, Cmp.lessThan);
 
-        const count_on = self.depth == 0 and self.host.progressCountBegin(entries.len);
         self.depth += 1;
         defer self.depth -= 1;
 
         try self.writer.writeAll("{ ");
-        for (entries, 0..) |entry, i| {
+        for (entries) |entry| {
             try self.writeAttrName(self.host.intern.get(entry.name));
             try self.writer.writeAll(" = ");
             try self.write(entry.value);
             try self.writer.writeAll("; ");
-            if (count_on) self.host.progressStep(i + 1, entries.len);
         }
         try self.writer.writeByte('}');
     }

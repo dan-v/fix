@@ -3,7 +3,6 @@
 
 const eval = @import("eval.zig");
 const policy = @import("policy.zig");
-const observ_mod = @import("observ.zig");
 const memory_config = @import("memory_config.zig");
 
 pub const bytecode = @import("tooling/bytecode.zig");
@@ -15,7 +14,6 @@ pub const Evaluator = eval.Evaluator;
 pub const BuildSession = eval.BuildSession;
 pub const Diagnostic = eval.Diagnostic;
 pub const EvalTrace = eval.EvalTrace;
-pub const EvalProgress = observ_mod.progress;
 pub const DebugSession = eval.DebugSession;
 pub const DebugFrame = eval.DebugFrame;
 pub const BreakReason = eval.BreakReason;

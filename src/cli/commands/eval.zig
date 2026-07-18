@@ -68,7 +68,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
     errdefer progress.deinit(false);
-    if (term.progressEnabled()) ev.setProgressSink(progress.sink());
+    if (term.progressEnabled()) ev.setObserver(progress.observer());
 
     var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, options);
     defer vm_trace.deinit(allocator);

@@ -32,11 +32,9 @@ pub fn evaluateAndWrite(
     source: Source,
     label: []const u8,
 ) !bool {
-    // Bracket the whole run so progress state is cleanly scoped across inputs.
     // Values render in the same palette as diagnostics when writing to a tty.
     ev.setValueColor(use_color);
-    ev.progressSessionBegin(label);
-    defer ev.progressSessionEnd();
+    _ = label;
 
     const result = ev.evaluatePathAt(source.text, source.base_path, source.abs_path) catch |err| {
         try render.evalFailure(io, use_color, show_trace, ev, source.text, err);

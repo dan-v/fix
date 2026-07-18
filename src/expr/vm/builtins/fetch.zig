@@ -1,6 +1,7 @@
 //! Network fetch builtins and fetched-source realization.
 
 const std = @import("std");
+const observ = @import("base").observ;
 const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
@@ -15,13 +16,19 @@ const derivation = @import("store").derivation;
 const nar = fetchers.nar;
 const path_ops = @import("runtime").paths;
 const source_paths = @import("store").realization.source_path;
-const eval_progress = @import("../../observ.zig").progress;
 const shared = @import("shared.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
 const arguments = @import("arguments.zig");
 const vm_force = @import("../force.zig");
 const vm_trace = @import("../trace.zig");
+
+const fetch_observation: observ.SpanSpec = .{
+    .category = "fetch",
+    .name = "fetch",
+    .begin_verb = "fetching",
+    .finish_verb = "fetched",
+};
 
 const contextStringWithPath = string_context.contextStringWithPath;
 const pathArg = strings.pathArg;
@@ -136,11 +143,20 @@ const FileCache = file_cache.FileCache;
 /// (`downloaded`/`total`) without knowing the progress types. Lives on the
 /// `offloadFetch` frame, which stays parked for the whole fetch.
 const FetchReport = struct {
-    span: eval_progress.Span,
+    span: *observ.Span,
+    downloaded: u64 = 0,
+    total: u64 = 0,
+    reported: bool = false,
 
     fn report(ctx: *anyopaque, downloaded: u64, total: u64) void {
         const self: *FetchReport = @ptrCast(@alignCast(ctx));
-        self.span.update(downloaded, total);
+        self.downloaded = downloaded;
+        self.total = total;
+        self.reported = true;
+        self.span.update(&.{
+            .{ .name = "downloaded", .value = .{ .unsigned = downloaded }, .unit = .bytes },
+            .{ .name = "total", .value = .{ .unsigned = total }, .unit = .bytes },
+        });
     }
 };
 
@@ -156,26 +172,30 @@ pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype) anyerror!@
         fetchers: *FetchCache,
         files: *FileCache,
         spec: @TypeOf(spec),
-        progress_spans: ?eval_progress.SpanSink,
+        observer: observ.Observer,
         res: Res = undefined,
         err: ?anyerror = null,
 
         fn run(p: *anyopaque) void {
             const c: *@This() = @ptrCast(@alignCast(p));
-            const span = if (c.progress_spans) |spans| spans.beginSpan(.fetch, c.spec.url) else null;
-            defer if (span) |active| active.end();
-            var report_store: FetchReport = undefined;
-            const reporter: ?FetchCache.Reporter = if (span) |active| blk: {
-                report_store = .{ .span = active };
+            var span = c.observer.begin(&fetch_observation, .{ .subject = .{ .url = c.spec.url } });
+            defer span.cancel();
+            var report_store: FetchReport = .{ .span = &span };
+            const reporter: ?FetchCache.Reporter = if (span.active()) blk: {
                 break :blk .{ .ctx = &report_store, .report = FetchReport.report };
             } else null;
             c.res = call(c.fetchers, c.files, c.spec, reporter) catch |e| {
                 c.err = e;
                 return;
             };
+            const metrics = [_]observ.Metric{
+                .{ .name = "downloaded", .value = .{ .unsigned = report_store.downloaded }, .unit = .bytes },
+                .{ .name = "total", .value = .{ .unsigned = report_store.total }, .unit = .bytes },
+            };
+            span.finish(.{ .metrics = if (report_store.reported) &metrics else &.{} });
         }
     };
-    var cell: Cell = .{ .fetchers = self.fetchers, .files = self.files, .spec = spec, .progress_spans = self.progress_spans };
+    var cell: Cell = .{ .fetchers = self.fetchers, .files = self.files, .spec = spec, .observer = self.observer };
     if (self.executor) |executor|
         executor.runBlocking(self.fetchers.blockingPool(), Cell.run, &cell)
     else
