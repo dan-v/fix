@@ -127,7 +127,7 @@ pub const BuildProgress = struct {
             previous.span.cancel();
         }
         const spec = activityAction(activity).observation();
-        const span = self.progress.observer().begin(spec, .{ .subject = .{ .path = activity.subject } });
+        const span = self.progress.observer().beginOn(spec, .{ .subject = .{ .path = activity.subject } }, .daemon);
         self.activities.put(self.allocator, activity.id, Active.init(activity.subject, span)) catch {
             var abandoned = span;
             abandoned.cancel();

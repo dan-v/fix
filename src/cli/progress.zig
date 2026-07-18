@@ -235,8 +235,9 @@ pub const Session = struct {
         };
         if (options.timeline_path != null) {
             session.timeline = try Timeline.init(allocator, ev.workerCount(), 1 << 21, ev.internTable());
-            session.timeline.?.setFlowSample(options.timeline_flows);
+            session.timeline.?.setFlows(options.timeline_flows);
             session.timeline.?.setSource(source);
+            ev.setTraceFlows(options.timeline_flows);
         }
         return session;
     }
@@ -246,7 +247,6 @@ pub const Session = struct {
     pub fn install(self: *Session) void {
         if (self.timeline) |*recorder| {
             self.progress.setTimeline(recorder);
-            self.ev.setTraceFlows(true);
         }
         if (self.progress.log_progress or self.timeline != null)
             self.ev.setObserver(self.progress.observer());
@@ -257,9 +257,9 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session, success: bool) void {
-        // Stop callbacks before serializing/freeing the sink. The evaluator can
-        // outlive command-local progress (notably realizeMany returning to
-        // `build`), so do not leave it pointing at this stack frame.
+        // Join producers before serializing, then detach because the evaluator
+        // can outlive this command-local progress frame.
+        self.ev.releaseEvalState();
         self.ev.setObserver(.{});
         self.progress.deinit(success);
         if (self.timeline_path) |path| self.timeline.?.dump(self.io, path);

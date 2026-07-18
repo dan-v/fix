@@ -415,7 +415,7 @@ pub const RealizationStore = struct {
     /// pool workers don't serialize on it.
     fn applyIsValid(self: *RealizationStore, conn: *rstore.DaemonStore, store_path: []const u8) !bool {
         if (self.cacheContains(store_path)) return true;
-        var span = self.observer.begin(&check_observation, .{ .subject = .{ .path = store_path } });
+        var span = self.observer.beginOn(&check_observation, .{ .subject = .{ .path = store_path } }, .daemon);
         defer span.cancel();
         const valid = try conn.isValidPath(store_path);
         // A path valid now stays valid for the eval (same assumption the cache
@@ -457,7 +457,7 @@ pub const RealizationStore = struct {
             };
             var label_buffer: [128]u8 = undefined;
             const label = pathsLabel(&label_buffer, self.paths);
-            var span = self.store.observer.begin(&query_observation, .{ .subject = .{ .text = label } });
+            var span = self.store.observer.beginOn(&query_observation, .{ .subject = .{ .text = label } }, .daemon);
             defer span.cancel();
             const result = daemon.queryMissing(self.store.allocator, self.paths) catch |err| {
                 self.store.captureDaemonError(daemon);
@@ -531,7 +531,7 @@ pub const RealizationStore = struct {
         // this request. Use a coarse fallback only for internal builds (IFD),
         // where no daemon activity stream is installed.
         var span = if (sink == null)
-            self.observer.begin(&build_observation, .{ .subject = .{ .text = label } })
+            self.observer.beginOn(&build_observation, .{ .subject = .{ .text = label } }, .daemon)
         else
             observ.Span{};
         defer span.cancel();
@@ -577,10 +577,14 @@ pub const RealizationStore = struct {
             const self: *RootCell = @ptrCast(@alignCast(p));
             self.err = blk: {
                 const c = daemonConn(conn) catch |e| break :blk e;
-                var span = self.store.observer.begin(&register_observation, .{
-                    .subject = .{ .path = self.link_path },
-                    .destination = .{ .path = self.target },
-                });
+                var span = self.store.observer.beginOn(
+                    &register_observation,
+                    .{
+                        .subject = .{ .path = self.link_path },
+                        .destination = .{ .path = self.target },
+                    },
+                    .daemon,
+                );
                 defer span.cancel();
                 c.addIndirectRoot(self.link_path) catch |err| break :blk err;
                 span.finish(.{});
@@ -633,7 +637,7 @@ pub const RealizationStore = struct {
         // operations, so both get spans. Open this only after the validity
         // check confirms that a transfer will actually happen.
         var span = if (report_progress)
-            self.observer.begin(&store_observation, .{ .subject = .{ .path = store_path } })
+            self.observer.beginOn(&store_observation, .{ .subject = .{ .path = store_path } }, .daemon)
         else
             observ.Span{};
         defer span.cancel();

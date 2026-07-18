@@ -245,9 +245,9 @@ pub const Options = struct {
     /// `--gc-report`: collection summary at evaluator teardown.
     gc_report: bool = false,
     timeline_path: ?[]const u8 = null,
-    /// `--timeline-flows`: steal-arrow flow-event volume. 0 = off, 1 = all
-    /// (default), N>1 = keep 1/N (flows are ~half the trace by event count).
-    timeline_flows: u32 = 1,
+    /// `--timeline-flows`: include scheduler steal arrows. They have a
+    /// separate recorder budget and cannot displace primary spans.
+    timeline_flows: bool = true,
 
     fn addSource(self: *Options, allocator: std.mem.Allocator, source: SourceArg) !void {
         try self.sources.append(allocator, source);
@@ -486,7 +486,7 @@ const specs = [_]Spec{
     .{ .id = .gc_budget, .long = "--gc-budget", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC collection budget (MiB,\nor with a k/m/g suffix; 0 = never collect).\nDefault: auto, scaled to RAM.", .show_in = eval_cmds },
     .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds },
     .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .help = "write a Perfetto timeline to PATH\n(default: fix-timeline.json)", .show_in = timeline_cmds },
-    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "N|off|all", .help = "record every Nth scheduler steal flow\n(default: all)", .show_in = timeline_cmds },
+    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "off|all", .help = "record all scheduler steal flows or none\n(default: all)", .show_in = timeline_cmds },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
     .{ .id = .bare, .long = "--bare", .help = "plain line-based input: no editor, no escape\nsequences (for pipes and expect-style automation)", .show_in = &.{.repl} },
@@ -756,11 +756,11 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .timeline_flows => {
             const v = v0.?;
             options.timeline_flows = if (std.mem.eql(u8, v, "off"))
-                0
+                false
             else if (std.mem.eql(u8, v, "all"))
-                1
+                true
             else
-                (std.fmt.parseInt(u32, v, 10) catch return error.InvalidTimelineFlows);
+                return error.InvalidTimelineFlows;
         },
     }
 }
@@ -869,7 +869,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.InvalidCores => "expected --cores to be a non-negative integer",
         error.InvalidGcBudget => "expected --gc-budget to be a size like 4096, 512m, or 4g",
         error.InvalidHugetlbMode => "expected --hugetlb to be auto, on, or off",
-        error.InvalidTimelineFlows => "expected --timeline-flows to be off, all, or a non-negative integer",
+        error.InvalidTimelineFlows => "expected --timeline-flows to be off or all",
         error.InvalidChunkId => "expected --chunk to be a chunk id (decimal, or 0x-prefixed hex)",
         error.UnknownOption => "unknown option",
         error.OptionNotValidForCommand => "that option is not valid for this command",
@@ -936,13 +936,28 @@ test "one-shot evaluator help exposes Perfetto timeline controls" {
         try writeHelpInner(&writer, "usage: fix", cmd);
         const help = writer.buffered();
         try std.testing.expect(std.mem.indexOf(u8, help, "--timeline[=PATH]") != null);
-        try std.testing.expect(std.mem.indexOf(u8, help, "--timeline-flows N|off|all") != null);
+        try std.testing.expect(std.mem.indexOf(u8, help, "--timeline-flows off|all") != null);
         try std.testing.expect(std.mem.indexOf(u8, help, "Perfetto timeline") != null);
     }
 
     var writer = std.Io.Writer.fixed(&buffer);
     try writeHelpInner(&writer, "usage: fix run", .run);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "--timeline") == null);
+}
+
+test "timeline flows are either complete or disabled" {
+    const off_argv = [_][*:0]const u8{ "fix", "--timeline-flows", "off" };
+    var off = try parseForTest(&off_argv, .build);
+    defer off.deinit(std.testing.allocator);
+    try std.testing.expect(!off.timeline_flows);
+
+    const all_argv = [_][*:0]const u8{ "fix", "--timeline-flows", "all" };
+    var all = try parseForTest(&all_argv, .instantiate);
+    defer all.deinit(std.testing.allocator);
+    try std.testing.expect(all.timeline_flows);
+
+    const sampled_argv = [_][*:0]const u8{ "fix", "--timeline-flows", "10" };
+    try std.testing.expectError(error.InvalidTimelineFlows, parseForTest(&sampled_argv, .eval));
 }
 
 test "verbosity accepts clustered short flags" {

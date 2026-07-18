@@ -602,6 +602,7 @@ pub const Worker = struct {
         };
         const span = f.vm.observer.begin(&run_observation, .{ .subject = subject });
         f.vm.observer.flow(&steal_flow, f.flow_in_id, .in, .current, 0);
+        f.flow_in_id = 0;
         return span;
     }
 

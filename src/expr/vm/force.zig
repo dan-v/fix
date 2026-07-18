@@ -980,7 +980,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                         self.observer.beginOn(
                             &critical_wait_observation,
                             .{ .subject = force_label.critWaitLabel(self, thunk_id, &lbuf) },
-                            .{ .worker = 500 },
+                            .critical,
                         )
                     else
                         observ.Span{};

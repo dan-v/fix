@@ -103,6 +103,9 @@ pub const Track = union(enum) {
     worker: u16,
     fiber: u32,
     activity: u64,
+    /// Logical tracks for work performed outside evaluator workers.
+    daemon,
+    critical,
 };
 
 pub const Interest = struct {
