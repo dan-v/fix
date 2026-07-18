@@ -84,21 +84,24 @@ const evaluate_observation: observ.SpanSpec = .{
     .name = "evaluate",
     .begin_verb = "evaluating",
     .finish_verb = "evaluated",
-    .begin_level = 1,
+    .begin_level = std.math.maxInt(u8),
+    .finish_level = std.math.maxInt(u8),
 };
 const import_observation: observ.SpanSpec = .{
     .category = "eval",
     .name = "import",
     .begin_verb = "importing",
     .finish_verb = "imported",
-    .begin_level = 1,
+    .begin_level = std.math.maxInt(u8),
+    .finish_level = std.math.maxInt(u8),
 };
 const render_observation: observ.SpanSpec = .{
     .category = "eval",
     .name = "render",
     .begin_verb = "rendering",
     .finish_verb = "rendered",
-    .begin_level = 1,
+    .begin_level = std.math.maxInt(u8),
+    .finish_level = std.math.maxInt(u8),
 };
 const fetch_observation: observ.SpanSpec = .{
     .category = "fetch",
