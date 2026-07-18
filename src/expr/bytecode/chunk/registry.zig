@@ -293,6 +293,23 @@ pub const ChunkRegistry = struct {
         return self.name_tree.isNamed(s.name);
     }
 
+    /// The qualified-name node attached to a chunk. Anonymous chunks attach to
+    /// the implicit root. Used by cold inspection indexes; hot VM paths should
+    /// continue reading their purpose-specific fields from `ChunkSlot`.
+    pub fn nameOf(self: *const ChunkRegistry, id: ChunkId) ?name_tree_mod.NameId {
+        const s = self.slot(id) orelse return null;
+        return s.name;
+    }
+
+    /// Read-only access to the append-only naming hierarchy for tooling.
+    pub fn nameCount(self: *const ChunkRegistry) u32 {
+        return self.name_tree.count();
+    }
+
+    pub fn nameNode(self: *const ChunkRegistry, id: name_tree_mod.NameId) ?name_tree_mod.NameTree.NodeView {
+        return self.name_tree.node(id);
+    }
+
     /// Intern a child name under `parent` for `segment` (compiler use, during
     /// its top-down descent). `synthetic` selects the `·` joiner.
     pub fn childName(self: *ChunkRegistry, parent: name_tree_mod.NameId, segment: types.InternId, synthetic: bool) !name_tree_mod.NameId {

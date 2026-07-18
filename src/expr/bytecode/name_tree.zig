@@ -33,6 +33,15 @@ pub const NameTree = struct {
         /// path never reads as a false attr path; a real binding joins with `.`.
         synthetic: bool,
     };
+
+    /// Read-only node shape exposed to inspection tools. The compiler keeps
+    /// the store itself private: callers may snapshot this append-only data,
+    /// but cannot mutate the naming hierarchy used by traces and diagnostics.
+    pub const NodeView = struct {
+        parent: NameId,
+        segment: types.InternId,
+        synthetic: bool,
+    };
     const Store = segments.StableSegments(Node, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
     nodes: Store = .empty,
@@ -51,6 +60,19 @@ pub const NameTree = struct {
         return id == root_name_id;
     }
 
+    /// Number of stored (non-root) nodes. Valid NameIds are `1...count()`;
+    /// zero is the implicit root.
+    pub fn count(self: *const NameTree) u32 {
+        return self.nodes.count();
+    }
+
+    /// Inspect one node by its biased NameId.
+    pub fn node(self: *const NameTree, id: NameId) ?NodeView {
+        if (id == root_name_id or id - 1 >= self.nodes.count()) return null;
+        const n = self.nodes.get(id - 1).*;
+        return .{ .parent = n.parent, .segment = n.segment, .synthetic = n.synthetic };
+    }
+
     /// Write the fully-qualified path for `id` (nothing for the root). Segments
     /// join with `.` (real) or `·` (synthetic), matching the old string naming.
     pub fn writeQualified(self: *const NameTree, w: *std.Io.Writer, id: NameId, intern: *const InternTable) !void {
@@ -60,11 +82,11 @@ pub const NameTree = struct {
     fn writeNode(self: *const NameTree, w: *std.Io.Writer, id: NameId, intern: *const InternTable) !void {
         if (id == root_name_id) return;
         if (id - 1 >= self.nodes.count()) return;
-        const node = self.nodes.get(id - 1).*;
-        try self.writeNode(w, node.parent, intern); // ancestors first
+        const entry = self.nodes.get(id - 1).*;
+        try self.writeNode(w, entry.parent, intern); // ancestors first
         // A leading separator before every segment except the root-most one.
-        if (node.parent != root_name_id) try w.writeAll(if (node.synthetic) "·" else ".");
-        try w.writeAll(intern.get(node.segment));
+        if (entry.parent != root_name_id) try w.writeAll(if (entry.synthetic) "·" else ".");
+        try w.writeAll(intern.get(entry.segment));
     }
 
     /// Whether `id` names anything (has at least one segment).
