@@ -26,9 +26,19 @@ pub const FakeDaemon = struct {
     materializations: std.ArrayListUnmanaged(Materialization) = .empty,
     fail_next_add: bool = false,
     fail_next_build: bool = false,
+    build_hook: ?BuildHook = null,
     server_error: ?anyerror = null,
 
     pub const Kind = enum { query, text, nar, flat, build };
+
+    /// Test synchronization seam invoked after a build request is recorded but
+    /// before it is materialized or answered. The hook runs on the fake
+    /// daemon's per-connection thread, so separate build requests can rendezvous
+    /// to prove client-side pipelining without timing assumptions.
+    pub const BuildHook = struct {
+        context: *anyopaque,
+        run: *const fn (context: *anyopaque, subject: []const u8) void,
+    };
 
     const Operation = struct {
         kind: Kind,
@@ -181,6 +191,12 @@ pub const FakeDaemon = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.fail_next_build = true;
+    }
+
+    pub fn setBuildHook(self: *FakeDaemon, hook: ?BuildHook) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.build_hook = hook;
     }
 
     pub fn count(self: *FakeDaemon, kind: Kind) usize {
@@ -449,6 +465,11 @@ pub const FakeDaemon = struct {
         defer owned_strings.free(self.allocator, paths);
         _ = try wire.readInt(input); // build mode
         for (paths) |path| try self.appendOperation(.build, path, "", &.{});
+
+        self.mu.lock();
+        const hook = self.build_hook;
+        self.mu.unlock();
+        if (hook) |active| for (paths) |path| active.run(active.context, path);
 
         self.mu.lock();
         const fail = self.fail_next_build;

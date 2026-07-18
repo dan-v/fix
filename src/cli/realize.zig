@@ -350,6 +350,153 @@ fn writeMissingGroup(label: []const u8, paths: []const []const u8) void {
     for (paths) |path| std.debug.print("  {s}\n", .{path});
 }
 
+const InterleaveRendezvous = struct {
+    blocked_subject: []const u8,
+    release_subject: []const u8,
+    blocked_seen: std.atomic.Value(bool) = .init(false),
+    release_seen: std.atomic.Value(bool) = .init(false),
+    blocked_crossed: std.atomic.Value(bool) = .init(false),
+    release_crossed: std.atomic.Value(bool) = .init(false),
+    timed_out: std.atomic.Value(bool) = .init(false),
+
+    fn hook(raw: *anyopaque, subject: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (std.mem.eql(u8, subject, self.blocked_subject)) {
+            self.blocked_seen.store(true, .release);
+            if (self.waitFor(&self.release_seen)) self.blocked_crossed.store(true, .release);
+        } else if (std.mem.eql(u8, subject, self.release_subject)) {
+            self.release_seen.store(true, .release);
+            if (self.waitFor(&self.blocked_seen)) self.release_crossed.store(true, .release);
+        }
+    }
+
+    /// The rendezvous itself is event-driven. This bounded poll is only a
+    /// deadlock watchdog so a regression fails in finite time instead of
+    /// hanging the test runner forever.
+    fn waitFor(self: *@This(), flag: *std.atomic.Value(bool)) bool {
+        for (0..5_000) |_| {
+            if (flag.load(.acquire)) return true;
+            @import("base").sync.sleepNs(std.time.ns_per_ms);
+        }
+        self.timed_out.store(true, .release);
+        return false;
+    }
+};
+
+fn proveBuildStartsBeforeOtherEvaluationFinishes(slow_index: usize) !void {
+    const testing = std.testing;
+    const FakeDaemon = @import("store").realization.testing.FakeDaemon;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "store", .default_dir);
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const store_dir = try std.fs.path.resolve(testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "store" });
+    defer testing.allocator.free(store_dir);
+
+    const fake = try FakeDaemon.start(testing.allocator, testing.io);
+    defer fake.deinit();
+    var ev = try Evaluator.init(testing.allocator, 2);
+    defer ev.deinit();
+    ev.setFileIo(testing.io);
+    ev.store.realization.store_dir = store_dir;
+    ev.store.realization.setDaemonSocketBorrowedForTest(fake.socketPath());
+    ev.store.daemon_runtime.pool_workers = 2;
+    ev.enableStoreWrites();
+
+    const gate_source =
+        \\builtins.derivation {
+        \\  name = "pipeline-eval-gate";
+        \\  system = "x86_64-linux";
+        \\  builder = "/bin/sh";
+        \\}
+    ;
+    const quick_source =
+        \\builtins.derivation {
+        \\  name = "pipeline-quick-terminal";
+        \\  system = "x86_64-linux";
+        \\  builder = "/bin/sh";
+        \\}
+    ;
+    const slow_source =
+        \\let
+        \\  gate = builtins.derivation {
+        \\    name = "pipeline-eval-gate";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\  };
+        \\  terminal = builtins.derivation {
+        \\    name = "pipeline-slow-terminal";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\  };
+        \\in builtins.seq (builtins.readFile gate.outPath) terminal
+    ;
+
+    // Compute the exact IFD and quick terminal subjects without building them.
+    const gate_value = try ev.evaluate(gate_source);
+    const gate_paths = (try ev.derivationBuildPaths(gate_value)) orelse return error.NotDerivation;
+    const quick_value = try ev.evaluate(quick_source);
+    const quick_paths = (try ev.derivationBuildPaths(quick_value)) orelse return error.NotDerivation;
+    const blocked_subject = try std.fmt.allocPrint(testing.allocator, "{s}!out", .{gate_paths.drv_path});
+    defer testing.allocator.free(blocked_subject);
+    const release_subject = try std.fmt.allocPrint(testing.allocator, "{s}!*", .{quick_paths.drv_path});
+    defer testing.allocator.free(release_subject);
+    try fake.registerBuildFile(blocked_subject, gate_paths.out_path, "gate opened\n");
+
+    var rendezvous: InterleaveRendezvous = .{
+        .blocked_subject = blocked_subject,
+        .release_subject = release_subject,
+    };
+    fake.setBuildHook(.{ .context = &rendezvous, .run = InterleaveRendezvous.hook });
+    defer fake.setBuildHook(null);
+
+    var inputs: [2]BuildInput = undefined;
+    const quick_index = 1 - slow_index;
+    inputs[slow_index] = .{
+        .source_arg = .{ .expr = slow_source },
+        .source = .{ .text = slow_source },
+    };
+    inputs[quick_index] = .{
+        .source_arg = .{ .expr = quick_source },
+        .source = .{ .text = quick_source },
+    };
+
+    var slots: [2]BuildSlot = .{ .{}, .{} };
+    for (&slots) |*slot| {
+        slot.request = Evaluator.AsyncBuildRequest.init(slot.request_paths[0..], null, .normal);
+    }
+    defer for (&slots) |*slot| slot.deinit(testing.allocator);
+    const parallel_inputs = [_]Evaluator.ParallelInput{
+        .{ .source = inputs[0].source.text },
+        .{ .source = inputs[1].source.text },
+    };
+    var pipeline: Pipeline = .{
+        .allocator = testing.allocator,
+        .ev = &ev,
+        .slots = &slots,
+        .inputs = &inputs,
+        .use_color = false,
+        .show_trace = false,
+    };
+    ev.evaluatePathsParallel(&parallel_inputs, .{ .context = &pipeline, .complete_fn = Pipeline.complete });
+    for (&slots) |*slot| try slot.request.wait();
+
+    try testing.expect(rendezvous.blocked_seen.load(.acquire));
+    try testing.expect(rendezvous.release_seen.load(.acquire));
+    try testing.expect(rendezvous.blocked_crossed.load(.acquire));
+    try testing.expect(rendezvous.release_crossed.load(.acquire));
+    try testing.expect(!rendezvous.timed_out.load(.acquire));
+}
+
+test "build 1 starts before slow evaluation 2 finishes" {
+    try proveBuildStartsBeforeOtherEvaluationFinishes(1);
+}
+
+test "build 2 starts before slow evaluation 1 finishes" {
+    try proveBuildStartsBeforeOtherEvaluationFinishes(0);
+}
+
 pub fn realize(
     allocator: std.mem.Allocator,
     io: std.Io,
