@@ -8,11 +8,11 @@ const presentation = @import("presentation.zig");
 
 pub const EvalProgress = struct {
     const max_log_spans = 128;
-    const max_subject_len = 192;
+    const max_subject_len = 512;
 
     const LogSubject = struct {
         bytes: [max_subject_len]u8 = undefined,
-        len: u8 = 0,
+        len: u16 = 0,
 
         fn set(self: *LogSubject, subject: []const u8) void {
             self.len = @intCast(@min(subject.len, self.bytes.len));
@@ -28,12 +28,14 @@ pub const EvalProgress = struct {
         token: usize = 0,
         kind: eval_progress.SpanKind = .fetch,
         subject: LogSubject = .{},
+        destination: LogSubject = .{},
         active: bool = false,
     };
 
     io: std.Io,
     started_at: std.Io.Timestamp,
-    use_color: bool,
+    cwd: []const u8,
+    color_depth: presentation.ColorDepth,
     log_progress: bool,
     verbosity: u8,
     log_span_mu: sync.BlockingMutex = .{},
@@ -41,11 +43,12 @@ pub const EvalProgress = struct {
     next_log_span_token: usize = 1,
     log_waiting: LogSubject = .{},
 
-    pub fn init(io: std.Io, log_progress: bool, use_color: bool, verbosity: u8) EvalProgress {
+    pub fn init(io: std.Io, cwd: []const u8, log_progress: bool, color_depth: presentation.ColorDepth, verbosity: u8) EvalProgress {
         return .{
             .io = io,
             .started_at = std.Io.Clock.awake.now(io),
-            .use_color = use_color,
+            .cwd = cwd,
+            .color_depth = color_depth,
             .log_progress = log_progress,
             .verbosity = verbosity,
         };
@@ -69,13 +72,17 @@ pub const EvalProgress = struct {
     }
 
     pub fn writeLogPrefix(self: *EvalProgress, writer: *std.Io.Writer, tag: []const u8) !void {
-        return presentation.writeLogPrefix(writer, self.io, self.use_color, self.started_at, tag);
+        return presentation.writeLogPrefix(writer, self.io, self.color_depth, self.started_at, tag);
     }
 
-    fn beginSpan(context: *anyopaque, kind: eval_progress.SpanKind, subject: []const u8) usize {
+    pub fn logNoun(self: *const EvalProgress, subject: []const u8) []const u8 {
+        return presentation.logNoun(self.cwd, subject);
+    }
+
+    fn beginSpan(context: *anyopaque, kind: eval_progress.SpanKind, subject: []const u8, destination: ?[]const u8) usize {
         const self: *EvalProgress = @ptrCast(@alignCast(context));
         if (!self.log_progress or !spanVisible(self.verbosity, kind)) return 0;
-        return self.beginLogSpan(kind, subject);
+        return self.beginLogSpan(kind, subject, destination);
     }
 
     fn endSpan(context: *anyopaque, token: usize) void {
@@ -83,7 +90,7 @@ pub const EvalProgress = struct {
         if (self.log_progress) self.endLogSpan(token);
     }
 
-    fn beginLogSpan(self: *EvalProgress, kind: eval_progress.SpanKind, subject: []const u8) usize {
+    fn beginLogSpan(self: *EvalProgress, kind: eval_progress.SpanKind, subject: []const u8, destination: ?[]const u8) usize {
         self.log_span_mu.lock();
         var started: ?LogSpan = null;
         for (&self.log_spans) |*span| {
@@ -93,6 +100,7 @@ pub const EvalProgress = struct {
             if (self.next_log_span_token == 0) self.next_log_span_token = 1;
             span.* = .{ .token = token, .kind = kind, .active = true };
             span.subject.set(subject);
+            if (destination) |path| span.destination.set(path);
             started = span.*;
             break;
         }
@@ -104,7 +112,7 @@ pub const EvalProgress = struct {
                 spanVerb(span.kind),
                 spanVerbRole(span.kind),
                 span.subject.get(),
-                false,
+                if (span.destination.len == 0) null else span.destination.get(),
             );
             return span.token;
         }
@@ -128,7 +136,7 @@ pub const EvalProgress = struct {
             completedSpanVerb(span.kind),
             spanVerbRole(span.kind),
             span.subject.get(),
-            false,
+            if (span.destination.len == 0) null else span.destination.get(),
         );
     }
 
@@ -155,18 +163,18 @@ pub const EvalProgress = struct {
                 stageVerb(step.stage),
                 stageVerbRole(step.stage),
                 step.subject,
-                true,
+                null,
             ),
             .end, .instant => |step| if (stageVisible(self.verbosity, step.stage)) self.writeProgressLog(
                 "eval",
                 completedStageVerb(step.stage),
                 stageVerbRole(step.stage),
                 step.subject,
-                true,
+                null,
             ),
             .wait_begin => |subject| {
                 self.log_waiting.set(subject);
-                self.writeProgressLog("eval", "waiting for", .query, subject, false);
+                self.writeProgressLog("eval", "waiting for", .query, subject, null);
             },
             .wait_end => self.logWaitEnd(),
         }
@@ -176,7 +184,7 @@ pub const EvalProgress = struct {
         if (self.log_waiting.len == 0) return;
         const subject = self.log_waiting;
         self.log_waiting.len = 0;
-        self.writeProgressLog("eval", "waited for", .query, subject.get(), false);
+        self.writeProgressLog("eval", "waited for", .query, subject.get(), null);
     }
 
     fn writeProgressLog(
@@ -184,37 +192,45 @@ pub const EvalProgress = struct {
         tag: []const u8,
         verb: []const u8,
         verb_role: presentation.Verb,
-        raw_subject: []const u8,
-        basename: bool,
+        subject: []const u8,
+        destination: ?[]const u8,
     ) void {
-        const subject = if (basename and raw_subject.len != 0) std.fs.path.basename(raw_subject) else raw_subject;
-        var subject_buffer: [1024]u8 = undefined;
-        const copied_len = @min(subject.len, subject_buffer.len);
-        @memcpy(subject_buffer[0..copied_len], subject[0..copied_len]);
-        const clean = terminal_text.stripAnsiInPlace(subject_buffer[0..copied_len]);
-
         var stderr_buffer: [4096]u8 = undefined;
         var stderr = presentation.lockStderr(self.io, &stderr_buffer) catch return;
         defer stderr.deinit();
         const writer = stderr.writer();
 
-        presentation.reset(writer, self.use_color) catch return;
+        const use_color = self.color_depth.enabled();
+        presentation.reset(writer, use_color) catch return;
         defer {
-            presentation.reset(writer, self.use_color) catch {};
+            presentation.reset(writer, use_color) catch {};
             stderr.flush() catch {};
         }
         const verb_color = presentation.verbColor(verb_role);
         self.writeLogPrefix(writer, tag) catch return;
-        presentation.foreground(writer, self.use_color, verb_color, false) catch return;
+        presentation.foreground(writer, self.color_depth, verb_color, false) catch return;
         writer.writeAll(verb) catch return;
-        presentation.reset(writer, self.use_color) catch return;
-        if (clean.len != 0) {
+        presentation.reset(writer, use_color) catch return;
+        if (subject.len != 0) {
             writer.writeByte(' ') catch return;
-            presentation.foreground(writer, self.use_color, presentation.nounColor(clean), true) catch return;
-            writer.writeAll(clean) catch return;
-            presentation.reset(writer, self.use_color) catch return;
+            self.writeNoun(writer, subject) catch return;
+        }
+        if (destination) |path| {
+            writer.writeAll(" -> ") catch return;
+            self.writeNoun(writer, path) catch return;
         }
         writer.writeByte('\n') catch return;
+    }
+
+    fn writeNoun(self: *EvalProgress, writer: *std.Io.Writer, subject: []const u8) !void {
+        const noun = self.logNoun(subject);
+        var buffer: [1024]u8 = undefined;
+        const copied_len = @min(noun.len, buffer.len);
+        @memcpy(buffer[0..copied_len], noun[0..copied_len]);
+        const clean = terminal_text.stripAnsiInPlace(buffer[0..copied_len]);
+        try presentation.foreground(writer, self.color_depth, presentation.nounColor(clean), true);
+        try writer.writeAll(clean);
+        try presentation.reset(writer, self.color_depth.enabled());
     }
 };
 

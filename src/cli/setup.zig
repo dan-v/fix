@@ -36,6 +36,7 @@ pub fn workerCount(options: args.Options) !u8 {
 
 pub const Terminal = struct {
     use_color: bool,
+    color_depth: presentation.ColorDepth,
     log_progress: bool,
 
     pub fn progressEnabled(self: Terminal) bool {
@@ -122,11 +123,13 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     try ev.setBasePathFromCurrentPath(init.io);
     try applyNixPath(ev, init, options);
 
-    const use_color = presentation.shouldColor(options.color, init.io, init.environ_map);
+    const color_depth = presentation.colorDepth(options.color, init.io, init.environ_map);
+    const use_color = color_depth.enabled();
     const progress = presentation.progressPolicy(options.progress);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
     return .{
         .use_color = use_color,
+        .color_depth = color_depth,
         .log_progress = progress.log,
     };
 }

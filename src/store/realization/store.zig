@@ -28,10 +28,9 @@ const HashModuloView = types.HashModuloView;
 /// Thread safety: all access to `records` and `debug_records` goes through
 /// `mu`. The store is read-mostly during evaluation but writes (record /
 /// recordDebug) happen on whichever worker forces the originating thunk.
-/// The name portion of a store path: `/nix/store/<hash>-<name>` -> `<name>`.
-/// Store hashes are 32 base32 chars followed by `-`. Used as the `name` arg to
-/// `addTextToStore`, which recomputes the full path from name+content+refs.
-fn storePathName(path: []const u8) []const u8 {
+/// Extract the `name` argument required by daemon add-to-store operations.
+/// This is protocol data, not a presentation label: progress retains `path`.
+fn daemonStoreName(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
     if (base.len > 33 and base[32] == '-') return base[33..];
     return base;
@@ -39,8 +38,15 @@ fn storePathName(path: []const u8) []const u8 {
 
 fn pathsLabel(buffer: []u8, paths: []const []const u8) []const u8 {
     if (paths.len == 0) return "paths";
-    if (paths.len == 1) return storePathName(paths[0]);
+    if (paths.len == 1) return paths[0];
     return std.fmt.bufPrint(buffer, "{d} paths", .{paths.len}) catch "paths";
+}
+
+test "progress labels retain complete store paths" {
+    const path = "/nix/store/01234567890123456789012345678901-hello-1.0.drv";
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(path, pathsLabel(&buffer, &.{path}));
+    try std.testing.expectEqualStrings("hello-1.0.drv", daemonStoreName(path));
 }
 
 pub const RealizationStore = struct {
@@ -267,6 +273,11 @@ pub const RealizationStore = struct {
         return spans.beginSpan(kind, label);
     }
 
+    fn beginSpanTo(self: *RealizationStore, kind: eval_progress.SpanKind, subject: []const u8, destination: []const u8) ?eval_progress.Span {
+        const spans = self.progress_spans orelse return null;
+        return spans.beginSpanTo(kind, subject, destination);
+    }
+
     /// Close a span opened by `beginSpan` (no-op on null / no hooks).
     pub fn endSpan(_: *RealizationStore, span: ?eval_progress.Span) void {
         if (span) |handle| handle.end();
@@ -389,7 +400,7 @@ pub const RealizationStore = struct {
     /// pool workers don't serialize on it.
     fn applyIsValid(self: *RealizationStore, conn: *rstore.DaemonStore, store_path: []const u8) !bool {
         if (self.cacheContains(store_path)) return true;
-        const span = self.beginSpan(.check, storePathName(store_path));
+        const span = self.beginSpan(.check, store_path);
         defer self.endSpan(span);
         const valid = try conn.isValidPath(store_path);
         // A path valid now stays valid for the eval (same assumption the cache
@@ -525,8 +536,8 @@ pub const RealizationStore = struct {
 
     /// Register `link_path` (an existing absolute symlink into the store) as an
     /// indirect GC root via the daemon.
-    pub fn addIndirectRoot(self: *RealizationStore, link_path: []const u8) !void {
-        var cell: RootCell = .{ .store = self, .link_path = link_path };
+    pub fn addIndirectRoot(self: *RealizationStore, link_path: []const u8, target: []const u8) !void {
+        var cell: RootCell = .{ .store = self, .link_path = link_path, .target = target };
         try self.runOnDaemon(RootCell.run, &cell);
         return cell.err;
     }
@@ -534,13 +545,14 @@ pub const RealizationStore = struct {
     const RootCell = struct {
         store: *RealizationStore,
         link_path: []const u8,
+        target: []const u8,
         err: anyerror!void = {},
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *RootCell = @ptrCast(@alignCast(p));
             self.err = blk: {
                 const c = daemonConn(conn) catch |e| break :blk e;
-                const span = self.store.beginSpan(.register, std.fs.path.basename(self.link_path));
+                const span = self.store.beginSpanTo(.register, self.link_path, self.target);
                 defer self.store.endSpan(span);
                 break :blk c.addIndirectRoot(self.link_path);
             };
@@ -590,12 +602,12 @@ pub const RealizationStore = struct {
         // The fetch that produced this content and its store write are distinct
         // operations, so both get spans. Open this only after the validity
         // check confirms that a transfer will actually happen.
-        const span = if (report_progress) self.beginSpan(.store, storePathName(store_path)) else null;
+        const span = if (report_progress) self.beginSpan(.store, store_path) else null;
         defer self.endSpan(span);
         const written = switch (op) {
-            .text => |o| daemon.addTextToStore(self.allocator, storePathName(store_path), o.text, o.references),
-            .path => |o| daemon.addPath(self.allocator, storePathName(store_path), o.nar_bytes, &.{}),
-            .flat => |o| daemon.addFlatFile(self.allocator, storePathName(store_path), o.bytes, &.{}),
+            .text => |o| daemon.addTextToStore(self.allocator, daemonStoreName(store_path), o.text, o.references),
+            .path => |o| daemon.addPath(self.allocator, daemonStoreName(store_path), o.nar_bytes, &.{}),
+            .flat => |o| daemon.addFlatFile(self.allocator, daemonStoreName(store_path), o.bytes, &.{}),
         } catch |err| {
             self.captureDaemonError(daemon);
             return err;

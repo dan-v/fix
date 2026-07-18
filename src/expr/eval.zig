@@ -557,8 +557,8 @@ pub const Evaluator = struct {
         self.scheduler.setTraceFlows(enabled);
     }
 
-    pub fn addIndirectRoot(self: *Evaluator, link_path: []const u8) !void {
-        return self.store.addIndirectRoot(link_path);
+    pub fn addIndirectRoot(self: *Evaluator, link_path: []const u8, target: []const u8) !void {
+        return self.store.addIndirectRoot(link_path, target);
     }
 
     pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {

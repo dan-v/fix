@@ -43,12 +43,12 @@ const Action = enum {
 };
 
 const Phase = enum { ongoing, completed };
-const max_name_len = 192;
+const max_name_len = 512;
 
 const Active = struct {
     action: Action,
     noun: [max_name_len]u8,
-    noun_len: u8,
+    noun_len: u16,
 
     fn init(action: Action, noun: []const u8) Active {
         var active: Active = .{
@@ -69,18 +69,18 @@ pub const BuildProgress = struct {
     progress: *EvalProgress,
     allocator: std.mem.Allocator,
     io: std.Io,
-    use_color: bool,
+    color_depth: presentation.ColorDepth,
     log_progress: bool,
     /// Active activity id -> its presentation identity.
     activities: std.AutoHashMapUnmanaged(u64, Active) = .empty,
     mu: sync.BlockingMutex = .{},
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, use_color: bool, log_progress: bool, progress: *EvalProgress) BuildProgress {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, color_depth: presentation.ColorDepth, log_progress: bool, progress: *EvalProgress) BuildProgress {
         return .{
             .progress = progress,
             .allocator = allocator,
             .io = io,
-            .use_color = use_color,
+            .color_depth = color_depth,
             .log_progress = log_progress,
         };
     }
@@ -107,7 +107,7 @@ pub const BuildProgress = struct {
         switch (event) {
             .start => |activity| {
                 const action = activityAction(activity);
-                const noun = activityNoun(activity);
+                const noun = self.progress.logNoun(activity.subject);
                 _ = self.activities.remove(activity.id);
                 self.activities.put(self.allocator, activity.id, Active.init(action, noun)) catch return;
                 if (self.log_progress) self.writeActivity(action, noun, .ongoing);
@@ -128,9 +128,10 @@ pub const BuildProgress = struct {
 
         // Reset before and after every external record. Even an interrupted
         // write cannot leave our selected style active for subsequent output.
-        presentation.reset(writer, self.use_color) catch return;
+        const use_color = self.color_depth.enabled();
+        presentation.reset(writer, use_color) catch return;
         defer {
-            presentation.reset(writer, self.use_color) catch {};
+            presentation.reset(writer, use_color) catch {};
             stderr.flush() catch {};
         }
 
@@ -155,36 +156,33 @@ pub const BuildProgress = struct {
         defer stderr.deinit();
         const writer = stderr.writer();
 
-        presentation.reset(writer, self.use_color) catch return;
+        const use_color = self.color_depth.enabled();
+        presentation.reset(writer, use_color) catch return;
         defer {
-            presentation.reset(writer, self.use_color) catch {};
+            presentation.reset(writer, use_color) catch {};
             stderr.flush() catch {};
         }
         self.progress.writeLogPrefix(writer, "daemon") catch return;
         self.writeActivityText(writer, action, noun, phase) catch return;
-        if (phase == .completed and action == .building and std.mem.endsWith(u8, noun, ".drv")) {
-            writer.writeAll(" -> ") catch return;
-            self.writeNoun(writer, stripDrv(noun), noun) catch return;
-        }
         writer.writeByte('\n') catch return;
     }
 
     fn writeActivityText(self: *BuildProgress, writer: *std.Io.Writer, action: Action, noun: []const u8, phase: Phase) !void {
-        try presentation.foreground(writer, self.use_color, presentation.verbColor(action.verbRole()), false);
+        try presentation.foreground(writer, self.color_depth, presentation.verbColor(action.verbRole()), false);
         try writer.writeAll(switch (phase) {
             .ongoing => action.verb(),
             .completed => action.completedVerb(),
         });
-        try presentation.reset(writer, self.use_color);
+        try presentation.reset(writer, self.color_depth.enabled());
         if (noun.len == 0) return;
         try writer.writeByte(' ');
         try self.writeNoun(writer, noun, noun);
     }
 
     fn writeNoun(self: *BuildProgress, writer: *std.Io.Writer, noun: []const u8, identity: []const u8) !void {
-        try presentation.foreground(writer, self.use_color, presentation.nounColor(identity), true);
+        try presentation.foreground(writer, self.color_depth, presentation.nounColor(identity), true);
         try writer.writeAll(noun);
-        try presentation.reset(writer, self.use_color);
+        try presentation.reset(writer, self.color_depth.enabled());
     }
 };
 
@@ -196,22 +194,7 @@ fn activityAction(activity: daemon.build_events.Activity) Action {
     };
 }
 
-fn activityNoun(activity: daemon.build_events.Activity) []const u8 {
-    const name = storePathName(activity.subject);
-    return name;
-}
-
-fn storePathName(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    if (base.len > 33 and base[32] == '-') return base[33..];
-    return base;
-}
-
-fn stripDrv(name: []const u8) []const u8 {
-    return if (std.mem.endsWith(u8, name, ".drv")) name[0 .. name.len - 4] else name;
-}
-
-test "build activities have owned presentation identities" {
+test "build activities retain daemon subjects as presentation identities" {
     const build: daemon.build_events.Activity = .{
         .id = 1,
         .kind = .build,
@@ -219,8 +202,8 @@ test "build activities have owned presentation identities" {
         .detail = "",
     };
     try std.testing.expectEqual(Action.building, activityAction(build));
-    try std.testing.expectEqualStrings("hello-1.0.drv", activityNoun(build));
-    try std.testing.expectEqualStrings("hello-1.0", stripDrv(activityNoun(build)));
+    const active = Active.init(activityAction(build), presentation.logNoun("/work", build.subject));
+    try std.testing.expectEqualStrings("hello-1.0.drv", active.name());
     const copy: daemon.build_events.Activity = .{
         .id = 2,
         .kind = .substitute,
@@ -228,7 +211,6 @@ test "build activities have owned presentation identities" {
         .detail = "local",
     };
     try std.testing.expectEqual(Action.copying, activityAction(copy));
-    try std.testing.expectEqualStrings("source", activityNoun(copy));
     const fetch: daemon.build_events.Activity = .{
         .id = 3,
         .kind = .substitute,
@@ -236,7 +218,7 @@ test "build activities have owned presentation identities" {
         .detail = "https://cache.example",
     };
     try std.testing.expectEqual(Action.fetching, activityAction(fetch));
-    try std.testing.expectEqual(presentation.nounColor("source"), presentation.nounColor("source"));
+    try std.testing.expectEqual(presentation.nounColor(fetch.subject), presentation.nounColor(fetch.subject));
     try std.testing.expectEqualStrings("built", Action.building.completedVerb());
     try std.testing.expectEqualStrings("copied", Action.copying.completedVerb());
 }

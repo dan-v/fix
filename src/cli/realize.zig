@@ -165,7 +165,7 @@ pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Evaluator, name: 
             std.debug.print("warning: {s} is not in the gcroots directory, so it will not be an effective GC root (pass --indirect)\n", .{abs});
         return;
     }
-    ev.addIndirectRoot(abs) catch |err| {
+    ev.addIndirectRoot(abs, target) catch |err| {
         std.debug.print("warning: could not register GC root {s}: {s}\n", .{ abs, @errorName(err) });
     };
 }
@@ -190,7 +190,7 @@ pub fn realizeMany(
     options: args.Options,
     inputs: []const BuildInput,
 ) !u8 {
-    var progress = EvalProgress.init(io, terminal.log_progress, terminal.use_color, options.verbose);
+    var progress = EvalProgress.init(io, ev.basePath() orelse "", terminal.log_progress, terminal.color_depth, options.verbose);
     if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
     ev.progressSessionBegin("build inputs");
     var progress_closed = false;
@@ -199,7 +199,7 @@ pub fn realizeMany(
         progress.deinit(false);
     };
 
-    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.use_color, terminal.log_progress, &progress);
+    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, &progress);
     defer build_progress_state.deinit();
     // Keep the typed daemon sink active even when progress is disabled: it
     // still owns build-log labeling and terminal-safe color boundaries.
@@ -255,7 +255,7 @@ pub fn dryRunMany(
     options: args.Options,
     inputs: []const BuildInput,
 ) !u8 {
-    var progress = EvalProgress.init(io, terminal.log_progress, terminal.use_color, options.verbose);
+    var progress = EvalProgress.init(io, ev.basePath() orelse "", terminal.log_progress, terminal.color_depth, options.verbose);
     var progress_ok = false;
     defer progress.deinit(progress_ok);
     if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
@@ -325,7 +325,7 @@ pub fn realize(
     source: eval_support.Source,
     want_program: bool,
 ) !Result {
-    var progress = EvalProgress.init(io, terminal.log_progress, terminal.use_color, options.verbose);
+    var progress = EvalProgress.init(io, ev.basePath() orelse "", terminal.log_progress, terminal.color_depth, options.verbose);
     var torn_down = false;
     defer if (!torn_down) progress.deinit(false);
     if (terminal.progressEnabled()) ev.setProgressSink(progress.sink());
@@ -359,7 +359,7 @@ pub fn realize(
     };
     errdefer realized.deinit(allocator);
 
-    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.use_color, terminal.log_progress, &progress);
+    var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, &progress);
     const build_sink = build_progress_state.sink();
     var build_session = ev.beginBuildPhase(&.{derived}, release_action) catch |err| {
         build_progress_state.deinit();

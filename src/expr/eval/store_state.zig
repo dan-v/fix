@@ -47,7 +47,7 @@ pub const StoreState = struct {
         return self.realization.lastStoreError();
     }
 
-    pub fn addIndirectRoot(self: *StoreState, link_path: []const u8) !void {
-        return self.realization.addIndirectRoot(link_path);
+    pub fn addIndirectRoot(self: *StoreState, link_path: []const u8, target: []const u8) !void {
+        return self.realization.addIndirectRoot(link_path, target);
     }
 };

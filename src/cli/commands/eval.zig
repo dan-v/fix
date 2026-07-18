@@ -66,7 +66,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
     const input_count = try input_plan.count();
 
-    var progress = progress_ui.EvalProgress.init(init.io, term.log_progress, term.use_color, options.verbose);
+    var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
     errdefer progress.deinit(false);
     if (term.progressEnabled()) ev.setProgressSink(progress.sink());
 

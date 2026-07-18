@@ -182,10 +182,10 @@ pub fn sourcePathOf(source: SourceArg, loaded: Source) ?[]const u8 {
     return loaded.abs_path;
 }
 
-/// A short human label for an evaluation progress session.
+/// The source identity used for an evaluation progress session.
 pub fn sourceLabel(source: SourceArg) []const u8 {
     return switch (source) {
-        .file => |p| std.fs.path.basename(p),
+        .file => |p| p,
         .expr => "expression",
         .flake => |inst| inst,
     };

@@ -94,7 +94,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         console.install(&ev);
     }
 
-    var progress = progress_ui.EvalProgress.init(init.io, term.log_progress, term.use_color, options.verbose);
+    var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
     var repl_ok = false;
     defer progress.deinit(repl_ok);
     if (term.progressEnabled()) ev.setProgressSink(progress.sink());
@@ -102,7 +102,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // Normal repl output suppresses color in bare mode; the debugger console
     // colors by the resolved terminal decision (its banner/snippet do too).
     ev.setValueColor(if (options.debugger) term.use_color else (term.use_color and interactive));
-    var repl = Repl.init(allocator, init, options, &ev, term.use_color and interactive, interactive);
+    var repl = Repl.init(allocator, init, options, &ev, if (interactive) term.color_depth else .none, interactive);
     defer repl.deinit();
     if (options.debugger) repl.debug_console = &console;
 
@@ -122,6 +122,7 @@ const Repl = struct {
     options: Options,
     ev: *Evaluator,
     use_color: bool,
+    color_depth: presentation.ColorDepth,
     interactive: bool,
     /// The debug console when `--debugger` is set, so the bare loop can share
     /// its stdin reader (see `runBare`). Null otherwise.
@@ -143,7 +144,7 @@ const Repl = struct {
         proc_init: std.process.Init,
         options: Options,
         ev: *Evaluator,
-        use_color: bool,
+        color_depth: presentation.ColorDepth,
         interactive: bool,
     ) Repl {
         return .{
@@ -152,7 +153,8 @@ const Repl = struct {
             .io = proc_init.io,
             .options = options,
             .ev = ev,
-            .use_color = use_color,
+            .use_color = color_depth.enabled(),
+            .color_depth = color_depth,
             .interactive = interactive,
             .history = history_mod.History.init(allocator),
         };
@@ -755,7 +757,7 @@ const Repl = struct {
         }
 
         if (self.interactive) {
-            try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id.?, self.use_color);
+            try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id.?, self.color_depth);
         } else {
             var out = self.stdout();
             defer out.interface.flush() catch {};

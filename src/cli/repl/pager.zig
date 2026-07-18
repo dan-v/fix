@@ -13,6 +13,7 @@ const engine = @import("expr");
 const runtime = @import("runtime");
 const term_mod = @import("term.zig");
 const keys_mod = @import("keys.zig");
+const ColorDepth = @import("base").terminal_color.Depth;
 
 const Evaluator = engine.Evaluator;
 const ChunkId = runtime.types.ChunkId;
@@ -67,12 +68,12 @@ const Visit = struct {
     };
 };
 
-pub fn browse(allocator: std.mem.Allocator, io: std.Io, ev: *Evaluator, start: ChunkId, use_color: bool) !void {
+pub fn browse(allocator: std.mem.Allocator, io: std.Io, ev: *Evaluator, start: ChunkId, color_depth: ColorDepth) !void {
     var pager = Pager{
         .allocator = allocator,
         .io = io,
         .ev = ev,
-        .use_color = use_color,
+        .color_depth = color_depth,
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
     defer pager.deinit();
@@ -83,7 +84,7 @@ const Pager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     ev: *Evaluator,
-    use_color: bool,
+    color_depth: ColorDepth,
     /// Pages + reverse-ref cache live here for the whole browse session.
     arena: std.heap.ArenaAllocator,
 
@@ -162,7 +163,7 @@ const Pager = struct {
                 var text: std.Io.Writer.Allocating = .init(arena);
                 const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
                 var options = disasm_options;
-                options.use_color = self.use_color;
+                options.color_depth = self.color_depth;
                 try disasm.writeChunk(arena, &text.writer, id, chunk, symbols, options);
                 const lines = try splitLines(arena, text.written());
                 return .{

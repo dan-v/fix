@@ -33,14 +33,23 @@ pub const Span = struct {
 /// thread/fiber and closed or updated on another.
 pub const SpanSink = struct {
     context: *anyopaque,
-    begin_span_fn: *const fn (*anyopaque, SpanKind, []const u8) usize,
+    begin_span_fn: *const fn (*anyopaque, SpanKind, []const u8, ?[]const u8) usize,
     end_span_fn: *const fn (*anyopaque, usize) void,
     update_span_fn: *const fn (*anyopaque, usize, u64, u64) void,
 
     pub fn beginSpan(self: SpanSink, kind: SpanKind, subject: []const u8) Span {
         return .{
             .context = self.context,
-            .token = self.begin_span_fn(self.context, kind, subject),
+            .token = self.begin_span_fn(self.context, kind, subject, null),
+            .end_fn = self.end_span_fn,
+            .update_fn = self.update_span_fn,
+        };
+    }
+
+    pub fn beginSpanTo(self: SpanSink, kind: SpanKind, subject: []const u8, destination: []const u8) Span {
+        return .{
+            .context = self.context,
+            .token = self.begin_span_fn(self.context, kind, subject, destination),
             .end_fn = self.end_span_fn,
             .update_fn = self.update_span_fn,
         };

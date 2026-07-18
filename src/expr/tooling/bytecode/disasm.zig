@@ -7,7 +7,9 @@
 //! closure/thunk opcodes.
 
 const std = @import("std");
-const hueColor = @import("base").terminal_color.hueColor;
+const terminal_color = @import("base").terminal_color;
+const ColorDepth = terminal_color.Depth;
+const hueColor = terminal_color.hueColor;
 const bytecode = @import("../../bytecode.zig");
 const Chunk = bytecode.Chunk;
 const ChunkRegistry = bytecode.ChunkRegistry;
@@ -39,12 +41,12 @@ pub const Options = struct {
     /// Print source-map column on the right.
     show_source: bool = true,
     /// Print the raw instruction bytes as a hex column (one color per byte
-    /// value when `use_color`, so repeated bytes/opcodes stand out).
+    /// value when `color_depth`, so repeated bytes/opcodes stand out).
     show_bytes: bool = false,
     /// Walk closure/thunk operands and recursively disassemble referenced chunks.
     recurse: bool = false,
     /// Colorize headers, mnemonics, operands, and the per-byte hex column.
-    use_color: bool = false,
+    color_depth: ColorDepth = .none,
     /// Recursion cap when `recurse` is true; 0 = unlimited (a visited set still
     /// guarantees termination). The trace pretty-printer bounds this.
     max_depth: u8 = 4,
@@ -122,29 +124,31 @@ fn writeChunkAt(
     };
     // The strict/deep flags fold into the upvalues table when it renders;
     // otherwise the header prints its fallback flag lines.
-    try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, up_names != null, options.use_color);
+    try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, up_names != null, options.color_depth);
 
     if (options.show_constants and chunk.constants.len > 0) {
-        try writeGuide(writer, cc, null, options.use_color);
+        try writeGuide(writer, cc, null, options.color_depth);
         try writer.writeAll("  constants:\n");
         for (chunk.constants, 0..) |c, i| {
             // Table rows sit under their own colored `│` gutter, like operand
             // groups do under their count line; the run closes with `└`.
-            try writeGuide(writer, cc, null, options.use_color);
+            try writeGuide(writer, cc, null, options.color_depth);
             try writer.writeAll("  ");
-            try writeTreeGuide(writer, sec_constants_color, if (i == chunk.constants.len - 1) .corner else .vert, null, options.use_color);
+            try writeTreeGuide(writer, sec_constants_color, if (i == chunk.constants.len - 1) .corner else .vert, null, options.color_depth);
             // `#N` in the slot's identity color — the same hue a `push_const #N`
             // reference carries, so a reference ties back to its row here.
             var ibuf: [8]u8 = undefined;
             const istr = std.fmt.bufPrint(&ibuf, "#{d}", .{i}) catch "#?";
-            if (options.use_color) {
+            if (options.color_depth.enabled()) {
                 const ic = constColor(i);
-                try writer.print("\x1b[38;2;{d};{d};{d}m{s}\x1b[0m", .{ ic[0], ic[1], ic[2], istr });
+                try setFg(writer, ic, options.color_depth);
+                try writer.writeAll(istr);
+                try writer.writeAll("\x1b[0m");
             } else {
                 try writer.writeAll(istr);
             }
             try writer.splatByteAll(' ', 6 -| istr.len);
-            try writeValueDigest(writer, c, symbols, table_snippet_max, options.use_color);
+            try writeValueDigest(writer, c, symbols, table_snippet_max, options.color_depth);
             try writer.writeByte('\n');
         }
     }
@@ -155,20 +159,20 @@ fn writeChunkAt(
     // resolved contents live here, once, like the constant pool. Gated with the
     // constants flag: they are compile-time data of the same family.
     if (options.show_constants and chunk.attr_names.len > 0) {
-        try writeGuide(writer, cc, null, options.use_color);
+        try writeGuide(writer, cc, null, options.color_depth);
         try writer.writeAll("  attr names:\n");
         for (chunk.attr_names, 0..) |nm, i| {
-            try writeTableRowHead(writer, cc, sec_attr_names_color, i, i == chunk.attr_names.len - 1, attrNameColor(i), options.use_color);
-            try writeStringRef(writer, "str", nm, symbols, table_snippet_max, options.use_color);
+            try writeTableRowHead(writer, cc, sec_attr_names_color, i, i == chunk.attr_names.len - 1, attrNameColor(i), options.color_depth);
+            try writeStringRef(writer, "str", nm, symbols, table_snippet_max, options.color_depth);
             try writer.writeByte('\n');
         }
     }
     if (options.show_constants and chunk.attr_pos.len > 0) {
-        try writeGuide(writer, cc, null, options.use_color);
+        try writeGuide(writer, cc, null, options.color_depth);
         try writer.writeAll("  attr positions:\n");
         for (chunk.attr_pos, 0..) |rec, i| {
-            try writeTableRowHead(writer, cc, sec_attr_pos_color, i, i == chunk.attr_pos.len - 1, attrPosColor(i), options.use_color);
-            try writeAttrPosRow(writer, rec, symbols, options.use_color);
+            try writeTableRowHead(writer, cc, sec_attr_pos_color, i, i == chunk.attr_pos.len - 1, attrPosColor(i), options.color_depth);
+            try writeAttrPosRow(writer, rec, symbols, options.color_depth);
             try writer.writeByte('\n');
         }
     }
@@ -180,17 +184,19 @@ fn writeChunkAt(
     if (up_names) |ups| {
         const strict = chunk.scheduling.strictness.forced_upvalues;
         const deep = chunk.scheduling.strictness.deep_upvalues & ~strict;
-        try writeGuide(writer, cc, null, options.use_color);
+        try writeGuide(writer, cc, null, options.color_depth);
         try writer.writeAll("  upvalues:\n");
         for (ups, 0..) |name_id, i| {
-            try writeGuide(writer, cc, null, options.use_color);
+            try writeGuide(writer, cc, null, options.color_depth);
             try writer.writeAll("  ");
-            try writeTreeGuide(writer, sec_upvalues_color, if (i == ups.len - 1) .corner else .vert, null, options.use_color);
+            try writeTreeGuide(writer, sec_upvalues_color, if (i == ups.len - 1) .corner else .vert, null, options.color_depth);
             var ibuf: [8]u8 = undefined;
             const istr = std.fmt.bufPrint(&ibuf, "#{d}", .{i}) catch "#?";
-            if (options.use_color) {
+            if (options.color_depth.enabled()) {
                 const uc = upvColor(i);
-                try writer.print("\x1b[38;2;{d};{d};{d}m{s}\x1b[0m", .{ uc[0], uc[1], uc[2], istr });
+                try setFg(writer, uc, options.color_depth);
+                try writer.writeAll(istr);
+                try writer.writeAll("\x1b[0m");
             } else {
                 try writer.writeAll(istr);
             }
@@ -198,18 +204,18 @@ fn writeChunkAt(
             if (symbols.internName(name_id)) |raw| {
                 // Strip the leading NUL off compiler-internal names.
                 const name = if (raw.len > 0 and raw[0] == 0) raw[1..] else raw;
-                if (options.use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
+                try setFg(writer, name_color, options.color_depth);
                 try writer.writeAll(name);
-                if (options.use_color) try writer.writeAll("\x1b[0m");
+                if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
             } else {
                 try writer.print("0x{x}", .{name_id});
             }
             const is_strict = i < 64 and (strict >> @intCast(i)) & 1 == 1;
             const is_deep = i < 64 and (deep >> @intCast(i)) & 1 == 1;
             if (is_strict or is_deep) {
-                try setCommentFg(writer, options.use_color);
+                try setCommentFg(writer, options.color_depth);
                 try writer.print(" ; {s}", .{if (is_strict) "strict" else "deep"});
-                if (options.use_color) try writer.writeAll("\x1b[0m");
+                if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
             }
             try writer.writeByte('\n');
         }
@@ -220,10 +226,10 @@ fn writeChunkAt(
         const inc = graph.incoming(id);
         const out = graph.outgoing(id);
         if (inc.len > 0 or out.len > 0) {
-            try writeGuide(writer, cc, null, options.use_color);
+            try writeGuide(writer, cc, null, options.color_depth);
             try writer.writeAll("  references:\n");
-            try writeRefList(writer, "incoming", sec_incoming_color, inc, out.len == 0, symbols, cc, options.use_color);
-            try writeRefList(writer, "outgoing", sec_outgoing_color, out, true, symbols, cc, options.use_color);
+            try writeRefList(writer, "incoming", sec_incoming_color, inc, out.len == 0, symbols, cc, options.color_depth);
+            try writeRefList(writer, "outgoing", sec_outgoing_color, out, true, symbols, cc, options.color_depth);
         }
     };
 
@@ -243,7 +249,7 @@ fn writeChunkAt(
     const env = Env{
         .cc = cc,
         .show_bytes = options.show_bytes,
-        .use_color = options.use_color,
+        .color_depth = options.color_depth,
         .line_width = options.line_width,
     };
     // Zebra stripe unit counter for the body rows (see takeBg).
@@ -255,8 +261,8 @@ fn writeChunkAt(
     var last_file: ?InternId = null;
     if (options.show_source) {
         if (inspect.chunkPrimaryFile(chunk, chunk_id, symbols.registry)) |f| {
-            try writeGuide(writer, cc, null, options.use_color);
-            try writeFileLine(writer, f, symbols, options.use_color);
+            try writeGuide(writer, cc, null, options.color_depth);
+            try writeFileLine(writer, f, symbols, options.color_depth);
             last_file = f;
         }
     }
@@ -270,16 +276,16 @@ fn writeChunkAt(
         // forward instead of crashing on `@enumFromInt`.
         if (op_byte >= opcode_mod.count) {
             ip += 1;
-            const bg = takeBg(&stripe, options.use_color);
-            try beginRow(writer, bg, options.use_color);
-            try writeGuide(writer, cc, bg, options.use_color);
-            try writeOffset(writer, start, bg, options.use_color);
+            const bg = takeBg(&stripe, options.color_depth);
+            try beginRow(writer, bg, options.color_depth);
+            try writeGuide(writer, cc, bg, options.color_depth);
+            try writeOffset(writer, start, bg, options.color_depth);
             try writer.writeAll("  ");
-            if (options.show_bytes) try writeByteCellColored(writer, op_byte, byteRgb(op_byte), bg, options.use_color);
+            if (options.show_bytes) try writeByteCellColored(writer, op_byte, byteRgb(op_byte), bg, options.color_depth);
             if (options.show_bytes) try writer.splatByteAll(' ', (bytes_per_line - 1) * 3 + 1);
-            try setCommentFg(writer, options.use_color);
+            try setCommentFg(writer, options.color_depth);
             try writer.print(".byte 0x{x:0>2}", .{op_byte});
-            try sgrReset(writer, bg, options.use_color);
+            try sgrReset(writer, bg, options.color_depth);
             try endRow(writer, bg, env.prefixWidth() + 10, env);
             continue;
         }
@@ -299,8 +305,8 @@ fn writeChunkAt(
         if (span) |s| {
             if (s.file) |f| {
                 if (last_file == null or last_file.? != f) {
-                    try writeGuide(writer, cc, null, options.use_color);
-                    try writeFileLine(writer, f, symbols, options.use_color);
+                    try writeGuide(writer, cc, null, options.color_depth);
+                    try writeFileLine(writer, f, symbols, options.color_depth);
                     last_file = f;
                 }
             }
@@ -309,10 +315,10 @@ fn writeChunkAt(
         // Every instruction renders through the same head/tail token model:
         // the mnemonic row carries the head operand (raw accessors, byte-linked,
         // with a colored token comment); multiline ops add indented child rows.
-        const bg = takeBg(&stripe, options.use_color);
-        try beginRow(writer, bg, options.use_color);
-        try writeGuide(writer, cc, bg, options.use_color);
-        try writeOffset(writer, start, bg, options.use_color);
+        const bg = takeBg(&stripe, options.color_depth);
+        try beginRow(writer, bg, options.color_depth);
+        try writeGuide(writer, cc, bg, options.color_depth);
+        try writeOffset(writer, start, bg, options.color_depth);
         try writer.writeAll("  ");
         var seq: usize = @intFromEnum(op) + 1;
         var head: Line = undefined;
@@ -339,18 +345,19 @@ fn writeChunkAt(
 }
 
 /// One row of the raw-byte column: `bytes` hex cells (color-coded per byte
-/// value when `use_color`), padded to a fixed width so what follows aligns.
+/// value when `color_depth`), padded to a fixed width so what follows aligns.
 /// `bytes.len` must be ≤ `bytes_per_row`.
-fn writeByteField(writer: *std.Io.Writer, bytes: []const u8, use_color: bool) !void {
-    for (bytes) |b| try writeByteCell(writer, b, use_color);
+fn writeByteField(writer: *std.Io.Writer, bytes: []const u8, color_depth: ColorDepth) !void {
+    for (bytes) |b| try writeByteCell(writer, b, color_depth);
     try writer.splatByteAll(' ', (bytes_per_line - bytes.len) * 3);
 }
 
-/// One `xx ` hex cell, color-coded per byte value when `use_color`.
-fn writeByteCell(writer: *std.Io.Writer, b: u8, use_color: bool) !void {
-    if (use_color) {
+/// One `xx ` hex cell, color-coded per byte value when `color_depth`.
+fn writeByteCell(writer: *std.Io.Writer, b: u8, color_depth: ColorDepth) !void {
+    if (color_depth.enabled()) {
         const rgb = byteRgb(b);
-        try writer.print("\x1b[38;2;{d};{d};{d}m{x:0>2}\x1b[0m ", .{ rgb[0], rgb[1], rgb[2], b });
+        try setFg(writer, rgb, color_depth);
+        try writer.print("{x:0>2}\x1b[0m ", .{b});
     } else {
         try writer.print("{x:0>2} ", .{b});
     }
@@ -364,22 +371,23 @@ fn byteRgb(b: u8) [3]u8 {
     return hueColor(b);
 }
 
-fn writeOffset(writer: *std.Io.Writer, off: usize, bg: ?[3]u8, use_color: bool) !void {
+fn writeOffset(writer: *std.Io.Writer, off: usize, bg: ?[3]u8, color_depth: ColorDepth) !void {
     try writer.writeAll("  ");
-    if (use_color) try writer.writeAll("\x1b[2m");
+    if (color_depth.enabled()) try writer.writeAll("\x1b[2m");
     try writer.print("{x:0>4}", .{off});
-    try sgrReset(writer, bg, use_color);
+    try sgrReset(writer, bg, color_depth);
 }
 
 /// Write the mnemonic followed by a single space. When colored, it takes the
 /// same per-value color as its opcode byte, so the mnemonic and its leading hex
 /// cell visually match.
-fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, bg: ?[3]u8, use_color: bool) !void {
+fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, bg: ?[3]u8, color_depth: ColorDepth) !void {
     const name = @tagName(op);
-    if (use_color) {
+    if (color_depth.enabled()) {
         const rgb = byteRgb(@intFromEnum(op));
-        try writer.print("\x1b[38;2;{d};{d};{d}m{s}", .{ rgb[0], rgb[1], rgb[2], name });
-        try sgrReset(writer, bg, use_color);
+        try setFg(writer, rgb, color_depth);
+        try writer.writeAll(name);
+        try sgrReset(writer, bg, color_depth);
     } else {
         try writer.writeAll(name);
     }
@@ -474,7 +482,7 @@ const Env = struct {
     /// Chunk guide color (the left margin `│`).
     cc: [3]u8,
     show_bytes: bool,
-    use_color: bool,
+    color_depth: ColorDepth,
     /// Terminal width the zebra background extends to (0 = no extension).
     line_width: u16,
 
@@ -487,25 +495,25 @@ const Env = struct {
 /// Zebra striping: every other body row gets the background tint, where a
 /// multi-row record (position entries) counts as ONE stripe unit. Returns the
 /// current unit's background and advances the stripe.
-fn takeBg(stripe: *usize, use_color: bool) ?[3]u8 {
-    const bg: ?[3]u8 = if (use_color and stripe.* % 2 == 1) row_bg else null;
+fn takeBg(stripe: *usize, color_depth: ColorDepth) ?[3]u8 {
+    const bg: ?[3]u8 = if (color_depth.enabled() and stripe.* % 2 == 1) row_bg else null;
     stripe.* += 1;
     return bg;
 }
 
 /// Start a body row: establish its background (if striped) from column 0, so
 /// the tint covers the whole line including the left margin.
-fn beginRow(writer: *std.Io.Writer, bg: ?[3]u8, use_color: bool) !void {
-    if (use_color) if (bg) |b| try writer.print("\x1b[48;2;{d};{d};{d}m", .{ b[0], b[1], b[2] });
+fn beginRow(writer: *std.Io.Writer, bg: ?[3]u8, color_depth: ColorDepth) !void {
+    if (bg) |b| try terminal_color.background(writer, color_depth, b);
 }
 
 /// Finish a body row at absolute column `abs_w`: extend a striped row's tint to
 /// the full terminal width, reset, newline.
 fn endRow(writer: *std.Io.Writer, bg: ?[3]u8, abs_w: u16, env: Env) !void {
-    if (env.use_color and bg != null and env.line_width > abs_w) {
+    if (env.color_depth.enabled() and bg != null and env.line_width > abs_w) {
         try writer.splatByteAll(' ', env.line_width - abs_w);
     }
-    if (env.use_color) try writer.writeAll("\x1b[0m");
+    if (env.color_depth.enabled()) try writer.writeAll("\x1b[0m");
     try writer.writeByte('\n');
 }
 
@@ -521,23 +529,24 @@ fn visibleWidth(text: []const u8) u16 {
 /// Set the foreground for comment/structural text — the one grey used for
 /// every `;` comment, bracket, and annotation, so nothing reads fainter than
 /// the rest regardless of hue or the zebra background underneath.
-fn setCommentFg(writer: *std.Io.Writer, use_color: bool) !void {
-    if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ comment_color[0], comment_color[1], comment_color[2] });
+fn setCommentFg(writer: *std.Io.Writer, color_depth: ColorDepth) !void {
+    try setFg(writer, comment_color, color_depth);
 }
 
 /// Reset the foreground (and any attributes), then — inside a background-tinted
 /// row (`bg` set) — re-establish that background so the tint survives per-cell
 /// resets and stays an unbroken rectangle.
-fn sgrReset(writer: *std.Io.Writer, bg: ?[3]u8, use_color: bool) !void {
-    if (!use_color) return;
+fn sgrReset(writer: *std.Io.Writer, bg: ?[3]u8, color_depth: ColorDepth) !void {
+    if (!color_depth.enabled()) return;
     try writer.writeAll("\x1b[0m");
-    if (bg) |b| try writer.print("\x1b[48;2;{d};{d};{d}m", .{ b[0], b[1], b[2] });
+    if (bg) |b| try terminal_color.background(writer, color_depth, b);
 }
 
-fn writeByteCellColored(writer: *std.Io.Writer, b: u8, rgb: [3]u8, bg: ?[3]u8, use_color: bool) !void {
-    if (use_color) {
-        try writer.print("\x1b[38;2;{d};{d};{d}m{x:0>2}", .{ rgb[0], rgb[1], rgb[2], b });
-        try sgrReset(writer, bg, use_color);
+fn writeByteCellColored(writer: *std.Io.Writer, b: u8, rgb: [3]u8, bg: ?[3]u8, color_depth: ColorDepth) !void {
+    if (color_depth.enabled()) {
+        try setFg(writer, rgb, color_depth);
+        try writer.print("{x:0>2}", .{b});
+        try sgrReset(writer, bg, color_depth);
         try writer.writeByte(' ');
     } else {
         try writer.print("{x:0>2} ", .{b});
@@ -634,10 +643,10 @@ const Line = struct {
     /// groups differ sharply regardless of their byte values. The HSV math is
     /// skipped when not coloring (nothing reads the colors then), but `seq`
     /// still advances so hue assignment is identical either way.
-    fn paint(self: *Line, seq: *usize, use_color: bool) void {
+    fn paint(self: *Line, seq: *usize, color_depth: ColorDepth) void {
         for (self.toks[0..self.n]) |*t| {
             if (t.colored and t.len > 0 and !t.pin) {
-                if (use_color) t.color = hueColor(seq.*);
+                if (color_depth.enabled()) t.color = hueColor(seq.*);
                 seq.* += 1;
             }
         }
@@ -653,10 +662,11 @@ const Line = struct {
 /// One hierarchy indent guide, drawn once per ancestor group and colored by
 /// that group's title — a background block in color mode, `│` otherwise. This
 /// is what nests capture/position lists under their count line.
-fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, bg: ?[3]u8, use_color: bool) !void {
-    if (use_color) {
-        try writer.print("\x1b[38;2;{d};{d};{d}m│", .{ rgb[0], rgb[1], rgb[2] });
-        try sgrReset(writer, bg, use_color);
+fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, bg: ?[3]u8, color_depth: ColorDepth) !void {
+    if (color_depth.enabled()) {
+        try setFg(writer, rgb, color_depth);
+        try writer.writeAll("│");
+        try sgrReset(writer, bg, color_depth);
         try writer.writeByte(' ');
     } else {
         try writer.writeAll("│ ");
@@ -667,15 +677,16 @@ fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, bg: ?[3]u8, use_color: bool) !
 /// group's members, closing with an L-shaped `└` on the run's last row. A
 /// column wider than the thin chunk margin.
 const GuideKind = enum { vert, corner, blank };
-fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, bg: ?[3]u8, use_color: bool) !void {
+fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, bg: ?[3]u8, color_depth: ColorDepth) !void {
     const glyph: []const u8 = switch (kind) {
         .vert => "│  ",
         .corner => "└  ",
         .blank => "   ",
     };
-    if (use_color and kind != .blank) {
-        try writer.print("\x1b[38;2;{d};{d};{d}m{s}", .{ rgb[0], rgb[1], rgb[2], glyph });
-        try sgrReset(writer, bg, use_color);
+    if (color_depth.enabled() and kind != .blank) {
+        try setFg(writer, rgb, color_depth);
+        try writer.writeAll(glyph);
+        try sgrReset(writer, bg, color_depth);
     } else {
         try writer.writeAll(glyph); // blank guide: bare spaces (already on `bg`)
     }
@@ -691,7 +702,7 @@ fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, bg: ?[3]u
 fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, last_mask: u8, bg: ?[3]u8, env: Env) !void {
     const base = off.*;
     const total = line.total();
-    line.paint(seq, env.use_color);
+    line.paint(seq, env.color_depth);
     const depth: u16 = @intCast(guides.len);
     // Field-row comment column, relative to the token area: absolute alignment
     // with the mnemonic-line comments, minus this row's guide indentation.
@@ -699,14 +710,14 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
     const rows: u16 = if (!env.show_bytes or total == 0) 1 else (total + bytes_per_line - 1) / bytes_per_line;
     var r: u16 = 0;
     while (r < rows) : (r += 1) {
-        try beginRow(writer, bg, env.use_color);
-        try writeGuide(writer, env.cc, bg, env.use_color);
+        try beginRow(writer, bg, env.color_depth);
+        try writeGuide(writer, env.cc, bg, env.color_depth);
         try writer.writeAll("        "); // blank offset column
         if (env.show_bytes) {
             var c: u16 = 0;
             while (c < bytes_per_line) : (c += 1) {
                 const pos = r * bytes_per_line + c;
-                if (pos < total) try writeByteCellColored(writer, code[base + pos], line.colorAt(pos), bg, env.use_color) else try writer.writeAll("   ");
+                if (pos < total) try writeByteCellColored(writer, code[base + pos], line.colorAt(pos), bg, env.color_depth) else try writer.writeAll("   ");
             }
         }
         try writer.writeByte(' '); // gap column between the bytes and the gutter
@@ -716,7 +727,7 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
         for (guides, 0..) |gc, gi| {
             const ends = (last_mask >> @intCast(gi)) & 1 == 1;
             const kind: GuideKind = if (ends and r == rows - 1) .corner else .vert;
-            try writeTreeGuide(writer, gc, kind, bg, env.use_color);
+            try writeTreeGuide(writer, gc, kind, bg, env.color_depth);
         }
         var w: u16 = 0;
         if (r == 0) {
@@ -724,18 +735,18 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
                 // Align the `;` comments down the block: pad the raw-value
                 // region out to the shared column before the comment starts.
                 if (line.comment_tok != null and i == line.comment_tok.? and w < comment_col) {
-                    try sgrReset(writer, bg, env.use_color);
+                    try sgrReset(writer, bg, env.color_depth);
                     try writer.splatByteAll(' ', comment_col - w);
                     w = comment_col;
                 }
-                if (env.use_color) {
+                if (env.color_depth.enabled()) {
                     if (t.colored) {
-                        try writer.print("\x1b[38;2;{d};{d};{d}m", .{ t.color[0], t.color[1], t.color[2] });
+                        try setFg(writer, t.color, env.color_depth);
                     } else {
                         // Structural / comment text: grey — reset first so it
                         // doesn't inherit the previous token's hue.
-                        try sgrReset(writer, bg, env.use_color);
-                        try writer.print("\x1b[38;2;{d};{d};{d}m", .{ comment_color[0], comment_color[1], comment_color[2] });
+                        try sgrReset(writer, bg, env.color_depth);
+                        try setFg(writer, comment_color, env.color_depth);
                     }
                 }
                 try writer.writeAll(t.text);
@@ -1099,35 +1110,35 @@ fn headInterp(l: *Line, f: Operand, chunk: *const Chunk, code: []const u8, off: 
 /// colored to match) then the mnemonic and the inline head operand. `head` is
 /// from `buildHead`; `head_len` its operand byte count.
 fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: OpCode, head: *Line, head_len: u16, seq: *usize, bg: ?[3]u8, env: Env) !void {
-    head.paint(seq, env.use_color);
+    head.paint(seq, env.color_depth);
     if (env.show_bytes) {
         var c: u16 = 0;
         while (c < bytes_per_line) : (c += 1) {
             if (c == 0) {
-                try writeByteCellColored(writer, code[start], byteRgb(code[start]), bg, env.use_color);
+                try writeByteCellColored(writer, code[start], byteRgb(code[start]), bg, env.color_depth);
             } else if (c <= head_len) {
-                try writeByteCellColored(writer, code[start + c], head.colorAt(c), bg, env.use_color);
+                try writeByteCellColored(writer, code[start + c], head.colorAt(c), bg, env.color_depth);
             } else {
                 try writer.writeAll("   ");
             }
         }
     }
     try writer.writeByte(' '); // gap between bytes and the mnemonic
-    try writeMnemonic(writer, op, bg, env.use_color);
+    try writeMnemonic(writer, op, bg, env.color_depth);
     // Width from the mnemonic's first character, for the shared comment column.
     var w: u16 = @intCast(@tagName(op).len + 1);
     for (head.toks[0..head.n], 0..) |t, i| {
         if (head.comment_tok != null and i == head.comment_tok.? and w < mnem_comment_col) {
-            try sgrReset(writer, bg, env.use_color);
+            try sgrReset(writer, bg, env.color_depth);
             try writer.splatByteAll(' ', mnem_comment_col - w);
             w = mnem_comment_col;
         }
-        if (env.use_color) {
+        if (env.color_depth.enabled()) {
             if (t.colored) {
-                try writer.print("\x1b[38;2;{d};{d};{d}m", .{ t.color[0], t.color[1], t.color[2] });
+                try setFg(writer, t.color, env.color_depth);
             } else {
-                try sgrReset(writer, bg, env.use_color);
-                try writer.print("\x1b[38;2;{d};{d};{d}m", .{ comment_color[0], comment_color[1], comment_color[2] });
+                try sgrReset(writer, bg, env.color_depth);
+                try setFg(writer, comment_color, env.color_depth);
             }
         }
         try writer.writeAll(t.text);
@@ -1139,13 +1150,13 @@ fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: 
     if (env.show_bytes and head_len + 1 > bytes_per_line) {
         var o: usize = bytes_per_line;
         while (o < head_len + 1) : (o += bytes_per_line) {
-            try beginRow(writer, bg, env.use_color);
-            try writeGuide(writer, env.cc, bg, env.use_color);
+            try beginRow(writer, bg, env.color_depth);
+            try writeGuide(writer, env.cc, bg, env.color_depth);
             try writer.writeAll("        ");
             var c: usize = o;
             var cnt: u16 = 0;
             while (c < o + bytes_per_line and c < head_len + 1) : (c += 1) {
-                try writeByteCellColored(writer, code[start + c], head.colorAt(@intCast(c)), bg, env.use_color);
+                try writeByteCellColored(writer, code[start + c], head.colorAt(@intCast(c)), bg, env.color_depth);
                 cnt += 1;
             }
             try endRow(writer, bg, 10 + 3 * cnt, env);
@@ -1161,7 +1172,7 @@ fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: [
     l.group(0, 2, "#{d}", .{readU16(code, off.*)});
     l.comment();
     l.glue("{s}", .{label});
-    try emitLine(writer, code, off, &l, seq, guides, last_mask, takeBg(stripe, env.use_color), env);
+    try emitLine(writer, code, off, &l, seq, guides, last_mask, takeBg(stripe, env.color_depth), env);
 }
 
 /// The `n` inline capture descriptors (3 bytes each: kind byte + u16 index),
@@ -1190,7 +1201,7 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
             }
         }
         const mask: u8 = if (k == n - 1) end_mask else 0;
-        try emitLine(writer, code, off, &l, seq, guides, mask, takeBg(stripe, env.use_color), env);
+        try emitLine(writer, code, off, &l, seq, guides, mask, takeBg(stripe, env.color_depth), env);
     }
 }
 
@@ -1272,7 +1283,7 @@ fn writeOperandTail(
             l.tint(c_slot, "{d}", .{code[off]});
             l.glue("]", .{});
             if (localName(local_names, symbols, code[off])) |nm| l.tint(name_color, " {s}", .{nm});
-            try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
+            try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.color_depth), env);
         },
         .attrs_new_named_srt, .attrs_new_named_pos_srt => {
             // Head took the count; remaining operands are the names start
@@ -1293,7 +1304,7 @@ fn writeOperandTail(
                 l.glue("names[", .{});
                 l.tint(c, "{d}..{d}", .{ names_start, names_start + count });
                 l.glue("]", .{});
-                try emitLine(writer, code, &off, &l, seq, g[0..1], if (has_pos) 0 else 0b01, takeBg(stripe, env.use_color), env);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], if (has_pos) 0 else 0b01, takeBg(stripe, env.color_depth), env);
             }
             if (has_pos) {
                 const pos_count = readU16(code, off);
@@ -1308,7 +1319,7 @@ fn writeOperandTail(
                 l.glue("positions[", .{});
                 l.tint(c, "{d}..{d}", .{ pos_start, pos_start + pos_count });
                 l.glue("]", .{});
-                try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.color_depth), env);
             }
         },
         .thunk_defer => {
@@ -1348,7 +1359,7 @@ fn writeOperandTail(
                 } else {
                     l.glue(" → local[{d}]", .{slot});
                 }
-                try emitLine(writer, code, &off, &l, seq, g[0..1], if (k == expected - 1) 0b01 else 0, takeBg(stripe, env.use_color), env);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], if (k == expected - 1) 0b01 else 0, takeBg(stripe, env.color_depth), env);
             }
         },
         else => {
@@ -1357,7 +1368,7 @@ fn writeOperandTail(
                 var l: Line = undefined;
                 l.reset();
                 l.group(0, @intCast(end_ip - off), "{s}", .{operand_text});
-                try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.color_depth), env);
             }
         },
     }
@@ -1366,7 +1377,7 @@ fn writeOperandTail(
         var l: Line = undefined;
         l.reset();
         l.group(0, @intCast(end_ip - off), "{s}", .{"…"});
-        try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
+        try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.color_depth), env);
     }
 }
 
@@ -1396,34 +1407,35 @@ fn isMultiline(op: OpCode) bool {
     };
 }
 
-fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Chunk, symbols: Symbols, cc: [3]u8, has_upvalue_table: bool, use_color: bool) !void {
+fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Chunk, symbols: Symbols, cc: [3]u8, has_upvalue_table: bool, color_depth: ColorDepth) !void {
     if (chunk_id) |id| {
         // Same `store[accessor]` coloring as every reference to this chunk —
         // keyword, dim brackets, id in the chunk's identity color (bold: this
         // is the definition the references point at).
-        if (use_color) try writer.print("\x1b[1;38;2;{d};{d};{d}m", .{ store_kw_color[0], store_kw_color[1], store_kw_color[2] });
+        try terminal_color.foreground(writer, color_depth, store_kw_color, true);
         try writer.writeAll("chunk");
-        if (use_color) try writer.writeAll("\x1b[0m");
-        try setCommentFg(writer, use_color);
+        if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+        try setCommentFg(writer, color_depth);
         try writer.writeByte('[');
-        if (use_color) try writer.print("\x1b[0;1;38;2;{d};{d};{d}m", .{ cc[0], cc[1], cc[2] });
+        if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+        try terminal_color.foreground(writer, color_depth, cc, true);
         try writer.print("0x{x}", .{id});
-        if (use_color) try writer.writeAll("\x1b[0m");
-        try setCommentFg(writer, use_color);
+        if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+        try setCommentFg(writer, color_depth);
         try writer.writeByte(']');
-        if (use_color) try writer.writeAll("\x1b[0m");
+        if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
     } else {
-        if (use_color) try writer.print("\x1b[1;38;2;{d};{d};{d}m", .{ store_kw_color[0], store_kw_color[1], store_kw_color[2] });
+        try terminal_color.foreground(writer, color_depth, store_kw_color, true);
         try writer.writeAll("chunk");
-        if (use_color) try writer.writeAll("\x1b[0m");
+        if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
     }
     // Best-effort compiler-attributed name (the binding a lambda/thunk was
     // compiled for), when name capture was on. See ChunkRegistry.recordName.
     if (chunk_id) |id| {
         if (chunkNameOf(symbols, id)) |name| {
-            if (use_color) try writer.print("\x1b[1;38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
+            try terminal_color.foreground(writer, color_depth, name_color, true);
             try writer.print(" {s}", .{name});
-            if (use_color) try writer.writeAll("\x1b[0m");
+            if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
         }
     }
     try writer.print(" ({d} bytes, {d} consts, {d} locals", .{
@@ -1442,7 +1454,7 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
     // lines are the fallback for chunks with no recorded upvalue names.
     if (has_upvalue_table) return;
     if (chunk.scheduling.strictness.forced_upvalues != 0) {
-        try writeGuide(writer, cc, null, use_color);
+        try writeGuide(writer, cc, null, color_depth);
         try writer.writeAll("  strict upvalues:");
         var mask = chunk.scheduling.strictness.forced_upvalues;
         while (mask != 0) {
@@ -1454,7 +1466,7 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
     }
     const deep_extra = chunk.scheduling.strictness.deep_upvalues & ~chunk.scheduling.strictness.forced_upvalues;
     if (deep_extra != 0) {
-        try writeGuide(writer, cc, null, use_color);
+        try writeGuide(writer, cc, null, color_depth);
         try writer.writeAll("  deep upvalues:");
         var mask = deep_extra;
         while (mask != 0) {
@@ -1468,25 +1480,25 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
 
 /// A `references:` sub-section (`incoming`/`outgoing`): one `chunk[0xN] name`
 /// per referenced chunk, each in that chunk's identity color. No-op when empty.
-fn writeRefList(writer: *std.Io.Writer, label: []const u8, sub_color: [3]u8, ids: []const ChunkId, outer_last: bool, symbols: Symbols, cc: [3]u8, use_color: bool) !void {
+fn writeRefList(writer: *std.Io.Writer, label: []const u8, sub_color: [3]u8, ids: []const ChunkId, outer_last: bool, symbols: Symbols, cc: [3]u8, color_depth: ColorDepth) !void {
     if (ids.len == 0) return;
     // Sub-section header under the references gutter, then one row per chunk
     // under the sub-section's own gutter; each vertical run closes with `└`.
-    try writeGuide(writer, cc, null, use_color);
+    try writeGuide(writer, cc, null, color_depth);
     try writer.writeAll("  ");
-    try writeTreeGuide(writer, sec_references_color, .vert, null, use_color);
+    try writeTreeGuide(writer, sec_references_color, .vert, null, color_depth);
     try writer.print("{s}:\n", .{label});
     for (ids, 0..) |id, i| {
         const sub_last = i == ids.len - 1;
-        try writeGuide(writer, cc, null, use_color);
+        try writeGuide(writer, cc, null, color_depth);
         try writer.writeAll("  ");
-        try writeTreeGuide(writer, sec_references_color, if (outer_last and sub_last) .corner else .vert, null, use_color);
-        try writeTreeGuide(writer, sub_color, if (sub_last) .corner else .vert, null, use_color);
-        try writeStoreRefText(writer, "chunk", id, objColor(id), use_color);
+        try writeTreeGuide(writer, sec_references_color, if (outer_last and sub_last) .corner else .vert, null, color_depth);
+        try writeTreeGuide(writer, sub_color, if (sub_last) .corner else .vert, null, color_depth);
+        try writeStoreRefText(writer, "chunk", id, objColor(id), color_depth);
         if (chunkNameOf(symbols, id)) |name| {
-            if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
+            try setFg(writer, name_color, color_depth);
             try writer.print(" {s}", .{name});
-            if (use_color) try writer.writeAll("\x1b[0m");
+            if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
         }
         try writer.writeByte('\n');
     }
@@ -1631,7 +1643,7 @@ fn writeFieldInterp(
         .const_idx => {
             const idx = readU16(code, ip);
             if (idx < chunk.constants.len)
-                try writeValueDigest(writer, chunk.constants[idx], symbols, snippet_max, false)
+                try writeValueDigest(writer, chunk.constants[idx], symbols, snippet_max, .none)
             else
                 try writer.print("const #{d}", .{idx});
         },
@@ -1741,15 +1753,15 @@ fn writeInternRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols) !void 
 
 /// A standalone `; <filename>` comment line marking that subsequent instructions
 /// come from this file (emitted only when the file changes).
-fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, use_color: bool) !void {
-    try setCommentFg(writer, use_color);
+fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, color_depth: ColorDepth) !void {
+    try setCommentFg(writer, color_depth);
     try writer.writeAll("  ; ");
     if (symbols.internName(file)) |name| {
         try writer.writeAll(name);
     } else {
         try writer.print("file 0x{x}", .{file});
     }
-    if (use_color) try writer.writeAll("\x1b[0m");
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
     try writer.writeByte('\n');
 }
 
@@ -1757,115 +1769,118 @@ fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, use_c
 /// current file (whose name is on its own hoisted line).
 /// A `store[accessor]` reference written directly (outside the `Line` token
 /// model): keyword in the store color, brackets comment-grey, accessor in `id_color`.
-fn writeStoreRefText(writer: *std.Io.Writer, kw: []const u8, id: u64, id_color: [3]u8, use_color: bool) !void {
-    if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ store_kw_color[0], store_kw_color[1], store_kw_color[2] });
+fn writeStoreRefText(writer: *std.Io.Writer, kw: []const u8, id: u64, id_color: [3]u8, color_depth: ColorDepth) !void {
+    try setFg(writer, store_kw_color, color_depth);
     try writer.writeAll(kw);
-    if (use_color) try writer.writeAll("\x1b[0m");
-    try setCommentFg(writer, use_color);
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+    try setCommentFg(writer, color_depth);
     try writer.writeByte('[');
-    if (use_color) try writer.print("\x1b[0;38;2;{d};{d};{d}m", .{ id_color[0], id_color[1], id_color[2] });
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+    try setFg(writer, id_color, color_depth);
     try writer.print("0x{x}", .{id});
-    if (use_color) try writer.writeAll("\x1b[0m");
-    try setCommentFg(writer, use_color);
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+    try setCommentFg(writer, color_depth);
     try writer.writeByte(']');
-    if (use_color) try writer.writeAll("\x1b[0m");
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
 }
 
 /// `type[accessor] → value` digest of a constant. Interned strings/paths render
 /// the full lookup chain — `str[0xN] → "text"` — with the intern id in its
-/// identity color (matching every other occurrence of that id) when `use_color`.
+/// identity color (matching every other occurrence of that id) when `color_depth`.
 /// `max` caps string length.
-fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max: usize, use_color: bool) !void {
+fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max: usize, color_depth: ColorDepth) !void {
     switch (value.kind()) {
         .null => try writer.writeAll("null"),
         .bool_true => try writer.writeAll("true"),
         .bool_false => try writer.writeAll("false"),
         .int => try writer.print("int {d}", .{value.asInt()}),
         .float => try writer.print("float {d}", .{value.asFloat()}),
-        .string => try writeStringRef(writer, "str", value.asInternId(), symbols, max, use_color),
-        .path => try writeStringRef(writer, "path", value.asInternId(), symbols, max, use_color),
-        .list => try writeStoreRefText(writer, "list", value.asObjectId(), heapColor(value.asObjectId()), use_color),
-        .attrs => try writeStoreRefText(writer, "attrs", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .string => try writeStringRef(writer, "str", value.asInternId(), symbols, max, color_depth),
+        .path => try writeStringRef(writer, "path", value.asInternId(), symbols, max, color_depth),
+        .list => try writeStoreRefText(writer, "list", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
+        .attrs => try writeStoreRefText(writer, "attrs", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
         .closure => if (value.isFunction())
-            try writeStoreRefText(writer, "function", value.asFunctionChunkId(), objColor(value.asFunctionChunkId()), use_color)
+            try writeStoreRefText(writer, "function", value.asFunctionChunkId(), objColor(value.asFunctionChunkId()), color_depth)
         else
-            try writeStoreRefText(writer, "closure", value.asObjectId(), heapColor(value.asObjectId()), use_color),
-        .thunk => try writeStoreRefText(writer, "thunk", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+            try writeStoreRefText(writer, "closure", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
+        .thunk => try writeStoreRefText(writer, "thunk", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
         .builtin => {
             const bid = value.asBuiltinId();
-            try writeStoreRefText(writer, "builtin", bid, heapColor(bid), use_color);
+            try writeStoreRefText(writer, "builtin", bid, heapColor(bid), color_depth);
             if (builtinName(bid)) |nm| {
-                try setCommentFg(writer, use_color);
+                try setCommentFg(writer, color_depth);
                 try writer.writeAll(" → ");
-                if (use_color) {
+                if (color_depth.enabled()) {
                     const c = heapColor(bid);
-                    try writer.print("\x1b[38;2;{d};{d};{d}m", .{ c[0], c[1], c[2] });
+                    try setFg(writer, c, color_depth);
                 }
                 try writer.writeAll(nm);
-                if (use_color) try writer.writeAll("\x1b[0m");
+                if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
             }
         },
-        .builtin_closure => try writeStoreRefText(writer, "builtin_closure", value.asObjectId(), heapColor(value.asObjectId()), use_color),
-        .string_context => try writeStoreRefText(writer, "string_ctx", value.asObjectId(), heapColor(value.asObjectId()), use_color),
-        .boxed_int => try writeStoreRefText(writer, "boxed_int", value.asObjectId(), heapColor(value.asObjectId()), use_color),
-        .partial_app => try writeStoreRefText(writer, "partial_app", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .builtin_closure => try writeStoreRefText(writer, "builtin_closure", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
+        .string_context => try writeStoreRefText(writer, "string_ctx", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
+        .boxed_int => try writeStoreRefText(writer, "boxed_int", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
+        .partial_app => try writeStoreRefText(writer, "partial_app", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
     }
 }
 
-fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols, max: usize, use_color: bool) !void {
-    try writeStoreRefText(writer, kind, id, internColor(id), use_color);
+fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols, max: usize, color_depth: ColorDepth) !void {
+    try writeStoreRefText(writer, kind, id, internColor(id), color_depth);
     if (symbols.internName(id)) |text| {
-        try setCommentFg(writer, use_color);
+        try setCommentFg(writer, color_depth);
         try writer.writeAll(" → \"");
         try writeEscapedSnippet(writer, text, max);
         try writer.writeByte('"');
-        if (use_color) try writer.writeAll("\x1b[0m");
+        if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
     }
 }
 
 /// Set the foreground to `rgb` (no-op when not coloring).
-fn setFg(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
-    if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ rgb[0], rgb[1], rgb[2] });
+fn setFg(writer: *std.Io.Writer, rgb: [3]u8, color_depth: ColorDepth) !void {
+    try terminal_color.foreground(writer, color_depth, rgb, false);
 }
 
 /// One `attr positions:` row body: `"name" @ file:line:col`, the name and the
 /// filename each in their intern identity color, structural glue comment-grey.
-fn writeAttrPosRow(writer: *std.Io.Writer, rec: @import("runtime").heap.AttrPosEntry, symbols: Symbols, use_color: bool) !void {
+fn writeAttrPosRow(writer: *std.Io.Writer, rec: @import("runtime").heap.AttrPosEntry, symbols: Symbols, color_depth: ColorDepth) !void {
     if (symbols.internName(rec.name)) |s| {
-        try setFg(writer, internColor(rec.name), use_color);
+        try setFg(writer, internColor(rec.name), color_depth);
         try writer.writeByte('"');
         try writeEscapedSnippet(writer, s, table_snippet_max);
         try writer.writeByte('"');
-        if (use_color) try writer.writeAll("\x1b[0m");
+        if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
     } else {
-        try writeStoreRefText(writer, "str", rec.name, internColor(rec.name), use_color);
+        try writeStoreRefText(writer, "str", rec.name, internColor(rec.name), color_depth);
     }
-    try setCommentFg(writer, use_color);
+    try setCommentFg(writer, color_depth);
     try writer.writeAll(" @ ");
     if (symbols.internName(rec.pos.file)) |f| {
-        try setFg(writer, internColor(rec.pos.file), use_color);
+        try setFg(writer, internColor(rec.pos.file), color_depth);
         try writer.writeAll(std.fs.path.basename(f));
-        if (use_color) try writer.writeAll("\x1b[0m");
+        if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
     } else {
-        try writeStoreRefText(writer, "file", rec.pos.file, internColor(rec.pos.file), use_color);
+        try writeStoreRefText(writer, "file", rec.pos.file, internColor(rec.pos.file), color_depth);
     }
-    try setCommentFg(writer, use_color);
+    try setCommentFg(writer, color_depth);
     try writer.print(":{d}:{d}", .{ rec.pos.line, rec.pos.column });
-    if (use_color) try writer.writeAll("\x1b[0m");
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
 }
 
 /// The `│  └ #idx` prefix of one `name:` section-table row: chunk gutter, the
 /// section's tree guide (`└` on the last row, else `│`), then the row index in
 /// its identity color padded to the value column. The shared row opener for the
 /// attr-name/position tables.
-fn writeTableRowHead(writer: *std.Io.Writer, cc: [3]u8, sec_color: [3]u8, idx: usize, last: bool, idx_color: [3]u8, use_color: bool) !void {
-    try writeGuide(writer, cc, null, use_color);
+fn writeTableRowHead(writer: *std.Io.Writer, cc: [3]u8, sec_color: [3]u8, idx: usize, last: bool, idx_color: [3]u8, color_depth: ColorDepth) !void {
+    try writeGuide(writer, cc, null, color_depth);
     try writer.writeAll("  ");
-    try writeTreeGuide(writer, sec_color, if (last) .corner else .vert, null, use_color);
+    try writeTreeGuide(writer, sec_color, if (last) .corner else .vert, null, color_depth);
     var ibuf: [16]u8 = undefined;
     const istr = std.fmt.bufPrint(&ibuf, "#{d}", .{idx}) catch "#?";
-    if (use_color) {
-        try writer.print("\x1b[38;2;{d};{d};{d}m{s}\x1b[0m", .{ idx_color[0], idx_color[1], idx_color[2], istr });
+    if (color_depth.enabled()) {
+        try setFg(writer, idx_color, color_depth);
+        try writer.writeAll(istr);
+        try writer.writeAll("\x1b[0m");
     } else {
         try writer.writeAll(istr);
     }

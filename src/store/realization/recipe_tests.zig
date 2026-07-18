@@ -51,7 +51,7 @@ const ProgressRecorder = struct {
         };
     }
 
-    fn begin(raw: *anyopaque, kind: store_progress.SpanKind, _: []const u8) usize {
+    fn begin(raw: *anyopaque, kind: store_progress.SpanKind, _: []const u8, _: ?[]const u8) usize {
         const self: *ProgressRecorder = @ptrCast(@alignCast(raw));
         self.mu.lock();
         defer self.mu.unlock();

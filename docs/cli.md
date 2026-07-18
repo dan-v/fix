@@ -139,7 +139,7 @@ explicit typed flake-output/installable form.
 | `--hugetlb auto\|on\|off` | back the evaluation heap with explicit 2 MB huge pages (default `auto`: only when the kernel pool has ≥256 MB unreserved capacity). Provision the pool with `sysctl vm.nr_hugepages=N` → [perf/hugetlb.md](perf/hugetlb.md) |
 | `--show-trace` | full evaluation traces on error |
 | `--debugger` (eval, repl) | pause into the interactive debug console at `builtins.break` and on evaluation errors; forces `--workers=1`. See [The debugger](#the-debugger). |
-| `--color[=auto\|always\|never]` / `--no-color` | color diagnostics |
+| `--color[=auto\|always\|never]` / `--no-color` | color diagnostics; auto disables color off-TTY or under `NO_COLOR`, then selects truecolor from `COLORTERM`, 256-color from `TERM`, or ANSI-16 |
 | `--progress` / `--no-progress` | enable / disable timestamped progress records on stderr |
 | `-v, --verbose` | increase progress detail (checks at `-v`, parse/compile at `-vv`) and daemon build verbosity |
 | `--bare` (repl) | plain line-based input: no editor, no escape sequences — for pipes and expect-style automation |

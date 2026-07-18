@@ -78,11 +78,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // Coloring and paging both follow stdout (where the disassembly goes),
     // unlike the eval commands whose diagnostics go to stderr.
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
-    const use_color = switch (options.color) {
-        .always => true,
-        .never => false,
-        .auto => presentation.autoColor(stdout_tty, init.environ_map),
-    };
+    const color_depth = presentation.colorDepthForTerminal(options.color, stdout_tty, init.environ_map);
 
     const source = runner.getSource(&ev, init.io, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
@@ -137,7 +133,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         // The `--eval` registry walk visits every chunk once, so recursion is
         // only for the static single-chunk-graph path.
         .recurse = !options.disasm_eval and !options.disasm_no_recurse,
-        .use_color = use_color,
+        .color_depth = color_depth,
         .max_depth = 0, // unlimited: the visited set guarantees termination.
         .refs = if (ref_graph) |*g| g else null,
         // Queried before any pager spawns (stdout is still the terminal), so
@@ -152,7 +148,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     } else null;
     var pager: ?Pager = if (pager_cmd) |cmd| Pager.start(init, cmd) else null;
     const sink: std.Io.File = if (pager) |p| p.child.stdin.? else std.Io.File.stdout();
-    if (use_color and pager == null) std.Io.File.stdout().enableAnsiEscapeCodes(init.io) catch {};
+    if (color_depth.enabled() and pager == null) std.Io.File.stdout().enableAnsiEscapeCodes(init.io) catch {};
 
     var out_buffer: [1 << 15]u8 = undefined;
     var stream = sink.writerStreaming(init.io, &out_buffer);
