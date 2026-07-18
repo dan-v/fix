@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const cli = @import("cli");
 const process_support = @import("process_support");
 const commands = cli.commands;
+const command_match = cli.command_match;
 
 const ArgsIterator = std.process.Args.Iterator;
 const SubcommandRun = *const fn (cli.ProcessContext, std.process.Init, *ArgsIterator) anyerror!u8;
@@ -15,25 +16,31 @@ const Subcommand = struct {
 };
 
 const subcommands = [_]Subcommand{
-    .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = commands.eval.run },
-    .{ .name = "parse", .summary = "parse an expression and print its AST as JSON", .run = commands.parse.run },
-    .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = commands.instantiate.run },
     .{ .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .run = commands.build.run },
+    .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = commands.disasm.run },
+    .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = commands.eval.run },
+    .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = commands.instantiate.run },
+    .{ .name = "parse", .summary = "parse an expression and print its AST as JSON", .run = commands.parse.run },
+    .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = commands.repl.run },
     .{ .name = "run", .summary = "build a derivation and run a program from its output", .run = commands.run.run },
     .{ .name = "shell", .summary = "build a derivation and open a shell with its bin/ on PATH", .run = commands.shell.run },
     .{ .name = "switch", .summary = "build and activate a NixOS/nix-darwin/home-manager configuration", .run = commands.@"switch".run },
-    .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = commands.repl.run },
-    .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = commands.disasm.run },
-} ++ (if (cli.vm_trace_enabled) [_]Subcommand{
-    .{ .name = "trace", .summary = "work with binary VM trace files", .run = commands.trace.run },
-} else [_]Subcommand{}) ++ (if (cli.thunks_log_enabled) [_]Subcommand{
+} ++ (if (cli.thunks_log_enabled) [_]Subcommand{
     .{ .name = "thunks", .summary = "diff thunks-logs to find divergent resolutions", .run = commands.thunks.run },
+} else [_]Subcommand{}) ++ (if (cli.vm_trace_enabled) [_]Subcommand{
+    .{ .name = "trace", .summary = "work with binary VM trace files", .run = commands.trace.run },
 } else [_]Subcommand{});
+
+const subcommand_names = blk: {
+    var names: [subcommands.len][]const u8 = undefined;
+    for (subcommands, 0..) |subcommand, index| names[index] = subcommand.name;
+    break :blk names;
+};
 
 fn writeTopUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll("usage: fix <command> [options]\n\ncommands:\n");
     inline for (subcommands) |c| {
-        try writer.print("  {s:<9} {s}\n", .{ c.name, c.summary });
+        try writer.print("  {s:<12} {s}\n", .{ c.name, c.summary });
     }
     try writer.writeAll("\nrun `fix <command> -h` for command-specific help.\n");
 }
@@ -86,25 +93,32 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(0);
     }
 
-    const code = runSubcommand(command, process, init, &args_iter) orelse {
-        std.debug.print("fix: unknown command '{s}'\n\n{s}", .{ command, topUsage(allocator) });
-        std.process.exit(2);
+    const subcommand = switch (command_match.resolve(&subcommand_names, command)) {
+        .match => |index| &subcommands[index],
+        .ambiguous => {
+            std.debug.print("fix: ambiguous command '{s}' (could be:", .{command});
+            for (subcommands) |candidate| {
+                if (std.mem.startsWith(u8, candidate.name, command))
+                    std.debug.print(" {s}", .{candidate.name});
+            }
+            std.debug.print(")\n\n{s}", .{topUsage(allocator)});
+            std.process.exit(2);
+        },
+        .none => {
+            std.debug.print("fix: unknown command '{s}'\n\n{s}", .{ command, topUsage(allocator) });
+            std.process.exit(2);
+        },
     };
-    std.process.exit(code);
+    std.process.exit(runSubcommand(subcommand, process, init, &args_iter));
 }
 
-fn runSubcommand(name: []const u8, process: cli.ProcessContext, init: std.process.Init, args_iter: *ArgsIterator) ?u8 {
-    inline for (subcommands) |subcommand| {
-        if (std.mem.eql(u8, name, subcommand.name)) {
-            return subcommand.run(process, init, args_iter) catch |err| {
-                // `error.ConfigError` (e.g. a bad nix.conf include) already
-                // printed its own message; don't double-report.
-                if (err != error.ConfigError) std.debug.print("error: {s}\n", .{@errorName(err)});
-                return 1;
-            };
-        }
-    }
-    return null;
+fn runSubcommand(subcommand: *const Subcommand, process: cli.ProcessContext, init: std.process.Init, args_iter: *ArgsIterator) u8 {
+    return subcommand.run(process, init, args_iter) catch |err| {
+        // `error.ConfigError` (e.g. a bad nix.conf include) already printed
+        // its own message; don't double-report.
+        if (err != error.ConfigError) std.debug.print("error: {s}\n", .{@errorName(err)});
+        return 1;
+    };
 }
 
 fn trimLargeBlocks(context: *anyopaque) void {
