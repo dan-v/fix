@@ -213,8 +213,8 @@ pub const Options = struct {
     /// compiled (follows imports and lazy attr bodies), instead of statically
     /// compiling the top expression only.
     disasm_eval: bool = false,
-    /// `fix disasm --stats`: print corpus statistics instead of a listing.
-    disasm_stats: bool = false,
+    /// Print command-specific evaluator or bytecode statistics.
+    stats: bool = false,
     source: ?SourceArg = null,
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
@@ -239,7 +239,6 @@ pub const Options = struct {
     /// default when RSS was over-weighted vs the measured GC cost.
     disable_spec_thunks: bool = false,
     disable_fanout: bool = false,
-    print_sched_stats: bool = false,
     /// `--mem-report[=dump]`: peak memory attribution at evaluator teardown.
     mem_report: ?[]const u8 = null,
     /// `--gc-report`: collection summary at evaluator teardown.
@@ -357,7 +356,7 @@ const Opt = enum {
     no_bytes,
     no_pager,
     disasm_eval,
-    disasm_stats,
+    stats,
     // Internal perf/trace knobs (hidden from help, still parsed everywhere).
     workers,
     vm_trace,
@@ -367,7 +366,6 @@ const Opt = enum {
     thunks_log,
     no_spec_thunks,
     no_fanout,
-    print_sched_stats,
     mem_report,
     gc_report,
     timeline,
@@ -417,6 +415,8 @@ const selected_source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell,
 /// progress, and the GC memory budget apply. `disasm` stops at compilation, so
 /// it is excluded.
 const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .@"switch" };
+/// Commands with a meaningful evaluator/bytecode statistics report.
+const stats_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .disasm, .@"switch" };
 /// One-shot evaluator commands that can write a complete Perfetto capture.
 const timeline_cmds = &[_]Cmd{ .eval, .instantiate, .build };
 /// Commands that print an evaluated value, so the output format (`--json`,
@@ -477,6 +477,7 @@ const specs = [_]Spec{
     .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase progress detail and daemon build verbosity (repeatable)", .show_in = verbose_cmds },
     .{ .id = .no_build_output, .short = "-Q", .long = "--no-build-output", .help = "suppress builder output", .show_in = daemon_setting_cmds },
 
+    .{ .id = .stats, .long = "--stats", .help = "print evaluator or bytecode corpus statistics", .show_in = stats_cmds },
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error", .show_in = eval_cmds },
     .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{ .eval, .repl } },
     .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
@@ -503,7 +504,6 @@ const specs = [_]Spec{
 
     // Disasm.
     .{ .id = .disasm_eval, .long = "--eval", .help = "evaluate first, then disassemble every chunk that\ncompiled (imports + whatever evaluation forces)", .show_in = &.{.disasm} },
-    .{ .id = .disasm_stats, .long = "--stats", .help = "print corpus statistics (sizes, categories, reuse,\ncompressibility) instead of a disassembly", .show_in = &.{.disasm} },
     .{ .id = .chunk, .long = "--chunk", .arg = .req, .metavar = "N", .help = "disassemble only chunk N (decimal or 0x hex, as\nshown in chunk headers; default: all reachable)", .show_in = &.{.disasm} },
     .{ .id = .no_recurse, .long = "--no-recurse", .help = "only show the top chunk", .show_in = &.{.disasm} },
     .{ .id = .no_bytes, .long = "--no-bytes", .help = "omit the raw bytecode hex column", .show_in = &.{.disasm} },
@@ -520,7 +520,6 @@ const specs = [_]Spec{
     .{ .id = .thunks_log, .long = "--thunks-log", .arg = .req, .metavar = "PATH", .hidden = true },
     .{ .id = .no_spec_thunks, .long = "--no-spec-thunks", .hidden = true },
     .{ .id = .no_fanout, .long = "--no-fanout", .hidden = true },
-    .{ .id = .print_sched_stats, .long = "--print-sched-stats", .hidden = true },
     .{ .id = .mem_report, .long = "--mem-report", .arg = .opt, .metavar = "dump", .hidden = true },
     .{ .id = .gc_report, .long = "--gc-report", .hidden = true },
 };
@@ -739,7 +738,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .no_bytes => options.disasm_no_bytes = true,
         .no_pager => options.disasm_no_pager = true,
         .disasm_eval => options.disasm_eval = true,
-        .disasm_stats => options.disasm_stats = true,
+        .stats => options.stats = true,
 
         .workers => options.workers = std.fmt.parseInt(u8, v0.?, 10) catch return error.InvalidWorkers,
         .vm_trace => options.vm_trace_path = v0 orelse "-",
@@ -749,7 +748,6 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .thunks_log => options.thunks_log_path = v0.?,
         .no_spec_thunks => options.disable_spec_thunks = true,
         .no_fanout => options.disable_fanout = true,
-        .print_sched_stats => options.print_sched_stats = true,
         .mem_report => options.mem_report = v0 orelse "",
         .gc_report => options.gc_report = true,
         .timeline => options.timeline_path = v0 orelse "fix-timeline.json",
@@ -908,6 +906,19 @@ test "lowercase expression short flag is rejected and flake requires a value" {
 test "parser enforces command option scope" {
     const argv = [_][*:0]const u8{ "fix", "--dry-run" };
     try std.testing.expectError(error.OptionNotValidForCommand, parseForTest(&argv, .eval));
+}
+
+test "stats is shared by evaluator and disasm commands" {
+    const argv = [_][*:0]const u8{ "fix", "--stats" };
+    for (stats_cmds) |cmd| {
+        var options = try parseForTest(&argv, cmd);
+        defer options.deinit(std.testing.allocator);
+        try std.testing.expect(options.stats);
+    }
+
+    try std.testing.expectError(error.OptionNotValidForCommand, parseForTest(&argv, .parse));
+    const retired = [_][*:0]const u8{ "fix", "--print-sched-stats" };
+    try std.testing.expectError(error.UnknownOption, parseForTest(&retired, .eval));
 }
 
 test "package list returns to ordinary option parsing" {

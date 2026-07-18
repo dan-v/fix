@@ -19,7 +19,7 @@ The build-module graph follows independently reusable or consumed groups. Within
 | `cli` | `src/cli/root.zig` | `base`, `expr`, `runtime`, `syntax`, `store` | command surface, argument parsing, rendering, progress |
 | `process_support` | `src/process_support.zig` | `base`, `runtime` | executable-only allocator composition |
 
-`cli` is the in-repository consumer, so it imports the durable modules it uses directly. Evaluation commands use `expr`; value inspection uses `runtime`; parsing and debugger highlighting use `syntax`; realization and daemon commands use `store`. The executable (`src/main.zig`) imports `cli` and the private `process_support` composition module.
+`cli` is the in-repository consumer, so it imports the durable modules it uses directly. Evaluation commands use `expr`; value inspection uses `runtime`; parsing and debugger highlighting use `syntax`; realization commands use `store`. The executable (`src/main.zig`) imports `cli` and the private `process_support` composition module.
 
 ## Parser-table codegen
 
@@ -38,13 +38,13 @@ All are `bool` and off unless noted. These are exactly the flags `build.zig` def
 | diagnostics | `debug-checks` | VM dispatch invariant assertions (**defaults on** in Debug builds) |
 | | `vm-trace` | enable VM execution tracing (surfaced by `--vm-trace`) → [cli.md](cli.md) |
 | | `thunks-log` | per-thunk lifecycle event log (surfaced by `--thunks-log`) → [cli.md](cli.md) |
-| profiling | `prof-main` | rdtsc-time the main thread's hot serial paths; reported via `--print-sched-stats` → [perf/probes.md](perf/probes.md) |
-| | `prof-path` | record the force-call tree + critical path (workers=1); reported via `--print-sched-stats` → [perf/probes.md](perf/probes.md) |
+| profiling | `prof-main` | rdtsc-time the main thread's hot serial paths; reported via `--stats` → [perf/probes.md](perf/probes.md) |
+| | `prof-path` | record the force-call tree + critical path (workers=1); reported via `--stats` → [perf/probes.md](perf/probes.md) |
 | compilation | `profile` | keep symbols + frame pointers (sets `strip=false`, `omit_frame_pointer=false`) |
 
 Standard `zig build` options apply too: `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall` and `-Dtarget=…`. Perf numbers assume `ReleaseFast` (or `ReleaseSafe`); `-Dprofile` only flips symbol/frame-pointer stripping, it does not change the optimize mode.
 
-The `--vm-trace` / `--thunks-log` runtime flags are inert unless the matching `-D` flag compiled the machinery in. `--timeline` is a special case: the timeline probe is always compiled in and runtime-gated, so `--timeline[=path]` arms it with no rebuild. The `-Dprof-*` reports have no runtime toggle — they are build-time only, so exercising one means a rebuild, and its output surfaces through `--print-sched-stats`.
+The `--vm-trace` / `--thunks-log` runtime flags are inert unless the matching `-D` flag compiled the machinery in; the `fix trace` and `fix thunks` analysis commands are likewise registered only in builds with their corresponding flags. `--timeline` is a special case: the timeline probe is always compiled in and runtime-gated, so `--timeline[=path]` arms it with no rebuild. The `-Dprof-*` reports have no runtime toggle — they are build-time only, so exercising one means a rebuild, and its output surfaces through `--stats`.
 
 ## Why LLVM is forced (`use_llvm = true`)
 

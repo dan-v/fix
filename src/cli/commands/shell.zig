@@ -14,6 +14,7 @@ const build_progress_ui = @import("../build_progress.zig");
 const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
+const stats = @import("../stats.zig");
 
 const Evaluator = engine.Evaluator;
 const EnvMap = std.process.Environ.Map;
@@ -121,6 +122,7 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     // Evaluation is done and its results are copied out: drop the language
     // heap (see build.zig) concurrently with the build phase, which can run
     // for minutes and needs only the daemon connection.
+    if (options.stats) stats.report(ev);
     var build_session = ev.beginBuildPhase(derived.items, release_action) catch |err| {
         return eval_support.buildFailure(init.io, term.use_color, ev.lastStoreError(), err);
     };
@@ -159,6 +161,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     defer allocator.free(derived);
     // See realizePackages: results are copied out, so free the language heap
     // concurrently with the build phase.
+    if (options.stats) stats.report(ev);
     var build_session = ev.beginBuildPhase(&.{derived}, release_action) catch |err| {
         return eval_support.buildFailure(init.io, term.use_color, ev.lastStoreError(), err);
     };

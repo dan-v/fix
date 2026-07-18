@@ -8,6 +8,7 @@ const progress_ui = @import("../progress.zig");
 const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
+const stats = @import("../stats.zig");
 const build = @import("build.zig");
 
 const Evaluator = engine.Evaluator;
@@ -68,6 +69,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     if (options.find_file) {
         const code = try findFiles(init.io, &ev, options.sources.items);
+        if (options.stats) stats.report(&ev);
         ok = code == 0;
         return code;
     }
@@ -86,6 +88,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         defer input.deinit(&ev);
         ok = (try instantiateOne(allocator, init, term, options, &ev, input, index)) and ok;
     }
+    if (options.stats) stats.report(&ev);
     return if (ok) 0 else 1;
 }
 

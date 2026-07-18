@@ -24,6 +24,7 @@ const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 const debugger = @import("../debugger.zig");
 const render_err = @import("../render.zig");
+const stats = @import("../stats.zig");
 const engine = @import("expr");
 const runtime = @import("runtime");
 const future_mod = runtime.future;
@@ -111,6 +112,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     } else {
         try repl.runBare(stdin_tty);
     }
+    if (options.stats) stats.report(&ev);
     repl_ok = true;
     return 0;
 }

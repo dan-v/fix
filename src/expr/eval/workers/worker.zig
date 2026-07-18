@@ -264,7 +264,7 @@ pub const Worker = struct {
 
     /// Accumulated time this worker spent parked waiting for work. Paired
     /// with `busy_ns` to compute utilisation; reported to the scheduler on
-    /// `deinit` so `fix inspect` can show whether helpers are CPU-bound or
+    /// `deinit` so `--stats` can show whether helpers are CPU-bound or
     /// starved.
     idle_ns: u64,
     /// Accumulated time this worker spent inside `runFiber` (i.e. inside

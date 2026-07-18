@@ -112,6 +112,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     }
     vm_trace.finish();
     thunks_setup.finish();
-    if (options.print_sched_stats) stats.report(&ev);
+    if (options.stats) stats.report(&ev);
     return if (ok) 0 else 1;
 }

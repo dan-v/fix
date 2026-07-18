@@ -40,7 +40,7 @@
 //! and the LIFO assumption breaks; `enter`/`exit` then self-guard and
 //! the data is meaningless. Run it as:
 //!   zig build -Doptimize=ReleaseFast -Dprof-path
-//!   ./zig-out/bin/fix --file X --workers=1 --print-sched-stats 2>&1
+//!   ./zig-out/bin/fix eval --file X --workers=1 --stats 2>&1
 
 const std = @import("std");
 const builtin = @import("builtin");

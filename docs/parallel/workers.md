@@ -72,7 +72,7 @@ Tearing down workers while a stolen fiber is still running (on another thread, o
 - **`in_runfiber`** (per fiber slot, atomic): set while a fiber is actually being resumed. `Worker.deinit` **spins until `in_runfiber` is 0** for each slot, so a fiber that a thief is still inside is never reclaimed.
 - **`awaitHelpersQuiescent`**: a barrier each helper crosses **after** its drain loop exits and **before** it destroys its fibers, so all forcing has stopped before any fiber is freed. Otherwise a helper could free a still-enrolled speculative fiber while another helper, finishing its last quantum, resolves that fiber's thunk and wakes the freed memory.
 
-Together: no fiber is reclaimed while owned, and no worker is torn down while another might wake it. On `deinit` each worker also reports its fiber/VM-stack high-water and its `idle_ns`/`busy_ns` to the scheduler for `fix inspect`.
+Together: no fiber is reclaimed while owned, and no worker is torn down while another might wake it. On `deinit` each worker also reports its fiber/VM-stack high-water and its `idle_ns`/`busy_ns` to the scheduler for `--stats`.
 
 ## Race invariants (summary)
 

@@ -293,7 +293,7 @@ pub inline fn end(comptime path: Path, t: u64) void {
 }
 
 /// Dump the main-thread path + per-builtin cycle samples
-/// (`--print-sched-stats`). Lives beside the counters it reads.
+/// (`--stats`). Lives beside the counters it reads.
 /// `registry`/`intern` resolve chunk keys to source locations for the
 /// age-at-force per-body breakdown (same shapes as `prof_path.report`).
 pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {

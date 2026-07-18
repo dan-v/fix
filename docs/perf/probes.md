@@ -2,7 +2,7 @@
 
 *The instrumentation suite — quantify a lever's ceiling before building the optimizer.*
 
-The expensive cycle/debug probes are compile-time `-D` flags (see [build](../build.md)) and are **zero-cost when off**. Structured observations are different: spans/events are always compiled, selected at runtime, and feed both terminal progress and the evaluator-scoped Perfetto recorder. With neither output interested, a span stops at the inline observer gate; `--timeline` installs a recorder with fixed event/name buffers, so recording itself never allocates or reaches process-global state. The cycle profilers keep their counters plain (no atomics): `-Dprof-main` writes only from worker 0, so it stays lock-free at any worker count — run it at `--workers=32` for the wait question and at `--workers=1` for the pathlength floor; `-Dprof-path` requires `--workers=1`, since its span nesting assumes a single fiber forcing LIFO. Results surface either through `--print-sched-stats` (see [cli](../cli.md)) or a written file.
+The expensive cycle/debug probes are compile-time `-D` flags (see [build](../build.md)) and are **zero-cost when off**. Structured observations are different: spans/events are always compiled, selected at runtime, and feed both terminal progress and the evaluator-scoped Perfetto recorder. With neither output interested, a span stops at the inline observer gate; `--timeline` installs a recorder with fixed event/name buffers, so recording itself never allocates or reaches process-global state. The cycle profilers keep their counters plain (no atomics): `-Dprof-main` writes only from worker 0, so it stays lock-free at any worker count — run it at `--workers=32` for the wait question and at `--workers=1` for the pathlength floor; `-Dprof-path` requires `--workers=1`, since its span nesting assumes a single fiber forcing LIFO. Results surface either through `--stats` (see [cli](../cli.md)) or a written file.
 
 The governing philosophy: **measure headroom before building.** Every dead-end in the [performance model](./model.md) was probed first — the probe told us the ceiling, and the ceiling told us not to build. The two live levers (deforestation, GC) are likewise the output of measurement.
 
@@ -10,8 +10,8 @@ The governing philosophy: **measure headroom before building.** Every dead-end i
 
 | flag | question it answers | output |
 | --- | --- | --- |
-| `-Dprof-main` | Where does main spend cycles, per C++-level op (e.g. `merge_attrs`, `force_value`, `do_call`), and **does main ever wait**? | rdtsc exclusive-cycle breakdown + piggyback censuses (below), via `--print-sched-stats` |
-| `-Dprof-path` | What is the **force-call critical path** (per-chunk attribution), and what is the `w=∞` floor? | force-call tree + per-chunk self/span time, via `--print-sched-stats` |
+| `-Dprof-main` | Where does main spend cycles, per C++-level op (e.g. `merge_attrs`, `force_value`, `do_call`), and **does main ever wait**? | rdtsc exclusive-cycle breakdown + piggyback censuses (below), via `--stats` |
+| `-Dprof-path` | What is the **force-call critical path** (per-chunk attribution), and what is the `w=∞` floor? | force-call tree + per-chunk self/span time, via `--stats` |
 | `--timeline` | Per-worker **wall-clock timeline** — structured eval/store spans, fiber-run quanta, GC pauses, counters, metrics, and flows | Perfetto JSON, written via `--timeline[=path]` |
 | `-Dthunks-log` | What value did each thunk resolve to, and **where was it created** — for cross-run comparison | per-thunk lifecycle event log (create/claim/resolve/reset/errored/blackhole), written via `--thunks-log PATH`; two logs are compared with `fix thunks diff`, which reports the creator source locations whose resolve/errored/reset outcome multisets differ (keyed by creator location, which is stable across runs) |
 
@@ -33,9 +33,9 @@ This is the probe that settled the floor question. At `--workers=32` main parks 
 
 Attribution caveat: spans nest on thunk *forces* only, not on direct closure calls (`do_call`/`do_tail_call` keep running in the same dispatch loop). Work in a directly-called closure that forces no thunk is charged to the *forcing* chunk's self-time. Read the flat profile as "which forcing site drives the most call work", and use `-Dprof-main` for operation-level truth.
 
-## `--print-sched-stats`
+## `--stats`
 
-`--print-sched-stats` works in any build (it does not need a probe flag) and dumps the scheduler/registry/deferred counters plus worker utilisation and the speculation-precision census (of all resolved thunks, the undemanded fraction = speculative waste by count). When `-Dprof-main` or `-Dprof-path` is compiled in, this is also where their reports print.
+`--stats` works in any build (it does not need a probe flag) and dumps heap/intern/chunk/scheduler/deferred counters plus worker utilisation and the speculation-precision census (of all resolved thunks, the undemanded fraction = speculative waste by count). When `-Dprof-main` or `-Dprof-path` is compiled in, this is also where their reports print.
 
 ## How a probe result becomes a decision
 

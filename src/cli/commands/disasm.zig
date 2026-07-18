@@ -124,7 +124,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // Cross-reference graph over the whole registry, so each chunk header can
     // list its incoming/outgoing chunk references. Best-effort: on failure we
     // simply omit the section. `--stats` never renders references.
-    var ref_graph: ?bytecode.inspect.RefGraph = if (options.disasm_stats) null else bytecode.inspect.RefGraph.build(allocator, ev.chunkRegistry()) catch null;
+    var ref_graph: ?bytecode.inspect.RefGraph = if (options.stats) null else bytecode.inspect.RefGraph.build(allocator, ev.chunkRegistry()) catch null;
     defer if (ref_graph) |*g| g.deinit();
     const opts = bytecode.disasm.Options{
         .show_constants = !options.disasm_no_constants,
@@ -155,7 +155,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const writer = &stream.interface;
 
     const write_err: ?anyerror = blk: {
-        if (options.disasm_stats) {
+        if (options.stats) {
             bytecode.stats.write(allocator, writer, ev.chunkRegistry()) catch |e| break :blk e;
         } else if (options.disasm_eval and options.disasm_chunk == null) {
             dumpAll(writer, &ev, symbols, opts) catch |e| break :blk e;

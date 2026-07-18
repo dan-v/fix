@@ -1,9 +1,9 @@
-//! `--print-sched-stats` diagnostics dump.
+//! Shared `--stats` evaluator diagnostics.
 //!
-//! Scheduler/registry/deferred counters, plus the comptime-gated
-//! `-Dprof-main` and `-Dprof-path` reports. Kept out of `main` so the entry
-//! point stays a thin composition; the build-flag-gated subsystem internals
-//! are imported here at the top of the file rather than inline at each use.
+//! Heap, intern, chunk, scheduler, and deferred counters, plus the
+//! comptime-gated `-Dprof-main` and `-Dprof-path` reports. Reports go to
+//! stderr so evaluated values and store paths remain machine-readable on
+//! stdout.
 
 const std = @import("std");
 const engine = @import("expr");
@@ -12,12 +12,26 @@ const prof = engine.probe.prof;
 const prof_path = engine.probe.prof_path;
 
 pub fn report(ev: *Evaluator) void {
+    const h = ev.heapStats();
+    std.debug.print(
+        "heap: objects={d} values={d} attrs={d} attr_positions={d}\n",
+        .{ h.objects, h.values, h.attrs, h.attr_positions },
+    );
+    const intern = ev.internStats();
+    std.debug.print(
+        "intern: entries={d} data_bytes={d} shard_imbalance={d:.2}x\n",
+        .{ intern.entries, intern.data_bytes, intern.shardImbalance() },
+    );
+    const chunks = ev.chunkStats();
+    std.debug.print(
+        "chunks: count={d} code_bytes={d} constants={d} source_spans={d} max_code_bytes={d}\n",
+        .{ chunks.chunks, chunks.code_bytes, chunks.const_count, chunks.source_map_entries, chunks.max_code_bytes },
+    );
     const s = ev.schedulerStats();
     std.debug.print(
         "sched: spec_ok={d} spec_rej={d} urgent_ok={d} urgent_rej={d} pops={d} steals={d} parks={d} sweeps={d} evicts={d} novel={d} spec_bails={d}\n",
         .{ s.speculative_submitted, s.speculative_rejected, s.urgent_submitted, s.urgent_rejected, s.pops, s.steals, s.parks, s.sweeps, s.evicts, s.novel_ok, s.spec_bails },
     );
-    std.debug.print("registry: chunks={d}\n", .{ev.chunkStats().chunks});
     {
         const d = ev.deferred_table.stats();
         std.debug.print("deferred: registered={d} compiled={d} ({d:.1}% forced)\n", .{
@@ -42,7 +56,6 @@ pub fn report(ev: *Evaluator) void {
     // a real caller vs. pre-forced (speculation / fan-out) and never observed.
     // The undemanded share is the speculative-waste fraction by COUNT.
     {
-        const h = ev.heapStats();
         const dem = h.resolved_demanded;
         const undem = h.resolved_undemanded;
         const tot = dem + undem;

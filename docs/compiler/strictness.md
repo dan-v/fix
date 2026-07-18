@@ -57,7 +57,7 @@ ChunkStrictness {
 }
 ```
 
-Bit `i` corresponds to the chunk-relative [upvalue index](scopes.md) `i`. **Chunks with more than 64 upvalue slots degrade coverage** — slots ≥ 64 are dropped from the masks (still safe: a missed bit only loses information, never forces anything wrongly). These masks are stamped onto `SchedulingHints.strictness` and read by the [disassembler](../vm/dispatch.md) and by the chunk-registry statistics (`speculatable_with_strictness`, surfaced in `fix inspect`) — they are informational, not consulted on the force path.
+Bit `i` corresponds to the chunk-relative [upvalue index](scopes.md) `i`. **Chunks with more than 64 upvalue slots degrade coverage** — slots ≥ 64 are dropped from the masks (still safe: a missed bit only loses information, never forces anything wrongly). These masks are stamped onto `SchedulingHints.strictness` and read by the [disassembler](../vm/dispatch.md) and by the chunk-registry statistics — they are informational, not consulted on the force path.
 
 **2. Eager `let`-binding elision (`analyzeLetBindings` + `firstForcedName`).** A binding the body **must-forces**, that is non-recursive and forward-reference-free, is compiled straight into its slot with **no thunk at all**. Restricted to the single binding the body demands *first* (`firstForcedName`) so eager order equals lazy order and no error is reordered.
 

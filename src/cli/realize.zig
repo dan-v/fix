@@ -8,6 +8,7 @@ const eval_support = @import("eval_support.zig");
 const build_progress = @import("build_progress.zig");
 const presentation = @import("presentation.zig");
 const render = @import("render.zig");
+const stats = @import("stats.zig");
 const EvalProgress = @import("progress.zig").EvalProgress;
 
 pub const Realized = struct {
@@ -277,6 +278,7 @@ pub fn realizeMany(
 
     // Every demand fiber has either enqueued its build or completed its request
     // with an error. Nothing below reads language values.
+    if (options.stats) stats.report(ev);
     ev.releaseEvalState();
     if (release_action) |action| action.run(action.context);
 
@@ -322,6 +324,7 @@ pub fn dryRunMany(
         derived_count += 1;
     }
 
+    if (options.stats) stats.report(ev);
     var session = ev.beginBuildPhase(derived[0..derived_count], release_action) catch |err| {
         return eval_support.buildFailure(io, terminal.use_color, ev.lastStoreError(), err);
     };
@@ -537,6 +540,7 @@ pub fn realize(
     };
     errdefer realized.deinit(allocator);
 
+    if (options.stats) stats.report(ev);
     var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, &progress);
     var build_operation = build_progress_state.operation();
     const build_sink = build_operation.sink();

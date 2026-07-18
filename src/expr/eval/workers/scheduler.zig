@@ -546,7 +546,7 @@ pub const Scheduler = struct {
         max_vm_sp: u64,
         /// Summed across all workers (main + helpers): time spent parked
         /// on the wake futex, in nanoseconds. Together with `busy_ns` and
-        /// the wall-clock run time, this lets `fix inspect` show whether
+        /// the wall-clock run time, this lets `--stats` show whether
         /// helpers were starved (idle ≫ busy ⇒ not enough parallel work)
         /// or saturated (busy ≈ wall × workers ⇒ CPU-bound).
         idle_ns: u64,
@@ -871,7 +871,7 @@ pub const Scheduler = struct {
 
     /// Worker shutdown reports the deepest fiber stack and VM sp it
     /// observed. We monotonically max into the scheduler counters so
-    /// `fix inspect` can show the high-water across the whole eval.
+    /// `--stats` can show the high-water across the whole eval.
     pub fn reportVmStackHighWater(self: *Scheduler, max_vm_sp: u64) void {
         atomicMax(&self.n_max_vm_sp, max_vm_sp);
     }

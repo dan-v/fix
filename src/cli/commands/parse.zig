@@ -5,8 +5,8 @@
 //! unbound variables and the deprecated-feature gates are reported before the
 //! AST is printed. We mirror that: after the syntactic parse (used for the JSON
 //! AST), we compile-and-discard through the evaluator to surface those static
-//! errors. This is the CLI reusing the evaluator — like `fix inspect
-//! --no-eval` — not the syntax layer depending on the compiler. Byte-parity
+//! errors. This is the CLI reusing the evaluator for static validation, not
+//! the syntax layer depending on the compiler. Byte-parity
 //! with Nix's error prose is out of scope; the exit code and rejection are what
 //! the pinned parse corpus checks.
 
