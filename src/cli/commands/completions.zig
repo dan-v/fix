@@ -2,7 +2,7 @@
 //! backend they call.
 //!
 //! The backend follows Nix's deliberately small protocol: the first line is a
-//! completion kind (`normal`, `filenames`, or `attrs`), followed by
+//! completion kind (`normal`, `options`, `filenames`, or `attrs`), followed by
 //! `value<TAB>description` candidates. Shell-specific code stays tiny while
 //! option metadata and Nix evaluation remain in `fix`.
 
@@ -66,37 +66,60 @@ const zsh_script =
     \\        _files
     \\        return
     \\    fi
-    \\    local -a suggestions descriptions suggestions_display compadd_args
-    \\    local line suggestion description
+    \\    local -a raw_suggestions raw_descriptions suggestions hidden_suggestions suggestion_labels descriptions suggestions_display compadd_args
+    \\    local line suggestion next_suggestion description next_description label
     \\    local display_width=0 description_width menu_width index
     \\    for line in ${response:1}; do
     \\        suggestion="${line%%$'\t'*}"
-    \\        suggestions+=("$suggestion")
+    \\        raw_suggestions+=("$suggestion")
     \\        if [[ $line == *$'\t'* ]]; then
     \\            description="${line#*$'\t'}"
     \\        else
     \\            description=
     \\        fi
+    \\        raw_descriptions+=("$description")
+    \\    done
+    \\    for (( index = 1; index <= ${#raw_suggestions}; index++ )); do
+    \\        suggestion="${raw_suggestions[$index]}"
+    \\        description="${raw_descriptions[$index]}"
+    \\        if [[ $type == options && $suggestion == -? && $suggestion != -- ]] && (( index < ${#raw_suggestions} )); then
+    \\            next_suggestion="${raw_suggestions[$(( index + 1 ))]}"
+    \\            next_description="${raw_descriptions[$(( index + 1 ))]}"
+    \\            if [[ $next_suggestion == --* && $description == $next_description ]]; then
+    \\                hidden_suggestions+=("$suggestion")
+    \\                suggestions+=("$next_suggestion")
+    \\                suggestion_labels+=("$next_suggestion, $suggestion")
+    \\                descriptions+=("$description")
+    \\                (( index++ ))
+    \\                continue
+    \\            fi
+    \\        fi
+    \\        suggestions+=("$suggestion")
+    \\        suggestion_labels+=("$suggestion")
     \\        descriptions+=("$description")
-    \\        (( ${#suggestion} > display_width )) && display_width=${#suggestion}
+    \\    done
+    \\    for label in $suggestion_labels; do
+    \\        (( ${#label} > display_width )) && display_width=${#label}
     \\    done
     \\    menu_width=${COLUMNS:-100}
     \\    description_width=$(( menu_width - display_width - 4 ))
     \\    for (( index = 1; index <= ${#suggestions}; index++ )); do
     \\        suggestion="${suggestions[$index]}"
+    \\        label="${suggestion_labels[$index]}"
     \\        description="${descriptions[$index]}"
     \\        if [[ -n $description ]] && (( description_width > 3 )); then
     \\            if (( ${#description} > description_width )); then
     \\                description="${description[1,$(( description_width - 3 ))]}..."
     \\            fi
-    \\            suggestions_display+=("${(r:${display_width}:: :)suggestion} -- $description")
+    \\            suggestions_display+=("${(r:${display_width}:: :)label} -- $description")
     \\        else
-    \\            suggestions_display+=("$suggestion")
+    \\            suggestions_display+=("$label")
     \\        fi
     \\    done
     \\    if [[ $type == attrs ]]; then
     \\        compadd_args+=('-S' '')
     \\    fi
+    \\    (( ${#hidden_suggestions} )) && compadd -n -V fix-aliases -a hidden_suggestions
     \\    compadd -V fix -l "${compadd_args[@]}" -d suggestions_display -a suggestions
     \\}
     \\# When autoloaded from a site-functions directory, run the completion.
@@ -108,7 +131,23 @@ const zsh_script =
     \\fi
 ;
 
-const fish_script =
+const fish_script_prefix =
+    \\function __fix_command_is
+    \\    set -l fix_args (commandline --current-process --tokenize --cut-at-cursor)
+    \\    test (count $fix_args) -ge 2; or return 1
+    \\    set -l typed $fix_args[2]
+    \\    set -l matches
+    \\    for candidate in
+;
+
+const fish_script_suffix =
+    \\        if string match --quiet -- "$typed*" $candidate
+    \\            set --append matches $candidate
+    \\        end
+    \\    end
+    \\    test (count $matches) -eq 1; and test "$matches[1]" = "$argv[1]"
+    \\end
+    \\
     \\function __fix_complete
     \\    set -l fix_args (commandline --current-process --tokenize --cut-at-cursor)
     \\    set -l current_token (commandline --current-token --cut-at-cursor)
@@ -123,11 +162,41 @@ const fish_script =
     \\
     \\function __fix_candidates
     \\    set -l response (__fix_complete 2>/dev/null)
+    \\    test "$response[1]" = options; and return
+    \\    set -l current_token (commandline --current-token --cut-at-cursor)
+    \\    if string match --quiet -- '--*=*' $current_token; or string match --quiet --regex -- '^-[^-].+' $current_token
+    \\        return
+    \\    end
     \\    string collect -- $response[2..-1]
     \\end
     \\
+    \\function __fix_option_candidates
+    \\    set -l response (__fix_complete 2>/dev/null)
+    \\    set -l replacement
+    \\    set -l current_token (commandline --current-token --cut-at-cursor)
+    \\    if string match --quiet -- '--*=*' $current_token
+    \\        set replacement (string replace --regex '=.*$' '=' -- $current_token)
+    \\    else if string match --quiet --regex -- '^-[^-].+' $current_token
+    \\        set replacement (string sub --length 2 -- $current_token)
+    \\    end
+    \\    if test "$response[1]" = filenames
+    \\        set -l value_prefix $current_token
+    \\        if test -n "$replacement"
+    \\            set value_prefix (string replace -- "$replacement" '' $current_token)
+    \\        end
+    \\        __fish_complete_path $value_prefix
+    \\        return
+    \\    end
+    \\    for candidate in $response[2..-1]
+    \\        if test -n "$replacement"
+    \\            set candidate (string replace -- "$replacement" '' $candidate)
+    \\        end
+    \\        string collect -- $candidate
+    \\    end
+    \\end
+    \\
     \\complete --command fix --condition 'not __fix_accepts_files' --no-files
-    \\complete --command fix --arguments '(__fix_candidates)'
+    \\complete --command fix --keep-order --arguments '(__fix_candidates)'
 ;
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
@@ -142,12 +211,19 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     if (std.mem.eql(u8, mode, "--complete"))
         return runLive(process.allocator, init, args_iter);
 
+    if (std.mem.eql(u8, mode, "fish")) {
+        if (args_iter.next() != null) {
+            std.debug.print("error: completions accepts exactly one shell name\n\n{s}\n", .{synopsis});
+            return 2;
+        }
+        try writeFishScript(init.io);
+        return 0;
+    }
+
     const script = if (std.mem.eql(u8, mode, "bash"))
         bash_script
     else if (std.mem.eql(u8, mode, "zsh"))
         zsh_script
-    else if (std.mem.eql(u8, mode, "fish"))
-        fish_script
     else {
         std.debug.print("error: unknown shell '{s}' (expected bash, zsh, or fish)\n\n{s}\n", .{ mode, synopsis });
         return 2;
@@ -158,6 +234,27 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     }
     try writeStdout(init.io, script);
     return 0;
+}
+
+fn writeFishScript(io: std.Io) !void {
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try writeFishScriptInner(&stdout.interface);
+    try stdout.interface.flush();
+}
+
+fn writeFishScriptInner(w: *std.Io.Writer) !void {
+    try w.writeAll(fish_script_prefix);
+    for (&command_meta.table) |*command| {
+        if (commandEnabled(command.kind)) try w.print(" {s}", .{command.name});
+    }
+    try w.writeByte('\n');
+    try w.writeAll(fish_script_suffix);
+    try w.writeByte('\n');
+    for (&command_meta.table) |*command| {
+        if (!commandEnabled(command.kind)) continue;
+        if (command.args_cmd) |cmd| try args.writeFishOptionDeclarations(w, cmd, command.name);
+    }
 }
 
 fn writeStdout(io: std.Io, text: []const u8) !void {
@@ -259,7 +356,7 @@ fn complete(allocator: std.mem.Allocator, init: std.process.Init, w: *std.Io.Wri
             return;
         }
         if (std.mem.startsWith(u8, current, "-")) {
-            try w.writeAll("normal\n");
+            try w.writeAll("options\n");
             try args.writeOptionCompletions(w, cmd, current);
             return;
         }
@@ -653,13 +750,26 @@ fn writeListValueCandidates(w: *std.Io.Writer, prefix: []const u8, replacement: 
 test "generated adapters call the live backend" {
     try std.testing.expect(std.mem.indexOf(u8, bash_script, "completions --complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "completions --complete") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fish_script, "completions --complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_script_suffix, "completions --complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compdef _fix fix") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "funcstack[1] == _fix") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "-d suggestions_display") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "menu_width=${COLUMNS:-100}") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "(r:${display_width}:: :)suggestion") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compadd -V fix -l") != null);
+}
+
+test "zsh groups option aliases and fish registers them natively" {
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "suggestion_labels+=(\"$next_suggestion, $suggestion\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compadd -n -V fix-aliases") != null);
+
+    var buffer: [128 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeFishScriptInner(&writer);
+    const script = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, script, "complete --command fix --condition '__fix_command_is eval'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--short-option E --long-option expr --exclusive --arguments '(__fix_option_candidates)'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "test \"$response[1]\" = options; and return") != null);
 }
 
 test "attribute prefixes retain their completed parent" {

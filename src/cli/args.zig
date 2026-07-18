@@ -653,6 +653,42 @@ pub fn writeOptionCompletions(w: *std.Io.Writer, cmd: Cmd, prefix: []const u8) !
     }
 }
 
+/// Emit native Fish option declarations. Fish groups the short and long names
+/// from one `complete` call into a single described candidate while retaining
+/// both spellings for prefix matching and insertion.
+pub fn writeFishOptionDeclarations(w: *std.Io.Writer, cmd: Cmd, command_name: []const u8) !void {
+    var storage: [specs.len]*const Spec = undefined;
+    const visible = visibleSpecs(cmd, &storage);
+
+    for (visible) |spec| {
+        if (spec.short == null and spec.long == null) continue;
+
+        try w.print("complete --command fix --condition '__fix_command_is {s}' --keep-order", .{command_name});
+        if (spec.short) |short| try w.print(" --short-option {s}", .{short[1..]});
+        if (spec.long) |long| try w.print(" --long-option {s}", .{long[2..]});
+        switch (spec.arg) {
+            .flag => {},
+            .opt => try w.writeAll(" --arguments '(__fix_option_candidates)'"),
+            .req, .req2, .multi => try w.writeAll(" --exclusive --arguments '(__fix_option_candidates)'"),
+        }
+        const description = spec.help[0 .. std.mem.indexOfScalar(u8, spec.help, '\n') orelse spec.help.len];
+        if (description.len != 0) {
+            try w.writeAll(" --description ");
+            try writeFishQuoted(w, description);
+        }
+        try w.writeByte('\n');
+    }
+}
+
+fn writeFishQuoted(w: *std.Io.Writer, text: []const u8) !void {
+    try w.writeByte('\'');
+    for (text) |byte| {
+        if (byte == '\\' or byte == '\'') try w.writeByte('\\');
+        try w.writeByte(byte);
+    }
+    try w.writeByte('\'');
+}
+
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
