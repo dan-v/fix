@@ -66,8 +66,9 @@ const zsh_script =
     \\        _files
     \\        return
     \\    fi
-    \\    local -a raw_suggestions raw_descriptions suggestions hidden_suggestions suggestion_labels descriptions suggestions_display compadd_args
-    \\    local line suggestion next_suggestion description next_description label
+    \\    local -a raw_suggestions raw_descriptions option_specs compdescribe_expl grouped_args grouped_matches grouped_display suggestions descriptions suggestions_display compadd_args
+    \\    local line suggestion description
+    \\    local base_list="$compstate[list]" grouped_list
     \\    local display_width=0 description_width menu_width index
     \\    for line in ${response:1}; do
     \\        suggestion="${line%%$'\t'*}"
@@ -79,47 +80,40 @@ const zsh_script =
     \\        fi
     \\        raw_descriptions+=("$description")
     \\    done
-    \\    for (( index = 1; index <= ${#raw_suggestions}; index++ )); do
-    \\        suggestion="${raw_suggestions[$index]}"
-    \\        description="${raw_descriptions[$index]}"
-    \\        if [[ $type == options && $suggestion == -? && $suggestion != -- ]] && (( index < ${#raw_suggestions} )); then
-    \\            next_suggestion="${raw_suggestions[$(( index + 1 ))]}"
-    \\            next_description="${raw_descriptions[$(( index + 1 ))]}"
-    \\            if [[ $next_suggestion == --* && $description == $next_description ]]; then
-    \\                hidden_suggestions+=("$suggestion")
-    \\                suggestions+=("$next_suggestion")
-    \\                suggestion_labels+=("$next_suggestion, $suggestion")
-    \\                descriptions+=("$description")
-    \\                (( index++ ))
-    \\                continue
-    \\            fi
-    \\        fi
-    \\        suggestions+=("$suggestion")
-    \\        suggestion_labels+=("$suggestion")
-    \\        descriptions+=("$description")
-    \\    done
-    \\    for label in $suggestion_labels; do
-    \\        (( ${#label} > display_width )) && display_width=${#label}
+    \\    if [[ $type == options ]]; then
+    \\        for (( index = 1; index <= ${#raw_suggestions}; index++ )); do
+    \\            option_specs+=("${raw_suggestions[$index]}:${raw_descriptions[$index]//\%/%%}")
+    \\        done
+    \\        zmodload -i zsh/computil
+    \\        compdescribe -I "" "$(( ${COLUMNS:-100} / 2 ))" "-- " compdescribe_expl -g option_specs -V fix -o nosort
+    \\        while compdescribe -g grouped_list grouped_args grouped_matches grouped_display; do
+    \\            compstate[list]="$base_list $grouped_list"
+    \\            compadd "${grouped_args[@]}" -d grouped_display -a grouped_matches
+    \\        done
+    \\        return
+    \\    fi
+    \\    suggestions=("${raw_suggestions[@]}")
+    \\    descriptions=("${raw_descriptions[@]}")
+    \\    for suggestion in $suggestions; do
+    \\        (( ${#suggestion} > display_width )) && display_width=${#suggestion}
     \\    done
     \\    menu_width=${COLUMNS:-100}
     \\    description_width=$(( menu_width - display_width - 4 ))
     \\    for (( index = 1; index <= ${#suggestions}; index++ )); do
     \\        suggestion="${suggestions[$index]}"
-    \\        label="${suggestion_labels[$index]}"
     \\        description="${descriptions[$index]}"
     \\        if [[ -n $description ]] && (( description_width > 3 )); then
     \\            if (( ${#description} > description_width )); then
     \\                description="${description[1,$(( description_width - 3 ))]}..."
     \\            fi
-    \\            suggestions_display+=("${(r:${display_width}:: :)label} -- $description")
+    \\            suggestions_display+=("${(r:${display_width}:: :)suggestion} -- $description")
     \\        else
-    \\            suggestions_display+=("$label")
+    \\            suggestions_display+=("$suggestion")
     \\        fi
     \\    done
     \\    if [[ $type == attrs ]]; then
     \\        compadd_args+=('-S' '')
     \\    fi
-    \\    (( ${#hidden_suggestions} )) && compadd -n -V fix-aliases -a hidden_suggestions
     \\    compadd -V fix -l "${compadd_args[@]}" -d suggestions_display -a suggestions
     \\}
     \\# When autoloaded from a site-functions directory, run the completion.
@@ -760,8 +754,9 @@ test "generated adapters call the live backend" {
 }
 
 test "zsh groups option aliases and fish registers them natively" {
-    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "suggestion_labels+=(\"$next_suggestion, $suggestion\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compadd -n -V fix-aliases") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "compdescribe -I") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "-g option_specs -V fix -o nosort") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "fix-aliases") == null);
 
     var buffer: [128 * 1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
