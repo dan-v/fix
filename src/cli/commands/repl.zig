@@ -1025,6 +1025,7 @@ test {
     _ = @import("../repl/commands.zig");
     _ = @import("../repl/complete.zig");
     _ = @import("../repl/pager.zig");
+    _ = @import("../repl/transcript.zig");
 }
 
 const testing = std.testing;

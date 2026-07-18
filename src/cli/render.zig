@@ -53,6 +53,17 @@ pub fn evaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Evalu
     try stderr.flush();
 }
 
+/// Writer-targeted variants used by terminal surfaces that own their output
+/// region (notably the REPL transcript). Keeping the rendering here prevents
+/// interactive and plain diagnostics from drifting apart.
+pub fn evalFailureTo(writer: *std.Io.Writer, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !void {
+    try writeEvalFailure(writer, use_color, show_trace, ev, source, err, ev.getTrace(), true);
+}
+
+pub fn evaluationErrorTo(writer: *std.Io.Writer, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !void {
+    try writeEvaluationError(writer, use_color, show_trace, ev, source, err, ev.getTrace());
+}
+
 /// Render a parallel-input failure while evaluator source and trace state are
 /// still alive. The caller can emit the owned bytes later, after workers are
 /// quiescent, without reducing the error to its Zig error-set name.
