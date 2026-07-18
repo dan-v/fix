@@ -145,6 +145,10 @@ const Repl = struct {
     /// or name tree grows. Bare queries share it instead of rescanning millions
     /// of chunks for every command.
     vm_index: ?engine.bytecode.inspect.NameIndex = null,
+    /// Set only while the full-screen REPL executes one input. Every ordinary
+    /// command/result/diagnostic is routed here, preserving the shared command
+    /// implementation while keeping terminal writes inside the owned screen.
+    output_capture: ?*std.Io.Writer = null,
     history: history_mod.History,
     quit: bool = false,
 
@@ -196,9 +200,9 @@ const Repl = struct {
 
         while (!self.quit) {
             if (show_prompt) {
-                var out = self.stdout();
-                defer out.interface.flush() catch {};
-                out.interface.writeAll(if (pending.items.len == 0) prompt_main else prompt_cont) catch {};
+                var out = self.output();
+                defer out.flush() catch {};
+                out.writer().writeAll(if (pending.items.len == 0) prompt_main else prompt_cont) catch {};
             }
             const line = stdin.interface.takeDelimiter('\n') catch |err| switch (err) {
                 error.StreamTooLong => {
@@ -242,11 +246,11 @@ const Repl = struct {
         const env = self.proc_init.environ_map;
         const hint_off = env.get("FIX_REPL_NO_HINT") != null;
         if (!hint_off) {
-            var out = self.stdout();
-            defer out.interface.flush() catch {};
-            try presentation.style(&out.interface, self.use_color, .dim);
-            try out.interface.writeAll("fix repl — :? for help, :q or Ctrl-D to quit\n");
-            try presentation.reset(&out.interface, self.use_color);
+            var out = self.output();
+            defer out.flush() catch {};
+            try presentation.style(out.writer(), self.use_color, .dim);
+            try out.writer().writeAll("fix repl — :? for help, :q or Ctrl-D to quit\n");
+            try presentation.reset(out.writer(), self.use_color);
         }
 
         self.history.open(self.io, env);
@@ -457,9 +461,9 @@ const Repl = struct {
 
         switch (cmd.id) {
             .help => {
-                var out = self.stdout();
-                defer out.interface.flush() catch {};
-                try commands.writeHelp(&out.interface);
+                var out = self.output();
+                defer out.flush() catch {};
+                try commands.writeHelp(out.writer());
             },
             .quit => self.quit = true,
             .load => {
@@ -477,10 +481,10 @@ const Repl = struct {
             .type_of => {
                 if (try self.evalExpr(rest)) |v| {
                     const forced = self.ev.forceValue(v) catch v;
-                    var out = self.stdout();
-                    defer out.interface.flush() catch {};
-                    try self.describeType(&out.interface, forced);
-                    try out.interface.writeByte('\n');
+                    var out = self.output();
+                    defer out.flush() catch {};
+                    try self.describeType(out.writer(), forced);
+                    try out.writer().writeByte('\n');
                     try self.collectBetweenInputs();
                 }
             },
@@ -488,7 +492,7 @@ const Repl = struct {
                 if (try self.evalExpr(rest)) |v| {
                     try self.bind("it", v);
                     self.ev.forceDeep(v) catch |err| {
-                        try render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, rest, err);
+                        try self.evaluationError(rest, err);
                         return;
                     };
                     try self.printResult(v, rest);
@@ -497,38 +501,40 @@ const Repl = struct {
             },
             .inspect => {
                 if (try self.evalExpr(rest)) |v| {
-                    var out = self.stdout();
-                    defer out.interface.flush() catch {};
-                    try self.inspectValue(&out.interface, v);
+                    var out = self.output();
+                    defer out.flush() catch {};
+                    try self.inspectValue(out.writer(), v);
                     try self.collectBetweenInputs();
                 }
             },
             .vm => try self.vm(rest),
             .env => {
-                var out = self.stdout();
-                defer out.interface.flush() catch {};
+                var out = self.output();
+                defer out.flush() catch {};
+                const w = out.writer();
                 if (self.bindings.count() == 0) {
-                    try out.interface.writeAll("no bindings — `name = expr` creates one\n");
+                    try w.writeAll("no bindings — `name = expr` creates one\n");
                 } else {
                     var it = self.bindings.iterator();
                     while (it.next()) |e| {
-                        try presentation.style(&out.interface, self.use_color, .name);
-                        try out.interface.writeAll(e.key_ptr.*);
-                        try presentation.reset(&out.interface, self.use_color);
-                        try out.interface.writeAll(" : ");
-                        try self.describeType(&out.interface, e.value_ptr.*);
-                        try out.interface.writeByte('\n');
+                        try presentation.style(w, self.use_color, .name);
+                        try w.writeAll(e.key_ptr.*);
+                        try presentation.reset(w, self.use_color);
+                        try w.writeAll(" : ");
+                        try self.describeType(w, e.value_ptr.*);
+                        try w.writeByte('\n');
                     }
                 }
             },
             .gc => {
                 const r = self.ev.collectMajorNow();
-                var out = self.stdout();
-                defer out.interface.flush() catch {};
+                var out = self.output();
+                defer out.flush() catch {};
+                const w = out.writer();
                 if (!r.ran) {
-                    try out.interface.writeAll("gc: collector inactive (non-gc build, --gc-budget=0, or nothing evaluated yet)\n");
+                    try w.writeAll("gc: collector inactive (non-gc build, --gc-budget=0, or nothing evaluated yet)\n");
                 } else {
-                    try out.interface.print("gc: heap reserved {d:.1} MiB -> {d:.1} MiB\n", .{
+                    try w.print("gc: heap reserved {d:.1} MiB -> {d:.1} MiB\n", .{
                         @as(f64, @floatFromInt(r.reserved_before)) / (1 << 20),
                         @as(f64, @floatFromInt(r.reserved_after)) / (1 << 20),
                     });
@@ -543,7 +549,7 @@ const Repl = struct {
     /// and yield null.
     fn evalExpr(self: *Repl, source: []const u8) !?Value {
         const result = self.ev.evaluateWithScopeResult(source, self.scope) catch |err| {
-            try render_err.evalFailure(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
+            try self.evalFailure(source, err);
             return null;
         };
         self.vm_focus = self.focusForValue(result.value, result.entry_chunk);
@@ -554,13 +560,13 @@ const Repl = struct {
         const mode = self.options.evaluationMode();
         if (mode.strict) {
             self.ev.forceDeep(value) catch |err| {
-                try render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
+                try self.evaluationError(source, err);
                 return;
             };
         }
-        var out = self.stdout();
-        defer out.interface.flush() catch {};
-        const w = &out.interface;
+        var out = self.output();
+        defer out.flush() catch {};
+        const w = out.writer();
         const write_err: ?anyerror = blk: {
             switch (mode.output) {
                 .nix => self.ev.writeValue(w, value) catch |err| break :blk err,
@@ -573,7 +579,7 @@ const Repl = struct {
         if (write_err) |err| {
             if (err == error.WriteFailed) return err;
             w.flush() catch {};
-            try render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
+            try self.evaluationError(source, err);
             return;
         }
         if (mode.output != .xml and mode.output != .raw) try w.writeByte('\n');
@@ -597,7 +603,7 @@ const Repl = struct {
 
         const value = (try self.evalExpr(expr.items)) orelse return false;
         const forced = self.ev.forceValue(value) catch |err| {
-            try render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, path, err);
+            try self.evaluationError(path, err);
             return false;
         };
         if (!forced.isAttrs()) {
@@ -614,9 +620,9 @@ const Repl = struct {
         }
         // One scope rebuild for the whole file, not one per attribute.
         try self.rebuildScope();
-        var out = self.stdout();
-        defer out.interface.flush() catch {};
-        try out.interface.print("added {d} bindings\n", .{added});
+        var out = self.output();
+        defer out.flush() catch {};
+        try out.writer().print("added {d} bindings\n", .{added});
         return true;
     }
 
@@ -789,16 +795,16 @@ const Repl = struct {
         if (self.interactive) {
             try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id, self.color_depth);
         } else {
-            var out = self.stdout();
-            defer out.interface.flush() catch {};
-            try pager_mod.writePlain(self.allocator, &out.interface, self.ev, chunk_id);
+            var out = self.output();
+            defer out.flush() catch {};
+            try pager_mod.writePlain(self.allocator, out.writer(), self.ev, chunk_id);
         }
     }
 
     fn vmHelp(self: *Repl) !void {
-        var out = self.stdout();
-        defer out.interface.flush() catch {};
-        try out.interface.writeAll(
+        var out = self.output();
+        defer out.flush() catch {};
+        try out.writer().writeAll(
             \\:vm [EXPR]              evaluate and focus a value's chunk
             \\:vm                     show the focused chunk
             \\:vm chunk ID            focus and show a chunk directly
@@ -832,9 +838,10 @@ const Repl = struct {
             try self.printError("name @{d} not found", .{query.name_id});
             return;
         }
-        var out = self.stdout();
-        defer out.interface.flush() catch {};
-        try self.writeVmNameHeader(&out.interface, index, query.name_id);
+        var out = self.output();
+        defer out.flush() catch {};
+        const w = out.writer();
+        try self.writeVmNameHeader(w, index, query.name_id);
 
         var shown: usize = 0;
         var active: usize = 0;
@@ -844,7 +851,7 @@ const Repl = struct {
             active += 1;
             if (shown >= query.limit) continue;
             const node = index.node(child).?;
-            try out.interface.print("  @{d:<8} {s}{s:<28} {d:>9} chunks  {Bi:>10} code\n", .{
+            try w.print("  @{d:<8} {s}{s:<28} {d:>9} chunks  {Bi:>10} code\n", .{
                 child,
                 if (node.synthetic) "·" else "",
                 self.ev.internTable().get(node.segment),
@@ -853,8 +860,8 @@ const Repl = struct {
             });
             shown += 1;
         }
-        if (active == 0) try out.interface.writeAll("  (no named children)\n");
-        if (active > shown) try out.interface.print("  ... {d} more; increase LIMIT to show them\n", .{active - shown});
+        if (active == 0) try w.writeAll("  (no named children)\n");
+        if (active > shown) try w.print("  ... {d} more; increase LIMIT to show them\n", .{active - shown});
     }
 
     fn vmChunks(self: *Repl, args_text: []const u8) !void {
@@ -868,22 +875,23 @@ const Repl = struct {
             try self.printError("name @{d} not found", .{query.name_id});
             return;
         }
-        var out = self.stdout();
-        defer out.interface.flush() catch {};
-        try self.writeVmNameHeader(&out.interface, index, query.name_id);
+        var out = self.output();
+        defer out.flush() catch {};
+        const w = out.writer();
+        try self.writeVmNameHeader(w, index, query.name_id);
         const chunks = index.chunksOf(query.name_id);
         const shown = @min(chunks.len, query.limit);
         for (chunks[0..shown]) |id| {
             const chunk = self.ev.getChunk(id) orelse continue;
-            try out.interface.print("  #{d:<9} {Bi:>9} code  {d:>7} constants  arity {d}\n", .{
+            try w.print("  #{d:<9} {Bi:>9} code  {d:>7} constants  arity {d}\n", .{
                 id,
                 chunk.code.len,
                 chunk.constants.len,
                 chunk.arity,
             });
         }
-        if (chunks.len == 0) try out.interface.writeAll("  (no directly attached chunks)\n");
-        if (chunks.len > shown) try out.interface.print("  ... {d} more; increase LIMIT to show them\n", .{chunks.len - shown});
+        if (chunks.len == 0) try w.writeAll("  (no directly attached chunks)\n");
+        if (chunks.len > shown) try w.print("  ... {d} more; increase LIMIT to show them\n", .{chunks.len - shown});
     }
 
     const VmDefaultName = union(enum) { root, chunk: types.ChunkId };
@@ -953,13 +961,49 @@ const Repl = struct {
 
     // -- small output helpers ----------------------------------------------------
 
-    fn stdout(self: *Repl) std.Io.File.Writer {
+    const Output = union(enum) {
+        capture: *std.Io.Writer,
+        terminal: std.Io.File.Writer,
+
+        fn writer(self: *Output) *std.Io.Writer {
+            return switch (self.*) {
+                .capture => |sink| sink,
+                .terminal => |*terminal| &terminal.interface,
+            };
+        }
+
+        fn flush(self: *Output) !void {
+            try self.writer().flush();
+        }
+    };
+
+    fn output(self: *Repl) Output {
+        if (self.output_capture) |writer| return .{ .capture = writer };
         // A fresh short-lived buffered writer per print keeps interleaving
         // with the engine's own stdout writes (writeValue) safe.
-        return std.Io.File.stdout().writerStreaming(self.io, &stdout_scratch);
+        return .{ .terminal = std.Io.File.stdout().writerStreaming(self.io, &stdout_scratch) };
+    }
+
+    fn evalFailure(self: *Repl, source: []const u8, err: anyerror) !void {
+        if (self.output_capture) |writer|
+            return render_err.evalFailureTo(writer, self.use_color, self.options.show_trace, self.ev, source, err);
+        return render_err.evalFailure(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
+    }
+
+    fn evaluationError(self: *Repl, source: []const u8, err: anyerror) !void {
+        if (self.output_capture) |writer|
+            return render_err.evaluationErrorTo(writer, self.use_color, self.options.show_trace, self.ev, source, err);
+        return render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
     }
 
     fn printError(self: *Repl, comptime fmt: []const u8, fmt_args: anytype) !void {
+        if (self.output_capture) |w| {
+            try presentation.style(w, self.use_color, .error_label);
+            try w.writeAll("error");
+            try presentation.reset(w, self.use_color);
+            try w.print(": " ++ fmt ++ "\n", fmt_args);
+            return;
+        }
         var stderr_buffer: [1024]u8 = undefined;
         var stderr = try presentation.lockStderr(self.io, &stderr_buffer);
         defer stderr.deinit();
