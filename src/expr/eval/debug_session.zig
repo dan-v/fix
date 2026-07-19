@@ -106,7 +106,12 @@ pub fn step(ctx: Context, kind: StepKind) !void {
     }
     if (depth >= 2) {
         const caller = frameRef(ctx.vm, depth - 2).frame();
-        try sites.append(ctx.allocator, .{ .chunk_id = caller.chunk_id, .offset = @intCast(caller.ip) });
+        // Most handlers save the ip immediately after their opcode before
+        // reading operands or forcing a nested value. Normalize that suspended
+        // ip to the following instruction before using it as a patch site.
+        if (bp.instructionBoundaryAtOrAfter(caller.chunk_id, caller.chunk_ptr, caller.ip)) |offset| {
+            try sites.append(ctx.allocator, .{ .chunk_id = caller.chunk_id, .offset = offset });
+        }
     }
     if (kind == .into) {
         var refs: std.ArrayListUnmanaged(types.ChunkId) = .empty;

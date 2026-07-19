@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const InternTable = @import("runtime").intern.InternTable;
 const chunk_mod = @import("chunk.zig");
 const Chunk = chunk_mod.Chunk;
@@ -252,6 +253,34 @@ pub const BreakpointTable = struct {
         self.step_hit_kind = .step;
     }
 
+    /// Return the first instruction boundary at or after `offset`. A paused
+    /// caller's saved ip is not necessarily a boundary: handlers record the ip
+    /// just after their opcode before decoding operands or forcing a value.
+    /// Stepping must advance such an ip past the rest of that instruction,
+    /// rather than replacing one of its operand bytes with `breakpoint`.
+    pub fn instructionBoundaryAtOrAfter(
+        self: *const BreakpointTable,
+        chunk_id: ChunkId,
+        chunk: *const Chunk,
+        offset: usize,
+    ) ?u32 {
+        var start: usize = 0;
+        while (start < chunk.code.len) {
+            if (offset <= start) return @intCast(start);
+
+            const raw = self.originalOpcodeByte(chunk_id, start, chunk);
+            if (raw >= opcode.count) return null;
+            const op: opcode.OpCode = @enumFromInt(raw);
+            const operands_start = start + 1;
+            const operands_len = opcode.operandLen(op, chunk.code, operands_start);
+            if (operands_len > chunk.code.len - operands_start) return null;
+            const next = operands_start + operands_len;
+            if (offset < next) return if (next < chunk.code.len) @intCast(next) else null;
+            start = next;
+        }
+        return null;
+    }
+
     fn placedAt(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) bool {
         for (self.placements.items) |p| {
             if (p.chunk_id == chunk_id and p.offset == offset) return true;
@@ -268,6 +297,7 @@ pub const BreakpointTable = struct {
 
     fn placeStepSite(self: *BreakpointTable, chunk_id: ChunkId, offset: u32, chunk: *const Chunk) !void {
         if (offset >= chunk.code.len) return;
+        if (self.instructionBoundaryAtOrAfter(chunk_id, chunk, offset) != offset) return;
         if (self.placedAt(chunk_id, offset) or self.stepPlacedAt(chunk_id, offset)) return;
         if (chunk.code[offset] == breakpoint_byte) return;
         try self.step_temps.append(self.gpa, .{
@@ -313,6 +343,7 @@ pub const BreakpointTable = struct {
         }
         const start = best_start orelse return;
         if (start >= chunk.code.len) return;
+        if (self.instructionBoundaryAtOrAfter(chunk_id, chunk, start) != start) return;
         // Already placed here?
         for (self.placements.items) |p| {
             if (p.chunk_id == chunk_id and p.offset == start) return;
@@ -345,6 +376,19 @@ pub const BreakpointTable = struct {
         return null;
     }
 
+    /// Read the opcode which was present before any debugger patch at this
+    /// site, allowing boundary scans to run while permanent or temporary
+    /// breakpoints are armed.
+    fn originalOpcodeByte(self: *const BreakpointTable, chunk_id: ChunkId, offset: usize, chunk: *const Chunk) u8 {
+        for (self.placements.items) |p| {
+            if (p.chunk_id == chunk_id and p.offset == offset) return p.original;
+        }
+        for (self.step_temps.items) |p| {
+            if (p.chunk_id == chunk_id and p.offset == offset) return p.original;
+        }
+        return chunk.code[offset];
+    }
+
     /// A stored span file matches the user's path if it's an exact match, a path
     /// suffix, or the same basename — forgiving of absolute-vs-relative forms.
     fn fileMatches(self: *const BreakpointTable, span_file: ?InternId, wanted: []const u8) bool {
@@ -368,4 +412,35 @@ fn firstMappedOffset(chunk: *const Chunk) ?u32 {
         if (best == null or entry.start < best.?) best = entry.start;
     }
     return best;
+}
+
+test "step sites advance suspended operand ips to instruction boundaries" {
+    var intern = try InternTable.init(std.testing.allocator);
+    defer intern.deinit();
+    var table = BreakpointTable.init(std.testing.allocator, &intern);
+    defer table.deinit();
+
+    // loc_get has one operand and push_const has two. A handler can suspend
+    // with its saved ip at any of the marked operand positions.
+    var code = [_]u8{
+        @intFromEnum(opcode.OpCode.loc_get),    7,
+        @intFromEnum(opcode.OpCode.push_const), 0,
+        0,                                      @intFromEnum(opcode.OpCode.halt),
+    };
+    var constants: [0]Value = .{};
+    var chunk: Chunk = .{ .code = &code, .constants = &constants, .local_count = 0 };
+
+    try std.testing.expectEqual(@as(?u32, 0), table.instructionBoundaryAtOrAfter(9, &chunk, 0));
+    try std.testing.expectEqual(@as(?u32, 2), table.instructionBoundaryAtOrAfter(9, &chunk, 1));
+    try std.testing.expectEqual(@as(?u32, 2), table.instructionBoundaryAtOrAfter(9, &chunk, 2));
+    try std.testing.expectEqual(@as(?u32, 5), table.instructionBoundaryAtOrAfter(9, &chunk, 3));
+    try std.testing.expectEqual(@as(?u32, 5), table.instructionBoundaryAtOrAfter(9, &chunk, 4));
+
+    // A raw operand offset is rejected, while the normalized boundary is
+    // patched. Boundary scans still work through that debugger-owned patch.
+    try table.placeStepSite(9, 1, &chunk);
+    try std.testing.expectEqual(@as(u8, 7), code[1]);
+    try table.placeStepSite(9, 2, &chunk);
+    try std.testing.expectEqual(breakpoint_byte, code[2]);
+    try std.testing.expectEqual(@as(?u32, 5), table.instructionBoundaryAtOrAfter(9, &chunk, 3));
 }

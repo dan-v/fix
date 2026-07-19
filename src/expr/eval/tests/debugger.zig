@@ -292,6 +292,37 @@ test "stepping pauses again and preserves the result" {
     try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result)).asInt());
 }
 
+test "repeated step into preserves suspended caller operands" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+
+    // Forcing `seed`, `base`, and the function argument suspends parent
+    // handlers with their saved ip at an operand byte. Re-arming step-into at
+    // each nested pause must target the following instruction, not that byte.
+    const Ctl = struct {
+        pauses: usize = 0,
+
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            s.clearStep();
+            self.pauses += 1;
+            if (self.pauses < 16) try s.step(.into);
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    const src =
+        \\let
+        \\  base = let seed = 40; in seed + 1;
+        \\  add = x: x + 1;
+        \\in add base
+    ;
+    const result = try ev.debugWithScopeResult(src, null);
+    try std.testing.expect(ctl.pauses >= 3);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result.value)).asInt());
+}
+
 test "step into follows an import compiled after the step is armed" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
