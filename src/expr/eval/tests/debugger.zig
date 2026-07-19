@@ -438,6 +438,7 @@ test "repeated debug evaluations replay memoized imports for stepping" {
     const first = try ev.debugWithScopeResult(source, null);
     try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(first.value)).asInt());
     try std.testing.expectEqual(@as(usize, 0), ctl.imported_hits);
+    const chunks_after_first = ev.chunkRegistry().count();
 
     // Step-into must replay the import even though the ordinary result is
     // cached, and a later debug session must be replayable again.
@@ -446,11 +447,13 @@ test "repeated debug evaluations replay memoized imports for stepping" {
     const second = try ev.debugWithScopeResult(source, null);
     try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(second.value)).asInt());
     try std.testing.expectEqual(@as(usize, 1), ctl.imported_hits);
+    try std.testing.expectEqual(chunks_after_first, ev.chunkRegistry().count());
 
     ctl.pauses_this_run = 0;
     const third = try ev.debugWithScopeResult(source, null);
     try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(third.value)).asInt());
     try std.testing.expectEqual(@as(usize, 2), ctl.imported_hits);
+    try std.testing.expectEqual(chunks_after_first, ev.chunkRegistry().count());
 }
 
 test "pending import breakpoint preserves the parent stack and finish returns to it" {
