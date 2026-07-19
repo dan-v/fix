@@ -42,6 +42,7 @@ pub const Index = struct {
     chunks: []ChunkId,
     subtree: []Stats,
     chunk_nodes: []NodeId,
+    equivalence: bytecode.inspect.ChunkEquivalenceIndex,
     registry_count: u32,
     name_count: u32,
 
@@ -71,6 +72,7 @@ pub const Index = struct {
         self.allocator.free(self.chunks);
         self.allocator.free(self.subtree);
         self.allocator.free(self.chunk_nodes);
+        self.equivalence.deinit();
         self.* = undefined;
     }
 
@@ -260,6 +262,9 @@ const Builder = struct {
             subtree[nodes[reverse].parent].chunks += subtree[reverse].chunks;
         }
 
+        var equivalence = try bytecode.inspect.ChunkEquivalenceIndex.build(self.allocator, self.registry);
+        errdefer equivalence.deinit();
+
         return .{
             .allocator = self.allocator,
             .labels = labels,
@@ -270,6 +275,7 @@ const Builder = struct {
             .chunks = chunks,
             .subtree = subtree,
             .chunk_nodes = chunk_nodes,
+            .equivalence = equivalence,
             .registry_count = registry_count,
             .name_count = name_count,
         };

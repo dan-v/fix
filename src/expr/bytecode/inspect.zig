@@ -342,56 +342,167 @@ pub const CaptureCensus = struct {
     dup_ge2: usize = 0,
 };
 
-/// Registry-wide body-sharing and capture-list measurements. Kept as data so
-/// CLI and future machine-readable reporters share the same analysis.
-pub const CodeDedupCensus = struct {
-    total: u32 = 0,
-    total_code: usize = 0,
-    distinct_full: usize = 0,
-    dup_full: u32 = 0,
-    dup_full_bytes: usize = 0,
-    distinct_code: usize = 0,
-    dup_code: u32 = 0,
-    captures: CaptureCensus = .{},
+/// Collision-safe registry index for the two relationships users commonly
+/// mean by "duplicate chunk": literal instruction-byte equality, and the
+/// registry's full structural equality (constants, positions, side tables,
+/// arguments, and code). Every member of a non-singleton group points at one
+/// peer, including the group's first chunk.
+pub const ChunkEquivalenceIndex = struct {
+    const no_peer = std.math.maxInt(ChunkId);
+    const Kind = enum { code, structural };
 
-    pub fn build(allocator: std.mem.Allocator, registry: *const ChunkRegistry) !CodeDedupCensus {
-        var by_full: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer by_full.deinit(allocator);
-        var by_code: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer by_code.deinit(allocator);
+    allocator: std.mem.Allocator,
+    code_peers: []ChunkId,
+    structural_peers: []ChunkId,
+    total: u32,
+    total_code: usize,
+    distinct_code: usize,
+    duplicate_code: u32,
+    distinct_structural: usize,
+    duplicate_structural: u32,
+    duplicate_structural_bytes: usize,
 
-        var out: CodeDedupCensus = .{};
+    pub fn build(allocator: std.mem.Allocator, registry: *const ChunkRegistry) !ChunkEquivalenceIndex {
+        const count = registry.count();
+        const code_peers = try allocator.alloc(ChunkId, count);
+        errdefer allocator.free(code_peers);
+        const structural_peers = try allocator.alloc(ChunkId, count);
+        errdefer allocator.free(structural_peers);
+        @memset(code_peers, no_peer);
+        @memset(structural_peers, no_peer);
+
+        const code_next = try allocator.alloc(ChunkId, count);
+        defer allocator.free(code_next);
+        const structural_next = try allocator.alloc(ChunkId, count);
+        defer allocator.free(structural_next);
+        @memset(code_next, no_peer);
+        @memset(structural_next, no_peer);
+
+        var code_heads: std.AutoHashMapUnmanaged(u64, ChunkId) = .empty;
+        defer code_heads.deinit(allocator);
+        var structural_heads: std.AutoHashMapUnmanaged(u64, ChunkId) = .empty;
+        defer structural_heads.deinit(allocator);
+
+        var out: ChunkEquivalenceIndex = .{
+            .allocator = allocator,
+            .code_peers = code_peers,
+            .structural_peers = structural_peers,
+            .total = 0,
+            .total_code = 0,
+            .distinct_code = 0,
+            .duplicate_code = 0,
+            .distinct_structural = 0,
+            .duplicate_structural = 0,
+            .duplicate_structural_bytes = 0,
+        };
+
         var id: ChunkId = 0;
-        while (id < registry.count()) : (id += 1) {
+        while (id < count) : (id += 1) {
             const chunk = registry.get(id) orelse continue;
             out.total += 1;
             out.total_code += chunk.code.len;
 
-            var full_hash = std.hash.Wyhash.init(0);
-            full_hash.update(chunk.code);
-            full_hash.update(std.mem.sliceAsBytes(chunk.constants));
-            full_hash.update(std.mem.sliceAsBytes(chunk.attr_names));
-            full_hash.update(std.mem.asBytes(&chunk.local_count));
-            full_hash.update(std.mem.asBytes(&chunk.arity));
-            full_hash.update(std.mem.asBytes(&chunk.strict_params));
-            if ((try by_full.getOrPut(allocator, full_hash.final())).found_existing) {
-                out.dup_full += 1;
-                out.dup_full_bytes += chunk.code.len;
+            if (try matchOrInsert(allocator, registry, .code, id, chunk, &code_heads, code_next)) |peer| {
+                recordPeer(code_peers, id, peer);
+                out.duplicate_code += 1;
+            } else {
+                out.distinct_code += 1;
             }
 
-            var code_hash = std.hash.Wyhash.init(0);
-            code_hash.update(chunk.code);
-            code_hash.update(std.mem.asBytes(&chunk.local_count));
-            code_hash.update(std.mem.asBytes(&chunk.arity));
-            if ((try by_code.getOrPut(allocator, code_hash.final())).found_existing) out.dup_code += 1;
+            if (try matchOrInsert(allocator, registry, .structural, id, chunk, &structural_heads, structural_next)) |peer| {
+                recordPeer(structural_peers, id, peer);
+                out.duplicate_structural += 1;
+                out.duplicate_structural_bytes += chunk.code.len;
+            } else {
+                out.distinct_structural += 1;
+            }
+        }
+        return out;
+    }
 
+    fn matchOrInsert(
+        allocator: std.mem.Allocator,
+        registry: *const ChunkRegistry,
+        kind: Kind,
+        id: ChunkId,
+        chunk: *const Chunk,
+        heads: *std.AutoHashMapUnmanaged(u64, ChunkId),
+        next_ids: []ChunkId,
+    ) !?ChunkId {
+        const hash = switch (kind) {
+            .code => std.hash.Wyhash.hash(0, chunk.code),
+            .structural => ChunkRegistry.structuralHash(chunk),
+        };
+        var candidate = heads.get(hash);
+        while (candidate) |other| {
+            const other_chunk = registry.get(other).?;
+            const equal = switch (kind) {
+                .code => std.mem.eql(u8, other_chunk.code, chunk.code),
+                .structural => ChunkRegistry.structurallyEqual(other_chunk, chunk),
+            };
+            if (equal) return other;
+            const next = next_ids[other];
+            candidate = if (next == no_peer) null else next;
+        }
+        next_ids[id] = heads.get(hash) orelse no_peer;
+        try heads.put(allocator, hash, id);
+        return null;
+    }
+
+    fn recordPeer(peers: []ChunkId, id: ChunkId, peer: ChunkId) void {
+        peers[id] = peer;
+        if (peers[peer] == no_peer) peers[peer] = id;
+    }
+
+    pub fn deinit(self: *ChunkEquivalenceIndex) void {
+        self.allocator.free(self.code_peers);
+        self.allocator.free(self.structural_peers);
+        self.* = undefined;
+    }
+
+    pub fn codePeer(self: *const ChunkEquivalenceIndex, id: ChunkId) ?ChunkId {
+        if (id >= self.code_peers.len or self.code_peers[id] == no_peer) return null;
+        return self.code_peers[id];
+    }
+
+    pub fn structuralPeer(self: *const ChunkEquivalenceIndex, id: ChunkId) ?ChunkId {
+        if (id >= self.structural_peers.len or self.structural_peers[id] == no_peer) return null;
+        return self.structural_peers[id];
+    }
+};
+
+/// Registry-wide body-sharing and capture-list measurements. Kept as data so
+/// CLI and future machine-readable reporters share the same exact analysis.
+pub const CodeDedupCensus = struct {
+    total: u32 = 0,
+    total_code: usize = 0,
+    distinct_structural: usize = 0,
+    duplicate_structural: u32 = 0,
+    duplicate_structural_bytes: usize = 0,
+    distinct_code: usize = 0,
+    duplicate_code: u32 = 0,
+    captures: CaptureCensus = .{},
+
+    pub fn build(allocator: std.mem.Allocator, registry: *const ChunkRegistry) !CodeDedupCensus {
+        var equivalence = try ChunkEquivalenceIndex.build(allocator, registry);
+        defer equivalence.deinit();
+        var out: CodeDedupCensus = .{
+            .total = equivalence.total,
+            .total_code = equivalence.total_code,
+            .distinct_structural = equivalence.distinct_structural,
+            .duplicate_structural = equivalence.duplicate_structural,
+            .duplicate_structural_bytes = equivalence.duplicate_structural_bytes,
+            .distinct_code = equivalence.distinct_code,
+            .duplicate_code = equivalence.duplicate_code,
+        };
+        var id: ChunkId = 0;
+        while (id < registry.count()) : (id += 1) {
+            const chunk = registry.get(id) orelse continue;
             const captures = captureCensus(allocator, chunk) catch continue;
             inline for (std.meta.fields(CaptureCensus)) |field| {
                 @field(out.captures, field.name) += @field(captures, field.name);
             }
         }
-        out.distinct_full = by_full.count();
-        out.distinct_code = by_code.count();
         return out;
     }
 };
@@ -489,6 +600,25 @@ fn refTestChunk(allocator: std.mem.Allocator, targets: []const ChunkId) !Chunk {
     try builder.writeOp(allocator, .ret);
     try builder.writeOp(allocator, .halt);
     return builder.finish(allocator, 0);
+}
+
+test "chunk equivalence distinguishes same code from full structure" {
+    const testing = std.testing;
+    var registry = try ChunkRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const first = try registry.register(try indexTestChunk(testing.allocator, 1));
+    const identical = try registry.register(try indexTestChunk(testing.allocator, 1));
+    const code_only = try registry.register(try indexTestChunk(testing.allocator, 2));
+
+    var index = try ChunkEquivalenceIndex.build(testing.allocator, &registry);
+    defer index.deinit();
+    try testing.expect(index.structuralPeer(first) != null);
+    try testing.expectEqual(first, index.structuralPeer(identical).?);
+    try testing.expect(index.structuralPeer(code_only) == null);
+    try testing.expect(index.codePeer(first) != null);
+    try testing.expectEqual(first, index.codePeer(code_only).?);
+    try testing.expect(index.duplicate_code > index.duplicate_structural);
 }
 
 test "reference graph uses compact ranges for both directions" {

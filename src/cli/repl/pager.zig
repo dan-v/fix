@@ -464,6 +464,10 @@ const Tui = struct {
         object: struct { id: runtime.types.ObjectId, depth: u16 },
     };
     const RangeKind = enum(u2) { names, chunks, objects };
+    const ChunkEquivalence = union(enum) {
+        structural: ChunkId,
+        code: ChunkId,
+    };
     const Range = struct {
         kind: RangeKind,
         parent: u32,
@@ -773,6 +777,7 @@ const Tui = struct {
                     };
                 };
                 var page: PageBuilder = .{ .arena = arena };
+                try self.appendChunkEquivalence(&page, id);
                 const source_lines = if (self.panel == .source)
                     try self.sourceDocument(id, chunk)
                 else
@@ -994,6 +999,36 @@ const Tui = struct {
             const action: RowAction = if (target == .none and disasmOffset(chunk, plain) != null) .instruction else target;
             try page.lineAt(line, action, self.disasmLocation(id, chunk, plain));
         }
+    }
+
+    fn chunkEquivalence(self: *const Tui, id: ChunkId) ?ChunkEquivalence {
+        const index = &self.tree_index.equivalence;
+        if (index.structuralPeer(id)) |peer| return .{ .structural = peer };
+        if (index.codePeer(id)) |peer| return .{ .code = peer };
+        return null;
+    }
+
+    fn chunkEquivalenceSuffix(self: *const Tui, buffer: []u8, id: ChunkId) []const u8 {
+        const relation = self.chunkEquivalence(id) orelse return "";
+        return switch (relation) {
+            .structural => |peer| std.fmt.bufPrint(buffer, " · identical #{d}", .{peer}) catch "",
+            .code => |peer| std.fmt.bufPrint(buffer, " · same code #{d}", .{peer}) catch "",
+        };
+    }
+
+    fn appendChunkEquivalence(self: *Tui, page: *PageBuilder, id: ChunkId) !void {
+        const relation = self.chunkEquivalence(id) orelse return;
+        switch (relation) {
+            .structural => |peer| try page.line(
+                try std.fmt.allocPrint(page.arena, "structurally identical to chunk #{d}", .{peer}),
+                .{ .chunk = peer },
+            ),
+            .code => |peer| try page.line(
+                try std.fmt.allocPrint(page.arena, "same bytecode as chunk #{d}; constants, source data, or metadata differ", .{peer}),
+                .{ .chunk = peer },
+            ),
+        }
+        try page.line("", .none);
     }
 
     fn disasmLocation(self: *Tui, id: ChunkId, chunk: *const bytecode.Chunk, plain: []const u8) ?BreakpointLocation {
@@ -2321,6 +2356,7 @@ const Tui = struct {
     /// arbitrarily long. Other row kinds never need multiline treatment.
     fn longTreeContentWidth(self: *const Tui, row: TreeRow) ?usize {
         var suffix_buf: [96]u8 = undefined;
+        var relation_buf: [96]u8 = undefined;
         return switch (row) {
             .name => |entry| blk: {
                 const node = self.tree_index.node(entry.id) orelse return null;
@@ -2330,7 +2366,8 @@ const Tui = struct {
             .chunk => |entry| if (entry.label) |node_id| blk: {
                 const node = self.tree_index.node(node_id) orelse return null;
                 const chunk = self.ev.getChunk(entry.id) orelse return null;
-                const suffix = std.fmt.bufPrint(&suffix_buf, "  #{d} · {Bi}", .{ entry.id, chunk.code.len }) catch "";
+                const relation = self.chunkEquivalenceSuffix(&relation_buf, entry.id);
+                const suffix = std.fmt.bufPrint(&suffix_buf, "  #{d} · {Bi}{s}", .{ entry.id, chunk.code.len, relation }) catch "";
                 break :blk width_mod.strWidth(node.label) + width_mod.strWidth(suffix);
             } else null,
             else => null,
@@ -2364,8 +2401,10 @@ const Tui = struct {
                 }
                 return;
             };
+            var relation_buf: [96]u8 = undefined;
+            const relation = self.chunkEquivalenceSuffix(&relation_buf, id);
             const line = if (self.ev.getChunk(id)) |chunk|
-                std.fmt.bufPrint(&line_buf, " ● #0x{x}  {d}b · {d}c · a{d}", .{ id, chunk.code.len, chunk.constants.len, chunk.arity }) catch " current chunk"
+                std.fmt.bufPrint(&line_buf, " ● #0x{x}  {d}b · {d}c · a{d}{s}", .{ id, chunk.code.len, chunk.constants.len, chunk.arity, relation }) catch " current chunk"
             else
                 std.fmt.bufPrint(&line_buf, " ● #0x{x}  missing", .{id}) catch " current chunk";
             try frame.text(line, 0, width, .current);
@@ -2431,21 +2470,25 @@ const Tui = struct {
                 @memset(indent[0..indent_len], ' ');
                 const chunk = self.ev.getChunk(entry.id);
                 const label = if (entry.label) |node_id| (self.tree_index.node(node_id) orelse return).label else "";
+                var relation_buf: [96]u8 = undefined;
+                const relation = self.chunkEquivalenceSuffix(&relation_buf, entry.id);
                 break :blk if (chunk) |ch|
                     if (label.len > 0)
-                        try std.fmt.allocPrint(arena, " {s}{s} {s}  #{d} · {Bi}", .{
+                        try std.fmt.allocPrint(arena, " {s}{s} {s}  #{d} · {Bi}{s}", .{
                             indent[0..indent_len],
                             if (self.currentChunk() == entry.id) "●" else "·",
                             label,
                             entry.id,
                             ch.code.len,
+                            relation,
                         })
                     else
-                        std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {Bi}", .{
+                        std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {Bi}{s}", .{
                             indent[0..indent_len],
                             if (self.currentChunk() == entry.id) "●" else "·",
                             entry.id,
                             ch.code.len,
+                            relation,
                         }) catch " chunk"
                 else
                     std.fmt.bufPrint(&line_buf, " {s}! #{d} missing", .{ indent[0..indent_len], entry.id }) catch " missing";
