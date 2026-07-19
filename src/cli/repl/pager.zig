@@ -15,6 +15,7 @@ const editor_mod = @import("editor.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("transcript.zig");
 const vm_tree = @import("vm_tree.zig");
+const source_render = @import("../source_render.zig");
 const base = @import("base");
 const tui = base.tui;
 const ColorDepth = base.terminal_color.Depth;
@@ -622,7 +623,7 @@ const Tui = struct {
             prompt_renderer.setWidth(size.cols);
             prompt_view.max_rows = size.rows -| 2;
             const prompt_rows = if (prompt_active) try prompt_renderer.measure(prompt_view) else 0;
-            try self.drawSession(w, &prompt_renderer, prompt_view, prompt_rows, capture, prompt_active);
+            try self.drawSession(frame_arena.allocator(), w, &prompt_renderer, prompt_view, prompt_rows, capture, prompt_active);
             try w.flush();
 
             // Keep polling while a thread handle exists, even if the worker
@@ -1079,7 +1080,7 @@ const Tui = struct {
         return document.lines.items;
     }
 
-    fn appendSourceExcerpt(_: *Tui, document: *PageBuilder, source: []const u8, span: bytecode.Chunk.SourceSpan) !void {
+    fn appendSourceExcerpt(self: *Tui, document: *PageBuilder, source: []const u8, span: bytecode.Chunk.SourceSpan) !void {
         const focus_start = @min(@as(usize, span.offset), source.len);
         const focus_end = @min(focus_start +| @as(usize, span.len), source.len);
 
@@ -1107,7 +1108,17 @@ const Tui = struct {
             const active = cursor < focus_end and line_end >= focus_start;
             var rendered: std.Io.Writer.Allocating = .init(document.arena);
             try rendered.writer.print("{s} {d:>5} │ ", .{ if (active) "▶" else " ", line_number });
-            try writeSanitizedSource(&rendered.writer, source[cursor..@min(line_end, cursor +| 4096)]);
+            const shown_end = @min(line_end, cursor +| 4096);
+            const selected: ?source_render.Range = if (active) blk: {
+                const selected_start = @max(cursor, focus_start);
+                const selected_end = @min(shown_end, @max(focus_end, focus_start +| 1));
+                if (selected_start >= selected_end) break :blk null;
+                break :blk .{ .start = selected_start - cursor, .end = selected_end - cursor };
+            } else null;
+            try source_render.writeLine(&rendered.writer, source[cursor..shown_end], .{
+                .color = self.color_depth.enabled(),
+                .focus = selected,
+            });
             if (line_end > cursor +| 4096) try rendered.writer.writeAll(" …");
             try document.line(rendered.written(), .none);
             line_number += 1;
@@ -1135,10 +1146,10 @@ const Tui = struct {
         const cols = @max(@as(usize, 1), self.viewport_cols);
         const body_rows = self.viewport_rows;
         const split = cols >= 96;
-        const sidebar_width = if (split) @min(@max(cols / 4, 26), 38) else 0;
+        const sidebar_width = if (split) @max(cols * 3 / 10, 28) else 0;
         const source_split = split and cols >= 140 and self.currentChunk() != null and self.panels[@intFromEnum(Panel.source)];
         const inspector_width = if (split) cols - sidebar_width - 1 else cols;
-        const source_width = if (source_split) @min(@max(cols / 3, 38), 64) else 0;
+        const source_width = if (source_split) @max(cols * 3 / 10, 42) else 0;
         const main_width = inspector_width -| source_width -| @intFromBool(source_split);
         const main_col = if (split) sidebar_width + 2 else 1;
         return .{
@@ -1955,6 +1966,7 @@ const Tui = struct {
 
     fn drawSession(
         self: *Tui,
+        arena: std.mem.Allocator,
         w: *std.Io.Writer,
         prompt_renderer: *render_mod.Renderer,
         prompt_view: render_mod.View,
@@ -2008,7 +2020,7 @@ const Tui = struct {
         try frame.bar(1, header, cols, .header);
 
         if (explorer_rows > 0) {
-            try self.drawExplorerBody(&frame, 2, explorer_rows, cols);
+            try self.drawExplorerBody(arena, &frame, 2, explorer_rows, cols);
             const separator_row = 2 + explorer_rows;
             try frame.clearRow(separator_row);
             const separator = if (self.indexing)
@@ -2043,7 +2055,7 @@ const Tui = struct {
         }
     }
 
-    fn drawExplorerBody(self: *Tui, frame: *tui.Frame, first_row: usize, rows: usize, cols: usize) !void {
+    fn drawExplorerBody(self: *Tui, arena: std.mem.Allocator, frame: *tui.Frame, first_row: usize, rows: usize, cols: usize) !void {
         const layout_now = self.layout();
         self.clampScroll();
         self.tree_selection = @min(self.tree_selection, self.tree_rows.items.len -| 1);
@@ -2052,7 +2064,7 @@ const Tui = struct {
             try frame.clearRow(screen_row);
             if (layout_now.split) {
                 try frame.at(screen_row, 1);
-                try self.drawChunkRow(frame, row, layout_now.sidebar_width, rows);
+                try self.drawChunkRow(arena, frame, row, layout_now.sidebar_width, rows);
                 try frame.divider(screen_row, layout_now.sidebar_width + 1);
                 try frame.at(screen_row, layout_now.main_col);
                 try self.drawDisasmRow(frame, row, layout_now.main_width);
@@ -2063,7 +2075,7 @@ const Tui = struct {
                 }
             } else if (self.focus == .chunks) {
                 try frame.at(screen_row, 1);
-                try self.drawChunkRow(frame, row, cols, rows);
+                try self.drawChunkRow(arena, frame, row, cols, rows);
             } else {
                 try frame.at(screen_row, 1);
                 try self.drawDisasmRow(frame, row, layout_now.main_width);
@@ -2180,7 +2192,92 @@ const Tui = struct {
         return count;
     }
 
-    fn drawChunkRow(self: *Tui, frame: *tui.Frame, row: usize, width: usize, rows: usize) !void {
+    const TreeCell = struct {
+        index: usize,
+        segment: usize,
+        pinned: bool,
+        wrapped: bool,
+    };
+
+    /// Map one physical sidebar row to a logical tree row. Selected rows and
+    /// pinned breadcrumbs may consume several rows; ordinary rows stay one
+    /// line and are middle-ellipsized by the renderer below.
+    fn treeCell(self: *const Tui, slot: usize, width: usize, slots: usize) ?TreeCell {
+        const viewport = self.treeViewport(slots);
+        var pin_start: usize = 0;
+        var pin_height: usize = 0;
+        for (viewport.pinned[0..viewport.pin_count]) |index| pin_height += self.treeDisplayHeight(index, width, slots, true);
+        const selected_height = self.treeDisplayHeight(self.tree_selection, width, slots, false);
+        while (pin_start < viewport.pin_count and pin_height + selected_height > slots) : (pin_start += 1) {
+            pin_height -|= self.treeDisplayHeight(viewport.pinned[pin_start], width, slots, true);
+        }
+
+        var normal_start = viewport.start;
+        var before_selected = self.tree_selection -| normal_start;
+        while (normal_start < self.tree_selection and pin_height + before_selected + selected_height > slots) {
+            normal_start += 1;
+            before_selected -|= 1;
+        }
+
+        var physical: usize = 0;
+        for (viewport.pinned[pin_start..viewport.pin_count]) |index| {
+            const height = self.treeDisplayHeight(index, width, slots, true);
+            if (slot < physical + height) return .{
+                .index = index,
+                .segment = slot - physical,
+                .pinned = true,
+                .wrapped = height > 1,
+            };
+            physical += height;
+        }
+
+        var index = normal_start;
+        while (index < self.tree_rows.items.len and physical < slots) : (index += 1) {
+            const height = self.treeDisplayHeight(index, width, slots, false);
+            if (slot < physical + height) return .{
+                .index = index,
+                .segment = slot - physical,
+                .pinned = false,
+                .wrapped = height > 1,
+            };
+            physical += height;
+        }
+        return null;
+    }
+
+    fn treeDisplayHeight(self: *const Tui, index: usize, width: usize, slots: usize, pinned: bool) usize {
+        if (index >= self.tree_rows.items.len or width < 8) return 1;
+        const selected = index == self.tree_selection and self.focus == .chunks;
+        if (!pinned and !selected) return 1;
+        const content_width = self.longTreeContentWidth(self.tree_rows.items[index]) orelse return 1;
+        const prefix = @min(1 + @as(usize, treeRowDepth(self.tree_rows.items[index])) * 2 + 2, width - 1);
+        const available = width - prefix;
+        const height = @max(@as(usize, 1), (content_width + available - 1) / available);
+        const limit = if (pinned) @max(@as(usize, 2), @min(@as(usize, 3), slots / 3)) else @max(@as(usize, 2), slots / 2);
+        return @min(height, limit);
+    }
+
+    /// Width after indentation/marker for the node rows whose labels may be
+    /// arbitrarily long. Other row kinds never need multiline treatment.
+    fn longTreeContentWidth(self: *const Tui, row: TreeRow) ?usize {
+        var suffix_buf: [96]u8 = undefined;
+        return switch (row) {
+            .name => |entry| blk: {
+                const node = self.tree_index.node(entry.id) orelse return null;
+                const suffix = std.fmt.bufPrint(&suffix_buf, "  {d}", .{self.tree_index.statsOf(entry.id).chunks}) catch "";
+                break :blk width_mod.strWidth(node.label) + width_mod.strWidth(suffix);
+            },
+            .chunk => |entry| if (entry.label) |node_id| blk: {
+                const node = self.tree_index.node(node_id) orelse return null;
+                const chunk = self.ev.getChunk(entry.id) orelse return null;
+                const suffix = std.fmt.bufPrint(&suffix_buf, "  #{d} · {Bi}", .{ entry.id, chunk.code.len }) catch "";
+                break :blk width_mod.strWidth(node.label) + width_mod.strWidth(suffix);
+            } else null,
+            else => null,
+        };
+    }
+
+    fn drawChunkRow(self: *Tui, arena: std.mem.Allocator, frame: *tui.Frame, row: usize, width: usize, rows: usize) !void {
         var line_buf: [512]u8 = undefined;
         if (row == 0) {
             const root_stats = self.tree_index.statsOf(vm_tree.root_node_id);
@@ -2226,11 +2323,11 @@ const Tui = struct {
         }
         const slots = rows -| 3;
         if (slots == 0) return;
-        const viewport = self.treeViewport(slots);
         const slot = row - 3;
-        const index = viewport.index(slot) orelse return;
+        const cell = self.treeCell(slot, width, slots) orelse return;
+        const index = cell.index;
         if (index >= count) return;
-        const pinned = slot < viewport.pin_count;
+        const pinned = cell.pinned;
         const selected = index == self.tree_selection;
         const line: []const u8 = switch (self.tree_rows.items[index]) {
             .category => |entry| blk: {
@@ -2261,12 +2358,12 @@ const Tui = struct {
                     node.label
                 else
                     "?";
-                break :blk std.fmt.bufPrint(&line_buf, " {s}{s} {s}  {d}", .{
+                break :blk try std.fmt.allocPrint(arena, " {s}{s} {s}  {d}", .{
                     indent[0..indent_len],
                     if (self.expanded.contains(entry.id)) "▾" else if (self.focus_path.contains(entry.id)) "›" else "▸",
                     label,
                     stats.chunks,
-                }) catch " name";
+                });
             },
             .chunk => |entry| blk: {
                 var indent: [64]u8 = undefined;
@@ -2276,13 +2373,13 @@ const Tui = struct {
                 const label = if (entry.label) |node_id| (self.tree_index.node(node_id) orelse return).label else "";
                 break :blk if (chunk) |ch|
                     if (label.len > 0)
-                        std.fmt.bufPrint(&line_buf, " {s}{s} {s}  #{d} · {Bi}", .{
+                        try std.fmt.allocPrint(arena, " {s}{s} {s}  #{d} · {Bi}", .{
                             indent[0..indent_len],
                             if (self.currentChunk() == entry.id) "●" else "·",
                             label,
                             entry.id,
                             ch.code.len,
-                        }) catch " chunk"
+                        })
                     else
                         std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {Bi}", .{
                             indent[0..indent_len],
@@ -2372,16 +2469,21 @@ const Tui = struct {
                 else => .chunk,
             },
         };
-        try frame.text(line, 0, width, role);
+        if (cell.wrapped) {
+            const prefix_width = @min(1 + @as(usize, treeRowDepth(self.tree_rows.items[index])) * 2 + 2, width -| 1);
+            if (cell.segment == 0) {
+                try frame.text(line, 0, width, role);
+            } else if (prefix_width < width) {
+                const indent = try arena.alloc(u8, prefix_width);
+                @memset(indent, ' ');
+                try frame.text(indent, 0, prefix_width, role);
+                const available = width - prefix_width;
+                const start = prefix_width + cell.segment * (width - prefix_width);
+                try frame.text(line, start, available, role);
+            }
+        } else {
+            const shown = try width_mod.middleEllipsis(arena, line, width);
+            try frame.text(shown, 0, width, role);
+        }
     }
 };
-
-fn writeSanitizedSource(w: *std.Io.Writer, source: []const u8) !void {
-    for (source) |byte| switch (byte) {
-        '\t' => try w.writeAll("    "),
-        '\r' => {},
-        0x1b => try w.writeAll("␛"),
-        0...8, 10...12, 14...26, 28...0x1f, 0x7f => try w.writeByte('?'),
-        else => try w.writeByte(byte),
-    };
-}

@@ -71,8 +71,18 @@ fn writeSpan(
 fn styled(w: *std.Io.Writer, text: []const u8, color: ?[]const u8, selected: bool) !void {
     if (selected) try w.writeAll(focus);
     if (color) |code| try w.writeAll(code);
-    try w.writeAll(text);
+    try writeSafe(w, text);
     if (selected or color != null) try w.writeAll(reset);
+}
+
+fn writeSafe(w: *std.Io.Writer, text: []const u8) !void {
+    for (text) |byte| switch (byte) {
+        '\t' => try w.writeAll("    "),
+        '\r' => {},
+        0x1b => try w.writeAll("␛"),
+        0...8, 10...12, 14...26, 28...0x1f, 0x7f => try w.writeByte('?'),
+        else => try w.writeByte(byte),
+    };
 }
 
 fn tokenColor(token: TokenType) ?[]const u8 {

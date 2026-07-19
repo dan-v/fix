@@ -87,6 +87,48 @@ pub fn strWidth(text: []const u8) usize {
     return total;
 }
 
+/// Keep both ends of a long label visible, replacing its middle with one
+/// ellipsis cell. The returned slice borrows `text` when it already fits and
+/// otherwise belongs to `allocator`.
+pub fn middleEllipsis(allocator: std.mem.Allocator, text: []const u8, max_cells: usize) ![]const u8 {
+    if (strWidth(text) <= max_cells) return text;
+    if (max_cells == 0) return "";
+    if (max_cells == 1) return "…";
+
+    const left_cells = (max_cells - 1) / 2;
+    const right_cells = max_cells - 1 - left_cells;
+    const left_end = prefixEnd(text, left_cells);
+    const right_start = suffixStart(text, right_cells);
+    return std.fmt.allocPrint(allocator, "{s}…{s}", .{ text[0..left_end], text[right_start..] });
+}
+
+fn prefixEnd(text: []const u8, cells: usize) usize {
+    var used: usize = 0;
+    var end: usize = 0;
+    var it = Utf8Iterator{ .text = text };
+    while (it.next()) |cp| {
+        const width = cpWidth(cp.cp);
+        if (used + width > cells) break;
+        used += width;
+        end = cp.offset + cp.len;
+    }
+    return end;
+}
+
+fn suffixStart(text: []const u8, cells: usize) usize {
+    var used: usize = 0;
+    var start = text.len;
+    while (start > 0) {
+        const previous = prevBoundary(text, start);
+        const cp = std.unicode.utf8Decode(text[previous..start]) catch 0xFFFD;
+        const width = cpWidth(cp);
+        if (used + width > cells) break;
+        used += width;
+        start = previous;
+    }
+    return start;
+}
+
 pub const Cp = struct {
     cp: u21,
     /// Byte offset of this codepoint in the source text.
@@ -151,6 +193,13 @@ test "strWidth mixes widths" {
     try std.testing.expectEqual(@as(usize, 3), strWidth("abc"));
     try std.testing.expectEqual(@as(usize, 4), strWidth("a中b")); // 1+2+1
     try std.testing.expectEqual(@as(usize, 2), strWidth("e\u{0301}x")); // e + combining + x
+}
+
+test "middle ellipsis preserves both ends at display width" {
+    const shortened = try middleEllipsis(std.testing.allocator, "abcdefghij", 7);
+    defer std.testing.allocator.free(shortened);
+    try std.testing.expectEqualStrings("abc…hij", shortened);
+    try std.testing.expectEqual(@as(usize, 7), strWidth(shortened));
 }
 
 test "boundaries walk codepoints, not bytes" {
