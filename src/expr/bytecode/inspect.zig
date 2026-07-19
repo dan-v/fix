@@ -56,49 +56,98 @@ pub fn collectRefs(allocator: std.mem.Allocator, chunk: *const Chunk, out: *std.
 
 /// Whole-registry incoming/outgoing chunk reference graph.
 pub const RefGraph = struct {
-    out: []std.ArrayListUnmanaged(ChunkId),
-    inc: []std.ArrayListUnmanaged(ChunkId),
+    out_offsets: []u32,
+    out_edges: []ChunkId,
+    inc_offsets: []u32,
+    inc_edges: []ChunkId,
+    registry_count: u32,
     allocator: std.mem.Allocator,
 
     pub fn build(allocator: std.mem.Allocator, registry: *const ChunkRegistry) !RefGraph {
-        const n = registry.count();
-        const out = try allocator.alloc(std.ArrayListUnmanaged(ChunkId), n);
-        const inc = try allocator.alloc(std.ArrayListUnmanaged(ChunkId), n);
-        for (out) |*list| list.* = .empty;
-        for (inc) |*list| list.* = .empty;
+        const registry_count = registry.count();
+        const n: usize = registry_count;
+        const out_offsets = try allocator.alloc(u32, n + 1);
+        errdefer allocator.free(out_offsets);
+        const inc_offsets = try allocator.alloc(u32, n + 1);
+        errdefer allocator.free(inc_offsets);
+        @memset(out_offsets, 0);
+        @memset(inc_offsets, 0);
 
         var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
         defer refs.deinit(allocator);
         var id: ChunkId = 0;
-        while (id < n) : (id += 1) {
+        while (id < registry_count) : (id += 1) {
+            const chunk = registry.get(id) orelse continue;
+            refs.clearRetainingCapacity();
+            collectRefsInto(chunk, &refs, allocator) catch continue;
+            out_offsets[@as(usize, id) + 1] = @intCast(refs.count());
+            for (refs.keys()) |target| {
+                if (target < registry_count) inc_offsets[@as(usize, target) + 1] += 1;
+            }
+        }
+        prefixSum(out_offsets);
+        prefixSum(inc_offsets);
+
+        const out_edges = try allocator.alloc(ChunkId, out_offsets[n]);
+        errdefer allocator.free(out_edges);
+        const inc_edges = try allocator.alloc(ChunkId, inc_offsets[n]);
+        errdefer allocator.free(inc_edges);
+        const out_cursor = try allocator.dupe(u32, out_offsets[0..n]);
+        defer allocator.free(out_cursor);
+        const inc_cursor = try allocator.dupe(u32, inc_offsets[0..n]);
+        defer allocator.free(inc_cursor);
+
+        id = 0;
+        while (id < registry_count) : (id += 1) {
             const chunk = registry.get(id) orelse continue;
             refs.clearRetainingCapacity();
             collectRefsInto(chunk, &refs, allocator) catch continue;
             for (refs.keys()) |target| {
-                out[id].append(allocator, target) catch {};
-                if (target < n) inc[target].append(allocator, id) catch {};
+                out_edges[out_cursor[id]] = target;
+                out_cursor[id] += 1;
+                if (target < registry_count) {
+                    inc_edges[inc_cursor[target]] = id;
+                    inc_cursor[target] += 1;
+                }
             }
         }
-        for (out) |*list| std.mem.sort(ChunkId, list.items, {}, std.sort.asc(ChunkId));
-        for (inc) |*list| std.mem.sort(ChunkId, list.items, {}, std.sort.asc(ChunkId));
-        return .{ .out = out, .inc = inc, .allocator = allocator };
+        for (0..n) |i| {
+            std.mem.sort(ChunkId, out_edges[out_offsets[i]..out_offsets[i + 1]], {}, std.sort.asc(ChunkId));
+            std.mem.sort(ChunkId, inc_edges[inc_offsets[i]..inc_offsets[i + 1]], {}, std.sort.asc(ChunkId));
+        }
+        return .{
+            .out_offsets = out_offsets,
+            .out_edges = out_edges,
+            .inc_offsets = inc_offsets,
+            .inc_edges = inc_edges,
+            .registry_count = registry_count,
+            .allocator = allocator,
+        };
     }
 
     pub fn deinit(self: *RefGraph) void {
-        for (self.out) |*list| list.deinit(self.allocator);
-        for (self.inc) |*list| list.deinit(self.allocator);
-        self.allocator.free(self.out);
-        self.allocator.free(self.inc);
+        self.allocator.free(self.out_offsets);
+        self.allocator.free(self.out_edges);
+        self.allocator.free(self.inc_offsets);
+        self.allocator.free(self.inc_edges);
+        self.* = undefined;
     }
 
     pub fn outgoing(self: *const RefGraph, id: ChunkId) []const ChunkId {
-        return if (id < self.out.len) self.out[id].items else &.{};
+        if (id >= self.registry_count) return &.{};
+        return self.out_edges[self.out_offsets[id]..self.out_offsets[@as(usize, id) + 1]];
     }
 
     pub fn incoming(self: *const RefGraph, id: ChunkId) []const ChunkId {
-        return if (id < self.inc.len) self.inc[id].items else &.{};
+        if (id >= self.registry_count) return &.{};
+        return self.inc_edges[self.inc_offsets[id]..self.inc_offsets[@as(usize, id) + 1]];
     }
 };
+
+fn prefixSum(offsets: []u32) void {
+    var i: usize = 1;
+    while (i < offsets.len) : (i += 1) offsets[i] += offsets[i - 1];
+}
 
 /// Compact, cold-path projection of the registry's parent-linked name tree.
 ///
@@ -276,11 +325,6 @@ pub const NameIndex = struct {
         return self.subtree[id];
     }
 
-    fn prefixSum(offsets: []u32) void {
-        var i: usize = 1;
-        while (i < offsets.len) : (i += 1) offsets[i] += offsets[i - 1];
-    }
-
     fn normalizedName(id: NameId, max: NameId) NameId {
         return if (id <= max) id else root_name_id;
     }
@@ -432,6 +476,36 @@ fn indexTestChunk(allocator: std.mem.Allocator, value: i64) !Chunk {
     try builder.writeOp(allocator, .ret);
     try builder.writeOp(allocator, .halt);
     return builder.finish(allocator, 0);
+}
+
+fn refTestChunk(allocator: std.mem.Allocator, targets: []const ChunkId) !Chunk {
+    var builder = try chunk_mod.ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+    for (targets) |target| {
+        try builder.writeOp(allocator, .closure);
+        try builder.writeU16(allocator, @intCast(target));
+        try builder.writeU16(allocator, 0);
+    }
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+    return builder.finish(allocator, 0);
+}
+
+test "reference graph uses compact ranges for both directions" {
+    const testing = std.testing;
+    var registry = try ChunkRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const left = try registry.register(try indexTestChunk(testing.allocator, 1));
+    const right = try registry.register(try indexTestChunk(testing.allocator, 2));
+    const source = try registry.register(try refTestChunk(testing.allocator, &.{ right, left, right }));
+
+    var graph = try RefGraph.build(testing.allocator, &registry);
+    defer graph.deinit();
+    try testing.expectEqual(registry.count(), graph.registry_count);
+    try testing.expectEqualSlices(ChunkId, &.{ left, right }, graph.outgoing(source));
+    try testing.expectEqualSlices(ChunkId, &.{source}, graph.incoming(left));
+    try testing.expectEqualSlices(ChunkId, &.{source}, graph.incoming(right));
 }
 
 test "name index builds compact child and chunk ranges with subtree totals" {

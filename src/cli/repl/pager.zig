@@ -52,19 +52,19 @@ fn writeChunk(
     try disasm.writeChunk(allocator, w, chunk_id, chunk, symbols, options);
 }
 
-const Section = enum(u2) { code, tables, source, references };
+const Panel = enum(u2) { code, tables, source, references };
 const Category = enum(u1) { bytecode, heap };
 const HeapView = enum { overview, objects, values, attrs, attr_positions };
 
 const RowAction = union(enum) {
     none,
-    section: Section,
+    heading: Panel,
     chunk: ChunkId,
 };
 
 /// One rendered inspector document (or the help screen). Actions are parallel
-/// to lines so section headers and references remain useful even when the
-/// chunk itself is shorter than the viewport.
+/// to lines so references remain useful even when the chunk itself is shorter
+/// than the viewport.
 const Page = struct {
     title: []u8,
     lines: [][]u8,
@@ -297,6 +297,64 @@ const HeapJob = struct {
     }
 };
 
+const RefJob = struct {
+    registry: *const bytecode.ChunkRegistry,
+    thread: ?std.Thread = null,
+    mutex: sync.BlockingMutex = .{},
+    ready: ?bytecode.inspect.RefGraph = null,
+    running: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *RefJob) !void {
+        if (self.thread != null) return;
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.running.store(false, .release);
+            return err;
+        };
+    }
+
+    fn build(self: *RefJob) void {
+        const result = bytecode.inspect.RefGraph.build(std.heap.smp_allocator, self.registry) catch {
+            self.running.store(false, .release);
+            return;
+        };
+        self.mutex.lock();
+        self.ready = result;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    fn poll(self: *RefJob, target: *?bytecode.inspect.RefGraph) bool {
+        if (self.thread == null or self.running.load(.acquire)) return false;
+        return self.finish(target);
+    }
+
+    fn finish(self: *RefJob, target: *?bytecode.inspect.RefGraph) bool {
+        const thread = self.thread orelse return false;
+        thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        const next = self.ready;
+        self.ready = null;
+        self.mutex.unlock();
+        if (next) |graph| {
+            if (target.*) |*old| old.deinit();
+            target.* = graph;
+            return true;
+        }
+        return false;
+    }
+
+    fn deinit(self: *RefJob) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        if (self.ready) |*graph| graph.deinit();
+        self.ready = null;
+        self.mutex.unlock();
+    }
+};
+
 const Tui = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -327,9 +385,11 @@ const Tui = struct {
     tree_selection: usize = 0,
     detail_selection: usize = 0,
     x_scroll: usize = 0,
-    sections: [4]bool = .{ true, false, true, false },
+    panels: [4]bool = .{ true, false, true, false },
     category_expanded: [2]bool = .{ false, false },
     heap_stats: ?runtime.ObjectHeap.Stats = null,
+    ref_graph: ?bytecode.inspect.RefGraph = null,
+    reference_indexing: bool = false,
 
     const Focus = enum { chunks, disassembly };
     const TreeRow = union(enum) {
@@ -368,6 +428,7 @@ const Tui = struct {
         self.focus_path.deinit(self.allocator);
         self.tree_rows.deinit(self.allocator);
         self.transcript_lines.deinit(self.allocator);
+        if (self.ref_graph) |*graph| graph.deinit();
         self.arena.deinit();
     }
 
@@ -452,7 +513,6 @@ const Tui = struct {
             try self.expandFocusedPath(id);
             try self.rebuildTree(id);
         } else {
-            try self.expanded.put(self.allocator, bytecode.root_name_id, {});
             try self.rebuildTree(std.math.maxInt(ChunkId));
         }
         if (host.start_heap) {
@@ -470,6 +530,8 @@ const Tui = struct {
         defer index_job.deinit();
         var heap_job = HeapJob{ .ev = self.ev };
         defer heap_job.deinit();
+        var ref_job = RefJob{ .registry = self.ev.chunkRegistry() };
+        defer ref_job.deinit();
         var prompt_style_buf: [64]u8 = undefined;
         var prompt_renderer = render_mod.Renderer.init(
             self.allocator,
@@ -511,13 +573,29 @@ const Tui = struct {
                     self.status_msg = "(heap census failed)";
                 };
             }
+            if (ref_job.poll(&self.ref_graph)) {
+                self.reference_indexing = false;
+                if (self.currentChunk() != null and self.panels[@intFromEnum(Panel.references)]) try self.refreshPage(self.currentKind());
+            }
+            const wants_references = self.currentChunk() != null and self.panels[@intFromEnum(Panel.references)];
+            const refs_stale = self.ref_graph == null or self.ref_graph.?.registry_count != registry.count();
+            if (wants_references and refs_stale and ref_job.thread == null) {
+                ref_job.start() catch {
+                    self.status_msg = "(reference index failed)";
+                };
+            }
+            const now_reference_indexing = wants_references and (refs_stale or ref_job.running.load(.acquire));
+            if (now_reference_indexing != self.reference_indexing) {
+                self.reference_indexing = now_reference_indexing;
+                try self.refreshPage(self.currentKind());
+            }
 
             _ = frame_arena.reset(.retain_capacity);
             var prompt_view = try self.sessionPromptView(editor, frame_arena.allocator());
             const size = term_mod.size();
             prompt_renderer.setWidth(size.cols);
             prompt_view.max_rows = size.rows -| 2;
-            const prompt_rows = try prompt_renderer.measure(prompt_view);
+            const prompt_rows = if (prompt_active) try prompt_renderer.measure(prompt_view) else 0;
             try self.drawSession(w, &prompt_renderer, prompt_view, prompt_rows, capture, prompt_active);
             try w.flush();
 
@@ -525,7 +603,7 @@ const Tui = struct {
             // finished between drawing and this check; otherwise a very fast
             // build could leave us in an infinite blocking read before its
             // completed generation is adopted.
-            const timeout: i32 = if (decoder.wantsMore()) 40 else if (index_job.thread != null or heap_job.thread != null) 50 else -1;
+            const timeout: i32 = if (decoder.wantsMore()) 40 else if (index_job.thread != null or heap_job.thread != null or ref_job.thread != null) 50 else -1;
             const result = term_mod.readInput(&read_buf, timeout);
             events.clearRetainingCapacity();
             switch (result) {
@@ -557,6 +635,7 @@ const Tui = struct {
                             try capture.writer.writeByte('\n');
                             _ = index_job.finish(self.name_index);
                             heap_job.finish(&self.heap_stats);
+                            _ = ref_job.finish(&self.ref_graph);
                             try host.execute(trimmed, &capture.writer);
                             self.heap_stats = null;
                             if (capture.written().len > 0 and capture.written()[capture.written().len - 1] != '\n')
@@ -644,22 +723,22 @@ const Tui = struct {
                     };
                 };
                 var page: PageBuilder = .{ .arena = arena };
-                const source_lines = if (self.sections[@intFromEnum(Section.source)])
+                const source_lines = if (self.panels[@intFromEnum(Panel.source)])
                     try self.sourceDocument(id, chunk)
                 else
                     &.{};
-                for (std.meta.tags(Section)) |section| {
-                    try page.line(try self.sectionHeader(section), .{ .section = section });
-                    if (!self.sections[@intFromEnum(section)]) continue;
+                for (std.meta.tags(Panel)) |panel| {
+                    if (!self.panels[@intFromEnum(panel)]) continue;
+                    try page.line(panelLabel(panel), .{ .heading = panel });
 
-                    switch (section) {
+                    switch (panel) {
                         .code, .tables => {
                             var text: std.Io.Writer.Allocating = .init(arena);
                             const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
                             var options = disasm_options;
                             options.color_depth = self.color_depth;
-                            options.show_constants = section == .tables;
-                            options.show_code = section == .code;
+                            options.show_constants = panel == .tables;
+                            options.show_code = panel == .code;
                             options.line_width = @intCast(@min(self.layout().main_width, std.math.maxInt(u16)));
                             try disasm.writeChunk(arena, &text.writer, id, chunk, symbols, options);
                             try page.text(text.written());
@@ -671,7 +750,7 @@ const Tui = struct {
                                 for (source_lines) |source_line| try page.line(source_line, .none);
                             }
                         },
-                        .references => try self.appendRefs(&page, id, chunk),
+                        .references => try self.appendRefs(&page, id),
                     }
                 }
                 return .{
@@ -688,9 +767,9 @@ const Tui = struct {
                     \\
                     \\  Tab             switch tree/detail focus
                     \\  j/k, arrows     move between interactive rows
-                    \\  Enter, →        expand a tree/group/section or open a reference
-                    \\  ←               collapse a tree/group/section
-                    \\  c/t/s/r         toggle code/tables/source/references
+                    \\  Enter, →        expand a tree/group or open a reference
+                    \\  ←               collapse a tree/group
+                    \\  c/t/s/r         show/hide code/tables/source/references panels
                     \\  d/u, PgDn/PgUp  scroll the detail document
                     \\  b / f           back / forward through visited chunks
                     \\  /               search; n/N next/previous match
@@ -765,38 +844,30 @@ const Tui = struct {
         };
     }
 
-    fn sectionHeader(self: *Tui, section: Section) ![]u8 {
-        const arena = self.arena.allocator();
-        const is_open = self.sections[@intFromEnum(section)];
-        const label = switch (section) {
+    fn panelLabel(panel: Panel) []const u8 {
+        return switch (panel) {
             .code => "BYTECODE",
             .tables => "TABLES",
             .source => "SOURCE",
             .references => "REFERENCES",
         };
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ if (is_open) "▾" else "▸", label });
     }
 
-    fn appendRefs(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk) !void {
-        var refs: std.ArrayListUnmanaged(ChunkId) = .empty;
-        defer refs.deinit(self.allocator);
-        try bytecode.inspect.collectRefs(self.allocator, chunk, &refs);
-        try page.line(try std.fmt.allocPrint(page.arena, "outgoing ({d})", .{refs.items.len}), .none);
-        for (refs.items) |target| try self.appendChunkLabel(page, "  →", target);
+    fn appendRefs(self: *Tui, page: *PageBuilder, id: ChunkId) !void {
+        const graph = self.ref_graph orelse {
+            try page.line("indexing the chunk reference graph asynchronously…", .none);
+            return;
+        };
+        const outgoing = graph.outgoing(id);
+        try page.line(try std.fmt.allocPrint(page.arena, "outgoing ({d})", .{outgoing.len}), .none);
+        for (outgoing) |target| try self.appendChunkLabel(page, "  →", target);
 
-        var incoming: usize = 0;
-        const total = self.ev.chunkRegistry().count();
-        var candidate: ChunkId = 0;
-        while (candidate < total) : (candidate += 1) {
-            const source = self.ev.getChunk(candidate) orelse continue;
-            refs.clearRetainingCapacity();
-            bytecode.inspect.collectRefs(self.allocator, source, &refs) catch continue;
-            if (std.mem.indexOfScalar(ChunkId, refs.items, id) == null) continue;
-            if (incoming == 0) try page.line("incoming", .none);
-            try self.appendChunkLabel(page, "  ←", candidate);
-            incoming += 1;
+        const incoming = graph.incoming(id);
+        try page.line(try std.fmt.allocPrint(page.arena, "incoming ({d})", .{incoming.len}), .none);
+        for (incoming) |source| try self.appendChunkLabel(page, "  ←", source);
+        if (self.reference_indexing) {
+            try page.line("updating references for newly compiled chunks…", .none);
         }
-        if (incoming == 0) try page.line("incoming (0)", .none);
     }
 
     fn appendChunkLabel(self: *Tui, page: *PageBuilder, marker: []const u8, id: ChunkId) !void {
@@ -930,7 +1001,7 @@ const Tui = struct {
         const body_rows = self.viewport_rows;
         const split = cols >= 96;
         const sidebar_width = if (split) @min(@max(cols / 4, 26), 38) else 0;
-        const source_split = split and cols >= 140 and self.currentChunk() != null and self.sections[@intFromEnum(Section.source)];
+        const source_split = split and cols >= 140 and self.currentChunk() != null and self.panels[@intFromEnum(Panel.source)];
         const inspector_width = if (split) cols - sidebar_width - 1 else cols;
         const source_width = if (source_split) @min(@max(cols / 3, 38), 64) else 0;
         const main_width = inspector_width -| source_width -| @intFromBool(source_split);
@@ -970,11 +1041,9 @@ const Tui = struct {
     fn expandFocusedPath(self: *Tui, chunk_id: ChunkId) !void {
         self.category_expanded[@intFromEnum(Category.bytecode)] = true;
         self.focus_path.clearRetainingCapacity();
-        try self.expanded.put(self.allocator, bytecode.root_name_id, {});
         try self.focus_path.put(self.allocator, bytecode.root_name_id, {});
         var name = self.ev.chunkRegistry().nameOf(chunk_id) orelse bytecode.root_name_id;
         while (name != bytecode.root_name_id) {
-            try self.expanded.put(self.allocator, name, {});
             try self.focus_path.put(self.allocator, name, {});
             name = (self.name_index.node(name) orelse break).parent;
         }
@@ -1004,9 +1073,20 @@ const Tui = struct {
 
     fn appendNameRows(self: *Tui, name: bytecode.name_tree.NameId, depth: u16, focused_chunk: ChunkId) std.mem.Allocator.Error!void {
         try self.tree_rows.append(self.allocator, .{ .name = .{ .id = name, .depth = depth } });
-        if (!self.expanded.contains(name)) return;
         const next_depth = depth +| 1;
         const children = self.name_index.childrenOf(name);
+        if (!self.expanded.contains(name)) {
+            if (!self.focus_path.contains(name)) return;
+            for (children) |child| {
+                if (self.focus_path.contains(child)) try self.appendNameRows(child, next_depth, focused_chunk);
+            }
+            var attached = self.ev.chunkRegistry().nameOf(focused_chunk) orelse bytecode.root_name_id;
+            if (self.name_index.node(attached) == null) attached = bytecode.root_name_id;
+            if (attached == name and self.ev.getChunk(focused_chunk) != null) {
+                try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = focused_chunk, .depth = next_depth } });
+            }
+            return;
+        }
         try self.appendNameRange(name, children, 0, @intCast(children.len), next_depth, focused_chunk);
 
         const chunks = self.name_index.chunksOf(name);
@@ -1319,15 +1399,15 @@ const Tui = struct {
     fn rowActionable(self: *const Tui, index: usize) bool {
         if (index >= self.page.actions.len) return false;
         return switch (self.page.actions[index]) {
-            .none => false,
-            else => true,
+            .chunk => true,
+            .none, .heading => false,
         };
     }
 
     fn firstActionableRow(self: *const Tui) ?usize {
         for (self.page.actions, 0..) |action, i| switch (action) {
-            .none => {},
-            else => return i,
+            .chunk => return i,
+            .none, .heading => {},
         };
         return null;
     }
@@ -1359,36 +1439,27 @@ const Tui = struct {
         self.clampScroll();
     }
 
-    fn toggleSection(self: *Tui, section: Section, desired: ?bool) !void {
+    fn togglePanel(self: *Tui, panel: Panel) !void {
         if (self.currentChunk() == null) return;
-        const index = @intFromEnum(section);
-        self.sections[index] = desired orelse !self.sections[index];
+        const index = @intFromEnum(panel);
+        self.panels[index] = !self.panels[index];
         try self.refreshPage(self.currentKind());
-        for (self.page.actions, 0..) |action, row| switch (action) {
-            .section => |candidate| if (candidate == section) {
-                self.detail_selection = row;
-                self.ensureDetailVisible();
-                break;
-            },
-            else => {},
-        };
         self.focus = .disassembly;
     }
 
     fn activateDetailRow(self: *Tui) !void {
         if (self.detail_selection >= self.page.actions.len) return;
         switch (self.page.actions[self.detail_selection]) {
-            .none => {},
-            .section => |section| try self.toggleSection(section, null),
             .chunk => |id| try self.open(.{ .chunk = id }),
+            .none, .heading => {},
         }
     }
 
-    fn setDetailSection(self: *Tui, expand: bool) !void {
-        if (self.detail_selection >= self.page.actions.len) return;
-        switch (self.page.actions[self.detail_selection]) {
-            .section => |section| try self.toggleSection(section, expand),
-            else => {},
+    fn toggleHelp(self: *Tui) !void {
+        if (self.currentKind() == .help and self.stack.items.len > 1) {
+            try self.back();
+        } else if (self.currentKind() != .help) {
+            try self.open(.help);
         }
     }
 
@@ -1449,11 +1520,11 @@ const Tui = struct {
                 },
                 'b' => try self.back(),
                 'f' => try self.goForward(),
-                'c' => try self.toggleSection(.code, null),
-                't' => try self.toggleSection(.tables, null),
-                's' => try self.toggleSection(.source, null),
-                'r' => try self.toggleSection(.references, null),
-                '?' => try self.open(.help),
+                'c' => try self.togglePanel(.code),
+                't' => try self.togglePanel(.tables),
+                's' => try self.togglePanel(.source),
+                'r' => try self.togglePanel(.references),
+                '?' => try self.toggleHelp(),
                 '/' => {
                     if (self.focus == .disassembly) try self.searchPrompt();
                 },
@@ -1476,13 +1547,13 @@ const Tui = struct {
                 }
             },
             .left => {
-                if (self.focus == .chunks) try self.collapseTreeRow() else try self.setDetailSection(false);
+                if (self.focus == .chunks) try self.collapseTreeRow() else self.x_scroll -|= 4;
             },
             .right => {
                 if (self.focus == .chunks) {
                     try self.activateTreeRow();
                 } else {
-                    try self.setDetailSection(true);
+                    self.x_scroll = @min(self.x_scroll + 4, self.maxXScroll());
                 }
             },
             .page_up => {
@@ -1662,16 +1733,19 @@ const Tui = struct {
         else if (prompt_active)
             " Enter evaluate · Esc explorer · Ctrl-D leave VM · Tab complete · Ctrl-R history "
         else
-            std.fmt.bufPrint(&footer_buf, " q/Esc exit · i expression · : command · Tab pane · ↵ interact{s} ", .{
+            std.fmt.bufPrint(&footer_buf, " q/Esc exit · i expression · : command · Tab pane · c/t/s/r panels · ↵ interact{s} ", .{
                 if (self.indexing) " · indexing" else "",
             }) catch " q exit ";
         try frame.bar(screen_rows, footer, cols, .footer);
 
-        try frame.at(prompt_start, 1);
         prompt_renderer.invalidate();
-        try frame.cursor(prompt_active);
-        try prompt_renderer.draw(w, prompt_view);
-        if (!prompt_active) try frame.cursor(false);
+        if (prompt_active) {
+            try frame.at(prompt_start, 1);
+            try frame.cursor(true);
+            try prompt_renderer.draw(w, prompt_view);
+        } else {
+            try frame.cursor(false);
+        }
     }
 
     fn drawExplorerBody(self: *Tui, frame: *tui.Frame, first_row: usize, rows: usize, cols: usize) !void {
@@ -1759,12 +1833,16 @@ const Tui = struct {
         else
             @min(100, (self.scroll + rows) * 100 / self.page.lines.len);
         var footer_buf: [512]u8 = undefined;
-        const footer = std.fmt.bufPrint(&footer_buf, " {d}% · {d}/{d} · x:{d}  {s}  tab focus · c/t/s/r sections · ↵ interact · ? help · q exit ", .{
+        const footer = std.fmt.bufPrint(&footer_buf, " {d}% · {d}/{d} · x:{d}  {s}  panels:{s}{s}{s}{s} · tab focus · ? help · q exit ", .{
             pct,
             @min(self.scroll + 1, self.page.lines.len),
             self.page.lines.len,
             self.x_scroll,
             self.status_msg,
+            if (self.panels[@intFromEnum(Panel.code)]) "C" else "·",
+            if (self.panels[@intFromEnum(Panel.tables)]) "T" else "·",
+            if (self.panels[@intFromEnum(Panel.source)]) "S" else "·",
+            if (self.panels[@intFromEnum(Panel.references)]) "R" else "·",
         }) catch " q quit ";
         try frame.bar(layout_now.rows, footer, layout_now.cols, .footer);
     }
@@ -1786,7 +1864,7 @@ const Tui = struct {
 
     fn detailRole(self: *const Tui, index: usize) tui.Role {
         if (index < self.page.actions.len) switch (self.page.actions[index]) {
-            .section => return .section,
+            .heading => return .section,
             .chunk => return .chunk,
             .none => {},
         };
@@ -1937,7 +2015,7 @@ const Tui = struct {
                     "?";
                 break :blk std.fmt.bufPrint(&line_buf, " {s}{s} {s}  {d}", .{
                     indent[0..indent_len],
-                    if (self.expanded.contains(entry.id)) "▾" else "▸",
+                    if (self.expanded.contains(entry.id)) "▾" else if (self.focus_path.contains(entry.id)) "›" else "▸",
                     label,
                     stats.chunks,
                 }) catch " name";
