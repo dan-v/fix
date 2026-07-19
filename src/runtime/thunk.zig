@@ -484,7 +484,15 @@ pub const Thunk = struct {
 };
 
 test "thunk layout stays compact" {
-    if (!created_tsc_enabled) try std.testing.expectEqual(@as(usize, 80), @sizeOf(Thunk));
+    if (created_tsc_enabled) return;
+    // Debug/ReleaseSafe retain Zig's active-arm safety tag for the bare target
+    // union. ReleaseFast/ReleaseSmall intentionally elide it: targetKind plus
+    // Future.state are the production discriminants (see targetLeadingRacy).
+    const budget: usize = switch (builtin.mode) {
+        .Debug, .ReleaseSafe => 80,
+        .ReleaseFast, .ReleaseSmall => 56,
+    };
+    try std.testing.expect(@sizeOf(Thunk) <= budget);
 }
 
 test "thunk: cross-worker enroll + resolve signals waiter" {
