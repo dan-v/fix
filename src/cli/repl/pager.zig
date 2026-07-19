@@ -14,6 +14,7 @@ const width_mod = @import("width.zig");
 const editor_mod = @import("editor.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("transcript.zig");
+const vm_tree = @import("vm_tree.zig");
 const base = @import("base");
 const tui = base.tui;
 const ColorDepth = base.terminal_color.Depth;
@@ -156,14 +157,14 @@ pub fn runSession(
     transcript: *transcript_mod.Capture,
     host: SessionHost,
 ) !void {
-    var name_index = try bytecode.inspect.NameIndex.build(allocator, ev.chunkRegistry());
-    defer name_index.deinit();
+    var tree_index = try vm_tree.Index.build(allocator, ev.chunkRegistry(), ev.internTable(), ev.basePath());
+    defer tree_index.deinit();
     var explorer = Tui{
         .allocator = allocator,
         .io = io,
         .ev = ev,
         .color_depth = color_depth,
-        .name_index = &name_index,
+        .tree_index = &tree_index,
         .session_host = host,
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
@@ -173,9 +174,11 @@ pub fn runSession(
 
 const IndexJob = struct {
     registry: *const bytecode.ChunkRegistry,
+    intern: *const runtime.InternTable,
+    base_path: ?[]const u8,
     thread: ?std.Thread = null,
     mutex: sync.BlockingMutex = .{},
-    ready: ?bytecode.inspect.NameIndex = null,
+    ready: ?vm_tree.Index = null,
     running: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
 
@@ -190,7 +193,7 @@ const IndexJob = struct {
     }
 
     fn build(self: *IndexJob) void {
-        const result = bytecode.inspect.NameIndex.build(std.heap.smp_allocator, self.registry) catch {
+        const result = vm_tree.Index.build(std.heap.smp_allocator, self.registry, self.intern, self.base_path) catch {
             self.failed.store(true, .release);
             self.running.store(false, .release);
             return;
@@ -201,12 +204,12 @@ const IndexJob = struct {
         self.running.store(false, .release);
     }
 
-    fn poll(self: *IndexJob, current: *bytecode.inspect.NameIndex) bool {
+    fn poll(self: *IndexJob, current: *vm_tree.Index) bool {
         if (self.thread == null or self.running.load(.acquire)) return false;
         return self.finish(current);
     }
 
-    fn finish(self: *IndexJob, current: *bytecode.inspect.NameIndex) bool {
+    fn finish(self: *IndexJob, current: *vm_tree.Index) bool {
         const thread = self.thread orelse return false;
         thread.join();
         self.thread = null;
@@ -400,7 +403,7 @@ const Tui = struct {
     io: std.Io,
     ev: *Evaluator,
     color_depth: ColorDepth,
-    name_index: *bytecode.inspect.NameIndex,
+    tree_index: *vm_tree.Index,
     session_host: ?SessionHost = null,
     /// Only the current rendered page lives here. Persistent REPL sessions
     /// reset it on every view/focus change instead of accumulating every
@@ -414,9 +417,9 @@ const Tui = struct {
     page: Page = undefined,
     scroll: usize = 0,
     search: std.ArrayListUnmanaged(u8) = .empty,
-    expanded: std.AutoHashMapUnmanaged(bytecode.name_tree.NameId, void) = .empty,
+    expanded: std.AutoHashMapUnmanaged(u32, void) = .empty,
     expanded_ranges: std.AutoHashMapUnmanaged(u128, void) = .empty,
-    focus_path: std.AutoHashMapUnmanaged(bytecode.name_tree.NameId, void) = .empty,
+    focus_path: std.AutoHashMapUnmanaged(u32, void) = .empty,
     tree_rows: std.ArrayListUnmanaged(TreeRow) = .empty,
     transcript_lines: std.ArrayListUnmanaged(LineRange) = .empty,
     status_msg: []const u8 = "",
@@ -438,8 +441,8 @@ const Tui = struct {
     const Focus = enum { chunks, disassembly };
     const TreeRow = union(enum) {
         category: struct { kind: Category, depth: u16 },
-        name: struct { id: bytecode.name_tree.NameId, depth: u16 },
-        chunk: struct { id: ChunkId, depth: u16 },
+        name: struct { id: u32, depth: u16 },
+        chunk: struct { id: ChunkId, depth: u16, label: ?u32 = null },
         range: Range,
         heap: struct { view: HeapView, depth: u16 },
         object: struct { id: runtime.types.ObjectId, depth: u16 },
@@ -447,7 +450,7 @@ const Tui = struct {
     const RangeKind = enum(u2) { names, chunks, objects };
     const Range = struct {
         kind: RangeKind,
-        parent: bytecode.name_tree.NameId,
+        parent: u32,
         start: u32,
         len: u32,
         depth: u16,
@@ -519,7 +522,11 @@ const Tui = struct {
         }
         try self.refreshPage(initial_kind);
 
-        var index_job = IndexJob{ .registry = self.ev.chunkRegistry() };
+        var index_job = IndexJob{
+            .registry = self.ev.chunkRegistry(),
+            .intern = self.ev.internTable(),
+            .base_path = self.ev.basePath(),
+        };
         defer index_job.deinit();
         var heap_job = HeapJob{ .ev = self.ev };
         defer heap_job.deinit();
@@ -545,7 +552,7 @@ const Tui = struct {
         var read_buf: [512]u8 = undefined;
 
         while (true) {
-            if (index_job.poll(self.name_index)) {
+            if (index_job.poll(self.tree_index)) {
                 self.indexing = false;
                 if (host.focusedChunk()) |id| {
                     try self.expandFocusedPath(id);
@@ -553,7 +560,7 @@ const Tui = struct {
                 }
             }
             const registry = self.ev.chunkRegistry();
-            const stale = self.name_index.registry_count != registry.count() or self.name_index.name_count != registry.nameCount();
+            const stale = self.tree_index.registry_count != registry.count() or self.tree_index.name_count != registry.nameCount();
             if (stale and index_job.thread == null and !index_job.failed.load(.acquire)) {
                 index_job.start() catch {
                     self.status_msg = "(name index failed)";
@@ -652,7 +659,7 @@ const Tui = struct {
                             try capture.writer.writeAll("fix> ");
                             try capture.writer.writeAll(trimmed);
                             try capture.writer.writeByte('\n');
-                            _ = index_job.finish(self.name_index);
+                            _ = index_job.finish(self.tree_index);
                             heap_job.finish(&self.heap_stats);
                             object_job.finish(&self.object_snapshot);
                             _ = ref_job.finish(&self.ref_graph);
@@ -1180,11 +1187,11 @@ const Tui = struct {
     fn expandFocusedPath(self: *Tui, chunk_id: ChunkId) !void {
         self.category_expanded[@intFromEnum(Category.bytecode)] = true;
         self.focus_path.clearRetainingCapacity();
-        try self.focus_path.put(self.allocator, bytecode.root_name_id, {});
-        var name = self.ev.chunkRegistry().nameOf(chunk_id) orelse bytecode.root_name_id;
-        while (name != bytecode.root_name_id) {
+        try self.focus_path.put(self.allocator, vm_tree.root_node_id, {});
+        var name = self.tree_index.nodeForChunk(chunk_id);
+        while (name != vm_tree.root_node_id) {
             try self.focus_path.put(self.allocator, name, {});
-            name = (self.name_index.node(name) orelse break).parent;
+            name = (self.tree_index.node(name) orelse break).parent;
         }
     }
 
@@ -1211,9 +1218,9 @@ const Tui = struct {
         }
         try self.tree_rows.append(self.allocator, .{ .category = .{ .kind = .bytecode, .depth = 0 } });
         if (self.category_expanded[@intFromEnum(Category.bytecode)]) {
-            try self.appendNameRows(bytecode.root_name_id, 1, focused_chunk);
+            try self.appendNameRows(vm_tree.root_node_id, 1, focused_chunk);
         } else if (self.currentChunk() != null) {
-            try self.appendFocusedNameRows(bytecode.root_name_id, 1, focused_chunk);
+            try self.appendFocusedNameRows(vm_tree.root_node_id, 1, focused_chunk);
         }
         self.tree_selection = 0;
         for (self.tree_rows.items, 0..) |row, i| switch (row) {
@@ -1233,15 +1240,19 @@ const Tui = struct {
         };
     }
 
-    fn appendFocusedNameRows(self: *Tui, name: bytecode.name_tree.NameId, depth: u16, focused_chunk: ChunkId) std.mem.Allocator.Error!void {
+    fn appendFocusedNameRows(self: *Tui, name: u32, depth: u16, focused_chunk: ChunkId) std.mem.Allocator.Error!void {
+        const children = self.tree_index.childrenOf(name);
+        const chunks = self.tree_index.chunksOf(name);
+        if (name != vm_tree.root_node_id and children.len == 0 and chunks.len == 1) {
+            try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = chunks[0], .depth = depth, .label = name } });
+            return;
+        }
         try self.tree_rows.append(self.allocator, .{ .name = .{ .id = name, .depth = depth } });
         const next_depth = depth +| 1;
-        for (self.name_index.childrenOf(name)) |child| {
+        for (children) |child| {
             if (self.focus_path.contains(child)) try self.appendFocusedNameRows(child, next_depth, focused_chunk);
         }
-        var attached = self.ev.chunkRegistry().nameOf(focused_chunk) orelse bytecode.root_name_id;
-        if (self.name_index.node(attached) == null) attached = bytecode.root_name_id;
-        if (attached == name and self.ev.getChunk(focused_chunk) != null) {
+        if (self.tree_index.nodeForChunk(focused_chunk) == name and self.ev.getChunk(focused_chunk) != null) {
             try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = focused_chunk, .depth = next_depth } });
         }
     }
@@ -1299,32 +1310,33 @@ const Tui = struct {
         }
     }
 
-    fn appendNameRows(self: *Tui, name: bytecode.name_tree.NameId, depth: u16, focused_chunk: ChunkId) std.mem.Allocator.Error!void {
+    fn appendNameRows(self: *Tui, name: u32, depth: u16, focused_chunk: ChunkId) std.mem.Allocator.Error!void {
+        const children = self.tree_index.childrenOf(name);
+        const chunks = self.tree_index.chunksOf(name);
+        if (name != vm_tree.root_node_id and children.len == 0 and chunks.len == 1) {
+            try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = chunks[0], .depth = depth, .label = name } });
+            return;
+        }
         try self.tree_rows.append(self.allocator, .{ .name = .{ .id = name, .depth = depth } });
         const next_depth = depth +| 1;
-        const children = self.name_index.childrenOf(name);
         if (!self.expanded.contains(name)) {
             if (!self.focus_path.contains(name)) return;
             for (children) |child| {
                 if (self.focus_path.contains(child)) try self.appendNameRows(child, next_depth, focused_chunk);
             }
-            var attached = self.ev.chunkRegistry().nameOf(focused_chunk) orelse bytecode.root_name_id;
-            if (self.name_index.node(attached) == null) attached = bytecode.root_name_id;
-            if (attached == name and self.ev.getChunk(focused_chunk) != null) {
+            if (self.tree_index.nodeForChunk(focused_chunk) == name and self.ev.getChunk(focused_chunk) != null) {
                 try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = focused_chunk, .depth = next_depth } });
             }
             return;
         }
         try self.appendNameRange(name, children, 0, @intCast(children.len), next_depth, focused_chunk);
-
-        const chunks = self.name_index.chunksOf(name);
         try self.appendChunkRange(name, chunks, 0, @intCast(chunks.len), next_depth, focused_chunk);
     }
 
     fn appendNameRange(
         self: *Tui,
-        parent: bytecode.name_tree.NameId,
-        children: []const bytecode.name_tree.NameId,
+        parent: u32,
+        children: []const u32,
         start: u32,
         len: u32,
         depth: u16,
@@ -1333,7 +1345,7 @@ const Tui = struct {
         if (len == 0) return;
         if (len <= range_leaf) {
             for (children[start .. start + len]) |child| {
-                if (self.name_index.statsOf(child).chunks == 0) continue;
+                if (self.tree_index.statsOf(child).chunks == 0) continue;
                 try self.appendNameRows(child, depth, focused_chunk);
             }
             return;
@@ -1365,7 +1377,7 @@ const Tui = struct {
 
     fn appendChunkRange(
         self: *Tui,
-        parent: bytecode.name_tree.NameId,
+        parent: u32,
         chunks: []const ChunkId,
         start: u32,
         len: u32,
@@ -1531,9 +1543,9 @@ const Tui = struct {
             };
             return;
         }
-        const name: bytecode.name_tree.NameId = switch (selected) {
+        const name: u32 = switch (selected) {
             .name => |entry| entry.id,
-            .chunk => |entry| self.ev.chunkRegistry().nameOf(entry.id) orelse bytecode.root_name_id,
+            .chunk => |entry| self.tree_index.nodeForChunk(entry.id),
             .object => {
                 var cursor = self.tree_selection;
                 while (cursor > 0) {
@@ -1560,7 +1572,7 @@ const Tui = struct {
             };
             return;
         }
-        const parent = (self.name_index.node(name) orelse return).parent;
+        const parent = (self.tree_index.node(name) orelse return).parent;
         for (self.tree_rows.items, 0..) |row, i| switch (row) {
             .name => |entry| if (entry.id == parent) {
                 self.tree_selection = i;
@@ -2171,7 +2183,7 @@ const Tui = struct {
     fn drawChunkRow(self: *Tui, frame: *tui.Frame, row: usize, width: usize, rows: usize) !void {
         var line_buf: [512]u8 = undefined;
         if (row == 0) {
-            const root_stats = self.name_index.statsOf(bytecode.root_name_id);
+            const root_stats = self.tree_index.statsOf(vm_tree.root_node_id);
             const heap_counts = self.ev.heapCounts();
             const line = if (self.indexing)
                 std.fmt.bufPrint(&line_buf, " VM STATE · {d} chunks · {d} object slots · indexing…", .{ root_stats.chunks, heap_counts.objects }) catch " VM STATE"
@@ -2229,7 +2241,7 @@ const Tui = struct {
                 };
                 break :blk switch (entry.kind) {
                     .bytecode => blk2: {
-                        const stats = self.name_index.statsOf(bytecode.root_name_id);
+                        const stats = self.tree_index.statsOf(vm_tree.root_node_id);
                         break :blk2 std.fmt.bufPrint(&line_buf, " {s} BYTECODE  {d} chunks", .{ if (is_open) "▾" else if (projected) "›" else "▸", stats.chunks }) catch " bytecode";
                     },
                     .heap => blk2: {
@@ -2239,14 +2251,14 @@ const Tui = struct {
                 };
             },
             .name => |entry| blk: {
-                const stats = self.name_index.statsOf(entry.id);
+                const stats = self.tree_index.statsOf(entry.id);
                 var indent: [64]u8 = undefined;
                 const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                 @memset(indent[0..indent_len], ' ');
-                const label = if (entry.id == bytecode.root_name_id)
+                const label = if (entry.id == vm_tree.root_node_id)
                     "<root>"
-                else if (self.name_index.node(entry.id)) |node|
-                    self.ev.internTable().get(node.segment)
+                else if (self.tree_index.node(entry.id)) |node|
+                    node.label
                 else
                     "?";
                 break :blk std.fmt.bufPrint(&line_buf, " {s}{s} {s}  {d}", .{
@@ -2261,13 +2273,23 @@ const Tui = struct {
                 const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                 @memset(indent[0..indent_len], ' ');
                 const chunk = self.ev.getChunk(entry.id);
+                const label = if (entry.label) |node_id| (self.tree_index.node(node_id) orelse return).label else "";
                 break :blk if (chunk) |ch|
-                    std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {Bi}", .{
-                        indent[0..indent_len],
-                        if (self.currentChunk() == entry.id) "●" else "·",
-                        entry.id,
-                        ch.code.len,
-                    }) catch " chunk"
+                    if (label.len > 0)
+                        std.fmt.bufPrint(&line_buf, " {s}{s} {s}  #{d} · {Bi}", .{
+                            indent[0..indent_len],
+                            if (self.currentChunk() == entry.id) "●" else "·",
+                            label,
+                            entry.id,
+                            ch.code.len,
+                        }) catch " chunk"
+                    else
+                        std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {Bi}", .{
+                            indent[0..indent_len],
+                            if (self.currentChunk() == entry.id) "●" else "·",
+                            entry.id,
+                            ch.code.len,
+                        }) catch " chunk"
                 else
                     std.fmt.bufPrint(&line_buf, " {s}! #{d} missing", .{ indent[0..indent_len], entry.id }) catch " missing";
             },
@@ -2284,7 +2306,7 @@ const Tui = struct {
                         entry.start + entry.len,
                     }) catch " name range",
                     .chunks => blk2: {
-                        const chunks = self.name_index.chunksOf(entry.parent);
+                        const chunks = self.tree_index.chunksOf(entry.parent);
                         const first = chunks[entry.start];
                         const last = chunks[entry.start + entry.len - 1];
                         break :blk2 std.fmt.bufPrint(&line_buf, " {s}{s} chunks #{d}–#{d}", .{
