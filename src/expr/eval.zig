@@ -1141,8 +1141,9 @@ pub const Evaluator = struct {
 
     /// Enable best-effort chunk naming: the compiler records the attr/let
     /// binding name behind each lambda/thunk chunk into a registry sidecar, for
-    /// `fix disasm` to display. Off by default (hot compiles pay nothing); only
-    /// safe to enable for a single-threaded compile. Set before compiling.
+    /// `fix disasm` and the REPL explorer to display. Off by default (hot
+    /// compiles pay nothing); only safe to enable when compilation itself is
+    /// serialized. Set before compiling.
     pub fn setCaptureChunkNames(self: *Evaluator, on: bool) void {
         self.registry.capture_names = on;
     }
@@ -1158,6 +1159,10 @@ pub const Evaluator = struct {
         if (self.debugger.breakpoints == null) {
             self.debugger.breakpoints = bytecode.BreakpointTable.init(self.allocator, &self.intern);
         }
+    }
+
+    pub fn clearDebugUi(self: *Evaluator) void {
+        self.debugger.clearUi();
     }
 
     pub fn setDebugSource(self: *Evaluator, source: ?[]const u8) void {
@@ -1231,6 +1236,10 @@ pub const Evaluator = struct {
         config.disable_speculation = disable_speculation;
         config.disable_fanout = disable_fanout;
         self.scheduler.configure(config);
+    }
+
+    pub fn setDebugSerial(self: *Evaluator, enabled: bool) void {
+        self.scheduler.setDebugSerial(enabled);
     }
 
     /// Compile source text into bytecode and evaluate it.

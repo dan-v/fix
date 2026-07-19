@@ -84,12 +84,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
+    // The explorer is a first-class REPL surface: retain binding and synthetic
+    // lambda/node path segments for every session, not only --debugger runs.
+    ev.setCaptureChunkNames(true);
 
-    var console: debugger.Console = undefined;
+    var console: debugger.Console = .{ .allocator = allocator, .io = init.io, .use_color = term.use_color };
     if (options.debugger) {
         ev.setParallelismToggles(true, true);
-        ev.setCaptureChunkNames(true);
-        console = .{ .allocator = allocator, .io = init.io, .use_color = term.use_color };
         console.install(&ev);
     }
 
@@ -103,7 +104,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     ev.setValueColor(if (options.debugger) term.use_color else (term.use_color and interactive));
     var repl = Repl.init(allocator, init, options, &ev, if (interactive) term.color_depth else .none, interactive);
     defer repl.deinit();
-    if (options.debugger) repl.debug_console = &console;
+    repl.debug_console = &console;
 
     if (interactive) {
         try repl.runInteractive();
@@ -131,8 +132,8 @@ const Repl = struct {
     use_color: bool,
     color_depth: presentation.ColorDepth,
     interactive: bool,
-    /// The debug console when `--debugger` is set, so the bare loop can share
-    /// its stdin reader (see `runBare`). Null otherwise.
+    /// Shared by persistent `--debugger` sessions and transient `:debug`
+    /// commands; the bare loop attaches its buffered stdin reader here.
     debug_console: ?*debugger.Console = null,
 
     /// Scope bindings, insertion-ordered. Keys are owned; values are heap
@@ -150,6 +151,9 @@ const Repl = struct {
     /// or name tree grows. Bare queries share it instead of rescanning millions
     /// of chunks for every command.
     vm_index: ?engine.bytecode.inspect.NameIndex = null,
+    /// Compact live-object index for bounded bare `:vm objects` queries.
+    /// Invalidated before evaluation or collection mutates the heap.
+    vm_objects: ?runtime.ObjectHeap.ObjectSnapshot = null,
     /// Direct REPL sources are not backed by the evaluator's file cache. Keep
     /// the source alongside the chunk generation so the VM inspector can show
     /// real text for expression spans as well as imported-file spans.
@@ -192,6 +196,7 @@ const Repl = struct {
         for (self.loaded.items) |p| self.allocator.free(p);
         self.loaded.deinit(self.allocator);
         if (self.vm_index) |*index| index.deinit();
+        if (self.vm_objects) |*snapshot| snapshot.deinit();
         for (self.vm_sources.items) |source| self.allocator.free(source.text);
         self.vm_sources.deinit(self.allocator);
         self.history.deinit();
@@ -465,6 +470,7 @@ const Repl = struct {
                     try self.collectBetweenInputs();
                 }
             },
+            .debug => try self.debugExpr(rest),
             .vm => try self.vm(rest),
             .env => {
                 var out = self.output();
@@ -485,6 +491,7 @@ const Repl = struct {
                 }
             },
             .gc => {
+                self.clearVmObjects();
                 const r = self.ev.collectMajorNow();
                 var out = self.output();
                 defer out.flush() catch {};
@@ -506,6 +513,9 @@ const Repl = struct {
     /// Evaluate an expression in the repl scope. Failures render to stderr
     /// and yield null.
     fn evalExpr(self: *Repl, source: []const u8) !?Value {
+        self.clearVmObjects();
+        self.ev.setDebugSource(source);
+        defer self.ev.setDebugSource(null);
         const first_chunk = self.ev.chunkRegistry().count();
         const result = self.ev.evaluateWithScopeResult(source, self.scope) catch |err| {
             try self.rememberVmSource(source, first_chunk, null);
@@ -515,6 +525,28 @@ const Repl = struct {
         try self.rememberVmSource(source, first_chunk, result.entry_chunk);
         self.vm_focus = self.focusForValue(result.value, result.entry_chunk);
         return result.value;
+    }
+
+    fn debugExpr(self: *Repl, source: []const u8) !void {
+        const console = self.debug_console orelse {
+            try self.printError("debug console unavailable", .{});
+            return;
+        };
+        const wrapper = try std.fmt.allocPrint(self.allocator, "builtins.seq (builtins.break null) (\n{s}\n)", .{source});
+        defer self.allocator.free(wrapper);
+
+        self.ev.setDebugSerial(true);
+        defer self.ev.setDebugSerial(false);
+
+        const transient = !self.options.debugger;
+        if (transient) console.install(self.ev);
+        defer if (transient) console.uninstall(self.ev);
+
+        if (try self.evalExpr(wrapper)) |value| {
+            try self.bind("it", value);
+            try self.printResult(value, source);
+            try self.collectBetweenInputs();
+        }
     }
 
     fn rememberVmSource(self: *Repl, source: []const u8, first: types.ChunkId, entry: ?types.ChunkId) !void {
@@ -636,6 +668,7 @@ const Repl = struct {
     /// garbage too (a minor leaves the old generation, which under parallel
     /// workers otherwise ratchets reserved memory up across inputs).
     fn collectBetweenInputs(self: *Repl) !void {
+        self.clearVmObjects();
         _ = self.ev.collectMajorNow();
     }
 
@@ -683,7 +716,7 @@ const Repl = struct {
                     .errored => try w.writeAll(" (cached failure)\n"),
                     else => {
                         switch (thunk.targetKind()) {
-                            .bytecode => try w.print(" (bytecode, chunk #{d} — :d it)\n", .{thunk.payload.target.bytecode.chunk_id}),
+                            .bytecode => try w.print(" (bytecode, chunk #{d} — :vm it)\n", .{thunk.payload.target.bytecode.chunk_id}),
                             .closure => try w.writeAll(" (closure application)\n"),
                             .pass_through => try w.writeAll(" (pass-through cell)\n"),
                             .attr_access => try w.writeAll(" (attribute access)\n"),
@@ -699,7 +732,7 @@ const Repl = struct {
                 };
                 var arity: usize = 1;
                 if (self.ev.getChunk(closure.chunk_id)) |chunk| arity = chunk.arity;
-                try w.print("closure: chunk #{d}, arity {d}, {d} upvalue{s} — :d it\n", .{
+                try w.print("closure: chunk #{d}, arity {d}, {d} upvalue{s} — :vm it\n", .{
                     closure.chunk_id,
                     arity,
                     closure.upvalues.len,
@@ -739,6 +772,8 @@ const Repl = struct {
         if (std.mem.eql(u8, word, "ls") or std.mem.eql(u8, word, "tree")) return self.vmList(rest);
         if (std.mem.eql(u8, word, "chunks")) return self.vmChunks(rest);
         if (std.mem.eql(u8, word, "heap")) return self.vmHeap();
+        if (std.mem.eql(u8, word, "objects")) return self.vmObjects(rest);
+        if (std.mem.eql(u8, word, "object")) return self.vmObject(rest);
         if (std.mem.eql(u8, word, "chunk") or std.mem.eql(u8, word, "code")) {
             if (rest.len > 0) {
                 self.vm_focus = parseChunkId(rest) orelse {
@@ -809,6 +844,119 @@ const Repl = struct {
         }
     }
 
+    fn clearVmObjects(self: *Repl) void {
+        if (self.vm_objects) |*snapshot| snapshot.deinit();
+        self.vm_objects = null;
+    }
+
+    fn ensureVmObjects(self: *Repl) !*runtime.ObjectHeap.ObjectSnapshot {
+        if (self.vm_objects == null) self.vm_objects = try self.ev.heapObjectSnapshot(self.allocator);
+        return &self.vm_objects.?;
+    }
+
+    fn vmObjects(self: *Repl, args_text: []const u8) !void {
+        var start: runtime.types.ObjectId = 0;
+        var limit: usize = 40;
+        var tokens = std.mem.tokenizeAny(u8, args_text, " \t");
+        if (tokens.next()) |text| {
+            start = parseChunkId(text) orelse {
+                try self.printError("invalid object id `{s}`", .{text});
+                return;
+            };
+            if (tokens.next()) |text_limit| limit = (try self.parseVmLimit(text_limit)) orelse return;
+        }
+        if (tokens.next() != null) {
+            try self.printError(":vm objects takes at most START and LIMIT", .{});
+            return;
+        }
+
+        const snapshot = try self.ensureVmObjects();
+        var out = self.output();
+        defer out.flush() catch {};
+        const w = out.writer();
+        try w.print("live objects: {d} across slots #0–#{d}\n", .{ snapshot.live_count, snapshot.high_water -| 1 });
+        var next = snapshot.nextLive(start);
+        var shown: usize = 0;
+        var continuation: ?runtime.types.ObjectId = null;
+        while (next) |id| {
+            if (shown >= limit) {
+                continuation = id;
+                break;
+            }
+            const info = self.ev.inspectHeapObject(snapshot, id) catch {
+                next = snapshot.nextLive(id + 1);
+                continue;
+            };
+            try w.print("  #{d:<11} {s}\n", .{ id, @tagName(info) });
+            shown += 1;
+            next = snapshot.nextLive(id + 1);
+        }
+        if (shown == 0) try w.writeAll("  (no live objects at or after that id)\n");
+        if (continuation) |id| try w.print("continue with `:vm objects {d} {d}`\n", .{ id, limit });
+    }
+
+    fn vmObject(self: *Repl, args_text: []const u8) !void {
+        const text = std.mem.trim(u8, args_text, " \t");
+        const id = parseChunkId(text) orelse {
+            try self.printError(":vm object needs an object id", .{});
+            return;
+        };
+        const snapshot = try self.ensureVmObjects();
+        const info = self.ev.inspectHeapObject(snapshot, id) catch {
+            try self.printError("object #{d} is not live", .{id});
+            return;
+        };
+        var out = self.output();
+        defer out.flush() catch {};
+        const w = out.writer();
+        try w.print("object #{d}: {s}\n", .{ id, @tagName(info) });
+        switch (info) {
+            .list => |list| try w.print("  items: {d}\n", .{list.len}),
+            .attrs => |attrs| try w.print("  attrs: {d}, positions: {d}, sibling swept: {s}\n", .{ attrs.len, attrs.positions, if (attrs.sibling_swept) "yes" else "no" }),
+            .merge_attrs => |merge| {
+                try w.print("  base: object #{d}\n  overlay: object #{d}\n  depth: {d}\n", .{ merge.base, merge.overlay, merge.depth });
+                if (merge.flattened) |flat| try w.print("  flattened: object #{d}\n", .{flat});
+            },
+            .closure => |closure| try w.print("  chunk: #{d}\n  upvalues: {d}\n", .{ closure.chunk, closure.upvalues }),
+            .builtin_closure => |closure| try w.print("  builtin: #{d}\n  arguments: {d}\n", .{ closure.builtin, closure.args }),
+            .thunk => |thunk| {
+                try w.print("  state: {s}\n  demanded: {s}\n", .{ @tagName(thunk.state), if (thunk.demanded) "yes" else "no" });
+                switch (thunk.body) {
+                    .result => |value| try writeVmValueRef(w, "result", value),
+                    .error_name => |name| try w.print("  error: {s}\n", .{name}),
+                    .target => |target| switch (target) {
+                        .closure => |value| try writeVmValueRef(w, "closure", value),
+                        .bytecode => |body| try w.print("  chunk: #{d}\n  captures: {d}\n", .{ body.chunk, body.captures }),
+                        .pass_through => |value| try writeVmValueRef(w, "value", value),
+                        .attr_access => |access| {
+                            try writeVmValueRef(w, "base", access.base);
+                            try w.print("  attribute: intern #{d}\n", .{access.name});
+                        },
+                        .deferred => |body| try w.print("  deferred: #{d}\n  captures: {d}\n", .{ body.id, body.captures }),
+                    },
+                }
+            },
+            .context_string => |string| try w.print("  text: intern #{d}\n  context entries: {d}\n", .{ string.text, string.context }),
+            .boxed_int => |value| try w.print("  value: {d}\n", .{value}),
+            .partial_app => |partial| {
+                try writeVmValueRef(w, "function", partial.function);
+                try w.print("  arguments: {d}\n", .{partial.args});
+            },
+        }
+    }
+
+    fn writeVmValueRef(w: *std.Io.Writer, label: []const u8, value: runtime.heap.ValueRef) !void {
+        try w.print("  {s}: {s}", .{ label, @tagName(value.kind) });
+        switch (value.target) {
+            .none => {},
+            .object => |id| try w.print(" object #{d}", .{id}),
+            .chunk => |id| try w.print(" chunk #{d}", .{id}),
+            .intern => |id| try w.print(" intern #{d}", .{id}),
+            .builtin => |id| try w.print(" #{d}", .{id}),
+        }
+        try w.writeByte('\n');
+    }
+
     fn vmHelp(self: *Repl) !void {
         var out = self.output();
         defer out.flush() catch {};
@@ -820,6 +968,9 @@ const Repl = struct {
             \\:vm chunks [@NAME] [LIMIT]
             \\                         list chunks directly attached to a name
             \\:vm heap                inspect heap stores and object census
+            \\:vm objects [START] [LIMIT]
+            \\                         list live objects from an id (default 40)
+            \\:vm object ID           inspect one live object and its references
             \\:vm eval EXPR            disambiguate an expression starting with
             \\                         a VM subcommand word
             \\Name and chunk ids printed by the explorer are stable for this

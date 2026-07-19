@@ -161,6 +161,18 @@ test "no debug UI installed leaves builtins.break as a plain identity" {
     try std.testing.expectEqual(@as(i64, 7), (try ev.forceValue(result)).asInt());
 }
 
+test "debug UI can be detached between evaluations" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    var probe: Probe = .{};
+    probe.install(&ev);
+    _ = try ev.evaluate("builtins.break 1");
+    ev.clearDebugUi();
+    const result = try ev.evaluate("builtins.break 2");
+    try std.testing.expectEqual(@as(usize, 1), probe.hits);
+    try std.testing.expectEqual(@as(i64, 2), (try ev.forceValue(result)).asInt());
+}
+
 test "throw enters the debugger, then the error still propagates" {
     var ev = try Evaluator.init(std.testing.allocator, 1);
     defer ev.deinit();

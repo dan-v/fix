@@ -31,7 +31,7 @@ const disasm_options: disasm.Options = .{
     .recurse = false,
 };
 
-/// Non-interactive `:d`: the same chunk disassembly without terminal chrome.
+/// Non-interactive `:vm`: the focused chunk without terminal chrome.
 pub fn writePlain(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Evaluator, chunk_id: ChunkId) !void {
     const symbols: disasm.Symbols = .{ .intern = ev.internTable(), .registry = ev.chunkRegistry() };
     try writeChunk(allocator, w, ev, chunk_id, symbols, disasm_options);
@@ -108,27 +108,6 @@ const Visit = struct {
         help,
     };
 };
-
-pub fn browse(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    ev: *Evaluator,
-    start: ChunkId,
-    color_depth: ColorDepth,
-) !void {
-    var name_index = try bytecode.inspect.NameIndex.build(allocator, ev.chunkRegistry());
-    defer name_index.deinit();
-    var explorer = Tui{
-        .allocator = allocator,
-        .io = io,
-        .ev = ev,
-        .color_depth = color_depth,
-        .name_index = &name_index,
-        .arena = std.heap.ArenaAllocator.init(allocator),
-    };
-    defer explorer.deinit();
-    try explorer.run(start);
-}
 
 /// The REPL owns evaluation semantics; the screen owns input/output placement.
 /// This narrow interface is what lets the same prompt drive both the plain
@@ -489,59 +468,6 @@ const Tui = struct {
         if (self.ref_graph) |*graph| graph.deinit();
         if (self.object_snapshot) |*snapshot| snapshot.deinit();
         self.arena.deinit();
-    }
-
-    fn run(self: *Tui, start: ChunkId) !void {
-        var raw = term_mod.RawMode.enable() catch return;
-        defer raw.disable();
-
-        var out_buf: [32 * 1024]u8 = undefined;
-        var out = std.Io.File.stdout().writerStreaming(self.io, &out_buf);
-        const w = &out.interface;
-
-        var screen = try tui.Screen.enter(w, .{});
-        defer {
-            screen.leave() catch {};
-            w.flush() catch {};
-        }
-
-        const initial_size = term_mod.size();
-        self.viewport_cols = initial_size.cols;
-        self.viewport_rows = initial_size.rows -| 2;
-        try self.stack.append(self.allocator, .{ .kind = .{ .chunk = start } });
-        try self.expandFocusedPath(start);
-        try self.rebuildTree(start);
-        try self.refreshPage(.{ .chunk = start });
-
-        var decoder = keys_mod.Decoder{};
-        var events: keys_mod.Decoder.List = .empty;
-        defer events.deinit(self.allocator);
-        var read_buf: [256]u8 = undefined;
-
-        while (true) {
-            try self.draw(w);
-            try w.flush();
-
-            const result = term_mod.readInput(&read_buf, if (decoder.wantsMore()) 40 else -1);
-            events.clearRetainingCapacity();
-            switch (result) {
-                .timeout => try decoder.idleFlush(self.allocator, &events),
-                .winch => {
-                    const resized = term_mod.size();
-                    self.viewport_cols = resized.cols;
-                    self.viewport_rows = resized.rows -| 2;
-                    try self.refreshPage(self.currentKind());
-                    self.clampScroll();
-                    self.x_scroll = @min(self.x_scroll, self.maxXScroll());
-                    continue;
-                },
-                .eof => return,
-                .data => |n| for (read_buf[0..n]) |b| try decoder.feed(self.allocator, b, &events),
-            }
-            for (events.items) |key| {
-                if (!try self.handleKey(key)) return;
-            }
-        }
     }
 
     fn runSession(self: *Tui, editor: *editor_mod.Editor, capture: *transcript_mod.Capture, host: SessionHost) !void {
@@ -2103,63 +2029,6 @@ const Tui = struct {
             try frame.at(first_row + row, 1);
             try frame.text(line, 0, cols, .plain);
         }
-    }
-
-    fn draw(self: *Tui, w: *std.Io.Writer) !void {
-        var frame = tui.Frame.init(w, self.color_depth, width_mod.cpWidth);
-        const layout_now = self.layout();
-        const rows = layout_now.body_rows;
-        self.clampScroll();
-        self.tree_selection = @min(self.tree_selection, self.tree_rows.items.len -| 1);
-
-        var header_buf: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, " fix vm  ·  {s}  ·  {s} pane ", .{
-            self.page.title,
-            if (self.focus == .chunks) "tree" else "detail",
-        }) catch " fix vm ";
-        try frame.bar(1, header, layout_now.cols, .header);
-
-        var row: usize = 0;
-        while (row < rows) : (row += 1) {
-            const screen_row = row + 2;
-            try frame.clearRow(screen_row);
-            if (layout_now.split) {
-                try frame.at(screen_row, 1);
-                try self.drawChunkRow(&frame, row, layout_now.sidebar_width, rows);
-                try frame.divider(screen_row, layout_now.sidebar_width + 1);
-                try frame.at(screen_row, layout_now.main_col);
-                try self.drawDisasmRow(&frame, row, layout_now.main_width);
-                if (layout_now.source_split) {
-                    try frame.divider(screen_row, layout_now.source_col - 1);
-                    try frame.at(screen_row, layout_now.source_col);
-                    try self.drawSourceRow(&frame, row, layout_now.source_width);
-                }
-            } else if (self.focus == .chunks) {
-                try frame.at(screen_row, 1);
-                try self.drawChunkRow(&frame, row, layout_now.cols, rows);
-            } else {
-                try frame.at(screen_row, 1);
-                try self.drawDisasmRow(&frame, row, layout_now.main_width);
-            }
-        }
-
-        const pct = if (self.page.lines.len == 0)
-            100
-        else
-            @min(100, (self.scroll + rows) * 100 / self.page.lines.len);
-        var footer_buf: [512]u8 = undefined;
-        const footer = std.fmt.bufPrint(&footer_buf, " {d}% · {d}/{d} · x:{d}  {s}  panels:{s}{s}{s}{s} · tab focus · ? help · q exit ", .{
-            pct,
-            @min(self.scroll + 1, self.page.lines.len),
-            self.page.lines.len,
-            self.x_scroll,
-            self.status_msg,
-            if (self.panels[@intFromEnum(Panel.code)]) "C" else "·",
-            if (self.panels[@intFromEnum(Panel.tables)]) "T" else "·",
-            if (self.panels[@intFromEnum(Panel.source)]) "S" else "·",
-            if (self.panels[@intFromEnum(Panel.references)]) "R" else "·",
-        }) catch " q quit ";
-        try frame.bar(layout_now.rows, footer, layout_now.cols, .footer);
     }
 
     fn drawDisasmRow(self: *Tui, frame: *tui.Frame, row: usize, width: usize) !void {

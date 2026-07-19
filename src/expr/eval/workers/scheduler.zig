@@ -690,6 +690,11 @@ pub const Scheduler = struct {
     /// already-claimed thunk, never on a queued task), so correctness is
     /// unaffected; only un-started backlog work is skipped.
     suppress_background: std.atomic.Value(bool),
+    /// Transient debugger gate. Unlike immutable scheduler configuration this
+    /// can be toggled between top-level REPL evaluations after helper threads
+    /// have started. It prevents a paused demand fiber from sharing mutable VM
+    /// state with speculative/fan-out work.
+    debug_serial: std.atomic.Value(bool),
 
     /// Stop-the-world and parallel-mark phase coordination.
     gc_barrier: GcBarrier,
@@ -781,6 +786,7 @@ pub const Scheduler = struct {
             .n_idle_ns = .init(0),
             .n_busy_ns = .init(0),
             .suppress_background = .init(false),
+            .debug_serial = .init(false),
             .gc_barrier = gc_barrier,
         };
     }
@@ -803,6 +809,10 @@ pub const Scheduler = struct {
     /// to false at the start of each top-level entry.
     pub inline fn setSuppressBackground(self: *Scheduler, v: bool) void {
         self.suppress_background.store(v, .release);
+    }
+
+    pub fn setDebugSerial(self: *Scheduler, enabled: bool) void {
+        self.debug_serial.store(enabled, .release);
     }
 
     pub inline fn backgroundSuppressed(self: *const Scheduler) bool {
@@ -1085,7 +1095,7 @@ pub const Scheduler = struct {
     /// before-park (project-tier1-perf-session).
     pub fn submit(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
-        if (self.config.disable_speculation) return false;
+        if (self.config.disable_speculation or self.debug_serial.load(.acquire)) return false;
         if (submitter_id >= self.worker_count) return false;
         const cap: u32 = @as(u32, self.worker_count - 1) * self.config.spec_backlog_per_helper;
         if (self.pending_tasks.v.load(.monotonic) >= cap) {
@@ -1128,7 +1138,7 @@ pub const Scheduler = struct {
     /// on full and is consumed newest-first by owner and stealers alike.
     pub fn submitNovel(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
-        if (self.config.disable_speculation) return false;
+        if (self.config.disable_speculation or self.debug_serial.load(.acquire)) return false;
         if (submitter_id >= self.worker_count) return false;
         const push_ts: u64 = if (self.config.trace_flows) monotonicNs() else 0;
         const prev: u32 = switch (self.novel_queues[submitter_id].push(
@@ -1158,7 +1168,7 @@ pub const Scheduler = struct {
     /// bypasses queued speculation.
     pub fn submitUrgent(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
-        if (self.config.disable_fanout) return false;
+        if (self.config.disable_fanout or self.debug_serial.load(.acquire)) return false;
         if (self.pushOwn(self.urgent_queues, task, submitter_id)) {
             self.bump(submitter_id, "urgent_ok");
             return true;

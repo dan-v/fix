@@ -50,6 +50,10 @@ pub const Console = struct {
         ev.setDebugUi(self, runCallback);
     }
 
+    pub fn uninstall(_: *Console, ev: *engine.Evaluator) void {
+        ev.clearDebugUi();
+    }
+
     /// Read console input from `r` (a shared reader) rather than our own — the
     /// bare repl calls this so its line reader and the console don't fight over
     /// the stdin pipe's buffer.

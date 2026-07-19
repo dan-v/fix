@@ -14,6 +14,7 @@ pub const Id = enum {
     type_of,
     print,
     inspect,
+    debug,
     vm,
     env,
     gc,
@@ -36,7 +37,8 @@ pub const table = [_]Command{
     .{ .id = .type_of, .names = &.{ ":t", ":type" }, .arg = .expr, .metavar = "EXPR", .help = "show the type of a value (forces to weak head)" },
     .{ .id = .print, .names = &.{ ":p", ":print" }, .arg = .expr, .metavar = "EXPR", .help = "deep-force a value and print it fully" },
     .{ .id = .inspect, .names = &.{ ":i", ":inspect" }, .arg = .expr, .metavar = "EXPR", .help = "inspect a value: kind, thunk state, backing chunk, size" },
-    .{ .id = .vm, .names = &.{ ":vm", ":d", ":disasm" }, .arg = .opt_expr, .metavar = "[COMMAND | EXPR]", .help = "explore VM chunks and tables; `:vm help` for commands\n(interactive TUI on a tty; bounded text in bare mode)" },
+    .{ .id = .debug, .names = &.{ ":debug", ":d" }, .arg = .expr, .metavar = "EXPR", .help = "evaluate an expression in the debugger, paused before it is forced" },
+    .{ .id = .vm, .names = &.{":vm"}, .arg = .opt_expr, .metavar = "[COMMAND | EXPR]", .help = "explore VM chunks and tables; `:vm help` for commands\n(interactive TUI on a tty; bounded text in bare mode)" },
     .{ .id = .env, .names = &.{":env"}, .arg = .none, .help = "list the current scope bindings" },
     .{ .id = .gc, .names = &.{":gc"}, .arg = .none, .help = "run a garbage collection now and report heap usage" },
 };
@@ -106,6 +108,8 @@ test "every alias resolves to its command" {
         }
     }
     try testing.expect(find(":nope") == null);
+    try testing.expect(find(":disasm") == null);
+    try testing.expectEqual(Id.debug, find(":d").?.id);
 }
 
 test "help renders every command name" {

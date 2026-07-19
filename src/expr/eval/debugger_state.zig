@@ -11,6 +11,11 @@ pub fn State(comptime Ui: type, comptime BreakpointTable: type) type {
             self.ui = ui;
         }
 
+        pub fn clearUi(self: *@This()) void {
+            self.ui = null;
+            self.in_session = false;
+        }
+
         pub fn setSource(self: *@This(), source: ?[]const u8) void {
             self.source = source;
         }
