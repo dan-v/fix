@@ -65,6 +65,7 @@ const Page = struct {
     title: []u8,
     lines: [][]u8,
     actions: []RowAction,
+    source_lines: []const []const u8 = &.{},
 };
 
 const PageBuilder = struct {
@@ -130,6 +131,7 @@ pub const SessionHost = struct {
     ctx: *anyopaque,
     executeFn: *const fn (ctx: *anyopaque, input: []const u8, output: *std.Io.Writer) anyerror!void,
     focusFn: *const fn (ctx: *anyopaque) ?ChunkId,
+    sourceFn: *const fn (ctx: *anyopaque, chunk_id: ChunkId) ?[]const u8,
     quitFn: *const fn (ctx: *anyopaque) bool,
 
     fn execute(self: SessionHost, input: []const u8, output: *std.Io.Writer) !void {
@@ -138,6 +140,10 @@ pub const SessionHost = struct {
 
     fn focusedChunk(self: SessionHost) ?ChunkId {
         return self.focusFn(self.ctx);
+    }
+
+    fn directSource(self: SessionHost, chunk_id: ChunkId) ?[]const u8 {
+        return self.sourceFn(self.ctx, chunk_id);
     }
 
     fn quitting(self: SessionHost) bool {
@@ -166,6 +172,7 @@ pub fn runSession(
         .ev = ev,
         .color_depth = color_depth,
         .name_index = &name_index,
+        .session_host = host,
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
     defer tui.deinit();
@@ -234,6 +241,7 @@ const Tui = struct {
     ev: *Evaluator,
     color_depth: ColorDepth,
     name_index: *bytecode.inspect.NameIndex,
+    session_host: ?SessionHost = null,
     /// Only the current rendered page lives here. Persistent REPL sessions
     /// reset it on every view/focus change instead of accumulating every
     /// disassembly ever visited.
@@ -255,7 +263,7 @@ const Tui = struct {
     tree_selection: usize = 0,
     detail_selection: usize = 0,
     x_scroll: usize = 0,
-    sections: [4]bool = .{ true, false, false, false },
+    sections: [4]bool = .{ true, false, true, false },
 
     const Focus = enum { chunks, disassembly };
 
@@ -511,6 +519,10 @@ const Tui = struct {
                     };
                 };
                 var page: PageBuilder = .{ .arena = arena };
+                const source_lines = if (self.sections[@intFromEnum(Section.source)])
+                    try self.sourceDocument(id, chunk)
+                else
+                    &.{};
                 for (std.meta.tags(Section)) |section| {
                     try page.line(try self.sectionHeader(section), .{ .section = section });
                     if (!self.sections[@intFromEnum(section)]) continue;
@@ -528,9 +540,11 @@ const Tui = struct {
                             try page.text(text.written());
                         },
                         .source => {
-                            var text: std.Io.Writer.Allocating = .init(arena);
-                            try self.writeSourcePage(&text.writer, id, chunk);
-                            try page.text(text.written());
+                            if (self.layout().source_split) {
+                                try page.line("  source is shown alongside the inspector", .none);
+                            } else {
+                                for (source_lines) |source_line| try page.line(source_line, .none);
+                            }
                         },
                         .references => try self.appendRefs(&page, id, chunk),
                     }
@@ -539,6 +553,7 @@ const Tui = struct {
                     .title = try std.fmt.allocPrint(arena, "chunk[0x{x}]", .{id}),
                     .lines = page.lines.items,
                     .actions = page.actions.items,
+                    .source_lines = if (self.layout().source_split) source_lines else &.{},
                 };
             },
             .help => {
@@ -656,28 +671,69 @@ const Tui = struct {
         std.mem.reverse(LineRange, self.transcript_lines.items);
     }
 
-    fn writeSourcePage(self: *Tui, w: *std.Io.Writer, id: ChunkId, chunk: *const bytecode.Chunk) !void {
-        try w.print("chunk #{d}: {d} source-map entries\n", .{ id, chunk.source_map.len });
-        if (chunk.body_span) |span| {
-            try w.writeAll("body   ");
-            try self.writeSpan(w, span);
-            try w.writeByte('\n');
-        }
-        for (chunk.source_map) |entry| {
-            try w.print("{x:0>4}..{x:0>4}  ", .{ entry.start, entry.end });
-            try self.writeSpan(w, entry.span);
-            try w.writeByte('\n');
-        }
-        if (chunk.source_map.len == 0 and chunk.body_span == null) try w.writeAll("(no source information)\n");
+    fn sourceDocument(self: *Tui, id: ChunkId, chunk: *const bytecode.Chunk) ![][]u8 {
+        const arena = self.arena.allocator();
+        const span = chunk.body_span orelse if (chunk.source_map.len > 0) chunk.source_map[0].span else {
+            var missing: PageBuilder = .{ .arena = arena };
+            try missing.line("(no source information)", .none);
+            return missing.lines.items;
+        };
+
+        const label, const source = if (span.file) |file| blk: {
+            const path = self.ev.internTable().get(file);
+            break :blk .{ path, self.ev.readSourceFile(path) catch null };
+        } else blk: {
+            const direct = if (self.session_host) |host| host.directSource(id) else null;
+            break :blk .{ "<repl expression>", direct };
+        };
+
+        var document: PageBuilder = .{ .arena = arena };
+        try document.line(try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ label, span.line, span.column }), .none);
+        const bytes = source orelse {
+            try document.line("(source text is unavailable)", .none);
+            return document.lines.items;
+        };
+        try self.appendSourceExcerpt(&document, bytes, span);
+        return document.lines.items;
     }
 
-    fn writeSpan(self: *Tui, w: *std.Io.Writer, span: bytecode.Chunk.SourceSpan) !void {
-        if (span.file) |file| {
-            try w.writeAll(self.ev.internTable().get(file));
-        } else {
-            try w.writeAll("expression");
+    fn appendSourceExcerpt(self: *Tui, document: *PageBuilder, source: []const u8, span: bytecode.Chunk.SourceSpan) !void {
+        const focus_start = @min(@as(usize, span.offset), source.len);
+        const focus_end = @min(focus_start +| @as(usize, span.len), source.len);
+
+        var start = focus_start;
+        var lines_before: usize = 0;
+        while (start > 0 and lines_before < 2) {
+            start -= 1;
+            if (source[start] == '\n') {
+                lines_before += 1;
+                if (lines_before == 2) start += 1;
+            }
         }
-        try w.print(":{d}:{d}  offset {d}+{d}", .{ span.line, span.column, span.offset, span.len });
+        var end = focus_end;
+        var lines_after: usize = 0;
+        while (end < source.len and lines_after < 3) : (end += 1) {
+            if (source[end] == '\n') lines_after += 1;
+        }
+
+        var line_number = @as(usize, span.line) -| lines_before;
+        var cursor = start;
+        var shown: usize = 0;
+        while (cursor <= end and cursor < source.len and shown < 24) : (shown += 1) {
+            const newline = std.mem.indexOfScalarPos(u8, source, cursor, '\n') orelse source.len;
+            const line_end = @min(newline, end);
+            const active = cursor < focus_end and line_end >= focus_start;
+            var rendered: std.Io.Writer.Allocating = .init(document.arena);
+            if (active and self.color_depth.enabled()) try rendered.writer.writeAll("\x1b[1;33m");
+            try rendered.writer.print("{s} {d:>5} │ ", .{ if (active) "▶" else " ", line_number });
+            try writeSanitizedSource(&rendered.writer, source[cursor..@min(line_end, cursor +| 4096)]);
+            if (line_end > cursor +| 4096) try rendered.writer.writeAll(" …");
+            if (active and self.color_depth.enabled()) try rendered.writer.writeAll("\x1b[0m");
+            try document.line(rendered.written(), .none);
+            line_number += 1;
+            if (newline >= end or newline == source.len) break;
+            cursor = newline + 1;
+        }
     }
 
     // -- navigation ------------------------------------------------------------
@@ -690,6 +746,9 @@ const Tui = struct {
         sidebar_width: usize,
         main_col: usize,
         main_width: usize,
+        source_split: bool,
+        source_col: usize,
+        source_width: usize,
     };
 
     fn layout(self: *const Tui) Layout {
@@ -697,14 +756,22 @@ const Tui = struct {
         const body_rows = self.viewport_rows;
         const split = cols >= 96;
         const sidebar_width = if (split) @min(@max(cols / 4, 26), 38) else 0;
+        const source_split = split and cols >= 140 and self.sections[@intFromEnum(Section.source)];
+        const inspector_width = if (split) cols - sidebar_width - 1 else cols;
+        const source_width = if (source_split) @min(@max(cols / 3, 38), 64) else 0;
+        const main_width = inspector_width -| source_width -| @intFromBool(source_split);
+        const main_col = if (split) sidebar_width + 2 else 1;
         return .{
             .cols = cols,
             .rows = body_rows + 2,
             .body_rows = body_rows,
             .split = split,
             .sidebar_width = sidebar_width,
-            .main_col = if (split) sidebar_width + 2 else 1,
-            .main_width = if (split) cols - sidebar_width - 1 else cols,
+            .main_col = main_col,
+            .main_width = main_width,
+            .source_split = source_split,
+            .source_col = main_col + main_width + @intFromBool(source_split),
+            .source_width = source_width,
         };
     }
 
@@ -1276,6 +1343,12 @@ const Tui = struct {
                 try w.writeAll("\x1b[2m│\x1b[0m");
                 try moveTo(w, first_row + row, layout_now.main_col);
                 try self.drawDisasmRow(w, row, layout_now.main_width);
+                if (layout_now.source_split) {
+                    try moveTo(w, first_row + row, layout_now.source_col - 1);
+                    try w.writeAll("\x1b[2m│\x1b[0m");
+                    try moveTo(w, first_row + row, layout_now.source_col);
+                    try self.drawSourceRow(w, row, layout_now.source_width);
+                }
             } else if (self.focus == .chunks) {
                 try self.drawChunkRow(w, row, cols, rows);
             } else {
@@ -1322,6 +1395,12 @@ const Tui = struct {
                 try w.writeAll("\x1b[2m│\x1b[0m");
                 try moveTo(w, row + 2, layout_now.main_col);
                 try self.drawDisasmRow(w, row, layout_now.main_width);
+                if (layout_now.source_split) {
+                    try moveTo(w, row + 2, layout_now.source_col - 1);
+                    try w.writeAll("\x1b[2m│\x1b[0m");
+                    try moveTo(w, row + 2, layout_now.source_col);
+                    try self.drawSourceRow(w, row, layout_now.source_width);
+                }
             } else if (self.focus == .chunks) {
                 try self.drawChunkRow(w, row, layout_now.cols, rows);
             } else {
@@ -1358,6 +1437,10 @@ const Tui = struct {
         } else if (idx == self.page.lines.len and self.page.lines.len != 0) {
             try writeAnsiWindow(w, "\x1b[2m(end)\x1b[0m", 0, width);
         }
+    }
+
+    fn drawSourceRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize) !void {
+        if (row < self.page.source_lines.len) try writeAnsiWindow(w, self.page.source_lines[row], 0, width);
     }
 
     fn drawChunkRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize, rows: usize) !void {
@@ -1448,6 +1531,16 @@ const Tui = struct {
 
 fn moveTo(w: *std.Io.Writer, row: usize, col: usize) !void {
     try w.print("\x1b[{d};{d}H", .{ row, col });
+}
+
+fn writeSanitizedSource(w: *std.Io.Writer, source: []const u8) !void {
+    for (source) |byte| switch (byte) {
+        '\t' => try w.writeAll("    "),
+        '\r' => {},
+        0x1b => try w.writeAll("␛"),
+        0...8, 10...12, 14...26, 28...0x1f, 0x7f => try w.writeByte('?'),
+        else => try w.writeByte(byte),
+    };
 }
 
 const BarKind = enum { header, footer };

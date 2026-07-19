@@ -116,6 +116,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 }
 
 const Repl = struct {
+    const VmSource = struct {
+        first: types.ChunkId,
+        end: types.ChunkId,
+        entry: types.ChunkId,
+        text: []u8,
+    };
+
     allocator: std.mem.Allocator,
     proc_init: std.process.Init,
     io: std.Io,
@@ -143,6 +150,10 @@ const Repl = struct {
     /// or name tree grows. Bare queries share it instead of rescanning millions
     /// of chunks for every command.
     vm_index: ?engine.bytecode.inspect.NameIndex = null,
+    /// Direct REPL sources are not backed by the evaluator's file cache. Keep
+    /// the source alongside the chunk generation so the VM inspector can show
+    /// real text for expression spans as well as imported-file spans.
+    vm_sources: std.ArrayListUnmanaged(VmSource) = .empty,
     /// Set only while the full-screen REPL executes one input. Every ordinary
     /// command/result/diagnostic is routed here, preserving the shared command
     /// implementation while keeping terminal writes inside the owned screen.
@@ -180,6 +191,8 @@ const Repl = struct {
         for (self.loaded.items) |p| self.allocator.free(p);
         self.loaded.deinit(self.allocator);
         if (self.vm_index) |*index| index.deinit();
+        for (self.vm_sources.items) |source| self.allocator.free(source.text);
+        self.vm_sources.deinit(self.allocator);
         self.history.deinit();
     }
 
@@ -292,6 +305,7 @@ const Repl = struct {
             .ctx = self,
             .executeFn = sessionExecute,
             .focusFn = sessionFocus,
+            .sourceFn = sessionSource,
             .quitFn = sessionQuit,
         }) catch |err| switch (err) {
             error.NotATerminal => return,
@@ -322,6 +336,17 @@ const Repl = struct {
     fn sessionFocus(raw: *anyopaque) ?types.ChunkId {
         const self: *Repl = @ptrCast(@alignCast(raw));
         return self.vm_focus;
+    }
+
+    fn sessionSource(raw: *anyopaque, chunk_id: types.ChunkId) ?[]const u8 {
+        const self: *Repl = @ptrCast(@alignCast(raw));
+        var i = self.vm_sources.items.len;
+        while (i > 0) {
+            i -= 1;
+            const source = self.vm_sources.items[i];
+            if (chunk_id == source.entry or (chunk_id >= source.first and chunk_id < source.end)) return source.text;
+        }
+        return null;
     }
 
     fn sessionQuit(raw: *anyopaque) bool {
@@ -469,12 +494,28 @@ const Repl = struct {
     /// Evaluate an expression in the repl scope. Failures render to stderr
     /// and yield null.
     fn evalExpr(self: *Repl, source: []const u8) !?Value {
+        const first_chunk = self.ev.chunkRegistry().count();
         const result = self.ev.evaluateWithScopeResult(source, self.scope) catch |err| {
+            try self.rememberVmSource(source, first_chunk, null);
             try self.evalFailure(source, err);
             return null;
         };
+        try self.rememberVmSource(source, first_chunk, result.entry_chunk);
         self.vm_focus = self.focusForValue(result.value, result.entry_chunk);
         return result.value;
+    }
+
+    fn rememberVmSource(self: *Repl, source: []const u8, first: types.ChunkId, entry: ?types.ChunkId) !void {
+        const end = self.ev.chunkRegistry().count();
+        if (first == end and entry == null) return;
+        const owned = try self.allocator.dupe(u8, source);
+        errdefer self.allocator.free(owned);
+        try self.vm_sources.append(self.allocator, .{
+            .first = first,
+            .end = end,
+            .entry = entry orelse std.math.maxInt(types.ChunkId),
+            .text = owned,
+        });
     }
 
     fn printResult(self: *Repl, value: Value, source: []const u8) !void {
