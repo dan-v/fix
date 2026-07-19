@@ -48,9 +48,7 @@ class AdapterInvocationTests(unittest.TestCase):
 
 
 def lix_root():
-    expr = f"builtins.toString (import {runner.REPO}/npins).lix"
-    out = subprocess.check_output(["nix-instantiate", "--eval", "--expr", expr], text=True)
-    return Path(out.strip().strip('"')) / "tests/functional2/lang"
+    return runner.pin_path("lix") / "tests/functional2/lang"
 
 
 def command_count(test_file):

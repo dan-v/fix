@@ -133,14 +133,20 @@ class Result:
 
 def pin_path(name: str) -> Path:
     """Resolve an npins pin to its /nix/store path (fetching if needed)."""
-    expr = f"builtins.toString (import {REPO}/npins).{name}"
+    # Determinate Nix can return a lazy-tree store path from fetchGit without
+    # materializing it. Reading the root forces the corpus into the store before
+    # Python traverses it.
+    expr = f"""
+        let source = (import {REPO}/npins).{name};
+        in builtins.seq (builtins.readDir source) (builtins.toString source)
+    """
     p = subprocess.run(
-        ["nix-instantiate", "--eval", "--expr", expr],
+        ["nix-instantiate", "--eval", "--strict", "--raw", "--expr", expr],
         capture_output=True, text=True,
     )
     if p.returncode != 0:
         sys.exit(f"failed to resolve pin {name!r}:\n{p.stderr}")
-    return Path(p.stdout.strip().strip('"'))
+    return Path(p.stdout.strip())
 
 
 # --------------------------------------------------------------------------

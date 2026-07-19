@@ -1,7 +1,6 @@
 import importlib.util
 import sys
 import re
-import subprocess
 import tomllib
 import unittest
 from collections import Counter
@@ -27,9 +26,17 @@ CUSTOM_COUNTS = {
 
 
 def pin(name):
-    expr = f"builtins.toString (import {runner.REPO}/npins).{name}"
-    out = subprocess.check_output(["nix-instantiate", "--eval", "--expr", expr], text=True)
-    return Path(out.strip().strip('"'))
+    return runner.pin_path(name)
+
+
+class PinResolutionTests(unittest.TestCase):
+    def test_pin_resolution_materializes_lazy_source_trees(self):
+        completed = runner.subprocess.CompletedProcess([], 0, "/nix/store/source", "")
+        with mock.patch.object(runner.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(Path("/nix/store/source"), runner.pin_path("lix"))
+        argv = run.call_args.args[0]
+        self.assertIn("--raw", argv)
+        self.assertIn("builtins.readDir source", argv[-1])
 
 
 def declarative_inventory(root):

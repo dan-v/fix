@@ -14,9 +14,7 @@ SPEC.loader.exec_module(runner)
 
 
 def snix_root():
-    expr = f"builtins.toString (import {runner.REPO}/npins).snix"
-    out = subprocess.check_output(["nix-instantiate", "--eval", "--expr", expr], text=True)
-    return Path(out.strip().strip('"')) / "contrib/nix-language-test-suite/tests/cases"
+    return runner.pin_path("snix") / "contrib/nix-language-test-suite/tests/cases"
 
 
 class SnixBehaviorTests(unittest.TestCase):
