@@ -1,9 +1,7 @@
 //! Lazily allocated caches owned by an evaluator OS thread.
 //!
-//! These used to be large `threadlocal` arrays. Static TLS made every thread
-//! carry ~840 KiB of evaluator-only storage, including threads that never
-//! execute VM code. Keep only one pointer in TLS and allocate the
-//! cache bundle when an evaluator worker first registers or uses it.
+//! TLS holds one lazy pointer; the cache bundle is allocated only for threads
+//! that execute evaluator code.
 
 const std = @import("std");
 const types = @import("runtime").types;
@@ -51,8 +49,7 @@ var registry: [max_workers]?*Caches = @splat(null);
 
 /// Return this OS thread's cache bundle, allocating it on first VM use.
 /// Zero is the empty sentinel for every cache's heap token, so byte-zeroing is
-/// sufficient and avoids materializing the tagged `Value.null_val` across
-/// hundreds of thousands of initialized TLS bytes.
+/// sufficient; individual tagged values need not be initialized.
 pub fn get() *Caches {
     if (local) |caches| return caches;
     const caches = std.heap.c_allocator.create(Caches) catch @panic("VM thread cache allocation failed");

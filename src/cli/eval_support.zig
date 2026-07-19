@@ -240,9 +240,8 @@ fn getSourceMode(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Op
     // success paths below hand `base` off or free it explicitly.
     errdefer base.deinit(allocator);
 
-    // Apply `-A`/`--arg`/`--argstr`. When they wrap the text, the wrapper
-    // prefix shifts every byte offset, so the file path no longer describes
-    // `text`: drop the whole base (freeing its text and abs_path).
+    // Apply `-A`/`--arg`/`--argstr`. Wrapped text has offsets unrelated to the
+    // source file, so drop the original source metadata.
     const selected = try applySelectors(ev, base.text, options, completion_auto_call);
     if (selected.owned) {
         var wrapped = selected;

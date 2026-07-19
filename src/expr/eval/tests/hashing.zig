@@ -1,5 +1,5 @@
 const std = @import("std");
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 // Test vectors independently verified via `printf 'abc' | md5sum` /
 // `printf 'abc' | sha512sum` rather than trusting self-consistency.

@@ -1,5 +1,5 @@
 const std = @import("std");
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 test "a lambda body returning a bare local evaluates correctly" {
     // Exercises the loc_get/loc_get_ret fusion in emitRet.

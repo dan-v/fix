@@ -167,9 +167,8 @@ fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Evaluator, sour
         if (traceFrameSource(ev, source, frame)) |frame_source| {
             var located_diag = diag;
             located_diag.source_path = diag.source_path orelse frame.source_path orelse "expression";
-            // The excerpt and caret already identify the expression.  `near`
-            // is useful for terse parser diagnostics, but merely repeats (and
-            // for multi-line spans used to spill) VM trace source here.
+            // The excerpt and caret already identify the expression, so omit a
+            // redundant `near` fragment for VM trace frames.
             try ev.writeTraceDiagnostic(writer, frame_source, located_diag, use_color);
             return;
         }

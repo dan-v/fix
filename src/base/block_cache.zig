@@ -1,18 +1,12 @@
 //! Bounded reuse cache for large allocations.
 //!
-//! `SmpAllocator` (the release-mode process gpa) sends every allocation of
-//! 64 KB or more straight to `PageAllocator` — a fresh `mmap` whose pages
-//! are minor-faulted (and kernel-zeroed) on first touch, then `munmap`ed on
-//! free. An eval-heavy run cycles ~9K such blocks (~2 GB of first-touch:
-//! per-file parse/compile arenas, builtin temp buffers), costing ~0.5 s of
-//! fault handling per NixOS toplevel at w=1 — >20% of wall.
+//! The process allocator directly maps large allocations, so short-lived parse,
+//! compile, and builtin buffers otherwise repeat mapping and first-touch work.
 //!
 //! This wrapper rounds cacheable sizes up to power-of-two classes and keeps
 //! freed blocks on a per-class free stack for reuse, so repeated large
-//! temporaries stop re-faulting. Bounds: classes 64 KB..64 MB, per-class
-//! block caps sized so the worst-case retained set is ~220 MB (blocks are
-//! only retained if the workload actually allocated them). Anything outside
-//! the cacheable range (or over-aligned) passes through untouched.
+//! temporaries stop re-faulting. Classes span 64 KB..64 MB and use decreasing
+//! retention caps. Anything outside the range or over-aligned passes through.
 //!
 //! Invariant: every user block whose `len` falls in the cacheable range was
 //! allocated with its full class capacity from the backing allocator, so
@@ -26,15 +20,9 @@ const Alignment = std.mem.Alignment;
 const SpinMutex = @import("sync.zig").SpinMutex;
 const hugetlb = @import("hugetlb.zig");
 
-// When hugetlb backing is engaged (see base/hugetlb.zig for the policy and
-// the numbers), blocks of 2 MB and up come from explicit hugetlb mmaps
-// instead of the backing allocator's PageAllocator path: one 2 MB TLB entry
-// replaces 512 4 KB ones and first-touch faults drop 512x. The mappings are
-// non-NORESERVE, DONTFORK, and write-prefaulted, so pool/NUMA/cgroup failure
-// is reported during setup and the block falls back to the backing allocator
-// instead of risking a later SIGBUS. Ownership is tracked
-// (`huge_ptrs`/`huge_lens`) so free/resize/remap/deinit munmap these blocks
-// instead of handing foreign memory to the backing allocator.
+// With hugetlb enabled, blocks of at least 2 MB use explicit huge-page
+// mappings. Setup failures fall back to the backing allocator. The ownership
+// table ensures these mappings are unmapped through the matching API.
 const huge_page_size: usize = hugetlb.huge_page_size;
 
 const min_size_log2: u6 = 16; // 64 KB — the smallest block class
@@ -49,8 +37,7 @@ const max_blocks_per_class = 8;
 /// straight to PageAllocator). That's the cacheable-range floor: a
 /// (32 KB, 64 KB] request gets a 64 KB class block here — the unused
 /// tail pages are never touched, so they cost nothing — instead of a
-/// fresh mmap/munmap per use (measured ~4.6K such cycles per NixOS
-/// eval at w=1, one ~36-60 KB parse-scratch block per file).
+/// fresh mapping per use.
 const direct_map_threshold: usize = 32 * 1024;
 
 fn classSize(class: usize) usize {
@@ -85,10 +72,8 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
         blocks: [size_class_count][max_blocks_per_class][*]u8 = undefined,
         counts: [size_class_count]u8 = @splat(0),
 
-        /// (ptr, rounded_len) of blocks this cache mmap'd itself with
-        /// MAP_HUGETLB. Small fixed table under `mu` — blocks of ≥2 MB
-        /// number in the dozens per eval. Full table = fall back to the
-        /// backing allocator for further blocks (never lose a free).
+        /// Hugetlb blocks owned by this cache. A full table makes later
+        /// allocations fall back to the backing allocator.
         /// Lookups are guarded by a `len >= huge_page_size` check on every path,
         /// so sub-2 MB traffic never scans it.
         huge_ptrs: [max_tracked_huge_blocks]usize = @splat(0),
@@ -141,10 +126,8 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
 
         /// Release every *parked* block (free stacks only — live allocations
         /// are untouched) and keep the cache usable. The evaluator's
-        /// build-phase release calls this after the heap teardown floods the
-        /// stacks with dead segment blocks that would otherwise sit retained
-        /// (~200 MB) for the whole build. Thread-safe: the stacks are drained
-        /// under `mu`, the frees run outside it.
+        /// build-phase release calls this after heap teardown returns segment
+        /// blocks. Thread-safe: stacks are drained under `mu`; frees run outside.
         pub fn trim(self: *Self) void {
             var drained: [size_class_count][max_blocks_per_class][*]u8 = undefined;
             var drained_counts: [size_class_count]u8 = undefined;

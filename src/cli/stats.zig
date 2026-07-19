@@ -33,7 +33,7 @@ pub fn report(ev: *Evaluator) void {
         .{ s.speculative_submitted, s.speculative_rejected, s.urgent_submitted, s.urgent_rejected, s.pops, s.steals, s.parks, s.sweeps, s.evicts, s.novel_ok, s.spec_bails },
     );
     {
-        const d = ev.deferred_table.stats();
+        const d = ev.deferredStats();
         std.debug.print("deferred: registered={d} compiled={d} ({d:.1}% forced)\n", .{
             d.registered,                                                                                                                d.compiled,
             if (d.registered == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(d.compiled)) / @as(f64, @floatFromInt(d.registered)),

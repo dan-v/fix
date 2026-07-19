@@ -254,13 +254,9 @@ pub const Options = struct {
     /// huge pages. `null` selects `auto`; resolution happens in
     /// `setup.applyMemoryBacking`, before the heap maps.
     hugetlb: ?hugetlb.Mode = null,
-    /// Speculation (eager background thunk forcing) is ON by default: it is
-    /// worth ~20-32% wall at --workers>1 (spec-off→on: 2.62→2.11s with GC,
-    /// 2.10→1.43s without), and the RSS it costs is absorbed by the GC without
-    /// thrashing (3→9 minor collections, +70ms mark — measured, see
-    /// docs/compiler/lazy-compile.md era). `--no-spec-thunks` opts
-    /// out (bounds RSS at the cost of that wall); it was the pre-2026-07
-    /// default when RSS was over-weighted vs the measured GC cost.
+    /// Enable background thunk forcing unless `--no-spec-thunks` is given.
+    /// Disabling it bounds speculative work and memory at the cost of less
+    /// parallelism.
     disable_spec_thunks: bool = false,
     disable_fanout: bool = false,
     /// `--mem-report[=dump]`: peak memory attribution at evaluator teardown.

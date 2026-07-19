@@ -193,12 +193,8 @@ const StackFrame = struct {
     builtin_id: u16 = no_builtin,
 };
 
-// Must comfortably exceed the deepest instrumented-region nesting: force
-// chains alone reach depth 269+ on the NixOS toplevel (see the age-at-force
-// `max_depth` diag) and each force level pushes ~3-4 region frames. At 256
-// the overflow silently dropped deep frames, so their time was misattributed
-// to whatever shallow ancestor happened to be tracked — e.g. `map`'s
-// per-builtin excl read 661M cy when its true body cost is ~60M.
+// Large enough that nested force instrumentation does not truncate and
+// attribute dropped regions to a shallower ancestor.
 const stack_cap: usize = 4096;
 
 /// Per-thread instrumentation stack. Only worker 0 writes to it.

@@ -1,39 +1,19 @@
 //! Explicit 2 MB huge-page (hugetlb) backing for the evaluator's big memory.
 //!
-//! Why: the eval's working set is dominated by a handful of giant mappings
-//! (the flat object store, the ≥2 MB block-cache blocks that back the
-//! value/attr segment stores and parse arenas). Backing them with explicit
-//! hugetlb pages replaces 512 4 KB TLB entries with one 2 MB entry and cuts
-//! first-touch faults 512x — measured −8.3% wall at w=1 on the NixOS
-//! toplevel, −57% faults / −47% dTLB misses at w=8, and it removes a +202 ms
-//! bimodal slow mode under memory-pressure co-load. Transparent huge pages
-//! work well for the flat store when its long sequential reservation is
-//! explicitly advised, but do not reliably cover the evaluator's shorter-
-//! lived block and segment mappings; the reserved pool is the deterministic
-//! route for those mappings and remains faster for the flat store too.
+//! Policy shared by `block_cache.zig` and `segments.zig`. Candidate mappings
+//! reserve, exclude themselves from `fork`, and write-prefault before they are
+//! published. Any failure falls back to ordinary mappings.
 //!
-//! Policy lives here; the two consumers are `block_cache.zig` (class blocks
-//! ≥2 MB and >64 MB pass-throughs) and `segments.zig` (the flat store's
-//! reserved prefix). Everything is fail-soft: every candidate mapping
-//! reserves its pool pages up front, is excluded from `fork`, and is
-//! synchronously write-prefaulted before publication. Pool/NUMA/cgroup
-//! shortages therefore fail during setup (handled) instead of becoming a
-//! later SIGBUS, and exec-only subprocesses cannot create private-hugetlb
-//! COW faults.
-//!
-//! Mode is process-global, default *unconfigured* (= off) so that library
-//! consumers and early allocations never engage hugetlb before the CLI has
-//! resolved the user's intent (see `cli/setup.zig:applyMemoryBacking`):
+//! Mode is process-global and starts unconfigured so early allocations cannot
+//! engage hugetlb before CLI setup resolves the user's intent:
 //!   - `off`  — never.
 //!   - `on`   — always try; warn once when the pool can't serve a mapping.
 //!   - `auto` — engage only when the 2 MB pool has unreserved capacity for a
 //!     sensible floor (`auto_floor_bytes`) at first use; individual mmap
 //!     failures after that fall back silently per-mapping.
 //!
-//! Accounting: hugetlb pages are invisible to VmRSS/VmHWM/statm, so every
-//! byte mapped through here is counted in `mapped_bytes`/`peak_mapped_bytes`
-//! for the RSS-adjacent reporters (`runtime/gc.zig` footprint helpers,
-//! `--mem-report`, the progress/timeline memory counters).
+//! Hugetlb pages are absent from conventional RSS counters, so this module
+//! tracks current and peak mapped bytes explicitly.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -211,23 +191,14 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
 /// guarantee the range holds no live data (the replaced mapping's contents
 /// are discarded).
 ///
-/// Two-step on purpose — the obvious single `mmap(MAP_FIXED|MAP_HUGETLB)`
-/// is NOT atomic on failure: the kernel unmaps the target range *before*
-/// attempting the hugetlb reservation, so pool exhaustion leaves a hole,
-/// and even repairing the hole immediately is racy — between the failed
-/// mmap and the repair, a concurrent thread's plain `mmap(NULL, ...)` (the
-/// backing page allocator) can be placed *inside* the hole; the repair then
-/// clobbers that foreign block and its later munmap blows a hole in the
-/// caller's region (observed as a mid-run SIGSEGV under pool drain).
-/// Instead:
+/// A failing `MAP_FIXED` mmap may unmap the target before reserving huge pages,
+/// leaving a race while the hole is repaired. Avoid that window by:
 ///   1. `map(len)` at a kernel-chosen address — reservation, DONTFORK, and
 ///      prefault failures happen HERE with no effect on the target mapping;
 ///   2. `mremap(MAYMOVE|FIXED)` the fresh mapping onto the target — a
 ///      single syscall under mmap_lock, so no userspace-visible window
 ///      where the target is unmapped.
-/// On any failure the target range is left exactly as it was (best-effort
-/// re-assert on the vanishingly-rare post-unmap mremap failure) and false
-/// is returned.
+/// On failure the target is preserved or restored, and false is returned.
 pub fn overlayFixed(target: [*]u8, len: usize) bool {
     if (comptime builtin.os.tag != .linux) return false;
     std.debug.assert(@intFromPtr(target) % huge_page_size == 0 and len % huge_page_size == 0 and len > 0);

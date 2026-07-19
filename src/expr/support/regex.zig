@@ -515,11 +515,8 @@ fn matchesPosixClass(class: PosixClass, c: u8) bool {
     };
 }
 
-/// Compiled-pattern cache for the regex builtins (`builtins.match` /
-/// `builtins.split`). C++ Nix keeps the equivalent per-EvalState
-/// `regexCache`: NixOS evals call `match` thousands of times over a
-/// handful of distinct patterns, and compiling dwarfs matching for the
-/// short subjects involved. Keyed by the pattern text's InternId (the
+/// Compiled-pattern cache for `builtins.match` and `builtins.split`.
+/// Keyed by the pattern text's InternId (the
 /// intern table dedupes by content, and its byte storage is stable, so
 /// compiled nodes may reference the source slice safely). Entries live
 /// until `deinit`. A compiled `Pattern` is immutable after `compile`

@@ -59,7 +59,6 @@ pub fn builtinConcatLists(self: *VM, arg: Value) !Value {
     // of how each outer element was represented.
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
-    // gc: re-fetch — the outer range may move across the force
     const n = lists.len;
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -88,7 +87,6 @@ pub fn builtinListToAttrs(self: *VM, arg: Value) !Value {
     var entry_idx: shared.NameIndex = .{};
     defer entry_idx.deinit(self.allocator);
 
-    // gc: re-fetch — range may move across the force
     const list_id = value.asObjectId();
     const n = try self.heap.getListLen(list_id);
     var i: usize = 0;
@@ -129,9 +127,8 @@ pub fn callComparator(self: *VM, cmp: Value, left: Value, right: Value) !bool {
 /// float value (so `1 == 1.0` and the int/float merge rule both hold),
 /// with `-0.0` normalized to `0.0`. String-likes hash by their canonical
 /// text intern id (string equality is id equality). Compound keys
-/// (lists/attrs/closures/...) share one sentinel bucket so they are
-/// always exhaustively compared — identical to the old linear scan, just
-/// without inflating the simple-key buckets.
+/// (lists/attrs/closures/...) share one sentinel bucket and are exhaustively
+/// compared without inflating the simple-key buckets.
 fn gcKeyMix(tag: u64, x: u64) u64 {
     var h = (tag *% 0x9E3779B97F4A7C15) ^ x;
     h *%= 0xC2B2AE3D27D4EB4F;
@@ -155,13 +152,8 @@ fn gcKeyHashCode(self: *VM, key: Value) !u64 {
     };
 }
 
-/// O(1)-amortized dedup set for `genericClosure` keys, replacing the old
-/// O(N) linear scan per insert (O(N²) over the closure). The module
-/// system's `genericClosure` over the full module set (N≈3800 on a NixOS
-/// toplevel) spent ~114M cy on that scan, all on the serial critical
-/// path. Buckets keyed by `gcKeyHashCode`; membership confirmed by the
-/// same `valuesEqualForced` the linear scan used, so the result is
-/// byte-identical.
+/// O(1)-amortized deduplication for `genericClosure` keys. Buckets use
+/// `gcKeyHashCode`; membership is confirmed by `valuesEqualForced`.
 pub const GcKeySet = struct {
     index: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(Value)) = .empty,
     seen: std.ArrayListUnmanaged(vm_equality.EqualityPair) = .empty,
@@ -220,8 +212,6 @@ pub fn builtinElem(self: *VM, needle: Value, list_arg: Value) !Value {
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
 
-    // gc: pass the list id (not a raw slice) — the range may move across the
-    // per-element equality forces inside listContainsValue.
     return Value.boolVal(try vm_equality.listContainsValue(self, needle, list.asObjectId()));
 }
 
@@ -242,7 +232,6 @@ pub fn builtinAll(self: *VM, pred_arg: Value, list_arg: Value) !Value {
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
 
-    // gc: re-fetch — range may move across the force
     const list_id = list.asObjectId();
     const n = try self.heap.getListLen(list_id);
     var i: usize = 0;
@@ -260,7 +249,6 @@ pub fn builtinAny(self: *VM, pred_arg: Value, list_arg: Value) !Value {
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
 
-    // gc: re-fetch — range may move across the force
     const list_id = list.asObjectId();
     const n = try self.heap.getListLen(list_id);
     var i: usize = 0;
@@ -286,7 +274,6 @@ pub fn builtinFilter(self: *VM, pred_arg: Value, list_arg: Value) !Value {
 
     const items = try self.heap.getList(list_id);
     vm_force.forceListAccelerate(self, list_id, items);
-    // gc: re-fetch — range may move across the force
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const item = try self.heap.getListItem(list_id, i);
@@ -308,12 +295,8 @@ pub fn builtinMap(self: *VM, fn_arg: Value, list_arg: Value) !Value {
     const out = try self.allocator.alloc(Value, items.len);
     defer self.allocator.free(out);
 
-    // Reuse the genlist_apply chunk (`call_tail upvalues[0] upvalues[1]`).
-    // The chunk doesn't care that the second upvalue is a list element
-    // instead of an integer index — it just calls `func arg`. This swap
-    // drops the per-element `BuiltinClosureObject` that the old
-    // `mapValue`-wrapped path allocated alongside the Thunk; now we
-    // have one Object per element instead of two.
+    // `genlist_apply` only calls `upvalues[0] upvalues[1]`, so it also serves
+    // list elements and avoids a distinct wrapper closure for each one.
     const apply_chunk_id = self.registry.well_known.genlist_apply;
     const speculatable = shared.isSpeculatableUserFunc(self, func);
     for (items, out) |item, *mapped| {
@@ -344,7 +327,6 @@ pub fn builtinConcatMap(self: *VM, fn_arg: Value, list_arg: Value) !Value {
     // The final direct heap builder copies their elements exactly once.
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
-    // gc: re-fetch — the input range may move across the force
     const n = items.len;
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -368,16 +350,8 @@ pub fn builtinGenList(self: *VM, fn_arg: Value, count_arg: Value) !Value {
     const out = try self.allocator.alloc(Value, len);
     defer self.allocator.free(out);
 
-    // Each element is a bytecode thunk over the registry's genlist_apply
-    // stub chunk with upvalues `[func, index]`. This skips the
-    // per-element `builtin_closure` object that the old `mapValue`-wrapped
-    // path allocated — halving the Object slots used by genList output.
-    //
-    // The old path piggybacked on `makeThunk`'s `shouldSpeculateClosure`
-    // hook for `mapValue` builtin closures, which checked whether the
-    // wrapped user function was a substantial closure and submitted a
-    // speculative force task if so. Replicate that check here so helpers
-    // still pre-compute heavy genList bodies on the side.
+    // Each element is one bytecode thunk over `genlist_apply`, with upvalues
+    // `[func, index]`. Submit heavy user functions for speculative forcing.
     const apply_chunk_id = self.registry.well_known.genlist_apply;
     const speculatable = shared.isSpeculatableUserFunc(self, func);
     for (out, 0..) |*value, i| {
@@ -426,7 +400,6 @@ pub fn builtinPartition(self: *VM, pred_arg: Value, list_arg: Value) !Value {
     const list_id = list.asObjectId();
     const items = try self.heap.getList(list_id);
     vm_force.forceListAccelerate(self, list_id, items);
-    // gc: re-fetch — range may move across the force
     const n = items.len;
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -467,7 +440,6 @@ pub fn builtinGroupBy(self: *VM, fn_arg: Value, list_arg: Value) !Value {
     const list_id = list.asObjectId();
     const items = try self.heap.getList(list_id);
     vm_force.forceListAccelerate(self, list_id, items);
-    // gc: re-fetch — range may move across the force
     const n = items.len;
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -516,7 +488,6 @@ pub fn builtinGenericClosure(self: *VM, arg: Value) !Value {
     defer vm_force.rootsEnd(self, gc_roots);
 
     const key_name = try self.intern.intern("key");
-    // gc: re-fetch — range may move across genericClosureAppend's force
     const start_id = start_set.asObjectId();
     const start_n = try self.heap.getListLen(start_id);
     var s: usize = 0;
@@ -530,7 +501,6 @@ pub fn builtinGenericClosure(self: *VM, arg: Value) !Value {
         const produced = try vm_force.forceValue(self, try vm_closures.callValue(self, operator, result.items[index]));
         if (!produced.isList()) return error.TypeError;
         vm_force.rootKeep(self, produced);
-        // gc: re-fetch — range may move across genericClosureAppend's force
         const produced_id = produced.asObjectId();
         const produced_n = try self.heap.getListLen(produced_id);
         var p: usize = 0;
@@ -562,7 +532,6 @@ pub fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Va
     // is an arg until the first iteration overwrites `acc`.)
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
-    // gc: re-fetch — range may move across the force
     const n = items.len;
     var i: usize = 0;
     while (i < n) : (i += 1) {

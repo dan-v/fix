@@ -82,20 +82,12 @@ fn topUsage(allocator: std.mem.Allocator) []const u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    // The std-provided Debug `gpa` captures a DWARF stack trace on every
-    // alloc/free, under a global mutex. On an eval-heavy run that's a ~30x
-    // slowdown (w=1 nixos_toplevel: ~80s vs ~3s ReleaseSafe) — slow enough
-    // to look like a hang, and it masks any real parallelism behaviour
-    // because the allocator serialises everything. Use our own
-    // DebugAllocator with trace capture off: same double-free / leak
-    // detection, none of the per-alloc unwind cost. Release builds keep
-    // the fast std `gpa` untouched (perf numbers depend on it).
+    // Debug builds retain allocator diagnostics without capturing a stack on
+    // every allocation, which would serialize evaluation on the unwind path.
     var debug_gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer _ = debug_gpa.deinit();
-    // Release: wrap the gpa in the large-block reuse cache — SmpAllocator
-    // maps/unmaps every >=64KB allocation, and the eval's ~9K large
-    // temporaries otherwise re-minor-fault ~2GB of pages per run (>20% of
-    // w=1 wall in fault handling). See runtime/block_cache.zig.
+    // Release builds reuse large temporary blocks to avoid repeated mappings
+    // and first-touch faults.
     var big_blocks = process_support.LargeBlockAllocator.init(init.gpa);
     defer big_blocks.deinit();
     const allocator = if (comptime builtin.mode == .Debug) debug_gpa.allocator() else big_blocks.allocator();

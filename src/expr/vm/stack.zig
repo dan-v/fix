@@ -21,13 +21,8 @@ const ChunkId = types.ChunkId;
 /// that pushed it and is subject to the `max-call-depth` cap; a
 /// passthrough frame inherits its parent's depth unchanged.
 ///
-/// `inline` so `is_call` folds to a compile-time constant at each call
-/// site (every caller passes a literal), collapsing the depth-accounting
-/// branches. Before the call-depth work landed this was small enough that
-/// LLVM inlined it into the hot callers (`doCall`, `runIsolatedFrame`,
-/// `opApplyArg`); the added bookkeeping pushed it just over the inline
-/// threshold, turning every frame push into an out-of-line call (~+9%
-/// instructions on call-heavy code). Forcing inline restores that.
+/// `inline` lets the literal `is_call` argument remove irrelevant depth
+/// accounting branches at each call site.
 pub inline fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32, upvalues: ?[]const Value, is_call: bool) !void {
     if (self.frames_len >= types.max_frames) return error.FrameOverflow;
     if (arg_count > ch.local_count) return error.InvalidCallFrame;

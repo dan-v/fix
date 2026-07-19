@@ -1,5 +1,5 @@
 const std = @import("std");
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 test "stringLength counts bytes, not unicode codepoints" {
     var ev = try Evaluator.init(std.testing.allocator, 0);

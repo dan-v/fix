@@ -1,9 +1,7 @@
 //! Bounded output capture for the interactive REPL screen.
 //!
-//! Evaluation output can be arbitrarily large (a NixOS value easily spans
-//! millions of lines), so the TUI must not use an allocating writer and hope
-//! for the best. `Capture` is an ordinary `std.Io.Writer` that counts every
-//! byte but retains only the newest `limit` bytes for the visible transcript.
+//! Evaluation output is unbounded. `Capture` counts every byte but retains only
+//! the newest `limit` bytes for the visible transcript.
 
 const std = @import("std");
 

@@ -149,7 +149,7 @@ const Repl = struct {
     debug_tui: ?*debugger_tui.DebuggerTui = null,
 
     /// Scope bindings, insertion-ordered. Keys are owned; values are heap
-    /// Values kept alive via `gc_extra_roots` + the scope attrset.
+    /// Values kept alive via the evaluator's external roots and scope attrset.
     bindings: std.StringArrayHashMapUnmanaged(Value) = .empty,
     /// The bindings as one attrset value, rebuilt when bindings change.
     /// Compiled into every input chunk as its ambient scope.

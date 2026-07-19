@@ -4,7 +4,7 @@
 //! `src/cli/debugger.zig`.
 
 const std = @import("std");
-const eval_mod = @import("../../eval.zig");
+const eval_mod = @import("../../evaluator.zig");
 const Evaluator = eval_mod.Evaluator;
 const DebugSession = eval_mod.DebugSession;
 const Value = @import("runtime").value.Value;

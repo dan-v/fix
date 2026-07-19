@@ -31,8 +31,7 @@ pub const age_bucket_shift: u6 = 10; // bucket 0 = age < 2^10 cycles
 pub const age_bucket_count = 26;
 pub const AgeBucket = struct { n: u64 = 0, excl: u64 = 0, incl_top: u64 = 0 };
 pub var age_buckets: [age_bucket_count]AgeBucket = @splat(.{});
-/// Ages >= this many cycles count as "old" (~0.5ms at 3.6GHz — plenty
-/// of time for a helper to have picked the thunk up).
+/// Ages at or above this TSC delta count as old enough to race ahead.
 pub const age_old_threshold: u64 = 1 << 21;
 pub var age_offloadable_incl: u64 = 0;
 pub var age_old_top_n: u64 = 0;
@@ -52,9 +51,8 @@ const AgeFrame = struct {
     bucket: u8,
     is_old: bool,
 };
-/// Deeper than the shared prof stack: main's demand chain routinely
-/// nests thousands of claimed forces (the module fixpoint recursion),
-/// and a dropped frame mis-attributes its whole subtree.
+/// Deeper than the shared profiler stack because every claimed force can add
+/// a frame; dropping one misattributes its subtree.
 const age_stack_cap: usize = 65536;
 threadlocal var age_stack: [age_stack_cap]AgeFrame = undefined;
 threadlocal var age_stack_len: usize = 0;

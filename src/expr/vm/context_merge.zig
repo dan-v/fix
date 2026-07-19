@@ -1,11 +1,8 @@
-//! The one GC-safe VM string-context merge algorithm.
+//! Canonical GC-safe string-context merge algorithm.
 //!
 //! String concatenation (`vm/strings.zig`) and the context builtins
-//! (`vm/builtins/string_context.zig`) both merge string-context attrsets. They
-//! previously each carried their own copy, which drifted: one had weaker GC
-//! rooting than the other. Keeping the algorithm here — descriptor
-//! insertion/merge, `outputs` union/dedup/sort, GC rooting, and post-force slice
-//! re-fetching — means the rooting and set rules stay in lock-step.
+//! (`vm/builtins/string_context.zig`) share descriptor insertion, `outputs`
+//! union/dedup/sort, and GC rooting here.
 //!
 //! Every operation takes the concrete `*VM` interface used by the builtins.
 
@@ -59,8 +56,8 @@ pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !Obje
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, Value.attrs(left_id));
     vm_force.rootKeep(self, Value.attrs(right_id));
-    var left = try self.heap.getAttrs(left_id);
-    var right = try self.heap.getAttrs(right_id);
+    const left = try self.heap.getAttrs(left_id);
+    const right = try self.heap.getAttrs(right_id);
     const left_len = left.len;
     const right_len = right.len;
 
@@ -70,9 +67,6 @@ pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !Obje
     var left_i: usize = 0;
     var right_i: usize = 0;
     while (left_i < left_len and right_i < right_len) {
-        // gc: re-fetch — ranges may move across mergeContextAttrValue's force
-        left = try self.heap.getAttrs(left_id);
-        right = try self.heap.getAttrs(right_id);
         const l = left[left_i];
         const r = right[right_i];
         if (l.name < r.name) {
@@ -88,9 +82,6 @@ pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !Obje
             right_i += 1;
         }
     }
-    // gc: re-fetch — ranges may have moved across the loop's forces
-    left = try self.heap.getAttrs(left_id);
-    right = try self.heap.getAttrs(right_id);
     while (left_i < left_len) : (left_i += 1) {
         merged.appendAssumeCapacity(left[left_i]);
     }
@@ -120,7 +111,6 @@ pub fn mergeContextOutputs(self: *VM, left: Value, right: Value) !Value {
     var outputs: std.ArrayListUnmanaged(Value) = .empty;
     defer outputs.deinit(self.allocator);
 
-    // gc: re-fetch — ranges may move across appendUniqueContextOutput's force
     const left_id = left_list.asObjectId();
     const left_n = try self.heap.getListLen(left_id);
     var li: usize = 0;

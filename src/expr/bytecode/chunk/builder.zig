@@ -38,13 +38,12 @@ pub const ChunkBuilder = struct {
     /// `Chunk.capture_bytes`. `capture_index` records each distinct list's
     /// range so `internCaptureList` can coalesce identical lists (an attrset's
     /// shared scope snapshot) by a linear scan — a chunk has only a handful of
-    /// distinct lists even when it emits thousands of ops, so no map is needed.
+    /// distinct lists per chunk, so no map is needed.
     capture_bytes: std.ArrayListUnmanaged(u8) = .empty,
     capture_index: std.ArrayListUnmanaged(CaptureRange) = .empty,
-    /// Total descriptor bytes that USED to be inline in code (summed per op,
-    /// before dedup) — added to `sideTableWeight` so extracting them doesn't
-    /// shrink the chunk's perceived size past the speculation cliff.
-    capture_inline_weight: usize = 0,
+    /// Dispatch-equivalent weight of capture descriptors before side-table
+    /// deduplication, used only for scheduling classification.
+    capture_dispatch_weight: usize = 0,
     /// The body node's span (see `Chunk.body_span`). Set by `stampOnBuilder`.
     body_span: ?Chunk.SourceSpan = null,
     /// Byte offset of the start of the most recently written opcode.
@@ -53,13 +52,9 @@ pub const ChunkBuilder = struct {
     /// patches an offset in place). Used by `emit.emitRet` to fuse
     /// the previous value-producing op into a `<op>_ret` super-op.
     last_op_offset: ?usize = null,
-    /// Bytes saved by emit-time fusion (super-op rewrites). Added back
-    /// to `code.items.len` when computing `body_is_substantial` so a
-    /// chunk's perceived "weight" reflects the work it does, not the
-    /// fusion-compressed encoding. Speculation tuning lives at a sharp
-    /// cliff (see project-tier1-perf-session); shifting chunks across
-    /// the threshold by 1 byte per fusion was a real regression.
-    fusion_savings: u32 = 0,
+    /// Dispatch-equivalent bytes represented by fused super-operations, used
+    /// only for scheduling classification.
+    fused_dispatch_weight: u32 = 0,
     /// Strictness signature computed by `compiler/strictness.zig`
     /// after the body is compiled. Carried through `finish` onto the
     /// resulting Chunk via `SchedulingHints`.
@@ -120,11 +115,11 @@ pub const ChunkBuilder = struct {
         self.attr_names.clearRetainingCapacity();
         self.capture_bytes.clearRetainingCapacity();
         self.capture_index.clearRetainingCapacity();
-        self.capture_inline_weight = 0;
+        self.capture_dispatch_weight = 0;
         self.source_map.clearRetainingCapacity();
         self.body_span = null;
         self.last_op_offset = null;
-        self.fusion_savings = 0;
+        self.fused_dispatch_weight = 0;
         self.strictness = .{};
         self.strict_param = false;
         self.strict_via_upvalue = null;
@@ -208,19 +203,11 @@ pub const ChunkBuilder = struct {
         });
     }
 
-    /// Side-table compensation for `body_is_substantial`: attr positions and
-    /// attr names used to live inline in the code stream (16 bytes per
-    /// position record; 3 bytes per name — a `push_const` op + u16 index).
-    /// Extracting them to side tables shrank `code.len`, but the speculation
-    /// threshold (`speculation_min_code_bytes`) is tuned against the OLD
-    /// effective sizes and sits on a sharp cliff — measured 2026-07: dropping
-    /// effective chunk size by even 64 bytes cost +52% w=8 wall. These
-    /// constants mirror the removed inline encodings so a chunk's perceived
-    /// weight reflects the work it does, not the encoding; ANY future
-    /// extraction of code bytes into a side table MUST add its own
-    /// compensation here (same rule as `fusion_savings`).
-    fn sideTableWeight(self: *const ChunkBuilder) usize {
-        return self.attr_pos.items.len * 16 + self.attr_names.items.len * 3 + self.capture_inline_weight;
+    /// Scheduling weight for metadata whose cost is independent of its compact
+    /// side-table encoding. New side tables that replace dispatched work must
+    /// contribute here.
+    fn schedulingSideTableWeight(self: *const ChunkBuilder) usize {
+        return self.attr_pos.items.len * 16 + self.attr_names.items.len * 3 + self.capture_dispatch_weight;
     }
 
     /// Finalize into an immutable Chunk.
@@ -240,6 +227,7 @@ pub const ChunkBuilder = struct {
         const capture_bytes = try allocator.dupe(u8, self.capture_bytes.items);
         errdefer allocator.free(capture_bytes);
         const source_map = try allocator.dupe(Chunk.SourceMapEntry, self.source_map.items);
+        const scheduling_weight = self.code.items.len + self.fused_dispatch_weight + self.schedulingSideTableWeight();
         return Chunk{
             .code = code,
             .constants = constants,
@@ -248,8 +236,8 @@ pub const ChunkBuilder = struct {
             .arity = self.arity,
             .strict_params = self.strict_params,
             .scheduling = .{
-                .body_is_substantial = self.code.items.len + self.fusion_savings + self.sideTableWeight() >= speculation_min_code_bytes,
-                .spec_band_small = self.code.items.len + self.fusion_savings + self.sideTableWeight() < speculation_trusted_code_bytes,
+                .body_is_substantial = scheduling_weight >= speculation_min_code_bytes,
+                .spec_band_small = scheduling_weight < speculation_trusted_code_bytes,
                 .strictness = self.strictness,
                 .trivial = classifyTrivialBody(self.code.items, self.constants.items, local_count),
                 .strict_param = self.strict_param and local_count == 1,

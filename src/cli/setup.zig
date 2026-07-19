@@ -1,5 +1,5 @@
 //! Shared evaluator setup for the eval-producing subcommands (`eval`, `repl`,
-//! and later `instantiate`/`build`/`run`). Folds the worker-count formula and
+//! `instantiate`, `build`, and `run`). Owns the worker-count formula and
 //! the `Options → Evaluator` configuration block that each subcommand would
 //! otherwise duplicate.
 
@@ -16,17 +16,8 @@ const Evaluator = engine.Evaluator;
 
 /// Resolve the worker-thread count: an explicit `--workers`, else
 /// `min(12, cpu_count)` (1 when single-threaded).
-///
-/// The cap is the measured parallelism knee for real Nix eval: an interleaved
-/// static sweep of the realworld workloads (nixos-hm/desktop/hm-profile/minimal)
-/// puts the wall minimum at ~10-12 workers and regresses past 16 — demand
-/// parallelism saturates around there and wider pools spend the surplus on
-/// junk speculation + idle-thread overhead (see memory fix-perf-dynamic-pool /
-/// fix-perf-w32-work-starvation). 12 wins ~5% over the old 8 on the heavier
-/// workloads and is within noise on the lighter ones. Boxes with <12 cores are
-/// unaffected. A dynamic (float-the-active-count) pool was prototyped and
-/// rejected: provisioning beyond the knee costs more than a controller can
-/// claw back, since deep-parking can't remove the OS threads' existence cost.
+/// The default cap limits speculative and idle-thread overhead after demand
+/// parallelism saturates. `--workers` remains available for explicit tuning.
 pub fn workerCount(options: args.Options) !u8 {
     return options.workers orelse if (builtin.single_threaded)
         1

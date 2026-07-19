@@ -142,10 +142,8 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     // we already know what forcing the thunk will produce — the
     // captured value, or the constant. Push it directly instead of
     // allocating a thunk, populating its upvalues, and (later)
-    // running a 4-byte chunk through the dispatcher. Saves a heap
-    // alloc, a markDemanded, a frame push/pop, and several dispatches
-    // per occurrence — the dominant pattern that drives the
-    // `thunk` op count (~15% of all ops on NixOS toplevel).
+    // running a tiny chunk through the dispatcher. This saves a heap
+    // allocation, demand mark, frame push/pop, and several dispatches.
     switch (slot.trivial) {
         .identity_upvalue => |idx| {
             return shortCircuitIdentityUpvalue(self, descriptors, frame, idx);
@@ -176,7 +174,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
         // thunk a demand fiber blocks on — route its sub-work to the URGENT
         // lane so idle workers help clear the critical subtree instead of it
         // sitting in the spec backlog behind junk.
-        const ok = if (self.demand_rescue.load(.monotonic) != 0)
+        const ok = if (self.speculation.demand_rescue.load(.monotonic) != 0)
             self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId())
             // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
             // instance of this chunk goes to the high-priority novel lane.

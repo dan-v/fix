@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
     // ordinary file imports beneath these roots so each type has one canonical
     // instance without restating every file edge in the build graph.
     const syntax_mod = b.addModule("syntax", .{
-        .root_source_file = b.path("src/syntax/syntax.zig"),
+        .root_source_file = b.path("src/syntax/root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
 
     // Generic, reusable infrastructure with zero Nix coupling.
     const base_mod = b.addModule("base", .{
-        .root_source_file = b.path("src/base/base.zig"),
+        .root_source_file = b.path("src/base/root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
     syntax_mod.addImport("base", base_mod);
 
     const runtime_mod = b.addModule("runtime", .{
-        .root_source_file = b.path("src/runtime/runtime.zig"),
+        .root_source_file = b.path("src/runtime/root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,

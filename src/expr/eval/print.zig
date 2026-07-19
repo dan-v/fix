@@ -320,9 +320,7 @@ const ValuePrinter = struct {
             try self.write(thunk.payload.result);
             return;
         }
-        // Pass-through (cell-like) thunks hold a value that hasn't been
-        // forced yet. Render the wrapped value rather than an opaque
-        // `...`, matching how cells used to render their `initial`.
+        // Pass-through thunks expose their wrapped value even before forcing.
         if (thunk.targetKind() == .pass_through) {
             try self.write(thunk.payload.target.pass_through);
         } else {

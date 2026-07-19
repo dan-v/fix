@@ -10,9 +10,6 @@
 //! synchronised under a per-entry mutex, so workers reading *different*
 //! files do I/O in parallel and workers reading the *same* file
 //! serialise on just that path's mutex (rather than the whole cache).
-//! For a NixOS toplevel eval — hundreds of imports across helper
-//! workers — this is the difference between file I/O being a
-//! single-file-at-a-time pipeline and a fan-out.
 
 const std = @import("std");
 const sync = @import("base").sync;

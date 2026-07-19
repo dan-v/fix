@@ -59,7 +59,6 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
     vm_force.rootKeep(self, sep_value);
     const sep = self.intern.get(try stringTextInternId(self, sep_value));
     var item_bytes: usize = 0;
-    // gc: re-fetch — range may move across coerceStringContextValue's force
     for (item_values, item_text_ids, 0..) |*value, *text_id, i| {
         value.* = try coerceStringContextValue(self, try self.heap.getListItem(list_id, i));
         vm_force.rootKeep(self, value.*);
@@ -283,7 +282,6 @@ pub fn stringListArg(self: *VM, arg: Value) ![][]const u8 {
     const items = try self.heap.getList(list_id);
     const out = try self.allocator.alloc([]const u8, items.len);
     errdefer self.allocator.free(out);
-    // gc: re-fetch — range may move across stringArg's force
     for (out, 0..) |*string, i| string.* = try stringArg(self, try self.heap.getListItem(list_id, i));
     return out;
 }
@@ -296,7 +294,6 @@ pub fn stringListInternIdsArg(self: *VM, arg: Value) ![]InternId {
     const items = try self.heap.getList(list_id);
     const ids = try self.allocator.alloc(InternId, items.len);
     errdefer self.allocator.free(ids);
-    // gc: re-fetch — range may move across the force
     for (ids, 0..) |*id, i| {
         const value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
         if (!isPlainString(value)) return error.TypeError;
@@ -356,7 +353,6 @@ pub fn coerceListToStringValue(self: *VM, list_id: ObjectId) !Value {
 
     var first = true;
     var trailing_empty_list = false;
-    // gc: re-fetch — range may move across the force
     const list_len = try self.heap.getListLen(list_id);
     var i: usize = 0;
     while (i < list_len) : (i += 1) {
@@ -456,7 +452,6 @@ pub fn coerceDerivationListToStringValue(self: *VM, list_id: ObjectId) !Value {
 
     var first = true;
     var trailing_empty_list = false;
-    // gc: re-fetch — range may move across the force
     const list_len = try self.heap.getListLen(list_id);
     var i: usize = 0;
     while (i < list_len) : (i += 1) {

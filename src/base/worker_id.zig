@@ -10,6 +10,6 @@ pub threadlocal var current: u8 = 0;
 /// publish futures and thus run waiter `wake_fn`s, but their `current` is a
 /// meaningless default: this flag lets a wake distinguish "resolved by a
 /// compute worker (its core is cache-hot for the value)" from "resolved by an
-/// IO thread (no useful locality)" so resolver-affinity routing only fires in
-/// the former case. Set alongside `current` at the two worker-loop entries.
+/// IO thread (no useful locality)" so resolver-affinity routing only fires for
+/// compute workers. Set alongside `current` at the two worker-loop entries.
 pub threadlocal var is_worker: bool = false;

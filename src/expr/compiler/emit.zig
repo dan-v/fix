@@ -128,7 +128,7 @@ fn fuseStoreToSlot(self: *Compiler, slot: u16, target: StoreTarget) !bool {
     self.builder.last_op_offset = null;
     // Unfused: extra `loc_set` op (1 byte) + slot byte. Fused: just
     // the slot byte appended. Net 1 byte saved.
-    self.builder.fusion_savings += 1;
+    self.builder.fused_dispatch_weight += 1;
     return true;
 }
 
@@ -217,7 +217,7 @@ pub fn emitGetAttr(self: *Compiler, id: InternId) !void {
                     self.builder.last_op_offset = null;
                     // The unfused encoding would have been 3 bytes
                     // (attr_get op + 2-byte name); we wrote 2 bytes.
-                    self.builder.fusion_savings += 1;
+                    self.builder.fused_dispatch_weight += 1;
                     return;
                 }
             }
@@ -288,8 +288,7 @@ pub fn emitApplyArg(self: *Compiler, chunk_id: types.ChunkId, captures: []const 
 
 /// Emit `thunk_defer` (lazy per-attr compilation): a deferred-table id plus a
 /// `(start, count)` reference into the chunk's deduped capture-list side table.
-/// An attrset's deferred values all snapshot the same enclosing scope, so the
-/// descriptor list — previously re-emitted inline per value — is interned once.
+/// Repeated scope snapshots share one interned descriptor list.
 pub fn emitDeferAttrValue(self: *Compiler, deferred_id: u32, scope: []const Capture) !void {
     const env_count = try captureCount(scope.len);
     const cap_start = try internCaptureList(self, scope);
@@ -297,9 +296,7 @@ pub fn emitDeferAttrValue(self: *Compiler, deferred_id: u32, scope: []const Capt
     try self.builder.writeU32(self.allocator, deferred_id);
     try self.builder.writeU32(self.allocator, cap_start);
     try self.builder.writeU16(self.allocator, env_count);
-    // The descriptors left the code stream for the side table — compensate the
-    // speculation-size threshold (see ChunkBuilder.sideTableWeight).
-    self.builder.capture_inline_weight += @as(usize, scope.len) * 3;
+    self.builder.capture_dispatch_weight += @as(usize, scope.len) * 3;
 }
 
 /// Encode `captures` as `(kind:1, index:2-LE)*` and intern the list into the
@@ -395,10 +392,9 @@ pub fn patchJump(self: *Compiler, instruction_offset: usize, target_offset: usiz
     self.builder.code.items[operand_offset + 3] = @truncate(relative >> 24);
     // Patching a jump means some branch now lands at `target_offset`.
     // If that target equals the current write position (`code.len`),
-    // the next opcode we emit becomes a multi-predecessor join — we
-    // can no longer assume the op at `last_op_offset` is the only
-    // path producing the value flowing into `emit.emitRet`'s fuse
-    // candidate. Conservative: drop the hint whenever the target
+    // the next opcode we emit becomes a multi-predecessor join. Return fusion
+    // must account for every predecessor, not only `last_op_offset`'s path.
+    // Conservative: drop the hint whenever the target
     // is the tail. (Patches that land BEFORE the tail can't affect
     // straight-line fusion of subsequent ops.)
     if (target_offset == self.builder.code.items.len) {

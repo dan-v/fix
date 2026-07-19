@@ -1,5 +1,5 @@
 const std = @import("std");
-const eval_mod = @import("../../eval.zig");
+const eval_mod = @import("../../evaluator.zig");
 const Evaluator = eval_mod.Evaluator;
 const RealizationStore = @import("store").RealizationStore;
 const Value = @import("runtime").value.Value;
@@ -206,7 +206,7 @@ test "storeless builtins.path recursive source records the serialized NAR" {
         defer fixture.allocator.free(source);
 
         const store_path = try valueText(&fixture, try fixture.ev.evaluate(source));
-        const nar_bytes = try nar.serialize(fixture.allocator, &fixture.ev.files, tree_path, null);
+        const nar_bytes = try nar.serialize(fixture.allocator, &fixture.ev.sources.files, tree_path, null);
         defer fixture.allocator.free(nar_bytes);
 
         try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.recipeCountForTest());
@@ -237,7 +237,7 @@ test "storeless builtins.path recursive false records retained flat file identit
         defer fixture.allocator.free(source);
 
         const store_path = try valueText(&fixture, try fixture.ev.evaluate(source));
-        var retained = try fixture.ev.files.retainFile(flat_path);
+        var retained = try fixture.ev.sources.files.retainFile(flat_path);
         defer retained.release();
 
         try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.recipeCountForTest());
@@ -268,7 +268,7 @@ test "storeless fetchurl records retained flat file identity" {
         defer fixture.allocator.free(source);
 
         const store_path = try valueText(&fixture, try fixture.ev.evaluate(source));
-        var retained = try fixture.ev.files.retainFile(store_path);
+        var retained = try fixture.ev.sources.files.retainFile(store_path);
         defer retained.release();
 
         try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.recipeCountForTest());
@@ -345,9 +345,9 @@ test "realizeOutput realizes a mixed producer closure before the root derivation
         const records = fixture.ev.derivationDebugRecords();
         try std.testing.expectEqual(@as(usize, 1), records.len);
 
-        const nar_bytes = try nar.serialize(fixture.allocator, &fixture.ev.files, src_path, null);
+        const nar_bytes = try nar.serialize(fixture.allocator, &fixture.ev.sources.files, src_path, null);
         defer fixture.allocator.free(nar_bytes);
-        var retained = try fixture.ev.files.retainFile(flat_path);
+        var retained = try fixture.ev.sources.files.retainFile(flat_path);
         defer retained.release();
 
         try std.testing.expectEqual(@as(usize, 4), fixture.ev.store.realization.recipeCountForTest());

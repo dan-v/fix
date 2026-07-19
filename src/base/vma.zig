@@ -163,8 +163,7 @@ pub fn Vma(
         };
 
         /// Ask the kernel how much of each registered region is resident.
-        /// Point-in-time; costs one `mincore` per ~128 MB of *virtual* range, so
-        /// call it from reports, not hot paths. Off-Linux returns zeros.
+        /// This point-in-time scan is report-only. Off-Linux returns zeros.
         pub fn residency() Residency {
             var r: Residency = .{};
             if (comptime builtin.os.tag != .linux) return r;

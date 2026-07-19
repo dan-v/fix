@@ -51,15 +51,15 @@ pub const FrameRef = struct {
 
 pub fn frameCount(vm: *const VM) usize {
     var total: usize = vm.frames_len;
-    var cursor = vm.debug_parent;
-    while (cursor) |parent| : (cursor = parent.debug_parent) total += parent.frames_len;
+    var cursor = vm.debug.parent;
+    while (cursor) |parent| : (cursor = parent.debug.parent) total += parent.frames_len;
     return total;
 }
 
 /// Resolve logical frame `i` (outermost = 0) through the import-parent chain.
 pub fn frameRef(vm: *VM, i: usize) FrameRef {
-    const parent_count = if (vm.debug_parent) |parent| frameCount(parent) else 0;
-    if (i < parent_count) return frameRef(vm.debug_parent.?, i);
+    const parent_count = if (vm.debug.parent) |parent| frameCount(parent) else 0;
+    if (i < parent_count) return frameRef(vm.debug.parent.?, i);
     return .{ .vm = vm, .index = i - parent_count };
 }
 

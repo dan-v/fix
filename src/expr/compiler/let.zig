@@ -309,9 +309,8 @@ const BodyMarker = struct {
 
 /// Per-slot RHS aggregation: `counts[slot]` = number of RHS regions
 /// mentioning the name, `first[slot]` = earliest such binding index.
-/// `stamp_seen` dedups within one region so a name mentioned twice in
-/// the same RHS counts once (region semantics, matching the former
-/// per-RHS hashsets).
+/// `stamp_seen` deduplicates within one region, so repeated mentions in the
+/// same RHS count once.
 const RhsMarker = struct {
     slots: *const std.StringHashMapUnmanaged(u32),
     counts: []u32,

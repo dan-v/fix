@@ -1,10 +1,9 @@
-//! `runtime` module facade — the value/heap data layer.
+//! `runtime` module facade: the value/heap data layer.
 //!
 //! NaN-boxed values, the object heap, thunks, interning, and the numeric /
 //! hashing / path primitives the evaluator is built on, plus the builtin value
-//! registry. Concrete filesystem, network, and daemon effects live in `host`.
-//! Depends only on the generic `base` module. Consumers import this module by
-//! name (`@import("runtime")`) and
+//! registry. Depends only on the generic `base` module. Consumers import this
+//! module by name (`@import("runtime")`) and
 //! reach submodules through it; they must not import `runtime/*` files directly.
 
 pub const types = @import("types.zig");

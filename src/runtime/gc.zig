@@ -2,13 +2,11 @@
 //! stop-the-world collector. See `docs/gc.md` for the architecture and root
 //! map.
 //!
-//! `fix`'s stores are append-only bump allocators, so without reclamation
-//! peak RSS tracks *total* allocation, not the *live* set. Phase 0
-//! measured ~81% of the nixos_toplevel heap is reclaimable garbage with a
-//! stable ~228 MB live plateau. This module provides serial and parallel
-//! marking; `heap/collector.zig` owns collection policy and reclamation; the
-//! evaluator enumerates roots and the VM coordinates force-boundary
-//! safepoints. At multiple workers, parked peers assist marking and evacuation.
+//! Without reclamation, the segmented stores track total allocation rather
+//! than the live set. This module provides serial and parallel marking;
+//! `heap/collector.zig` owns collection policy and reclamation; the evaluator
+//! enumerates roots; the VM coordinates force-boundary safepoints. Parked peers
+//! can assist both marking and sweeping.
 //!
 //! The `Tracer` follows exactly the heap edges described in `docs/gc.md`.
 
@@ -152,7 +150,7 @@ pub const Tracer = struct {
     /// collector during the single-threaded root-scan (`beginSeeding`), so a
     /// plain field — no concurrency — is safe.
     parallel_seed: ?*Marker = null,
-    /// Minor-collection mode (copying nursery): when armed, `markObject` stops
+    /// Minor-collection mode: when armed, `markObject` stops
     /// at OLD objects — the mark reaches only the young generation. Old objects
     /// are assumed live; the young objects they reference arrive via the
     /// remembered set (`markRemsetSource`), not by tracing through old.
@@ -233,7 +231,7 @@ pub const Tracer = struct {
         while (self.stack.pop()) |id| scanObject(SerialSink, &sink, heap, id);
     }
 
-    // --- minor collection (copying nursery, young-gated) ---
+    // --- minor collection (young-gated) ---
 
     /// Prepare a young-gated mark over `[0, object_count)`.
     pub fn resetMinor(self: *Tracer, object_count: u32) !void {
@@ -919,14 +917,14 @@ test "gc policy and reports are isolated per heap" {
     heap_collector.enableBudget(&right, 2 << 30, false);
     left.gcSetDisableReuse(true);
 
-    try std.testing.expectEqual(@as(u64, 128 << 20), left.gc_budget_bytes);
-    try std.testing.expectEqual(@as(u64, 4 << 20), left.gc_step_bytes);
-    try std.testing.expect(left.gc_disable_reuse);
-    try std.testing.expectEqual(@as(u64, 2 << 30), right.gc_budget_bytes);
-    try std.testing.expectEqual(@as(u64, 0), right.gc_step_bytes);
-    try std.testing.expect(!right.gc_disable_reuse);
+    try std.testing.expectEqual(@as(u64, 128 << 20), left.collection.budget_bytes);
+    try std.testing.expectEqual(@as(u64, 4 << 20), left.collection.step_bytes);
+    try std.testing.expect(left.collection.disable_reuse);
+    try std.testing.expectEqual(@as(u64, 2 << 30), right.collection.budget_bytes);
+    try std.testing.expectEqual(@as(u64, 0), right.collection.step_bytes);
+    try std.testing.expect(!right.collection.disable_reuse);
 
-    recordCollection(&left.gc_report, 3, 4096, 8192);
-    try std.testing.expectEqual(@as(u64, 1), liveReport(&left.gc_report).collections);
-    try std.testing.expectEqual(@as(u64, 0), liveReport(&right.gc_report).collections);
+    recordCollection(&left.collection.report, 3, 4096, 8192);
+    try std.testing.expectEqual(@as(u64, 1), liveReport(&left.collection.report).collections);
+    try std.testing.expectEqual(@as(u64, 0), liveReport(&right.collection.report).collections);
 }

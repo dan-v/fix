@@ -11,10 +11,9 @@
 //! frame pointer, and resume address into a `Context`; every other register
 //! — callee-saved GPRs, the vector file, and the FP/flags control state
 //! (`mxcsr`/`fpcr`/direction flag) — is listed as clobbered, so the compiler
-//! spills whatever is live around each swap site. Being `inline` is what makes
-//! that correct: the clobbers must land at the real call sites, not behind a
-//! call. This preserves FP rounding mode and the direction flag across a swap,
-//! which the old hand-rolled per-arch `.S` did not.
+//! spills whatever is live around each swap site. Being `inline` is required:
+//! the clobbers must apply at the real call sites. This also preserves FP
+//! rounding mode and the direction flag across a swap.
 //!
 //! Fibers can be resumed from any OS thread. `caller_ctx` points into
 //! the resumer's stack frame for the duration of one `resume_` call
@@ -49,7 +48,7 @@ comptime {
 /// dispatcher) paths, threadlocal so the accumulation itself is free of
 /// coherence traffic. `Worker.runFiber` seeds `census_pre_swap` at its
 /// entry and drains `census_in_cy`/`census_in_n` after each resume, so
-/// the measured swap-in window covers the *whole* per-resume machinery
+/// the swap-in window covers the complete per-resume machinery
 /// (run_mu, timeline branch, spec-ctx refresh, `resume_` setup, the asm
 /// swap) and the swap-out window symmetric machinery on the way back.
 /// Zero-footprint when the build flag is off.
@@ -270,8 +269,8 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
 }
 
 /// Save the running context into `from` and switch to `to`. `inline` so the
-/// vendored `contextSwitch` clobbers bind at the caller (`resume_`/`yield`/
-/// `trampoline`), the way the old out-of-line swap call did.
+/// vendored `contextSwitch` clobbers bind at the caller (`resume_`, `yield`, or
+/// `trampoline`).
 inline fn swap(from: *Context, to: *Context) void {
     var s = Switch{ .old = from, .new = to };
     _ = contextSwitch(&s);
@@ -344,9 +343,8 @@ pub const Fiber = struct {
     /// demand-pages it, so RSS scales with actual depth touched, not the
     /// full reservation. Only virtual address space is reserved up front
     /// (physical grows as the stack is touched, at zero hot-path cost), so
-    /// this can be generous. 16 MiB gives ~tens of thousands of native
-    /// frames — comfortably past `default_max_call_depth` (10000) so deep
-    /// *forcing* (which max-call-depth doesn't bound) has room before the
+    /// this can be generous. The reservation exceeds `default_max_call_depth`,
+    /// leaving room for deep forcing (which that limit does not bound) before the
     /// `forceThunkImpl` guard trips a graceful "stack overflow". Raising it
     /// costs virtual address space × peak fiber count, not memory.
     pub const min_stack_bytes: usize = 16 * 1024 * 1024;
@@ -461,9 +459,7 @@ pub const Fiber = struct {
         // already have been re-enqueued (its awaited resolved before it parked —
         // the ".suspended, already resolved" handoff) and resumed on another
         // worker, whose `resume_` has set `caller_ctx` to *its own* frame. Nulling
-        // it here would race that store (both are plain writes from two threads)
-        // and strand the fiber with no back-context — observed as "finished fiber
-        // has no caller_ctx" on weakly-ordered aarch64, where the window is wide.
+        // it here would race that store and strand the fiber without a caller.
         // The clear is also unnecessary: the next `resume_` sets `caller_ctx`
         // afresh before the fiber runs again, and `reset` nulls it for a recycled
         // fiber, so no stale/dangling value is ever read.

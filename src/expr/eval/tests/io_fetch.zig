@@ -1,5 +1,5 @@
 const std = @import("std");
-const eval_mod = @import("../../eval.zig");
+const eval_mod = @import("../../evaluator.zig");
 const Evaluator = eval_mod.Evaluator;
 const Diagnostic = eval_mod.Diagnostic;
 const Value = @import("runtime").value.Value;
@@ -823,7 +823,7 @@ test "evaluate import through evaluator file cache" {
 
     const imported = try ev.evaluate(source);
     try std.testing.expectEqual(@as(i64, 84), imported.asInt());
-    try std.testing.expectEqual(@as(u32, 1), ev.imports.entries.count());
+    try std.testing.expectEqual(@as(u32, 1), ev.sources.imports.entries.count());
 }
 
 test "evaluate path builtins coerce outPath attrsets" {

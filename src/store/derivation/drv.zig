@@ -48,11 +48,9 @@ pub const Drv = struct {
         // Resolve the hash-modulo input set ONCE per build. Both
         // `hashModulo` calls below (masked for output paths, unmasked for
         // the dependency hash) need the same actual-inputs set; it's a
-        // pure function of `input_drvs` + resolver, and building it does
-        // per-input resolver lookups, hash dupes, and a quadratic merge —
-        // the second recomputation was measurable in the `drv_compute`
-        // bucket (~3.6% of w=1 in aggregate). Fixed-output derivations
-        // never read it.
+        // pure function of `input_drvs` and the resolver, while building it
+        // performs resolver lookups, hash copies, and a merge. Fixed-output
+        // derivations never read it.
         const actual_inputs: ?[]DrvInput = if (self.isFixedOutput())
             null
         else

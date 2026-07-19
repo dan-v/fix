@@ -287,9 +287,7 @@ test "object heap sweep frees unmarked objects and lets ids be reused" {
     try std.testing.expectEqual(@as(i64, 1), (try heap.getListItem(live_a, 0)).asInt());
     try std.testing.expectEqual(@as(i64, 2), (try heap.getListItem(live_b, 0)).asInt());
 
-    // A freed slot is handed back out to a subsequent allocation rather
-    // than growing the object store — the swept id now holds fresh data,
-    // not the stale dead list it used to.
+    // A subsequent allocation reuses a freed slot without growing the store.
     const objects_before_reuse = heap.objects.count();
     const reused_attrs = try heap.addAttrs(&.{
         .{ .name = 1, .value = Value.int(7) },

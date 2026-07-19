@@ -34,9 +34,7 @@ pub const FutureState = enum(u32) {
 ///
 /// Blackhole detection compares ids directly: same fiber re-entering
 /// its own evaluation = real recursion; different fiber on any worker
-/// = must wait. The id is stable across fiber migration (F1 unpin),
-/// so a fiber that wakes on a different worker than where it was
-/// allocated still presents the same identity.
+/// = must wait. Migration does not change the id.
 pub const ClaimerId = u32;
 pub const invalid_claimer: ClaimerId = std.math.maxInt(ClaimerId);
 

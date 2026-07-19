@@ -247,12 +247,8 @@ pub const Parser = struct {
 
     // ---- diagnostics ----
 
-    /// Line number for a token, recomputed from its offset (tokens don't
-    /// carry line numbers; diagnostics are cold). Reproduces the scanner's
-    /// old incremental counter exactly: it had counted every newline up to
-    /// the END of the token when the token was made — except an
-    /// unterminated string's `error_token` (spans to EOF, body newlines
-    /// never counted), which reported its start line.
+    /// Diagnostic line for a token. Normal tokens use their end offset;
+    /// unterminated error tokens use their start offset.
     pub fn tokenLine(source: []const u8, tok: Token) u32 {
         const target = if (tok.type == .error_token) tok.offset else tok.offset + tok.len;
         return diagnostic.lineForOffset(source, target);
@@ -749,42 +745,7 @@ pub const Parser = struct {
                 .attr_set = rhs[1].node,
                 .body = rhs[3].node,
             } }) },
-            .let_in => {
-                var entries = rhs[1].entries;
-                try self.checkDuplicateAttrs(entries.items, true);
-                const bindings = try a.alloc(Node.Binding, entries.items.len);
-                for (entries.items, bindings) |entry, *b| {
-                    var path = entry.path;
-                    if (path.len == 0) {
-                        // A dynamic attr in a let. Nix folds a constant-string
-                        // key (`${"x"}`) to the static attr `x` before checking
-                        // for dynamic bindings, so it's allowed; a genuine
-                        // dynamic key (`${var}`) is not. The folded name reuses
-                        // the string token (quotes included), exactly as a plain
-                        // `"x" = ...;` binding would.
-                        const folded = self.constStringAttrAtom(entry.dynamic_name) orelse {
-                            self.report(rhs[2].tok, "Dynamic attributes are not allowed in let bindings.");
-                            return error.ParseError;
-                        };
-                        const single = try a.alloc(Node.Atom, 1);
-                        single[0] = folded;
-                        path = single;
-                    }
-                    b.* = .{
-                        .name_offset = path[0].offset,
-                        .name_len = path[0].len,
-                        .path = path,
-                        .expr = entry.expr,
-                        .inherit_outer = entry.inherit_outer,
-                        .inherit_group = entry.inherit_group,
-                    };
-                }
-                entries.deinit(a);
-                return .{ .node = try self.arena.createNode(.let_in, .{ .let_in = .{
-                    .bindings = bindings,
-                    .body = rhs[3].node,
-                } }) };
-            },
+            .let_in => return self.buildLetIn(rhs),
 
             // ---- ExprIf ----
             .if_else => return .{ .node = try self.arena.createNode(.if_else, .{ .if_else = .{
@@ -890,48 +851,8 @@ pub const Parser = struct {
             .null_lit => return self.atom(.null, rhs[0].tok),
             .parens => return .{ .node = try self.arena.createNode(.parens, .{ .parens = rhs[1].node }) },
             .attrset_from_brace => return self.buildAttrSet(rhs[0].brace),
-            .rec_attr_set => {
-                var entries = rhs[2].entries;
-                try self.checkDuplicateAttrs(entries.items, false);
-                // A dynamic attribute (`${e} = …`) in a recursive set is
-                // deprecated — it is evaluated outside the recursive scope.
-                for (entries.items) |entry| {
-                    if (entry.dynamic_name) |dyn| {
-                        if (dyn.span) |s| self.noteWarningAt(.rec_set_dynamic_attrs, s.offset, s.len);
-                    }
-                }
-                return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
-                    .entries = try entries.toOwnedSlice(a),
-                    .recursive = true,
-                } }) };
-            },
-            // Ancient `let { … }` == `(rec { … }).body`. Build the rec set, then
-            // select its `body` attribute (reusing a real "body" source span so
-            // the select segment reads the right name).
-            .let_attrs => {
-                var entries = rhs[2].entries;
-                try self.checkDuplicateAttrs(entries.items, false);
-                const rec = try self.arena.createNode(.attr_set, .{ .attr_set = .{
-                    .entries = try entries.toOwnedSlice(a),
-                    .recursive = true,
-                } });
-                var body_atom: ?Node.Atom = null;
-                for (rec.data.attr_set.entries) |entry| {
-                    if (entry.path.len != 1) continue;
-                    const seg = entry.path[0];
-                    if (std.mem.eql(u8, self.source[seg.offset .. seg.offset + seg.len], "body")) {
-                        body_atom = seg;
-                        break;
-                    }
-                }
-                const body_name = body_atom orelse {
-                    self.report(rhs[0].tok, "'let { ... }' requires a 'body' attribute");
-                    return error.ParseError;
-                };
-                var segs: SegAccum = .{};
-                try segs.push(a, .{ .static = body_name });
-                return .{ .node = try self.buildSelect(rec, segs) };
-            },
+            .rec_attr_set => return self.buildRecursiveAttrSet(rhs),
+            .let_attrs => return self.buildLegacyLetAttrs(rhs),
             .list => {
                 var nodes = rhs[1].nodes;
                 return .{ .node = try self.arena.createNode(.list, .{ .list = .{
@@ -1050,6 +971,82 @@ pub const Parser = struct {
     }
 
     // ---- action helpers ----
+
+    fn buildLetIn(self: *Parser, rhs: []Value) !Value {
+        const a = self.arenaAllocator();
+        var entries = rhs[1].entries;
+        try self.checkDuplicateAttrs(entries.items, true);
+        const bindings = try a.alloc(Node.Binding, entries.items.len);
+        for (entries.items, bindings) |entry, *binding| {
+            var path = entry.path;
+            if (path.len == 0) {
+                // Constant dynamic keys become static bindings; other dynamic
+                // keys are not valid in a let.
+                const folded = self.constStringAttrAtom(entry.dynamic_name) orelse {
+                    self.report(rhs[2].tok, "Dynamic attributes are not allowed in let bindings.");
+                    return error.ParseError;
+                };
+                const single = try a.alloc(Node.Atom, 1);
+                single[0] = folded;
+                path = single;
+            }
+            binding.* = .{
+                .name_offset = path[0].offset,
+                .name_len = path[0].len,
+                .path = path,
+                .expr = entry.expr,
+                .inherit_outer = entry.inherit_outer,
+                .inherit_group = entry.inherit_group,
+            };
+        }
+        entries.deinit(a);
+        return .{ .node = try self.arena.createNode(.let_in, .{ .let_in = .{
+            .bindings = bindings,
+            .body = rhs[3].node,
+        } }) };
+    }
+
+    fn buildRecursiveAttrSet(self: *Parser, rhs: []Value) !Value {
+        var entries = rhs[2].entries;
+        try self.checkDuplicateAttrs(entries.items, false);
+        // Dynamic attributes in a recursive set are evaluated outside its scope.
+        for (entries.items) |entry| {
+            if (entry.dynamic_name) |dynamic| {
+                if (dynamic.span) |source_span| self.noteWarningAt(.rec_set_dynamic_attrs, source_span.offset, source_span.len);
+            }
+        }
+        return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
+            .entries = try entries.toOwnedSlice(self.arenaAllocator()),
+            .recursive = true,
+        } }) };
+    }
+
+    /// `let { … }` evaluates `(rec { … }).body`.
+    fn buildLegacyLetAttrs(self: *Parser, rhs: []Value) !Value {
+        const a = self.arenaAllocator();
+        var entries = rhs[2].entries;
+        try self.checkDuplicateAttrs(entries.items, false);
+        const recursive = try self.arena.createNode(.attr_set, .{ .attr_set = .{
+            .entries = try entries.toOwnedSlice(a),
+            .recursive = true,
+        } });
+        var body_name: ?Node.Atom = null;
+        for (recursive.data.attr_set.entries) |entry| {
+            if (entry.path.len != 1) continue;
+            const segment = entry.path[0];
+            if (std.mem.eql(u8, self.source[segment.offset .. segment.offset + segment.len], "body")) {
+                body_name = segment;
+                break;
+            }
+        }
+        const selected = body_name orelse {
+            self.report(rhs[0].tok, "'let { ... }' requires a 'body' attribute");
+            return error.ParseError;
+        };
+        var segments: SegAccum = .{};
+        try segments.push(a, .{ .static = selected });
+        return .{ .node = try self.buildSelect(recursive, segments) };
+    }
 
     fn atom(self: *Parser, tag: NodeTag, tok: Token) !Value {
         return .{ .node = try self.arena.createNode(tag, .{ .atom = .{ .offset = tok.offset, .len = tok.len } }) };

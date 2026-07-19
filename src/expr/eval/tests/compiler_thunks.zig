@@ -1,5 +1,5 @@
 const std = @import("std");
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 test "an unforced let binding thunk never evaluates its erroring body" {
     // `compileThunk` defers the body; if `b` were compiled/run eagerly,

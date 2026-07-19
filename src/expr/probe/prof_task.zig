@@ -18,10 +18,8 @@ const pct = prof.pct;
 ///     arrival (pure scheduling overhead);
 ///   - the useful-work cycle distribution (log2 buckets) for the rest.
 /// Recorded at fiber entry (slotEntry/contEntry) from any worker —
-/// shared atomics, monotonic; the write rate is one task, not one
-/// force, so contention is negligible next to the work itself. Cycles
-/// are wall-rdtsc across the task INCLUDING suspended time (98.4% of
-/// tasks never suspend, so the tail barely smears the histogram).
+/// shared monotonic atomics. Cycles are wall-rdtsc across the task,
+/// including suspended time.
 pub const TaskClass = enum(u8) {
     /// Creation-time speculative `force_thunk` (bulk spec lane).
     spec_thunk,

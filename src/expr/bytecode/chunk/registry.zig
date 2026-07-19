@@ -26,9 +26,7 @@ pub const WellKnownChunks = struct {
     /// Stub chunk for `builtins.genList` element thunks. Body:
     ///   `up_get 0; up_get 1; call_tail; ret; halt`
     /// Upvalues are `[func, index]`. Forcing the thunk calls
-    /// `func index` and returns the result. Replaces the
-    /// `builtin_closure(.mapValue, [func, index])` per element that
-    /// would otherwise allocate one extra Object per genList slot.
+    /// `func index` and returns the result with one thunk object per element.
     /// Reused by `builtins.map` since the body is the same single-arg
     /// application regardless of whether arg 1 is an index or a list
     /// item.
@@ -37,9 +35,8 @@ pub const WellKnownChunks = struct {
     ///   `up_get 0; up_get 1; call; up_get 2; call_tail;
     ///    ret; halt`
     /// Upvalues are `[func, name, value]`. Forcing the thunk calls
-    /// `(func name) value` (partial application then tail call).
-    /// Replaces the `builtin_closure(.mapAttrValue, ...)` + Thunk pair
-    /// the old path allocated per attr.
+    /// `(func name) value` (partial application then tail call) with one thunk
+    /// object per attribute.
     mapattrs_apply: ChunkId,
 };
 
@@ -50,13 +47,8 @@ pub const WellKnownChunks = struct {
 ///   - `get(id)` is lock-free.
 ///   - `register(chunk)` serializes on the underlying segments' writer mutex.
 pub const ChunkRegistry = struct {
-    /// Dense per-chunk slot: the Chunk pointer plus a copy of the hot
-    /// scheduling metadata. The thunk-creation path (`thunk`,
-    /// ~6M executions per NixOS toplevel) and the speculation gates only
-    /// need `trivial`/`body_is_substantial`; reading them through `ptr`
-    /// is a cache-missing deref into a heap-scattered Chunk, while the
-    /// slot array is dense and hot chunk ids repeat. `ptr` is only
-    /// dereferenced by paths that need the code/constants themselves.
+    /// Dense per-chunk slot: the Chunk pointer plus scheduling metadata used
+    /// without dereferencing the chunk. Code and constant consumers use `ptr`.
     pub const ChunkSlot = struct {
         ptr: *Chunk,
         /// Qualified-name node in `name_tree` (0 = anonymous). Always populated
@@ -125,21 +117,14 @@ pub const ChunkRegistry = struct {
     local_names: std.AutoHashMapUnmanaged(ChunkId, []types.InternId) = .empty,
     /// Content-addressed dedup of chunk registrations: structurally identical
     /// chunks are semantically interchangeable, so re-registrations reuse the
-    /// first id (the generalization of the hand-picked WellKnownChunks).
-    /// Sharded by hash bits (see `DedupShard`): registrations come from every
-    /// compiling worker (deferred bodies + speculative compiles, ~264K at
-    /// w=8), and one global lock held across the full structural memcmp
-    /// burned ~3-4% of all w=8 cycles in spin. Each shard carries its own
-    /// lock. Existing candidates are compared OUTSIDE it; only candidates
-    /// added by a concurrent racer are rechecked while locked (see
-    /// `registerDeduped`).
+    /// first id. Hash shards let compiling workers register concurrently.
+    /// Existing candidates are compared outside the shard lock; candidates
+    /// added by a racer are rechecked while locked.
     dedup_shards: [dedup_shard_count]DedupShard = [_]DedupShard{.{}} ** dedup_shard_count,
     /// Single-threaded mode: when the owner guarantees exactly one thread
     /// ever registers chunks (a `--workers=1` evaluator; set before anything
     /// runs), `registerDeduped` skips the dedup shard mutexes and `register`
-    /// takes the serial (CAS-free) slot append. ~2 lock RMWs + 1 CAS per
-    /// registration elided (~213K registrations per NixOS-toplevel eval).
-    /// Reads (`get`) were always lock-free. Default off.
+    /// takes the serial slot-append path. Reads remain lock-free. Default off.
     solo: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
@@ -194,13 +179,9 @@ pub const ChunkRegistry = struct {
         try builder.writeU16(self.allocator, 1);
         // call           — partial = func name (result on stack)
         try builder.writeOp(self.allocator, .call);
-        // up_grab 2 — push value *unforced*. `value` is whatever
-        // the source attrset stored, typically a thunk. Forcing it here
-        // (the old `up_get`) eagerly evaluated entries that the
-        // user lambda would otherwise treat lazily — when the lambda
-        // captures the parent recursive attrset (typical NixOS module
-        // pattern), the eager force routes through that parent and
-        // blackholes. Passing unforced lets the user lambda decide.
+        // up_grab 2 — preserve the source attrset's laziness. The user lambda
+        // decides whether to force the value; eager forcing can blackhole when
+        // it captures the parent recursive attrset.
         try builder.writeOp(self.allocator, .up_grab);
         try builder.writeU16(self.allocator, 2);
         // call_tail      — partial value
@@ -350,8 +331,8 @@ pub const ChunkRegistry = struct {
     }
 
     // Every field of `Chunk` must either be covered by `contentHash` AND
-    // `contentEql` or be derived from covered fields (`scheduling` is the
-    // one derived field today): a semantic field missing from both silently
+    // `contentEql` or be derived from covered fields (`scheduling` is derived):
+    // a semantic field missing from both silently
     // merges chunks that differ in it. If you add a field, teach BOTH
     // functions about it, then bump this count. Diagnostic-only metadata
     // (names, files, upvalue names, ...) belongs in the registry sidecar
@@ -368,12 +349,9 @@ pub const ChunkRegistry = struct {
     /// undefined padding can't perturb the hash.
     fn contentHash(chunk: *const Chunk) u64 {
         // The hash is only a bucket key — collisions fall through to
-        // `contentEql`, which stays FULL. Instead of per-entry
-        // attr_pos/source_map walks (the +512M instr/eval cost measured at
-        // 77befca), mix in a cheap positional fingerprint: lens + first/last
-        // source-map span line. Position-divergent clones collide into one
-        // bucket and the loser registers normally via `contentEql`, so the
-        // dedup rate is unchanged.
+        // `contentEql`, which stays complete. Mix a cheap positional
+        // fingerprint instead of walking every source-map entry. Clones that
+        // collide are still distinguished by `contentEql`.
         var h = std.hash.Wyhash.init(0);
         h.update(chunk.code);
         h.update(std.mem.sliceAsBytes(chunk.constants));

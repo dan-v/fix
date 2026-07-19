@@ -149,20 +149,12 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
         },
     }
 
-    // Perceived-weight compensation: speculation admission
-    // (`body_is_substantial`) is keyed on encoded size, and its tuning
-    // "lives at a sharp cliff" (see `ChunkBuilder.fusion_savings`). The
-    // old encoding spent `total_parts - 1` int_add bytes (plus a 3-byte
-    // empty-string constant and one more add when the literal starts
-    // with an interpolation); the new one spends 3 bytes per concat op.
-    // Add the (saturating) difference back so many-part literals keep
-    // the scheduling weight they had under the int_add fold — dropping
-    // hot generated-config chunks below the cliff measurably starves
-    // the speculation avalanche at w>=8.
+    // Normalize scheduling weight to the equivalent `int_add` sequence so
+    // compact `str_cat` encoding does not make the same work look cheaper.
     if (ops_emitted != 0) {
-        const old_extra: u32 = (total_parts - 1) + @as(u32, if (first_is_interp) 4 else 0);
-        const new_extra: u32 = 3 * ops_emitted;
-        self.builder.fusion_savings += old_extra -| new_extra;
+        const expanded_weight: u32 = (total_parts - 1) + @as(u32, if (first_is_interp) 4 else 0);
+        const encoded_weight: u32 = 3 * ops_emitted;
+        self.builder.fused_dispatch_weight += expanded_weight -| encoded_weight;
     }
 }
 
@@ -357,11 +349,8 @@ pub fn compileIdent(self: *Compiler, node: *const Node) !void {
         try compileCurPos(self, node.data.atom);
         return;
     }
-    // Intern once, then resolve by id (u32 compares) up the scope chain
-    // instead of re-comparing the source bytes against every local at
-    // every parent level. Identifier resolution is the bulk of compile
-    // time (~13% of w=1), and most references are deep upvalues
-    // (`lib`/`config`/`pkgs`) that walk the whole parent chain.
+    // Intern once, then resolve the compact id up the scope chain instead of
+    // comparing source bytes against every local at every parent level.
     const name_id = try self.intern.intern(span);
     if (scope.resolveLocalId(self, name_id)) |slot| {
         try emit.emitGetLocal(self, slot);

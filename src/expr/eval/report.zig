@@ -1,8 +1,7 @@
 //! Per-evaluation state.
 //!
-//! Holds the diagnostic list, the error trace, and an arena for any strings
-//! they reference. The arena replaces the two parallel `owned_*` arrays the
-//! Evaluator used to maintain alongside the diagnostic list.
+//! Holds the diagnostic list, the error trace, and an arena for referenced
+//! strings.
 //!
 //! Concurrent imports on helper threads reach into this struct; the
 //! `SpinMutex` protects every mutation. Reads from the main thread after

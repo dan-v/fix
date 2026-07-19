@@ -385,7 +385,6 @@ fn normalizeDerivation(self: *VM, attrs_id: ObjectId, drv_name: []const u8, outp
             const ok = self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.workerId());
             if (!ok) break;
         }
-        // gc: re-fetch — range may move across the forces below
         const attrs_len = original_attrs.len;
         var ai: usize = 0;
         while (ai < attrs_len) : (ai += 1) {
@@ -537,7 +536,6 @@ fn derivationArgs(
     const items = try self.heap.getList(list_id);
     const args = try self.allocator.alloc([]const u8, items.len);
     errdefer self.allocator.free(args);
-    // gc: re-fetch — range may move across derivationAttrString's force
     for (args, 0..) |*arg, i| arg.* = try derivationAttrString(self, try self.heap.getListItem(list_id, i), inputs, owned_strings);
     return args;
 }
@@ -640,7 +638,6 @@ fn appendStructuredJsonValue(
             defer _ = seen.pop();
 
             try out.append(self.allocator, '[');
-            // gc: re-fetch — range may move across the recursive force
             const n = try self.heap.getListLen(list_id);
             var index: usize = 0;
             while (index < n) : (index += 1) {
@@ -819,7 +816,6 @@ fn contextOutputs(
         const items = try self.heap.getList(list_id);
         const outputs = try self.allocator.alloc([]const u8, items.len);
         errdefer self.allocator.free(outputs);
-        // gc: re-fetch — range may move across the force
         for (outputs, 0..) |*output, i| {
             const item_value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
             if (!isPlainString(item_value)) return error.TypeError;
@@ -901,7 +897,6 @@ fn derivationOutputNames(self: *VM, attrs_id: ObjectId) !DerivationOutputNames {
 
     const names = try self.allocator.alloc(InternId, items.len);
     errdefer self.allocator.free(names);
-    // gc: re-fetch — range may move across the force
     for (names, 0..) |*name, i| {
         const value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
         if (!isPlainString(value)) return error.TypeError;

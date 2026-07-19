@@ -4,7 +4,7 @@
 //! values below come straight from that oracle.
 
 const std = @import("std");
-const eval_mod = @import("../../eval.zig");
+const eval_mod = @import("../../evaluator.zig");
 const Evaluator = eval_mod.Evaluator;
 const Diagnostic = eval_mod.Diagnostic;
 const helpers = @import("../test_helpers.zig");

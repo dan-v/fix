@@ -56,9 +56,7 @@ pub fn compileAttrOr(self: *Compiler, node: *const Node) !void {
     // Flatten the whole select path — across nested `attr_path`/`attr_dynamic`
     // (e.g. `root.a.${b}.c` parses as an `attr_path` whose root is an
     // `attr_dynamic`) — into one segment list, so the `or` default covers a
-    // missing attr at ANY position, static or dynamic. Compiling the nested
-    // dynamic root separately (the old code) left it outside the fallback, so
-    // `x.a.${b}.c or d` threw instead of yielding `d`.
+    // missing attr at any position, static or dynamic.
     var segments: std.ArrayListUnmanaged(Node.HasAttrMixedSegment) = .empty;
     defer segments.deinit(self.allocator);
     const base = try flattenAttrPath(self, attr_or.attr_path, &segments);

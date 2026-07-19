@@ -21,8 +21,7 @@ pub const Command = union(enum) {
 };
 
 /// A bare line is an expression unless it is exactly a no-argument command.
-/// A leading `:` forces command interpretation, matching the console's
-/// historical ambiguity rules (`n + 1` evaluates; `n` steps).
+/// A leading `:` forces command interpretation (`n + 1` evaluates; `n` steps).
 pub fn parse(line_raw: []const u8) Command {
     const line = std.mem.trim(u8, line_raw, " \t\r\n");
     if (line.len == 0) return .none;

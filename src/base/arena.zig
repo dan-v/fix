@@ -1,10 +1,4 @@
-//! Plain (non-atomic) arena allocator — vendored from Zig 0.15.2 std.
-//!
-//! Zig 0.16 rewrote `std.heap.ArenaAllocator` to be thread-safe: every bump
-//! allocation now pays a `lock xadd` on `end_index`, usually a `lock cmpxchg`
-//! to reclaim alignment overshoot, and a node spinlock on the grow path.
-//! Measured on the NixOS-toplevel eval (`--workers=1`), those atomics are
-//! ~1.4% of all cycles — for a safety property no arena in this tree needs:
+//! Plain non-atomic arena allocator for single-owner contexts.
 //!
 //!   * `WorkerFiber.scratch` is per-fiber; a fiber runs on one OS thread at a
 //!     time and every cross-thread handoff (steal, wake, recycle) is
@@ -19,8 +13,7 @@
 //! concurrent `alloc` from two threads on one arena is a data race. New arenas
 //! that genuinely need cross-thread sharing should use `std.heap.ArenaAllocator`.
 //!
-//! Source: lib/zig/std/heap/arena_allocator.zig @ 0.15.2, unmodified except
-//! for this header and the std import.
+//! Vendored from `lib/zig/std/heap/arena_allocator.zig` at Zig 0.15.2.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -73,8 +66,6 @@ pub const ArenaAllocator = struct {
     }
 
     pub fn deinit(self: ArenaAllocator) void {
-        // NOTE: When changing this, make sure `reset()` is adjusted accordingly!
-
         var it = self.state.buffer_list.first;
         while (it) |node| {
             // this has to occur before the free because the free frees node
@@ -89,18 +80,12 @@ pub const ArenaAllocator = struct {
     pub const ResetMode = union(enum) {
         /// Releases all allocated memory in the arena.
         free_all,
-        /// This will pre-heat the arena for future allocations by allocating a
-        /// large enough buffer for all previously done allocations.
-        /// Preheating will speed up the allocation process by invoking the backing allocator
-        /// less often than before. If `reset()` is used in a loop, this means that after the
-        /// biggest operation, no memory allocations are performed anymore.
+        /// Retains the arena's total capacity in one reusable buffer.
         retain_capacity,
-        /// This is the same as `retain_capacity`, but the memory will be shrunk to
-        /// this value if it exceeds the limit.
+        /// Retains at most the requested capacity in one reusable buffer.
         retain_with_limit: usize,
     };
-    /// Queries the current memory use of this arena.
-    /// This will **not** include the storage required for internal keeping.
+    /// Returns usable capacity, excluding allocator metadata.
     pub fn queryCapacity(self: ArenaAllocator) usize {
         var size: usize = 0;
         var it = self.state.buffer_list.first;
@@ -112,35 +97,11 @@ pub const ArenaAllocator = struct {
         }
         return size;
     }
-    /// Resets the arena allocator and frees all allocated memory.
-    ///
-    /// `mode` defines how the currently allocated memory is handled.
-    /// See the variant documentation for `ResetMode` for the effects of each mode.
-    ///
-    /// The function will return whether the reset operation was successful or not.
-    /// If the reallocation  failed `false` is returned. The arena will still be fully
-    /// functional in that case, all memory is released. Future allocations just might
-    /// be slower.
-    ///
-    /// NOTE: If `mode` is `free_all`, the function will always return `true`.
+    /// Resets the arena. Returns false only when retaining capacity requires an
+    /// allocation that fails; the arena remains empty and usable.
     pub fn reset(self: *ArenaAllocator, mode: ResetMode) bool {
-        // Some words on the implementation:
-        // The reset function can be implemented with two basic approaches:
-        // - Counting how much bytes were allocated since the last reset, and storing that
-        //   information in State. This will make reset fast and alloc only a teeny tiny bit
-        //   slower.
-        // - Counting how much bytes were allocated by iterating the chunk linked list. This
-        //   will make reset slower, but alloc() keeps the same speed when reset() as if reset()
-        //   would not exist.
-        //
-        // The second variant was chosen for implementation, as with more and more calls to reset(),
-        // the function will get faster and faster. At one point, the complexity of the function
-        // will drop to amortized O(1), as we're only ever having a single chunk that will not be
-        // reallocated, and we're not even touching the backing allocator anymore.
-        //
-        // Thus, only the first hand full of calls to reset() will actually need to iterate the linked
-        // list, all future calls are just taking the first node, and only resetting the `end_index`
-        // value.
+        // Capacity is computed during reset so the allocation path needs no
+        // retained-capacity accounting.
         const requested_capacity = switch (mode) {
             .retain_capacity => self.queryCapacity(),
             .retain_with_limit => |limit| @min(limit, self.queryCapacity()),

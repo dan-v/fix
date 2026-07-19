@@ -54,7 +54,7 @@ pub const Chunk = struct {
     /// Number of stack slots reserved for locals in each frame.
     local_count: u16,
     /// Number of parameters the function consumes before its body runs.
-    /// 1 for curried/attrset lambdas (the historical default) and for
+    /// 1 for curried or attrset lambdas and for
     /// thunk bodies (which are never "called"). N>1 for an *uncurried*
     /// chunk produced by merging an adjacent `a: b: ...:` value-lambda
     /// chain (see `compiler/lambda.zig compileLambda`): a call site
@@ -84,10 +84,8 @@ pub const Chunk = struct {
     /// location. Empty when the chunk was compiled without a source path.
     function_arg_pos: []const AttrPosEntry = &.{},
     /// Attr-position records referenced by `attrs_new_named_pos_srt` ops.
-    /// Kept OUT of the dispatched code stream (they were 16 bytes/entry
-    /// inline — ~38% of all emitted bytecode on a NixOS eval, cold data read
-    /// only by `unsafeGetAttrPos`/diagnostics). Ops carry a (start, count)
-    /// reference.
+    /// Kept outside dispatched code because only diagnostics read them; ops
+    /// carry a `(start, count)` reference.
     attr_pos: []const AttrPosEntry = &.{},
     /// Attr names referenced by `attrs_new_named*` ops (interned ids, sorted
     /// per site) — like `attr_pos`, kept out of the code stream; each op
@@ -95,10 +93,8 @@ pub const Chunk = struct {
     attr_names: []const types.InternId = &.{},
     /// Capture-descriptor lists referenced by `thunk_defer` (and, later, the
     /// thunk family) — kept OUT of the code stream and DEDUPED, like `attr_pos`.
-    /// An attrset's deferred values all snapshot the same enclosing scope, so
-    /// the same `(kind:1, index:2)*` list was re-emitted inline per value (~12%
-    /// of all code). Ops now carry a `(start, count)` reference; identical lists
-    /// share one range here. Read via `captureList`.
+    /// Identical `(kind:1, index:2)*` lists share a range referenced by
+    /// `(start, count)`. Read via `captureList`.
     capture_bytes: []const u8 = &.{},
     /// Source span ranges for cold-path error traces.
     source_map: []const SourceMapEntry = &.{},
@@ -227,14 +223,12 @@ pub const SchedulingHints = struct {
     /// bodies whose one execution can recursively force multi-million-
     /// thunk never-demanded subgraphs). Speculative `force_thunk` tasks
     /// whose ROOT chunk carries this bit run under a hard creation
-    /// budget (`Scheduler.Config.spec_band_budget`); trusted (≥256) roots run
-    /// unbudgeted as always. With the admission gate at its default
+    /// budget (`Scheduler.Config.spec_band_budget`); trusted roots run
+    /// unbudgeted. With the admission gate at its default
     /// (== trusted threshold) no such chunk is ever submitted, so the
     /// bit is dormant; it exists so lowering the admission gate — or a
-    /// future aged-pool drain of the sub-256 family — is contained by
-    /// construction instead of cascading (measured 2026-07: gate at 192
-    /// unbudgeted = +15-52% w=8 wall; same gate under a 512 creation
-    /// budget = baseline).
+    /// future aged-pool drain of the small-body family — cannot cascade
+    /// without a creation bound.
     spec_band_small: bool = false,
     /// See ChunkStrictness.
     strictness: ChunkStrictness = .{},

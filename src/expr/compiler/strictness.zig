@@ -62,9 +62,8 @@ const Strictness = struct {
     /// Must-force shallow set: names forced on *every* path before any
     /// other observable effect (sound under-approximation). Differs from
     /// `shallow` only at `assert` (body may be skipped) and `with` (scope
-    /// forced lazily). By construction `shallow_must ⊆ shallow`. Computed
-    /// alongside `shallow` in one walk so the eager-submit and eager-elision
-    /// analyses no longer need separate AST traversals.
+    /// forced lazily). By construction `shallow_must ⊆ shallow`. Both sets are
+    /// computed in one walk for eager-submit and eager-elision.
     shallow_must: NameSet,
 
     fn empty() Strictness {
@@ -599,9 +598,8 @@ pub fn analyzeChunkBody(
 ///                            anyway (can't turn a success into an error,
 ///                            only reorder which error surfaces).
 ///
-/// Replaces the former separate `analyzeLetEagerness` + `analyzeLetMustForce`
-/// walks: the may-force and must-force sets are computed together (they
-/// differ only at `assert`/`with`), so one traversal yields both. Analyzes
+/// The may-force and must-force sets share one traversal; they differ only at
+/// `assert` and `with`. Analyzes
 /// `body` with an empty bound_stack so binding names appear as free
 /// identifiers; inner scopes (nested lets, lambdas) correctly shadow via
 /// the analyzer's bound_stack management.
@@ -673,8 +671,8 @@ pub fn bodyMustForceName(
 /// param survives only where the converged hypothesis shows the body forces it
 /// on every path (the `if`-intersection rule still gates each branch). A
 /// non-saturated / shadowed / non-self call credits nothing extra. With no
-/// `self_name` (or a param that shadows it) this is exactly the old per-param
-/// `bodyMustForceName`.
+/// `self_name` (or when a parameter shadows it), this reduces to per-parameter
+/// must-force analysis.
 pub fn strictParamsMask(
     allocator: std.mem.Allocator,
     intern: *InternTable,
@@ -1080,8 +1078,8 @@ test "strictParamsMask: self-recursion proves a let accumulator strict" {
     const go = try parsed.intern.intern("go");
     const params = [_]InternId{ acc, i };
 
-    // Without a self name the recursive call's args aren't credited, so only
-    // `i` (the `if` condition) is must-forced — the old, conservative result.
+    // Without a self name the recursive call's arguments are not credited, so
+    // only `i`, the `if` condition, is must-forced.
     const base = try strictParamsMask(allocator, &parsed.intern, source, body, &params, null);
     try std.testing.expectEqual(@as(u8, 0b10), base);
 

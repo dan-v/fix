@@ -8,7 +8,7 @@ const std = @import("std");
 // these tests drive it through `Evaluator.evaluate`/`forceDeep`, matching
 // the rest of the eval-level test suite (see src/expr/eval/tests/core.zig).
 
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 test "forceThunk resolves an unresolved thunk and reuses the resolved fast path" {
     var ev = try Evaluator.init(std.testing.allocator, 0);

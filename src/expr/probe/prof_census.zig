@@ -32,9 +32,8 @@ pub var disc: Disc = .{};
 /// claims itself is a speculation coverage MISS (helpers didn't pre-resolve
 /// it). This census classifies those misses by (a) whether speculation ever
 /// submitted a force task for the thunk — `Thunk.spec_disp`: 0 never /
-/// 1 admitted / 2 rejected — crossed with (b) whether the thunk was OLD
-/// enough at force (>= ~0.5ms) that a helper could in principle have raced
-/// ahead. The decisive cells:
+/// 1 admitted / 2 rejected — crossed with (b) whether the thunk was old
+/// enough at force that a helper could have raced ahead. The decisive cells:
 ///   never + old   = TARGETING gap (existed long enough, but speculation
 ///                   never aimed here) — the addressable coverage prize.
 ///   admitted + old= LATENCY  gap (aimed + admitted, but main won the race
@@ -58,9 +57,7 @@ pub const Coverage = struct {
 };
 pub var cov: Coverage = .{};
 
-/// "Old enough for a helper to have raced ahead" — mirrors
-/// `prof_age.age_old_threshold` (2^21 cy, ~0.5ms at 3.6GHz); duplicated to
-/// keep this module import-light.
+/// Mirrors `prof_age.age_old_threshold`; duplicated to keep imports light.
 const coverage_old_threshold: u64 = 1 << 21;
 
 /// Classify one `claimed_by_main` force. `disp` = `Thunk.spec_disp`,

@@ -1,5 +1,5 @@
 const std = @import("std");
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 const renderForTest = @import("../test_helpers.zig").renderForTest;
 
 test "add evaluates simple integer arithmetic" {

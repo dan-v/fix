@@ -495,9 +495,8 @@ pub fn overloadNameForBinary(op: BinaryOp) ?[]const u8 {
 /// True iff `name_id` resolves to a *user* binding (a local, or a local of
 /// some ancestor compiler that would be captured as an upvalue). This walks
 /// the same local/ancestor chain as `resolveCaptureId` but WITHOUT its
-/// capture side effect, so a probe that finds nothing leaves the compiler
-/// state untouched — the direct arithmetic op is emitted exactly as before,
-/// keeping the common (non-overloaded) case byte-for-byte identical.
+/// capture side effect, so a failed probe leaves compiler state untouched and
+/// the non-overloaded path emits a direct arithmetic op.
 fn overloadBindingInScope(self: *const Compiler, name_id: types.InternId) bool {
     if (scope.resolveLocalId(self, name_id)) |_| return true;
     var p = self.parent;

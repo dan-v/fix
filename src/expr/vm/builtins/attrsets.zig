@@ -26,7 +26,6 @@ pub fn builtinCatAttrs(self: *VM, name_arg: Value, list_arg: Value) !Value {
     var values: std.ArrayListUnmanaged(Value) = .empty;
     defer values.deinit(self.allocator);
 
-    // gc: re-fetch — range may move across the force
     const list_id = list.asObjectId();
     const n = try self.heap.getListLen(list_id);
     var i: usize = 0;
@@ -61,7 +60,6 @@ pub fn builtinZipAttrsWith(self: *VM, func_arg: Value, list_arg: Value) !Value {
     var group_idx: shared.NameIndex = .{};
     defer group_idx.deinit(self.allocator);
 
-    // gc: re-fetch — range may move across the force
     const list_id = list.asObjectId();
     const n = try self.heap.getListLen(list_id);
     var i: usize = 0;
@@ -272,16 +270,11 @@ pub fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value 
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
 
-    // Names are forced at most once each, into a growing prefix cache,
-    // in exactly the order the per-entry rescan used to force them —
-    // same evaluation set and stopping points (an entry that matches an
-    // early name never forces the later ones), so laziness-observable
-    // behavior is unchanged. What goes away is the O(entries × names)
-    // re-force/re-fetch of already-resolved list items.
+    // Resolve names into a prefix cache at most once. Stop extending the
+    // prefix after a match so unused later names remain lazy.
     var resolved: std.ArrayListUnmanaged(InternId) = .empty;
     defer resolved.deinit(self.allocator);
 
-    // gc: re-fetch — ranges may move across the name forces
     const attrs_id = attrs.asObjectId();
     const names_id = names.asObjectId();
     const names_len = try self.heap.getListLen(names_id);
@@ -333,10 +326,8 @@ fn sortedEntryIndex(entries: []const heap_mod.AttrEntry, name: InternId) ?usize 
 }
 
 /// Size ratio beyond which `intersectAttrs` walks the smaller operand and
-/// binary-searches the larger, instead of merge-walking both. callPackage's
-/// `intersectAttrs (functionArgs f) pkgs` intersects ~10 formal args with a
-/// tens-of-thousands-entry package set; the O(left+right) merge walk paid
-/// ~12K cycles per call scanning entries the small side can never match.
+/// binary-searches the larger instead of merge-walking both. This bounds work
+/// for highly skewed sets such as function arguments intersected with `pkgs`.
 const intersection_skew = 8;
 
 pub fn builtinIntersectAttrs(self: *VM, left_arg: Value, right_arg: Value) !Value {

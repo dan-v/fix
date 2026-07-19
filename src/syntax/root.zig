@@ -1,4 +1,4 @@
-//! `syntax` module facade — lexing, parsing, and the AST.
+//! `syntax` module facade: lexing, parsing, and the AST.
 //!
 //! Self-contained front end: source text → tokens → AST, plus diagnostics.
 //! Depends only on generic `base`. Consumers import this module by name

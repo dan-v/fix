@@ -102,7 +102,7 @@ fn writeChunkAt(
     options: Options,
     // `usize`, not `u8`: `fix disasm` runs with `max_depth == 0` (unlimited,
     // termination guaranteed by `visited`), so a deep reachable-chunk chain
-    // (e.g. hundreds of nested lambdas) recurses past 255 — a `u8` counter would
+    // Deeply nested chunks can recurse past 255; a `u8` counter would
     // overflow and panic.
     depth: usize,
     visited: *Visited,
@@ -132,144 +132,7 @@ fn writeChunkAt(
     // otherwise the header prints its fallback flag lines.
     try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, up_names != null, options.color_depth);
 
-    if (options.show_constants and chunk.constants.len > 0) {
-        try writeGuide(writer, cc, null, options.color_depth);
-        try writer.writeAll("  constants:\n");
-        for (chunk.constants, 0..) |c, i| {
-            // Table rows sit under their own colored `│` gutter, like operand
-            // groups do under their count line; the run closes with `└`.
-            try writeGuide(writer, cc, null, options.color_depth);
-            try writer.writeAll("  ");
-            try writeTreeGuide(writer, sec_constants_color, if (i == chunk.constants.len - 1) .corner else .vert, null, options.color_depth);
-            // `#N` in the slot's identity color — the same hue a `push_const #N`
-            // reference carries, so a reference ties back to its row here.
-            var ibuf: [8]u8 = undefined;
-            const istr = std.fmt.bufPrint(&ibuf, "#{d}", .{i}) catch "#?";
-            if (options.color_depth.enabled()) {
-                const ic = constColor(i);
-                try setFg(writer, ic, options.color_depth);
-                try writer.writeAll(istr);
-                try writer.writeAll("\x1b[0m");
-            } else {
-                try writer.writeAll(istr);
-            }
-            try writer.splatByteAll(' ', 6 -| istr.len);
-            try writeValueDigest(writer, c, symbols, table_snippet_max, options.color_depth);
-            try writer.writeByte('\n');
-        }
-    }
-
-    if (options.show_constants and chunk.function_args.len > 0) {
-        try writeGuide(writer, cc, null, options.color_depth);
-        try writer.writeAll("  function arguments:\n");
-        for (chunk.function_args, 0..) |arg, i| {
-            try writeTableRowHead(writer, cc, sec_function_args_color, i, i == chunk.function_args.len - 1, attrNameColor(i), options.color_depth);
-            try writeStringRef(writer, "str", arg.name, symbols, table_snippet_max, options.color_depth);
-            try setCommentFg(writer, options.color_depth);
-            try writer.writeAll(" = ");
-            if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
-            try writeValueDigest(writer, arg.value, symbols, table_snippet_max, options.color_depth);
-            if (i < chunk.function_arg_pos.len) {
-                try setCommentFg(writer, options.color_depth);
-                try writer.writeAll(" ; ");
-                if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
-                try writeAttrPosLocation(writer, chunk.function_arg_pos[i], symbols, options.color_depth);
-            }
-            try writer.writeByte('\n');
-        }
-    }
-
-    // Attr-name / attr-position side tables: the names and source positions the
-    // `attrs_new_named*` ops pull out of the code stream. Each op carries only a
-    // `names[start..]` / `positions[start..]` reference into these tables — the
-    // resolved contents live here, once, like the constant pool. Gated with the
-    // constants flag: they are compile-time data of the same family.
-    if (options.show_constants and chunk.attr_names.len > 0) {
-        try writeGuide(writer, cc, null, options.color_depth);
-        try writer.writeAll("  attr names:\n");
-        for (chunk.attr_names, 0..) |nm, i| {
-            try writeTableRowHead(writer, cc, sec_attr_names_color, i, i == chunk.attr_names.len - 1, attrNameColor(i), options.color_depth);
-            try writeStringRef(writer, "str", nm, symbols, table_snippet_max, options.color_depth);
-            try writer.writeByte('\n');
-        }
-    }
-    if (options.show_constants and chunk.attr_pos.len > 0) {
-        try writeGuide(writer, cc, null, options.color_depth);
-        try writer.writeAll("  attr positions:\n");
-        for (chunk.attr_pos, 0..) |rec, i| {
-            try writeTableRowHead(writer, cc, sec_attr_pos_color, i, i == chunk.attr_pos.len - 1, attrPosColor(i), options.color_depth);
-            try writeAttrPosRow(writer, rec, symbols, options.color_depth);
-            try writer.writeByte('\n');
-        }
-    }
-    if (options.show_constants and chunk.capture_bytes.len > 0) {
-        try writeGuide(writer, cc, null, options.color_depth);
-        try writer.writeAll("  capture descriptors:\n");
-        const count = chunk.capture_bytes.len / 3;
-        for (0..count) |i| {
-            const offset = i * 3;
-            const is_upvalue = chunk.capture_bytes[offset] != 0;
-            const index = readU16(chunk.capture_bytes, offset + 1);
-            try writeTableRowHead(writer, cc, sec_captures_color, i, i == count - 1, upvColor(i), options.color_depth);
-            try writer.print("@{d} {s}[{d}]\n", .{ offset, if (is_upvalue) "upvalue" else "local", index });
-        }
-    }
-
-    // Upvalue table: the best-effort binding name behind each upvalue slot
-    // (mirrored by the `upvalue[N] name` comments in the body), with the
-    // chunk's strictness flags folded in per slot. `#N` takes the slot's
-    // identity color — the same hue every `up_get #N` operand carries.
-    if (up_names) |ups| {
-        const strict = chunk.scheduling.strictness.forced_upvalues;
-        const deep = chunk.scheduling.strictness.deep_upvalues & ~strict;
-        try writeGuide(writer, cc, null, options.color_depth);
-        try writer.writeAll("  upvalues:\n");
-        for (ups, 0..) |name_id, i| {
-            try writeGuide(writer, cc, null, options.color_depth);
-            try writer.writeAll("  ");
-            try writeTreeGuide(writer, sec_upvalues_color, if (i == ups.len - 1) .corner else .vert, null, options.color_depth);
-            var ibuf: [8]u8 = undefined;
-            const istr = std.fmt.bufPrint(&ibuf, "#{d}", .{i}) catch "#?";
-            if (options.color_depth.enabled()) {
-                const uc = upvColor(i);
-                try setFg(writer, uc, options.color_depth);
-                try writer.writeAll(istr);
-                try writer.writeAll("\x1b[0m");
-            } else {
-                try writer.writeAll(istr);
-            }
-            try writer.splatByteAll(' ', 6 -| istr.len);
-            if (symbols.internName(name_id)) |raw| {
-                // Strip the leading NUL off compiler-internal names.
-                const name = if (raw.len > 0 and raw[0] == 0) raw[1..] else raw;
-                try setFg(writer, name_color, options.color_depth);
-                try writer.writeAll(name);
-                if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
-            } else {
-                try writer.print("0x{x}", .{name_id});
-            }
-            const is_strict = i < 64 and (strict >> @intCast(i)) & 1 == 1;
-            const is_deep = i < 64 and (deep >> @intCast(i)) & 1 == 1;
-            if (is_strict or is_deep) {
-                try setCommentFg(writer, options.color_depth);
-                try writer.print(" ; {s}", .{if (is_strict) "strict" else "deep"});
-                if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
-            }
-            try writer.writeByte('\n');
-        }
-    }
-
-    // References section: which chunks reach this one and which it reaches.
-    if (chunk_id) |id| if (options.refs) |graph| {
-        const inc = graph.incoming(id);
-        const out = graph.outgoing(id);
-        if (inc.len > 0 or out.len > 0) {
-            try writeGuide(writer, cc, null, options.color_depth);
-            try writer.writeAll("  references:\n");
-            try writeRefList(writer, "incoming", sec_incoming_color, inc, out.len == 0, symbols, cc, options.color_depth);
-            try writeRefList(writer, "outgoing", sec_outgoing_color, out, true, symbols, cc, options.color_depth);
-        }
-    };
+    try writeChunkTables(writer, chunk_id, chunk, symbols, options, cc, up_names);
 
     if (!options.show_code) return;
 
@@ -383,6 +246,142 @@ fn writeChunkAt(
             try writer.writeByte('\n');
             try writeChunkAt(allocator, writer, child_id, child, symbols, options, depth + 1, visited);
         }
+    }
+}
+
+fn writeChunkTables(
+    writer: *std.Io.Writer,
+    chunk_id: ?ChunkId,
+    chunk: *const Chunk,
+    symbols: Symbols,
+    options: Options,
+    cc: [3]u8,
+    up_names: ?[]const InternId,
+) !void {
+    if (!options.show_constants) return;
+
+    if (chunk.constants.len > 0) {
+        try writeGuide(writer, cc, null, options.color_depth);
+        try writer.writeAll("  constants:\n");
+        for (chunk.constants, 0..) |constant, i| {
+            try writeGuide(writer, cc, null, options.color_depth);
+            try writer.writeAll("  ");
+            try writeTreeGuide(writer, sec_constants_color, if (i == chunk.constants.len - 1) .corner else .vert, null, options.color_depth);
+            var index_buf: [8]u8 = undefined;
+            const index_text = std.fmt.bufPrint(&index_buf, "#{d}", .{i}) catch "#?";
+            if (options.color_depth.enabled()) {
+                try setFg(writer, constColor(i), options.color_depth);
+                try writer.writeAll(index_text);
+                try writer.writeAll("\x1b[0m");
+            } else {
+                try writer.writeAll(index_text);
+            }
+            try writer.splatByteAll(' ', 6 -| index_text.len);
+            try writeValueDigest(writer, constant, symbols, table_snippet_max, options.color_depth);
+            try writer.writeByte('\n');
+        }
+    }
+
+    if (chunk.function_args.len > 0) {
+        try writeGuide(writer, cc, null, options.color_depth);
+        try writer.writeAll("  function arguments:\n");
+        for (chunk.function_args, 0..) |arg, i| {
+            try writeTableRowHead(writer, cc, sec_function_args_color, i, i == chunk.function_args.len - 1, attrNameColor(i), options.color_depth);
+            try writeStringRef(writer, "str", arg.name, symbols, table_snippet_max, options.color_depth);
+            try setCommentFg(writer, options.color_depth);
+            try writer.writeAll(" = ");
+            if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
+            try writeValueDigest(writer, arg.value, symbols, table_snippet_max, options.color_depth);
+            if (i < chunk.function_arg_pos.len) {
+                try setCommentFg(writer, options.color_depth);
+                try writer.writeAll(" ; ");
+                if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
+                try writeAttrPosLocation(writer, chunk.function_arg_pos[i], symbols, options.color_depth);
+            }
+            try writer.writeByte('\n');
+        }
+    }
+
+    if (chunk.attr_names.len > 0) {
+        try writeGuide(writer, cc, null, options.color_depth);
+        try writer.writeAll("  attr names:\n");
+        for (chunk.attr_names, 0..) |name, i| {
+            try writeTableRowHead(writer, cc, sec_attr_names_color, i, i == chunk.attr_names.len - 1, attrNameColor(i), options.color_depth);
+            try writeStringRef(writer, "str", name, symbols, table_snippet_max, options.color_depth);
+            try writer.writeByte('\n');
+        }
+    }
+    if (chunk.attr_pos.len > 0) {
+        try writeGuide(writer, cc, null, options.color_depth);
+        try writer.writeAll("  attr positions:\n");
+        for (chunk.attr_pos, 0..) |position, i| {
+            try writeTableRowHead(writer, cc, sec_attr_pos_color, i, i == chunk.attr_pos.len - 1, attrPosColor(i), options.color_depth);
+            try writeAttrPosRow(writer, position, symbols, options.color_depth);
+            try writer.writeByte('\n');
+        }
+    }
+    if (chunk.capture_bytes.len > 0) {
+        try writeGuide(writer, cc, null, options.color_depth);
+        try writer.writeAll("  capture descriptors:\n");
+        const count = chunk.capture_bytes.len / 3;
+        for (0..count) |i| {
+            const offset = i * 3;
+            const is_upvalue = chunk.capture_bytes[offset] != 0;
+            const index = readU16(chunk.capture_bytes, offset + 1);
+            try writeTableRowHead(writer, cc, sec_captures_color, i, i == count - 1, upvColor(i), options.color_depth);
+            try writer.print("@{d} {s}[{d}]\n", .{ offset, if (is_upvalue) "upvalue" else "local", index });
+        }
+    }
+
+    if (up_names) |names| try writeUpvalueTable(writer, chunk, names, symbols, options, cc);
+
+    if (chunk_id) |id| if (options.refs) |graph| {
+        const incoming = graph.incoming(id);
+        const outgoing = graph.outgoing(id);
+        if (incoming.len > 0 or outgoing.len > 0) {
+            try writeGuide(writer, cc, null, options.color_depth);
+            try writer.writeAll("  references:\n");
+            try writeRefList(writer, "incoming", sec_incoming_color, incoming, outgoing.len == 0, symbols, cc, options.color_depth);
+            try writeRefList(writer, "outgoing", sec_outgoing_color, outgoing, true, symbols, cc, options.color_depth);
+        }
+    };
+}
+
+fn writeUpvalueTable(writer: *std.Io.Writer, chunk: *const Chunk, names: []const InternId, symbols: Symbols, options: Options, cc: [3]u8) !void {
+    const strict = chunk.scheduling.strictness.forced_upvalues;
+    const deep = chunk.scheduling.strictness.deep_upvalues & ~strict;
+    try writeGuide(writer, cc, null, options.color_depth);
+    try writer.writeAll("  upvalues:\n");
+    for (names, 0..) |name_id, i| {
+        try writeGuide(writer, cc, null, options.color_depth);
+        try writer.writeAll("  ");
+        try writeTreeGuide(writer, sec_upvalues_color, if (i == names.len - 1) .corner else .vert, null, options.color_depth);
+        var index_buf: [8]u8 = undefined;
+        const index_text = std.fmt.bufPrint(&index_buf, "#{d}", .{i}) catch "#?";
+        if (options.color_depth.enabled()) {
+            try setFg(writer, upvColor(i), options.color_depth);
+            try writer.writeAll(index_text);
+            try writer.writeAll("\x1b[0m");
+        } else {
+            try writer.writeAll(index_text);
+        }
+        try writer.splatByteAll(' ', 6 -| index_text.len);
+        if (symbols.internName(name_id)) |raw| {
+            const name = if (raw.len > 0 and raw[0] == 0) raw[1..] else raw;
+            try setFg(writer, name_color, options.color_depth);
+            try writer.writeAll(name);
+            if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
+        } else {
+            try writer.print("0x{x}", .{name_id});
+        }
+        const is_strict = i < 64 and (strict >> @intCast(i)) & 1 == 1;
+        const is_deep = i < 64 and (deep >> @intCast(i)) & 1 == 1;
+        if (is_strict or is_deep) {
+            try setCommentFg(writer, options.color_depth);
+            try writer.print(" ; {s}", .{if (is_strict) "strict" else "deep"});
+            if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
+        }
+        try writer.writeByte('\n');
     }
 }
 
@@ -629,10 +628,8 @@ const Line = struct {
     /// tokens before it out to `field_comment_col` so comment semicolons align.
     comment_tok: ?usize = null,
 
-    /// Reset without touching `toks`/`buf`: the `Line{}` literal lowers to a
-    /// ~2KB memset of the undefined arrays, which at one Line per rendered row
-    /// (millions per `--eval` dump) dominates the render loop. Declare the Line
-    /// `undefined` and reset the three live scalars instead.
+    /// Reset only initialized scalars; token and text storage is overwritten
+    /// before use.
     inline fn reset(self: *Line) void {
         self.n = 0;
         self.used = 0;
@@ -1036,8 +1033,7 @@ fn fieldIsList(f: Operand) bool {
 }
 
 /// Table-driven head: render an op's leading SCALAR operand fields as byte-
-/// pinned colored groups plus their grey interpretation — the flag-rendering of
-/// what used to be ~11 near-identical per-op arms. Multiline ops keep only their
+/// pinned colored groups plus their grey interpretation. Multiline ops keep only their
 /// leading scalar here (chunk id); the list body is drawn by `writeOperandTail`.
 /// Ops whose head is a list (attr paths, mix) or empty fall back to the compact
 /// decode.
@@ -1615,8 +1611,7 @@ fn writeOperands(
     // Uniform, table-driven operand rendering. Two passes over the op's operand
     // layout (`opcode.layout`): pass 1 prints raw operand tokens, pass 2 their
     // interpretation, joined as "raw ; interp" (the form the multiline view
-    // splits on). Every per-op case that used to live here is now one entry in
-    // that table plus the per-field-type renderers below.
+    // splits on). Per-field renderers share the same layout table.
     const code = chunk.code;
     const fields = opcode_mod.layout(op);
 

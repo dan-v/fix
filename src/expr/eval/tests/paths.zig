@@ -1,7 +1,7 @@
 const std = @import("std");
 const std_testing = std.testing;
 const renderForTest = @import("../test_helpers.zig").renderForTest;
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 /// Evaluate `source` as if it lived at `file_path` (relative path literals
 /// resolve against the file's dir, like Nix), deep-force, render.

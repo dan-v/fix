@@ -15,8 +15,8 @@ const vm_trace = @import("../trace.zig");
 /// normally so the caller still propagates the original error; only a `:q`
 /// abort from the console surfaces as an error here.
 pub fn debugBreakError(self: *VM, value: Value) !void {
-    if (self.tryeval_depth != 0) return;
-    if (self.break_sink) |sink| try sink.fire(sink.ctx, self, value, .eval_error);
+    if (self.debug.tryeval_depth != 0) return;
+    if (self.debug.break_sink) |sink| try sink.fire(sink.ctx, self, value, .eval_error);
 }
 
 pub fn builtinThrow(self: *VM, message_arg: Value) !Value {
@@ -33,8 +33,8 @@ pub fn builtinAbort(self: *VM, message_arg: Value) !Value {
 
 pub fn builtinTryEval(self: *VM, arg: Value) !Value {
     // Suppress debugger error-entry for errors caught here.
-    self.tryeval_depth += 1;
-    defer self.tryeval_depth -= 1;
+    self.debug.tryeval_depth += 1;
+    defer self.debug.tryeval_depth -= 1;
     const value = vm_force.forceValue(self, arg) catch |err| switch (err) {
         error.NixThrow,
         error.NixAbort,
@@ -62,7 +62,7 @@ pub fn builtinAddErrorContext(self: *VM, message_arg: Value, value_arg: Value) !
 /// behaviour). With no debugger (`break_sink == null`, the normal case) this
 /// is a plain forced identity, so it costs nothing off the debug path.
 pub fn builtinBreak(self: *VM, arg: Value) !Value {
-    if (self.break_sink) |sink| {
+    if (self.debug.break_sink) |sink| {
         try sink.fire(sink.ctx, self, arg, .break_builtin);
     }
     return vm_force.forceValue(self, arg);

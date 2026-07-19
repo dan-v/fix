@@ -1,9 +1,7 @@
 //! Qualified chunk names as a persistent tree, not strings.
 //!
 //! A chunk's name is its path through the binding hierarchy — `pkgs.hello`, not
-//! the useless leaf `hello`. Building that path as a string per chunk (the old
-//! `capture_names` sidecar) is expensive and single-threaded, so it was gated
-//! off. Instead we store, per name, a `{ parent, segment }` node: the segment
+//! the ambiguous leaf `hello`. Each name is a `{ parent, segment }` node: the segment
 //! is the leaf binding's interned id, the parent points at the enclosing name.
 //! Siblings share the parent, so the whole naming hierarchy costs one small
 //! node per *bound* chunk and no string is materialised until something renders
@@ -74,7 +72,7 @@ pub const NameTree = struct {
     }
 
     /// Write the fully-qualified path for `id` (nothing for the root). Segments
-    /// join with `.` (real) or `·` (synthetic), matching the old string naming.
+    /// join with `.` for real bindings or `·` for synthetic ones.
     pub fn writeQualified(self: *const NameTree, w: *std.Io.Writer, id: NameId, intern: *const InternTable) !void {
         try self.writeNode(w, id, intern);
     }

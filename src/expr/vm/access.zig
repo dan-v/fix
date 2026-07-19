@@ -142,7 +142,7 @@ inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId)
 /// The sweep task forces members via `forceValueSpeculative`, so it is
 /// demand-invisible (no `demanded` marks, sticky-error rules unchanged).
 fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
-    if (self.in_speculation) return;
+    if (self.speculation.active) return;
     if (!member.isThunk()) return;
     const th = self.heap.getThunkAssumeValid(member.asObjectId());
     if (th.future.state.load(.monotonic) != @intFromEnum(future_mod.FutureState.unresolved)) return;

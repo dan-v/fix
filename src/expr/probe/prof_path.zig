@@ -21,20 +21,18 @@
 //! max-span child from the root enumerates the chain. Because
 //! independent sibling forces would run in *parallel* at high worker
 //! counts, `max` (not `sum`) over children models the multi-worker
-//! floor — so the reported critical path estimates what w=∞ can't beat,
-//! and its cycle total should track the measured w=32 wall.
+//! floor, so the reported path is a lower-bound model rather than a
+//! prediction for a particular worker count.
 //!
 //! IMPORTANT attribution caveat. Spans nest on thunk *forces* only, not
 //! on direct closure calls (`do_call`/`call_tail` push a frame and keep
 //! running in the same dispatch loop). So work done in a directly-called
 //! closure that does not itself force a thunk is charged to the *forcing*
 //! chunk's self-time, not to the callee. A driver chunk like the overlay
-//! fixpoint (`prev // overlay final prev`) therefore shows huge self-time
-//! that is really the overlays it calls — NOT the `//` merge (measured
-//! separately at ~250M cy via `-Dprof-main` `attrs_merge`). Read the flat
-//! profile as "which forcing site drives the most call work", not "which
-//! operation is hot" — use `-Dprof-main` for operation-level truth. A
-//! future version could nest on frame push/pop to attribute calls too.
+//! fixpoint (`prev // overlay final prev`) can therefore charge overlay work
+//! to the forcing chunk rather than the merge. Read the flat profile as
+//! "which forcing site drives call work", not "which operation is hot";
+//! use `-Dprof-main` for operation-level attribution.
 //!
 //! This is a workers=1 tool. At higher worker counts fibers interleave
 //! and the LIFO assumption breaks; `enter`/`exit` then self-guard and

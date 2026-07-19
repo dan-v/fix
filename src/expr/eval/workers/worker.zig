@@ -3,8 +3,8 @@
 //! Each helper thread (and the main thread, persistently for the
 //! evaluator's lifetime) owns a Worker. The Worker owns:
 //!   - A mutex-protected free list of `.finished` fibers ready to be
-//!     reset for a new task. Foreign workers push onto this when a
-//!     stolen fiber finishes — see F1.4.
+//!     reset for a new task. Foreign workers push onto it when a stolen
+//!     fiber finishes.
 //!   - The set of all fibers it has ever allocated, for teardown.
 //!
 //! The *ready* queue lives on the scheduler, not the worker — see
@@ -25,7 +25,7 @@
 //! pointers (heap, registry, intern, scheduler) live on the VM but
 //! point at evaluator-owned tables.
 //!
-//! Fiber execution is *not* pinned to the allocator worker post-F1.4.
+//! Fiber execution is not pinned to the allocator worker.
 //! Any worker may pop a ready fiber and resume it on its own thread;
 //! the per-fiber `in_runfiber` atomic protects against tearing down
 //! a stolen-and-currently-running fiber.
@@ -34,6 +34,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
+const AttrEntry = @import("runtime").heap.AttrEntry;
 const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
 const sync = @import("base").sync;
@@ -80,7 +81,7 @@ const backlog_counter: observ.CounterSpec = .{ .category = "scheduler", .name = 
 const speculation_counter: observ.CounterSpec = .{ .category = "scheduler", .name = "speculation" };
 const steal_flow: observ.FlowSpec = .{ .category = "scheduler", .name = "steal" };
 
-/// VM constructor injected by the embedder (eval.zig). Returns a VM
+/// VM constructor injected by the embedder (evaluator.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker repoints
 /// the VM's `ctx` at the fiber's own ExecutionContext (which carries the
 /// fiber's claim id). `scratch` is the fiber's
@@ -94,9 +95,7 @@ pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, fiber_id: u32, s
 /// flight than the prewarm count.
 pub const prewarm_fiber_count: u8 = 4;
 
-/// Pre-park spin duration in `parkAndAccount`. This is the measured production
-/// value; keeping it fixed avoids turning a scheduler invariant into a runtime
-/// experiment surface.
+/// Pre-park spin duration in `parkAndAccount`.
 const spin_iterations: u32 = 1024;
 
 /// Fiber cost/benefit census (piggybacks on `-Dprof-main`; see
@@ -117,8 +116,8 @@ pub const FiberState = enum(u8) {
 
 /// One in-flight evaluation. Owns a stack, a Context (via InnerFiber),
 /// and a VM. Lives until the Worker is torn down — once allocated, it
-/// is reused via `WorkerFiber.reset` across tasks. Post-F1.4 the fiber's
-/// thread affinity is advisory: it wakes onto its allocator-worker's
+/// is reused via `WorkerFiber.reset` across tasks. Its thread affinity is
+/// advisory: it wakes onto its allocator-worker's
 /// ready queue by preference but any worker can steal it.
 pub const WorkerFiber = struct {
     /// The worker that allocated this fiber. Used as a hint for which
@@ -135,13 +134,9 @@ pub const WorkerFiber = struct {
     /// this fiber shares the pointer — identity is structural, never
     /// re-dressed per VM.
     ctx: ExecutionContext,
-    /// Per-fiber scratch arena backing `vm`'s run-path allocations
-    /// (builtin temp buffers, drv hashing, equality scratch — ~490 MB of
-    /// transient traffic per NixOS eval). Arena semantics are load-bearing:
-    /// run paths free best-effort and error/suspend paths abandon
-    /// allocations. Reset (bounded retention) each time the fiber is
-    /// recycled onto the free list — a never-reset arena retained ~240 MB
-    /// (w=1) / ~380 MB (w=8) of dead interleaved pages.
+    /// Per-fiber scratch arena for VM temporaries. Run paths free best-effort,
+    /// while error and suspend paths may abandon allocations. Bounded capacity
+    /// is retained when the fiber returns to the free list.
     scratch: arena_mod.ArenaAllocator,
     state: FiberState,
     /// Set to 1 while some worker is inside `inner.resume_()` on this
@@ -254,9 +249,7 @@ pub const Worker = struct {
     /// Depth of the `free_head` list. Drives the stack-release policy:
     /// fibers parked deeper than the prewarm count are spike overflow
     /// (a burst of blocking work grew the pool) and give their stack
-    /// pages back to the OS — 8 MiB dirty reservations otherwise stay
-    /// resident forever, and 99.9% of tasks are served by the first
-    /// (still-warm) `prewarm_fiber_count` fibers.
+    /// pages back to the OS. The prewarmed fibers keep their stacks.
     free_count: u32,
     free_mu: sync.SpinMutex,
 
@@ -690,17 +683,17 @@ pub const Worker = struct {
         defer run_span.cancel();
         // Creation-context flag: creations during this quantum belong to
         // the resumed fiber's context (demand chain vs. speculative work).
-        // `in_speculation` is fiber-state (saved on its VM across yields);
+        // `speculation.active` is fiber state saved across yields;
         // the heap flag is per worker THREAD, so refresh it on every
         // resume. `forceValueSpeculative` keeps it in sync mid-quantum.
-        f.vm.heap.setSpecCtx(f.vm.in_speculation);
+        f.vm.heap.setSpecCtx(f.vm.speculation.active);
         // Creation-budget re-base: the per-worker `thunks_created` counter
         // advanced while this fiber was parked (other fibers' creations)
         // and may belong to a different worker now (migration). Re-base
         // the snapshot so only creations made INSIDE this fiber's own run
-        // slices are charged against its budget (see VM.spec_create_left).
-        if (f.vm.spec_create_left != vm_mod.no_spec_budget)
-            vm_force.specCreateArm(&f.vm, f.vm.spec_create_left);
+        // slices are charged against its budget (see VM.speculation.create_left).
+        if (f.vm.speculation.create_left != vm_mod.no_spec_budget)
+            vm_force.specCreateArm(&f.vm, f.vm.speculation.create_left);
         f.in_runfiber.store(1, .release);
         f.inner.resume_();
         f.in_runfiber.store(0, .release);
@@ -796,9 +789,8 @@ pub const Worker = struct {
         }
 
         self.flushTimingToScheduler();
-        // About to sleep: idle time is free — give parked overflow fibers'
-        // dirty stacks back to the OS (never on the task-completion path;
-        // measured ~107K madvise calls/eval there, ~2µs each).
+        // Give parked overflow fibers' dirty stacks back to the OS only when
+        // the worker is already about to sleep.
         self.sweepFreeStacks();
         const t0 = nanoMonotonic();
         const pt = prof.start(.park_main_worker);
@@ -811,9 +803,7 @@ pub const Worker = struct {
         if (t1 > t0) self.idle_ns += t1 - t0;
     }
 
-    /// Release the stacks of free-list fibers beyond the prewarm depth
-    /// (spike overflow, parked with dirty 8 MiB reservations — spikes
-    /// reach ~196 live fibers, so up to ~1.5 GB of once-touched pages).
+    /// Release the stacks of free-list fibers beyond the prewarm depth.
     /// Runs only when this worker is about to park. Candidates are
     /// collected under `free_mu` but madvised outside it — safe because
     /// the free list's consumer is THIS worker only (see `free_head`),
@@ -917,7 +907,7 @@ pub const Worker = struct {
         errdefer f.vm.deinit();
         // Priority inheritance (`FIX_RESCUE`): expose this fiber's rescue flag
         // under its id so a peer blocking on its work can promote it.
-        self.scheduler.registerRescue(fiber_id, &f.vm.demand_rescue);
+        self.scheduler.registerRescue(fiber_id, &f.vm.speculation.demand_rescue);
 
         f.inner = try InnerFiber.init(self.allocator, InnerFiber.min_stack_bytes, slotEntry, undefined);
         // Bake the native-stack guard limit now that the fiber owns its stack.
@@ -926,10 +916,8 @@ pub const Worker = struct {
         // (base) address. Permanent for the fiber's life (the stack never moves),
         // like `claimer_id`. See `exec_context.stack_limit` / `forceThunkImpl`.
         f.ctx.stack_limit = @intFromPtr(f.inner.stack.ptr) + exec_context.stack_guard_margin;
-        // RSS attribution: the owner (this worker) registers the fiber stack —
-        // fiber.zig no longer does it, keeping the primitive free of the tag
-        // taxonomy. Registered when the stack is committed, unregistered when
-        // it is munmapped (both teardown paths + this errdefer).
+        // The worker owns stack attribution because memory tags are
+        // application-specific. Registration matches every teardown path.
         mem_tag.vma.registerRegion(f.inner.stack.ptr, f.inner.stack.len, .fiber_stack);
         errdefer {
             mem_tag.vma.unregisterRegion(f.inner.stack.ptr);
@@ -989,7 +977,7 @@ pub const Worker = struct {
     }
 };
 
-/// CLOCK_MONOTONIC reading used to bucket worker run and park time.
+/// Monotonic clock for worker run and park-time buckets.
 const nanoMonotonic = clock.monotonicNs;
 
 /// Standard fiber entry: run one task to completion and return.
@@ -1002,7 +990,7 @@ fn slotEntry(arg: *anyopaque) void {
     f.vm.frames_len = 0;
     // Priority inheritance (`FIX_RESCUE`): a rescue flag applies only to the
     // task it was granted for — clear it at each task boundary.
-    f.vm.demand_rescue.store(0, .monotonic);
+    f.vm.speculation.demand_rescue.store(0, .monotonic);
     const task = f.current_task orelse return;
     f.current_task = null;
     // Speculative work must NOT touch the user-facing error trace. A
@@ -1107,191 +1095,162 @@ fn specRootBandSmall(f: *WorkerFiber, thunk_id: types.ObjectId) bool {
 /// out so the census wrapper can bracket it without duplicating arms).
 fn runTask(f: *WorkerFiber, task: Task) void {
     switch (task) {
-        .force_thunk => |thunk_id| {
-            // Bounded spec-lane cascade: arm the per-task creation budget for
-            // speculative/novel force_thunk tasks, so one wrong guess can't
-            // evaluate an unbounded never-demanded subgraph (the sub-256-
-            // combinator junk cascade). Bail is a transient thunk reset;
-            // resolved sub-thunks are kept — same semantics the sibling
-            // sweeps have shipped with. Urgent (demand-adjacent) tasks
-            // stay unbounded. The band budget applies only to
-            //    tasks whose ROOT chunk is below the trusted size
-            //    (`spec_band_small`) — the family whose execution
-            //    cascades. Trusted (≥256) roots run unbudgeted: bailing
-            //    useful deep speculation discards its claim spine, and the
-            //    demand-side redo measured +12% w=8 wall.
-            if (f.current_lane != .urgent) {
-                const band = f.vm.scheduler.config.spec_band_budget;
-                if (band != 0 and specRootBandSmall(f, thunk_id))
-                    vm_force.specCreateArm(&f.vm, band);
-            }
-            defer {
-                f.vm.spec_create_left = vm_mod.no_spec_budget;
-                f.vm.spec_budget = vm_mod.no_spec_budget;
-            }
-            const v = Value.thunk(thunk_id);
-            _ = vm_force.forceValueSpeculative(&f.vm, v) catch |err| {
-                if (err == error.SpeculativeBail)
-                    f.vm.scheduler.noteSpecBail(worker_id_mod.current);
-            };
-        },
-        .force_list_range => |range| {
-            // The list's value range is a RAW store slice held across
-            // `forceValueSpeculative` — which can drive a GC collection. We
-            // nulled `current_task` above, so nothing else roots this list.
-            // Rooting keeps the list *object* live, but the copying nursery
-            // collector EVACUATES (moves) its value range to to-space, so a
-            // slice captured before the force dangles even though the object
-            // survives. Re-fetch each element from the id per iteration
-            // (`getListItem` re-derives the range from the moved object) so we
-            // always read the live copy.
-            // NON-MOVING GC: `rootKeep` keeps the list live and ranges never
-            // relocate/are-swept while rooted, so the slice is stable across the
-            // element forces — hold it, no per-element re-fetch.
-            const gc_roots = vm_force.rootsBegin(&f.vm);
-            defer vm_force.rootsEnd(&f.vm, gc_roots);
-            vm_force.rootKeep(&f.vm, Value.list(range.list_id));
-            const items = f.vm.heap.getList(range.list_id) catch return;
-            const end = @min(@as(usize, range.offset) + @as(usize, range.len), items.len);
-            var i: usize = range.offset;
-            while (i < end) : (i += 1) {
-                if (!items[i].isThunk()) continue;
-                _ = vm_force.forceValueSpeculative(&f.vm, items[i]) catch {};
-            }
-        },
-        .force_attrs_sweep => |attrs_id| {
-            // Demand-sibling prefetch (`FIX_SIBLING`): force every still-
-            // unresolved thunk member of one attrset. Rooting mirrors the
-            // list case above; the submitter only ever sweeps plain
-            // `.attrs` objects, so `getAttrs` never flattens here. Members
-            // resolved since submission fall through the resolved fast
-            // path in `forceValueSpeculative` — the sweep is idempotent.
-            const gc_roots = vm_force.rootsBegin(&f.vm);
-            defer vm_force.rootsEnd(&f.vm, gc_roots);
-            vm_force.rootKeep(&f.vm, Value.attrs(attrs_id));
-            const entries = f.vm.heap.getAttrs(attrs_id) catch return;
-            const log = f.vm.scheduler.config.sibling_log;
-            const objs_before: u32 = if (log) f.vm.heap.objects.count() else 0;
-            var lbuf: [160]u8 = undefined;
-            var rbuf: [224]u8 = undefined;
-            if (log) {
-                // Identify the sweep target: first attr name + first
-                // unresolved member's body label (best-effort).
-                var label: []const u8 = "?";
-                for (entries) |entry| {
-                    if (!entry.value.isThunk()) continue;
-                    const subj = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), &lbuf);
-                    if (subj.isEmpty()) continue;
-                    label = switch (subj) {
-                        .source => |source| std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(source.file)), source.line }) catch "?",
-                        .text, .path, .url => |text| text,
-                        .none => "?",
-                    };
-                    break;
-                }
-                std.debug.print("sweep attrs={d} n={d} t_us={d} worker={d} claimer={d} first_attr={s} member={s}\n", .{
-                    attrs_id,             entries.len,
-                    vm_force.diagNowUs(), worker_id_mod.current,
-                    f.ctx.claimer_id,     f.vm.intern.get(entries[0].name),
-                    label,
-                });
-            }
-            // Arm the per-member cascade bounds (claimed forces AND thunk
-            // creations); restore before the fiber is recycled for tasks
-            // that must run unbounded.
-            defer {
-                f.vm.spec_budget = vm_mod.no_spec_budget;
-                f.vm.spec_create_left = vm_mod.no_spec_budget;
-            }
-            for (entries) |entry| {
-                if (!entry.value.isThunk()) continue;
-                if (!vm_force.sweepMemberAdmissible(&f.vm, entry.value.asObjectId())) continue;
-                f.vm.spec_budget = f.vm.scheduler.config.sibling_claim_budget;
-                vm_force.specCreateArm(&f.vm, f.vm.scheduler.config.sibling_budget);
-                if (log) {
-                    // Per-member cascade attribution: this worker's own
-                    // thunk-creation counter around the force. Best-effort —
-                    // a mid-force fiber migration garbles one sample.
-                    const before = f.vm.heap.currentLocal().thunks_created;
-                    const subj = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), &lbuf);
-                    _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
-                    const created = f.vm.heap.currentLocal().thunks_created -| before;
-                    if (created > 2000) {
-                        const mlabel: []const u8 = switch (subj) {
-                            .source => |source| std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(source.file)), source.line }) catch "?",
-                            .text, .path, .url => |text| if (text.len == 0) "?" else text,
-                            .none => "?",
-                        };
-                        std.debug.print("sweep-member attrs={d} attr={s} member={s} created={d} t_us={d} claimer={d}\n", .{
-                            attrs_id,             f.vm.intern.get(entry.name), mlabel, created,
-                            vm_force.diagNowUs(), f.ctx.claimer_id,
-                        });
-                    }
-                    continue;
-                }
-                _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
-            }
-            if (log) {
-                std.debug.print("sweep attrs={d} done: t_us={d} heap_growth={d}\n", .{
-                    attrs_id, vm_force.diagNowUs(), f.vm.heap.objects.count() -| objs_before,
-                });
-            }
-        },
-        .force_attrs_range => |range| {
-            // Batched attrs fan-out — the attrs analogue of
-            // `force_list_range` above (attrs are a positional slice in
-            // the heap, and the NON-MOVING GC note there applies
-            // identically: rooting keeps the entry range stable).
-            const gc_roots = vm_force.rootsBegin(&f.vm);
-            defer vm_force.rootsEnd(&f.vm, gc_roots);
-            vm_force.rootKeep(&f.vm, Value.attrs(range.attrs_id));
-            const entries = f.vm.heap.getAttrs(range.attrs_id) catch return;
-            const end = @min(@as(usize, range.offset) + @as(usize, range.len), entries.len);
-            var i: usize = range.offset;
-            while (i < end) : (i += 1) {
-                if (!entries[i].value.isThunk()) continue;
-                _ = vm_force.forceValueSpeculative(&f.vm, entries[i].value) catch {};
-            }
-        },
-        .import_prefetch => |path_id| {
-            // Speculative import prefetch (FIX_IMPORT_PREFETCH): resolve,
-            // parse, compile, and top-level-eval the file, populating the
-            // deduplicated import registry (imports.Registry) so the demand
-            // fiber later hits `.already_resolved` (or joins the in-flight
-            // Future) instead of paying parse+compile on the critical
-            // chain. Errors are swallowed here; deterministic failures are
-            // cached on the entry and replay identically on real demand.
-            const host = f.vm.import_host orelse return;
-            const path = f.vm.intern.get(path_id);
-            _ = host.import_value(host.context, &f.vm, path, 1) catch {};
-        },
-        .readdir_prefetch => |r| {
-            // Speculative readDir-children prefetch (FIX_READDIR_PREFETCH):
-            // warm the FileCache with the directory-kind children in
-            // [offset, offset+len) of the parent's listing. The parent
-            // read is a warm cache hit (the submitter just populated it);
-            // each child read is exactly the getdents the demand fiber
-            // would do — errors are swallowed and NOT cached, so a real
-            // demand read replays them identically.
-            const files = f.vm.files;
-            const parent = f.vm.intern.get(r.dir);
-            const entries = files.readDir(parent) catch return;
-            const end = @min(entries.len, @as(usize, r.offset) + r.len);
-            if (r.offset >= end) return;
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            for (entries[r.offset..end]) |ent| {
-                if (ent.kind != .directory) continue;
-                const child = std.fmt.bufPrint(&buf, "{s}/{s}", .{ parent, ent.name }) catch continue;
-                const listing = files.readDir(child) catch continue;
-                // Pre-intern the child's entry names: the demand-side
-                // builtins.readDir interns every name it returns (~21K
-                // for pkgs/by-name — measured as the residual chain cost
-                // once the getdents itself is prefetched). Warm inserts
-                // here turn those into read-mostly lookups. The intern
-                // table is append-only and global, so this is invisible
-                // beyond timing.
-                for (listing) |le| _ = f.vm.intern.intern(le.name) catch break;
-            }
-        },
+        .force_thunk => |thunk_id| runForceThunkTask(f, thunk_id),
+        .force_list_range => |range| runListRangeTask(f, range),
+        .force_attrs_sweep => |attrs_id| runAttrsSweepTask(f, attrs_id),
+        .force_attrs_range => |range| runAttrsRangeTask(f, range),
+        .import_prefetch => |path_id| runImportPrefetchTask(f, path_id),
+        .readdir_prefetch => |range| runReadDirPrefetchTask(f, range),
+    }
+}
+
+fn runForceThunkTask(f: *WorkerFiber, thunk_id: types.ObjectId) void {
+    // Limit cascades rooted at small speculative chunks. Urgent tasks and
+    // larger roots remain unbounded.
+    if (f.current_lane != .urgent) {
+        const budget = f.vm.scheduler.config.spec_band_budget;
+        if (budget != 0 and specRootBandSmall(f, thunk_id))
+            vm_force.specCreateArm(&f.vm, budget);
+    }
+    defer {
+        f.vm.speculation.create_left = vm_mod.no_spec_budget;
+        f.vm.speculation.claim_budget = vm_mod.no_spec_budget;
+    }
+    _ = vm_force.forceValueSpeculative(&f.vm, Value.thunk(thunk_id)) catch |err| {
+        if (err == error.SpeculativeBail)
+            f.vm.scheduler.noteSpecBail(worker_id_mod.current);
+    };
+}
+
+fn runListRangeTask(f: *WorkerFiber, range: scheduler_mod.ForceListRange) void {
+    // Rooting keeps both the list and its non-moving backing range live while
+    // element forces reach GC safepoints.
+    const roots = vm_force.rootsBegin(&f.vm);
+    defer vm_force.rootsEnd(&f.vm, roots);
+    vm_force.rootKeep(&f.vm, Value.list(range.list_id));
+    const items = f.vm.heap.getList(range.list_id) catch return;
+    const start: usize = range.offset;
+    const end = @min(start + @as(usize, range.len), items.len);
+    for (items[start..end]) |item| {
+        if (item.isThunk()) _ = vm_force.forceValueSpeculative(&f.vm, item) catch {};
+    }
+}
+
+fn runAttrsRangeTask(f: *WorkerFiber, range: scheduler_mod.ForceAttrsRange) void {
+    const roots = vm_force.rootsBegin(&f.vm);
+    defer vm_force.rootsEnd(&f.vm, roots);
+    vm_force.rootKeep(&f.vm, Value.attrs(range.attrs_id));
+    const entries = f.vm.heap.getAttrs(range.attrs_id) catch return;
+    const start: usize = range.offset;
+    const end = @min(start + @as(usize, range.len), entries.len);
+    for (entries[start..end]) |entry| {
+        if (entry.value.isThunk()) _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+    }
+}
+
+fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
+    const roots = vm_force.rootsBegin(&f.vm);
+    defer vm_force.rootsEnd(&f.vm, roots);
+    vm_force.rootKeep(&f.vm, Value.attrs(attrs_id));
+    const entries = f.vm.heap.getAttrs(attrs_id) catch return;
+    const log = f.vm.scheduler.config.sibling_log;
+    const objects_before: u32 = if (log) f.vm.heap.objects.count() else 0;
+    var label_buf: [160]u8 = undefined;
+    var rendered_buf: [224]u8 = undefined;
+
+    if (log) logAttrsSweepStart(f, attrs_id, entries, &label_buf, &rendered_buf);
+    defer {
+        f.vm.speculation.claim_budget = vm_mod.no_spec_budget;
+        f.vm.speculation.create_left = vm_mod.no_spec_budget;
+    }
+    for (entries) |entry| {
+        if (!entry.value.isThunk()) continue;
+        if (!vm_force.sweepMemberAdmissible(&f.vm, entry.value.asObjectId())) continue;
+        f.vm.speculation.claim_budget = f.vm.scheduler.config.sibling_claim_budget;
+        vm_force.specCreateArm(&f.vm, f.vm.scheduler.config.sibling_budget);
+        if (log) {
+            logAttrsSweepMember(f, attrs_id, entry, &label_buf, &rendered_buf);
+        } else {
+            _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+        }
+    }
+    if (log) {
+        std.debug.print("sweep attrs={d} done: t_us={d} heap_growth={d}\n", .{
+            attrs_id, vm_force.diagNowUs(), f.vm.heap.objects.count() -| objects_before,
+        });
+    }
+}
+
+fn logAttrsSweepStart(
+    f: *WorkerFiber,
+    attrs_id: types.ObjectId,
+    entries: []const AttrEntry,
+    label_buf: *[160]u8,
+    rendered_buf: *[224]u8,
+) void {
+    var label: []const u8 = "?";
+    for (entries) |entry| {
+        if (!entry.value.isThunk()) continue;
+        const subject = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), label_buf);
+        if (subject.isEmpty()) continue;
+        label = switch (subject) {
+            .source => |source| std.fmt.bufPrint(rendered_buf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(source.file)), source.line }) catch "?",
+            .text, .path, .url => |text| text,
+            .none => "?",
+        };
+        break;
+    }
+    std.debug.print("sweep attrs={d} n={d} t_us={d} worker={d} claimer={d} first_attr={s} member={s}\n", .{
+        attrs_id,             entries.len,
+        vm_force.diagNowUs(), worker_id_mod.current,
+        f.ctx.claimer_id,     f.vm.intern.get(entries[0].name),
+        label,
+    });
+}
+
+fn logAttrsSweepMember(
+    f: *WorkerFiber,
+    attrs_id: types.ObjectId,
+    entry: AttrEntry,
+    label_buf: *[160]u8,
+    rendered_buf: *[224]u8,
+) void {
+    const created_before = f.vm.heap.currentLocal().thunks_created;
+    const subject = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), label_buf);
+    _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+    const created = f.vm.heap.currentLocal().thunks_created -| created_before;
+    if (created <= 2000) return;
+    const label: []const u8 = switch (subject) {
+        .source => |source| std.fmt.bufPrint(rendered_buf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(source.file)), source.line }) catch "?",
+        .text, .path, .url => |text| if (text.len == 0) "?" else text,
+        .none => "?",
+    };
+    std.debug.print("sweep-member attrs={d} attr={s} member={s} created={d} t_us={d} claimer={d}\n", .{
+        attrs_id,             f.vm.intern.get(entry.name), label, created,
+        vm_force.diagNowUs(), f.ctx.claimer_id,
+    });
+}
+
+fn runImportPrefetchTask(f: *WorkerFiber, path_id: types.InternId) void {
+    const host = f.vm.import_host orelse return;
+    const path = f.vm.intern.get(path_id);
+    // Demand replays cached deterministic failures through the same registry.
+    _ = host.import_value(host.context, &f.vm, path, 1) catch {};
+}
+
+fn runReadDirPrefetchTask(f: *WorkerFiber, range: scheduler_mod.ReadDirPrefetch) void {
+    const files = f.vm.files;
+    const parent = f.vm.intern.get(range.dir);
+    const entries = files.readDir(parent) catch return;
+    const start: usize = range.offset;
+    const end = @min(entries.len, start + range.len);
+    if (start >= end) return;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (entries[start..end]) |entry| {
+        if (entry.kind != .directory) continue;
+        const child = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ parent, entry.name }) catch continue;
+        const listing = files.readDir(child) catch continue;
+        // Warm the append-only intern table along with the directory cache.
+        for (listing) |child_entry| _ = f.vm.intern.intern(child_entry.name) catch break;
     }
 }

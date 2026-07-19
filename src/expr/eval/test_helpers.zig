@@ -3,7 +3,7 @@
 //! variants) for eval unit tests.
 
 const std = @import("std");
-const eval_mod = @import("../eval.zig");
+const eval_mod = @import("../evaluator.zig");
 const Evaluator = eval_mod.Evaluator;
 
 pub fn renderForTest(source: []const u8) ![]u8 {

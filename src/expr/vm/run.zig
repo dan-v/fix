@@ -9,13 +9,8 @@
 //! `call`, so handlers never push frames — the whole dispatch chain
 //! reuses a single stack frame established by the outermost `runUntil`.
 //!
-//! Why threaded code rather than one giant switch: a 70-arm switch
-//! becomes a single ~32 KB function. LLVM's register allocator gives up
-//! aggressive slot coloring at that size, so adding a single case grew
-//! the stack frame by 16 bytes for *every* arm. Splitting handlers into
-//! small standalone functions lets the compiler allocate registers
-//! locally per handler, eliminates the per-arm spill amortisation cost,
-//! and makes adding cases genuinely free at the codegen level.
+//! Separate handlers keep per-opcode control flow and register allocation
+//! local instead of building one monolithic dispatch function.
 
 const std = @import("std");
 const vm_mod = @import("context.zig");
@@ -443,12 +438,12 @@ fn opBreakpoint(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
     const off: u32 = @intCast(ip - 1);
     frame.ip = ip;
     const Hit = bytecode_mod.breakpoints.BreakpointTable.Hit;
-    const h: Hit = if (vm.breakpoints) |bps|
+    const h: Hit = if (vm.debug.breakpoints) |bps|
         bps.hit(frame.chunk_id, off, vm.debugFrameDepth())
     else
         .{ .original = @intFromEnum(OpCode.halt), .pause = false, .kind = .none };
     if (h.pause) {
-        if (vm.break_sink) |sink| {
+        if (vm.debug.break_sink) |sink| {
             const reason: vm_mod.BreakReason = switch (h.kind) {
                 .step => .step,
                 .entry => .entry,
@@ -780,9 +775,7 @@ fn opMakeLazyShell(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dep
     frame.ip = ip;
     // The lazy-shell wrap exists solely so the lazy-XML renderer can show
     // eagerly-built shapes as `<unevaluated />` until demanded. Outside
-    // that mode (the common default/JSON/`.drv`/strict path) it's pure
-    // overhead — leave the value on the stack instead of allocating a
-    // throwaway thunk (millions on the NixOS toplevel).
+    // that mode, leave the value on the stack instead of allocating a thunk.
     if (vm.lazy_shells_visible) {
         const val = stack.pop(vm);
         const id = try vm.heap.addLazyShell(val);
@@ -854,8 +847,7 @@ fn applyOverrides(vm: *VM, built_id: types.ObjectId, ov_id: types.ObjectId) !voi
     // every override, so leave it (and its source positions) untouched.
     if (new_entries.items.len == 0) return;
 
-    // Rebuild with the additions. Copy the built entries out first: `addAttrs`
-    // appends to the same heap attr storage and may move the `getAttrs` slice.
+    // Rebuild with the additions in one sorted attrset.
     var all: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer all.deinit(vm.allocator);
     try all.appendSlice(vm.allocator, try vm.heap.getAttrs(built_id));
@@ -1141,7 +1133,7 @@ inline fn retEpilogue(vm: *VM, stop_depth: usize, result: Value) anyerror!void {
     }
     vm.sp = finished_frame.frame_base;
     try stack.push(vm, result);
-    if (vm.break_sink != null) {
+    if (vm.debug.break_sink != null) {
         @branchHint(.unlikely);
         try pauseAfterReturn(vm, result);
     }
@@ -1155,8 +1147,8 @@ inline fn retEpilogue(vm: *VM, stop_depth: usize, result: Value) anyerror!void {
 /// check; the result is already rooted on the VM stack before the UI may
 /// re-enter evaluation.
 noinline fn pauseAfterReturn(vm: *VM, result: Value) anyerror!void {
-    const sink = vm.break_sink orelse return;
-    const bps = vm.breakpoints orelse return;
+    const sink = vm.debug.break_sink orelse return;
+    const bps = vm.debug.breakpoints orelse return;
     const depth = vm.debugFrameDepth();
     if (depth == 0 or !bps.pausesAfterReturn(depth)) return;
     try sink.fire(sink.ctx, vm, result, .return_step);

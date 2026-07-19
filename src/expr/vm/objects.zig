@@ -69,8 +69,8 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
     force.rootKeep(self, Value.attrs(left_id));
     force.rootKeep(self, Value.attrs(right_id));
 
-    var left = try self.heap.getAttrs(left_id);
-    var right = try self.heap.getAttrs(right_id);
+    const left = try self.heap.getAttrs(left_id);
+    const right = try self.heap.getAttrs(right_id);
     const left_len = left.len;
     const right_len = right.len;
 
@@ -87,9 +87,6 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
     var left_i: usize = 0;
     var right_i: usize = 0;
     while (left_i < left_len and right_i < right_len) {
-        // gc: re-fetch — the input ranges may move across mergeAttrLiteralValue's force
-        left = try self.heap.getAttrs(left_id);
-        right = try self.heap.getAttrs(right_id);
         const l = left[left_i];
         const r = right[right_i];
         if (l.name < r.name) {
@@ -124,9 +121,6 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
             right_i += 1;
         }
     }
-    // gc: re-fetch — ranges may have moved across the loop's forces
-    left = try self.heap.getAttrs(left_id);
-    right = try self.heap.getAttrs(right_id);
     if (left_i < left_len) {
         const n = left_len - left_i;
         @memcpy(dst[out..][0..n], left[left_i..]);

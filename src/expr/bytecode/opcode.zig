@@ -59,8 +59,7 @@ pub const OpCode = enum(u8) {
     cmp_ge,
     /// Specialized `eq null` — pop one value, push `true` if it
     /// forces to null. Emitted by `compileBinary` when one side of
-    /// `==` is a literal `null`. Replaces the generic `valuesEqual`
-    /// dispatch with a type-monomorphic null check.
+    /// `==` is a literal `null`, avoiding generic equality dispatch.
     cmp_eq_null,
     /// Specialized `neq null` — symmetric with `cmp_eq_null`.
     cmp_ne_null,
@@ -90,9 +89,8 @@ pub const OpCode = enum(u8) {
     /// `attrs_new_srt` with the attr NAMES in the chunk's side table instead
     /// of pushed as string constants: the stack carries only the N values,
     /// and names come from `Chunk.attr_names[names_start..names_start+N]`
-    /// (compile-time interned, sorted, unique). Saves a `push_const` op +
-    /// dispatch + constant-pool slot per entry — attr-name pushes were ~55%
-    /// of all push_const executions on a NixOS eval.
+    /// (compile-time interned, sorted, unique). Saves a `push_const` op,
+    /// dispatch, and constant-pool slot per entry.
     /// Operand: count:u16 + names_start:u32.
     attrs_new_named_srt,
     /// `attrs_new_named_srt` carrying source positions too.
@@ -236,10 +234,8 @@ pub const OpCode = enum(u8) {
     // ---- fused compound super-ops ----
     /// Fused `up_get + attr_get` — read upvalue, force, look up
     /// attribute. Operand: 2-byte upvalue index + 2-byte name InternId.
-    /// Saves the push/pop of the attrs value plus one dispatch. The
-    /// `lib.foo` and `config.bar` patterns are everywhere in NixOS
-    /// modules; profiling shows `up_get` is 10% of all ops and
-    /// `attr_get` is 3%, much of it the same upvalue→attr chain.
+    /// Saves the intermediate attrs stack value and one dispatch for common
+    /// chains such as `lib.foo` and `config.bar`.
     up_get_attr,
     /// Fused `loc_get + attr_get` (narrow slot — 1-byte). Operand:
     /// 1-byte slot + 2-byte name InternId.
@@ -452,9 +448,8 @@ pub const Operand = union(enum) {
 
 // `comptime` params matter: `layout`'s arms return `&[_]Operand{…}` array literals, which
 // are only promoted to static storage when every element is comptime-known. A
-// runtime helper call would make the literal a stack temporary and the returned
-// slice would dangle (was a real bug — the validation assert in `writeOperands`
-// caught it), so these must fold at comptime.
+// runtime helper call would make the literal a stack temporary and leave the
+// returned slice dangling, so these must fold at comptime.
 fn slot(comptime w: Width, comptime role: Operand.Role) Operand {
     return .{ .slot = .{ .w = w, .role = role } };
 }

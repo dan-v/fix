@@ -39,7 +39,7 @@ const eval_trace = @import("observ.zig").trace;
 const observ = @import("base").observ;
 const ast_mod = @import("syntax").ast;
 const deferred_mod = @import("compiler.zig").deferred_table;
-const EvaluationReport = @import("eval/evaluation_report.zig").EvaluationReport;
+const EvaluationReport = @import("eval/report.zig").EvaluationReport;
 const path_ops = @import("runtime").paths;
 const eval_print = @import("eval/print.zig");
 const search_path_mod = @import("eval/search_path.zig");
@@ -293,15 +293,15 @@ pub const DebugSession = struct {
     /// Arm a single step. It takes effect once the console resumes; the next
     /// pause is the step's landing point. See `clearStep`.
     pub fn step(self: *DebugSession, kind: StepKind) !void {
-        if (kind == .into and !self.vm.debug_import_replay) {
+        if (kind == .into and !self.vm.debug.import_replay) {
             // `import` is memoized across REPL inputs. Continuing/finishing a
             // debug expression may use that fast path, but step-into promises
             // executable imported code. Give this paused VM chain a fresh,
             // separately rooted memo table so old helpers using the ordinary
             // table remain untouched.
-            self.ev.imports.beginReplayQuiescent(self.ev.allocator);
+            self.ev.sources.imports.beginReplayQuiescent(self.ev.allocator);
             var cursor: ?*VM = self.vm;
-            while (cursor) |vm| : (cursor = vm.debug_parent) vm.debug_import_replay = true;
+            while (cursor) |vm| : (cursor = vm.debug.parent) vm.debug.import_replay = true;
         }
         return debug_session.step(debugContext(self), kind);
     }
@@ -335,13 +335,56 @@ pub const DebugSession = struct {
 const StoreState = store_state.StoreState;
 pub const BuildSession = build_session.BuildSession;
 
+const ExecutionState = struct {
+    scheduler: Scheduler,
+    vm_buffers: vm_mod.BufferPool,
+    worker_count: u8,
+    main_worker: ?*worker_mod.Worker = null,
+};
+
+const PrefetchState = struct {
+    seen: std.AutoHashMapUnmanaged(types.InternId, void) = .empty,
+    mu: SpinMutex = .{},
+    budget: u32 = 0,
+};
+
+const SourceState = struct {
+    files: FileCache,
+    fetchers: FetchCache,
+    imports: imports_mod.Registry = .{},
+    search_paths: search_path_mod.Paths = .{},
+    base_path: ?[:0]u8 = null,
+    env_map: ?*const std.process.Environ.Map = null,
+    prefetch: PrefetchState = .{},
+};
+
+const CompilationState = struct {
+    deferred_table: deferred_mod.Table,
+    retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena) = .empty,
+    retained_arenas_mu: SpinMutex = .{},
+};
+
+const CollectionState = struct {
+    tracer: gc.Tracer,
+    import_vms: std.ArrayListUnmanaged(*VM) = .empty,
+    import_vms_mu: SpinMutex = .{},
+    workers: []std.atomic.Value(?*worker_mod.Worker),
+    chunks_scanned: ChunkId = 0,
+    budget_bytes: ?u64 = null,
+    mem_report_mode: ?[]const u8 = null,
+    report_on: bool = false,
+    parallel_cap: u32 = gc_controller.default_parallel_cap,
+    coordinator: gc_coordinator.Coordinator = .{},
+    extra_roots: std.ArrayListUnmanaged(Value) = .empty,
+};
+
 fn debugContext(session: *const DebugSession) debug_session.Context {
     return .{
         .allocator = session.ev.allocator,
         .heap = &session.ev.heap,
         .intern = &session.ev.intern,
         .registry = &session.ev.registry,
-        .files = &session.ev.files,
+        .files = &session.ev.sources.files,
         .breakpoints = if (session.ev.debugger.breakpoints) |*bp| bp else null,
         .source = session.ev.debugger.source,
         .vm = session.vm,
@@ -353,21 +396,13 @@ pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     intern: InternTable,
     registry: ChunkRegistry,
-    scheduler: Scheduler,
     heap: ObjectHeap,
-    files: FileCache,
-    fetchers: FetchCache,
+    execution: ExecutionState,
+    sources: SourceState,
     /// Store and daemon state that deliberately outlives language teardown.
     store: StoreState,
     /// Compiled-regex cache shared by every VM (`builtins.match`/`split`).
     regexes: regex_mod.PatternCache,
-    imports: imports_mod.Registry,
-    search_paths: search_path_mod.Paths,
-    /// Shared pool of VM stack/frames buffers (see vm.zig BufferPool):
-    /// nested import VMs churn ~2.6K times per NixOS eval; reuse bounds
-    /// their RSS at the concurrent-VM high-water instead of leaking a
-    /// dirty half-MB into the worker arena per import.
-    vm_buffers: vm_mod.BufferPool,
     builtins_value: ?Value,
     /// Whether the final render observes lazy shells (only lazy-XML).
     /// Propagated to every VM via `initVm`; gates `thunk_shell`.
@@ -381,88 +416,20 @@ pub const Evaluator = struct {
     /// by the CLI from its terminal-color decision; default off (plain text for
     /// pipes, tests, JSON/XML paths). See `eval/print.zig`.
     value_color: bool = false,
-    base_path: ?[:0]u8,
-    env_map: ?*const std.process.Environ.Map,
     observer: observ.Observer = .{},
     vm_trace: ?*VmTrace,
     thunk_trace: if (vm_mod.thunks_log_enabled) ?*ThunkTrace else void,
-    worker_count: u8,
-    /// Persistent worker for worker_id 0 (the main / calling thread).
-    /// Lazily created on first `runWithVm`, kept alive for the
-    /// evaluator's lifetime, and deinit'd *after* the scheduler is
-    /// torn down — that ordering guarantees no helper is still running
-    /// a stolen main-fiber when its stack gets freed. See [F1.4].
-    main_worker: ?*worker_mod.Worker,
     /// Per-evaluation state (diagnostics + trace + string arena). Cleared
     /// at the start of each `evaluate()`; helpers writing diagnostics from
     /// import error paths serialize on `report.mu`.
     report: EvaluationReport,
     /// Lazy per-attr compilation: deferred attrset value bodies, compiled
     /// on first force. See `compiler/deferred_table.zig`.
-    deferred_table: deferred_mod.Table,
-    /// AST arenas kept alive because a deferred body retains nodes into
-    /// them (force-time compile re-walks the node). Files that defer
-    /// nothing free their arena immediately (the common case). Appended
-    /// concurrently by helper-thread import compiles, hence the mutex.
-    retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena),
-    retained_arenas_mu: SpinMutex,
-    /// Reusable live-set marker driven at collection safepoints.
-    gc_tracer: gc.Tracer,
-    /// Fresh VMs for in-flight imports/scoped-imports. These
-    /// run on transient stack-local VMs NOT in a worker's `fibers` list, so
-    /// the collector must scan them explicitly or their live values are
-    /// missed. Guarded by `gc_import_vms_mu` — imports run concurrently at
-    /// --workers>1.
-    gc_import_vms: std.ArrayListUnmanaged(*VM),
-    gc_import_vms_mu: SpinMutex,
-    /// Every live `Worker` by id (0 = main, 1.. = helpers).
-    /// The collector walks each worker's fibers for roots. A worker
-    /// registers itself before it can allocate user objects and unregisters
-    /// after it's quiesced, and during a stop-the-world all live workers are
-    /// parked — so the collector reads a stable set.
-    gc_workers: []std.atomic.Value(?*worker_mod.Worker),
-    /// Chunk-constant root scan is INCREMENTAL across minors. A
-    /// chunk constant's referent is promoted to old at the first minor that
-    /// scans it and stays old (a later young reference it gains is caught by
-    /// the remembered-set barrier, not the constant). So each minor scans only
-    /// chunks `[gc_chunks_scanned, registry.count())`; re-scanning all of them
-    /// every minor was ~77% of the serial root-scan. A future MAJOR resets this
-    /// to 0 (a full mark re-scans every constant).
-    gc_chunks_scanned: ChunkId = 0,
-    /// `--gc-budget` override for the collector's heap budget, in bytes
-    /// (0 = never collect). `null` resolves the RAM-scaled default; see
-    /// `eval/gc_controller.zig:memoryBudget`.
-    /// Set by the CLI before evaluation.
-    gc_budget_bytes: ?u64 = null,
-    /// Optional teardown memory report (`"dump"` also lists registered VMAs).
-    mem_report_mode: ?[]const u8 = null,
-    /// Print the collector summary during teardown.
-    gc_report_on: bool = false,
-    /// Evaluator-local cap on parallel GC participants. Environment tuning of
-    /// one evaluator must not alter another evaluator in the same process.
-    gc_parallel_cap: u32 = gc_controller.default_parallel_cap,
-    gc_coord: gc_coordinator.Coordinator = .{},
-    /// Caller-held root values (the repl's scope bindings and
-    /// last results live outside any VM between evaluations). Marked by
-    /// `markRoots`; replaced wholesale via `gcSetExternalRoots`.
-    gc_extra_roots: std.ArrayListUnmanaged(Value) = .empty,
-    /// Speculative import prefetch state (`FIX_IMPORT_PREFETCH`).
-    prefetch: Prefetch = .{},
+    compilation: CompilationState,
+    collection: CollectionState,
     /// Whether `releaseEvalState` already ran (the build-phase memory
     /// release). Makes the release idempotent so `deinit` can share it.
     eval_released: bool = false,
-
-    /// Speculative import prefetch (`FIX_IMPORT_PREFETCH`): `.nix` path
-    /// constants discovered by `ChunkRegistry.register` are submitted as
-    /// `import_prefetch` tasks ahead of demand.
-    pub const Prefetch = struct {
-        /// Dedup so each path is prefetched at most once per eval. Guarded
-        /// by `mu` (compiles run on every worker).
-        seen: std.AutoHashMapUnmanaged(types.InternId, void) = .empty,
-        mu: SpinMutex = .{},
-        /// Remaining submission budget — bounds the junk volume.
-        budget: u32 = 0,
-    };
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -499,31 +466,30 @@ pub const Evaluator = struct {
             .allocator = allocator,
             .intern = intern,
             .registry = registry,
-            .scheduler = scheduler,
             .heap = try ObjectHeap.init(allocator, worker_count),
-            .files = FileCache.init(allocator),
-            .fetchers = FetchCache.init(allocator),
+            .execution = .{
+                .scheduler = scheduler,
+                .vm_buffers = vm_mod.BufferPool.init(allocator),
+                .worker_count = worker_count,
+            },
+            .sources = .{
+                .files = FileCache.init(allocator),
+                .fetchers = FetchCache.init(allocator),
+            },
             .store = store,
             .regexes = regex_mod.PatternCache.init(allocator),
-            .imports = .{},
-            .search_paths = .{},
-            .vm_buffers = vm_mod.BufferPool.init(allocator),
             .builtins_value = null,
-            .base_path = null,
-            .env_map = null,
             .observer = .{},
             .vm_trace = null,
             .thunk_trace = if (vm_mod.thunks_log_enabled) null else {},
-            .worker_count = worker_count,
-            .main_worker = null,
             .report = EvaluationReport.init(allocator),
-            .deferred_table = deferred_mod.Table.init(allocator),
-            .retained_arenas = .empty,
-            .retained_arenas_mu = .{},
-            .gc_tracer = gc.Tracer.init(allocator),
-            .gc_import_vms = .empty,
-            .gc_import_vms_mu = .{},
-            .gc_workers = gc_workers,
+            .compilation = .{
+                .deferred_table = deferred_mod.Table.init(allocator),
+            },
+            .collection = .{
+                .tracer = gc.Tracer.init(allocator),
+                .workers = gc_workers,
+            },
         };
         return ev;
     }
@@ -531,7 +497,7 @@ pub const Evaluator = struct {
     pub fn deinit(self: *Evaluator) void {
         self.debugger.deinit();
         self.releaseEvalState();
-        if (self.base_path) |path| self.allocator.free(path);
+        if (self.sources.base_path) |path| self.allocator.free(path);
         // Language workers are joined by releaseEvalState, so no fiber remains
         // parked on the store's fast IO lane when it is shut down here.
         self.store.deinit();
@@ -541,12 +507,8 @@ pub const Evaluator = struct {
     /// their fiber stacks, the object heap (flat store + segment stores),
     /// file/fetch caches, retained AST, bytecode registry, and the intern
     /// table — while keeping the store half (daemon connection + IO thread,
-    /// progress session) alive. The build-phase memory release: once `fix
-    /// build`/`run`/`shell` has copied the drv/out paths out of the intern
-    /// table, the ~2 GB evaluator heap has no further reader, but the
-    /// daemon build can run for minutes. Also flushes the process block
-    /// cache, whose free stacks would otherwise retain the dead segment
-    /// blocks for the build's duration.
+    /// progress session) alive. Once build targets are copied out, the daemon
+    /// needs only store state. Also flushes cached segment blocks.
     ///
     /// Idempotent; `deinit` runs it too. After this only store-side entry
     /// points are valid (`StoreState`/`BuildSession` and the progress-session
@@ -555,53 +517,46 @@ pub const Evaluator = struct {
     pub fn releaseEvalState(self: *Evaluator) void {
         if (self.eval_released) return;
         self.eval_released = true;
-        mem_report.report(&self.heap, &self.intern, &self.registry, self.retained_arenas.items, self.mem_report_mode);
-        gc.recordFinalTotal(&self.heap.gc_report, self.heap.totalReservedBytes());
-        if (self.gc_report_on) gc.report(&self.heap.gc_report, self.heap.gc_budget_bytes);
+        mem_report.report(&self.heap, &self.intern, &self.registry, self.compilation.retained_arenas.items, self.collection.mem_report_mode);
+        gc.recordFinalTotal(&self.heap.collection.report, self.heap.totalReservedBytes());
+        if (self.collection.report_on) gc.report(&self.heap.collection.report, self.heap.collection.budget_bytes);
         // Shut helpers down (which joins on `defer vm.deinit()` inside
         // helperLoop) before tearing down state their VMs borrow.
-        self.scheduler.deinit();
+        self.execution.scheduler.deinit();
         // Now that helpers are guaranteed quiescent, tear down the main
         // worker. Doing this before scheduler shutdown could race with
         // a helper still resuming a stolen main fiber.
-        if (self.main_worker) |w| w.deinit();
-        self.main_worker = null;
+        if (self.execution.main_worker) |w| w.deinit();
+        self.execution.main_worker = null;
         // Registration effects run directly from compiler workers now. Keep
         // their dedup state alive until every worker that can publish a chunk
         // has joined.
-        self.prefetch.seen.deinit(self.allocator);
+        self.sources.prefetch.seen.deinit(self.allocator);
         // Every VM (helper fibers, main worker, imports) is dead now —
         // all pooled stack/frames buffers are back on the free list.
-        self.vm_buffers.deinit();
-        // GC bookkeeping is freed only AFTER the workers above are joined:
-        // a helper can still be finishing a speculative import when the
-        // main thread enters deinit, and its `evaluateSource` appends the
-        // nested VM into `gc_import_vms` (and its registered chunks come
-        // from the same allocator pools). Freeing the list before the join
-        // leaves a dangling `items.ptr`; the late append then writes a
-        // fiber-stack `*VM` into whatever recycled the freed buffer — the
-        // observed victim was a freshly registered Chunk whose stomped
-        // `code.ptr` detonated at `registry.deinit` (teardown SIGSEGV).
-        self.gc_tracer.deinit();
-        self.gc_import_vms.deinit(self.allocator);
-        self.gc_extra_roots.deinit(self.allocator);
-        self.allocator.free(self.gc_workers);
+        self.execution.vm_buffers.deinit();
+        // Imports can register transient VMs until every worker has joined, so
+        // collection bookkeeping must outlive the worker runtime.
+        self.collection.tracer.deinit();
+        self.collection.import_vms.deinit(self.allocator);
+        self.collection.extra_roots.deinit(self.allocator);
+        self.allocator.free(self.collection.workers);
         self.report.deinit();
-        self.imports.deinit(self.allocator);
-        self.search_paths.deinit(self.allocator);
-        self.fetchers.deinit();
+        self.sources.imports.deinit(self.allocator);
+        self.sources.search_paths.deinit(self.allocator);
+        self.sources.fetchers.deinit();
         self.regexes.deinit();
         self.store.realization.releaseRecipePayloads();
-        self.files.deinit();
+        self.sources.files.deinit();
         self.heap.deinit();
         // Free deferred-compile state after the heap (whose thunks
         // referenced entries) and workers (no force-compile can be in
         // flight) are gone. The retained arenas own the AST nodes the
         // entries point at; the registered chunks are self-contained
         // bytecode and don't reference them, so order vs registry is free.
-        self.deferred_table.deinit();
-        for (self.retained_arenas.items) |*arena| arena.deinit();
-        self.retained_arenas.deinit(self.allocator);
+        self.compilation.deferred_table.deinit();
+        for (self.compilation.retained_arenas.items) |*arena| arena.deinit();
+        self.compilation.retained_arenas.deinit(self.allocator);
         self.registry.deinit();
         self.intern.deinit();
         // Dangling Value into the freed heap; never read again, but don't
@@ -616,7 +571,7 @@ pub const Evaluator = struct {
     }
 
     pub fn basePath(self: *const Evaluator) ?[]const u8 {
-        return self.base_path;
+        return self.sources.base_path;
     }
 
     pub fn configureLanguage(self: *Evaluator, policy: LanguagePolicy) void {
@@ -628,9 +583,9 @@ pub const Evaluator = struct {
     }
 
     pub fn configureMemory(self: *Evaluator, gc_budget: ?u64, report_mode: ?[]const u8, gc_report: bool) void {
-        self.gc_budget_bytes = gc_budget;
-        self.mem_report_mode = report_mode;
-        self.gc_report_on = gc_report;
+        self.collection.budget_bytes = gc_budget;
+        self.collection.mem_report_mode = report_mode;
+        self.collection.report_on = gc_report;
     }
 
     pub fn setLazyShellsVisible(self: *Evaluator, visible: bool) void {
@@ -638,7 +593,7 @@ pub const Evaluator = struct {
     }
 
     pub fn setTraceFlows(self: *Evaluator, enabled: bool) void {
-        self.scheduler.setTraceFlows(enabled);
+        self.execution.scheduler.setTraceFlows(enabled);
     }
 
     pub fn addIndirectRoot(self: *Evaluator, link_path: []const u8, target: []const u8) !void {
@@ -681,48 +636,48 @@ pub const Evaluator = struct {
 
     /// Cap concurrent fetches (`http-connections`; 0 = unlimited).
     pub fn setFetchConnections(self: *Evaluator, n: u32) !void {
-        try self.fetchers.setMaxConnections(n);
+        try self.sources.fetchers.setMaxConnections(n);
     }
 
     /// `download-attempts`: total tries per download before failing.
     pub fn setDownloadAttempts(self: *Evaluator, n: u32) void {
-        self.fetchers.setDownloadAttempts(n);
+        self.sources.fetchers.setDownloadAttempts(n);
     }
 
     pub fn setTarballTtl(self: *Evaluator, seconds: u32) void {
-        self.fetchers.setTarballTtl(seconds);
+        self.sources.fetchers.setTarballTtl(seconds);
     }
 
     pub fn setFetchConnectTimeout(self: *Evaluator, seconds: u32) void {
-        self.fetchers.setConnectTimeout(seconds);
+        self.sources.fetchers.setConnectTimeout(seconds);
     }
 
     pub fn setStalledDownloadTimeout(self: *Evaluator, seconds: u32) void {
-        self.fetchers.setStalledDownloadTimeout(seconds);
+        self.sources.fetchers.setStalledDownloadTimeout(seconds);
     }
 
     pub fn setDownloadSpeed(self: *Evaluator, kib_per_second: u64) void {
-        self.fetchers.setDownloadSpeed(kib_per_second);
+        self.sources.fetchers.setDownloadSpeed(kib_per_second);
     }
 
     pub fn setSslCertFile(self: *Evaluator, path: []const u8) !void {
-        try self.fetchers.setSslCertFile(path);
+        try self.sources.fetchers.setSslCertFile(path);
     }
 
     pub fn setFlakeRegistryUrl(self: *Evaluator, url: ?[]const u8) !void {
-        try self.fetchers.setFlakeRegistryUrl(url);
+        try self.sources.fetchers.setFlakeRegistryUrl(url);
     }
 
     /// Set the fetcher's `access-tokens` (a raw `nix.conf` value), used to
     /// authenticate downloads to matching hosts. See `setup.configure`.
     pub fn setAccessTokens(self: *Evaluator, raw: []const u8) !void {
-        try self.fetchers.setAccessTokens(raw);
+        try self.sources.fetchers.setAccessTokens(raw);
     }
 
     /// Set the fetcher's `netrc` credentials (raw file content) for HTTP
     /// basic-auth on plain downloads. See `setup.configure`.
     pub fn setNetrc(self: *Evaluator, content: []const u8) !void {
-        try self.fetchers.setNetrc(content);
+        try self.sources.fetchers.setNetrc(content);
     }
 
     pub fn derivationDebugRecords(self: *const Evaluator) []const derivation.DebugRecord {
@@ -730,16 +685,16 @@ pub const Evaluator = struct {
     }
 
     pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
-        self.files.setIo(io);
-        self.fetchers.setIo(io);
+        self.sources.files.setIo(io);
+        self.sources.fetchers.setIo(io);
         self.store.realization.setIo(io);
-        if (self.base_path) |path| self.allocator.free(path);
-        self.base_path = try std.process.currentPathAlloc(io, self.allocator);
+        if (self.sources.base_path) |path| self.allocator.free(path);
+        self.sources.base_path = try std.process.currentPathAlloc(io, self.allocator);
     }
 
     pub fn setFileIo(self: *Evaluator, io: std.Io) void {
-        self.files.setIo(io);
-        self.fetchers.setIo(io);
+        self.sources.files.setIo(io);
+        self.sources.fetchers.setIo(io);
         self.store.realization.setIo(io);
     }
 
@@ -748,18 +703,18 @@ pub const Evaluator = struct {
     /// base path. This makes a file's relative paths resolve relative to the
     /// file, as Nix does — not the process cwd.
     pub fn setBasePathToFileDir(self: *Evaluator, file_path: []const u8) !void {
-        const base = self.base_path orelse ".";
+        const base = self.sources.base_path orelse ".";
         const abs = try std.fs.path.resolve(self.allocator, &.{ base, file_path });
         defer self.allocator.free(abs);
         const dir = std.fs.path.dirname(abs) orelse abs;
         const owned = try self.allocator.dupeZ(u8, dir);
-        if (self.base_path) |old| self.allocator.free(old);
-        self.base_path = owned;
+        if (self.sources.base_path) |old| self.allocator.free(old);
+        self.sources.base_path = owned;
     }
 
     pub fn setEnvironment(self: *Evaluator, env_map: *const std.process.Environ.Map) void {
-        self.env_map = env_map;
-        self.fetchers.setEnvironment(env_map);
+        self.sources.env_map = env_map;
+        self.sources.fetchers.setEnvironment(env_map);
         // Point the fetch download-cache at `$XDG_CACHE_HOME/fix` (default
         // `~/.cache/fix`), mirroring Nix's `~/.cache/nix`. Best-effort; without
         // HOME/XDG the FetchCache keeps its `./.zig-cache/fix` fallback.
@@ -767,11 +722,11 @@ pub const Evaluator = struct {
     }
 
     pub fn environment(self: *const Evaluator) ?*const std.process.Environ.Map {
-        return self.env_map;
+        return self.sources.env_map;
     }
 
     fn setFetchCacheRoot(self: *Evaluator) !void {
-        const env = self.env_map orelse return;
+        const env = self.sources.env_map orelse return;
         const base: []const u8, const sub: []const []const u8 = blk: {
             if (env.get("XDG_CACHE_HOME")) |xdg| {
                 if (xdg.len != 0) break :blk .{ xdg, &.{"fix"} };
@@ -787,7 +742,7 @@ pub const Evaluator = struct {
         try parts.appendSlice(self.allocator, sub);
         const root = try std.fs.path.join(self.allocator, parts.items);
         defer self.allocator.free(root);
-        try self.fetchers.setCacheRoot(root);
+        try self.sources.fetchers.setCacheRoot(root);
     }
 
     pub fn setVmTrace(self: *Evaluator, vm_trace: ?*VmTrace) void {
@@ -814,8 +769,8 @@ pub const Evaluator = struct {
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
-        try self.search_paths.set(self.allocator, nix_path, self, resolveHostPath);
-        for (self.search_paths.entries) |*entry| {
+        try self.sources.search_paths.set(self.allocator, nix_path, self, resolveHostPath);
+        for (self.sources.search_paths.entries) |*entry| {
             if (!std.mem.startsWith(u8, entry.path, "http://") and !std.mem.startsWith(u8, entry.path, "https://") and !std.mem.startsWith(u8, entry.path, "file://")) continue;
             const result = try self.fetchTarball(entry.path);
             self.allocator.free(entry.path);
@@ -827,12 +782,12 @@ pub const Evaluator = struct {
     pub fn readSourceFile(self: *Evaluator, path: []const u8) ![]const u8 {
         const resolved = try self.resolveHostPath(path);
         defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.files.readFile(resolved.text);
+        return self.sources.files.readFile(resolved.text);
     }
 
     /// Resolve `<name>` through the configured NIX_PATH to an owned host path.
     pub fn resolveLookupPath(self: *Evaluator, name: []const u8) ![]u8 {
-        return self.search_paths.resolveName(self.allocator, &self.files, name);
+        return self.sources.search_paths.resolveName(self.allocator, &self.sources.files, name);
     }
 
     /// Fetch and unpack a legacy fileish tarball, returning its owned cache path.
@@ -845,7 +800,7 @@ pub const Evaluator = struct {
     fn fetchTarball(self: *Evaluator, url: []const u8) !@import("fetchers").FetchCache.TarballResult {
         var span = self.observer.begin(&fetch_observation, .{ .subject = .{ .url = url } });
         defer span.cancel();
-        const result = try self.fetchers.fetchTarball(&self.files, .{ .url = url, .name = "source" }, null);
+        const result = try self.sources.fetchers.fetchTarball(&self.sources.files, .{ .url = url, .name = "source" }, null);
         span.finish(.{ .verb = if (result.cached) "cached" else null });
         return result;
     }
@@ -853,7 +808,7 @@ pub const Evaluator = struct {
     pub fn isSourceDirectory(self: *Evaluator, path: []const u8) !bool {
         const resolved = try self.resolveHostPath(path);
         defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.files.isDirectoryFollowing(resolved.text);
+        return self.sources.files.isDirectoryFollowing(resolved.text);
     }
 
     /// Fetch a flake source without evaluating its outputs. `parseFlakeRef`
@@ -893,7 +848,7 @@ pub const Evaluator = struct {
         source: []const u8,
         source_path: ?[]const u8,
     ) !ChunkId {
-        return self.parseAndCompile(source, self.base_path, source_path, null);
+        return self.parseAndCompile(source, self.sources.base_path, source_path, null);
     }
 
     pub fn compileSourceAt(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !ChunkId {
@@ -904,7 +859,7 @@ pub const Evaluator = struct {
     /// `evaluateWithScope`). The repl's VM explorer compiles expressions that
     /// reference repl bindings through this.
     pub fn compileSourceScoped(self: *Evaluator, source: []const u8, scope: ?Value) !ChunkId {
-        return self.parseAndCompile(source, self.base_path, null, scope);
+        return self.parseAndCompile(source, self.sources.base_path, null, scope);
     }
 
     /// Parse + compile + register, returning the compiled chunk id.
@@ -955,64 +910,7 @@ pub const Evaluator = struct {
             break :blk parsed;
         };
 
-        // Compile-time feature gate. Pipe operators always parse (into tagged
-        // apply nodes); enabling them is required to compile. Like Nix, we
-        // reject on *presence* — the parser records whether any `|>`/`<|`
-        // was seen, so a pipe anywhere in the file (even an unused/deferred
-        // attr body) fails here, before any compilation runs.
-        if (parser.used_pipe_operators and !self.policy.pipe_operators_enabled) {
-            const tok = parser.first_pipe_token.?;
-            try self.copyDiagnostics(&.{.{
-                .severity = .err,
-                .kind = .compile,
-                .line = parser_mod.Parser.tokenLine(source, tok),
-                .column = diagnostic.columnForOffset(source, tok.offset),
-                .offset = tok.offset,
-                .len = tok.len,
-                .token_type = tok.type,
-                .message = "pipe operators are disabled; pass --extra-experimental-features pipe-operators to enable them",
-            }}, source, source_path);
-            return error.PipeOperatorsDisabled;
-        }
-
-        // Lix deprecated CR/CRLF line endings: rejected by default, re-permitted
-        // by `cr-line-endings`. The scanner records the first structural CR; the
-        // parse still succeeds (CR is treated as a line ending) so enabling the
-        // feature Just Works.
-        if (parser.first_cr_offset) |cr_off| {
-            if (!self.policy.allow_cr_line_endings) {
-                try self.copyDiagnostics(&.{.{
-                    .severity = .err,
-                    .kind = .compile,
-                    .line = diagnostic.lineForOffset(source, cr_off),
-                    .column = diagnostic.columnForOffset(source, cr_off),
-                    .offset = cr_off,
-                    .len = 1,
-                    .token_type = null,
-                    .message = "CR (`\\r`) and CRLF (`\\r\\n`) line endings are not supported. Please inspect the file and normalize it to use LF (`\\n`) line endings instead. Use --extra-deprecated-features cr-line-endings to silence this warning.",
-                }}, source, source_path);
-                return error.CrLineEndingsDisabled;
-            }
-        }
-
-        // Lix deprecated `tokens-no-whitespace`: a value token stuck to the next
-        // token without whitespace is rejected by default. The tokenization
-        // still succeeds, so enabling the feature Just Works.
-        if (parser.first_tokens_no_ws_offset) |off| {
-            if (!self.policy.allow_tokens_no_whitespace) {
-                try self.copyDiagnostics(&.{.{
-                    .severity = .err,
-                    .kind = .compile,
-                    .line = diagnostic.lineForOffset(source, off),
-                    .column = diagnostic.columnForOffset(source, off),
-                    .offset = off,
-                    .len = 1,
-                    .token_type = null,
-                    .message = "whitespace between tokens is required here. Use --extra-deprecated-features tokens-no-whitespace to disable this error.",
-                }}, source, source_path);
-                return error.TokensNoWhitespaceDisabled;
-            }
-        }
+        try self.validateParserPolicy(&parser, source, source_path);
 
         // Per-compilation-unit scratch arena: all of the compiler's
         // transient structures (builder buffers, locals/captures, strictness
@@ -1040,7 +938,7 @@ pub const Evaluator = struct {
         );
         compiler.base_path = base_path;
         compiler.source_path = source_path;
-        compiler.home_dir = if (self.env_map) |env| env.get("HOME") else null;
+        compiler.home_dir = if (self.sources.env_map) |env| env.get("HOME") else null;
         compiler.policy = self.policy;
         compiler.registration_sink = chunkRegistrationSink(self);
         // Set eagerly (not lazily on first position record, see sourceFileId):
@@ -1055,7 +953,7 @@ pub const Evaluator = struct {
         // repl/debug overlay also carries a scope but no source_path, and must
         // keep builtins visible; hence the source_path conjunct.
         compiler.scoped_base = scope != null and source_path != null;
-        compiler.deferred_table = &self.deferred_table;
+        compiler.deferred_table = &self.compilation.deferred_table;
         // Elided bodies materialize into the file's AST arena (retained
         // below alongside deferred bodies); this compile is single-threaded,
         // so in-place node replacement is safe and keeps every later
@@ -1077,47 +975,106 @@ pub const Evaluator = struct {
         }
 
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
-        // The top-level chunk registers outside Compiler.registerChunk; name
-        // it after the file (a useful `while evaluating 'configuration.nix'`).
-        // A bare `-E` expression stays anonymous so its trace reads plain.
-        // disasm adds its own `(top)` tag for pathless chunks.
-        const top_name: bytecode.NameId = if (source_path) |p|
-            (self.registry.childName(bytecode.root_name_id, try self.intern.intern(std.fs.path.basename(p)), false) catch bytecode.root_name_id)
-        else if (self.registry.capture_names)
-            (self.registry.childName(bytecode.root_name_id, try self.intern.intern("(top)"), true) catch bytecode.root_name_id)
-        else
-            bytecode.root_name_id;
-        const registered = try self.registry.registerDeduped(chunk, top_name);
-        const chunk_id = registered.id;
-        if (registered.reused) {
-            var duplicate = chunk;
-            duplicate.deinit(self.allocator);
-        }
-        self.chunkRegistered(chunk_id);
-        if (compiler.source_file_id) |f| try self.registry.recordFile(chunk_id, f);
-        // Local binding names for the top chunk (child chunks get theirs in
-        // `registerChunk`); lets the debugger and disasm name top-level locals.
-        if (self.registry.capture_names) try self.registry.recordLocalNames(chunk_id, compiler.local_names.items);
-        if (source_path) |path| {
-            if (self.debugger.breakpoints) |*breakpoints| {
-                breakpoints.resolvePendingFile(&self.registry, path);
-            }
-        }
-        // `chunk` now owns persistent copies of its bytecode; `scratch`
-        // (incl. `builder`'s buffers) is freed by the defers above.
+        const chunk_id = try self.registerTopLevelChunk(chunk, &compiler, source_path);
 
         // If any attr body in this file was deferred, its AST nodes are
         // referenced by `deferred_table` entries and must outlive the
         // compile — keep the arena alive for the evaluator's lifetime.
         if (compiler.deferred_count > 0) {
-            retain_arena = true; // nodes are referenced; never free here
-            self.retained_arenas_mu.lock();
-            defer self.retained_arenas_mu.unlock();
-            // Best-effort: on OOM we intentionally leak (don't free AST a
-            // deferred entry still points at) rather than risk a dangling node.
-            self.retained_arenas.append(self.allocator, arena) catch {};
+            retain_arena = true;
+            self.retainDeferredArena(arena);
         }
         return chunk_id;
+    }
+
+    fn validateParserPolicy(
+        self: *Evaluator,
+        parser: *const parser_mod.Parser,
+        source: []const u8,
+        source_path: ?[]const u8,
+    ) !void {
+        // The parser records disabled syntax even inside deferred bodies, so
+        // each compilation unit is validated before bytecode is emitted.
+        if (parser.used_pipe_operators and !self.policy.pipe_operators_enabled) {
+            const token = parser.first_pipe_token.?;
+            try self.copyDiagnostics(&.{.{
+                .severity = .err,
+                .kind = .compile,
+                .line = parser_mod.Parser.tokenLine(source, token),
+                .column = diagnostic.columnForOffset(source, token.offset),
+                .offset = token.offset,
+                .len = token.len,
+                .token_type = token.type,
+                .message = "pipe operators are disabled; pass --extra-experimental-features pipe-operators to enable them",
+            }}, source, source_path);
+            return error.PipeOperatorsDisabled;
+        }
+        if (parser.first_cr_offset) |offset| {
+            if (!self.policy.allow_cr_line_endings) {
+                try self.copyDiagnostics(&.{.{
+                    .severity = .err,
+                    .kind = .compile,
+                    .line = diagnostic.lineForOffset(source, offset),
+                    .column = diagnostic.columnForOffset(source, offset),
+                    .offset = offset,
+                    .len = 1,
+                    .token_type = null,
+                    .message = "CR (`\\r`) and CRLF (`\\r\\n`) line endings are not supported. Please inspect the file and normalize it to use LF (`\\n`) line endings instead. Use --extra-deprecated-features cr-line-endings to silence this warning.",
+                }}, source, source_path);
+                return error.CrLineEndingsDisabled;
+            }
+        }
+        if (parser.first_tokens_no_ws_offset) |offset| {
+            if (!self.policy.allow_tokens_no_whitespace) {
+                try self.copyDiagnostics(&.{.{
+                    .severity = .err,
+                    .kind = .compile,
+                    .line = diagnostic.lineForOffset(source, offset),
+                    .column = diagnostic.columnForOffset(source, offset),
+                    .offset = offset,
+                    .len = 1,
+                    .token_type = null,
+                    .message = "whitespace between tokens is required here. Use --extra-deprecated-features tokens-no-whitespace to disable this error.",
+                }}, source, source_path);
+                return error.TokensNoWhitespaceDisabled;
+            }
+        }
+    }
+
+    fn registerTopLevelChunk(
+        self: *Evaluator,
+        chunk: bytecode.Chunk,
+        compiler: *compiler_mod.Compiler,
+        source_path: ?[]const u8,
+    ) !ChunkId {
+        const top_name: bytecode.NameId = if (source_path) |path|
+            (self.registry.childName(bytecode.root_name_id, try self.intern.intern(std.fs.path.basename(path)), false) catch bytecode.root_name_id)
+        else if (self.registry.capture_names)
+            (self.registry.childName(bytecode.root_name_id, try self.intern.intern("(top)"), true) catch bytecode.root_name_id)
+        else
+            bytecode.root_name_id;
+        const registered = try self.registry.registerDeduped(chunk, top_name);
+        if (registered.reused) {
+            var duplicate = chunk;
+            duplicate.deinit(self.allocator);
+        }
+        self.chunkRegistered(registered.id);
+        if (compiler.source_file_id) |file| try self.registry.recordFile(registered.id, file);
+        if (self.registry.capture_names)
+            try self.registry.recordLocalNames(registered.id, compiler.local_names.items);
+        if (source_path) |path| {
+            if (self.debugger.breakpoints) |*breakpoints|
+                breakpoints.resolvePendingFile(&self.registry, path);
+        }
+        return registered.id;
+    }
+
+    fn retainDeferredArena(self: *Evaluator, arena: ast_mod.AstArena) void {
+        self.compilation.retained_arenas_mu.lock();
+        defer self.compilation.retained_arenas_mu.unlock();
+        // A failed bookkeeping allocation must leak rather than leave deferred
+        // table entries pointing into a freed arena.
+        self.compilation.retained_arenas.append(self.allocator, arena) catch {};
     }
 
     /// Read-only access to compiled chunks for tools.
@@ -1244,11 +1201,11 @@ pub const Evaluator = struct {
     /// frames untouched, so inspecting a value can't corrupt the pause point.
     fn debugEvalScoped(self: *Evaluator, paused_vm: *VM, source: []const u8, scope: ?Value) !Value {
         const chunk_id = try self.compileSourceScoped(source, scope);
-        return self.runWithVm(debugRunBody, .{ chunk_id, paused_vm.debug_import_replay });
+        return self.runWithVm(debugRunBody, .{ chunk_id, paused_vm.debug.import_replay });
     }
 
     fn debugRunBody(vm: *VM, chunk_id: ChunkId, import_replay: bool) !Value {
-        vm.debug_import_replay = import_replay;
+        vm.debug.import_replay = import_replay;
         return vm.eval(chunk_id);
     }
 
@@ -1277,35 +1234,39 @@ pub const Evaluator = struct {
     }
 
     pub fn schedulerStats(self: *const Evaluator) Scheduler.Stats {
-        return self.scheduler.stats();
+        return self.execution.scheduler.stats();
+    }
+
+    pub fn deferredStats(self: *const Evaluator) deferred_mod.Table.Stats {
+        return self.compilation.deferred_table.stats();
     }
 
     pub fn workerCount(self: *const Evaluator) u8 {
-        return self.scheduler.worker_count;
+        return self.execution.scheduler.worker_count;
     }
 
     pub fn setParallelismToggles(self: *Evaluator, disable_speculation: bool, disable_fanout: bool) void {
-        var config = self.scheduler.configuration();
+        var config = self.execution.scheduler.configuration();
         config.disable_speculation = disable_speculation;
         config.disable_fanout = disable_fanout;
-        self.scheduler.configure(config);
+        self.execution.scheduler.configure(config);
     }
 
     pub fn setDebugSerial(self: *Evaluator, enabled: bool) void {
-        self.scheduler.setDebugSerial(enabled);
+        self.execution.scheduler.setDebugSerial(enabled);
     }
 
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
-        return self.evaluateTop(source, self.base_path, null, null);
+        return self.evaluateTop(source, self.sources.base_path, null, null);
     }
 
     /// `evaluate`, attributing the top-level source to `source_path` — source
     /// spans and the disasm file sidecar then carry the entry file's name, the
     /// same way imported files do. Used by `fix disasm --eval`.
     pub fn evaluatePath(self: *Evaluator, source: []const u8, source_path: ?[]const u8) !Value {
-        return self.evaluateTop(source, self.base_path, source_path, null);
+        return self.evaluateTop(source, self.sources.base_path, source_path, null);
     }
 
     /// `evaluatePath` with an explicit relative-path base. Multi-input CLI
@@ -1322,21 +1283,21 @@ pub const Evaluator = struct {
     /// `scope` is baked into the compiled chunk's constants, which are GC
     /// roots; builtin/literal-only sources omit the unused scope.
     pub fn evaluateWithScope(self: *Evaluator, source: []const u8, scope: ?Value) !Value {
-        return self.evaluateTop(source, self.base_path, null, scope);
+        return self.evaluateTop(source, self.sources.base_path, null, scope);
     }
 
     /// `evaluateWithScope`, retaining the compiled entry chunk for tooling.
     pub fn evaluateWithScopeResult(self: *Evaluator, source: []const u8, scope: ?Value) !EvaluationResult {
-        return self.evaluateTopResult(source, self.base_path, null, scope, false);
+        return self.evaluateTopResult(source, self.sources.base_path, null, scope, false);
     }
 
     /// Evaluate REPL source with a one-shot debugger pause at its first mapped
     /// instruction. The source is compiled unchanged; the UI must already be
     /// installed so the entry trap has somewhere to route.
     pub fn debugWithScopeResult(self: *Evaluator, source: []const u8, scope: ?Value) !EvaluationResult {
-        const was_debug_serial = self.scheduler.swapDebugSerial(true);
-        defer self.scheduler.setDebugSerial(was_debug_serial);
-        return self.evaluateTopResult(source, self.base_path, null, scope, true);
+        const was_debug_serial = self.execution.scheduler.swapDebugSerial(true);
+        defer self.execution.scheduler.setDebugSerial(was_debug_serial);
+        return self.evaluateTopResult(source, self.sources.base_path, null, scope, true);
     }
 
     fn evaluateTop(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value) !Value {
@@ -1386,62 +1347,15 @@ pub const Evaluator = struct {
         // the self-reference `builtins.builtins`; that prediction is only
         // safe when no other thread is allocating objects.
         _ = try self.ensureBuiltins();
-        if (!self.scheduler.isStarted()) {
-            self.scheduler.configure(tuning.resolve(self.scheduler.configuration(), self.env_map, self.worker_count));
+        if (!self.execution.scheduler.isStarted()) {
+            self.execution.scheduler.configure(tuning.resolve(self.execution.scheduler.configuration(), self.sources.env_map, self.execution.worker_count));
         }
-        // Speculative import prefetch: `.nix` path constants of freshly
-        // compiled chunks are parse+compile+evaluated ahead of demand on
-        // the spec lane (the braid-window perf decomposition measured
-        // ~25-50ms of import parse+compile sitting ON the critical chain
-        // at w=8 while every helper parked). The import registry dedups
-        // and coordinates, so a prefetch is exactly the import the demand
-        // fiber would have run — started earlier. Default ON whenever
-        // helpers exist. (The old 2..16 gate mirrored the novel lane's:
-        // at w=32 extra spec-lane volume chased junk. Re-measured
-        // 2026-07-11 with the bulk-spec drain cap containing that
-        // volume — prefetch-on measured -5% median at w=32, so the
-        // gate is gone.) FIX_IMPORT_PREFETCH=0/1 overrides,
-        // FIX_IMPORT_PREFETCH_MAX bounds submissions per eval.
-        {
-            var on = self.worker_count >= 2;
-            var max: u32 = 8192;
-            if (self.env_map) |em| {
-                if (em.get("FIX_IMPORT_PREFETCH")) |s| on = !std.mem.eql(u8, s, "0");
-                if (em.get("FIX_IMPORT_PREFETCH_MAX")) |s| {
-                    if (std.fmt.parseInt(u32, s, 10)) |n| max = n else |_| {}
-                }
-            }
-            self.prefetch.budget = if (on and self.worker_count > 1) max else 0;
-        }
-        // Speculative readDir-children prefetch: a cold builtins.readDir
-        // whose listing is a directory-of-directories fans the children out
-        // to helpers, who warm the FileCache ahead of the demand fiber's
-        // serial child-readDir walk (pkgs/by-name: 756 shard listings
-        // back-to-back on the critical chain, ~19ms at w=8). Same default
-        // gate as import prefetch (ON whenever helpers exist; the old
-        // w<=16 bound fell with the bulk-spec drain cap, same evidence);
-        // FIX_READDIR_PREFETCH=0/1 overrides, FIX_READDIR_PREFETCH_MIN
-        // tunes the directory-children threshold,
-        // FIX_READDIR_PREFETCH_MAX bounds total child listings per eval.
-        {
-            var on = self.worker_count >= 2;
-            var min: u32 = 32;
-            var max: u32 = 16384;
-            if (self.env_map) |em| {
-                if (em.get("FIX_READDIR_PREFETCH")) |s| on = !std.mem.eql(u8, s, "0");
-                if (em.get("FIX_READDIR_PREFETCH_MIN")) |s| {
-                    if (std.fmt.parseInt(u32, s, 10)) |n| min = n else |_| {}
-                }
-                if (em.get("FIX_READDIR_PREFETCH_MAX")) |s| {
-                    if (std.fmt.parseInt(u32, s, 10)) |n| max = n else |_| {}
-                }
-            }
-            if (on and self.worker_count > 1)
-                self.scheduler.setReadDirPrefetch(min, max)
-            else
-                self.scheduler.setReadDirPrefetch(0, 0);
-        }
-        try self.scheduler.start(helperLoop, self);
+        // Prefetch work is deduplicated by the import and file registries, and
+        // bounded so speculative tasks cannot grow without limit.
+        const prefetch = tuning.resolvePrefetch(self.sources.env_map, self.execution.worker_count);
+        self.sources.prefetch.budget = prefetch.import_budget;
+        self.execution.scheduler.setReadDirPrefetch(prefetch.read_dir_min, prefetch.read_dir_budget);
+        try self.execution.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.store.realization.clearDebugRecords();
     }
@@ -1531,7 +1445,7 @@ pub const Evaluator = struct {
         };
 
         for (inputs, 0..) |input, index| {
-            const chunk_id = self.parseAndCompile(input.source, input.base_path orelse self.base_path, input.source_path, null) catch |err| {
+            const chunk_id = self.parseAndCompile(input.source, input.base_path orelse self.sources.base_path, input.source_path, null) catch |err| {
                 sink.complete(index, null, .{ .err = err, .trace = self.getTrace(), .diagnostics = true });
                 continue;
             };
@@ -1599,8 +1513,8 @@ pub const Evaluator = struct {
         defer scratch.deinit();
         var vm = try self.initVm(0, scratch.allocator());
         defer vm.deinit();
-        vm.debug_parent = debug_parent;
-        vm.debug_import_replay = if (debug_parent) |parent| parent.debug_import_replay else false;
+        vm.debug.parent = debug_parent;
+        vm.debug.import_replay = if (debug_parent) |parent| parent.debug.import_replay else false;
         // Depth-transparent import: the fresh nested VM inherits the caller's
         // depth minus 1 (dropping the `import` builtin's own +1), so a
         // top-level import evaluates at depth 0 (collects) while a nested one
@@ -1621,12 +1535,8 @@ pub const Evaluator = struct {
 
     /// `scratch` is the VM's allocation arena — per-fiber (reset when the
     /// fiber is recycled) or per-import (freed when the import returns).
-    /// It MUST be an arena: VM run paths lean on arena semantics — frees
-    /// are best-effort, error/suspend paths may abandon allocations, and
-    /// the sweep happens wholesale at reset/deinit. It must NOT live for
-    /// the whole evaluator: that retained ~240 MB (w=1) / ~380 MB (w=8)
-    /// of dead interleaved scratch pages on a NixOS eval (~490 MB of
-    /// transient traffic per run never reclaimed by a never-reset arena).
+    /// It must be an arena: VM frees are best-effort, error and suspend paths
+    /// may abandon allocations, and reset/deinit reclaims them wholesale.
     fn initVm(self: *Evaluator, worker_id: u8, scratch: std.mem.Allocator) !VM {
         // RSS attribution: the VM's own allocations (gc lists; the
         // stack/frames go through the shared pool) get the worker bucket.
@@ -1635,14 +1545,14 @@ pub const Evaluator = struct {
         var vm = try VM.init(.{
             .driver = &vm_mod.driver,
             .allocator = scratch,
-            .buffer_pool = &self.vm_buffers,
+            .buffer_pool = &self.execution.vm_buffers,
             .registry = &self.registry,
             .intern = &self.intern,
             .heap = &self.heap,
-            .files = &self.files,
-            .fetchers = &self.fetchers,
+            .files = &self.sources.files,
+            .fetchers = &self.sources.fetchers,
             .realization = &self.store.realization,
-            .scheduler = &self.scheduler,
+            .scheduler = &self.execution.scheduler,
             // Helpers (worker_id != 0) don't write to the shared trace —
             // it's a side effect of *real* evaluation, so speculative force
             // stays invisible to it.
@@ -1660,7 +1570,7 @@ pub const Evaluator = struct {
             .thunk_trace = self.thunk_trace,
             .import_host = .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             .builtins_value = try self.ensureBuiltins(),
-            .deferred_table = &self.deferred_table,
+            .deferred_table = &self.compilation.deferred_table,
             .registration_sink = chunkRegistrationSink(self),
             .regexes = &self.regexes,
             .break_sink = if (self.debugger.ui != null) .{ .ctx = self, .fire = fireBreak } else null,
@@ -1841,9 +1751,8 @@ pub const Evaluator = struct {
             const drv = derived[0..(std.mem.indexOfScalar(u8, derived, '!') orelse derived.len)];
             try self.store.realization.ensureClosure(drv);
         }
-        // Now release on a helper thread so the build launches immediately and
-        // the ~2 GB heap teardown overlaps it. If the thread can't spawn, fall
-        // back to serial release-then-build.
+        // Release on a helper so teardown overlaps daemon startup. If spawning
+        // fails, release synchronously.
         const releaser = std.Thread.spawn(.{}, releaseForBuild, .{ self, after_release }) catch blk: {
             releaseForBuild(self, after_release);
             break :blk null;
@@ -1935,39 +1844,39 @@ pub const Evaluator = struct {
     }
 
     fn ensureMainWorker(self: *Evaluator) !*worker_mod.Worker {
-        if (self.main_worker) |w| return w;
+        if (self.execution.main_worker) |w| return w;
         const w = try worker_mod.Worker.init(
             self.allocator,
-            &self.scheduler,
+            &self.execution.scheduler,
             0,
             self,
             initVmForWorkerSlot,
         );
-        self.main_worker = w;
+        self.execution.main_worker = w;
         // Register the collect callback now that `self` is at
         // its final address (init returns by value), and enable reclaim. The
         // collect runs at the forceThunk safepoint when allocation crosses
         // the byte threshold; at --workers>1 it stops the world (all workers
         // park at safepoints) before marking. Register worker 0 so the
         // collector can walk its fibers for roots.
-        self.gc_workers[0].store(w, .release);
-        self.gc_coord.install(&self.heap, &self.scheduler, .{
+        self.collection.workers[0].store(w, .release);
+        self.collection.coordinator.install(&self.heap, &self.execution.scheduler, .{
             .context = self,
             .collect = gcCollect,
             .help_mark = gcHelpMark,
         });
-        if (self.env_map) |em|
+        if (self.sources.env_map) |em|
             if (em.get("FIX_GC_NOREUSE") != null) self.heap.gcSetDisableReuse(true);
-        if (self.env_map) |em|
+        if (self.sources.env_map) |em|
             if (em.get("FIX_GC_PAR_CAP")) |s| {
                 if (std.fmt.parseInt(u32, s, 10)) |c| {
-                    if (c >= 1) self.gc_parallel_cap = c;
+                    if (c >= 1) self.collection.parallel_cap = c;
                 } else |_| {}
             };
         // FIX_GC_STEP_MB (validation): collect every N MB of fresh
         // allocation so the detector exercises every builtin loop.
         var step_bytes: u64 = 0;
-        if (self.env_map) |em| {
+        if (self.sources.env_map) |em| {
             if (em.get("FIX_GC_STEP_MB")) |s| {
                 if (std.fmt.parseInt(u64, s, 10)) |mb| step_bytes = mb << 20 else |_| {}
             }
@@ -1994,11 +1903,11 @@ pub const Evaluator = struct {
     }
 
     /// Replace the caller-held external root set (see
-    /// `gc_extra_roots`). The repl passes its scope attrset + loose values
+    /// `collection.extra_roots`). The repl passes its scope attrset + loose values
     /// here whenever they change; they stay rooted until replaced.
     pub fn gcSetExternalRoots(self: *Evaluator, roots: []const Value) !void {
-        self.gc_extra_roots.clearRetainingCapacity();
-        try self.gc_extra_roots.appendSlice(self.allocator, roots);
+        self.collection.extra_roots.clearRetainingCapacity();
+        try self.collection.extra_roots.appendSlice(self.allocator, roots);
     }
 
     pub const CollectNowResult = struct {
@@ -2026,7 +1935,7 @@ pub const Evaluator = struct {
     }
 
     fn finishCollectNow(self: *Evaluator, result: *CollectNowResult, before: gc.LiveReport) void {
-        const after = gc.liveReport(&self.heap.gc_report);
+        const after = gc.liveReport(&self.heap.collection.report);
         result.ran = true;
         result.collections = after.collections -| before.collections;
         result.objects_freed = after.freed_objects -| before.freed_objects;
@@ -2047,11 +1956,11 @@ pub const Evaluator = struct {
         var result = self.collectNowResult();
         // No hook yet (nothing evaluated) or reclaim disabled by policy
         // (threshold never armed): nothing to do.
-        if (self.main_worker == null) return result;
-        if (self.heap.gc_threshold_bytes == std.math.maxInt(u64)) return result;
-        if (!self.scheduler.gcTryBeginCollection()) return result;
-        const before = gc.liveReport(&self.heap.gc_report);
-        self.scheduler.gcWaitAllParked(0);
+        if (self.execution.main_worker == null) return result;
+        if (self.heap.collection.threshold_bytes == std.math.maxInt(u64)) return result;
+        if (!self.execution.scheduler.gcTryBeginCollection()) return result;
+        const before = gc.liveReport(&self.heap.collection.report);
+        self.execution.scheduler.gcWaitAllParked(0);
         // Invalidate the token-keyed thread-local caches (thunk memo, attr
         // IC) BEFORE marking: they root the previous evaluation's hottest
         // values (markRoots must treat current-token entries as live), but
@@ -2061,7 +1970,7 @@ pub const Evaluator = struct {
         // the token after the sweep (`afterCollect`).
         self.heap.token = runtime.heap.next_heap_token.fetchAdd(1, .monotonic);
         heap_collector.runCollect(&self.heap, 0);
-        self.scheduler.gcEndCollection(0);
+        self.execution.scheduler.gcEndCollection(0);
         self.finishCollectNow(&result, before);
         return result;
     }
@@ -2074,14 +1983,14 @@ pub const Evaluator = struct {
     /// dance + cache-invalidating token bump as `collectNow`.
     pub fn collectMajorNow(self: *Evaluator) CollectNowResult {
         var result = self.collectNowResult();
-        if (self.main_worker == null) return result;
-        if (self.heap.gc_threshold_bytes == std.math.maxInt(u64)) return result;
-        if (!self.scheduler.gcTryBeginCollection()) return result;
-        const before = gc.liveReport(&self.heap.gc_report);
-        self.scheduler.gcWaitAllParked(0);
+        if (self.execution.main_worker == null) return result;
+        if (self.heap.collection.threshold_bytes == std.math.maxInt(u64)) return result;
+        if (!self.execution.scheduler.gcTryBeginCollection()) return result;
+        const before = gc.liveReport(&self.heap.collection.report);
+        self.execution.scheduler.gcWaitAllParked(0);
         self.heap.token = runtime.heap.next_heap_token.fetchAdd(1, .monotonic);
         gc_controller.collectMajor(gcContext(self), 0);
-        self.scheduler.gcEndCollection(0);
+        self.execution.scheduler.gcEndCollection(0);
         self.finishCollectNow(&result, before);
         return result;
     }
@@ -2103,7 +2012,7 @@ pub const Evaluator = struct {
     }
 
     fn importResolvedPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
-        const entry = try self.imports.lookupOrCreate(self.allocator, path, debug_parent.debug_import_replay);
+        const entry = try self.sources.imports.lookupOrCreate(self.allocator, path, debug_parent.debug.import_replay);
         return self.forceImportEntry(path, entry, parent_depth, debug_parent);
     }
 
@@ -2171,7 +2080,7 @@ pub const Evaluator = struct {
         const source = if (corepkgs.source(stable_path)) |core_source|
             core_source
         else
-            self.files.readFile(stable_path) catch |err| switch (err) {
+            self.sources.files.readFile(stable_path) catch |err| switch (err) {
                 error.IsDir => return self.importDirectory(stable_path, parent_depth, debug_parent),
                 else => return err,
             };
@@ -2199,22 +2108,21 @@ pub const Evaluator = struct {
     /// phase (`FIX_IMPORT_PREFETCH`):
     /// called for every `.path` constant of every freshly compiled chunk,
     /// from whichever worker ran the compile. Filters to `.nix` files
-    /// (directory references — the bulk of e.g. all-packages.nix's ~1.7K
-    /// path constants — are mostly never imported in a given eval and
-    /// would be junk), dedups per intern id, spends the submission
+    /// because directory constants are not necessarily imports, dedups per
+    /// intern id, spends the submission
     /// budget, and hands the path to the spec lane.
     fn prefetchPathConst(self: *Evaluator, path_id: types.InternId) void {
         const text = self.intern.get(path_id);
         if (!std.mem.endsWith(u8, text, ".nix")) return;
         {
-            self.prefetch.mu.lock();
-            defer self.prefetch.mu.unlock();
-            if (self.prefetch.budget == 0) return;
-            const gop = self.prefetch.seen.getOrPut(self.allocator, path_id) catch return;
+            self.sources.prefetch.mu.lock();
+            defer self.sources.prefetch.mu.unlock();
+            if (self.sources.prefetch.budget == 0) return;
+            const gop = self.sources.prefetch.seen.getOrPut(self.allocator, path_id) catch return;
             if (gop.found_existing) return;
-            self.prefetch.budget -= 1;
+            self.sources.prefetch.budget -= 1;
         }
-        _ = self.scheduler.submit(.{ .import_prefetch = path_id }, worker_id_mod.current);
+        _ = self.execution.scheduler.submit(.{ .import_prefetch = path_id }, worker_id_mod.current);
     }
 
     fn scopedImportValue(context: *anyopaque, caller: *VM, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
@@ -2253,7 +2161,7 @@ pub const Evaluator = struct {
         const source = if (corepkgs.source(stable_path)) |core_source|
             core_source
         else
-            self.files.readFile(stable_path) catch |err| switch (err) {
+            self.sources.files.readFile(stable_path) catch |err| switch (err) {
                 error.IsDir => return self.scopedImportDirectory(scope, stable_path, parent_depth, debug_parent),
                 else => return err,
             };
@@ -2288,17 +2196,17 @@ pub const Evaluator = struct {
 
     fn getEnv(context: *anyopaque, name: []const u8) anyerror![]const u8 {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        const env_map = self.env_map orelse return "";
+        const env_map = self.sources.env_map orelse return "";
         return env_map.get(name) orelse "";
     }
 
     fn findFileInDefaultSearchPath(self: *Evaluator, name: []const u8) !Value {
-        return self.search_paths.findFile(self.allocator, &self.files, &self.intern, name);
+        return self.sources.search_paths.findFile(self.allocator, &self.sources.files, &self.intern, name);
     }
 
     fn ensureBuiltins(self: *Evaluator) !Value {
         if (self.builtins_value) |value| return value;
-        const nix_path = try self.search_paths.toNixPath(self.allocator);
+        const nix_path = try self.sources.search_paths.toNixPath(self.allocator);
         defer self.allocator.free(nix_path);
         const value = try builtins.buildAttrSet(&self.intern, &self.heap, nix_path);
         self.builtins_value = value;
@@ -2310,7 +2218,7 @@ pub const Evaluator = struct {
             return .{ .text = path, .owned = false };
         if (std.fs.path.isAbsolute(path)) return .{ .text = path, .owned = false };
 
-        const base_path = self.base_path orelse return error.RelativePath;
+        const base_path = self.sources.base_path orelse return error.RelativePath;
         return .{
             .text = try std.fs.path.resolve(self.allocator, &.{ base_path, path }),
             .owned = true,
@@ -2347,7 +2255,7 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
     // for roots. Registration happens before `run()` (before any user-object
     // allocation), and the collector only reads the registry at a stop-the-
     // world where this worker is parked.
-    ev.gc_workers[worker_id].store(worker, .release);
+    ev.collection.workers[worker_id].store(worker, .release);
     worker.run();
     // Wait until ALL helpers have stopped forcing before destroying any
     // fibers — a still-running helper could resolve a thunk and wake a
@@ -2356,7 +2264,7 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
     // Unregister before deinit so a late collection never scans freed fibers.
     // (After awaitHelpersQuiescent no helper is still forcing, so no
     // collection can be triggered past this point, but keep the invariant.)
-    ev.gc_workers[worker_id].store(null, .release);
+    ev.collection.workers[worker_id].store(null, .release);
     worker.deinit();
 }
 
@@ -2436,20 +2344,20 @@ fn gcContext(ev: *Evaluator) gc_controller.Context {
         .allocator = ev.allocator,
         .heap = &ev.heap,
         .registry = &ev.registry,
-        .scheduler = &ev.scheduler,
+        .scheduler = &ev.execution.scheduler,
         .realization = &ev.store.realization,
-        .imports = &ev.imports,
+        .imports = &ev.sources.imports,
         .builtins_value = &ev.builtins_value,
-        .env_map = ev.env_map,
-        .worker_count = ev.worker_count,
-        .gc_budget_bytes = ev.gc_budget_bytes,
-        .tracer = &ev.gc_tracer,
-        .import_vms = &ev.gc_import_vms,
-        .import_vms_mu = &ev.gc_import_vms_mu,
-        .workers = ev.gc_workers,
-        .chunks_scanned = &ev.gc_chunks_scanned,
-        .extra_roots = &ev.gc_extra_roots,
-        .parallel_cap = ev.gc_parallel_cap,
+        .env_map = ev.sources.env_map,
+        .worker_count = ev.execution.worker_count,
+        .gc_budget_bytes = ev.collection.budget_bytes,
+        .tracer = &ev.collection.tracer,
+        .import_vms = &ev.collection.import_vms,
+        .import_vms_mu = &ev.collection.import_vms_mu,
+        .workers = ev.collection.workers,
+        .chunks_scanned = &ev.collection.chunks_scanned,
+        .extra_roots = &ev.collection.extra_roots,
+        .parallel_cap = ev.collection.parallel_cap,
         .observer = ev.observer,
     };
 }

@@ -142,8 +142,8 @@ pub fn compileThunkContext(self: *Compiler, expr: *const Node) !void {
     // it and returns), so compile it as a tail expression — matching lambda
     // bodies. A trailing apply becomes `call_tail`, reusing the thunk's frame
     // instead of pushing a callee frame that returns straight into a `ret`
-    // (the `ret->ret` forwarding pattern). Gives thunk bodies O(1) tail-stack
-    // like lambdas; perf-neutral, kept for consistency/robustness.
+    // (the `ret->ret` forwarding pattern). Thunk and lambda bodies therefore
+    // share the same tail-stack behavior.
     lambda.compileTailExpression(&child, expr) catch |err| {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;

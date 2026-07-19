@@ -338,8 +338,8 @@ const prec = [_]lr.RawPrec{
 
 const num_nt = @typeInfo(Nonterminal).@"enum".fields.len;
 
-/// Eliminate unit productions at comptime. Faster runtime (no chain reductions)
-/// at the cost of a much larger table and slower generation.
+/// Eliminate runtime chain reductions by expanding unit productions at
+/// comptime. This increases generated table size and generation work.
 const eliminate_units = true;
 
 fn isUnitPass(p: Production) bool {

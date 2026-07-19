@@ -1,8 +1,5 @@
-//! GC collector glue for the Evaluator: VM-root registration and
-//! the stop-the-world minor-collect driver (mark roots, drive the parallel
-//! evac, record stats). These are the Evaluator-side halves of the copying
-//! nursery; the heap-side machinery lives in `runtime/heap` and the marking
-//! tracer in `runtime.gc`.
+//! Evaluator-side GC coordination: root enumeration, stop-the-world marking,
+//! sweeping, and collection metrics.
 //!
 //! The explicit `Context` below contains only the evaluator state GC owns or
 //! scans, keeping this controller independent of the full `Evaluator` type.
@@ -60,9 +57,8 @@ pub const Context = struct {
     observer: observ.Observer,
 };
 
-/// Cap on the number of participants in a single collection's mark+evac.
-/// The eval still runs `worker_count`-wide; only the STW mark/evac is
-/// throttled (contention-bound past ~8). Set from `FIX_GC_PAR_CAP`.
+/// Default cap on collection participants. Evaluation may still use every
+/// worker. Overridden by `FIX_GC_PAR_CAP`.
 pub const default_parallel_cap: u32 = 8;
 
 /// GC: register a stack-local VM (the top-level entry's VM, a
@@ -92,55 +88,25 @@ pub fn unregisterVm(ev: Context, vm: *VM) void {
 /// scheduler callback and dispatches here.
 pub fn helpMark(ev: Context, worker_id: u8) void {
     _ = worker_id;
-    // Grab a marker slot. The collection is capped at GC_PAR_CAP
-    // participants (contention-bound past ~8); a peer over the cap parks
-    // idle rather than piling on. The collector already grabbed slot 0.
     const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
     const slot = ev.heap.gcMarkSlotGrab();
     if (slot >= marker_count) return;
-    // Drain the mark to global termination, then help the second phase: a MINOR
-    // evacuates the young-object lists; a MAJOR sweeps the whole id range. Both
-    // are claim loops over a shared work queue that this peer joins alongside
-    // the collector.
+    // Join the mark, then claim young-object lists from the shared sweep queue.
     ev.tracer.drainParallel(ev.heap, slot);
-    if (ev.heap.gc_collecting_major)
-        heap_collector.sweepClaimLoop(ev.heap, ev.tracer.mark_bits)
-    else
-        heap_collector.evacClaimLoop(ev.heap, ev.tracer.mark_bits);
+    heap_collector.minorSweepClaimLoop(ev.heap, ev.tracer.mark_bits);
 }
 
-/// GC: one stop-the-world mark-sweep at a safepoint. Mark the
-/// live graph from roots, sweep dead objects/ranges into the free
-/// lists, set the next threshold from the surviving live set. Runs on
-/// the lone mutator at --workers=1; see docs/gc.md for the roots.
+/// Run one stop-the-world generational collection at a safepoint.
 pub fn collect(ev: Context, collector_id: u8) void {
-    // Lazy policy (`enableBudget`): the first threshold (budget/2) crossing
-    // arms tracking instead of collecting — everything allocated so far
-    // becomes untracked/old, and the real collections start at the budget.
-    // We are inside the STW (all peers parked), which `armTracking` needs
-    // for the TLAB flush + flag publication.
-    if (!ev.heap.gc_collect_enabled) {
+    // The first threshold crossing arms tracking; collection starts at the
+    // full budget. The world is already stopped for publication.
+    if (!ev.heap.collection.collect_enabled) {
         heap_collector.armLazy(ev.heap);
         return;
     }
-    // Escalate to a full collection once enough has tenured that a young-gated
-    // minor can't recover the accumulated old-generation garbage (see
-    // `gc_major_gate`). Same STW; the major reclaims old dead objects too.
-    //
-    // MAJOR IS `--workers=1`-ONLY (gated pending a w>1 fix). At w>1 the full
-    // sweep occasionally frees a LIVE object it never marked → UAF (detector
-    // `gcAssertLive` "read after sweep" ~1/60 under a tight `--gc-budget
-    // --workers=12`; release segv/`InvalidObjectType` ~1/80). It's a
-    // MISSING-ROOT/EDGE class that only bites the full mark at w>1: seeding the
-    // remembered set in `collectMajor` (below) closed the biggest one — a
-    // write-barrier-recorded old→young edge `scanObject` doesn't re-traverse —
-    // but at least one more remains, and the parallel work-stealing major mark
-    // has a separate race on top. The copying MINOR is parallel-safe at any
-    // width (young-gated + remset-seeded, extensively validated), so at w>1 we
-    // run minor-only: young churn stays bounded, old garbage accumulates but
-    // never corrupts. `gcReconstructAllocBits` itself is w>1-CORRECT (it
-    // excludes every worker's current-chunk tail + free list) — that was NOT
-    // the bug, contrary to an earlier guess. See docs / the GC memo.
+    // Major collection remains single-worker until full-mark root closure is
+    // proven under parallel evaluation. Multi-worker runs therefore reclaim
+    // young garbage but may accumulate unreachable old objects.
     if (ev.worker_count == 1 and ev.heap.gcShouldMajor()) {
         collectMajor(ev, collector_id);
         return;
@@ -149,9 +115,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
     // so `collector_id` isn't needed past the major dispatch.
     var observation = ev.observer.begin(&gc_observation, .{ .subject = .{ .text = "minor" } });
     defer observation.cancel();
-    // Copying minor collection (STW). The young-gated mark runs from roots +
-    // the old→young remembered set. At --workers>1 the parked peers HELP the
-    // mark (parallel young-gated drain); at --workers=1 it's serial.
+    // The young-gated mark starts from roots and the remembered set.
     const tr = ev.tracer;
     const t0 = nowNs();
     const SeedCtx = struct { tr: *gc.Tracer, heap: *ObjectHeap };
@@ -161,15 +125,12 @@ pub fn collect(ev: Context, collector_id: u8) void {
         }
     };
     if (ev.worker_count > 1) {
-        // Cap the collection's participants (contention-bound past ~8) —
-        // the eval still runs `worker_count`-wide; only the mark+evac is
-        // throttled. Peers over the cap park idle (see gcHelpMarkThunk).
         const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
         tr.resetParallelMinor(ev.heap.objects.count(), marker_count) catch {
             heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
             return;
         };
-        heap_collector.beginEvac(ev.heap, ev.worker_count); // arm the evac work queue (resets slot dispenser)
+        heap_collector.beginMinorSweep(ev.heap, ev.worker_count);
         const collector_slot = ev.heap.gcMarkSlotGrab(); // grabbed before gcOpenMark ⇒ slot 0
         // Seed roots + remset into the collector's own marker deque, open
         // the mark so parked peers help drain it, then drain alongside them.
@@ -179,12 +140,11 @@ pub fn collect(ev: Context, collector_id: u8) void {
         tr.endSeeding();
         ev.scheduler.gcOpenMark();
         tr.drainParallel(ev.heap, collector_slot); // returns at termination
-        // Mark closed. Verify closure while peers spin (no range moves yet),
-        // then open the evac phase and evacuate alongside them.
+        // Sweep cannot start until the mark is closed and verified.
         heap_collector.verifyMinorClosure(ev.heap, tr.mark_bits);
-        heap_collector.openEvac(ev.heap);
-        heap_collector.evacClaimLoop(ev.heap, tr.mark_bits);
-        heap_collector.waitEvacDone(ev.heap);
+        heap_collector.openMinorSweep(ev.heap);
+        heap_collector.minorSweepClaimLoop(ev.heap, tr.mark_bits);
+        heap_collector.waitMinorSweepDone(ev.heap);
         ev.scheduler.gcCloseMark();
         tr.sumStats();
     } else {
@@ -207,13 +167,12 @@ pub fn collect(ev: Context, collector_id: u8) void {
         const p2 = nowNs();
         tr.drainMinor(ev.heap);
         const p3 = nowNs();
-        gc.recordMarkPhases(&ev.heap.gc_report, p0 - t0, p1 - p0, p2 - p1, p3 - p2, remset_sources);
+        gc.recordMarkPhases(&ev.heap.collection.report, p0 - t0, p1 - p0, p2 - p1, p3 - p2, remset_sources);
     }
     const t1 = nowNs();
-    // w>1 already evacuated in parallel (claim loop); just finish (verify +
-    // reset nursery). w=1 runs the whole serial minor here.
+    // Parallel participants already drained the young lists.
     const st = if (ev.worker_count > 1)
-        heap_collector.finishEvac(ev.heap)
+        heap_collector.finishMinorSweep(ev.heap)
     else
         heap_collector.minorCollect(ev.heap, tr.mark_bits);
     const t2 = nowNs();
@@ -222,15 +181,15 @@ pub fn collect(ev: Context, collector_id: u8) void {
     // accumulated in the old generation, the next collection escalates.
     ev.heap.gcNoteMinorPromoted(st.promoted);
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
-    gc.recordCollection(&ev.heap.gc_report, st.freed, tr.stats.bytes, ev.heap.totalReservedBytes());
-    gc.recordTiming(&ev.heap.gc_report, t1 - t0, t2 - t1);
-    gc.recordBreakdown(&ev.heap.gc_report, .{
+    gc.recordCollection(&ev.heap.collection.report, st.freed, tr.stats.bytes, ev.heap.totalReservedBytes());
+    gc.recordTiming(&ev.heap.collection.report, t1 - t0, t2 - t1);
+    gc.recordBreakdown(&ev.heap.collection.report, .{
         .obj_live = tr.stats.objects,
         .obj_reserved = ev.heap.objects.count(),
         .val_live = tr.stats.values,
-        .val_reserved = ev.heap.values.reservedSlots(),
+        .val_reserved = ev.heap.values.count(),
         .attr_live = tr.stats.attrs,
-        .attr_reserved = ev.heap.attrs.reservedSlots(),
+        .attr_reserved = ev.heap.attrs.count(),
     });
     observation.finish(.{ .metrics = &.{
         .{ .name = "freed", .value = .{ .unsigned = st.freed }, .unit = .items },
@@ -248,7 +207,7 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     _ = collector_id; // marker slot grabbed dynamically, like the minor
     // Same lazy-arm as the minor: the first crossing arms tracking (everything
     // so far becomes untracked/old) rather than collecting.
-    if (!ev.heap.gc_collect_enabled) {
+    if (!ev.heap.collection.collect_enabled) {
         heap_collector.armLazy(ev.heap);
         return;
     }
@@ -266,15 +225,8 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
         return;
     };
     markRoots(ev, tr);
-    // The FULL mark must ALSO seed the remembered set (like the minor). A non-
-    // gated mark is *supposed* to reach every old→young edge by tracing through
-    // old objects, but the write barrier (`gcRecordEdge`, fired at thunk-resolve
-    // / merge-flatten / cell-bind) records edges that `scanObject` does not
-    // always re-traverse. Without seeding, the full mark can miss a live young
-    // object it never traced and sweep it (a UAF). Seeding matches the minor's
-    // edge coverage; the remset is cleared by the reconcile below. (This closed
-    // the dominant w>1 miss; a residual one remains, which is why the major
-    // stays w=1-gated — see `collect`.)
+    // Mutable edges recorded by the write barrier must seed the full mark too;
+    // not every such edge is recoverable by re-scanning its source object.
     {
         const SeedCtx = struct { tr: *gc.Tracer, heap: *ObjectHeap };
         const Seed = struct {
@@ -287,8 +239,8 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     tr.drain(ev.heap);
     const st = heap_collector.sweep(ev.heap, tr.mark_bits); // serial full sweep
     const t1 = nowNs();
-    // Tenure survivors + empty the nursery, then drop the now-stale remset
-    // (young generation is empty ⇒ no old→young edges remain). Swept slots stay
+    // Tenure every survivor, then clear the remembered set because no live
+    // young objects remain. Swept slots stay
     // round-robined across worker shards; the allocation path work-steals across
     // shards, so a demand-concentrated workload still reuses the whole pool.
     ev.heap.gcMajorReconcile(tr.mark_bits);
@@ -298,8 +250,8 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     ev.heap.gcNoteMajor(tr.stats.objects);
     const t2 = nowNs();
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
-    gc.recordCollection(&ev.heap.gc_report, st.objects_freed, tr.stats.bytes, ev.heap.totalReservedBytes());
-    gc.recordTiming(&ev.heap.gc_report, t1 - t0, t2 - t1);
+    gc.recordCollection(&ev.heap.collection.report, st.objects_freed, tr.stats.bytes, ev.heap.totalReservedBytes());
+    gc.recordTiming(&ev.heap.collection.report, t1 - t0, t2 - t1);
     observation.finish(.{ .metrics = &.{
         .{ .name = "freed", .value = .{ .unsigned = st.objects_freed }, .unit = .items },
         .{ .name = "live", .value = .{ .unsigned = tr.stats.bytes }, .unit = .bytes },
@@ -346,13 +298,12 @@ pub fn memoryBudget(ev: Context) u64 {
 }
 
 /// CONSTRAINED MODE: is memory tight enough that the collector will plausibly
-/// ARM (cross budget/2 during a real eval)? Only then does the pre-arming
-/// reclaim matter — and only then is it worth keeping the transient-root gates
-/// live from eval start (~1.9%, `heap.gc_root_active`) to make that reclaim
-/// sound. True iff an explicit `--gc-budget` was given (the
+/// ARM (cross budget/2 during a real eval)? Only then does pre-arming reclaim
+/// matter, and only then must transient rooting (`heap.collection.root_active`) stay
+/// live from evaluation start. True iff an explicit `--gc-budget` was given (the
 /// user opted into a limit), OR the auto line came in below the default ceiling
 /// (a RAM-limited box). A roomy auto machine (line clamped to the ceiling) never
-/// arms → stays exactly zero-cost with the reclaim off (moot there anyway).
+/// arms, so pre-arming reclaim stays off.
 pub fn constrainedMode(ev: Context, budget: u64) bool {
     const explicit = ev.gc_budget_bytes != null;
     const ceiling = envSize(ev, "FIX_GC_CEILING") orelse gc_limit_ceiling;
@@ -547,9 +498,9 @@ pub fn markRoots(ev: Context, tr: *gc.Tracer) void {
 
 pub fn markVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: *VM) void {
     tr.markValue(heap, vm.builtins);
-    tr.markValue(heap, vm.gc_extra_root); // value in-flight at the safepoint
-    for (vm.gc_force_chain.items) |id| tr.markObject(heap, id); // in-flight force chain
-    for (vm.gc_temp_roots.items) |v| tr.markValue(heap, v); // native builtin roots
+    tr.markValue(heap, vm.gc_roots.extra); // value in-flight at the safepoint
+    for (vm.gc_roots.force_chain.items) |id| tr.markObject(heap, id); // in-flight force chain
+    for (vm.gc_roots.temporary.items) |v| tr.markValue(heap, v); // native builtin roots
     for (vm.stack[0..vm.sp]) |v| tr.markValue(heap, v);
     for (vm.frames[0..vm.frames_len]) |frame| {
         if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);

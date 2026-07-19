@@ -1,5 +1,5 @@
 const std = @import("std");
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 test "if-else selects the matching branch" {
     var ev = try Evaluator.init(std.testing.allocator, 0);

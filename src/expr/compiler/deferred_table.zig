@@ -1,9 +1,8 @@
 //! Lazy per-attr compilation: the side table of deferred attrset value
 //! bodies.
 //!
-//! A large generated attrset (e.g. nixpkgs `hackage-packages.nix`,
-//! ~thousands of entries) compiles its value bodies *lazily* — each body
-//! is registered here as an `Entry` (AST node + a snapshot of the
+//! Large generated attrsets can compile value bodies lazily. Each body is
+//! registered here as an `Entry` (AST node + a snapshot of the
 //! enclosing lexical scope) and emitted as a `.deferred` thunk
 //! (`runtime/thunk.zig`). The body's bytecode is produced only when that
 //! attr is first forced, so never-forced entries are never compiled. The
@@ -37,14 +36,9 @@ pub const min_entries: usize = 64;
 
 /// `min_body_bytes`: the real lever. Defer a value body only if its
 /// source span is at least this large. Body source-span size is a cheap
-/// proxy for compile cost: deferral pays off only for EXPENSIVE bodies
-/// (measured — 98% of deferred bodies are never forced, so the win is
-/// skipping their compile; for cheap bodies the deferral overhead —
-/// scope snapshot, env, table entry, arena retention — exceeds the
-/// compile saved). This separates hackage-packages.nix's huge inline
-/// `callPackage ({...}: mkDerivation {...}) {}` bodies (hundreds–thousands
-/// of bytes, rarely forced) from all-packages.nix's tiny
-/// `callPackage ../path {}` bodies (mostly forced). Tunable by measurement.
+/// proxy for compile cost: deferral pays off only when skipped compilation
+/// outweighs the scope snapshot, environment, table entry, and arena
+/// retention.
 pub const min_body_bytes: usize = 100;
 
 // The parser's body-span elision gates mirror these tunables (an elided
@@ -57,16 +51,14 @@ comptime {
 
 /// `max_scope_size`: cap on the enclosing-scope snapshot size (lexical
 /// bindings + active `with` scopes). Keeps the env gather cheap and
-/// bounds the runtime stack buffer. hackage-packages.nix needs 4;
-/// perl-packages.nix (13 formals + `self:` + a `let` + `with self`)
-/// needs ~16.
+/// bounds the runtime stack buffer.
 pub const max_scope_size: usize = 32;
 
 /// One deferred value body. Structurally immutable after registration
 /// except for `compiled`, the publish-once compile cache.
 pub const Entry = struct {
     /// The value body's AST node (lives in an arena retained by the
-    /// Evaluator for its lifetime — see `eval.zig` arena retention).
+    /// Evaluator for its lifetime — see `evaluator.zig` arena retention).
     node: *const ast.Node,
     /// Snapshot of the enclosing lexical scope, in declaration order:
     /// each `Capture` says how to fetch one visible binding's value from
@@ -111,6 +103,8 @@ pub const Entry = struct {
 };
 
 pub const Table = struct {
+    pub const Stats = struct { registered: u32, compiled: u32 };
+
     const Store = segments.StableSegments(*Entry, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
     allocator: std.mem.Allocator,
@@ -223,7 +217,7 @@ pub const Table = struct {
     /// Diagnostic: how many bodies were registered (deferred) vs actually
     /// compiled (forced). A low compiled/registered ratio is where lazy
     /// compilation pays off.
-    pub fn stats(self: *const Table) struct { registered: u32, compiled: u32 } {
+    pub fn stats(self: *const Table) Stats {
         var compiled: u32 = 0;
         var id: u32 = 0;
         const total = self.entries.count();

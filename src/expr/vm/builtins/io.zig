@@ -167,22 +167,14 @@ pub fn builtinReadDir(self: *VM, arg: Value) !Value {
     const dir_path = try demandPathArg(self, arg);
     var cold = false;
     const dir_entries = try self.files.readDirCold(dir_path, &cold);
-    // Speculative readDir-children prefetch (FIX_READDIR_PREFETCH): a
-    // cold listing that is a directory-of-directories (pkgs/by-name:
-    // 756 shard dirs) strongly predicts the demand fiber readDirs each
-    // child next — serially, on the critical chain (~19ms measured in
-    // the w=8 braid). Fan the child index space out to helpers, who
-    // warm the FileCache ahead of that walk. Cache-only, error-
-    // swallowing, deduped by coldness — demand-invisible.
+    // A cold directory-of-directories often precedes reads of its children.
+    // Prefetch only warms the cache; errors remain on the demand path.
     if (cold) maybePrefetchChildDirs(self, dir_path, dir_entries);
     var attrs: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer attrs.deinit(self.allocator);
     try attrs.ensureTotalCapacity(self.allocator, dir_entries.len);
 
-    // The kind strings take one of four values — intern each once per call,
-    // not once per entry (pkgs/by-name enumeration alone is ~20K entries,
-    // and the redundant hash+shard-lock interning showed up on the
-    // critical chain in the braid-window perf decomposition).
+    // The kind strings take one of four values; intern each once per call.
     var kind_values: [FileKindCount]?Value = @splat(null);
     for (dir_entries) |dir_entry| {
         const ki = @intFromEnum(dir_entry.kind);
@@ -202,9 +194,7 @@ pub fn builtinReadDir(self: *VM, arg: Value) !Value {
 
 const FileKindCount = @typeInfo(@import("store").FileCache.FileKind).@"enum".fields.len;
 
-/// Children per `readdir_prefetch` task: coarse enough to amortise the
-/// queue+wake cost (a child listing is ~20-30µs of getdents), fine
-/// enough that 756 by-name shards split across every idle helper.
+/// Children per `readdir_prefetch` task.
 const readdir_prefetch_batch = 32;
 
 fn maybePrefetchChildDirs(
@@ -236,11 +226,8 @@ fn maybePrefetchChildDirs(
             if (e.kind == .directory) dirs_in_batch += 1;
         }
         if (dirs_in_batch != 0) {
-            // Urgent lane: this is demand-adjacent fan-out (the walk
-            // starts within the same quantum), not a long-odds bet —
-            // and the spec lane is typically deep in import-prefetch
-            // backlog exactly when this fires. Rejection = queue full;
-            // just stop, demand pays the old serial cost.
+            // This work is demand-adjacent, so use the urgent lane. A full
+            // queue simply leaves the remaining reads to demand.
             if (!self.scheduler.submitUrgent(.{ .readdir_prefetch = .{
                 .dir = dir_id,
                 .offset = offset,
@@ -266,7 +253,6 @@ pub fn builtinFindFile(self: *VM, search_path_arg: Value, name_arg: Value) !Valu
 
     const path_id = try self.intern.intern("path");
     const prefix_id = try self.intern.intern("prefix");
-    // gc: re-fetch — range may move across the force
     const list_id = search_path.asObjectId();
     const n = try self.heap.getListLen(list_id);
     var idx: usize = 0;

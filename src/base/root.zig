@@ -1,13 +1,11 @@
-//! `base` module facade — generic, reusable infrastructure with zero Nix
+//! `base` module facade: generic, reusable infrastructure with zero Nix
 //! coupling.
 //!
 //! Sits at the very bottom of the module dependency graph (depends only on
 //! `std` and `base_options`) so every higher subsystem can import it without
-//! creating a cycle. Absorbs what used to be the `containers` and `fiber`
-//! modules plus the generic primitives that lived in `runtime`: the lock-free
-//! work-stealing `Deque`, the stack-switching `Fiber`, the mutual-exclusion
-//! primitives, the segmented storage, the RSS region-tracker, the block reuse
-//! cache, and worker-id helpers. Consumers import this module
+//! creating a cycle. It provides work-stealing queues, stack-switching fibers,
+//! synchronization, segmented storage, RSS attribution, block reuse, and
+//! worker identity. Consumers import this module
 //! by name (`@import("base")`) and reach submodules through it.
 
 pub const deque = @import("deque.zig");

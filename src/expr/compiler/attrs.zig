@@ -353,8 +353,8 @@ fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anye
     // the runtime sort + duplicate scan on every construction. Value code
     // in a plain attr literal is non-strict (thunks/constants/captures),
     // so emission order is not observable. Sorts a compact index array —
-    // sorting the fat `AttrEntryGroup` structs by value swaps ~150 bytes
-    // per element and measured ~2% of w=1 wall.
+    // sorting the larger `AttrEntryGroup` values would copy each group many
+    // times.
     const order = try sortedGroupOrder(self, grouped.groups);
     defer self.allocator.free(order);
 

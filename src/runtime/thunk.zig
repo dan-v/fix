@@ -4,7 +4,7 @@
 //! `demanded` flag (was this resolution observed by a real caller?)
 //! on top of `Future`.
 //!
-//! Post-F1 architecture notes:
+//! Scheduling rules:
 //!   - Claimer identity (`ClaimerId`) is a globally-allocated fiber id
 //!     (`Scheduler.allocFiberId`). It does NOT encode which OS thread
 //!     the fiber runs on, so a fiber that migrates across workers
@@ -76,13 +76,9 @@ pub const BytecodeThunk = struct {
     storage: Storage,
 
     /// Up to `inline_capacity` upvalues live *inline* in the thunk — one
-    /// allocation, one cache line on the hot force path, no separate
-    /// `values`-store range to chase. The overwhelming majority of
-    /// bytecode thunks capture 0-2 upvalues. Wider captures spill to a
-    /// slice into the heap's `values` store. The discriminant is
-    /// `upvalue_count` itself (no tag word), which keeps the struct at
-    /// the same 24 bytes the old `[]const Value` slice occupied — so the
-    /// (very hot, millions-live) Thunk doesn't grow.
+    /// allocation and no separate `values`-store range. Wider captures spill
+    /// to the heap's `values` store. `upvalue_count` is the discriminant, so
+    /// inline storage needs no tag word.
     pub const inline_capacity: u32 = 2;
 
     const Storage = union {
@@ -104,15 +100,13 @@ pub const BytecodeThunk = struct {
 /// is the result of compiling an AST node (named by `deferred_id` into
 /// the evaluator's `DeferredTable`) against the captured environment
 /// `env`, then running it. Used by lazy per-attr compilation: a large
-/// generated attrset (e.g. nixpkgs hackage-packages.nix) emits these for
-/// its value bodies instead of compiling thousands of never-forced
-/// bodies up front. On first force the body is compiled, the resulting
+/// generated attrset can defer its value bodies. On first force the body is compiled, the resulting
 /// ChunkId is cached on the `DeferredTable` entry (shared across
 /// instantiations), and execution falls into the same path as a
 /// `.bytecode` thunk with `env` as its upvalues.
 ///
-/// Mirrors `BytecodeThunk`'s inline(≤2)/spilled storage so the (hot,
-/// millions-live) `Thunk` union is not widened — same 24-byte arm.
+/// Mirrors `BytecodeThunk`'s inline/spilled storage to keep both target arms
+/// the same size.
 pub const DeferredThunk = struct {
     deferred_id: u32,
     env_count: u32,
@@ -140,13 +134,7 @@ pub const DeferredThunk = struct {
 ///   - `.pass_through` is a memoization wrapper: the underlying Value is
 ///     forced and the result becomes the thunk's resolved value. This is
 ///     how the compiler models recursive let-binding cells.
-/// Frameless lazy attr access: forcing computes `getAttrValue(base,
-/// name)` directly, with no frame push or bytecode dispatch. The
-/// overwhelmingly common `someUpvalue.attr` thunk shape (`config.foo`,
-/// `lib.bar`, attrset-pattern param lookups) would otherwise allocate a
-/// `bytecode` thunk over a 7-byte `up_get_attr; ret` chunk and run a
-/// whole isolated frame to force it — `run_isolated_frame` is the biggest
-/// machinery bucket on the serial critical path.
+/// Frameless lazy attr access. Forcing selects `name` from `base` directly.
 pub const AttrAccess = struct {
     base: Value,
     name: types.InternId,
@@ -174,10 +162,7 @@ pub const ThunkTarget = union {
 /// slot (which is otherwise unused in that state). The struct and its
 /// message string are freed in `ObjectHeap.deinit`.
 ///
-/// Sidecar storage avoids widening the (very hot) Thunk struct by
-/// 24 bytes per instance — multiplied across millions of live thunks
-/// on real workloads, an inline field translated into a 10–15 %
-/// regression even though only a handful of thunks ever errored.
+/// Sidecar storage keeps the error payload out of every thunk.
 pub const ErrorInfo = struct {
     err: anyerror,
     message: ?[]const u8,
@@ -190,9 +175,7 @@ pub const ForceOutcome = union(enum) {
     busy,
     /// Borrowed pointer into the heap-owned sidecar; valid for the
     /// lifetime of the heap. Kept as a pointer rather than an inline
-    /// `ErrorInfo` value so the union stays 24 bytes (Value-sized) —
-    /// `forceThunkImpl` is in the hot dispatch path and any growth
-    /// here measurably widens its stack frame.
+    /// `ErrorInfo` value so the union remains Value-sized.
     errored: *const ErrorInfo,
 };
 
@@ -203,7 +186,7 @@ pub const ForceOutcome = union(enum) {
 /// the thunk reaches a terminal state. The two are never live at the
 /// same instant — a thunk reads `target` to compute its value, then
 /// overwrites the same bytes with `result` at resolution — so they
-/// share storage, keeping the (millions-live, cache-bound) Thunk small.
+/// share storage, keeping each thunk compact.
 /// `future.state` is the discriminant. `demanded` (on this thunk)
 /// distinguishes a real observation from speculative pre-forcing so
 /// lazy renderers can keep speculation invisible.

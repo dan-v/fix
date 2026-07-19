@@ -39,14 +39,10 @@ pub fn report(
     }.f;
     const p = std.debug.print;
 
-    // `reservedSlots`, not `count`: with the collector the segmented stores'
-    // cursor starts past the (possibly never-armed) nursery gap, and
-    // `count()` would bill those phantom slots as used (~175 MB of
-    // pages that don't exist on a dormant-GC run).
     const obj_b = @as(u64, heap.objects.count()) * @sizeOf(heap_mod.Object);
-    const val_b = @as(u64, heap.values.reservedSlots()) * @sizeOf(Value);
-    const attr_b = @as(u64, heap.attrs.reservedSlots()) * @sizeOf(heap_mod.AttrEntry);
-    const apos_b = @as(u64, heap.attr_positions.reservedSlots()) * @sizeOf(heap_mod.AttrPosEntry);
+    const val_b = @as(u64, heap.values.count()) * @sizeOf(Value);
+    const attr_b = @as(u64, heap.attrs.count()) * @sizeOf(heap_mod.AttrEntry);
+    const apos_b = @as(u64, heap.attr_positions.count()) * @sizeOf(heap_mod.AttrPosEntry);
     const stores_b = obj_b + val_b + attr_b + apos_b;
 
     const is = intern.stats();
@@ -69,8 +65,8 @@ pub fn report(
 
     p("\n=== MEM REPORT — peak RSS attribution ===\n", .{});
     p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), heap.objects.count() });
-    p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), heap.values.reservedSlots() });
-    p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), heap.attrs.reservedSlots() });
+    p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), heap.values.count() });
+    p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), heap.attrs.count() });
     p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
     p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
     p("  interned strs:  {d:>8.1} MB  ({d} entries, {d:.1} MB data)\n", .{ mb(intern_b), is.entries, mb(is.data_bytes) });
@@ -118,12 +114,10 @@ pub fn report(
     if (std.mem.eql(u8, mode.?, "dump")) vma_mod.dumpRegions();
 
     // Decompose the "untracked" bucket above via /proc/self/smaps:
-    // split current RSS into file-backed (binary + shared libs), the
-    // main thread stack, brk heap, and anonymous. The anonymous total
-    // minus the registry-tracked big mappings is the real SmpAllocator
-    // small-slab + worker-thread-stack + misc-anon footprint — showing
-    // the previously-opaque line is ~entirely small-object slabs, not
-    // binary/stacks.
+    // split current RSS into file-backed mappings, the main stack, brk heap,
+    // and anonymous mappings. Subtracting registered large mappings from the
+    // anonymous total isolates small slabs, worker stacks, and miscellaneous
+    // anonymous allocations.
     smapsDecompose(tracked_total);
 }
 

@@ -12,7 +12,7 @@ const std = @import("std");
 const terminal_text = @import("base").terminal_text;
 const wire = @import("wire.zig");
 const build_events = @import("build_events.zig");
-const build_options = @import("build_options.zig");
+const settings = @import("settings.zig");
 
 pub const default_socket_path = "/nix/var/nix/daemon-socket/socket";
 
@@ -37,16 +37,16 @@ pub const BuildSink = build_events.Sink;
 /// Build realization mode sent with `build_paths` (Nix's `BuildMode`): the
 /// default build, `--repair` (rebuild and fix corrupted paths), or `--check`
 /// (rebuild and verify outputs are unchanged).
-pub const BuildMode = build_options.Mode;
+pub const BuildMode = settings.Mode;
 
 /// A `name = value` daemon setting carried in the `set_options` overrides map.
-pub const Setting = build_options.Setting;
+pub const Setting = settings.Setting;
 
 /// Per-connection daemon settings applied via `set_options` (op 19). Mirrors
 /// the client settings Nix sends after the handshake: the fixed fields plus a
 /// trailing overrides map for any other `nix.conf` key (e.g. `timeout`). The
 /// daemon applies the map after the fixed fields, so an override wins.
-pub const BuildSettings = build_options.Settings;
+pub const BuildSettings = settings.Settings;
 
 pub const MissingPlan = struct {
     allocator: std.mem.Allocator,

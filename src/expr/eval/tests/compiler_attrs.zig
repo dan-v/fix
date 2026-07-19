@@ -1,5 +1,5 @@
 const std = @import("std");
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 test "compiles a plain attribute set with two entries" {
     var ev = try Evaluator.init(std.testing.allocator, 0);

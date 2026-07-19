@@ -49,16 +49,9 @@ pub const Driver = struct {
     eval: *const fn (*VM, ChunkId) anyerror!Value,
 };
 
-/// Reusable VM buffers — the value stack + frame stack, the two large
-/// per-VM allocations (~0.5 MB together). Pooled by the evaluator:
-/// nested import VMs are created ~2.6K times per NixOS eval, and each
-/// used to bump-allocate a fresh stack out of the worker arena that was
-/// then "freed" into the void (arena free is a no-op) — ~245 MB of
-/// once-touched, never-reused pages at w=1. Reuse keeps the working set
-/// at the max-concurrent-VM high-water instead, and stops the re-fault
-/// churn. Buffers come back dirty; that's fine — every consumer is
-/// bounded by `sp`/`frames_len`, including the GC's stack scan
-/// (eval/gc_controller.zig marks `stack[0..sp]`).
+/// Reusable value and frame stacks. Pooling bounds storage by concurrent VMs.
+/// Buffers return dirty; consumers and GC scans are bounded by `sp` and
+/// `frames_len`.
 pub const BufferPool = struct {
     allocator: std.mem.Allocator,
     mu: SpinMutex = .{},
@@ -171,11 +164,41 @@ pub const BreakSink = struct {
 };
 
 /// Per-thread VM state. Each worker thread has one of these.
-/// Sentinel for `VM.spec_budget`: no bound on speculative work. (Never
+/// Sentinel for `VM.speculation.claim_budget`: no bound on speculative work. (Never
 /// reachable by decrement — 2^64 claimed forces don't happen.)
 pub const no_spec_budget: u64 = std.math.maxInt(u64);
 
 pub const VM = struct {
+    const DebugState = struct {
+        break_sink: ?BreakSink = null,
+        tryeval_depth: u32 = 0,
+        breakpoints: ?*bytecode_mod.BreakpointTable = null,
+        parent: ?*VM = null,
+        import_replay: bool = false,
+    };
+
+    const SpeculationState = struct {
+        /// Suppresses recursive speculative submission while a task runs.
+        active: bool = false,
+        /// A demand waiter promotes this fiber's descendants to urgent work.
+        demand_rescue: std.atomic.Value(u8) = .init(0),
+        /// Remaining claimed forces; `no_spec_budget` disables the bound.
+        claim_budget: u64 = no_spec_budget,
+        /// Remaining thunk creations, settled from the current worker counter.
+        create_left: u64 = no_spec_budget,
+        create_snapshot: u64 = 0,
+        create_worker: u8 = 0,
+    };
+
+    const GcRoots = struct {
+        /// Value currently crossing a safepoint off the operand stack.
+        extra: Value = Value.null_val,
+        /// Claimed thunks whose bodies are currently nested.
+        force_chain: std.ArrayListUnmanaged(types.ObjectId) = .empty,
+        /// Native-held containers and results that cross later safepoints.
+        temporary: std.ArrayListUnmanaged(Value) = .empty,
+    };
+
     driver: *const Driver,
     allocator: std.mem.Allocator,
     /// Global chunk registry (shared across all VMs). Mutable: the
@@ -193,26 +216,8 @@ pub const VM = struct {
     /// `Evaluator.initVm`; null in standalone test VMs, which fall back
     /// to compiling per call.
     regexes: ?*PatternCache = null,
-    /// Optional debugger attachment. Set post-init by `Evaluator.initVm` only
-    /// when a debugger is active; null (the default, in every normal run)
-    /// makes `builtins.break` a plain identity. See `BreakSink`.
-    break_sink: ?BreakSink = null,
-    /// Nesting depth of `builtins.tryEval` forces on this fiber. The debugger's
-    /// error-entry (throw/abort/assert) suppresses itself while `> 0`, so a
-    /// caught error doesn't spuriously pause. Only touched on the debug path.
-    tryeval_depth: u32 = 0,
-    /// Source-line breakpoint table (patched-byte → original). Set post-init by
-    /// `Evaluator.initVm` when a debugger is active; read only by the
-    /// `breakpoint` opcode handler, which is unreachable without a patch.
-    breakpoints: ?*bytecode_mod.BreakpointTable = null,
-    /// Synchronous import VMs form a debugger-only parent chain back to the
-    /// VM containing the `import` call. The parent outlives this nested VM;
-    /// normal execution never reads the link.
-    debug_parent: ?*VM = null,
-    /// Select the debugger's fresh import memo table. This is carried by the
-    /// VM rather than the Evaluator so older helper VMs can safely finish a
-    /// normal evaluation while a serial debugger replay begins.
-    debug_import_replay: bool = false,
+    /// Debugger attachment, breakpoint state, and synchronous import ancestry.
+    debug: DebugState = .{},
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.
@@ -278,115 +283,30 @@ pub const VM = struct {
     /// logical count.
     frames: []Frame,
     frames_len: u32,
-    /// Demand-carrier: when this VM is currently running speculative work
-    /// (a helper forcing a thunk on its own initiative), new thunks
-    /// created during that run should NOT submit themselves for further
-    /// speculation. That single rule bounds the cascade: a helper that
-    /// picks up a speculative task does at most one layer of work before
-    /// its descendants fall back to lazy. Set/cleared around speculative
-    /// entry points (see `vm/force.zig`). Deliberately NOT on `ctx`:
-    /// `forceValueSpeculative` flips it save/restore-style for a sub-scope
-    /// of one VM's execution, so it is per-VM mutable state, not
-    /// fiber-lifetime identity.
-    in_speculation: bool,
-
-    /// Demand priority inheritance (`FIX_RESCUE`): set on a SPECULATIVE
-    /// fiber's VM when a demand (or already-rescued) fiber blocks waiting on
-    /// a thunk THIS fiber is computing (see `Scheduler.promoteFiber`, driven
-    /// from the `.busy` wait in `forceThunkImpl`). While set, this fiber's
-    /// sub-forces route to the URGENT lane (so the awaited subtree spreads
-    /// across idle workers instead of competing with junk in the spec lane)
-    /// and it never `SpeculativeBail`s (a bail would strand the demand
-    /// waiter). Cleared at each task boundary (`slotEntry`). Written from a
-    /// peer thread, read here — hence atomic; advisory (a stale set only
-    /// over-prioritises one task).
-    demand_rescue: std.atomic.Value(u8) = .init(0),
-
     /// Single-worker mode (`Scheduler.worker_count == 1`, captured at VM
     /// construction — before any helper thread can exist). When set, the
     /// thunk force protocol takes the plain-load/store claim + publish
     /// variants (`Thunk.tryForceSolo`/`resolveSolo`) instead of the CAS +
-    /// waiter-mutex ones: with one OS thread, fibers interleave only at
-    /// yield points, so the atomic RMWs are pure tax (~1% of w=1 cycles).
-    /// One predictable branch on the claim path at w>1.
+    /// waiter-mutex variants: with one OS thread, fibers interleave only at
+    /// yield points and do not need atomic ownership changes.
     solo: bool,
 
-    /// Bounded speculation (`FIX_SIBLING`): remaining claimed-force budget
-    /// for the current speculative task. `no_spec_budget` (the default)
-    /// disables the bound; a sibling-sweep task arms it per member force
-    /// so a wrongly-predicted member cascading into a huge evaluation
-    /// (`warnings`, `vmVariant`, ...) is abandoned via
-    /// `error.SpeculativeBail` after at most this many claimed forces —
-    /// while its already-resolved sub-thunks stay resolved (a later real
-    /// demand reuses them). Decremented only on the speculative path (see
-    /// `forceThunkImpl`'s claimed arm); zero cost on the demand path.
-    /// Fiber-local by construction (lives on the VM, travels with the
-    /// fiber across yields/steals).
-    spec_budget: u64,
-
-    /// Bounded speculation, creation side (`FIX_SIBLING` / band budget):
-    /// REMAINING thunk-creation budget for the
-    /// current speculative task. The claimed-force budget above cannot
-    /// bound creation-heavy builtins (one claimed force through
-    /// zipAttrsWith/mapAttrs can materialize 100Ks of thunks); this
-    /// catches those on the next speculative force. `no_spec_budget`
-    /// disables. Fiber-accurate accounting: creations are metered as
-    /// deltas of the per-worker `HeapLocal.thunks_created` counter,
-    /// settled lazily at each budget check (`force.specCreateExhausted`)
-    /// and RE-BASED on every fiber resume (`Worker.runFiber`), so
-    /// unrelated fibers interleaving on the same worker — or a migration
-    /// to another worker — never burn this task's budget. (The previous
-    /// absolute-limit scheme charged the task for every creation on its
-    /// worker while it was parked, and treated migration as instant
-    /// exhaustion: with budgets armed on all spec tasks that mass
-    /// false-bailed useful speculation, measured +15-20% w=8 wall
-    /// regardless of budget size.) Creations between the task's last
-    /// check and a yield are dropped by the resume re-base — a small,
-    /// benign undercount (checks run at every `forceValueImpl`).
-    spec_create_left: u64,
-    /// `HeapLocal.thunks_created` value on `spec_create_worker` at the
-    /// last settle/re-base. Only meaningful while `spec_create_left !=
-    /// no_spec_budget`.
-    spec_create_snapshot: u64,
-    /// Worker the creation snapshot was taken on. If a check runs on a
-    /// different worker before the resume re-base has happened
-    /// (defensive; runFiber re-bases first in practice), the check
-    /// re-bases instead of bailing.
-    spec_create_worker: u8,
+    /// Fiber-local mode, priority inheritance, and work budgets.
+    speculation: SpeculationState = .{},
 
     /// True only when the result will be rendered as lazy XML, where
     /// eagerly-built shapes (list/attrset/lambda) must appear unevaluated
     /// (`<unevaluated />`) until demanded. The compiler emits
     /// `thunk_shell` to wrap such values; when this is false (the
-    /// common default/JSON/`.drv`/strict path) the wrap is pure overhead
-    /// — millions of throwaway thunks — so the op pushes the value
+    /// common default/JSON/`.drv`/strict path) the op pushes the value
     /// directly. Set per-eval from `Evaluator.lazy_shells_visible`.
     lazy_shells_visible: bool,
 
-    /// The same compatibility policy used to parse and compile this code.
+    /// Compatibility policy applied while parsing and compiling this code.
     policy: LanguagePolicy,
 
-    /// GC: the value currently being forced, rooted across a
-    /// safepoint collection because it may be off the VM stack. `null_val`
-    /// outside a collection.
-    gc_extra_root: Value = Value.null_val,
-
-    /// GC: the chain of thunks currently being forced on this
-    /// fiber (A forces B forces C …). Each is claimed/`.evaluating` and off
-    /// the operand stack while its body runs, so without this a collection
-    /// triggered by a nested force would sweep the outer in-flight thunks
-    /// (and their target closures). Marked as roots.
-    gc_force_chain: std.ArrayListUnmanaged(types.ObjectId) = .empty,
-
-    /// GC: heap containers a native builtin holds as a raw store
-    /// slice across a force (e.g. `heap.getList(id)` after the list `Value`
-    /// goes dead). The conservative running-fiber scan sees `Value`-shaped
-    /// locals but cannot recover an object from a raw interior pointer, so an
-    /// iterating builtin pushes the container here for its loop's duration —
-    /// keeping it, and thus its not-yet-visited elements, alive across a
-    /// collection triggered mid-loop. Marked as roots; scoped via
-    /// `force.gcRootsMark`/`gcRootsRestore`.
-    gc_temp_roots: std.ArrayListUnmanaged(Value) = .empty,
+    /// Values held off the VM stack across GC safepoints.
+    gc_roots: GcRoots = .{},
 
     pub const Init = struct {
         driver: *const Driver,
@@ -432,8 +352,10 @@ pub const VM = struct {
             .deferred_table = options.deferred_table,
             .registration_sink = options.registration_sink,
             .regexes = options.regexes,
-            .break_sink = options.break_sink,
-            .breakpoints = options.breakpoints,
+            .debug = .{
+                .break_sink = options.break_sink,
+                .breakpoints = options.breakpoints,
+            },
             .intern = options.intern,
             .heap = options.heap,
             .files = options.files,
@@ -458,12 +380,7 @@ pub const VM = struct {
             .sp_high_water = 0,
             .frames = frames,
             .frames_len = 0,
-            .in_speculation = false,
             .solo = options.scheduler.worker_count == 1,
-            .spec_budget = no_spec_budget,
-            .spec_create_left = no_spec_budget,
-            .spec_create_snapshot = 0,
-            .spec_create_worker = 0,
             .lazy_shells_visible = options.lazy_shells_visible,
             .policy = options.policy,
         };
@@ -472,7 +389,7 @@ pub const VM = struct {
     /// The OS-thread-current worker id. Reads the threadlocal set by
     /// `Worker.run` / `Worker.runTopLevel`. Use this anywhere code
     /// needs to know "who is executing right now" — not a stored field
-    /// because fibers migrate across workers (F1.4).
+    /// because fibers migrate across workers.
     pub inline fn workerId(self: *const VM) u8 {
         _ = self;
         return worker_id_mod.current;
@@ -482,8 +399,8 @@ pub const VM = struct {
     /// by patched debugger traps, so normal dispatch does not pay for it.
     pub fn debugFrameDepth(self: *const VM) u32 {
         var total = self.frames_len;
-        var cursor = self.debug_parent;
-        while (cursor) |parent| : (cursor = parent.debug_parent) total += parent.frames_len;
+        var cursor = self.debug.parent;
+        while (cursor) |parent| : (cursor = parent.debug.parent) total += parent.frames_len;
         return total;
     }
 
@@ -492,15 +409,15 @@ pub const VM = struct {
     /// VM retains there. The lists are logically empty between tasks
     /// (roots/chains are scoped to a force); only their capacity lives on.
     pub fn onScratchReset(self: *VM) void {
-        std.debug.assert(self.gc_force_chain.items.len == 0);
-        std.debug.assert(self.gc_temp_roots.items.len == 0);
-        self.gc_force_chain = .empty;
-        self.gc_temp_roots = .empty;
+        std.debug.assert(self.gc_roots.force_chain.items.len == 0);
+        std.debug.assert(self.gc_roots.temporary.items.len == 0);
+        self.gc_roots.force_chain = .empty;
+        self.gc_roots.temporary = .empty;
     }
 
     pub fn deinit(self: *VM) void {
-        self.gc_force_chain.deinit(self.allocator);
-        self.gc_temp_roots.deinit(self.allocator);
+        self.gc_roots.force_chain.deinit(self.allocator);
+        self.gc_roots.temporary.deinit(self.allocator);
         if (self.buffer_pool) |bp| {
             bp.release(.{ .stack = self.stack, .frames = self.frames });
         } else {

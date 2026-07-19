@@ -11,7 +11,7 @@
 const std = @import("std");
 const testing = std.testing;
 
-const eval_mod = @import("../../eval.zig");
+const eval_mod = @import("../../evaluator.zig");
 const Evaluator = eval_mod.Evaluator;
 const vm_mod = @import("../../vm.zig");
 const VM = vm_mod.VM;
@@ -60,10 +60,10 @@ const Harness = struct {
             .registry = &ev.registry,
             .intern = &ev.intern,
             .heap = &ev.heap,
-            .files = &ev.files,
-            .fetchers = &ev.fetchers,
+            .files = &ev.sources.files,
+            .fetchers = &ev.sources.fetchers,
             .realization = &ev.store.realization,
-            .scheduler = &ev.scheduler,
+            .scheduler = &ev.execution.scheduler,
             .builtins_value = ev.builtins_value.?,
         });
         return .{ .ev = ev, .scratch = scratch, .vm = vm };

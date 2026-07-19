@@ -1,7 +1,7 @@
 //! DaemonRuntime: owns the background daemon-facing infrastructure `fix` uses to
 //! keep blocking nix-daemon store ops off the compute-fiber workers.
 //!
-//! The **pool** (`store/pool.zig`) is a set of hot daemon connections, each on
+//! The **pool** (`store/daemon/pool.zig`) is a set of hot daemon connections, each on
 //! its own background IO thread, draining a shared job queue. Every store op —
 //! `.drv`/source writes, `isValidPath` queries, builds, GC roots — is submitted
 //! to the pool while the calling fiber parks; a daemon worker runs it
@@ -15,7 +15,7 @@
 //! store demand. Ordering belongs to the realization layer's closure walk.
 
 const std = @import("std");
-const rstore = @import("daemon.zig");
+const rstore = @import("../daemon.zig");
 const sync = @import("base").sync;
 
 const DaemonPool = rstore.DaemonPool;

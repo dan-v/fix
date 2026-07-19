@@ -247,12 +247,8 @@ fn directlyAppliedStrictLambda(self: *Compiler, func_raw: *const Node) !bool {
 pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     // Uncurry: collect the maximal chain of adjacent *value* lambdas
     // `a: b: ...: body` into ONE chunk with N params (each a frame local)
-    // and `arity = N`. The historical compilation nested each as its own
-    // closure, so every extra param cost a throwaway intermediate closure
-    // alloc + frame at every application. Merging makes nested lambdas
-    // that reference an outer param capture it as a *local* (not an
-    // upvalue) — that's the alloc we drop. A call site supplying N args
-    // (`call_n`) then runs the body in one frame. Stops at the first
+    // and `arity = N`. Nested lambdas reference outer parameters as locals,
+    // and a `call_n` site supplying N args runs the body in one frame. Stop at the first
     // non-value-lambda (attrset-pattern lambda or non-lambda body), at the
     // `max_uncurry_arity` cap, or at a repeated param name (so we never
     // rely on within-frame shadow ordering of identically-named locals).

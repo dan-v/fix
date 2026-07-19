@@ -1,5 +1,5 @@
 const std = @import("std");
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 test "has-attr path within the segment-count limit compiles and evaluates" {
     var ev = try Evaluator.init(std.testing.allocator, 0);

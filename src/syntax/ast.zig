@@ -247,18 +247,8 @@ pub const Node = struct {
 
 /// Arena allocator wrapper for building ASTs. All nodes and their children
 /// live here and are freed together at `deinit`.
-///
-/// Note (perf): node building is ~40-55% of parse time, evenly split between
-/// `createNode` (allocate + write the ~64-byte `Node`; ~24% of full parse) and
-/// the semantic actions' slice allocations + dispatch (~30%). Measured neutral:
-/// a custom inline bump allocator, skipping span computation, and inlining
-/// `createNode` — so the cost is the writes/allocs themselves, not overhead.
-/// The remaining lever is a *smaller* `Node` (box the rare large union
-/// variants; drop the optional on `span`), which is an AST-wide change touching
-/// the compiler and evaluator — a deliberate, separate decision.
 pub const AstArena = struct {
-    // Plain (non-atomic) arena: a parse runs on one fiber, so the std arena's
-    // per-alloc atomics are pure tax here — see src/base/arena.zig.
+    // A parse is single-owner for the arena's lifetime.
     inner: @import("base").arena.ArenaAllocator,
 
     pub fn init(parent_allocator: std.mem.Allocator) AstArena {

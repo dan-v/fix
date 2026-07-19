@@ -1,5 +1,4 @@
-//! `fix eval` — evaluate a Nix expression, file, or flake output and print the
-//! value. This is the former default (no-subcommand) path, now a real command.
+//! `fix eval` — evaluate a Nix expression, file, or flake output and print it.
 
 const std = @import("std");
 const engine = @import("expr");

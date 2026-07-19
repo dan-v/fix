@@ -29,18 +29,14 @@ inline fn seqCstFence() void {
 /// payload `T` and `growable`.
 ///
 /// Both the fixed `Deque(T)` and the growable `GrowableDeque(T)` are thin
-/// public aliases over this private implementation — the entire owner-only
-/// push/pop (LIFO) / multi-consumer FIFO steal protocol (the `top`/`bottom`
-/// counters, the `mfence`s, the seq_cst last-element CAS races) is written
-/// here EXACTLY ONCE. The two flavors differ in exactly one respect: what
+/// public aliases over this private implementation. The two flavors differ in
+/// exactly one respect: what
 /// happens when `push` finds the deque full.
 ///
 ///   - `growable == false` (`Deque(T)`): fixed power-of-two capacity backed
 ///     by a plain `items: []T` slice + `mask`. Full push returns `false` and
 ///     the caller drops the item (speculation is best-effort). This is the
-///     scheduler's `TaskQueue` — `Deque(Task)` must compile to the same
-///     thing it does today, since `growable = false` makes every
-///     growable-only branch below comptime-dead. The scheduler also reaches
+///     scheduler's `TaskQueue`; growable-only branches are comptime-dead. The scheduler also reaches
 ///     into `items`/`mask`/`top`/`bottom` directly (see
 ///     `taskQueueGcMark`), so those fields keep their names and plain types
 ///     for the fixed instantiation.
@@ -55,8 +51,7 @@ inline fn seqCstFence() void {
 ///     epoch/hazard-pointer scheme is needed). See `steal` below for the
 ///     grow-during-steal safety argument.
 ///
-/// Memory ordering (identical for both flavors, and load-bearing — extracted
-/// verbatim from the scheduler's original TaskQueue):
+/// Memory ordering (identical for both flavors and load-bearing):
 ///   - `bottom` writes use release; reads in stealers use acquire.
 ///   - `top` writes use seq_cst (CAS) so the owner's `pop` race for the last
 ///     element synchronizes with concurrent steals.
@@ -107,19 +102,9 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
         /// runs concurrently with itself).
         retired: if (growable) std.ArrayListUnmanaged(*Buffer) else void = if (growable) .empty else {},
 
-        /// Owner-only writes (push/pop). Stealers read with acquire.
-        ///
-        /// `bottom` and `top` each own a full destructive-interference
-        /// block (`Isolated`). Un-isolated they sat 8 bytes apart: every
-        /// stealer's CAS on `top` (or even its failed empty-probe load)
-        /// invalidated the owner's line under `bottom`, and with 40B
-        /// deques packed contiguously, ADJACENT WORKERS' deques also
-        /// shared lines. Idle workers rescan every peer's deque
-        /// top+bottom per drain step, so at w=16 these probes were the
-        /// top source of cross-CCX cache fills (24% of
-        /// ls_dmnd_fills_from_sys.ext_cache_local landed in drainStep).
-        /// The buffer fields (`items`/`mask`/`array`) stay on their own
-        /// read-mostly block, shared harmlessly in S-state.
+        /// Owner-only writes (push/pop); stealers read with acquire. Isolating
+        /// both counters prevents stealer writes to `top` from invalidating
+        /// the owner's `bottom` cache line or an adjacent worker's deque.
         bottom: Isolated(u64),
         /// CAS by stealers (and the owner's last-element pop).
         top: Isolated(u64),

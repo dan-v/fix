@@ -123,11 +123,7 @@ pub const InternTable = struct {
             .shards = [_]Shard{.{}} ** shard_count,
             .token = next_table_token.fetchAdd(1, .monotonic),
         };
-        // Pre-size each shard's lookup map. A grow rehashes every stored id
-        // through `IdContext.hash` — a full Wyhash over the string bytes per
-        // key — so letting 64 shards grow from empty while a nixpkgs eval
-        // interns hundreds of thousands of strings burns >1% of wall on
-        // rehashing alone. ~3 MB total up front; over-full shards still grow.
+        // Pre-size each shard because growth rehashes every string key.
         const ctx = IdContext{ .table = &table };
         for (&table.shards) |*s| {
             s.lookup.ensureTotalCapacityContext(allocator, 8192, ctx) catch {};

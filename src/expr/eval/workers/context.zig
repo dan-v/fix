@@ -2,10 +2,8 @@
 //!
 //! Every `WorkerFiber` owns one `ExecutionContext`; its VM — and every
 //! nested VM created while running on that fiber (imports, render/force
-//! bodies) — reads identity through `VM.ctx`, a pointer to it. That makes
-//! identity structural: nested VMs *cannot* diverge from their fiber (the
-//! historical failure mode was a nested VM whose creation site forgot to
-//! copy execution identity).
+//! bodies) — reads identity through `VM.ctx`, so nested VMs share their fiber's
+//! identity structurally.
 //!
 //! Lifetime and ownership:
 //!   - The record lives exactly as long as its fiber (stable memory — it is

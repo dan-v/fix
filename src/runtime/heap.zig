@@ -59,9 +59,8 @@ pub const AttrPosEntry = struct {
     pos: SourcePos,
 };
 
-/// Per-heap collector diagnostics. These counters used to be process globals,
-/// which made independently configured Evaluators overwrite one another's
-/// policy and reports. Atomics keep worker/coordinator updates data-race-free.
+/// Per-heap collector diagnostics. Atomics keep worker and coordinator updates
+/// data-race-free.
 pub const GcReportState = struct {
     collections: std.atomic.Value(u64) = .init(0),
     objects_freed_total: std.atomic.Value(u64) = .init(0),
@@ -84,20 +83,13 @@ pub const GcReportState = struct {
 /// flat ObjectId (never via an externally-handed-out `Range`/`slice`,
 /// unlike the value/attr stores), so `get(id)` collapses to one load —
 /// `base[id]` — with no segment decode (`clz` + shifts) and no per-access
-/// atomic segment-pointer load. On the NixOS toplevel this access happens
-/// tens of millions of times. `object_max_slots` is a virtual reservation
-/// (MAP_NORESERVE), so the headroom over the ~6M objects a real eval
-/// produces costs no physical memory.
+/// atomic segment-pointer load. `object_max_slots` is a sparse virtual
+/// reservation (`MAP_NORESERVE`), so unused slots consume no physical memory.
 pub const object_max_slots: u32 = 1 << 30;
 const mem_tag = @import("mem_tag.zig");
 const ObjectStore = segments.FlatStore(Object, .{ .max_slots = object_max_slots, .vma_tag = .objects }, mem_tag.vma);
-// `huge_overlay_min`: the ≥64 MB doubling-tail segments get a NORESERVE
-// mapping + chunk-grown hugetlb prefix instead of a fully-mapped hugetlb
-// block — an up-front map bills the whole (mostly empty at peak) tail
-// segment against the pool: ~340 MB of mapped-never-faulted slack across
-// the three stores on a NixOS toplevel. All three stores move their
-// cursors under `write_mu` only (no `appendAtomic`), which the overlay
-// requires. 64 MB keeps the (GC) nursery segments allocator-backed.
+// Large tail segments use sparse mappings with a chunk-grown hugetlb prefix.
+// Their cursors advance only under `write_mu`, as the overlay requires.
 const ValueStore = segments.StableSegments(Value, .{ .first_segment_size = 1024, .vma_tag = .values, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 const AttrStore = segments.StableSegments(AttrEntry, .{ .first_segment_size = 512, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 const AttrPosStore = segments.StableSegments(AttrPosEntry, .{ .first_segment_size = 512, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
@@ -162,14 +154,8 @@ const ContextStringObject = struct {
     context: AttrRange,
 };
 
-/// An attrset slot: the sorted attr entries plus optional source
-/// positions for `unsafeGetAttrPos` / error messages. Positions used to
-/// live in a separate `meta` field on every heap object; folding them
-/// into the attrs variant (which is far smaller than the thunk variant
-/// that sizes the union) let the per-object `meta` field be removed
-/// entirely — a ~20% shrink across all heap objects, the vast majority
-/// of which carry no positions. `positions.len == 0` means "no
-/// positions"; it is never sliced.
+/// Sorted attr entries plus optional source positions for diagnostics.
+/// `positions.len == 0` means no positions and is never sliced.
 pub const AttrsObject = struct {
     range: AttrRange,
     positions: AttrPosRange = empty_attr_positions,
@@ -183,11 +169,8 @@ pub const AttrsObject = struct {
 
 /// A lazy, layered `//` (update) result: `base // overlay`, both attrset
 /// objects (either may itself be a `attrs_merge`, forming a chain). The
-/// NixOS module/overlay fixpoints build a massive attrset by `//`-ing an
-/// accumulator thousands of times; materializing each step copies the
-/// whole accumulator (O(N) per merge → O(N·K) total, and ~18M of the
-/// 19.4M attr-store entries are these throwaway copies). Layering makes a
-/// large `//` O(1): just record `base`+`overlay`. `//` is *shallow*
+/// Module and overlay fixpoints build large attrsets through repeated `//`.
+/// Layering records a large update in O(1). `//` is shallow and
 /// right-biased, so lookup checks `overlay` then `base`; the (obj,name)
 /// inline cache absorbs repeated lookups. The chain is flattened (one
 /// real merge) once `depth` exceeds `merge_flatten_depth`, bounding both
@@ -292,16 +275,6 @@ const value_chunk_size: u32 = 1024;
 const attr_chunk_size: u32 = 512;
 const attr_position_chunk_size: u32 = 256;
 
-// Copying nursery: the low `NURSERY_SEGS_*` segments of each range
-// store are the resettable young generation; the rest is tenured. Capacity =
-// first_segment_size * (2^N - 1) slots. With first_segment_size {values 1024,
-// attrs 512, attr_pos 512} and N below the nursery is ~16 MB for values and
-// ~16 MB for attrs — a minor fires when whichever store's nursery fills. A
-// young range is one whose `segment < nursery_segs` (no tag bit needed).
-const nursery_value_segments: u32 = 13;
-const nursery_attr_segments: u32 = 13;
-const nursery_attr_position_segments: u32 = 13;
-
 const LocalSlice = struct { segment: u32, offset: u32, len: u32 };
 
 const LocalChunk = struct {
@@ -334,30 +307,22 @@ pub const HeapLocal = struct {
     /// this worker thread is doing SPECULATIVE work (any
     /// `forceValueSpeculative`, including nested import VMs it spawns),
     /// false on the demand chain. Maintained by `Worker.runFiber` (from
-    /// the resumed fiber's `vm.in_speculation`) and toggled by
+    /// the resumed fiber's `vm.speculation.active`) and toggled by
     /// `forceValueSpeculative` itself. Single-writer (the owning thread);
     /// read at thunk creation to tag demand-created thunks for the
     /// `-Dprof-main` creation-context probe.
     spec_ctx: bool = false,
-    // GC per-worker free lists: reclaim reuse. The sweep (STW, single
-    // collector) distributes freed slots/ranges round-robin across every
-    // worker's shard; each worker's allocation hot path pops from its OWN shard,
-    // and WORK-STEALS from a peer's shard when its own runs dry — so a
-    // demand-concentrated workload (repl, or an uneven parallel eval) reuses the
-    // whole free pool instead of stranding most of it. `gc_free_mu` guards this
-    // worker's four free lists; a stealer locks the victim's. Only engaged while
-    // collection is armed (`gc_collect_enabled`) — zero cost otherwise. STW
-    // writers (sweep/evac) don't lock: the world is stopped, no eval allocates.
+    // Per-worker reclamation lists. A sweep returns ranges to its worker's
+    // shard; allocation pops locally and may steal from a peer. `gc_free_mu`
+    // guards steals, while stop-the-world sweep writers need no lock.
     gc_free_mu: sync.SpinMutex = .{},
     gc_free_objects: std.ArrayListUnmanaged(ObjectId) = .empty,
     gc_free_values: RangeFreeList = .{},
     gc_free_attrs: RangeFreeList = .{},
     gc_free_attr_pos: RangeFreeList = .{},
-    /// Copying-nursery remembered set: `source` object ids (already old) that
-    /// were written a pointer to a young object since the last minor. Per-worker
-    /// and single-owner, so the write barrier (`gcRecordEdge`) appends without a
-    /// lock. Drained (STW) at the next minor to seed the young referents that
-    /// only an old object keeps alive; cleared after.
+    /// Old objects that gained a young reference since the last minor. The
+    /// worker-owned write barrier appends without locking; the next stop-the-
+    /// world mark drains and clears the list.
     gc_remset: std.ArrayListUnmanaged(ObjectId) = .empty,
     /// This worker's young objects since the last minor (every id from
     /// `reserveObjectSlot`, including reused slots). The STW minor iterates
@@ -416,6 +381,32 @@ const RangeFreeList = struct {
     }
 };
 
+pub const HeapCollectionState = struct {
+    hook: ?GcHook = null,
+    collect_requested: bool = false,
+    threshold_bytes: u64 = std.math.maxInt(u64),
+    step_bytes: u64 = 0,
+    budget_bytes: u64 = 0,
+    disable_reuse: bool = false,
+    report: GcReportState = .{},
+    promoted_since_major: u64 = 0,
+    major_gate: u64,
+    collect_enabled: bool = false,
+    track_from: ObjectId = 0,
+    bootstrap_end: ObjectId = 0,
+    root_always: bool = false,
+    root_active: bool = false,
+    alloc_bits: []u64 = &.{},
+    old_bits: []u64 = &.{},
+    minor_sweep_open: std.atomic.Value(bool) = .init(false),
+    minor_sweep_next: std.atomic.Value(u32) = .init(0),
+    minor_sweep_done: std.atomic.Value(u32) = .init(0),
+    minor_sweep_count: u32 = 0,
+    mark_slot: std.atomic.Value(u32) = .init(0),
+    minor_sweep_promoted: std.atomic.Value(u64) = .init(0),
+    minor_sweep_freed: std.atomic.Value(u64) = .init(0),
+};
+
 pub const ObjectHeap = struct {
     allocator: std.mem.Allocator,
     objects: ObjectStore,
@@ -427,9 +418,7 @@ pub const ObjectHeap = struct {
     worker_locals: []HeapLocal,
     /// All `ErrorInfo` allocations produced by `Thunk.errored`, recorded
     /// at publish time so `deinit` can release them in O(errored_thunks)
-    /// rather than walking every object slot. Almost always tiny — a
-    /// realistic NixOS toplevel produces ~hundreds of entries against a
-    /// heap of millions of objects.
+    /// rather than walking every object slot.
     errored_infos: std.ArrayListUnmanaged(*ErrorInfo),
     errored_infos_mu: sync.SpinMutex,
     /// Unique-per-init id for cache invalidation. Same trick as the
@@ -437,156 +426,32 @@ pub const ObjectHeap = struct {
     /// allocator can reuse heap addresses, so a stale slot would match
     /// pointer equality even though it refers to a freed heap.
     token: u64,
-    /// Evaluator callback used to enumerate roots and drive collection.
-    gc_hook: ?GcHook = null,
-    /// Set by the allocation path when total reserved bytes cross
-    /// `gc_threshold_bytes`; consumed at the next safepoint poll.
-    gc_collect_requested: bool = false,
-    gc_threshold_bytes: u64 = std.math.maxInt(u64),
-    /// Per-heap collection policy. Kept beside the threshold because later
-    /// re-arming reads it; sharing these values across heaps lets one Evaluator
-    /// silently change another's collection cadence.
-    gc_step_bytes: u64 = 0,
-    gc_budget_bytes: u64 = 0,
-    gc_disable_reuse: bool = false,
-    gc_report: GcReportState = .{},
-    /// Major-collection policy: minors only reclaim young survivors and tenure
-    /// the rest, so tenured garbage accumulates in the old generation. Count the
-    /// objects promoted (tenured) since the last major; once it crosses
-    /// `gc_major_gate` (roughly "the old gen has grown by a live-set's worth"),
-    /// the next in-eval collection runs a MAJOR (full mark/sweep) instead of a
-    /// minor. Reset after each major.
-    gc_promoted_since_major: u64 = 0,
-    gc_major_gate: u64 = gc_major_gate_floor,
-    /// GC reclaim state. Inert until `gc_collect_enabled` is set. Before lazy
-    /// arming, the allocator hot path remains bump-only.
-    gc_collect_enabled: bool = false,
-    /// First ObjectId tracked by the alloc-bitmap (set at gcEnableCollect).
-    /// Objects created before collection was enabled aren't tracked/swept,
-    /// so the detector's assert skips them.
-    gc_track_from: ObjectId = 0,
-    /// CONSTRAINED-MODE pre-arming reclaim boundary: the first ObjectId a major
-    /// may sweep. Below it is true bootstrap (interns/builtins/chunk constants),
-    /// pinned forever. On a tight machine (`gc_root_always`) a major also
-    /// reclaims `[gc_bootstrap_end, gc_track_from)` — the ~line/2 pinned floor
-    /// drops toward bootstrap size. Captured at gcEnableBudget/gcEnableCollect.
-    /// When `gc_root_always` is false this is unused: the sweep floor stays at
-    /// `gc_track_from` (today's behavior, pre-arming pinned).
-    gc_bootstrap_end: ObjectId = 0,
-    /// Constrained mode: reclaim the pre-arming region AND (the price) keep the
-    /// force-chain + temp-root gates live even while collection is DORMANT, so
-    /// an in-flight thunk / builtin temp value that predates arming is still
-    /// rooted when the pre-arming major sweeps it. Off on roomy machines (they
-    /// never arm ⇒ pinning is free and the reclaim is moot). Set once at
-    /// gcEnableBudget from the collection policy (`gc_controller.constrainedMode`).
-    gc_root_always: bool = false,
-    /// Hot-path rooting gate for the transient-root appends (force chain,
-    /// rootKeep): `gc_root_always OR armed`. Read in place of
-    /// `gc_collect_enabled` by those two appends only. When NOT constrained it
-    /// is false until arming and true after — byte-identical to gating on
-    /// `gc_collect_enabled` (zero added cost). When constrained it is true from
-    /// eval start so pre-arming transients are rooted before the first major.
-    gc_root_active: bool = false,
-    /// One bit per ObjectId: set when a slot is *filled* (a real object),
-    /// cleared when swept. Lets `sweep` tell live objects from TLAB-
-    /// reserved-but-unfilled slots and already-freed slots.
-    gc_alloc_bits: []u64 = &.{},
-    /// Copying-nursery generation bitmap: one bit per ObjectId, set ⇒ **old**
-    /// (tenured). Clear (or beyond the array) ⇒ **young**. Written ONLY at a
-    /// stop-the-world minor (promote sets it; a future major clears it on
-    /// free), so there is NO allocation-path barrier — a freshly bumped slot is
-    /// young by default. Grown (zeroed) at each minor to cover the object count.
-    gc_old_bits: []u64 = &.{},
-    /// Parallel non-moving SWEEP coordination (`--workers>1`; the `gc_evac_*`
-    /// names are historical — the minor no longer evacuates). The young-object
-    /// lists (`worker_locals[*].gc_young_slots`) form a work queue: each helping
-    /// worker atomically claims a list index via `gc_evac_next` and sweeps it
-    /// (promote marked survivors in place; free dead ranges to ITS OWN free-list
-    /// shard), then bumps `gc_evac_done`. The collector opens the phase via
-    /// `gc_evac_open` (after verifying mark closure) and waits until
-    /// `gc_evac_done == gc_evac_count`.
-    gc_evac_open: std.atomic.Value(bool) = .init(false),
-    gc_evac_next: std.atomic.Value(u32) = .init(0),
-    gc_evac_done: std.atomic.Value(u32) = .init(0),
-    gc_evac_count: u32 = 0,
-    /// Dynamic marker-slot dispenser. The parallel collection is CAPPED at
-    /// `min(worker_count, GC_PAR_CAP)` participants because the mark+evac is
-    /// contention-bound: it bottoms out around 8 workers and gets *worse* past
-    /// that (shared mark bitmap + old-bits + TLAB-refill cache-line bouncing).
-    /// Each helping worker grabs the next slot; a worker whose slot is beyond
-    /// the cap parks idle rather than piling on. Reset per collection.
-    gc_mark_slot: std.atomic.Value(u32) = .init(0),
-    /// True while a MAJOR is marking: parked peers that help the parallel mark
-    /// (`helpMark`) then skip `evacClaimLoop` — a major sweeps the whole heap
-    /// serially rather than evacuating the young lists. Published before
-    /// `gcOpenMark` (release) and read after it (acquire), so peers see it; kept
-    /// set until after the sweep, long past any peer's evac-phase check.
-    gc_collecting_major: bool = false,
-    gc_evac_promoted: std.atomic.Value(u64) = .init(0),
-    gc_evac_freed: std.atomic.Value(u64) = .init(0),
-    /// Parallel MAJOR sweep coordination (`--workers>1`). The full sweep walks
-    /// the whole id range `[0, count)`, so it's partitioned into word-aligned
-    /// chunks the mark participants claim (`gc_sweep_next`) and sweep into their
-    /// OWN free-list shard (word-disjoint ⇒ no alloc-bit races). `gc_sweep_open`
-    /// gates the phase (the collector reconstructs the alloc bitmap serially
-    /// first); `gc_sweep_done` counts finishers against `gc_sweep_count`.
-    gc_sweep_next: std.atomic.Value(u32) = .init(0),
-    gc_sweep_done: std.atomic.Value(u32) = .init(0),
-    gc_sweep_freed: std.atomic.Value(u64) = .init(0),
-    gc_sweep_open: std.atomic.Value(bool) = .init(false),
-    gc_sweep_count: u32 = 0,
-    // Free lists are PER-WORKER (`HeapLocal.gc_free_*`) so the allocation hot
-    // path reuses without a lock — a single shared free list + mutex
-    // serialized all allocation across workers and was the entire w>1 wall
-    // cost (measured: 3.8x). The sweep (STW, single collector) distributes
-    // freed memory round-robin across the per-worker shards.
-
-    /// Nursery size (segments) for a range store. Scales with worker count:
-    /// each STW minor stalls ALL workers, so at higher parallelism we amortize
-    /// over a bigger nursery (fewer collections). `+1 segment` ≈ doubles the
-    /// capacity; capped so it doesn't overshoot to zero collections.
-    fn gcNurserySegs(base: u32, worker_count: u8) u32 {
-        _ = worker_count;
-        // Worker-count scaling was measured net-negative with the current
-        // SERIAL O(total-objects) minor: a bigger nursery cuts collections but
-        // raises RSS and each collection still does O(count) reconstruct+walk,
-        // so wall barely moves. Making w>1 fast needs parallel + O(young)
-        // minors first (then revisit scaling). For now: fixed base.
-        return base;
-    }
+    /// Collection policy, barriers, bitmaps, and parallel minor-sweep state.
+    collection: HeapCollectionState,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
         var objects = try ObjectStore.init();
         errdefer objects.deinit(allocator);
         const locals = try allocator.alloc(HeapLocal, @max(worker_count, 1));
         for (locals) |*l| l.* = .{};
-        var values: ValueStore = .empty;
-        var attrs: AttrStore = .empty;
-        var attr_positions: AttrPosStore = .empty;
-        // Partition each range store into a young nursery (low segments) +
-        // tenured region. Done here, before any allocation, so pre-collect
-        // bootstrap (builtins) tenures directly and post-collect allocations
-        // bump the nursery.
-        values.enableNursery(gcNurserySegs(nursery_value_segments, worker_count));
-        attrs.enableNursery(gcNurserySegs(nursery_attr_segments, worker_count));
-        attr_positions.enableNursery(gcNurserySegs(nursery_attr_position_segments, worker_count));
         return .{
             .allocator = allocator,
             .objects = objects,
-            .values = values,
-            .attrs = attrs,
-            .attr_positions = attr_positions,
+            .values = .empty,
+            .attrs = .empty,
+            .attr_positions = .empty,
             .worker_locals = locals,
             .errored_infos = .empty,
             .errored_infos_mu = .{},
             .token = next_heap_token.fetchAdd(1, .monotonic),
+            .collection = .{ .major_gate = gc_major_gate_floor },
         };
     }
 
     pub fn deinit(self: *ObjectHeap) void {
         self.freeErroredInfos();
-        self.allocator.free(self.gc_alloc_bits);
-        self.allocator.free(self.gc_old_bits);
+        self.allocator.free(self.collection.alloc_bits);
+        self.allocator.free(self.collection.old_bits);
         for (self.worker_locals) |*l| l.deinit(self.allocator);
         self.allocator.free(self.worker_locals);
         self.attr_positions.deinit(self.allocator);
@@ -620,9 +485,8 @@ pub const ObjectHeap = struct {
         attr_positions: u32,
     };
 
-    /// Bitset snapshot of currently filled object slots. A NixOS evaluation
-    /// can have millions of objects, so the explorer keeps one bit per slot
-    /// and discovers rows lazily instead of materializing an ObjectId array.
+    /// Bitset snapshot of currently filled object slots. The explorer keeps
+    /// one bit per slot and discovers rows lazily.
     /// Build and use this only while evaluation is idle.
     pub const ObjectSnapshot = struct {
         allocator: std.mem.Allocator,
@@ -675,7 +539,7 @@ pub const ObjectHeap = struct {
 
         // In the detector build reclaimed ids deliberately never enter a free
         // list. Its authoritative allocation bitmap supplies those holes.
-        if (comptime gc_debug) if (self.gc_collect_enabled) {
+        if (comptime gc_debug) if (self.collection.collect_enabled) {
             const floor = self.gcSweepFloor();
             var id = floor;
             while (id < high_water) : (id += 1) {
@@ -765,15 +629,13 @@ pub const ObjectHeap = struct {
     }
 
     /// Constant-time backing-store reservation counts for interactive
-    /// inspection. Unlike `stats`, this does not walk object/value slots, and
-    /// the range stores exclude the unbacked id-space gap reserved for their
-    /// copying nurseries.
+    /// inspection. Unlike `stats`, this does not walk object/value slots.
     pub fn counts(self: *const ObjectHeap) Counts {
         return .{
             .objects = self.objects.count(),
-            .values = self.values.reservedSlots(),
-            .attrs = self.attrs.reservedSlots(),
-            .attr_positions = self.attr_positions.reservedSlots(),
+            .values = self.values.count(),
+            .attrs = self.attrs.count(),
+            .attr_positions = self.attr_positions.count(),
         };
     }
 
@@ -916,9 +778,7 @@ pub const ObjectHeap = struct {
         // attrset values live in `attrs`. These two cover every place an
         // int Value can be heap-resident — the VM stack contains transient
         // ints during execution but is empty by the time stats() runs.
-        // `getIfAllocated`: with the collector the low nursery segments stay
-        // null until arming, so the linear id walk crosses a hole of
-        // never-allocated id space — skip whole segments there.
+        // Skip unallocated segments in sparse stores.
         var vid: u32 = 0;
         scan_val: while (vid < result.values) : (vid += 1) {
             if (val_skip.skipPast(vid)) |next| {
@@ -948,10 +808,9 @@ pub const ObjectHeap = struct {
         return result;
     }
 
-    // ---- `-Dprof-main` demand-prediction de-risk censuses ----
+    // ---- `-Dprof-main` demand-prediction censuses ----
     //
-    // Exit-time (no concurrent writers) heap walks that size the junk
-    // ratio of two candidate prefetch mechanisms BEFORE building them:
+    // Exit-time heap walks report:
     //   - creation census: thunks by creation context (demand chain vs.
     //     speculative work) × final observation state — the selection
     //     precision of creation-context speculation policy.
@@ -1202,15 +1061,9 @@ pub const ObjectHeap = struct {
         }
     }
 
-    /// TLAB reserve shared by the three range stores. When reclaim is active
-    /// (`gc_collect_enabled`) a reused range is popped from the free list (see
-    /// the callers) or a fresh chunk is bumped from the young region; if that
-    /// region is full the reservation spills to the tenured region so the
-    /// allocation always succeeds, and — past the reserved-bytes threshold — a
-    /// collection is requested (`gcNurseryFull`). Non-moving: nothing is reset
-    /// or relocated; the minor frees dead ranges to the free lists in place.
-    /// Otherwise it is the ordinary tenured bump used before lazy arming. A
-    /// returned range is young iff `segment < nursery_segs`.
+    /// TLAB reserve shared by the three range stores. Callers first try an
+    /// exact-size free range when collection is active; fresh reservations use
+    /// this per-worker chunk and poll the collection threshold on refill.
     inline fn reserveRangeLocal(
         self: *ObjectHeap,
         comptime StoreT: type,
@@ -1223,29 +1076,13 @@ pub const ObjectHeap = struct {
             const r = chunk.take(n);
             return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
         }
-        if (self.gc_collect_enabled) {
-            if (n > chunk_size) {
-                // Oversized reservations bypass the TLAB; tenure directly
-                // if they don't fit a nursery segment.
-                if (try store.reserveYoung(self.allocator, n)) |yr| return yr;
-            } else if (try store.reserveYoung(self.allocator, chunk_size)) |cr| {
-                chunk.segment = cr.segment;
-                chunk.cursor = cr.offset;
-                chunk.end = cr.offset + cr.len;
-                const r = chunk.take(n);
-                return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
-            }
-            // Nursery full: request a minor and spill to tenured below.
-            self.gcNurseryFull();
-        } else {
-            // Lazy policy, not yet armed (`gcEnableBudget`): poll the
-            // arming threshold (budget/2) on the same once-per-TLAB-refill
-            // cadence. One compare on a cold path — the whole pre-arming
-            // tracking cost of an always-available collector.
-            self.gcNurseryFull();
+        if (n > chunk_size) {
+            const range = try store.reserve(self.allocator, n);
+            self.gcCheckThreshold();
+            return range;
         }
-        if (n > chunk_size) return store.reserve(self.allocator, n);
         const refilled = try store.reserve(self.allocator, chunk_size);
+        self.gcCheckThreshold();
         chunk.segment = refilled.segment;
         chunk.cursor = refilled.offset;
         chunk.end = refilled.offset + refilled.len;
@@ -1294,8 +1131,8 @@ pub const ObjectHeap = struct {
         const local = self.currentLocal();
         // NON-MOVING reuse: a swept dead range of exactly `n` is reused in
         // place before touching the bump cursor. Ranges never relocate, so the
-        // returned slice is stable across forces (no re-fetch needed).
-        if (self.gc_collect_enabled) {
+        // returned slice remains stable across forces.
+        if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_values", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
         return self.reserveRangeLocal(ValueStore, &self.values, &local.value, value_chunk_size, n);
@@ -1307,12 +1144,6 @@ pub const ObjectHeap = struct {
     /// by attr-set merge primitives to skip a per-merge ArrayList +
     /// extra copy.
     pub fn reserveAttrsForMerge(self: *ObjectHeap, n: u32) !AttrRange {
-        // Tenured: the caller holds this reservation's raw `dst` slice across
-        // value-merge forces (see vm/objects.zig mergeAttrLiteralObjects). A
-        // young reservation would be reclaimed out from under `dst` by a minor's
-        // nursery reset. Tenured slots are never reset/evacuated, so `dst` stays
-        // valid. (The published object's slot is still young/reclaimable.)
-        if (self.gc_collect_enabled) return self.attrs.reserve(self.allocator, n);
         return self.reserveAttrsLocal(n);
     }
 
@@ -1336,7 +1167,7 @@ pub const ObjectHeap = struct {
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
         const local = self.currentLocal();
-        if (self.gc_collect_enabled) {
+        if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_attrs", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
         return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, attr_chunk_size, n);
@@ -1344,29 +1175,23 @@ pub const ObjectHeap = struct {
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
         const local = self.currentLocal();
-        if (self.gc_collect_enabled) {
+        if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_attr_pos", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
         return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, attr_position_chunk_size, n);
     }
 
-    /// Threshold hook: once reserved bytes cross `gc_threshold_bytes`, request a
+    /// Threshold hook: once reserved bytes cross `collection.threshold_bytes`, request a
     /// (non-moving) collection to run at the next forceThunk safepoint — it marks
     /// live, promotes survivors in place, and frees dead ranges to the free lists.
-    /// The reservation that triggered this has already spilled to the tenured
-    /// region so the allocation succeeds now; the spill window (until the
-    /// safepoint) is small because forces are frequent.
-    inline fn gcNurseryFull(self: *ObjectHeap) void {
-        // NON-MOVING: request a collect only once reserved bytes cross the
-        // threshold (re-armed to cursor+headroom after each collect). Called
-        // frequently (every young-full TLAB refill), so it polls the threshold.
-        if (self.totalReservedBytes() >= self.gc_threshold_bytes) self.gc_collect_requested = true;
+    inline fn gcCheckThreshold(self: *ObjectHeap) void {
+        if (self.totalReservedBytes() >= self.collection.threshold_bytes) self.collection.collect_requested = true;
     }
 
     /// Register the collect callback. Fired at
     /// a safepoint via `gcRunCollect` when a collection has been requested.
     pub fn setGcHook(self: *ObjectHeap, hook: GcHook) void {
-        self.gc_hook = hook;
+        self.collection.hook = hook;
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
@@ -1396,7 +1221,7 @@ pub const ObjectHeap = struct {
             // Reuse a slot freed by a prior collection (own shard, else
             // work-steal from a peer). Detector leaves freed slots unused so
             // use-after-free is caught.
-            if (self.gc_collect_enabled and !self.gc_disable_reuse and !gc_debug) {
+            if (self.collection.collect_enabled and !self.collection.disable_reuse and !gc_debug) {
                 if (self.gcReuseObject(local)) |rid| break :blk rid;
             }
             const chunk = &local.object;
@@ -1416,7 +1241,7 @@ pub const ObjectHeap = struct {
         // Record the id in this worker's young-slot list: the minor iterates
         // exactly these (O(young)), and it's robust to slot reuse and the
         // reserved-vs-filled TLAB tail (both of which broke an id-range frontier).
-        if (self.gc_collect_enabled) local.gc_young_slots.append(self.allocator, id) catch {};
+        if (self.collection.collect_enabled) local.gc_young_slots.append(self.allocator, id) catch {};
         return id;
     }
 
@@ -1428,11 +1253,11 @@ pub const ObjectHeap = struct {
         // (`gcReconstructAllocBits`) from the id range minus the free lists,
         // keeping this hot path free of GC work.
         if (comptime gc_debug) {
-            // `gc_root_active` (not `gc_collect_enabled`): in constrained mode
+            // `collection.root_active` (not `collection.collect_enabled`): in constrained mode
             // bits go live from eval start so the pre-arming region [bootstrap_
             // end, track_from) has precise per-object bits for the major sweep +
             // assert. Non-constrained: identical to gating on collect_enabled.
-            if (self.gc_root_active) self.gcSetAllocBit(id);
+            if (self.collection.root_active) self.gcSetAllocBit(id);
         }
     }
 
@@ -1440,7 +1265,7 @@ pub const ObjectHeap = struct {
 
     /// Floor on the collection threshold.
     pub const gc_min_threshold: u64 = 256 << 20;
-    /// Floor on the major-collection gate (see `gc_major_gate`): promote at
+    /// Floor on the major-collection gate (see `collection.major_gate`): promote at
     /// least this many objects since the last major before the next one, so a
     /// small heap never major-thrashes. Above the floor the gate tracks the
     /// live set (major when the old gen has roughly doubled with tenurings).
@@ -1454,7 +1279,7 @@ pub const ObjectHeap = struct {
     /// paths (bump-allocate instead). Measurement only — loses the RSS bound.
     /// Lets us isolate reclaim's reuse cost/benefit. Set from the evaluator.
     pub fn gcSetDisableReuse(self: *ObjectHeap, v: bool) void {
-        self.gc_disable_reuse = v;
+        self.collection.disable_reuse = v;
     }
 
     /// Is the alloc-bit set for `id`? (Detector helper.) Atomic load — the
@@ -1462,8 +1287,8 @@ pub const ObjectHeap = struct {
     /// (pre-sized in `gcEnableCollect`, so the array never moves).
     fn gcAllocBitSet(self: *const ObjectHeap, id: ObjectId) bool {
         const word = id >> 6;
-        if (word >= self.gc_alloc_bits.len) return false;
-        const w = @atomicLoad(u64, &self.gc_alloc_bits[word], .monotonic);
+        if (word >= self.collection.alloc_bits.len) return false;
+        const w = @atomicLoad(u64, &self.collection.alloc_bits[word], .monotonic);
         return w & (@as(u64, 1) << @intCast(id & 63)) != 0;
     }
 
@@ -1478,7 +1303,7 @@ pub const ObjectHeap = struct {
     /// Detector: trap if a *tracked* slot is read after being freed.
     inline fn gcAssertLive(self: *const ObjectHeap, id: ObjectId) void {
         if (comptime !gc_debug) return;
-        if (self.gc_collect_enabled and id >= self.gcSweepFloor() and !self.gcAllocBitSet(id)) {
+        if (self.collection.collect_enabled and id >= self.gcSweepFloor() and !self.gcAllocBitSet(id)) {
             // Reuse is off in the detector, so the slot still holds its real
             // payload — print the kind so we know which root is missing.
             std.debug.print("GC use-after-free: object {d} (kind={s}) read after sweep\n", .{ id, @tagName(self.objects.get(id).*) });
@@ -1491,13 +1316,13 @@ pub const ObjectHeap = struct {
     /// plateaus near the threshold once collection keeps up.
     pub fn totalReservedBytes(self: *const ObjectHeap) u64 {
         return @as(u64, self.objects.count()) * @sizeOf(Object) +
-            @as(u64, self.values.reservedSlots()) * @sizeOf(Value) +
-            @as(u64, self.attrs.reservedSlots()) * @sizeOf(AttrEntry) +
-            @as(u64, self.attr_positions.reservedSlots()) * @sizeOf(AttrPosEntry);
+            @as(u64, self.values.count()) * @sizeOf(Value) +
+            @as(u64, self.attrs.count()) * @sizeOf(AttrEntry) +
+            @as(u64, self.attr_positions.count()) * @sizeOf(AttrPosEntry);
     }
 
     pub fn gcCollectRequested(self: *const ObjectHeap) bool {
-        return self.gc_collect_requested;
+        return self.collection.collect_requested;
     }
 
     /// Rebuild the alloc bitmap (which slots are filled-and-live) from
@@ -1511,45 +1336,45 @@ pub const ObjectHeap = struct {
     /// only; the detector build keeps the incremental bitmap (it asserts
     /// liveness on every read, between collections).
     /// Lowest ObjectId a major sweep may reclaim: the pre-arming boundary in
-    /// constrained mode (`gc_root_always`), else the arming boundary (pre-arming
+    /// constrained mode (`collection.root_always`), else the arming boundary (pre-arming
     /// region pinned). Doubles as the detector's read-after-free assert floor.
     inline fn gcSweepFloor(self: *const ObjectHeap) ObjectId {
-        return if (self.gc_root_always) self.gc_bootstrap_end else self.gc_track_from;
+        return if (self.collection.root_always) self.collection.bootstrap_end else self.collection.track_from;
     }
 
     /// Detector build: size the alloc bitmap to the whole object id space so
     /// per-fill bit-sets never realloc under a concurrent reader/setter at
-    /// --workers>1. ~128 MB, debug only. Called at arming, or earlier at
+    /// --workers>1. Debug only. Called at arming, or earlier at
     /// gcEnableBudget in constrained mode (bits go live from eval start there).
     pub fn gcPresizeAllocBits(self: *ObjectHeap) void {
         if (comptime !gc_debug) return;
         const words = (@as(usize, object_max_slots) + 63) >> 6;
-        self.gc_alloc_bits = self.allocator.realloc(self.gc_alloc_bits, words) catch self.gc_alloc_bits;
-        @memset(self.gc_alloc_bits, 0);
+        self.collection.alloc_bits = self.allocator.realloc(self.collection.alloc_bits, words) catch self.collection.alloc_bits;
+        @memset(self.collection.alloc_bits, 0);
     }
 
     pub fn gcReconstructAllocBits(self: *ObjectHeap) void {
         const n = self.objects.count();
         const words = (@as(usize, n) + 63) >> 6;
-        if (self.gc_alloc_bits.len < words) {
-            const old_len = self.gc_alloc_bits.len;
-            self.gc_alloc_bits = self.allocator.realloc(self.gc_alloc_bits, words) catch return;
-            @memset(self.gc_alloc_bits[old_len..words], 0);
+        if (self.collection.alloc_bits.len < words) {
+            const old_len = self.collection.alloc_bits.len;
+            self.collection.alloc_bits = self.allocator.realloc(self.collection.alloc_bits, words) catch return;
+            @memset(self.collection.alloc_bits[old_len..words], 0);
         }
-        @memset(self.gc_alloc_bits[0..words], 0);
-        gcSetBitRange(self.gc_alloc_bits, self.gcSweepFloor(), n);
+        @memset(self.collection.alloc_bits[0..words], 0);
+        gcSetBitRange(self.collection.alloc_bits, self.gcSweepFloor(), n);
         // Exclude each worker's reserved-but-unfilled current object chunk.
         for (self.worker_locals) |*wl| {
             const lo = ObjectStore.globalIdOf(wl.object.segment, wl.object.cursor);
             const hi = ObjectStore.globalIdOf(wl.object.segment, wl.object.end);
-            if (hi > lo) gcClearBitRange(self.gc_alloc_bits, lo, hi);
+            if (hi > lo) gcClearBitRange(self.collection.alloc_bits, lo, hi);
         }
         // Exclude slots already on any worker's object free list (freed by a
         // prior collection, not yet reused).
         for (self.worker_locals) |*wl| {
             for (wl.gc_free_objects.items) |id| {
                 const word = id >> 6;
-                if (word < self.gc_alloc_bits.len) self.gc_alloc_bits[word] &= ~(@as(u64, 1) << @intCast(id & 63));
+                if (word < self.collection.alloc_bits.len) self.collection.alloc_bits[word] &= ~(@as(u64, 1) << @intCast(id & 63));
             }
         }
     }
@@ -1576,44 +1401,40 @@ pub const ObjectHeap = struct {
         // pre-sized in `gcEnableCollect` so it never reallocs here; concurrent
         // fills from other workers at --workers>1 are handled with atomic-or.
         const word = id >> 6;
-        if (word >= self.gc_alloc_bits.len) return;
-        _ = @atomicRmw(u64, &self.gc_alloc_bits[word], .Or, @as(u64, 1) << @intCast(id & 63), .monotonic);
+        if (word >= self.collection.alloc_bits.len) return;
+        _ = @atomicRmw(u64, &self.collection.alloc_bits[word], .Or, @as(u64, 1) << @intCast(id & 63), .monotonic);
     }
 
     // ===================================================================
-    // Copying nursery — minor collection
+    // Generational collection
     // ===================================================================
 
     /// Is object `id` young? Old ⇒ its bit is set (promoted in a prior minor);
     /// young ⇒ clear or beyond the (STW-grown) bitmap. No allocation barrier.
     pub inline fn gcIsYoung(self: *const ObjectHeap, id: ObjectId) bool {
-        // Pre-collection (bootstrap) objects are permanent — always old. Never
-        // evacuated/reclaimed, and the write barrier MUST treat them as old so
-        // an old→young edge they gain (e.g. a bootstrap thunk resolving to a
-        // young value) is remembered.
-        if (id < self.gc_track_from) return false;
+        // Bootstrap objects are pinned and treated as old so later edges from
+        // them to young objects enter the remembered set.
+        if (id < self.collection.track_from) return false;
         const word = id >> 6;
-        if (word >= self.gc_old_bits.len) return true;
-        return self.gc_old_bits[word] & (@as(u64, 1) << @intCast(id & 63)) == 0;
+        if (word >= self.collection.old_bits.len) return true;
+        return self.collection.old_bits[word] & (@as(u64, 1) << @intCast(id & 63)) == 0;
     }
 
     pub inline fn gcSetOld(self: *ObjectHeap, id: ObjectId) void {
         const word = id >> 6;
-        if (word >= self.gc_old_bits.len) return;
-        // Atomic OR: parallel evacuation promotes concurrently from multiple
-        // workers, whose ids may share a bitmap word. (Serially uncontended, so
-        // ~free at --workers=1.)
-        _ = @atomicRmw(u64, &self.gc_old_bits[word], .Or, @as(u64, 1) << @intCast(id & 63), .monotonic);
+        if (word >= self.collection.old_bits.len) return;
+        // Parallel minor sweepers may promote ids in the same bitmap word.
+        _ = @atomicRmw(u64, &self.collection.old_bits[word], .Or, @as(u64, 1) << @intCast(id & 63), .monotonic);
     }
 
     /// Grow the generation bitmap to cover `[0, count)` (new words zeroed ⇒
     /// young). STW only, so plain (non-atomic).
     pub fn gcGrowOldBits(self: *ObjectHeap, count: u32) void {
         const words = (@as(usize, count) + 63) >> 6;
-        if (self.gc_old_bits.len < words) {
-            const old_len = self.gc_old_bits.len;
-            self.gc_old_bits = self.allocator.realloc(self.gc_old_bits, words) catch return;
-            @memset(self.gc_old_bits[old_len..words], 0);
+        if (self.collection.old_bits.len < words) {
+            const old_len = self.collection.old_bits.len;
+            self.collection.old_bits = self.allocator.realloc(self.collection.old_bits, words) catch return;
+            @memset(self.collection.old_bits[old_len..words], 0);
         }
     }
 
@@ -1631,7 +1452,7 @@ pub const ObjectHeap = struct {
     /// other case bails cheaply. Fired at the write-once mutation sites (thunk
     /// resolve, merge flatten, cell bind).
     pub inline fn gcRecordEdge(self: *ObjectHeap, source: ObjectId, referent: Value) void {
-        if (!self.gc_collect_enabled) return;
+        if (!self.collection.collect_enabled) return;
         const ref_id = gcHeapId(referent) orelse return;
         if (!self.gcIsYoung(ref_id)) return; // referent already old
         if (self.gcIsYoung(source)) return; // source young → not old→young
@@ -1642,21 +1463,11 @@ pub const ObjectHeap = struct {
     /// driver in `heap/collector.zig`.
     pub const MinorStats = struct { promoted: u64 = 0, freed: u64 = 0 };
 
-    // --- parallel evacuation phase (`--workers>1`) ---------------------------
-    //
-    // The collector calls `gcBeginEvac` before opening the mark, then (after the
-    // mark terminates and it has verified closure) `gcOpenEvac`. Every worker —
-    // collector and parked peers alike — runs `gcEvacClaimLoop`, atomically
-    // claiming young-object lists and evacuating them into its own TLAB. The
-    // collector then `gcWaitEvacDone` + `gcFinishEvac` (reset the nursery).
-
     /// Grab the next marker slot for this worker (collector or peer). A slot
     /// `>= marker_count` means "don't participate — park idle". Called by both
-    /// the collector and the parallel-mark helper hook. (The rest of the evac
-    /// phase — beginEvac/openEvac/evacClaimLoop/waitEvacDone/finishEvac — lives
-    /// in the collector driver, `heap/collector.zig`.)
+    /// the collector and the parallel-mark helper hook.
     pub fn gcMarkSlotGrab(self: *ObjectHeap) u32 {
-        return self.gc_mark_slot.fetchAdd(1, .acq_rel);
+        return self.collection.mark_slot.fetchAdd(1, .acq_rel);
     }
 
     /// Post-major-sweep reconciliation of the generational state. A full sweep
@@ -1664,8 +1475,7 @@ pub const ObjectHeap = struct {
     /// exactly `mark_bits`. Tenure all of them (a full collection is a total
     /// tenure) and empty the per-worker young lists, so the young generation
     /// restarts empty: no live young objects, hence no old→young edges, hence
-    /// the caller can drop the remembered set. The next minor then works from a
-    /// clean nursery. STW-only (the collector alone touches these).
+    /// the caller can drop the remembered set. STW-only.
     pub fn gcMajorReconcile(self: *ObjectHeap, mark_bits: []const u64) void {
         const n = self.objects.count();
         self.gcGrowOldBits(n);
@@ -1673,10 +1483,10 @@ pub const ObjectHeap = struct {
         // just-freed OLD slot must lose its old bit, or when the allocator reuses
         // it the object is wrongly seen as old — the write barrier skips its
         // old→young edges and the next minor never scans it (use-after-free).
-        // (Bootstrap ids < gc_track_from are old via that check, not the bit, so
-        // clearing them here is harmless.) STW: no concurrent generation reads.
+        // Bootstrap ids below the tracking boundary are old via that check, not
+        // the bit, so clearing them here is harmless. STW only.
         const words = (@as(usize, n) + 63) >> 6;
-        @memset(self.gc_old_bits[0..@min(words, self.gc_old_bits.len)], 0);
+        @memset(self.collection.old_bits[0..@min(words, self.collection.old_bits.len)], 0);
         for (mark_bits, 0..) |word, wi| {
             var w = word;
             while (w != 0) {
@@ -1688,31 +1498,31 @@ pub const ObjectHeap = struct {
         for (self.worker_locals) |*wl| wl.gc_young_slots.clearRetainingCapacity();
         // Constrained mode: this major swept the pre-arming region too, so unify
         // the tracked frontier down to the bootstrap boundary. gcIsYoung's hard
-        // floor is gc_track_from (id < it ⇒ forced old); lowering it lets a
+        // floor is the tracking boundary; lowering it lets a
         // reused pre-arming slot be correctly young-eligible instead of
         // mis-tagged permanently-old (which would skip its write barrier → UAF).
-        if (self.gc_root_always) self.gc_track_from = self.gc_bootstrap_end;
+        if (self.collection.root_always) self.collection.track_from = self.collection.bootstrap_end;
     }
 
-    /// Major-collection policy hooks (see `gc_major_gate`). ---
+    /// Major-collection policy hooks (see `collection.major_gate`).
     /// Should the next in-eval collection be a MAJOR? True once enough objects
     /// have tenured since the last major that the old generation likely holds a
     /// live-set's worth of reclaimable garbage.
     pub fn gcShouldMajor(self: *const ObjectHeap) bool {
-        return self.gc_promoted_since_major >= self.gc_major_gate;
+        return self.collection.promoted_since_major >= self.collection.major_gate;
     }
 
     /// A minor tenured `promoted` objects; charge them against the major gate.
     pub fn gcNoteMinorPromoted(self: *ObjectHeap, promoted: u64) void {
-        self.gc_promoted_since_major += promoted;
+        self.collection.promoted_since_major += promoted;
     }
 
     /// A major just ran, leaving `live_objects` alive (all now tenured). Reset
     /// the promotion counter and re-arm the gate to the new live set (floored),
     /// so the next major fires once the old gen has ~doubled again.
     pub fn gcNoteMajor(self: *ObjectHeap, live_objects: u64) void {
-        self.gc_promoted_since_major = 0;
-        self.gc_major_gate = @max(gc_major_gate_floor, live_objects);
+        self.collection.promoted_since_major = 0;
+        self.collection.major_gate = @max(gc_major_gate_floor, live_objects);
     }
 
     pub fn getMut(self: *ObjectHeap, id: ObjectId) *Object {
@@ -1874,15 +1684,12 @@ pub const ObjectHeap = struct {
     fn kwayMergeLeaves(self: *ObjectHeap, leaves: []const ObjectId) !ObjectId {
         if (leaves.len == 1) return leaves[0];
         if (leaves.len > @bitSizeOf(usize)) {
-            // Leaf sets wider than the cursor bitmask (pkgs/by-name's
-            // mergeAttrsList: 756 shard leaves, ~21K entries) reduce in
-            // chunks of <=64 through the fast path below, then k-way the
+            // Leaf sets wider than the cursor bitmask reduce in machine-word
+            // chunks through the fast path below, then k-way the
             // intermediates (recursing until they fit). Chunks are
             // contiguous in precedence order and the outer merge is
             // right-biased across chunks, so the result is identical to
-            // the flat one-pass merge. Cost is O(N·k/64 + N·chunks)
-            // instead of the per-name O(N·k) wide walk that measured
-            // ~13ms on the critical chain for by-name alone.
+            // the flat one-pass merge. Cost is O(N·k/64 + N·chunks).
             var reduced: std.ArrayListUnmanaged(ObjectId) = .empty;
             defer reduced.deinit(self.allocator);
             var start: usize = 0;
@@ -2133,7 +1940,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addContextString(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
-        const range = try self.appendAttrEntriesTenured(context);
+        const range = try self.appendAttrEntries(context);
         errdefer self.attrs.rollback(range);
         self.sortAttrs(range);
         try self.rejectDuplicateAttrs(range);
@@ -2144,11 +1951,8 @@ pub const ObjectHeap = struct {
         const left = try self.getAttrs(left_id);
         const right = try self.getAttrs(right_id);
 
-        // Reserve worst-case (no overlap) directly in the heap's attr
-        // storage and write the merge in place. Skips a per-merge
-        // ArrayList allocation + one of the two memcpys the old path
-        // did (input → ArrayList → heap). Inputs are both sorted+
-        // deduped (invariant of `addAttrs`/`prepareAttrsRange`), so
+        // Reserve worst-case capacity and write the merge directly into heap
+        // storage. Inputs are both sorted and deduplicated, so
         // the in-order walk produces sorted+unique output by
         // construction.
         //
@@ -2309,12 +2113,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addClosure(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
-        // Upvalues are cached in the executing frame's `upvalues` slice (see
-        // vm/stack.zig Frame), which would dangle if the range were evacuated
-        // mid-execution. Born tenured so the frame slice never moves. (A future
-        // optimization can re-derive frame.upvalues at GC time and let these be
-        // young — see docs/gc.md.)
-        const range = try self.appendValuesTenured(upvalues);
+        const range = try self.appendValues(upvalues);
         errdefer self.values.rollback(range);
         return self.add(.{ .closure = .{
             .chunk_id = chunk_id,
@@ -2364,10 +2163,7 @@ pub const ObjectHeap = struct {
         if (upvalues.len <= BytecodeThunk.inline_capacity) {
             return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, upvalues) });
         }
-        // Spilled upvalues are a bare slice held by the thunk AND cached in the
-        // executing frame's `upvalues` — both would dangle if the range were
-        // evacuated. Born tenured (never moves), so neither ever moves.
-        const range = try self.appendValuesTenured(upvalues);
+        const range = try self.appendValues(upvalues);
         errdefer self.values.rollback(range);
         return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, self.values.slice(range)) });
     }
@@ -2378,7 +2174,7 @@ pub const ObjectHeap = struct {
         if (env.len <= DeferredThunk.inline_capacity) {
             return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, env) });
         }
-        const range = try self.appendValuesTenured(env); // stable: see addBytecodeThunk
+        const range = try self.appendValues(env);
         errdefer self.values.rollback(range);
         return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, self.values.slice(range)) });
     }
@@ -2405,16 +2201,6 @@ pub const ObjectHeap = struct {
 
     pub fn commitBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) !ObjectId {
         errdefer self.values.rollback(pending.range);
-        // Spilled (>inline_capacity) upvalues become the thunk's stable backing slice
-        // and are cached in executing frames; if the pending range is young it
-        // must be copied to the tenured region so it never moves. Inline (<=2)
-        // upvalues are copied into the thunk, so the young pending range is
-        // harmless (reclaimed by the next nursery reset).
-        if (pending.range.len > BytecodeThunk.inline_capacity and self.values.isYoung(pending.range)) {
-            const t = try self.values.reserve(self.allocator, pending.range.len);
-            @memcpy(self.values.sliceMut(t), self.values.slice(pending.range));
-            return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.values.slice(t)) });
-        }
         return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.values.slice(pending.range)) });
     }
 
@@ -2428,36 +2214,8 @@ pub const ObjectHeap = struct {
         return range;
     }
 
-    /// Like `appendValues` but always tenured (bypasses the nursery). For
-    /// storage that must never be evacuated because a bare slice into it is
-    /// held outside the object graph — spilled thunk upvalues (see
-    /// `addBytecodeThunk`).
-    fn appendValuesTenured(self: *ObjectHeap, items: []const Value) !ValueRange {
-        // Without an active copying nursery, TLAB ranges are just as stable
-        // as direct tenured reservations (StableSegments never relocates) —
-        // use the per-worker TLAB and skip the store's global `write_mu`.
-        // This is the thunk/closure spilled-upvalue path (every capture
-        // wider than inline_capacity), so at high worker counts the direct
-        // `values.reserve` was a spinlock convoy dominating the profile.
-        // Mirrors `appendAttrEntriesTenured`'s guard.
-        if (!self.gc_collect_enabled) return self.appendValues(items);
-        const range = try self.values.reserve(self.allocator, @intCast(items.len));
-        @memcpy(self.values.sliceMut(range), items);
-        return range;
-    }
-
     fn appendAttrEntries(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
         const range = try self.reserveAttrsLocal(@intCast(entries.len));
-        @memcpy(self.attrs.sliceMut(range), entries);
-        return range;
-    }
-
-    /// Tenured attr append — for a context-string's `context`, whose raw slice
-    /// (`contextEntriesForValue`) is held across forces in string builtins and
-    /// would dangle if evacuated. See `addContextString`.
-    fn appendAttrEntriesTenured(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
-        if (!self.gc_collect_enabled) return self.appendAttrEntries(entries);
-        const range = try self.attrs.reserve(self.allocator, @intCast(entries.len));
         @memcpy(self.attrs.sliceMut(range), entries);
         return range;
     }

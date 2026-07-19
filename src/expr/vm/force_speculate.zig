@@ -22,16 +22,12 @@ pub inline fn shouldSpeculateClosure(self: *VM, closure: Value) bool {
     // running speculative work, don't submit further speculation. The
     // helper's result may or may not be observed; chaining more
     // speculation off it would just multiply uncertain work.
-    if (self.in_speculation) return false;
+    if (self.speculation.active) return false;
     return switch (closure.kind()) {
         .closure => isSpeculatableClosureChunk(self, closure),
-        // map / mapAttrs / genList / zipAttrsWith all produce
-        // builtin_closure thunks that wrap a *user* function. Real
-        // evals create millions of these; if we wait for forceDeep to
-        // submit them urgently, main is already on the critical path.
-        // Speculate them now, gated on the inner function being
-        // substantial (and on `in_speculation` above, so a helper
-        // forcing one won't speculate the next one in the chain).
+        // map / mapAttrs / genList / zipAttrsWith produce builtin-closure
+        // thunks around a user function. Speculate them at creation when the
+        // inner function is substantial; `speculation.active` bounds chaining.
         .builtin_closure => isSpeculatableBuiltinClosure(self, closure),
         else => false,
     };

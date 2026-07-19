@@ -8,7 +8,7 @@ const std = @import("std");
 // `doCallN` only make sense against a real callee value. These drive the
 // module through `Evaluator.evaluate`, observing Nix-visible results only.
 
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 test "makeClosure with zero upvalues ignores the enclosing scope" {
     var ev = try Evaluator.init(std.testing.allocator, 0);

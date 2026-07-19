@@ -45,7 +45,7 @@ pub fn Params(comptime Vma: type) type {
         /// bills the whole segment against the pool — mapped-but-untouched
         /// hugetlb is real pool consumption. 0 = off (every segment through
         /// the allocator, as before). Requires every cursor advance to hold
-        /// `write_mu` (`reserve`/`reserveLocal`/`reserveYoung`), so it is
+        /// `write_mu` (`reserve`/`reserveLocal`), so it is
         /// incompatible with `appendAtomic` (enforced at comptime).
         huge_overlay_min: usize = 0,
     };
@@ -83,16 +83,14 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             len: u32,
         };
 
-        /// Per-worker tenured bump cursor (a thread-local allocation buffer).
+        /// Per-worker bump cursor (a thread-local allocation buffer).
         /// Refilled a chunk at a time under `write_mu`; individual reservations
-        /// bump the local cursor lock-free. Lets the parallel copying collector
-        /// evacuate survivors concurrently without every worker serializing on
-        /// the store's global `reserve`. Only the final partial chunk per worker
-        /// leaks (its unused tail), so the waste is bounded and tiny.
+        /// bump the local cursor lock-free. Only the final partial chunk per
+        /// worker is unused, so waste is bounded by one chunk per worker.
         pub const Tlab = struct { seg: u32 = 0, off: u32 = 0, used: u32 = 0, cap: u32 = 0 };
         pub const tlab_chunk_size: u32 = 8192;
 
-        /// Reserve `len` slots via `tlab` (tenured). Bumps the local cursor when
+        /// Reserve `len` slots via `tlab`. Bumps the local cursor when
         /// the current chunk has room; otherwise refills one chunk under
         /// `write_mu` (or, for an oversized `len`, reserves it directly and
         /// leaves the chunk intact). Not thread-safe on a single `tlab` — each
@@ -121,19 +119,6 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             break :blk arr;
         },
         write_mu: SpinMutex = .{},
-
-        // --- copying-nursery support (GC) ---
-        //
-        // When `nursery_segs > 0` the low segments `[0, nursery_segs)` form a
-        // resettable young-generation arena (its own bump cursor
-        // `young_cursor`), and the tenured region is segments
-        // `[nursery_segs, segment_count)` (the ordinary `cursor`, pre-positioned
-        // by `enableNursery`). A range is "young" iff `range.segment <
-        // nursery_segs` — so `slice`/`get` route by segment index with no tag
-        // bit and no per-access branch. `resetYoung` rewinds `young_cursor` to
-        // reclaim the whole nursery in O(1) after survivors are evacuated out.
-        young_cursor: std.atomic.Value(u64) = .init(0),
-        nursery_segs: u32 = 0,
 
         // --- per-segment hugetlb overlay (`params.huge_overlay_min`) ---
         //
@@ -226,98 +211,6 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             return range;
         }
 
-        /// Partition the store into a young nursery (`[0, nursery_segs)`) and a
-        /// tenured region (`[nursery_segs, segment_count)`). Must be called
-        /// before any `reserve` (the tenured cursor is moved to the first
-        /// tenured segment so ordinary reservations never land in the nursery).
-        /// Idempotent-safe only from a fresh (`empty`) store.
-        pub fn enableNursery(self: *Self, nursery_segs: u32) void {
-            std.debug.assert(nursery_segs > 0 and nursery_segs < segment_count);
-            std.debug.assert(self.count() == 0);
-            self.nursery_segs = nursery_segs;
-            self.young_cursor.store(0, .monotonic);
-            self.cursor.store(packCursor(nursery_segs, 0), .release);
-        }
-
-        /// Reserve `len` slots in the young nursery. Returns `null` when the
-        /// nursery is full (the caller then triggers a minor collection, or
-        /// spills to the tenured `reserve`). Never grows past `nursery_segs`.
-        pub fn reserveYoung(self: *Self, allocator: std.mem.Allocator, len: u32) !?Range {
-            if (len == 0) return Range{ .segment = 0, .offset = 0, .len = 0 };
-            self.write_mu.lock();
-            defer self.write_mu.unlock();
-
-            const cur = self.young_cursor.load(.monotonic);
-            var seg = segmentOf(cur);
-            var used = usedOf(cur);
-            while (true) {
-                if (seg >= self.nursery_segs) return null; // nursery exhausted
-                const cap = segmentCapacity(seg);
-                if (len <= cap and used + len <= cap) break;
-                seg += 1;
-                used = 0;
-            }
-            try self.ensureSegment(allocator, seg);
-            // Nursery segments are small (below `huge_overlay_min` in every
-            // real instantiation) so this is a no-op there, but keep the
-            // invariant uniform: cursor never passes the frontier.
-            if (comptime overlay_enabled)
-                self.extendSegHugeFrontier(seg, (@as(usize, used) + len) * @sizeOf(T));
-            self.extendSegPopulateFrontier(seg, (@as(usize, used) + len) * @sizeOf(T));
-            const range: Range = .{ .segment = seg, .offset = used, .len = len };
-            self.young_cursor.store(packCursor(seg, used + len), .release);
-            return range;
-        }
-
-        /// Young slots reserved (high-water within the nursery). O(1).
-        pub fn youngCount(self: *const Self) u32 {
-            const cur = self.young_cursor.load(.acquire);
-            return segmentStart(segmentOf(cur)) + usedOf(cur);
-        }
-
-        /// Tenured slots reserved (excludes the nursery capacity that
-        /// `count()`'s `segmentStart` would otherwise fold in).
-        pub fn tenuredCount(self: *const Self) u32 {
-            if (self.nursery_segs == 0) return self.count();
-            return self.count() - segmentStart(self.nursery_segs);
-        }
-
-        /// Total committed slots across both regions (RSS proxy for the GC
-        /// threshold). Excludes the un-backed nursery-capacity gap.
-        pub fn reservedSlots(self: *const Self) u32 {
-            if (self.nursery_segs == 0) return self.count();
-            return self.tenuredCount() + self.youngCount();
-        }
-
-        /// Base address + capacity of nursery segment `i` for `MADV_DONTNEED`
-        /// on reset. Null if the segment was never touched.
-        pub fn nurserySegmentPages(self: *const Self, i: u32) ?[]T {
-            const ptr = self.segments[i].load(.monotonic) orelse return null;
-            return ptr[0..segmentCapacity(i)];
-        }
-
-        /// Is `range` a young (nursery) reservation? True iff it lives in a
-        /// nursery segment. Used by the copying collector to decide what to
-        /// evacuate.
-        pub fn isYoung(self: *const Self, range: Range) bool {
-            return self.nursery_segs != 0 and range.segment < self.nursery_segs;
-        }
-
-        /// Does raw pointer `ptr` fall inside a nursery segment? For the one
-        /// place a bare slice into the store is held (spilled thunk upvalues),
-        /// where the owning `(segment, offset)` isn't recorded. O(nursery_segs).
-        pub fn isYoungPtr(self: *const Self, ptr: [*]const T) bool {
-            if (self.nursery_segs == 0) return false;
-            const p = @intFromPtr(ptr);
-            var i: u32 = 0;
-            while (i < self.nursery_segs) : (i += 1) {
-                const seg = self.segments[i].load(.monotonic) orelse continue;
-                const base = @intFromPtr(seg);
-                if (p >= base and p < base + @as(usize, segmentCapacity(i)) * @sizeOf(T)) return true;
-            }
-            return false;
-        }
-
         /// Append a single value. Returns its global u32 id.
         pub fn append(self: *Self, allocator: std.mem.Allocator, value: T) !u32 {
             const range = try self.reserve(allocator, 1);
@@ -329,19 +222,16 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         /// Lock-free single-slot append: reserve a slot by CAS-bumping the
         /// cursor (no `write_mu`), ensure its segment exists via a CAS-alloc,
         /// then write the value. Lets many workers register concurrently
-        /// without serializing on the writer mutex — the compile hot path
-        /// (ChunkRegistry.register) registers ~700K chunks. `count()` stays
+        /// without serializing on the writer mutex. `count()` stays
         /// accurate (each reserved slot is written by its own call before the
         /// id escapes); a reserved-but-unwritten slot is transient and only
         /// observable by a full-store scan, which never races registration
-        /// (scans run at teardown / STW / after eval). NOT for the nursery
-        /// variant — asserts no nursery is active.
+        /// (scans run at teardown / STW / after eval).
         pub fn appendAtomic(self: *Self, allocator: std.mem.Allocator, value: T) !u32 {
             // The overlay scheme requires every cursor advance to hold
             // `write_mu` (the frontier must cover a range before it is
             // handed out); this lock-free path can't uphold that.
             comptime if (overlay_enabled) @compileError("appendAtomic is incompatible with huge_overlay_min");
-            std.debug.assert(self.nursery_segs == 0);
             while (true) {
                 const cur = self.cursor.load(.acquire);
                 const seg = segmentOf(cur);
@@ -370,7 +260,6 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         /// well-defined — monotonic keeps the accesses atomic,
         /// it just drops the RMW and fences.
         pub fn appendSerial(self: *Self, allocator: std.mem.Allocator, value: T) !u32 {
-            std.debug.assert(self.nursery_segs == 0);
             const cur = self.cursor.load(.monotonic);
             var seg = segmentOf(cur);
             var used = usedOf(cur);
@@ -446,11 +335,8 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             return &seg_ptr[loc.offset];
         }
 
-        /// `get`, tolerating id space whose segment was never allocated —
-        /// with the collector the low nursery segments stay null until arming, so
-        /// a linear id walk (diagnostics/stats) crosses a hole. Returns
-        /// null there and sets `next_id.*` to the first id of the next
-        /// segment so walkers skip the hole in O(1).
+        /// `get`, tolerating a sparse id space. On an unallocated segment,
+        /// advances `next_id` to the following segment and returns null.
         pub fn getIfAllocated(self: *const Self, id: u32, next_id: *u32) ?*const T {
             const loc = locationOf(id);
             const seg_ptr = self.segments[loc.segment].load(.acquire) orelse {
@@ -647,10 +533,8 @@ pub fn FlatParams(comptime Vma: type) type {
         /// Small enough that a run only over-reserves one chunk of pool
         /// (mapped-but-untouched hugetlb is real pool consumption — it
         /// counts against the footprint and starves other mappings), big
-        /// enough that extension mmaps stay rare (an overlay is one
-        /// mmap+mremap under the already-held write lock; a ~1 GB store
-        /// crosses a 32 MB frontier ~30 times per run). Tests shrink it to
-        /// exercise many frontier crossings on a small store.
+        /// enough to avoid frequent mmap+mremap overlays under `write_mu`.
+        /// Tests shrink it to exercise frontier crossings on a small store.
         huge_chunk: usize = 32 << 20,
     };
 }

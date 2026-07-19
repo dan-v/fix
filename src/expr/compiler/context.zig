@@ -324,9 +324,8 @@ pub const Compiler = struct {
         return r.id;
     }
 
-    /// The disasm-only per-slot sidecar recording (upvalue/local names + file)
-    /// split out of `registerChunk`. The chunk's *name* is no longer here — it
-    /// lives in the always-on `name_tree` (see `initChild`/`registerDeduped`).
+    /// Record disassembly-only slot names and source-file metadata. Qualified
+    /// chunk names live in `name_tree`.
     fn recordChunkSidecar(self: *Compiler, id: types.ChunkId, ch: *const chunk.Chunk) !void {
         _ = ch;
         if (self.source_file_id) |file| try self.registry.recordFile(id, file);

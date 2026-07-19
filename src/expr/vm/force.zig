@@ -51,10 +51,8 @@ const critical_wait_observation: observ.SpanSpec = .{
 pub const thunkLabel = force_label.thunkLabel;
 
 /// Bounded spin a demanded fiber does on a `.busy` (helper-owned) thunk
-/// before enrolling as a waiter and suspending. Sized to catch a resolve
-/// that lands within a few hundred nanoseconds — the common case when the
-/// owner is nearly done — while still falling through to a real yield for
-/// long waits (so the worker can run other fibers). See the `.busy` arm.
+/// before enrolling as a waiter and suspending. Short waits avoid a context
+/// switch; longer waits yield the worker. See the `.busy` arm.
 const busy_spin_before_enroll: u32 = 1024;
 
 /// Map a thunk body to a `prof_path` key: the body's `ChunkId` (≈ a Nix
@@ -80,20 +78,13 @@ const VM = vm_mod.VM;
 
 // ---- thunk-result memo ----
 //
-// nixpkgs re-evaluates the same pure `lib` helpers (`lib.types.*`,
-// `lib.mkXxx`, ...) with identical arguments across thousands of modules,
-// producing distinct thunk objects that compute identical values — work
-// the per-object thunk memoization can't share. ~10.8% of bytecode-thunk
-// computations on the NixOS toplevel are such duplicates.
-//
 // This is a bounded, per-worker-thread (zero-contention) cache
 // mapping (heap_token, chunk_id, ≤2 upvalues) → resolved Value. Before
 // computing a freshly-claimed bytecode thunk we check it; a hit resolves
 // the thunk to the cached value and skips re-running the body. Pure
 // functions, so reuse is sound; the `heap_token` guard invalidates stale
 // entries across Evaluator instances (same trick as the attr inline
-// cache). Limited to ≤2-upvalue thunks so the key compares exactly with
-// no allocation — that's the inline-storage majority.
+// cache). The ≤2-upvalue limit keeps comparison exact and allocation-free.
 const memo_size = thread_caches.memo_size;
 
 /// GC: the thunk-result memo holds Values keyed by heap token. An
@@ -145,48 +136,38 @@ inline fn memoKeyForBytecode(b: *const thunk_mod.BytecodeThunk) ?MemoKey {
 
 // ---- GC roots for native code ----
 //
-// The collector is fully PRECISE: it never scans raw C-stacks or registers.
-// Every live heap `Value` must therefore be reachable from an enumerable root
-// at a collection safepoint (a `forceValue`/`forceThunk`). The roots are:
+// The precise collector does not scan native stacks or registers. At a
+// collection safepoint every live heap value must be reachable from:
 //   - the VM operand stack + frames + upvalues (bytecode ops — kept precise by
 //     forcing operands *in place*; see `forceAt`/`forceTop`, never pop-then-force);
 //   - the in-flight thunk force chain (`forceThunkImpl` pushes each claimed
 //     thunk — roots its target closure / upvalues / attr-access base);
-//   - `callValue`/`doCall`/`doTailCall` root their callee+arg for the call's
-//     duration; `doCallN` keeps args on the operand stack — so a builtin's
-//     arguments are rooted by whichever invoked it (`applyBuiltin` no longer
-//     roots them itself);
-//   - `gc_temp_roots` for anything native code holds that none of the above
-//     covers (see rule below).
+//   - call helpers, which root the callee and arguments for the call;
+//   - `gc_roots.temporary` for native-held values not covered above.
 //
-// RULE for writing a native builtin (so you get it right on the first try):
-//   Your ARGUMENTS are already rooted (by the caller — doCall/callValue/doCallN). Any value you pass to
-//   `forceValue`/`callValue`/`getAttrValue` is rooted for that call. List
-//   elements / attr values reached THROUGH a rooted argument are covered too.
-//   => You only need a scope when you stash a *newly produced* heap value in a
-//      Zig-side collection (an ArrayList, a running result) and keep it across a
-//      LATER force — e.g. lists a user function returns mid-loop. Then:
+// Builtin arguments and values passed directly to forcing/call helpers are
+// already rooted. Use a temporary root scope only for a newly produced heap
+// value held by native code across a later safepoint:
 //
 //        const scope = force.rootsBegin(self);
 //        defer force.rootsEnd(self, scope);
-//        ...
-//        force.rootKeep(self, produced); // keep `produced` alive across later forces
+//        force.rootKeep(self, produced);
 //
 pub const RootScope = usize;
 
 pub inline fn rootsBegin(self: *VM) RootScope {
-    return self.gc_temp_roots.items.len;
+    return self.gc_roots.temporary.items.len;
 }
 pub inline fn rootsEnd(self: *VM, scope: RootScope) void {
-    self.gc_temp_roots.items.len = scope;
+    self.gc_roots.temporary.items.len = scope;
 }
 pub inline fn rootKeep(self: *VM, v: Value) void {
     // DORMANT GATE (the temp-root flavor of forceThunkImpl's force-chain
     // gate — see the soundness argument there): while collection is
     // unarmed these roots cannot be observed, so skip the append. Once
     // armed (or constrained from eval start), root the value normally.
-    if (!self.heap.gc_root_active) return;
-    self.gc_temp_roots.append(self.allocator, v) catch @panic("gc temp root oom");
+    if (!self.heap.collection.root_active) return;
+    self.gc_roots.temporary.append(self.allocator, v) catch @panic("gc temp root oom");
 }
 
 pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
@@ -217,16 +198,16 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
     // created during evaluation should themselves be submitted for
     // speculation — they shouldn't, otherwise a single speculative task
     // can cascade into the rest of the dependency graph.
-    const saved = self.in_speculation;
-    self.in_speculation = true;
+    const saved = self.speculation.active;
+    self.speculation.active = true;
     // Mirror the fiber-state flag into the per-worker-thread creation-
     // context flag so thunks created inside this speculative force (incl.
-    // by nested import VMs, which never toggle `in_speculation`) are
+    // by nested import VMs, which never toggle `speculation.active`) are
     // tagged as spec-context. `Worker.runFiber` re-syncs it whenever a
     // different fiber resumes on this thread.
     self.heap.setSpecCtx(true);
     defer {
-        self.in_speculation = saved;
+        self.speculation.active = saved;
         self.heap.setSpecCtx(saved);
     }
     return forceValueImpl(self, value, false);
@@ -237,9 +218,9 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     // speculative task's cascade is abandoned once it has created more
     // thunks than its budget. Checked here (not just at claimed forces)
     // because creation-heavy builtins force sub-values far more often
-    // than they claim thunks. One predictable `in_speculation` branch on
+    // than they claim thunks. One predictable `speculation.active` branch on
     // the demand path.
-    if (self.in_speculation and self.spec_create_left != vm_mod.no_spec_budget) {
+    if (self.speculation.active and self.speculation.create_left != vm_mod.no_spec_budget) {
         if (specCreateExhausted(self)) return error.SpeculativeBail;
     }
     if (!value.isThunk()) {
@@ -365,8 +346,7 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
             if (forced.kind() == .list) {
                 if (!try enterDeep(self, .list, id, seen)) return;
                 // NON-MOVING GC: `rootKeep` keeps the list live, and ranges
-                // never relocate/are-swept while rooted, so the slice is stable
-                // across the recursive forces — no per-element re-fetch.
+                // remain stable while their owner is rooted.
                 const items = try self.heap.getList(id);
                 forceListAccelerate(self, id, items);
                 for (items) |item| try forceDeepInner(self, item, seen);
@@ -390,10 +370,7 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
 /// concatLists, foldl', concatMap, filter, sort, etc.) get the same
 /// benefit as forceDeep — main is about to touch every item, so getting
 /// helpers started early is free.
-/// Below this threshold, the caller can force the items itself faster
-/// than the round-trip through the scheduler (submit + helper wake +
-/// fiber resume). Chosen empirically; most "small" lists in a NixOS
-/// toplevel sit at 2-4 items.
+/// Avoid scheduling very small walks.
 const fan_out_min_items: usize = 4;
 
 /// Items-per-batch when submitting `force_list_range` /
@@ -401,15 +378,7 @@ const fan_out_min_items: usize = 4;
 /// not items, so batching also lets a fixed-cap queue describe much
 /// more pending work.
 ///
-/// Batch-size history: a 2026-07 census-driven re-derivation moved the
-/// value to 8 on the pre-scan-summary scheduler (interleaved w=8: 8
-/// beat 16 in both series, median 0.894 vs 0.907 and 0.886 vs 0.935,
-/// n=10 pairs each; batch 32 regressed hard). Re-measured while porting
-/// onto the per-lane scan-summary scheduler (413fc60/556af1a): the w=8
-/// win did not survive (neutral, 10 interleaved pairs), and 8 REGRESSED
-/// w=16 (wall median 0.905 vs 0.825, max-RSS 2.9-3.5GB vs 2.2GB —
-/// finer urgent batches feed the spec churn there). Sixteen remains the
-/// measured production choice.
+/// Keep tasks coarse enough to limit queue traffic while retaining fan-out.
 const fan_out_batch_items: u8 = 16;
 
 pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) void {
@@ -441,14 +410,8 @@ pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const heap_m
     // module config tree itself) and the cascade is what lets
     // independent contributions parallelise.
     if (entries.len < fan_out_min_items) return;
-    // Batched like the list fan-out (attrs are a positional slice in the
-    // heap, so the same offset/len range shape works). The former
-    // one-task-per-thunk form cost the submitter — usually MAIN, on its
-    // demand path — a queue push + pending-counter bump (+ periodic
-    // futex wake) per entry; the w=8 task census additionally measured
-    // 82.5% of those tasks arriving at an already-resolved thunk. One
-    // task per ~16 entries pays the scheduling overhead once per
-    // meaningful chunk of work instead of once per thunk.
+    // Attrs are positional heap slices, so the list range task shape also
+    // amortizes queue and wake overhead here.
     var offset: u32 = 0;
     while (offset < entries.len) {
         const remaining = entries.len - offset;
@@ -481,8 +444,8 @@ pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const V
 
 /// Attrset analogue of `forceListAccelerate` — the strict attrset walks
 /// (`attrValues`/`filter`/`mapAttrsToList`/forceDeep-attrs) are where the
-/// module-system option-merge work lives, so this exposes the previously-
-/// serial merge to idle workers.
+/// module-system option-merge work lives, so this exposes independent entries
+/// to idle workers.
 pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []const heap_mod.AttrEntry) void {
     if (comptime prof.enabled) {
         if (self.ctx.is_demand and self.workerId() == 0)
@@ -509,46 +472,46 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
 /// hand. Builtins with large internal loops (genList/map/...) poll this
 /// periodically and `return error.SpeculativeBail` so a single huge,
 /// never-demanded body can't run an allocation loop to completion. Off the
-/// demand path entirely (the `in_speculation` check short-circuits).
+/// demand path entirely (`speculation.active` short-circuits).
 pub inline fn specBailRequested(self: *VM) bool {
-    if (!self.in_speculation) return false;
-    if (self.scheduler.backgroundSuppressed() or self.spec_budget == 0) return true;
-    return self.spec_create_left != vm_mod.no_spec_budget and specCreateExhausted(self);
+    if (!self.speculation.active) return false;
+    if (self.scheduler.backgroundSuppressed() or self.speculation.claim_budget == 0) return true;
+    return self.speculation.create_left != vm_mod.no_spec_budget and specCreateExhausted(self);
 }
 
 /// Settle the fiber-accurate creation budget and report exhaustion. Only
-/// call with `spec_create_left != no_spec_budget`. Meters creations as
+/// call with a bounded `speculation.create_left`. Meters creations as
 /// deltas of the per-worker `thunks_created` counter since the last
 /// settle/re-base on the SAME worker; a check that observes a worker
 /// change before `Worker.runFiber`'s resume re-base ran (defensive — the
 /// re-base runs before the fiber body resumes) re-bases instead of
 /// bailing, so neither migration nor unrelated fibers interleaving on
-/// this worker can burn the task's budget (see `VM.spec_create_left`).
+/// this worker can burn the task's budget (see `VM.speculation.create_left`).
 pub inline fn specCreateExhausted(self: *VM) bool {
     const wid = self.workerId();
     const now = self.heap.currentLocal().thunks_created;
-    if (wid != self.spec_create_worker) {
-        self.spec_create_worker = wid;
-        self.spec_create_snapshot = now;
-        return self.spec_create_left == 0;
+    if (wid != self.speculation.create_worker) {
+        self.speculation.create_worker = wid;
+        self.speculation.create_snapshot = now;
+        return self.speculation.create_left == 0;
     }
-    const delta = now - self.spec_create_snapshot;
-    self.spec_create_snapshot = now;
-    if (delta >= self.spec_create_left) {
-        self.spec_create_left = 0;
+    const delta = now - self.speculation.create_snapshot;
+    self.speculation.create_snapshot = now;
+    if (delta >= self.speculation.create_left) {
+        self.speculation.create_left = 0;
         return true;
     }
-    self.spec_create_left -= delta;
+    self.speculation.create_left -= delta;
     return false;
 }
 
 /// Arm the creation budget on `vm` for a speculative task starting now:
-/// `spec_create_left = budget`, snapshot re-based to the current worker's
+/// Sets `speculation.create_left` and rebases to the current worker's
 /// creation counter.
 pub inline fn specCreateArm(self: *VM, budget: u64) void {
-    self.spec_create_left = budget;
-    self.spec_create_snapshot = self.heap.currentLocal().thunks_created;
-    self.spec_create_worker = self.workerId();
+    self.speculation.create_left = budget;
+    self.speculation.create_snapshot = self.heap.currentLocal().thunks_created;
+    self.speculation.create_worker = self.workerId();
 }
 
 /// Force the operand at stack depth `depth` (0 = top) IN PLACE: force it
@@ -636,46 +599,7 @@ inline fn resolveDispatch(self: *VM, thunk: *Thunk, value: Value) void {
 }
 
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
-    // GC safepoint. forceThunk is a clean unit
-    // boundary; collect here, never mid-allocation. The value being forced
-    // may be off the VM stack (passed by value), so root it explicitly
-    // across the collection. See docs/gc.md.
-    {
-        // Peer stop-the-world response (w>1): only park at native depth 0,
-        // where this fiber holds no builtin Zig locals a peer collector would
-        // need but can't precisely see. The collection coordinator waits for
-        // every peer to reach one of these safe native-depth-zero boundaries.
-        if (self.native_depth == 0 and self.scheduler.gcStopRequested()) {
-            self.gc_extra_root = thunk_val;
-            self.scheduler.gcSafepointPark(self.workerId());
-            self.gc_extra_root = Value.null_val;
-        }
-        // Collector: the threshold was crossed. Win the race to become the
-        // sole collector (others park), stop all peers, then mark+sweep. At
-        // --workers=1 this degenerates to a direct collect (0 peers).
-        //
-        // Fires at ANY native depth (the RSS lever). Correctness rests on the
-        // precise root discipline: eval-VM registration, arg/call rooting, the
-        // in-flight force chain, and container temp-roots in force-walking
-        // native functions; see the root inventory in `docs/gc.md`.
-        if (demand and self.heap.gcCollectRequested()) {
-            self.gc_extra_root = thunk_val;
-            if (self.scheduler.gcTryBeginCollection()) {
-                // Time the barrier (time-to-safepoint + release) separately
-                // from mark/sweep: at w>1 this busy-spin is the dominant cost.
-                const b0 = gc.nowNs();
-                self.scheduler.gcWaitAllParked(self.workerId());
-                const b1 = gc.nowNs();
-                @import("runtime").heap_collector.runCollect(self.heap, self.workerId());
-                const b2 = gc.nowNs();
-                self.scheduler.gcEndCollection(self.workerId());
-                gc.recordBarrier(&self.heap.gc_report, (b1 - b0) + (gc.nowNs() - b2));
-            } else {
-                self.scheduler.gcSafepointPark(self.workerId());
-            }
-            self.gc_extra_root = Value.null_val;
-        }
-    }
+    pollForCollection(self, thunk_val, demand);
     const t = prof.start(.force_thunk_slow);
     defer prof.end(.force_thunk_slow, t);
     const thunk_id = thunk_val.asObjectId();
@@ -721,134 +645,22 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     }
                 }
                 defer if (comptime prof.enabled) prof.ageForceEnd(age_t);
-                // Bail out of in-flight speculation once the demanded
-                // result is ready: rather than run a (possibly large,
-                // never-needed) body to completion, abandon it at this safe
-                // checkpoint and reset the thunk so a later real demand
-                // recomputes it. Bounds the cost of a single wrong
-                // speculative guess (see docs/perf/probes.md).
-                // Speculative path only — demand never bails — and the
-                // atomic load is off the resolved fast path.
-                // A rescued fiber (`FIX_RESCUE`) is on a demand fiber's critical
-                // path — bailing here would strand the waiter and force a
-                // recompute, so it runs its speculation to completion.
-                if (self.in_speculation and self.demand_rescue.load(.monotonic) == 0) {
-                    if (self.scheduler.backgroundSuppressed()) {
-                        publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
-                        return error.SpeculativeBail;
-                    }
-                    // Bounded speculation (`FIX_SIBLING`): a sweep task arms
-                    // a per-member claimed-force budget; when it runs dry,
-                    // abandon the cascade the same way. Sub-thunks already
-                    // resolved below this one stay resolved, so the partial
-                    // work is kept if the value is demanded later.
-                    if (self.spec_budget != vm_mod.no_spec_budget) {
-                        if (self.spec_budget == 0) {
-                            publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
-                            return error.SpeculativeBail;
-                        }
-                        self.spec_budget -= 1;
-                    }
-                }
-                // Thunk-result memo: reuse a previous identical pure
-                // computation on this worker, skipping re-running the body.
-                // Skip the map/genList application stub: its second upvalue is
-                // the per-element index/item, so the key is unique every time
-                // and the probe/store is pure overhead (never hits) that also
-                // evicts genuinely-reusable entries.
-                const memo_key: ?MemoKey = switch (thunk.targetKind()) {
-                    .bytecode => if (thunk.payload.target.bytecode.chunk_id == self.registry.well_known.genlist_apply)
-                        null
-                    else
-                        memoKeyForBytecode(&thunk.payload.target.bytecode),
-                    else => null,
-                };
-                if (comptime prof.enabled) {
-                    // Widening headroom: claimed bytecode thunks that miss
-                    // the ≤2-upvalue memo-key limit, by upvalue count.
-                    if (self.workerId() == 0 and memo_key == null and thunk.targetKind() == .bytecode) {
-                        switch (thunk.payload.target.bytecode.upvalues().len) {
-                            3 => prof_census.memo_inel_3 += 1,
-                            4 => prof_census.memo_inel_4 += 1,
-                            else => prof_census.memo_inel_ge5 += 1,
-                        }
-                    }
-                }
-                if (memo_key) |k| {
-                    const s = &thread_caches.get().thunk_memo[k.idx];
-                    // Memo census: 14.8% hit rate over 2.07M probes (w=1
-                    // NixOS toplevel) — hits save ~306K body runs, well
-                    // over the probe's TLS-miss cost. A 4x smaller table
-                    // (L2-resident) held 14.2% but was wall-neutral;
-                    // don't shrink blindly.
-                    if (comptime prof.enabled) {
-                        if (self.workerId() == 0) prof_census.memo_probes += 1;
-                    }
-                    if (s.token == self.heap.token and s.chunk == k.chunk and
-                        s.count == k.count and s.up0 == k.up0 and s.up1 == k.up1)
-                    {
-                        if (comptime prof.enabled) {
-                            if (self.workerId() == 0) prof_census.memo_hits += 1;
-                        }
-                        resolveDispatch(self, thunk, s.value);
-                        self.heap.gcRecordEdge(thunk_id, s.value); // old→young barrier
-                        recordResolve(self, thunk_id, s.value);
-                        if (demand) thunk.markDemanded();
-                        return s.value;
-                    }
-                }
+                try enforceSpeculationBudget(self, thunk, thunk_id);
+                const memo_key = claimedMemoKey(self, thunk);
+                if (memo_key) |key|
+                    if (reuseMemoizedThunk(self, thunk, thunk_id, key, demand)) |value| return value;
 
                 const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
                 defer prof_path.exit(pp);
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
-                // Root this in-flight thunk (and thus its target closure /
-                // upvalues / attr-access base) for the duration of its body:
-                // a collection triggered by a nested force must not sweep it.
-                // The thunk is `.evaluating` and off the operand stack while
-                // its body runs, and `thunk_val` is dead here (only `thunk_id`
-                // + the raw pointer remain), so the conservative scan can't
-                // see it — the per-VM force chain is load-bearing. The tracer
-                // follows an `.evaluating` thunk's target. See docs/gc.md.
-                //
-                // DORMANT GATE (the GC-default rooting tax): skip this push/pop
-                // entirely while rooting is DORMANT (`gc_root_active == false`).
-                // Soundness argument below assumes the pre-arming region is NEVER
-                // swept — true on roomy machines. In CONSTRAINED mode a major
-                // reclaims it, so `gc_root_active` (= `gc_root_always OR armed`)
-                // is forced true from eval start there and this gate stays open,
-                // rooting the in-flight thunk before the pre-arming major (whose
-                // sweep of a live-but-unrooted in-flight thunk was a UAF).
-                // Non-constrained: `gc_root_active` == `gc_collect_enabled`, so
-                // the original zero-cost-when-dormant argument holds verbatim —
-                // a thunk claimed while dormant is provably OLD in every
-                // collection, so rooting it is a no-op:
-                //   • `armTracking` sets `gc_track_from = objects.count()` at the
-                //     budget/2 STW safepoint; arming is monotonic and only
-                //     becomes visible after an STW where this worker was parked.
-                //     If we read `false` here, no arming has completed-and-resumed
-                //     for us, so this already-allocated thunk's id predates any
-                //     future `gc_track_from` ⇒ `thunk_id < gc_track_from` ⇒ old
-                //     (`gcIsYoung` false).
-                //   • The production collector is ALWAYS a young-gated minor
-                //     (`collect` uses only resetMinor/resetParallelMinor; no
-                //     major). `markObject` short-circuits on old ids under the
-                //     minor gate (`minor_gate and !gcIsYoung → return`), so
-                //     `markObject(old thunk)` neither marks the thunk nor follows
-                //     its target — the chain entry would do NOTHING.
-                //   • Arming mid-body is safe: the thunk stays old (id predates
-                //     the new track_from), young values the body produces are
-                //     rooted by the operand stack / frames / temp-roots (markVm),
-                //     never solely behind this `.evaluating` thunk; the resolved
-                //     result is picked up by `gcRecordEdge` (old→young remset).
-                //   • w>1 safe: arming happens only inside STW (all peers parked);
-                //     a `false` read here means no peer has armed-and-resumed.
-                // Captured ONCE so push and pop agree even if a peer arms
-                // mid-body. Once armed (`--gc-budget` small), this is true
-                // forever and the chain is maintained exactly as before.
-                const gc_root_chain = self.heap.gc_root_active;
-                if (gc_root_chain) self.gc_force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
+                // An evaluating thunk is off the operand stack. Once transient
+                // rooting is active, the force chain keeps its target reachable
+                // across nested collections. Before activation the thunk is
+                // below the collector's sweep floor; arming occurs at STW.
+                const gc_root_chain = self.heap.collection.root_active;
+                if (gc_root_chain) self.gc_roots.force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
                 defer {
-                    if (gc_root_chain) _ = self.gc_force_chain.pop();
+                    if (gc_root_chain) _ = self.gc_roots.force_chain.pop();
                 }
                 // Native-stack guard, checked right before we run the body (the
                 // recursion point). Forcing recurses on the fiber's fixed stack
@@ -902,98 +714,156 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return whnf;
             },
             .busy => {
-                // Discovery probe: main (a demand fiber) blocked on a
-                // helper-owned (.busy) thunk — a serial stall on the critical
-                // path. Record it, note whether the awaited thunk is still
-                // un-demanded (spec-owned ⇒ a demand→spec promotion could pull
-                // it up), and time the whole wait.
-                var disc_start: u64 = 0;
-                var disc_spec = false;
-                if (comptime prof.enabled) {
-                    if (demand and self.workerId() == 0) {
-                        const is_dem = self.ctx.is_demand;
-                        if (is_dem) {
-                            disc_spec = !thunk.isDemanded();
-                            prof_census.disc.busy_wait += 1;
-                            if (disc_spec) prof_census.disc.busy_spec_owned += 1;
-                            disc_start = prof.tscMainOnly();
-                        }
-                    }
-                }
-                defer if (comptime prof.enabled) {
-                    // `tscMainOnly()` returns 0 off worker 0 — the top fiber can
-                    // resume on another worker after the yield, so only account
-                    // the wait when we're still on worker 0 (guards underflow).
-                    const end_tsc = prof.tscMainOnly();
-                    if (disc_start != 0 and end_tsc > disc_start) {
-                        const dt = end_tsc - disc_start;
-                        prof_census.disc.busy_cycles += dt;
-                        if (disc_spec) prof_census.disc.busy_spec_cycles += dt;
-                    }
-                };
-                // Priority inheritance (`FIX_RESCUE`): this fiber — the demand
-                // thread, or itself already rescued — is blocking on a thunk a
-                // peer is computing speculatively. Mark it demanded and promote
-                // the computing fiber so its subtree runs at URGENT priority
-                // (spread across the idle workers) instead of competing with
-                // junk in the spec lane. Transitive: a rescued fiber that
-                // blocks here promotes the next link down the critical chain.
-                if (self.scheduler.config.spec_rescue and
-                    (self.ctx.is_demand or self.demand_rescue.load(.monotonic) != 0) and
-                    !thunk.isDemanded())
-                {
-                    thunk.markDemanded();
-                    self.scheduler.promoteFiber(thunk.future.claimer.load(.monotonic));
-                }
-                // Spin-before-enroll: a helper that is nearly done publishes
-                // within a few hundred ns. Catching the resolve here skips the
-                // whole enroll→suspend→yield→resume→re-tryForce cycle (µs of
-                // machinery). Bounded so a genuinely long wait falls through to
-                // the proper yield below, which lets the worker run other
-                // fibers / drain the queue instead of burning CPU. Re-`tryForce`
-                // is cheap on an `.evaluating` thunk (one acquire-load + claimer
-                // compare, no CAS); on resolve it returns the terminal state and
-                // we `continue` to the top where the outer switch handles it.
-                {
-                    var spins: u32 = 0;
-                    while (spins < busy_spin_before_enroll and thunk.isEvaluating()) : (spins += 1) {
-                        std.atomic.spinLoopHint();
-                    }
-                    // Left `.evaluating` during the spin → re-loop so the outer
-                    // `tryForce` observes (and claims/reads) the terminal state.
-                    if (!thunk.isEvaluating()) continue;
-                }
-                // Enroll on the thunk's fiber-waiter list and yield back
-                // to our worker so it can run other fibers / drain the
-                // queue while we wait. On resume, the outer while loop
-                // retries `tryForce`, where we'll observe whichever
-                // terminal state the resolver left.
-                //
-                // Every real call path now runs inside a fiber. If
-                // we're somehow here without a current fiber, that's a
-                // bug.
-                const park = self.ctx.park orelse
-                    @panic("forceThunkImpl hit .busy outside a fiber — every caller must run on a worker fiber");
-                if (thunk.enrollWaiter(park.waiter)) {
-                    var lbuf: [128]u8 = undefined;
-                    var wait_span = if (self.ctx.is_demand and self.observer.profiling())
-                        self.observer.beginOn(
-                            &critical_wait_observation,
-                            .{ .subject = force_label.critWaitLabel(self, thunk_id, &lbuf) },
-                            .critical,
-                        )
-                    else
-                        observ.Span{};
-                    defer wait_span.cancel();
-                    const ty = prof.start(.wait_busy_thunk);
-                    park.yield();
-                    prof.end(.wait_busy_thunk, ty);
-                    wait_span.finish(.{});
-                }
+                waitForBusyThunk(self, thunk, thunk_id, demand);
                 continue;
             },
         }
     }
+}
+
+fn enforceSpeculationBudget(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId) !void {
+    if (!self.speculation.active or self.speculation.demand_rescue.load(.monotonic) != 0) return;
+    if (self.scheduler.backgroundSuppressed()) {
+        publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
+        return error.SpeculativeBail;
+    }
+    if (self.speculation.claim_budget == vm_mod.no_spec_budget) return;
+    if (self.speculation.claim_budget == 0) {
+        publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
+        return error.SpeculativeBail;
+    }
+    self.speculation.claim_budget -= 1;
+}
+
+fn claimedMemoKey(self: *VM, thunk: *Thunk) ?MemoKey {
+    const key: ?MemoKey = switch (thunk.targetKind()) {
+        // The second upvalue makes every map/genList application key unique.
+        .bytecode => if (thunk.payload.target.bytecode.chunk_id == self.registry.well_known.genlist_apply)
+            null
+        else
+            memoKeyForBytecode(&thunk.payload.target.bytecode),
+        else => null,
+    };
+    if (comptime prof.enabled) {
+        if (self.workerId() == 0 and key == null and thunk.targetKind() == .bytecode) {
+            switch (thunk.payload.target.bytecode.upvalues().len) {
+                3 => prof_census.memo_inel_3 += 1,
+                4 => prof_census.memo_inel_4 += 1,
+                else => prof_census.memo_inel_ge5 += 1,
+            }
+        }
+    }
+    return key;
+}
+
+fn reuseMemoizedThunk(
+    self: *VM,
+    thunk: *Thunk,
+    thunk_id: types.ObjectId,
+    key: MemoKey,
+    demand: bool,
+) ?Value {
+    const slot = &thread_caches.get().thunk_memo[key.idx];
+    if (comptime prof.enabled) {
+        if (self.workerId() == 0) prof_census.memo_probes += 1;
+    }
+    if (slot.token != self.heap.token or slot.chunk != key.chunk or
+        slot.count != key.count or slot.up0 != key.up0 or slot.up1 != key.up1)
+        return null;
+
+    if (comptime prof.enabled) {
+        if (self.workerId() == 0) prof_census.memo_hits += 1;
+    }
+    resolveDispatch(self, thunk, slot.value);
+    self.heap.gcRecordEdge(thunk_id, slot.value);
+    recordResolve(self, thunk_id, slot.value);
+    if (demand) thunk.markDemanded();
+    return slot.value;
+}
+
+fn waitForBusyThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, demand: bool) void {
+    var wait_start: u64 = 0;
+    var speculative_owner = false;
+    if (comptime prof.enabled) {
+        if (demand and self.workerId() == 0 and self.ctx.is_demand) {
+            speculative_owner = !thunk.isDemanded();
+            prof_census.disc.busy_wait += 1;
+            if (speculative_owner) prof_census.disc.busy_spec_owned += 1;
+            wait_start = prof.tscMainOnly();
+        }
+    }
+    defer if (comptime prof.enabled) {
+        // A yielded top fiber can resume off worker 0, where `tscMainOnly`
+        // returns zero. Only record a complete same-clock interval.
+        const wait_end = prof.tscMainOnly();
+        if (wait_start != 0 and wait_end > wait_start) {
+            const elapsed = wait_end - wait_start;
+            prof_census.disc.busy_cycles += elapsed;
+            if (speculative_owner) prof_census.disc.busy_spec_cycles += elapsed;
+        }
+    };
+
+    // Demand priority propagates through chains of speculatively owned thunks.
+    if (self.scheduler.config.spec_rescue and
+        (self.ctx.is_demand or self.speculation.demand_rescue.load(.monotonic) != 0) and
+        !thunk.isDemanded())
+    {
+        thunk.markDemanded();
+        self.scheduler.promoteFiber(thunk.future.claimer.load(.monotonic));
+    }
+
+    var spins: u32 = 0;
+    while (spins < busy_spin_before_enroll and thunk.isEvaluating()) : (spins += 1)
+        std.atomic.spinLoopHint();
+    if (!thunk.isEvaluating()) return;
+
+    const park = self.ctx.park orelse
+        @panic("forceThunkImpl hit .busy outside a worker fiber");
+    if (!thunk.enrollWaiter(park.waiter)) return;
+
+    var label_buf: [128]u8 = undefined;
+    var wait_span = if (self.ctx.is_demand and self.observer.profiling())
+        self.observer.beginOn(
+            &critical_wait_observation,
+            .{ .subject = force_label.critWaitLabel(self, thunk_id, &label_buf) },
+            .critical,
+        )
+    else
+        observ.Span{};
+    defer wait_span.cancel();
+    const timer = prof.start(.wait_busy_thunk);
+    park.yield();
+    prof.end(.wait_busy_thunk, timer);
+    wait_span.finish(.{});
+}
+
+/// Respond to or lead a collection at the force boundary. `thunk_val` may be
+/// off the VM stack, so `gc_roots.extra` keeps it visible while the world stops.
+fn pollForCollection(self: *VM, thunk_val: Value, demand: bool) void {
+    if (self.native_depth == 0 and self.scheduler.gcStopRequested()) {
+        self.gc_roots.extra = thunk_val;
+        self.scheduler.gcSafepointPark(self.workerId());
+        self.gc_roots.extra = Value.null_val;
+    }
+    if (!demand or !self.heap.gcCollectRequested()) return;
+
+    self.gc_roots.extra = thunk_val;
+    defer self.gc_roots.extra = Value.null_val;
+    if (!self.scheduler.gcTryBeginCollection()) {
+        self.scheduler.gcSafepointPark(self.workerId());
+        return;
+    }
+
+    const barrier_start = gc.nowNs();
+    self.scheduler.gcWaitAllParked(self.workerId());
+    const collection_start = gc.nowNs();
+    @import("runtime").heap_collector.runCollect(self.heap, self.workerId());
+    const collection_end = gc.nowNs();
+    self.scheduler.gcEndCollection(self.workerId());
+    gc.recordBarrier(
+        &self.heap.collection.report,
+        (collection_start - barrier_start) + (gc.nowNs() - collection_end),
+    );
 }
 
 pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.TargetKind) anyerror!Value {
@@ -1197,7 +1067,7 @@ fn isTransientThunkError(err: anyerror) bool {
         // A speculative force that bailed because the demanded result is
         // already in hand. Transient: reset to `.unresolved` so a later
         // real demand recomputes the body cleanly. Only ever raised on the
-        // speculative path (gated by `in_speculation`), which `slotEntry`
+        // speculative path (gated by `speculation.active`), which `slotEntry`
         // swallows, so it never reaches a real caller.
         error.SpeculativeBail,
         => true,

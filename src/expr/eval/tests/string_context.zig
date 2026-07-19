@@ -1,5 +1,5 @@
 const std = @import("std");
-const Evaluator = @import("../../eval.zig").Evaluator;
+const Evaluator = @import("../../evaluator.zig").Evaluator;
 
 test "getContext and hasContext expose a derivation's context on its string coercion" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
