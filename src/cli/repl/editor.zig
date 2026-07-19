@@ -98,6 +98,7 @@ pub const Editor = struct {
     /// Completion menu to show below the input (arena-owned), plus the
     /// double-tab detection.
     menu: ?[]const []const u8 = null,
+    completion: ?Completion = null,
     menu_arena: std.heap.ArenaAllocator,
     last_was_tab: bool = false,
 
@@ -112,6 +113,12 @@ pub const Editor = struct {
         saved_buffer: []u8,
         saved_cursor: usize,
         failed: bool = false,
+    };
+
+    const Completion = struct {
+        start: usize,
+        end: usize,
+        selected: ?usize = null,
     };
 
     pub fn init(
@@ -202,8 +209,8 @@ pub const Editor = struct {
         const was_kill = self.last_was_kill;
         self.last_was_tab = false;
         self.last_was_kill = false;
-        // Any key other than a repeated Tab dismisses the menu.
-        if (key.code != .tab) self.clearMenu();
+        // Any key other than completion cycling dismisses the menu.
+        if (key.code != .tab and key.code != .backtab) self.clearMenu();
         // Vertical-movement goal column survives only up/down chains.
         if (key.code != .up and key.code != .down) self.goal_col = null;
 
@@ -227,7 +234,16 @@ pub const Editor = struct {
                     try self.insertCp('\t');
                     return .none;
                 }
+                if (self.menu != null) return self.cycleCompletion(true);
                 return self.completeAtCursor(was_tab);
+            },
+            .backtab => {
+                if (self.buffer.items.len == 0 or allWhitespace(self.buffer.items[0..self.cursor])) return .none;
+                if (self.menu == null) {
+                    _ = try self.completeAtCursor(true);
+                    if (self.menu == null) return .none;
+                }
+                return self.cycleCompletion(false);
             },
             .backspace => {
                 if (key.alt) {
@@ -272,7 +288,7 @@ pub const Editor = struct {
                 return .none;
             },
             .paste_begin, .paste_end => return .none,
-            .insert, .page_up, .page_down, .backtab, .unknown => return .none,
+            .insert, .page_up, .page_down, .unknown => return .none,
         }
     }
 
@@ -614,10 +630,9 @@ pub const Editor = struct {
     // -- completion -----------------------------------------------------------
 
     fn clearMenu(self: *Editor) void {
-        if (self.menu != null) {
-            self.menu = null;
-            _ = self.menu_arena.reset(.retain_capacity);
-        }
+        self.menu = null;
+        self.completion = null;
+        _ = self.menu_arena.reset(.retain_capacity);
     }
 
     fn completeAtCursor(self: *Editor, second_tab: bool) !Reaction {
@@ -643,11 +658,29 @@ pub const Editor = struct {
         // No progress: list on the second tab.
         if (second_tab) {
             self.menu = result.items;
+            self.completion = .{ .start = result.start, .end = result.end };
             self.last_was_tab = true;
             return .none;
         }
         self.last_was_tab = true;
         return .bell;
+    }
+
+    fn cycleCompletion(self: *Editor, forward: bool) !Reaction {
+        const items = self.menu orelse return .none;
+        if (items.len == 0) return .none;
+        const state = &self.completion.?;
+        const next = if (state.selected) |selected|
+            if (forward) (selected + 1) % items.len else (selected + items.len - 1) % items.len
+        else if (forward)
+            0
+        else
+            items.len - 1;
+        try self.replaceSpan(state.start, state.end, items[next]);
+        state.end = state.start + items[next].len;
+        state.selected = next;
+        self.last_was_tab = true;
+        return .none;
     }
 
     fn replaceSpan(self: *Editor, start: usize, end: usize, replacement: []const u8) !void {
@@ -1018,17 +1051,17 @@ const FakeCompleter = struct {
     }
 };
 
-test "tab completion: unique completes, prefix extends, double-tab lists" {
+test "tab completion extends, lists, and cycles in both directions" {
     var fake = FakeCompleter{ .items = &.{ "builtins", "buildEnv", "buildFHSEnv" } };
     var rig = TestRig.init();
     rig.start(fake.completer(), CompleteCheck.always());
     defer rig.deinit();
     const e = &rig.editor;
 
-    // "bui" → common prefix "build" (no unique match).
+    // "bui" → common prefix "buil" (no unique match).
     try rig.type_("bui");
     _ = try rig.key(.{ .code = .tab });
-    try testing.expectEqualStrings("build", e.text());
+    try testing.expectEqualStrings("buil", e.text());
     try testing.expectEqual(@as(usize, 0), e.menuLines().len);
 
     // Second tab with no further progress → menu.
@@ -1036,11 +1069,18 @@ test "tab completion: unique completes, prefix extends, double-tab lists" {
     _ = try rig.key(.{ .code = .tab });
     try testing.expectEqual(@as(usize, 3), e.menuLines().len);
 
-    // Typing dismisses the menu; unique completion fills fully.
-    try rig.type_("t");
-    try testing.expectEqual(@as(usize, 0), e.menuLines().len);
+    // Further tabs replace the span and wrap through the candidates.
     _ = try rig.key(.{ .code = .tab });
     try testing.expectEqualStrings("builtins", e.text());
+    _ = try rig.key(.{ .code = .tab });
+    try testing.expectEqualStrings("buildEnv", e.text());
+    _ = try rig.key(.{ .code = .backtab });
+    try testing.expectEqualStrings("builtins", e.text());
+
+    // Ordinary editing dismisses the menu.
+    _ = try rig.key(.{ .code = .end });
+    try rig.type_(".");
+    try testing.expectEqual(@as(usize, 0), e.menuLines().len);
 }
 
 test "reverse search finds, refines, and aborts" {
