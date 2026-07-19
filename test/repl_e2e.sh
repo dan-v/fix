@@ -44,7 +44,8 @@ out=$(printf ':t { a = 1; b = 2; }\n' | "$FIX" repl 2>/dev/null)
 t "bare: :t" "a set (2 attrs)" "$out"
 
 out=$(printf ':?\n' | "$FIX" repl 2>/dev/null)
-t "bare: :? lists :vm" ":vm, :d, :disasm" "$out"
+t "bare: :? lists debugger" ":debug, :d EXPR" "$out"
+t "bare: :? lists :vm" ":vm [COMMAND | EXPR]" "$out"
 
 out=$(printf ':env\nfoo = 1\n:env\n' | "$FIX" repl 2>/dev/null)
 t "bare: :env before" "no bindings" "$out"
@@ -66,7 +67,12 @@ fi
 
 out=$(printf '1 + 2\n:vm ls 1\n:vm chunks 1\n' | "$FIX" repl 2>/dev/null)
 t "bare: :vm name tree is queryable" "@0 <root>" "$out"
-t "bare: :vm listings report bounded overflow" "increase LIMIT" "$out"
+listing_lines=$(wc -l <<<"$out")
+if (( listing_lines <= 6 )); then
+    echo "ok   bare: :vm listings stay bounded"
+else
+    echo "FAIL bare: :vm listings emitted $listing_lines lines"; fails=$((fails+1))
+fi
 
 out=$(printf '1\n:vm heap\n' | "$FIX" repl --bare --color=never 2>/dev/null)
 t "bare: :vm heap has bounded aggregate output" "object slots" "$out"
@@ -76,6 +82,20 @@ if (( heap_lines <= 24 )); then
     echo "ok   bare: :vm heap stays bounded"
 else
     echo "FAIL bare: :vm heap emitted $heap_lines lines"; fails=$((fails+1))
+fi
+
+# The automation frontend remains line-oriented while exercising the same
+# entry stop, deferred import stepping, pending breakpoints, and logical stack.
+out=$(printf ':d (import ./test/imported.nix).value\nbreak test/imported.nix:1\nbreakpoints\ns\nbt\nfinish\nc\n' |
+    "$FIX" repl --bare --color=never 2>&1)
+t "bare debug: native entry" "-- debugger (entry) --" "$out"
+t "bare debug: pending import breakpoint" "test/imported.nix:1 (pending)" "$out"
+t "bare debug: steps into import" "imported.nix:1:3" "$out"
+t "bare debug: cross-import caller" "#1 <repl>:1:2" "$out"
+if [[ "$out" == *$'\x1b['* ]]; then
+    echo "FAIL bare debug: no CSI output"; fails=$((fails+1))
+else
+    echo "ok   bare debug: no CSI output"
 fi
 
 out=$(printf ':i builtins.map\n' | "$FIX" repl 2>/dev/null)
@@ -118,7 +138,10 @@ else
     echo "ok   tty: inline repl does not claim alternate screen"
 fi
 
-out=$(pty ':vm\rq')
+out=$(
+    ( sleep 0.4; printf ':vm\r'; sleep 0.4; printf 'q'; sleep 0.4 ) |
+        script -qec "$FIX repl" /dev/null 2>/dev/null
+)
 t "tty: :vm opens before first evaluation" "The VM explorer" "$out"
 
 # The VM workspace is entered explicitly, and leaving it restores the normal
@@ -136,6 +159,42 @@ else
 fi
 after_vm=${out##*$'\x1b[?1049l'}
 t "tty: vm transcript survives screen exit" "fix> 1 + 1" "$after_vm"
+
+# A debugger reached from the inline prompt owns one alternate-screen session
+# across multiple step stops, then restores the ordinary REPL on continue.
+out=$(
+    ( sleep 0.4; printf ':d (import ./test/imported.nix).value\r'; sleep 0.6;
+      printf 's'; sleep 0.5; printf 'c'; sleep 0.4; printf '\004'; sleep 0.2 ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+t "tty debug: opens integrated screen" "fix debug · entry" "$out"
+t "tty debug: import step stays in screen" "fix debug · step · imported.nix" "$out"
+debug_enters=$(grep -o $'\x1b\[?1049h' <<<"$out" | wc -l)
+debug_leaves=$(grep -o $'\x1b\[?1049l' <<<"$out" | wc -l)
+if (( debug_enters == 1 && debug_leaves == 1 )); then
+    echo "ok   tty debug: one screen across steps"
+else
+    echo "FAIL tty debug: screen lifecycle ($debug_enters enters, $debug_leaves leaves)"; fails=$((fails+1))
+fi
+
+# Inside :vm the debugger borrows the explorer's raw mode and alternate screen;
+# nested stepping must not emit another enter/leave pair.
+out=$(
+    ( sleep 0.4; printf ':vm\r'; sleep 0.5;
+      printf ':d (import ./test/imported.nix).value\r'; sleep 0.6;
+      printf 's'; sleep 0.5; printf 'c'; sleep 0.4;
+      printf '\033'; sleep 0.2; printf 'q'; sleep 0.4; printf '\004'; sleep 0.2 ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+t "tty vm debug: debugger is integrated" "fix debug · entry" "$out"
+t "tty vm debug: explorer redraws" "fix vm" "$out"
+vm_debug_enters=$(grep -o $'\x1b\[?1049h' <<<"$out" | wc -l)
+vm_debug_leaves=$(grep -o $'\x1b\[?1049l' <<<"$out" | wc -l)
+if (( vm_debug_enters == 1 && vm_debug_leaves == 1 )); then
+    echo "ok   tty vm debug: borrows explorer screen"
+else
+    echo "FAIL tty vm debug: nested screen lifecycle ($vm_debug_enters enters, $vm_debug_leaves leaves)"; fails=$((fails+1))
+fi
 
 # Tab completion: a unique candidate completes fully in-line.
 out=$(pty 'builtins.getFla\t\r')
