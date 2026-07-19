@@ -99,7 +99,6 @@ pub const SessionHost = struct {
     executeFn: *const fn (ctx: *anyopaque, input: []const u8, output: *std.Io.Writer) anyerror!void,
     focusFn: *const fn (ctx: *anyopaque) ?ChunkId,
     quitFn: *const fn (ctx: *anyopaque) bool,
-    show_hint: bool = true,
 
     fn execute(self: SessionHost, input: []const u8, output: *std.Io.Writer) !void {
         try self.executeFn(self.ctx, input, output);
@@ -124,6 +123,7 @@ pub fn runSession(
     ev: *Evaluator,
     color_depth: ColorDepth,
     editor: *editor_mod.Editor,
+    transcript: *transcript_mod.Capture,
     host: SessionHost,
 ) !void {
     var name_index = try bytecode.inspect.NameIndex.build(allocator, ev.chunkRegistry());
@@ -137,7 +137,7 @@ pub fn runSession(
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
     defer tui.deinit();
-    try tui.runSession(editor, host);
+    try tui.runSession(editor, transcript, host);
 }
 
 const IndexJob = struct {
@@ -301,7 +301,7 @@ const Tui = struct {
         }
     }
 
-    fn runSession(self: *Tui, editor: *editor_mod.Editor, host: SessionHost) !void {
+    fn runSession(self: *Tui, editor: *editor_mod.Editor, capture: *transcript_mod.Capture, host: SessionHost) !void {
         var raw = term_mod.RawMode.enable() catch return error.NotATerminal;
         defer raw.disable();
 
@@ -314,9 +314,6 @@ const Tui = struct {
             w.flush() catch {};
         }
 
-        var capture = transcript_mod.Capture.init(self.allocator, 4 * 1024 * 1024);
-        defer capture.deinit();
-        if (host.show_hint) try capture.writer.writeAll("fix repl — :? for help; Esc explores the VM\n");
         try self.rebuildTranscriptLines(capture.written());
 
         const first_focus = host.focusedChunk();
@@ -343,7 +340,7 @@ const Tui = struct {
         var frame_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer frame_arena.deinit();
 
-        var prompt_active = true;
+        var prompt_active = false;
         var decoder = keys_mod.Decoder{};
         var events: keys_mod.Decoder.List = .empty;
         defer events.deinit(self.allocator);
@@ -372,7 +369,7 @@ const Tui = struct {
             prompt_renderer.setWidth(size.cols);
             prompt_view.max_rows = size.rows -| 2;
             const prompt_rows = try prompt_renderer.measure(prompt_view);
-            try self.drawSession(w, &prompt_renderer, prompt_view, prompt_rows, &capture, prompt_active);
+            try self.drawSession(w, &prompt_renderer, prompt_view, prompt_rows, capture, prompt_active);
             try w.flush();
 
             // Keep polling while a thread handle exists, even if the worker
@@ -444,8 +441,7 @@ const Tui = struct {
                     else => false,
                 };
                 if (leave_explorer) {
-                    prompt_active = true;
-                    continue;
+                    return;
                 }
                 const enter_command = switch (key.code) {
                     .cp => |cp| cp == ':',

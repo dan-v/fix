@@ -2,11 +2,10 @@
 //!
 //! Two strictly separated modes:
 //!
-//! - **Interactive** (stdin AND stdout are a tty, and `--bare` not given): one
-//!   full-screen prompt/transcript/VM-explorer surface. The prompt retains the
-//!   same history, completion, and smart-enter multiline editor as bare mode's
-//!   command semantics; Escape exposes the additional tree/detail panes. Raw
-//!   mode is restored on every exit path, including fatal signals.
+//! - **Interactive** (stdin AND stdout are a tty, and `--bare` not given): an
+//!   ordinary inline editor with history, completion, and smart-enter
+//!   multiline input. `:vm` explicitly enters the full-screen VM workspace;
+//!   leaving it restores normal scrollback and the inline prompt.
 //! - **Bare** (`--bare`, or any non-tty end): a plain read-a-line loop — no
 //!   escape sequences, no raw mode, no redraw tricks. Lines are accumulated
 //!   until they form a complete expression, so multiline input pipes work.
@@ -35,7 +34,9 @@ const check = @import("../repl/check.zig");
 const history_mod = @import("../repl/history.zig");
 const editor_mod = @import("../repl/editor.zig");
 const complete_mod = @import("../repl/complete.zig");
+const line_input = @import("../repl/line_input.zig");
 const pager_mod = @import("../repl/pager.zig");
+const transcript_mod = @import("../repl/transcript.zig");
 
 const Options = args.Options;
 const Evaluator = engine.Evaluator;
@@ -147,6 +148,7 @@ const Repl = struct {
     /// implementation while keeping terminal writes inside the owned screen.
     output_capture: ?*std.Io.Writer = null,
     tui_active: bool = false,
+    vm_requested: bool = false,
     history: history_mod.History,
     quit: bool = false,
 
@@ -242,6 +244,13 @@ const Repl = struct {
 
     fn runInteractive(self: *Repl) !void {
         const env = self.proc_init.environ_map;
+        if (env.get("FIX_REPL_NO_HINT") == null) {
+            var out = self.output();
+            defer out.flush() catch {};
+            try presentation.style(out.writer(), self.use_color, .dim);
+            try out.writer().writeAll("fix repl — :? for help, :vm to explore the VM\n");
+            try presentation.reset(out.writer(), self.use_color);
+        }
         self.history.open(self.io, env);
 
         var completer_ctx = complete_mod.Ctx{
@@ -256,18 +265,50 @@ const Repl = struct {
             .{ .ctx = self, .isCompleteFn = isCompleteThunk },
         );
         defer editor.deinit();
+
+        while (!self.quit) {
+            const line = line_input.read(self.allocator, self.io, self.use_color, &editor) catch |err| switch (err) {
+                error.NotATerminal => return self.runBare(false),
+                else => return err,
+            } orelse break;
+            defer self.allocator.free(line);
+
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            try self.history.add(trimmed);
+            try self.processInput(trimmed);
+            if (self.vm_requested and !self.quit) try self.runVmSession(&editor);
+        }
+    }
+
+    fn runVmSession(self: *Repl, editor: *editor_mod.Editor) !void {
+        self.vm_requested = false;
+        var journal = transcript_mod.Capture.init(self.allocator, 4 * 1024 * 1024);
+        defer journal.deinit();
+
         self.tui_active = true;
         defer self.tui_active = false;
-        pager_mod.runSession(self.allocator, self.io, self.ev, self.color_depth, &editor, .{
+        pager_mod.runSession(self.allocator, self.io, self.ev, self.color_depth, editor, &journal, .{
             .ctx = self,
             .executeFn = sessionExecute,
             .focusFn = sessionFocus,
             .quitFn = sessionQuit,
-            .show_hint = env.get("FIX_REPL_NO_HINT") == null,
         }) catch |err| switch (err) {
-            error.NotATerminal => return self.runBare(false),
+            error.NotATerminal => return,
             else => return err,
         };
+
+        var out = self.output();
+        defer out.flush() catch {};
+        if (journal.omitted() > 0) {
+            try presentation.style(out.writer(), self.use_color, .dim);
+            try out.writer().print("[VM transcript retained its newest {Bi}; {Bi} omitted]\n", .{
+                journal.written().len,
+                journal.omitted(),
+            });
+            try presentation.reset(out.writer(), self.use_color);
+        }
+        try out.writer().writeAll(journal.written());
     }
 
     fn sessionExecute(raw: *anyopaque, input: []const u8, sink: *std.Io.Writer) !void {
@@ -674,7 +715,7 @@ const Repl = struct {
         }
         if (self.tui_active) return;
         if (self.interactive) {
-            try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id, self.color_depth);
+            self.vm_requested = true;
         } else {
             var out = self.output();
             defer out.flush() catch {};
@@ -945,6 +986,7 @@ test {
     _ = @import("../repl/width.zig");
     _ = @import("../repl/editor.zig");
     _ = @import("../repl/render.zig");
+    _ = @import("../repl/line_input.zig");
     _ = @import("../repl/history.zig");
     _ = @import("../repl/check.zig");
     _ = @import("../repl/commands.zig");
