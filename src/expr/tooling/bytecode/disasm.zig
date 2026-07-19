@@ -60,6 +60,8 @@ pub const Options = struct {
     /// Terminal width, for extending the zebra row background across the whole
     /// line. 0 disables the extension (background stops at the content).
     line_width: u16 = 0,
+    /// Instruction byte offset to mark as the live/current location.
+    current_offset: ?u32 = null,
 };
 
 /// Bytes shown per row: the hex column is a fixed 4 cells wide (so the opcode
@@ -314,10 +316,11 @@ fn writeChunkAt(
         // forward instead of crashing on `@enumFromInt`.
         if (op_byte >= opcode_mod.count) {
             ip += 1;
-            const bg = takeBg(&stripe, options.color_depth);
+            const current = options.current_offset == @as(u32, @intCast(start));
+            const bg = rowBackground(&stripe, current, options.color_depth);
             try beginRow(writer, bg, options.color_depth);
             try writeGuide(writer, cc, bg, options.color_depth);
-            try writeOffset(writer, start, bg, options.color_depth);
+            try writeOffset(writer, start, current, bg, options.color_depth);
             try writer.writeAll("  ");
             if (options.show_bytes) try writeByteCellColored(writer, op_byte, byteRgb(op_byte), bg, options.color_depth);
             if (options.show_bytes) try writer.splatByteAll(' ', (bytes_per_line - 1) * 3 + 1);
@@ -353,10 +356,11 @@ fn writeChunkAt(
         // Every instruction renders through the same head/tail token model:
         // the mnemonic row carries the head operand (raw accessors, byte-linked,
         // with a colored token comment); multiline ops add indented child rows.
-        const bg = takeBg(&stripe, options.color_depth);
+        const current = options.current_offset == @as(u32, @intCast(start));
+        const bg = rowBackground(&stripe, current, options.color_depth);
         try beginRow(writer, bg, options.color_depth);
         try writeGuide(writer, cc, bg, options.color_depth);
-        try writeOffset(writer, start, bg, options.color_depth);
+        try writeOffset(writer, start, current, bg, options.color_depth);
         try writer.writeAll("  ");
         var seq: usize = @intFromEnum(op) + 1;
         var head: Line = undefined;
@@ -409,8 +413,15 @@ fn byteRgb(b: u8) [3]u8 {
     return hueColor(b);
 }
 
-fn writeOffset(writer: *std.Io.Writer, off: usize, bg: ?[3]u8, color_depth: ColorDepth) !void {
-    try writer.writeAll("  ");
+fn writeOffset(writer: *std.Io.Writer, off: usize, current: bool, bg: ?[3]u8, color_depth: ColorDepth) !void {
+    if (current) {
+        try setFg(writer, hueColor(3), color_depth);
+        try writer.writeAll("▶");
+        try sgrReset(writer, bg, color_depth);
+        try writer.writeByte(' ');
+    } else {
+        try writer.writeAll("  ");
+    }
     if (color_depth.enabled()) try writer.writeAll("\x1b[2m");
     try writer.print("{x:0>4}", .{off});
     try sgrReset(writer, bg, color_depth);
@@ -450,6 +461,11 @@ const name_color: [3]u8 = .{ 0x83, 0xd6, 0x8f };
 /// Subtle background tint for alternating multi-row list records, so each
 /// 2-row entry reads as one block.
 const row_bg: [3]u8 = .{ 0x28, 0x28, 0x34 };
+
+/// A restrained live-instruction tint; the marker remains visible on terminals
+/// without color, while this makes the whole row easy to reacquire in a dense
+/// disassembly.
+const current_row_bg: [3]u8 = .{ 0x32, 0x2b, 0x43 };
 
 /// A constant pool slot's identity color, shared by its `#N` references and its
 /// row in the pool table. Offset well past typical chunk ids so a `#N` constant
@@ -539,6 +555,11 @@ fn takeBg(stripe: *usize, color_depth: ColorDepth) ?[3]u8 {
     const bg: ?[3]u8 = if (color_depth.enabled() and stripe.* % 2 == 1) row_bg else null;
     stripe.* += 1;
     return bg;
+}
+
+fn rowBackground(stripe: *usize, current: bool, color_depth: ColorDepth) ?[3]u8 {
+    const striped = takeBg(stripe, color_depth);
+    return if (current and color_depth.enabled()) current_row_bg else striped;
 }
 
 /// Start a body row: establish its background (if striped) from column 0, so
@@ -2078,6 +2099,26 @@ test "disassembling omits the constant pool section when show_constants is false
     const text = out.written();
 
     try std.testing.expect(std.mem.indexOf(u8, text, "  constants:\n") == null);
+}
+
+test "disassembly marks the current instruction" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try writeChunk(allocator, &out.writer, null, &chunk, .{}, .{
+        .show_constants = false,
+        .current_offset = 0,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "▶ 0000") != null);
 }
 
 test "table-only disassembly omits instructions" {

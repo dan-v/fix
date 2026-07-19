@@ -40,7 +40,8 @@ pub const DebuggerTui = struct {
     prompt_active: bool = false,
     selected_frame: usize = 0,
     detail: enum { source, disassembly } = .source,
-    detail_scroll: usize = 0,
+    detail_scroll: isize = 0,
+    context_frames: usize = 2,
     pauses: usize = 0,
 
     pub fn init(
@@ -211,9 +212,9 @@ pub const DebuggerTui = struct {
 
     fn handleKey(self: *DebuggerTui, session: *DebugSession, key: keys_mod.Key) !Outcome {
         switch (key.code) {
-            .up => self.selectOlder(session),
-            .down => self.selectNewer(session),
-            .page_up => self.detail_scroll -|= 8,
+            .up => self.selectPreviousFrameRow(session),
+            .down => self.selectNextFrameRow(session),
+            .page_up => self.detail_scroll -= 8,
             .page_down => self.detail_scroll += 8,
             .tab => self.toggleDetail(),
             .escape => return .resume_close,
@@ -231,8 +232,10 @@ pub const DebuggerTui = struct {
                     'c' => return .resume_close,
                     'q' => return .abort,
                     'v', '\t' => self.toggleDetail(),
-                    'k' => self.selectOlder(session),
-                    'j' => self.selectNewer(session),
+                    'k' => self.selectPreviousFrameRow(session),
+                    'j' => self.selectNextFrameRow(session),
+                    '[', '-' => self.context_frames -|= 1,
+                    ']', '+' => self.context_frames = @min(self.context_frames + 1, 6),
                     ':' => {
                         self.prompt_active = true;
                         try self.editor.insertText(":");
@@ -382,14 +385,14 @@ pub const DebuggerTui = struct {
         try self.log.appendSlice(self.allocator, text);
     }
 
-    fn selectOlder(self: *DebuggerTui, session: *DebugSession) void {
-        if (self.selected_frame > 0) self.selected_frame -= 1;
-        self.selected_frame = @min(self.selected_frame, session.frameCount() -| 1);
+    fn selectPreviousFrameRow(self: *DebuggerTui, session: *DebugSession) void {
+        self.selected_frame = @min(self.selected_frame + 1, session.frameCount() -| 1);
         self.detail_scroll = 0;
     }
 
-    fn selectNewer(self: *DebuggerTui, session: *DebugSession) void {
-        self.selected_frame = @min(self.selected_frame + 1, session.frameCount() -| 1);
+    fn selectNextFrameRow(self: *DebuggerTui, session: *DebugSession) void {
+        if (self.selected_frame > 0) self.selected_frame -= 1;
+        self.selected_frame = @min(self.selected_frame, session.frameCount() -| 1);
         self.detail_scroll = 0;
     }
 
@@ -440,7 +443,10 @@ pub const DebuggerTui = struct {
             @min(session.frameCount(), @max(@as(usize, 1), body_rows / 4));
         const content_rows = body_rows -| narrow_stack_rows;
         const locals_rows = @min(content_rows, @min(@as(usize, 7), @max(@as(usize, 3), content_rows / 3)));
-        const detail_rows = content_rows -| locals_rows;
+        const context_capacity = content_rows -| locals_rows -| 4;
+        const context_count = @min(self.context_frames, @min(session.frameCount(), context_capacity -| 1));
+        const context_rows = if (context_count > 0) context_count + 1 else 0;
+        const detail_rows = content_rows -| locals_rows -| context_rows;
 
         var row: usize = 0;
         while (row < body_rows) : (row += 1) {
@@ -458,8 +464,10 @@ pub const DebuggerTui = struct {
                 const content_row = row - narrow_stack_rows;
                 if (content_row < detail_rows) {
                     try self.drawDetailRow(&frame, arena, session, content_row, detail_width, detail_rows);
+                } else if (content_row < detail_rows + context_rows) {
+                    try self.drawContextRow(&frame, arena, session, content_row - detail_rows, detail_width, context_count);
                 } else {
-                    try self.drawLocalsRow(&frame, arena, session, content_row - detail_rows, detail_width);
+                    try self.drawLocalsRow(&frame, arena, session, content_row - detail_rows - context_rows, detail_width);
                 }
             }
         }
@@ -468,7 +476,7 @@ pub const DebuggerTui = struct {
             try frame.clearRow(rows);
             try self.drawPrompt(&frame, arena, rows, cols);
         } else {
-            const footer = " s step · n next · f finish · c continue · b break · i eval · v source/code · q abort ";
+            const footer = " s step · n next · f finish · c continue · b break · [ ] context · v source/code · q abort ";
             try frame.bar(rows, footer, cols, .footer);
             try frame.cursor(false);
         }
@@ -525,7 +533,7 @@ pub const DebuggerTui = struct {
         if (self.detail == .source) {
             try self.drawSourceRow(frame, arena, session, row - 1, width, rows -| 1);
         } else {
-            try self.drawDisassemblyRow(frame, arena, session, row - 1, width);
+            try self.drawDisassemblyRow(frame, arena, session, row - 1, width, rows -| 1);
         }
     }
 
@@ -544,7 +552,7 @@ pub const DebuggerTui = struct {
             return;
         };
         const focus_line: usize = @max(info.line, 1);
-        const start_line = @max(@as(usize, 1), focus_line -| (rows / 2) + self.detail_scroll);
+        const start_line = addScroll(focus_line -| (rows / 2), self.detail_scroll, 1);
         const line_no = start_line + row;
         const bounds = sourceLine(source, line_no) orelse return;
         const breakpoint = if (info.file) |file| hasBreakpoint(session, file, @intCast(line_no)) else false;
@@ -579,7 +587,9 @@ pub const DebuggerTui = struct {
         session: *DebugSession,
         row: usize,
         width: usize,
+        rows: usize,
     ) !void {
+        const info = session.frame(self.selected_frame);
         const id = session.frameChunkId(self.selected_frame);
         const chunk = self.ev.getChunk(id) orelse return;
         var output: std.Io.Writer.Allocating = .init(arena);
@@ -590,9 +600,73 @@ pub const DebuggerTui = struct {
             .show_bytes = true,
             .color_depth = self.color_depth,
             .line_width = @intCast(@min(width, std.math.maxInt(u16))),
+            .current_offset = info.instruction,
         });
-        const line = textLine(output.written(), self.detail_scroll + row) orelse return;
+        const current_line = markedLine(output.written()) orelse 0;
+        const centered = current_line -| (rows / 2);
+        const first = addScroll(centered, self.detail_scroll, 0);
+        const line = textLine(output.written(), first + row) orelse return;
         try frame.text(line, 0, width, .plain);
+    }
+
+    fn drawContextRow(
+        self: *DebuggerTui,
+        frame: *tui.Frame,
+        arena: std.mem.Allocator,
+        session: *DebugSession,
+        row: usize,
+        width: usize,
+        count: usize,
+    ) !void {
+        if (row == 0) {
+            const title = try std.fmt.allocPrint(arena, " stack context · {d} frame{s} · [ / ] adjusts ", .{ count, if (count == 1) "" else "s" });
+            try frame.text(title, 0, width, .section);
+            return;
+        }
+        const from_top = row - 1;
+        if (from_top >= count or from_top >= session.frameCount()) return;
+        const index = session.frameCount() - 1 - from_top;
+        const info = session.frame(index);
+        const prefix = try std.fmt.allocPrint(arena, "#{d} {s}:{d} │ ", .{
+            from_top,
+            if (info.file) |file| std.fs.path.basename(file) else "<repl>",
+            info.line,
+        });
+        const role: tui.Role = if (index == self.selected_frame) .selection_marker else if (from_top == 0) .current else .muted;
+        try frame.text(prefix, 0, width, role);
+        const prefix_width = width_mod.strWidth(prefix);
+        if (prefix_width >= width) return;
+
+        const source = session.frameSourceText(index) orelse return self.drawFrameName(frame, arena, session, index, width - prefix_width);
+        const bounds = sourceLine(source, info.line) orelse return self.drawFrameName(frame, arena, session, index, width - prefix_width);
+        const focus: ?source_render.Range = if (info.span) |span| blk: {
+            const span_start: usize = @intCast(span.offset);
+            const span_end = span_start +| @as(usize, @intCast(@max(span.len, 1)));
+            const start = @max(bounds.start, span_start);
+            const end = @min(bounds.end, span_end);
+            if (start >= end) break :blk null;
+            break :blk .{ .start = start - bounds.start, .end = end - bounds.start };
+        } else null;
+        var highlighted: std.Io.Writer.Allocating = .init(arena);
+        try source_render.writeLine(&highlighted.writer, source[bounds.start..bounds.end], .{
+            .color_depth = self.color_depth,
+            .focus = focus,
+        });
+        try frame.text(highlighted.written(), 0, width - prefix_width, .plain);
+    }
+
+    fn drawFrameName(
+        self: *DebuggerTui,
+        frame: *tui.Frame,
+        arena: std.mem.Allocator,
+        session: *DebugSession,
+        index: usize,
+        width: usize,
+    ) !void {
+        _ = self;
+        var name: std.Io.Writer.Allocating = .init(arena);
+        if (session.hasFrameName(index)) try session.writeFrameName(&name.writer, index);
+        try frame.text(if (name.written().len > 0) name.written() else "(source unavailable)", 0, width, .muted);
     }
 
     fn drawLocalsRow(
@@ -676,6 +750,17 @@ fn textLine(text: []const u8, wanted: usize) ?[]const u8 {
     return null;
 }
 
+fn markedLine(text: []const u8) ?usize {
+    const marker = std.mem.indexOf(u8, text, "▶") orelse return null;
+    return std.mem.count(u8, text[0..marker], "\n");
+}
+
+fn addScroll(anchor: usize, delta: isize, minimum: usize) usize {
+    if (delta >= 0) return @max(minimum, anchor +| @as(usize, @intCast(delta)));
+    const almost: usize = @intCast(-(delta + 1));
+    return @max(minimum, anchor -| (almost +| 1));
+}
+
 fn reasonName(reason: engine.BreakReason) []const u8 {
     return switch (reason) {
         .entry => "entry",
@@ -694,6 +779,7 @@ const help_text =
     \\i              evaluate an expression in the selected pause scope
     \\v / Tab        toggle source and disassembly
     \\j/k, arrows    select a stack frame
+    \\[ / ]          show fewer / more stack-context snippets
     \\:              enter any console command
     \\q / Ctrl-D     abort evaluation
 ;
@@ -714,4 +800,10 @@ test "sourceLine returns one-based source rows" {
         const bounds = sourceLine("one\ntwo\nthree", 2).?;
         break :blk "one\ntwo\nthree"[bounds.start..bounds.end];
     });
+}
+
+test "signed detail scrolling moves around a centered location" {
+    try std.testing.expectEqual(@as(usize, 12), addScroll(20, -8, 1));
+    try std.testing.expectEqual(@as(usize, 1), addScroll(3, -8, 1));
+    try std.testing.expectEqual(@as(usize, 28), addScroll(20, 8, 1));
 }

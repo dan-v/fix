@@ -267,18 +267,41 @@ pub const BreakpointTable = struct {
         var start: usize = 0;
         while (start < chunk.code.len) {
             if (offset <= start) return @intCast(start);
-
-            const raw = self.originalOpcodeByte(chunk_id, start, chunk);
-            if (raw >= opcode.count) return null;
-            const op: opcode.OpCode = @enumFromInt(raw);
-            const operands_start = start + 1;
-            const operands_len = opcode.operandLen(op, chunk.code, operands_start);
-            if (operands_len > chunk.code.len - operands_start) return null;
-            const next = operands_start + operands_len;
+            const next = self.instructionEnd(chunk_id, chunk, start) orelse return null;
             if (offset < next) return if (next < chunk.code.len) @intCast(next) else null;
             start = next;
         }
         return null;
+    }
+
+    /// Resolve a frame's saved ip to the instruction which suspended there.
+    /// Handlers save positions anywhere from just after the opcode through the
+    /// end of its operands, so this deliberately treats `ip == end` as part of
+    /// the preceding instruction. Patched breakpoint bytes are decoded through
+    /// their saved original opcodes.
+    pub fn instructionForSavedIp(
+        self: *const BreakpointTable,
+        chunk_id: ChunkId,
+        chunk: *const Chunk,
+        ip: usize,
+    ) ?u32 {
+        var start: usize = 0;
+        while (start < chunk.code.len) {
+            const end = self.instructionEnd(chunk_id, chunk, start) orelse return null;
+            if (ip <= end) return @intCast(start);
+            start = end;
+        }
+        return null;
+    }
+
+    fn instructionEnd(self: *const BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk, start: usize) ?usize {
+        const raw = self.originalOpcodeByte(chunk_id, start, chunk);
+        if (raw >= opcode.count) return null;
+        const op: opcode.OpCode = @enumFromInt(raw);
+        const operands_start = start + 1;
+        const operands_len = opcode.operandLen(op, chunk.code, operands_start);
+        if (operands_len > chunk.code.len - operands_start) return null;
+        return operands_start + operands_len;
     }
 
     fn placedAt(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) bool {
@@ -443,4 +466,8 @@ test "step sites advance suspended operand ips to instruction boundaries" {
     try table.placeStepSite(9, 2, &chunk);
     try std.testing.expectEqual(breakpoint_byte, code[2]);
     try std.testing.expectEqual(@as(?u32, 5), table.instructionBoundaryAtOrAfter(9, &chunk, 3));
+    try std.testing.expectEqual(@as(?u32, 0), table.instructionForSavedIp(9, &chunk, 1));
+    try std.testing.expectEqual(@as(?u32, 0), table.instructionForSavedIp(9, &chunk, 2));
+    try std.testing.expectEqual(@as(?u32, 2), table.instructionForSavedIp(9, &chunk, 3));
+    try std.testing.expectEqual(@as(?u32, 2), table.instructionForSavedIp(9, &chunk, 5));
 }

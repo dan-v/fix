@@ -29,6 +29,7 @@ pub const Context = struct {
 
 pub const DebugFrame = struct {
     chunk_id: types.ChunkId,
+    instruction: ?u32,
     file: ?[]const u8,
     line: u32,
     column: u32,
@@ -68,6 +69,7 @@ pub fn frame(ctx: Context, i: usize) DebugFrame {
     const file_id = if (span) |s| s.file else bytecode.inspect.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, ctx.registry);
     return .{
         .chunk_id = f.chunk_id,
+        .instruction = if (ctx.breakpoints) |bp| bp.instructionForSavedIp(f.chunk_id, f.chunk_ptr, f.ip) else null,
         .file = if (file_id) |fid| ctx.intern.get(fid) else null,
         .line = if (span) |s| s.line else 0,
         .column = if (span) |s| s.column else 0,
