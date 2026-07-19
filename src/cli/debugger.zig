@@ -32,7 +32,7 @@ pub const Console = struct {
     stdin_buf: [16 * 1024]u8 = undefined,
     reader: ?std.Io.File.Reader = null,
     /// When set, read console input through this reader instead of our own —
-    /// used by the bare repl, whose own buffered reader would otherwise swallow
+    /// used by the streaming repl, whose own buffered reader would otherwise swallow
     /// the shared stdin pipe. Null everywhere else (eval, interactive repl).
     ext_reader: ?*std.Io.File.Reader = null,
     /// How many times we've paused (for the banner).
@@ -48,7 +48,7 @@ pub const Console = struct {
     }
 
     /// Read console input from `r` (a shared reader) rather than our own — the
-    /// bare repl calls this so its line reader and the console don't fight over
+    /// streaming repl calls this so its line reader and the console don't fight over
     /// the stdin pipe's buffer.
     pub fn attachReader(self: *Console, r: *std.Io.File.Reader) void {
         self.ext_reader = r;
@@ -75,7 +75,7 @@ pub const Console = struct {
         // A debugger pause is a nested prompt inside the full-screen REPL.
         // Temporarily reveal the ordinary terminal and restore canonical input;
         // returning to the evaluator re-enters the alternate screen/raw mode,
-        // which the REPL immediately redraws. `fix eval --debugger` and bare
+        // which the REPL immediately redraws. `fix eval --debugger` and inline
         // mode are already cooked, so this becomes a no-op there.
         var screen_pause = ScreenPause.begin(self.io);
         defer screen_pause.end();
@@ -96,7 +96,7 @@ pub const Console = struct {
 
         // In the nested case, read a byte at a time so the debugger cannot
         // buffer a command typed ahead for the resumed REPL. Other modes keep
-        // the persistent buffered reader (or the bare REPL's shared reader).
+        // the persistent buffered reader (or the streaming REPL's shared reader).
         var nested_buf: [1]u8 = undefined;
         var nested_reader = std.Io.File.stdin().readerStreaming(self.io, &nested_buf);
         const in = if (screen_pause.cooked.active) &nested_reader else self.inputReader();

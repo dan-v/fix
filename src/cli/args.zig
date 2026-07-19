@@ -440,7 +440,7 @@ const Spec = struct {
 };
 
 /// Commands that take a source expression and its selectors (everything but the
-/// bare `repl`). `disasm` compiles rather than evaluates, but shares the same
+/// streaming `repl`). `disasm` compiles rather than evaluates, but shares the same
 /// source model (bare path / `-E` / `--file` / `--flake` / `-A` / `-I`).
 const source_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .disasm, .@"switch" };
 /// Source wrappers/selectors operate on evaluated text. `parse` consumes the

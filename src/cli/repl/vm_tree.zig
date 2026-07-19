@@ -387,11 +387,46 @@ test "display tree consolidates duplicate name siblings" {
     try testing.expectEqual(@as(u64, 2), index.statsOf(children[0]).chunks);
 }
 
+test "display tree groups files by relative path components" {
+    const testing = std.testing;
+    var intern = try runtime.InternTable.init(testing.allocator);
+    defer intern.deinit();
+    var registry = try bytecode.ChunkRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const basename = try intern.intern("default.nix");
+    const file_a = try intern.intern("/work/a/default.nix");
+    const file_b = try intern.intern("/work/b/default.nix");
+    const name_a = try registry.childName(bytecode.root_name_id, basename, false);
+    const name_b = try registry.childName(bytecode.root_name_id, basename, false);
+    _ = try registry.registerNamed(try testChunkAt(testing.allocator, 1, file_a), name_a);
+    _ = try registry.registerNamed(try testChunkAt(testing.allocator, 2, file_b), name_b);
+
+    var index = try Index.build(testing.allocator, &registry, &intern, "/work");
+    defer index.deinit();
+    for ([_][]const u8{ "a", "b" }) |directory| {
+        const dir = findChild(&index, root_node_id, directory).?;
+        const file = findChild(&index, dir, "default.nix").?;
+        try testing.expect(index.node(file).?.file_leaf);
+        try testing.expectEqual(@as(u64, 1), index.statsOf(file).chunks);
+    }
+}
+
+fn findChild(index: *const Index, parent: NodeId, label: []const u8) ?NodeId {
+    for (index.childrenOf(parent)) |id| if (std.mem.eql(u8, index.node(id).?.label, label)) return id;
+    return null;
+}
+
 fn testChunk(allocator: std.mem.Allocator, value: i64) !bytecode.Chunk {
+    return testChunkAt(allocator, value, null);
+}
+
+fn testChunkAt(allocator: std.mem.Allocator, value: i64, file: ?InternId) !bytecode.Chunk {
     var builder = try bytecode.ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
     try builder.emitConstant(allocator, runtime.Value.int(value));
     try builder.writeOp(allocator, .ret);
     try builder.writeOp(allocator, .halt);
+    if (file) |id| builder.body_span = .{ .file = id, .offset = 0, .len = 1, .line = 1, .column = 1 };
     return builder.finish(allocator, 0);
 }

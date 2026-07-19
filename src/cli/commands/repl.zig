@@ -142,10 +142,10 @@ const Repl = struct {
     interactive: bool,
     tui_enabled: bool,
     /// Shared by persistent `--debugger` sessions and transient `:debug`
-    /// commands; the bare loop attaches its buffered stdin reader here.
+    /// commands; the streaming loop attaches its buffered stdin reader here.
     debug_console: ?*debugger.Console = null,
-    /// Full-screen debugger selected only for an interactive tty. Null in bare
-    /// mode, which deliberately retains the line-oriented console contract.
+    /// Full-screen debugger selected only when TUI workspaces are enabled.
+    /// Null for --no-tui/streaming sessions, which use the line console.
     debug_tui: ?*debugger_tui.DebuggerTui = null,
 
     /// Scope bindings, insertion-ordered. Keys are owned; values are heap
@@ -163,7 +163,7 @@ const Repl = struct {
     /// or name tree grows. Bare queries share it instead of rescanning millions
     /// of chunks for every command.
     vm_index: ?engine.bytecode.inspect.NameIndex = null,
-    /// Compact live-object index for bounded bare `:vm objects` queries.
+    /// Compact live-object index for bounded inline `:vm objects` queries.
     /// Invalidated before evaluation or collection mutates the heap.
     vm_objects: ?runtime.ObjectHeap.ObjectSnapshot = null,
     /// Direct REPL sources are not backed by the evaluator's file cache. Keep

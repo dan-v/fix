@@ -1,4 +1,4 @@
-//! Presentation-neutral debugger command parsing shared by the bare console
+//! Presentation-neutral debugger command parsing shared by the line console
 //! and the interactive terminal UI.
 
 const std = @import("std");
