@@ -540,7 +540,7 @@ const Tui = struct {
 
             for (events.items) |key| {
                 if (prompt_active) {
-                    if (key.code == .escape and editor.text().len == 0 and self.hasInspector()) {
+                    if (key.code == .escape and editor.text().len == 0) {
                         prompt_active = false;
                         continue;
                     }
@@ -964,13 +964,6 @@ const Tui = struct {
         return switch (self.currentKind()) {
             .heap => |view| view,
             else => null,
-        };
-    }
-
-    fn hasInspector(self: *const Tui) bool {
-        return switch (self.currentKind()) {
-            .help => false,
-            .chunk, .heap => true,
         };
     }
 
@@ -1510,7 +1503,7 @@ const Tui = struct {
             .tab, .backtab => {
                 if (self.focus == .chunks) {
                     self.focus = .disassembly;
-                } else if (self.hasInspector()) {
+                } else {
                     self.focus = .chunks;
                 }
             },
@@ -1620,7 +1613,7 @@ const Tui = struct {
         var transcript_rows = upper_rows;
         // Prompt mode belongs to the transcript. The explorer only claims the
         // body after the user deliberately leaves the prompt with Escape.
-        if (!prompt_active and self.hasInspector() and upper_rows >= 7) {
+        if (!prompt_active and upper_rows >= 7) {
             transcript_rows = @min(@max(@as(usize, 2), upper_rows / 5), 5);
             explorer_rows = upper_rows - transcript_rows - 1;
         }
@@ -1643,7 +1636,9 @@ const Tui = struct {
                 if (prompt_active) "repl" else if (self.focus == .chunks) "tree" else "inspector",
             }) catch " fix vm "
         else
-            " fix repl  ·  prompt ";
+            std.fmt.bufPrint(&header_buf, " fix vm  ·  help  ·  {s} ", .{
+                if (prompt_active) "repl" else if (self.focus == .chunks) "tree" else "inspector",
+            }) catch " fix vm ";
         try frame.bar(1, header, cols, .header);
 
         if (explorer_rows > 0) {

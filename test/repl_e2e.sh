@@ -118,6 +118,9 @@ else
     echo "ok   tty: inline repl does not claim alternate screen"
 fi
 
+out=$(pty ':vm\rq')
+t "tty: :vm opens before first evaluation" "The VM explorer" "$out"
+
 # The VM workspace is entered explicitly, and leaving it restores the normal
 # terminal before replaying expressions evaluated inside the workspace.
 out=$(

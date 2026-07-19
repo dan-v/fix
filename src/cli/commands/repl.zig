@@ -760,6 +760,11 @@ const Repl = struct {
 
     fn vmShow(self: *Repl) !void {
         const chunk_id = self.vm_focus orelse {
+            if (self.interactive and !self.tui_active) {
+                self.vm_heap_requested = false;
+                self.vm_requested = true;
+                return;
+            }
             try self.printError("no VM focus yet — evaluate an expression or use `:vm chunk ID`", .{});
             return;
         };
