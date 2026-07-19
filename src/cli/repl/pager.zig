@@ -316,7 +316,7 @@ const Tui = struct {
 
         var capture = transcript_mod.Capture.init(self.allocator, 4 * 1024 * 1024);
         defer capture.deinit();
-        if (host.show_hint) try capture.writer.writeAll("fix repl — :? for help; Ctrl-O or Esc explores the VM\n");
+        if (host.show_hint) try capture.writer.writeAll("fix repl — :? for help; Esc explores the VM\n");
         try self.rebuildTranscriptLines(capture.written());
 
         const first_focus = host.focusedChunk();
@@ -393,14 +393,6 @@ const Tui = struct {
             }
 
             for (events.items) |key| {
-                if (key.isCtrl('o')) {
-                    if (prompt_active and self.currentChunk() != null) {
-                        prompt_active = false;
-                    } else {
-                        prompt_active = true;
-                    }
-                    continue;
-                }
                 if (prompt_active) {
                     if (key.code == .escape and editor.text().len == 0 and self.currentChunk() != null) {
                         prompt_active = false;
@@ -1114,13 +1106,13 @@ const Tui = struct {
 
         var footer_buf: [512]u8 = undefined;
         const footer = if (prompt_active and capture.omitted() > 0)
-            std.fmt.bufPrint(&footer_buf, " Enter evaluate · Ctrl-O/Esc explore · Tab complete · {Bi} output omitted ", .{capture.omitted()}) catch " Ctrl-O explore "
+            std.fmt.bufPrint(&footer_buf, " Enter evaluate · Esc explore · Tab complete · {Bi} output omitted ", .{capture.omitted()}) catch " Esc explore "
         else if (prompt_active)
-            " Enter evaluate · Ctrl-O/Esc explore · Tab complete · Ctrl-R history "
+            " Enter evaluate · Esc explore · Tab complete · Ctrl-R history · Ctrl-O newline "
         else
-            std.fmt.bufPrint(&footer_buf, " Ctrl-O/q prompt · Tab pane · 1 code · 2 tables · 3 source · 4 refs · ↵ open{s} ", .{
+            std.fmt.bufPrint(&footer_buf, " q/Esc prompt · Tab pane · 1 code · 2 tables · 3 source · 4 refs · ↵ open{s} ", .{
                 if (self.indexing) " · indexing" else "",
-            }) catch " Ctrl-O prompt ";
+            }) catch " q prompt ";
         try moveTo(w, screen_rows, 1);
         try writeBar(w, footer, cols);
 

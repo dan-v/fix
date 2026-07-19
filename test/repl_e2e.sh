@@ -44,17 +44,29 @@ out=$(printf ':t { a = 1; b = 2; }\n' | "$FIX" repl 2>/dev/null)
 t "bare: :t" "a set (2 attrs)" "$out"
 
 out=$(printf ':?\n' | "$FIX" repl 2>/dev/null)
-t "bare: :? lists :disasm" ":d, :disasm" "$out"
+t "bare: :? lists :vm" ":vm, :d, :disasm" "$out"
 
 out=$(printf ':env\nfoo = 1\n:env\n' | "$FIX" repl 2>/dev/null)
 t "bare: :env before" "no bindings" "$out"
 t "bare: :env after" "foo : an integer" "$out"
 
-out=$(printf ':d 1 + 2\n' | "$FIX" repl 2>/dev/null)
-t "bare: :d prints a chunk" "chunk[0x" "$out"
+out=$(printf ':vm 1 + 2\n' | "$FIX" repl 2>/dev/null)
+t "bare: :vm prints a chunk" "chunk[0x" "$out"
 # (1 + 2 folds to a constant; a lambda body keeps its arithmetic.)
-out=$(printf ':d x: x + 1\n' | "$FIX" repl 2>/dev/null)
-t "bare: :d shows opcodes" "int_add" "$out"
+out=$(printf ':vm x: x + 1\n' | "$FIX" repl 2>/dev/null)
+t "bare: :vm shows opcodes" "int_add" "$out"
+
+out=$(printf ':vm x: x + 1\n:vm\n' | "$FIX" repl 2>/dev/null)
+chunks=$(grep -c 'chunk\[0x' <<<"$out")
+if (( chunks >= 2 )); then
+    echo "ok   bare: focused chunk is repeatable"
+else
+    echo "FAIL bare: focused chunk is repeatable"; fails=$((fails+1))
+fi
+
+out=$(printf '1 + 2\n:vm ls 1\n:vm chunks 1\n' | "$FIX" repl 2>/dev/null)
+t "bare: :vm name tree is queryable" "@0 <root>" "$out"
+t "bare: :vm listings report bounded overflow" "increase LIMIT" "$out"
 
 out=$(printf ':i builtins.map\n' | "$FIX" repl 2>/dev/null)
 t "bare: :i function" "a function" "$out"
@@ -96,7 +108,10 @@ out=$(pty 'builtins.getFla\t\r')
 t "tty: unique attr completion" "getFlake" "$out"
 
 # Smart-enter: '{ a = 1;' is incomplete -> continuation prompt appears.
-out=$(pty '{ a = 1;\r}\r')
+out=$(
+    ( sleep 0.4; printf '{ a = 1;\r'; sleep 0.2; printf '}\r'; sleep 0.4 ) |
+        script -qec "$FIX repl" /dev/null 2>/dev/null
+)
 t "tty: continuation prompt" "...>" "$out"
 t "tty: multiline evaluates" "a = 1" "$out"
 

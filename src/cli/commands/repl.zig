@@ -5,7 +5,7 @@
 //! - **Interactive** (stdin AND stdout are a tty, and `--bare` not given): one
 //!   full-screen prompt/transcript/VM-explorer surface. The prompt retains the
 //!   same history, completion, and smart-enter multiline editor as bare mode's
-//!   command semantics; Ctrl-O exposes the additional tree/detail panes. Raw
+//!   command semantics; Escape exposes the additional tree/detail panes. Raw
 //!   mode is restored on every exit path, including fatal signals.
 //! - **Bare** (`--bare`, or any non-tty end): a plain read-a-line loop — no
 //!   escape sequences, no raw mode, no redraw tricks. Lines are accumulated

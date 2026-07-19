@@ -880,7 +880,7 @@ pub const Evaluator = struct {
     }
 
     /// `compileSource` with an ambient scope attrset (see
-    /// `evaluateWithScope`). The repl's `:disasm` compiles expressions that
+    /// `evaluateWithScope`). The repl's VM explorer compiles expressions that
     /// reference repl bindings through this.
     pub fn compileSourceScoped(self: *Evaluator, source: []const u8, scope: ?Value) !ChunkId {
         return self.parseAndCompile(source, self.base_path, null, scope);
