@@ -88,7 +88,7 @@ fi
 # entry stop, deferred import stepping, pending breakpoints, and logical stack.
 out=$(printf ':d (import ./test/imported.nix).value\nbreak test/imported.nix:1\nbreakpoints\ns\nbt\nfinish\nc\n' |
     "$FIX" repl --bare --color=never 2>&1)
-t "bare debug: native entry" "-- debugger (entry) --" "$out"
+t "bare debug: native entry" "-- debugger #1 (entry) --" "$out"
 t "bare debug: pending import breakpoint" "test/imported.nix:1 (pending)" "$out"
 t "bare debug: steps into import" "imported.nix:1:3" "$out"
 t "bare debug: cross-import caller" "#1 <repl>:1:2" "$out"
@@ -167,8 +167,8 @@ out=$(
       printf 's'; sleep 0.5; printf 'c'; sleep 0.4; printf '\004'; sleep 0.2 ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty debug: opens integrated screen" "fix debug · entry" "$out"
-t "tty debug: import step stays in screen" "fix debug · step · imported.nix" "$out"
+t "tty debug: opens integrated screen" "fix debug · pause 1 · entry" "$out"
+t "tty debug: import step stays in screen" "fix debug · pause 2 · step · imported.nix" "$out"
 debug_enters=$(grep -o $'\x1b\[?1049h' <<<"$out" | wc -l)
 debug_leaves=$(grep -o $'\x1b\[?1049l' <<<"$out" | wc -l)
 if (( debug_enters == 1 && debug_leaves == 1 )); then
@@ -197,7 +197,7 @@ out=$(
       printf '\033'; sleep 0.2; printf 'q'; sleep 0.4; printf '\004'; sleep 0.2 ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty vm debug: debugger is integrated" "fix debug · entry" "$out"
+t "tty vm debug: debugger is integrated" "fix debug · pause 1 · entry" "$out"
 t "tty vm debug: explorer redraws" "fix vm" "$out"
 vm_debug_enters=$(grep -o $'\x1b\[?1049h' <<<"$out" | wc -l)
 vm_debug_leaves=$(grep -o $'\x1b\[?1049l' <<<"$out" | wc -l)
@@ -231,13 +231,15 @@ t "tty: ctrl-c clears" "42" "$out"
 out=$(( sleep 0.4; printf '\x04'; sleep 0.4 ) | script -qec "$FIX repl; echo exit=\$?" /dev/null 2>/dev/null)
 t "tty: ctrl-d exits 0" "exit=0" "$out"
 
-# --bare forces the plain loop even on a tty (no escape codes emitted).
-out=$(printf '1 + 1\n\x04' | script -qec "$FIX repl --bare" /dev/null 2>/dev/null)
-t "tty+bare: evaluates" "2" "$out"
-if [[ "$out" == *$'\x1b['* ]]; then
-    echo "FAIL tty+bare: no CSI output"; fails=$((fails+1))
+# --no-tui retains the inline editor but prevents optional workspaces from
+# claiming the alternate screen.
+out=$(( sleep 0.4; printf '1 + 1\r'; sleep 0.3; printf '\x04'; sleep 0.2 ) |
+    script -qec "$FIX repl --no-tui --color=never" /dev/null 2>/dev/null)
+t "tty+no-tui: evaluates" "2" "$out"
+if [[ "$out" == *$'\x1b[?1049h'* ]]; then
+    echo "FAIL tty+no-tui: no alternate screen"; fails=$((fails+1))
 else
-    echo "ok   tty+bare: no CSI output"
+    echo "ok   tty+no-tui: no alternate screen"
 fi
 
 # --- GC between inputs: retained-capacity plateau -----------------------------
