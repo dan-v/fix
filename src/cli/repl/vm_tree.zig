@@ -348,7 +348,7 @@ fn normalizedName(id: NameId, max: NameId) NameId {
 }
 
 fn relativePath(path: []const u8, base_path: ?[]const u8) []const u8 {
-    const base = std.mem.trimRight(u8, base_path orelse return path, "/\\");
+    const base = std.mem.trimEnd(u8, base_path orelse return path, "/\\");
     if (base.len == 0 or path.len <= base.len or !std.mem.eql(u8, path[0..base.len], base)) return path;
     if (path[base.len] != '/' and path[base.len] != '\\') return path;
     return path[base.len + 1 ..];

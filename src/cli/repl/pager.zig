@@ -2570,7 +2570,7 @@ fn disasmTarget(line: []const u8) RowAction {
 }
 
 fn disasmOffset(chunk: *const bytecode.Chunk, line: []const u8) ?usize {
-    const trimmed = std.mem.trimLeft(u8, line, " │\t");
+    const trimmed = std.mem.trimStart(u8, line, " │\t");
     const end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return null;
     const offset = std.fmt.parseInt(usize, trimmed[0..end], 16) catch return null;
     return if (offset < chunk.code.len) offset else null;
