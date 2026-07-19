@@ -35,8 +35,35 @@ pub const DebugFrame = struct {
     span: ?bytecode.chunk.Chunk.SourceSpan,
 };
 
+/// One physical frame together with the VM whose stack owns it. Imported files
+/// run in synchronous nested VMs, so a logical debugger stack may cross more
+/// than one physical frame array.
+pub const FrameRef = struct {
+    vm: *VM,
+    index: usize,
+
+    pub fn frame(self: FrameRef) *@import("../vm/context.zig").Frame {
+        return &self.vm.frames[self.index];
+    }
+};
+
+pub fn frameCount(vm: *const VM) usize {
+    var total: usize = vm.frames_len;
+    var cursor = vm.debug_parent;
+    while (cursor) |parent| : (cursor = parent.debug_parent) total += parent.frames_len;
+    return total;
+}
+
+/// Resolve logical frame `i` (outermost = 0) through the import-parent chain.
+pub fn frameRef(vm: *VM, i: usize) FrameRef {
+    const parent_count = if (vm.debug_parent) |parent| frameCount(parent) else 0;
+    if (i < parent_count) return frameRef(vm.debug_parent.?, i);
+    return .{ .vm = vm, .index = i - parent_count };
+}
+
 pub fn frame(ctx: Context, i: usize) DebugFrame {
-    const f = &ctx.vm.frames[i];
+    const ref = frameRef(ctx.vm, i);
+    const f = ref.frame();
     const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip);
     const file_id = if (span) |s| s.file else bytecode.inspect.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, ctx.registry);
     return .{
@@ -49,7 +76,7 @@ pub fn frame(ctx: Context, i: usize) DebugFrame {
 }
 
 pub fn frameSourceText(ctx: Context, i: usize) ?[]const u8 {
-    const f = &ctx.vm.frames[i];
+    const f = frameRef(ctx.vm, i).frame();
     const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip) orelse return ctx.source;
     if (span.file) |fid| return ctx.files.readFile(ctx.intern.get(fid)) catch ctx.source;
     return ctx.source;
@@ -57,15 +84,16 @@ pub fn frameSourceText(ctx: Context, i: usize) ?[]const u8 {
 
 pub fn step(ctx: Context, kind: StepKind) !void {
     const bp = ctx.breakpoints orelse return;
-    const depth = ctx.vm.frames_len;
+    const depth = frameCount(ctx.vm);
     if (depth == 0) return;
-    const cur = &ctx.vm.frames[depth - 1];
+    const depth_u32: u32 = @intCast(depth);
+    const cur = frameRef(ctx.vm, depth - 1).frame();
 
     var sites: std.ArrayListUnmanaged(bytecode.BreakpointTable.Site) = .empty;
     defer sites.deinit(ctx.allocator);
     const max_depth: u32 = switch (kind) {
-        .out => if (depth >= 1) depth - 1 else 0,
-        .over => depth,
+        .out => depth_u32 - 1,
+        .over => depth_u32,
         .into => std.math.maxInt(u32),
     };
 
@@ -77,7 +105,7 @@ pub fn step(ctx: Context, kind: StepKind) !void {
         }
     }
     if (depth >= 2) {
-        const caller = &ctx.vm.frames[depth - 2];
+        const caller = frameRef(ctx.vm, depth - 2).frame();
         try sites.append(ctx.allocator, .{ .chunk_id = caller.chunk_id, .offset = @intCast(caller.ip) });
     }
     if (kind == .into) {
@@ -93,12 +121,13 @@ pub fn step(ctx: Context, kind: StepKind) !void {
 }
 
 pub fn scopeAttrs(ctx: Context) !Value {
-    if (ctx.vm.frames_len == 0) return bindValue(ctx, "it");
+    const count = frameCount(ctx.vm);
+    if (count == 0) return bindValue(ctx, "it");
 
     var map: std.AutoArrayHashMapUnmanaged(types.InternId, Value) = .empty;
     defer map.deinit(ctx.allocator);
-    for (0..ctx.vm.frames_len) |i| collectWithScopes(ctx, &map, i) catch {};
-    for (0..ctx.vm.frames_len) |i| try collectFrameBindings(ctx, &map, i);
+    for (0..count) |i| collectWithScopes(ctx, &map, i) catch {};
+    for (0..count) |i| try collectFrameBindings(ctx, &map, i);
     try map.put(ctx.allocator, try ctx.intern.intern("it"), ctx.value);
 
     var entries: std.ArrayListUnmanaged(runtime.heap.AttrEntry) = .empty;
@@ -114,7 +143,8 @@ fn bindValue(ctx: Context, name: []const u8) !Value {
 }
 
 fn collectWithScopes(ctx: Context, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), i: usize) !void {
-    const f = &ctx.vm.frames[i];
+    const ref = frameRef(ctx.vm, i);
+    const f = ref.frame();
     if (ctx.registry.upvalueNamesOf(f.chunk_id)) |names| if (f.upvalues) |ups| {
         for (names, 0..) |nid, idx| {
             if (idx >= ups.len) break;
@@ -124,7 +154,7 @@ fn collectWithScopes(ctx: Context, map: *std.AutoArrayHashMapUnmanaged(types.Int
     if (ctx.registry.localNamesOf(f.chunk_id)) |names| {
         for (names, 0..) |nid, slot| {
             if (slot >= f.local_count) break;
-            if (ctx.intern.get(nid).len == 0) try mergeWithAttrs(ctx, map, ctx.vm.stack[f.frame_base + slot]);
+            if (ctx.intern.get(nid).len == 0) try mergeWithAttrs(ctx, map, ref.vm.stack[f.frame_base + slot]);
         }
     }
 }
@@ -137,7 +167,8 @@ fn mergeWithAttrs(ctx: Context, map: *std.AutoArrayHashMapUnmanaged(types.Intern
 }
 
 fn collectFrameBindings(ctx: Context, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), i: usize) !void {
-    const f = &ctx.vm.frames[i];
+    const ref = frameRef(ctx.vm, i);
+    const f = ref.frame();
     if (ctx.registry.upvalueNamesOf(f.chunk_id)) |names| if (f.upvalues) |ups| {
         for (names, 0..) |nid, idx| {
             if (idx >= ups.len) break;
@@ -147,7 +178,7 @@ fn collectFrameBindings(ctx: Context, map: *std.AutoArrayHashMapUnmanaged(types.
     if (ctx.registry.localNamesOf(f.chunk_id)) |names| {
         for (names, 0..) |nid, slot| {
             if (slot >= f.local_count) break;
-            if (displayName(ctx.intern.get(nid)) != null) try map.put(ctx.allocator, nid, ctx.vm.stack[f.frame_base + slot]);
+            if (displayName(ctx.intern.get(nid)) != null) try map.put(ctx.allocator, nid, ref.vm.stack[f.frame_base + slot]);
         }
     }
 }

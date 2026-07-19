@@ -141,8 +141,8 @@ pub const ImportHost = struct {
     // `parent_depth` = the calling VM's `native_depth` (the import builtin has
     // already +1'd it): the nested import VM inherits `parent_depth - 1` so
     // imports stay depth-transparent for GC safepoints.
-    import_value: *const fn (*anyopaque, []const u8, u32) anyerror!Value,
-    scoped_import: *const fn (*anyopaque, Value, []const u8, u32) anyerror!Value,
+    import_value: *const fn (*anyopaque, *VM, []const u8, u32) anyerror!Value,
+    scoped_import: *const fn (*anyopaque, *VM, Value, []const u8, u32) anyerror!Value,
     find_file: *const fn (*anyopaque, []const u8) anyerror!Value,
     get_env: *const fn (*anyopaque, []const u8) anyerror![]const u8,
 };
@@ -204,6 +204,10 @@ pub const VM = struct {
     /// `Evaluator.initVm` when a debugger is active; read only by the
     /// `breakpoint` opcode handler, which is unreachable without a patch.
     breakpoints: ?*bytecode_mod.BreakpointTable = null,
+    /// Synchronous import VMs form a debugger-only parent chain back to the
+    /// VM containing the `import` call. The parent outlives this nested VM;
+    /// normal execution never reads the link.
+    debug_parent: ?*VM = null,
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.
@@ -467,6 +471,15 @@ pub const VM = struct {
     pub inline fn workerId(self: *const VM) u8 {
         _ = self;
         return worker_id_mod.current;
+    }
+
+    /// Physical frames across the synchronous import-parent chain. Used only
+    /// by patched debugger traps, so normal dispatch does not pay for it.
+    pub fn debugFrameDepth(self: *const VM) u32 {
+        var total = self.frames_len;
+        var cursor = self.debug_parent;
+        while (cursor) |parent| : (cursor = parent.debug_parent) total += parent.frames_len;
+        return total;
     }
 
     /// The owner is about to reset the arena backing `allocator` (fiber

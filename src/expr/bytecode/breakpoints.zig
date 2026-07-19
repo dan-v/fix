@@ -61,7 +61,9 @@ pub const BreakpointTable = struct {
     pub const Request = struct {
         id: u32,
         file: []u8,
+        requested_line: u32,
         line: u32,
+        pending: bool,
     };
 
     /// A patched site realizing a request in a specific chunk.
@@ -78,6 +80,7 @@ pub const BreakpointTable = struct {
         line: u32,
         /// How many sites were patched at set time (more may appear lazily).
         sites: usize,
+        pending: bool,
     };
 
     pub fn init(gpa: std.mem.Allocator, intern: *const InternTable) BreakpointTable {
@@ -95,7 +98,9 @@ pub const BreakpointTable = struct {
     /// The evaluator calls this after registration; the registry has no hidden
     /// debugger mutation hook.
     pub fn placeRegisteredChunk(self: *BreakpointTable, chunk_id: ChunkId, chunk: *Chunk) void {
-        for (self.requests.items) |req| self.placeRequestInChunk(req, chunk_id, chunk) catch {};
+        for (self.requests.items) |req| {
+            if (!req.pending) self.placeRequestInChunk(req, chunk_id, chunk) catch {};
+        }
         if (self.step_armed and self.step_follow_new_chunks) {
             const offset = firstMappedOffset(chunk) orelse return;
             self.placeStepSite(chunk_id, offset, chunk) catch {};
@@ -103,23 +108,54 @@ pub const BreakpointTable = struct {
     }
 
     /// Set a breakpoint at FILE:LINE. Resolves LINE to the nearest line ≥ LINE
-    /// that carries code (in any registered chunk of that file); returns null if
-    /// the file/line maps to nothing. Patches all matching registered chunks now
-    /// and, via the sink, any that compile later.
-    pub fn set(self: *BreakpointTable, registry: *ChunkRegistry, file: []const u8, line: u32) !?SetResult {
-        const resolved = self.nearestLine(registry, file, line) orelse return null;
+    /// in an already compiled file, or retains a pending request until the file
+    /// compiles. Patches all matching registered chunks now and any that appear
+    /// later.
+    pub fn set(self: *BreakpointTable, registry: *ChunkRegistry, file: []const u8, line: u32) !SetResult {
+        const resolved = self.nearestLine(registry, file, line);
         const id = self.next_id;
         self.next_id += 1;
-        try self.requests.append(self.gpa, .{ .id = id, .file = try self.gpa.dupe(u8, file), .line = resolved });
+        try self.requests.append(self.gpa, .{
+            .id = id,
+            .file = try self.gpa.dupe(u8, file),
+            .requested_line = line,
+            .line = resolved orelse line,
+            .pending = resolved == null,
+        });
         const req = self.requests.items[self.requests.items.len - 1];
 
         const before = self.placements.items.len;
-        var cid: ChunkId = 0;
-        const n = registry.count();
-        while (cid < n) : (cid += 1) {
-            if (registry.get(cid)) |c| try self.placeRequestInChunk(req, cid, c);
+        if (!req.pending) {
+            var cid: ChunkId = 0;
+            const n = registry.count();
+            while (cid < n) : (cid += 1) {
+                if (registry.get(cid)) |c| try self.placeRequestInChunk(req, cid, c);
+            }
         }
-        return .{ .id = id, .line = resolved, .sites = self.placements.items.len - before };
+        return .{
+            .id = id,
+            .line = req.line,
+            .sites = self.placements.items.len - before,
+            .pending = req.pending,
+        };
+    }
+
+    /// Resolve requests for a source file once its top-level compilation unit
+    /// is complete. This lets `break FILE:LINE` be set before an import exists
+    /// without guessing the nearest executable line from a partially
+    /// registered set of child chunks.
+    pub fn resolvePendingFile(self: *BreakpointTable, registry: *ChunkRegistry, compiled_file: []const u8) void {
+        for (self.requests.items) |*req| {
+            if (!req.pending or !textFileMatches(req.file, compiled_file)) continue;
+            const resolved = self.nearestLine(registry, compiled_file, req.requested_line) orelse continue;
+            req.line = resolved;
+            req.pending = false;
+            var cid: ChunkId = 0;
+            const n = registry.count();
+            while (cid < n) : (cid += 1) {
+                if (registry.get(cid)) |chunk| self.placeRequestInChunk(req.*, cid, chunk) catch {};
+            }
+        }
     }
 
     /// Remove a breakpoint by id, restoring every byte it patched. Returns true
@@ -281,9 +317,17 @@ pub const BreakpointTable = struct {
         for (self.placements.items) |p| {
             if (p.chunk_id == chunk_id and p.offset == start) return;
         }
-        const original = chunk.code[start];
-        if (original == breakpoint_byte) return; // patched by another request
-        try self.placements.append(self.gpa, .{
+        try self.placements.ensureUnusedCapacity(self.gpa, 1);
+        var original = chunk.code[start];
+        if (original == breakpoint_byte) {
+            // A pending permanent breakpoint can resolve while `step into`
+            // already owns this newly compiled entry. Promote that temporary
+            // patch instead of losing the permanent request when the step is
+            // cleared at the pause.
+            const promoted = self.takeStepPlacement(chunk_id, start) orelse return;
+            original = promoted.original;
+        }
+        self.placements.appendAssumeCapacity(.{
             .req_id = req.id,
             .chunk_id = chunk_id,
             .offset = start,
@@ -291,6 +335,14 @@ pub const BreakpointTable = struct {
         });
         // `chunk.code` is `[]u8`; the bytes are mutable even through `*const`.
         chunk.code[start] = breakpoint_byte;
+    }
+
+    fn takeStepPlacement(self: *BreakpointTable, chunk_id: ChunkId, offset: u32) ?Placement {
+        for (self.step_temps.items, 0..) |placement, i| {
+            if (placement.chunk_id == chunk_id and placement.offset == offset)
+                return self.step_temps.orderedRemove(i);
+        }
+        return null;
     }
 
     /// A stored span file matches the user's path if it's an exact match, a path
@@ -303,6 +355,12 @@ pub const BreakpointTable = struct {
         return std.mem.eql(u8, std.fs.path.basename(text), std.fs.path.basename(wanted));
     }
 };
+
+fn textFileMatches(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    if (std.mem.endsWith(u8, a, b) or std.mem.endsWith(u8, b, a)) return true;
+    return std.mem.eql(u8, std.fs.path.basename(a), std.fs.path.basename(b));
+}
 
 fn firstMappedOffset(chunk: *const Chunk) ?u32 {
     var best: ?u32 = null;

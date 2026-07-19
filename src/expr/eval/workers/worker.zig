@@ -1263,7 +1263,7 @@ fn runTask(f: *WorkerFiber, task: Task) void {
             // cached on the entry and replay identically on real demand.
             const host = f.vm.import_host orelse return;
             const path = f.vm.intern.get(path_id);
-            _ = host.import_value(host.context, path, 1) catch {};
+            _ = host.import_value(host.context, &f.vm, path, 1) catch {};
         },
         .readdir_prefetch => |r| {
             // Speculative readDir-children prefetch (FIX_READDIR_PREFETCH):

@@ -447,13 +447,9 @@ pub const Console = struct {
         var out = self.stderr();
         defer out.interface.flush() catch {};
         const w = &out.interface;
-        if (set) |r| {
-            try w.print("breakpoint {d} at {s}:{d}", .{ r.id, file, r.line });
-            if (r.line != line) try w.print(" (nearest code to line {d})", .{line});
-            try w.print(" — {d} site(s)\n", .{r.sites});
-        } else {
-            try w.print("no code found for {s}:{d} in compiled chunks\n", .{ file, line });
-        }
+        try w.print("breakpoint {d} {s}at {s}:{d}", .{ set.id, if (set.pending) "pending " else "", file, set.line });
+        if (set.line != line) try w.print(" (nearest code to line {d})", .{line});
+        try w.print(" — {d} site(s)\n", .{set.sites});
     }
 
     fn listBreakpoints(self: *Console, s: *DebugSession) !void {
@@ -465,7 +461,7 @@ pub const Console = struct {
             try w.writeAll("(no breakpoints)\n");
             return;
         }
-        for (items) |bp| try w.print("  {d}  {s}:{d}\n", .{ bp.id, bp.file, bp.line });
+        for (items) |bp| try w.print("  {d}  {s}:{d}{s}\n", .{ bp.id, bp.file, bp.line, if (bp.pending) " (pending)" else "" });
     }
 
     fn deleteBreakpoint(self: *Console, s: *DebugSession, arg: []const u8) !void {

@@ -152,7 +152,7 @@ pub fn builtinImport(self: *VM, arg: Value) !Value {
     // `import drv` is import-from-derivation: realize the output first so the
     // file to import exists on disk.
     const path = try demandPathArg(self, arg);
-    return host.import_value(host.context, path, self.native_depth);
+    return host.import_value(host.context, self, path, self.native_depth);
 }
 
 pub fn builtinScopedImport(self: *VM, scope_arg: Value, path_arg: Value) !Value {
@@ -160,7 +160,7 @@ pub fn builtinScopedImport(self: *VM, scope_arg: Value, path_arg: Value) !Value 
     if (!scope.isAttrs()) return vm_trace.typeErrorExpected(self, "attrs", scope);
     const host = self.import_host orelse return error.ImportUnavailable;
     const path = try demandPathArg(self, path_arg);
-    return host.scoped_import(host.context, scope, path, self.native_depth);
+    return host.scoped_import(host.context, self, scope, path, self.native_depth);
 }
 
 pub fn builtinReadDir(self: *VM, arg: Value) !Value {

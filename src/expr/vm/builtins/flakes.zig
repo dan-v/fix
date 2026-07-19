@@ -227,7 +227,7 @@ fn importFlakeValue(self: *VM, out_path: []const u8, dir: ?[]const u8) !Value {
         try std.fs.path.join(self.allocator, &.{ out_path, "flake.nix" });
     defer self.allocator.free(flake_path);
     const host = self.import_host orelse return error.ImportUnavailable;
-    const flake_value = try vm_force.forceValue(self, try host.import_value(host.context, flake_path, self.native_depth));
+    const flake_value = try vm_force.forceValue(self, try host.import_value(host.context, self, flake_path, self.native_depth));
     if (!flake_value.isAttrs()) return error.TypeError;
     return flake_value;
 }

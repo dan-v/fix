@@ -167,7 +167,7 @@ pub const DebugSession = struct {
 
     /// Number of active call frames (top of stack last).
     pub fn frameCount(self: *const DebugSession) usize {
-        return self.vm.frames_len;
+        return debug_session.frameCount(self.vm);
     }
 
     /// Frame `i` (0 = outermost, `frameCount()-1` = innermost/current).
@@ -177,8 +177,9 @@ pub const DebugSession = struct {
 
     /// The current (innermost) frame, or null if the stack is empty.
     pub fn currentFrame(self: *const DebugSession) ?DebugFrame {
-        if (self.vm.frames_len == 0) return null;
-        return self.frame(self.vm.frames_len - 1);
+        const count = self.frameCount();
+        if (count == 0) return null;
+        return self.frame(count - 1);
     }
 
     /// The source text for frame `i` — the file it runs (from the FileCache),
@@ -192,46 +193,48 @@ pub const DebugSession = struct {
     /// Local slots of frame `i` (the values in `vm.stack[base..base+count]`).
     /// Names are not tracked per local, so callers index by slot.
     pub fn localCount(self: *const DebugSession, i: usize) usize {
-        return self.vm.frames[i].local_count;
+        return debug_session.frameRef(self.vm, i).frame().local_count;
     }
 
     pub fn localValue(self: *const DebugSession, i: usize, slot: usize) Value {
-        const f = &self.vm.frames[i];
-        return self.vm.stack[f.frame_base + slot];
+        const ref = debug_session.frameRef(self.vm, i);
+        const f = ref.frame();
+        return ref.vm.stack[f.frame_base + slot];
     }
 
     /// Write frame `i`'s always-on qualified name (`pkgs.hello`) to `w`, or
     /// nothing if anonymous. Available in every run — no `capture_names` flag.
     pub fn writeFrameName(self: *const DebugSession, w: *std.Io.Writer, i: usize) !void {
-        try self.ev.registry.writeQualifiedName(w, self.vm.frames[i].chunk_id, &self.ev.intern);
+        const ref = debug_session.frameRef(self.vm, i);
+        try self.ev.registry.writeQualifiedName(w, ref.frame().chunk_id, &self.ev.intern);
     }
 
     pub fn hasFrameName(self: *const DebugSession, i: usize) bool {
-        return self.ev.registry.hasQualifiedName(self.vm.frames[i].chunk_id);
+        return self.ev.registry.hasQualifiedName(debug_session.frameRef(self.vm, i).frame().chunk_id);
     }
 
     /// The source name of local `slot` in frame `i`, if the compiler recorded
     /// one (requires chunk-name capture, which `--debugger` enables). Internal
     /// (`\x00`-prefixed) names are hidden.
     pub fn localName(self: *const DebugSession, i: usize, slot: usize) ?[]const u8 {
-        const names = self.ev.registry.localNamesOf(self.vm.frames[i].chunk_id) orelse return null;
+        const names = self.ev.registry.localNamesOf(debug_session.frameRef(self.vm, i).frame().chunk_id) orelse return null;
         if (slot >= names.len) return null;
         return debug_session.displayName(self.ev.intern.get(names[slot]));
     }
 
     /// The source name of upvalue `idx` in frame `i`, if recorded.
     pub fn upvalueName(self: *const DebugSession, i: usize, idx: usize) ?[]const u8 {
-        const names = self.ev.registry.upvalueNamesOf(self.vm.frames[i].chunk_id) orelse return null;
+        const names = self.ev.registry.upvalueNamesOf(debug_session.frameRef(self.vm, i).frame().chunk_id) orelse return null;
         if (idx >= names.len) return null;
         return debug_session.displayName(self.ev.intern.get(names[idx]));
     }
 
     pub fn upvalueCount(self: *const DebugSession, i: usize) usize {
-        return if (self.vm.frames[i].upvalues) |ups| ups.len else 0;
+        return if (debug_session.frameRef(self.vm, i).frame().upvalues) |ups| ups.len else 0;
     }
 
     pub fn upvalueValue(self: *const DebugSession, i: usize, idx: usize) Value {
-        return self.vm.frames[i].upvalues.?[idx];
+        return debug_session.frameRef(self.vm, i).frame().upvalues.?[idx];
     }
 
     /// Force `v` (shallow) on the paused fiber and return the result.
@@ -258,11 +261,11 @@ pub const DebugSession = struct {
     }
 
     /// Set a source-line breakpoint at `file:line`. Resolves to the nearest
-    /// line carrying code; returns null if nothing matches. Applies to already
-    /// compiled chunks and any that compile later.
-    pub fn setBreakpoint(self: *DebugSession, file: []const u8, line: u32) !?bytecode.BreakpointTable.SetResult {
+    /// line carrying code, or remains pending until the file is compiled.
+    /// Applies to already compiled chunks and any that compile later.
+    pub fn setBreakpoint(self: *DebugSession, file: []const u8, line: u32) !bytecode.BreakpointTable.SetResult {
         if (self.ev.debugger.breakpoints) |*bp| return bp.set(&self.ev.registry, file, line);
-        return null;
+        return error.DebuggerUnavailable;
     }
 
     /// All active breakpoint requests (for a `:breakpoints` listing).
@@ -1072,6 +1075,11 @@ pub const Evaluator = struct {
         // Local binding names for the top chunk (child chunks get theirs in
         // `registerChunk`); lets the debugger and disasm name top-level locals.
         if (self.registry.capture_names) try self.registry.recordLocalNames(chunk_id, compiler.local_names.items);
+        if (source_path) |path| {
+            if (self.debugger.breakpoints) |*breakpoints| {
+                breakpoints.resolvePendingFile(&self.registry, path);
+            }
+        }
         // `chunk` now owns persistent copies of its bytecode; `scratch`
         // (incl. `builder`'s buffers) is freed by the defers above.
 
@@ -1508,6 +1516,9 @@ pub const Evaluator = struct {
         /// GC-safepoint-transparent (a top-level import collects at depth 0; a
         /// nested one stays gated at the caller's depth). 0 for the top level.
         parent_depth: u32,
+        /// The VM containing the synchronous import call, for debugger stack
+        /// traversal. Null for a top-level/non-import evaluation.
+        debug_parent: ?*VM,
     ) !Value {
         const chunk_id = try self.parseAndCompile(source, base_path, source_path, scope);
         const subject = source_path orelse "expression";
@@ -1532,6 +1543,7 @@ pub const Evaluator = struct {
         defer scratch.deinit();
         var vm = try self.initVm(0, scratch.allocator());
         defer vm.deinit();
+        vm.debug_parent = debug_parent;
         // Depth-transparent import: the fresh nested VM inherits the caller's
         // depth minus 1 (dropping the `import` builtin's own +1), so a
         // top-level import evaluates at depth 0 (collects) while a nested one
@@ -2005,23 +2017,29 @@ pub const Evaluator = struct {
         gc_controller.helpMark(gcContext(self), worker_id);
     }
 
-    fn importValue(context: *anyopaque, path: []const u8, parent_depth: u32) anyerror!Value {
+    fn importValue(context: *anyopaque, caller: *VM, path: []const u8, parent_depth: u32) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return self.importPath(path, parent_depth);
+        return self.importPath(path, parent_depth, caller);
     }
 
-    fn importPath(self: *Evaluator, path: []const u8, parent_depth: u32) !Value {
+    fn importPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) !Value {
         const resolved = try self.resolveHostPath(path);
         defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.importResolvedPath(resolved.text, parent_depth);
+        return self.importResolvedPath(resolved.text, parent_depth, debug_parent);
     }
 
-    fn importResolvedPath(self: *Evaluator, path: []const u8, parent_depth: u32) anyerror!Value {
+    fn importResolvedPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
         const entry = try self.imports.lookupOrCreate(self.allocator, path);
-        return self.forceImportEntry(path, entry, parent_depth);
+        return self.forceImportEntry(path, entry, parent_depth, debug_parent);
     }
 
-    fn forceImportEntry(self: *Evaluator, path: []const u8, entry: *imports_mod.ImportEntry, parent_depth: u32) anyerror!Value {
+    fn forceImportEntry(
+        self: *Evaluator,
+        path: []const u8,
+        entry: *imports_mod.ImportEntry,
+        parent_depth: u32,
+        debug_parent: *VM,
+    ) anyerror!Value {
         const me = currentImportClaimer();
         while (true) {
             switch (entry.future.tryClaim(me)) {
@@ -2040,7 +2058,7 @@ pub const Evaluator = struct {
                     continue;
                 },
                 .claimed => {
-                    const value = self.compileImportPath(path, parent_depth) catch |err| {
+                    const value = self.compileImportPath(path, parent_depth, debug_parent) catch |err| {
                         self.publishImportFailure(entry, err);
                         return err;
                     };
@@ -2069,7 +2087,7 @@ pub const Evaluator = struct {
         entry.future.publishErrored();
     }
 
-    fn compileImportPath(self: *Evaluator, path: []const u8, parent_depth: u32) anyerror!Value {
+    fn compileImportPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
 
@@ -2080,11 +2098,11 @@ pub const Evaluator = struct {
             core_source
         else
             self.files.readFile(stable_path) catch |err| switch (err) {
-                error.IsDir => return self.importDirectory(stable_path, parent_depth),
+                error.IsDir => return self.importDirectory(stable_path, parent_depth, debug_parent),
                 else => return err,
             };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        const value = try self.evaluateSource(source, source_base, stable_path, null, parent_depth);
+        const value = try self.evaluateSource(source, source_base, stable_path, null, parent_depth, debug_parent);
         observation.finish(.{});
         return value;
     }
@@ -2125,18 +2143,24 @@ pub const Evaluator = struct {
         _ = self.scheduler.submit(.{ .import_prefetch = path_id }, worker_id_mod.current);
     }
 
-    fn scopedImportValue(context: *anyopaque, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
+    fn scopedImportValue(context: *anyopaque, caller: *VM, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return self.scopedImportPath(scope, path, parent_depth);
+        return self.scopedImportPath(scope, path, parent_depth, caller);
     }
 
-    fn scopedImportPath(self: *Evaluator, scope: Value, path: []const u8, parent_depth: u32) !Value {
+    fn scopedImportPath(self: *Evaluator, scope: Value, path: []const u8, parent_depth: u32, debug_parent: *VM) !Value {
         const resolved = try self.resolveHostPath(path);
         defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.scopedImportResolvedPath(scope, resolved.text, parent_depth);
+        return self.scopedImportResolvedPath(scope, resolved.text, parent_depth, debug_parent);
     }
 
-    fn scopedImportResolvedPath(self: *Evaluator, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
+    fn scopedImportResolvedPath(
+        self: *Evaluator,
+        scope: Value,
+        path: []const u8,
+        parent_depth: u32,
+        debug_parent: *VM,
+    ) anyerror!Value {
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
 
@@ -2156,25 +2180,31 @@ pub const Evaluator = struct {
             core_source
         else
             self.files.readFile(stable_path) catch |err| switch (err) {
-                error.IsDir => return self.scopedImportDirectory(scope, stable_path, parent_depth),
+                error.IsDir => return self.scopedImportDirectory(scope, stable_path, parent_depth, debug_parent),
                 else => return err,
             };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        const value = try self.evaluateSource(source, source_base, stable_path, scope, parent_depth);
+        const value = try self.evaluateSource(source, source_base, stable_path, scope, parent_depth, debug_parent);
         observation.finish(.{});
         return value;
     }
 
-    fn importDirectory(self: *Evaluator, path: []const u8, parent_depth: u32) anyerror!Value {
+    fn importDirectory(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
         const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
         defer self.allocator.free(default_path);
-        return self.importResolvedPath(default_path, parent_depth);
+        return self.importResolvedPath(default_path, parent_depth, debug_parent);
     }
 
-    fn scopedImportDirectory(self: *Evaluator, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
+    fn scopedImportDirectory(
+        self: *Evaluator,
+        scope: Value,
+        path: []const u8,
+        parent_depth: u32,
+        debug_parent: *VM,
+    ) anyerror!Value {
         const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
         defer self.allocator.free(default_path);
-        return self.scopedImportResolvedPath(scope, default_path, parent_depth);
+        return self.scopedImportResolvedPath(scope, default_path, parent_depth, debug_parent);
     }
 
     fn findFile(context: *anyopaque, name: []const u8) anyerror!Value {

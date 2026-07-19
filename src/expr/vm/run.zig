@@ -444,7 +444,7 @@ fn opBreakpoint(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
     frame.ip = ip;
     const Hit = bytecode_mod.breakpoints.BreakpointTable.Hit;
     const h: Hit = if (vm.breakpoints) |bps|
-        bps.hit(frame.chunk_id, off, vm.frames_len)
+        bps.hit(frame.chunk_id, off, vm.debugFrameDepth())
     else
         .{ .original = @intFromEnum(OpCode.halt), .pause = false, .kind = .none };
     if (h.pause) {

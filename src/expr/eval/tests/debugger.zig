@@ -245,8 +245,7 @@ test "deleting a source-line breakpoint stops it firing" {
                 return;
             }
             const set = try s.setBreakpoint("bp.nix", 3);
-            try std.testing.expect(set != null);
-            try std.testing.expect(s.deleteBreakpoint(set.?.id));
+            try std.testing.expect(s.deleteBreakpoint(set.id));
         }
     };
     var local: Local = .{};
@@ -350,6 +349,80 @@ test "step into follows an import compiled after the step is armed" {
     const result = try ev.evaluate(source);
     try std.testing.expect(ctl.imported_step);
     try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result)).asInt());
+}
+
+test "pending import breakpoint preserves the parent stack and finish returns to it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "pending.nix",
+        .data = "{ value = 41; }\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "pending.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).value + 1", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const Ctl = struct {
+        state: enum { entry, awaiting_import, finishing, returned } = .entry,
+        imported_frames: usize = 0,
+
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            s.clearStep();
+            switch (self.state) {
+                .entry => {
+                    try std.testing.expectEqual(eval_mod.BreakReason.entry, s.reason);
+                    const set = try s.setBreakpoint("pending.nix", 1);
+                    try std.testing.expect(set.pending);
+                    try std.testing.expectEqual(@as(usize, 0), set.sites);
+                    self.state = .awaiting_import;
+                    try s.step(.into);
+                },
+                .awaiting_import => {
+                    if (s.reason == .step) {
+                        try s.step(.into);
+                        return;
+                    }
+                    try std.testing.expectEqual(eval_mod.BreakReason.line_breakpoint, s.reason);
+                    const current = s.currentFrame().?;
+                    try std.testing.expect(current.file != null);
+                    try std.testing.expect(std.mem.endsWith(u8, current.file.?, "pending.nix"));
+                    self.imported_frames = s.frameCount();
+                    try std.testing.expect(self.imported_frames >= 2);
+                    try std.testing.expect(s.frame(0).file == null);
+                    self.state = .finishing;
+                    try s.step(.out);
+                },
+                .finishing => {
+                    try std.testing.expectEqual(eval_mod.BreakReason.step, s.reason);
+                    try std.testing.expect(s.currentFrame().?.file == null);
+                    try std.testing.expect(s.frameCount() < self.imported_frames);
+                    self.state = .returned;
+                },
+                .returned => return error.TestUnexpectedResult,
+            }
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    const result = try ev.debugWithScopeResult(source, null);
+    try std.testing.expectEqual(.returned, ctl.state);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result.value)).asInt());
 }
 
 test "clearStep after a step leaves no patched bytecode behind" {
