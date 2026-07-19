@@ -8,12 +8,12 @@ in
       packages = [
         pkgs.zig_0_16
         pkgs.pkg-config
-        pkgs.perf
         pkgs.hyperfine
         pkgs.vhs
         pkgs.curl
         pkgs.libgit2
         pkgs.mercurial
         pkgs.gnutar
-      ];
+      ]
+      ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.perf];
     }
