@@ -1070,17 +1070,22 @@ pub const Evaluator = struct {
         }
 
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
-        // The top-level chunk registers outside `registerChunk`; name it after
-        // the file (a useful `while evaluating 'configuration.nix'`). A bare
-        // `-E` expression stays anonymous so its trace reads plain. disasm adds
-        // its own `(top)` tag for pathless chunks.
+        // The top-level chunk registers outside Compiler.registerChunk; name
+        // it after the file (a useful `while evaluating 'configuration.nix'`).
+        // A bare `-E` expression stays anonymous so its trace reads plain.
+        // disasm adds its own `(top)` tag for pathless chunks.
         const top_name: bytecode.NameId = if (source_path) |p|
             (self.registry.childName(bytecode.root_name_id, try self.intern.intern(std.fs.path.basename(p)), false) catch bytecode.root_name_id)
         else if (self.registry.capture_names)
             (self.registry.childName(bytecode.root_name_id, try self.intern.intern("(top)"), true) catch bytecode.root_name_id)
         else
             bytecode.root_name_id;
-        const chunk_id = try self.registry.registerNamed(chunk, top_name);
+        const registered = try self.registry.registerDeduped(chunk, top_name);
+        const chunk_id = registered.id;
+        if (registered.reused) {
+            var duplicate = chunk;
+            duplicate.deinit(self.allocator);
+        }
         self.chunkRegistered(chunk_id);
         if (compiler.source_file_id) |f| try self.registry.recordFile(chunk_id, f);
         // Local binding names for the top chunk (child chunks get theirs in
@@ -1306,8 +1311,9 @@ pub const Evaluator = struct {
     /// Like `evaluate`, but compiles the source inside an ambient scope
     /// attrset (identifiers not otherwise bound resolve from `scope`, the
     /// same mechanism as `builtins.scopedImport`). The repl uses this to
-    /// make its bindings visible. `scope` is baked into the compiled
-    /// chunk's constants, which are GC roots.
+    /// make its bindings visible. When a source may reference those bindings,
+    /// `scope` is baked into the compiled chunk's constants, which are GC
+    /// roots; builtin/literal-only sources omit the unused scope.
     pub fn evaluateWithScope(self: *Evaluator, source: []const u8, scope: ?Value) !Value {
         return self.evaluateTop(source, self.base_path, null, scope);
     }
@@ -1350,9 +1356,9 @@ pub const Evaluator = struct {
         // Not routed through `evaluateSource`: its top-level detection is
         // `source_path == null`, so passing the path there would send the
         // top-level eval down the nested-import path (wrong fiber). Attribute
-        // the source at compile time (and bake `scope` into the chunk's
-        // constants, the repl's ambient-scope mechanism), then run on the
-        // main worker as usual.
+        // the source at compile time (and, when observable, bake `scope` into
+        // the chunk's constants as the repl's ambient-scope mechanism), then
+        // run on the main worker as usual.
         const chunk_id = try self.parseAndCompile(source, base_path, source_path, scope);
         if (initial_break) {
             if (self.debugger.breakpoints) |*breakpoints| {
@@ -2168,10 +2174,10 @@ pub const Evaluator = struct {
         return value;
     }
 
-    /// Explicit post-registration phase: compiler code reports a newly
-    /// published chunk here, after the registry mutation has completed. Import
-    /// discovery and debugger patching are evaluator orchestration, not hidden
-    /// side effects of `ChunkRegistry.register`.
+    /// Explicit post-registration phase: compiler code reports the canonical
+    /// chunk selected for a compiled body here, after registry mutation has
+    /// completed. Import discovery and debugger patching are evaluator
+    /// orchestration, not hidden side effects of `ChunkRegistry.register`.
     fn chunkRegistered(self: *Evaluator, chunk_id: ChunkId) void {
         const chunk = self.registry.get(chunk_id) orelse return;
         for (chunk.constants) |value| {

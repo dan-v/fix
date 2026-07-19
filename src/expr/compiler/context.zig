@@ -43,9 +43,9 @@ pub const Driver = struct {
 };
 
 /// Explicit post-registration effect owned by the evaluator. The compiler
-/// reports newly published chunks after registry mutation is complete; the
-/// registry itself remains a storage component and never schedules imports or
-/// patches debugger bytecode as a hidden side effect.
+/// reports the canonical chunk selected for a body after registry mutation is
+/// complete; the registry itself remains a storage component and never
+/// schedules imports or patches debugger bytecode as a hidden side effect.
 pub const ChunkRegistrationSink = struct {
     context: *anyopaque,
     registered: *const fn (context: *anyopaque, chunk_id: types.ChunkId) void,
@@ -314,10 +314,13 @@ pub const Compiler = struct {
         if (r.reused) {
             var copy = ch;
             copy.deinit(self.persistent);
-            return r.id; // first registration keeps its name/upvalue sidecar
+        } else {
+            try self.recordChunkSidecar(r.id, &ch);
         }
-        if (r.new_id) |id| if (self.registration_sink) |sink| sink.notify(id);
-        try self.recordChunkSidecar(r.id, &ch);
+        // A canonical reuse is still about to execute in this compile path.
+        // Report it so debugger step-following can patch an already-registered
+        // imported body; the evaluator deduplicates other cold side effects.
+        if (self.registration_sink) |sink| sink.notify(r.id);
         return r.id;
     }
 

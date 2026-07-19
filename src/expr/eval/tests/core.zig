@@ -112,6 +112,41 @@ test "external scope construction and rooting is evaluator-owned" {
     try std.testing.expectEqual(@as(i64, 42), result.asInt());
 }
 
+test "unused external scopes do not make duplicate entry chunks" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const first_scope = try ev.replaceExternalScope(&.{
+        .{ .name = "answer", .value = Value.int(1) },
+    });
+    const first = try ev.evaluateWithScopeResult("import", first_scope);
+    const second_scope = try ev.replaceExternalScope(&.{
+        .{ .name = "answer", .value = Value.int(2) },
+    });
+    const second = try ev.evaluateWithScopeResult("import", second_scope);
+
+    try std.testing.expectEqual(first.entry_chunk, second.entry_chunk);
+    try std.testing.expectEqual(@as(usize, 1), ev.getChunk(first.entry_chunk).?.constants.len);
+}
+
+test "referenced external scopes remain distinct chunk constants" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const first_scope = try ev.replaceExternalScope(&.{
+        .{ .name = "answer", .value = Value.int(41) },
+    });
+    const first = try ev.evaluateWithScopeResult("answer + 1", first_scope);
+    const second_scope = try ev.replaceExternalScope(&.{
+        .{ .name = "answer", .value = Value.int(42) },
+    });
+    const second = try ev.evaluateWithScopeResult("answer + 1", second_scope);
+
+    try std.testing.expectEqual(@as(i64, 42), first.value.asInt());
+    try std.testing.expectEqual(@as(i64, 43), second.value.asInt());
+    try std.testing.expect(first.entry_chunk != second.entry_chunk);
+}
+
 test "writeValue colorizes strings, numbers, keywords, and attr names when value_color is set" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

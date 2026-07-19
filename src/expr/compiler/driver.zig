@@ -1,9 +1,11 @@
 //! Recursive AST dispatch for `Compiler`.
 
+const std = @import("std");
 const context = @import("context.zig");
 const Compiler = context.Compiler;
 const Node = context.Node;
 const Value = @import("runtime").value.Value;
+const builtins = @import("runtime").builtins;
 const literals = @import("literals.zig");
 const fold = @import("fold.zig");
 const lambda = @import("lambda.zig");
@@ -15,6 +17,7 @@ const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const diagnostics = @import("diagnostics.zig");
 const strictness = @import("strictness.zig");
+const refs = @import("refs.zig");
 
 pub const driver: context.Driver = .{
     .compile_node = compileNode,
@@ -23,10 +26,46 @@ pub const driver: context.Driver = .{
 
 fn compileWithScope(self: *Compiler, node: *const Node, scope_value: ?Value) !void {
     if (scope_value) |value| {
-        try compileAmbientScope(self, node, value);
+        if (needsAmbientScope(self, node)) {
+            try compileAmbientScope(self, node, value);
+        } else {
+            try compileNode(self, node);
+        }
     } else {
         try compileNode(self, node);
     }
+}
+
+const AmbientUseMarker = struct {
+    needed: bool = false,
+
+    pub fn mark(self: *AmbientUseMarker, name: []const u8) void {
+        if (!isStaticName(name)) self.needed = true;
+    }
+
+    fn isStaticName(name: []const u8) bool {
+        return std.mem.eql(u8, name, "builtins") or
+            std.mem.eql(u8, name, "__curPos") or
+            std.mem.eql(u8, name, "__nixPath") or
+            builtins.ambientIdForName(name) != null or
+            builtins.hasConstant(name);
+    }
+};
+
+/// A REPL/debug scope overlays lexical names and the static builtin
+/// environment. If a subtree mentions no name which could reach that overlay,
+/// embedding the changing scope object would add dead bytecode and defeat
+/// chunk deduplication. The reference walk is conservative: bound names and
+/// interpolation words may retain an unnecessary scope, but it never removes
+/// one that may be observed.
+fn needsAmbientScope(self: *Compiler, node: *const Node) bool {
+    // scopedImport replaces the builtin environment, so even names such as
+    // `import` must keep consulting its supplied attrset.
+    if (self.scoped_base) return true;
+
+    var marker: AmbientUseMarker = .{};
+    refs.walkReferencedNames(self, node, &marker);
+    return marker.needed;
 }
 
 fn compileAndFinish(self: *Compiler, node: *const Node, scope_value: ?Value) !void {

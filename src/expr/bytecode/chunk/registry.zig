@@ -453,6 +453,11 @@ pub const ChunkRegistry = struct {
         return contentEql(a, b);
     }
 
+    /// Bucket hash paired with `structurallyEqual`; collisions are expected.
+    pub fn structuralHash(chunk: *const Chunk) u64 {
+        return contentHash(chunk);
+    }
+
     fn lambdaPatternEql(a: LambdaPattern, b: LambdaPattern) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
