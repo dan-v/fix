@@ -3,7 +3,7 @@
 //! Interactive use is deliberately a TUI rather than a pager: the name tree is
 //! persistent navigation, the chunk detail is a separately scrollable pane,
 //! and the ordinary REPL prompt/transcript occupy the same surface. The plain
-//! (`--bare`/non-tty) fallback exposes the same model through bounded commands.
+//! (`--no-tui`/non-tty) fallback exposes the same model through bounded commands.
 
 const std = @import("std");
 const engine = @import("expr");

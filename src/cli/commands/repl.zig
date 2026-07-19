@@ -2,11 +2,11 @@
 //!
 //! Two strictly separated modes:
 //!
-//! - **Interactive** (stdin AND stdout are a tty, and `--bare` not given): an
-//!   ordinary inline editor with history, completion, and smart-enter
-//!   multiline input. `:vm` explicitly enters the full-screen VM workspace;
-//!   leaving it restores normal scrollback and the inline prompt.
-//! - **Bare** (`--bare`, or any non-tty end): a plain read-a-line loop — no
+//! - **Interactive** (stdin AND stdout are a tty): an ordinary inline editor
+//!   with history, completion, and smart-enter multiline input. `:vm`
+//!   explicitly enters the full-screen VM workspace unless `--no-tui` was
+//!   given; leaving it restores normal scrollback and the inline prompt.
+//! - **Streaming** (either end is not a tty): a plain read-a-line loop — no
 //!   escape sequences, no raw mode, no redraw tricks. Lines are accumulated
 //!   until they form a complete expression, so multiline input pipes work.
 //!
@@ -71,12 +71,14 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         return 2;
     }
 
-    // THE MODE GATE. Interactive only when both ends are a terminal and
-    // --bare wasn't given; everything else is the plain loop. Decided once,
-    // up front — nothing downstream re-tests tty-ness.
+    // THE MODE GATE. A tty always gets the ordinary inline editor. --no-tui
+    // only selects line-oriented implementations for the optional VM and
+    // debugger workspaces; it does not discard history, completion, color, or
+    // terminal key handling.
     const stdin_tty = std.Io.File.stdin().isTty(init.io) catch false;
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
-    const interactive = stdin_tty and stdout_tty and !options.bare;
+    const interactive = stdin_tty and stdout_tty;
+    const tui_enabled = interactive and !options.no_tui;
 
     // The debugger needs a deterministic pause point: one worker, no
     // speculation. Same posture as `fix eval --debugger`.
@@ -99,17 +101,17 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer progress.deinit(repl_ok);
     if (term.progressEnabled()) ev.setObserver(progress.observer());
 
-    // Normal repl output suppresses color in bare mode; the debugger console
-    // colors by the resolved terminal decision (its banner/snippet do too).
+    // Streaming output suppresses automatic color; a tty retains the resolved
+    // terminal decision even when its alternate-screen workspaces are disabled.
     ev.setValueColor(if (options.debugger) term.use_color else (term.use_color and interactive));
     var repl = Repl.init(allocator, init, options, &ev, if (interactive) term.color_depth else .none, interactive);
     defer repl.deinit();
     repl.debug_console = &console;
     var debug_screen = debugger_tui.DebuggerTui.init(allocator, init.io, &ev, term.color_depth, &repl.history);
     defer debug_screen.deinit();
-    if (interactive) repl.debug_tui = &debug_screen;
+    if (tui_enabled) repl.debug_tui = &debug_screen;
     if (options.debugger) {
-        if (interactive) debug_screen.install(&ev) else console.install(&ev);
+        if (tui_enabled) debug_screen.install(&ev) else console.install(&ev);
     }
 
     if (interactive) {
@@ -138,6 +140,7 @@ const Repl = struct {
     use_color: bool,
     color_depth: presentation.ColorDepth,
     interactive: bool,
+    tui_enabled: bool,
     /// Shared by persistent `--debugger` sessions and transient `:debug`
     /// commands; the bare loop attaches its buffered stdin reader here.
     debug_console: ?*debugger.Console = null,
@@ -194,6 +197,7 @@ const Repl = struct {
             .use_color = color_depth.enabled(),
             .color_depth = color_depth,
             .interactive = interactive,
+            .tui_enabled = interactive and !options.no_tui,
             .history = history_mod.History.init(allocator),
         };
     }
@@ -211,11 +215,11 @@ const Repl = struct {
         self.history.deinit();
     }
 
-    // -- bare mode -----------------------------------------------------------
+    // -- streaming mode ------------------------------------------------------
 
     /// The plain loop: read lines, accumulate until the input parses as a
     /// complete expression, process. No escape sequences anywhere; a prompt
-    /// is written only when stdin is a terminal (`--bare` at a terminal).
+    /// is retained for defensive use if the inline editor cannot own a tty.
     fn runBare(self: *Repl, show_prompt: bool) !void {
         var stdin_buffer: [64 * 1024]u8 = undefined;
         var stdin = std.Io.File.stdin().readerStreaming(self.io, &stdin_buffer);
@@ -777,8 +781,8 @@ const Repl = struct {
         return entry_chunk;
     }
 
-    /// VM explorer command family. The TUI opens on the focused chunk; bare
-    /// mode exposes the same model through bounded hierarchy queries.
+    /// VM explorer command family. The TUI opens on the focused chunk when
+    /// enabled; streaming and --no-tui sessions use bounded text queries.
     fn vm(self: *Repl, args_text: []const u8) !void {
         const text = std.mem.trim(u8, args_text, " \t");
         if (text.len == 0) return self.vmShow();
@@ -813,7 +817,7 @@ const Repl = struct {
 
     fn vmShow(self: *Repl) !void {
         const chunk_id = self.vm_focus orelse {
-            if (self.interactive and !self.tui_active) {
+            if (self.tui_enabled and !self.tui_active) {
                 self.vm_heap_requested = false;
                 self.vm_requested = true;
                 return;
@@ -826,7 +830,7 @@ const Repl = struct {
             return;
         }
         if (self.tui_active) return;
-        if (self.interactive) {
+        if (self.tui_enabled) {
             self.vm_heap_requested = false;
             self.vm_requested = true;
         } else {
@@ -837,7 +841,7 @@ const Repl = struct {
     }
 
     fn vmHeap(self: *Repl) !void {
-        if (self.interactive) {
+        if (self.tui_enabled) {
             self.vm_heap_requested = true;
             if (!self.tui_active) self.vm_requested = true;
             return;

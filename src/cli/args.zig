@@ -151,10 +151,10 @@ pub const Options = struct {
     option_overrides: std.ArrayListUnmanaged(OptionOverride) = .empty,
     color: presentation.When = .auto,
     progress: presentation.ProgressMode = .enabled,
-    /// `fix repl --bare`: plain line-based input (no raw mode, no escape
-    /// sequences), regardless of whether stdin/stdout are a terminal. The
-    /// non-tty repl path is always bare; this forces it for automation.
-    bare: bool = false,
+    /// `fix repl --no-tui`: keep the ordinary interactive line editor, but
+    /// render `:debug` and `:vm` through their line-oriented interfaces rather
+    /// than entering an alternate-screen workspace.
+    no_tui: bool = false,
     show_trace: bool = false,
     /// Drop into the interactive debug console at `builtins.break` (and, later,
     /// on evaluation errors). Forces single-worker, speculation-free evaluation
@@ -362,7 +362,7 @@ const Opt = enum {
     hugetlb,
     help,
     // Repl.
-    bare,
+    no_tui,
     // Shell.
     packages,
     // Switch.
@@ -525,7 +525,8 @@ const specs = [_]Spec{
     .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "off|all", .help = "record all scheduler steal flows or none\n(default: all)", .completion_help = "record scheduler steal flows", .default_value = "all", .show_in = timeline_cmds, .complete = .{ .timeline_flows, .none } },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
-    .{ .id = .bare, .long = "--bare", .help = "plain line-based input: no editor, no escape\nsequences (for pipes and expect-style automation)", .show_in = &.{.repl} },
+    .{ .id = .no_tui, .long = "--no-tui", .help = "keep the interactive editor, but show :debug and :vm\nwithout an alternate-screen TUI", .show_in = &.{.repl} },
+    .{ .id = .no_tui, .long = "--bare", .show_in = &.{.repl}, .hidden = true }, // compatibility alias
 
     .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .multi, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell}, .complete = .{ .package, .none } },
 
@@ -940,7 +941,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .hugetlb => options.hugetlb = hugetlb.parseMode(v0.?) orelse return error.InvalidHugetlbMode,
         .help => return error.Help,
 
-        .bare => options.bare = true,
+        .no_tui => options.no_tui = true,
 
         .packages => unreachable, // handled in the parse loop
 
@@ -1164,6 +1165,15 @@ test "lowercase expression short flag is rejected and flake requires a value" {
 test "parser enforces command option scope" {
     const argv = [_][*:0]const u8{ "fix", "--dry-run" };
     try std.testing.expectError(error.OptionNotValidForCommand, parseForTest(&argv, .eval));
+}
+
+test "repl no-tui flag and legacy alias select inline workspaces" {
+    for ([_][*:0]const u8{ "--no-tui", "--bare" }) |flag| {
+        const argv = [_][*:0]const u8{ "fix", flag };
+        var options = try parseForTest(&argv, .repl);
+        defer options.deinit(std.testing.allocator);
+        try std.testing.expect(options.no_tui);
+    }
 }
 
 test "stats is shared by evaluator and disasm commands" {

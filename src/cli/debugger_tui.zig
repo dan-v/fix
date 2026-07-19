@@ -4,7 +4,7 @@
 //! small full-screen event loop while the VM is paused. At an ordinary inline
 //! prompt it owns raw mode + the alternate screen. When reached from `:vm`, it
 //! borrows the already-active terminal session and simply redraws that screen.
-//! The line-oriented `debugger.Console` remains the bare/non-TTY frontend.
+//! The line-oriented `debugger.Console` remains the --no-tui/non-TTY frontend.
 
 const std = @import("std");
 const base = @import("base");
