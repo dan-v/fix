@@ -41,9 +41,9 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` share the compile
 
 **Scope.** `name = expr` binds; the last printed value is `it`; `:l PATH` merges a file's attrset into scope (auto-calling a top-level function with `{}`); `:r` reloads. Inputs compile inside an ambient scope attrset (the `scopedImport` mechanism), so bound values are *shared*, never re-evaluated.
 
-**GC.** A collection runs between inputs (`Evaluator.collectNow`: the standard STW barrier driven from outside an evaluation), so session memory tracks the live bindings rather than accreting. Repl-held values are precise GC roots (`Evaluator.gcSetExternalRoots` → `gc_extra_roots` in the root set). `:gc` collects on demand and reports reserved bytes.
+**GC.** A collection runs between inputs (`Evaluator.collectNow`: the standard STW barrier driven from outside an evaluation), so session memory tracks the live bindings rather than accreting. Repl-held values are precise GC roots (`Evaluator.gcSetExternalRoots` → `collection.extra_roots`). `:gc` collects on demand and reports reserved bytes.
 
-**Commands** (`:?` shows this table in-repl): `:?`/`:help`, `:q`/`:quit`/`:exit`, `:l`/`:load PATH`, `:r`/`:reload`, `:t`/`:type EXPR`, `:p`/`:print EXPR` (deep-force), `:i`/`:inspect EXPR` (kind, thunk state + backing chunk, closure chunk/arity), `:debug`/`:d EXPR` (pause before forcing an expression), `:vm [COMMAND | EXPR]`, `:env`, `:gc`. `:disasm` is no longer a REPL alias; exploration and debugging have distinct command families.
+**Commands** (`:?` shows this table in-repl): `:?`/`:help`, `:q`/`:quit`/`:exit`, `:l`/`:load PATH`, `:r`/`:reload`, `:t`/`:type EXPR`, `:p`/`:print EXPR` (deep-force), `:i`/`:inspect EXPR` (kind, thunk state + backing chunk, closure chunk/arity), `:debug`/`:d EXPR` (pause before forcing an expression), `:vm [COMMAND | EXPR]`, `:env`, `:gc`.
 
 **`:vm` — focus and explore VM state.** Every successful evaluation updates a stable focused chunk: a closure or bytecode thunk contributes its backing chunk; other values use the evaluation's entry chunk. `:vm EXPR` evaluates and focuses, plain `:vm` reopens the same focus even when no chunk was newly compiled (or opens the collapsed help workspace before the first evaluation), and `:vm chunk ID` focuses a registry id directly. `c`/`t`/`s`/`r` select the code, tables (constants, function arguments and positions, attr names/positions, captures, upvalues), syntax-highlighted source, or references panel instead of folding those sections into the disassembly document. At 140 columns and wider, the source selection appears beside bytecode, and wide screens allocate proportional space to tree/source instead of feeding all surplus width to disassembly. The sidebar contains collapsed HEAP and BYTECODE roots. BYTECODE groups source files by relative path component, then consolidates identical compiler-name siblings even when their append-only numeric IDs are disjoint. A name with one direct chunk and no children becomes a labeled leaf instead of a redundant one-item group. Closed nodes project only the focused chunk and its ancestors; large explicitly-open sets become recursively expandable range nodes. Ordinary long names are truncated in the middle; selected nodes and pinned ancestors use bounded, indented continuation lines. Opening references starts one compact asynchronous whole-registry graph build; page refreshes then use constant-time CSR slices instead of rescanning every chunk.
 
@@ -185,7 +185,7 @@ explicit typed flake-output/installable form.
 
 ### Parallelism debug toggles
 
-Speculation and fan-out are **on by default** (worth ~20–32% wall at `--workers>1`); these toggles turn them off for A/B and divergence isolation.
+Speculation and fan-out are **on by default**; these toggles disable them for controlled comparisons and divergence isolation.
 
 | Flag | Meaning |
 |---|---|

@@ -1,8 +1,8 @@
 # GC
 
-*A non-moving, precise, generational collector. It is part of every supported build and runs at all worker counts. A run that never crosses half its memory budget stays dormant and pays only the mutator rooting tax (~2–2.5% wall, measured), because reclaim tracking is armed lazily at the first budget/2 safepoint. Collection never changes output — the [interpreter](vm/dispatch.md) is canonical and evaluation is byte-identical whether the collector stays dormant or collects.*
+*A non-moving, precise, generational collector. It is part of every supported build and runs at all worker counts. Reclaim tracking is armed lazily at the first budget/2 safepoint, so smaller evaluations avoid young tracking, barriers, and free-list probes. Collection never changes output — the [interpreter](vm/dispatch.md) remains canonical.*
 
-**Why a collector at all.** `fix`'s object stores are append-only bump allocators (see [heap](runtime/heap.md)), so without reclamation peak RSS tracks *total* allocation, not the live set — and the live set plateaus (~228 MB on nixos_toplevel) while total allocation grows linearly (~1.2 GB). The collector's job is to bound RSS on memory-constrained machines; it is not a throughput lever (mark is a wall tax — see [perf/model](perf/model.md)).
+**Why a collector at all.** Without reclamation, the stores track *total* allocation rather than the live set. The collector bounds retained heap storage on memory-constrained machines; current cost measurements belong in [perf/model](perf/model.md).
 
 ## Memory budget (the collection policy)
 
@@ -10,7 +10,7 @@ One number decides when the collector runs: a heap-reserved-bytes budget, defend
 
 - Resolution order: `--gc-budget=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemTotal**, clamped to 256 MiB–8 GiB (fallback: half of an assumed 4 GiB). The budget covers the evaluator heap stores, not total process RSS; side allocations such as chunks, interned strings, and thread stacks sit outside it. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
 - **Lazy arming**: below budget/2 the heap only compares its reserved-bytes cursor against the threshold once per TLAB refill — no young-slot tracking, no write barrier, no free-list probes. The first budget/2 crossing runs an arming stop-the-world safepoint (`armLazy`): everything allocated so far becomes untracked/old (the unreclaimable floor, ≈ reserved at budget/2 by construction), and real collections start at the full budget, re-armed to `max(budget, reserved + clamp(budget/8, 64MB, 1GB))` after each.
-- Consequence: on a big-RAM machine the default budget dwarfs any eval → **zero collections, zero arming, rooting-tax only**; on a small-RAM device collections start well before OOM and peak reserved stays bounded near the budget (measured: `--gc-budget=512m` holds nixos_toplevel at ~850 MB reserved vs ~1.4 GB unbounded, byte-identical).
+- Consequence: evaluations below the arming threshold do not collect, while constrained budgets begin reclamation before heap reservations grow without bound.
 
 ## Why non-moving + precise
 
@@ -35,9 +35,9 @@ Root set (all must be enumerated — precise):
       – operand stack + all Frames        (vm/dispatch.md)
       – Frame.upvalues                     (runtime/thunks.md)
       – builtins + the value in-flight at the safepoint
-  • In-flight force chain    vm.gc_force_chain   (the suspended
+  • In-flight force chain    vm.gc_roots.force_chain (the suspended
         forceThunk stack, runtime/thunks.md)
-  • Native temp roots        vm.gc_temp_roots    (loop-based builtins
+  • Native temp roots        vm.gc_roots.temporary (loop-based builtins
         holding transient objects across allocations)
   • Each fiber's assigned-but-unprocessed task target
   • Scheduler-queued task targets            (parallel/scheduler.md)
@@ -59,8 +59,8 @@ Root set (all must be enumerated — precise):
 ## Sweep (reclaim)
 
 - Processing each young object: **marked ⇒ survivor**, promoted in place (`gcSetOld`, id unchanged, ranges stay put); **unmarked ⇒ dead**, its store ranges returned to the free lists in place and its slot id recycled.
-- **Per-worker** free lists in the [heap](runtime/heap.md) (`HeapLocal.gc_free_objects` for slot ids; `gc_free_values` / `gc_free_attrs` / `gc_free_attr_pos` are exact-fit range lists keyed by length). A dead object's slot id and ranges are pushed into the free shard of whichever worker evacuated its young-slot list, then **reused lock-free** by that worker's subsequent allocations (exact-length range match; slot ids LIFO). No shared alloc mutex.
-- Non-moving: no compaction pass; scattered death leaves fragmentation (measured real, not recoverable by page-return — see status).
+- **Per-worker** free lists in the [heap](runtime/heap.md) (`HeapLocal.gc_free_objects` for slot ids; `gc_free_values` / `gc_free_attrs` / `gc_free_attr_pos` are exact-fit range lists keyed by length). A dead object's slot id and ranges are pushed into the free shard of the worker that swept its young-slot list, then **reused lock-free** by that worker's subsequent allocations (exact-length range match; slot ids LIFO). No shared allocation mutex.
+- Non-moving: no compaction pass, so scattered death can leave fragmentation.
 
 ## Safepoints
 
@@ -75,25 +75,26 @@ Every `ValueRange` / `AttrRange` (the backing store for lists and attrsets) has 
 
 At `--workers=1` a minor is serial on the lone mutator. At `--workers>1` every live worker is parked at a safepoint, so the collector recruits the parked peers:
 
-- **Parallel mark** — an atomic bitmap + per-worker work-stealing deques; the collector seeds roots + remembered set into its own deque, opens the mark, and parked peers help-drain to global termination. Participants are capped by `FIX_GC_PAR_CAP` (default 8; the mark is contention-bound past ~8).
-- **Parallel evacuation** — the young-object lists are a shared claim-loop; each participant claims lists and promotes/frees them into its own tenured TLAB and free shard.
-- The eval still runs `worker_count`-wide; only the mark+evac is throttled by the cap. Peers over the cap park idle rather than pile on.
+- **Parallel mark** — an atomic bitmap plus per-worker work-stealing deques. The collector seeds roots and the remembered set, then parked peers help drain to global termination. `FIX_GC_PAR_CAP` caps participants.
+- **Parallel minor sweep** — the per-worker young-object lists form a shared claim loop; each participant promotes marked survivors in place and returns dead slots and ranges to its own free shard.
+- Evaluation still runs `worker_count`-wide; collection participation is capped. Peers over the cap remain parked.
+- **Major collection is currently single-worker-only.** Multi-worker runs perform minor collections but can retain unreachable old-generation objects until evaluator teardown.
 
 ## Status
 
 | Mode | State |
 |------|-------|
-| w=1 | **Fully working, byte-identical** (incl. ReleaseSafe UAF-detector gauntlet under `FIX_GC_STEP_MB=64`). Minor pause ~48ms (mark ~33ms — ~94% of it the young-survivor transitive drain; roots + remset are single-digit ms thanks to the incremental chunk-constant scan — plus sweep ~15ms). |
-| w>1 | **Fully working, byte-identical** (validated w=8: 512m/768m budgets, `FIX_GC_STEP_MB=64` ×13–28 collections, detector build). Mark + evac are parallel across parked peers (see above); free lists are per-worker sharded. Barrier spin ~4–11ms/collection at w=8. |
+| w=1 | Minor and major collection are enabled; detector builds validate reads and mark closure. |
+| w>1 | Minor mark and sweep run across parked peers; free lists are per-worker sharded. Major collection remains disabled while parallel full-mark root closure is unresolved. |
 
-**Net verdict on time:** the dormant cost is the rooting tax only (~2–2.5%): force-chain / temp-root maintenance must stay complete from process start (entries live across the arming boundary), so it cannot be runtime-gated. When collecting, the pause is the young-survivor drain + young-slot sweep; frequency is budget-driven, so total GC wall scales with allocation-past-budget, not run length. The RSS bound is real; `madvise` page-return recovers only ~32 MB (scattered non-moving death). The end goal is concurrent SATB, for which the parallel mark is the substrate.
+**Cost model:** force-chain and temporary-root maintenance must stay complete across the arming boundary. Once collection is active, pauses consist of survivor marking and young-list sweep; frequency is budget-driven. Non-moving fragmentation limits how much storage can be returned directly to the OS.
 
 ## Correctness tooling
 
 - **UAF detector** (ReleaseSafe): freed slots are *not reused* and every read asserts the alloc bit is set — surfaces dangling ObjectIds at the read, at their source. A companion closure check verifies the minor mark is closed (every young child of a live parent is marked) before the sweep, panicking with the offending parent→child edge so a missed barrier/root is caught at its source.
 - **Swept-range poisoning**: freed ranges are overwritten with an invalid thunk so any stale reader trips immediately.
 - **`FIX_GC_STEP_MB`**: collect every N MB of fresh allocation from a low start threshold (eager tracking, ignores the budget) to shake out rooting gaps.
-- **`FIX_GC_NOREUSE`** (skip free-list reuse; validate the reuse path) and **`FIX_GC_PAR_CAP`** (mark/evac participant cap) are validation/tuning knobs.
+- **`FIX_GC_NOREUSE`** (skip free-list reuse; validate the reuse path) and **`FIX_GC_PAR_CAP`** (collection participant cap) are validation/tuning knobs.
 - **`--gc-report`** dumps the per-run collection report (pauses, promoted/freed, live vs reserved breakdown) to stderr.
 
-Code: `src/runtime/gc.zig` (the precise serial/parallel marker and metrics), `src/runtime/heap/collector.zig` (arming, evacuation, sweep, and threshold policy), and `src/expr/eval/gc_controller.zig` (root enumeration, stop-the-world integration, and budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).
+Code: `src/runtime/gc.zig` (the precise serial/parallel marker and metrics), `src/runtime/heap/collector.zig` (arming, sweep, and threshold policy), and `src/expr/eval/gc_controller.zig` (root enumeration, stop-the-world integration, and budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).

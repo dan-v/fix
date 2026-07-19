@@ -36,7 +36,7 @@ contextSwitch(from, to):          # inline at each call site
     jmp  *to.rip                  # → resume where `to` last swapped out
 ```
 
-`inline` is mandatory: the clobbers only force the compiler to preserve live registers when the asm is emitted *at the real call site* (`resume_`/`yield`/`trampoline`), not behind a call boundary — a non-inline wrapper would save/restore callee-saved registers around a stack it's about to switch away from, corrupting state. Because the clobber list includes `mxcsr`/`fpcr`/direction flag, FP rounding mode and the direction flag are preserved across a swap (the old hand-rolled `.S`, which saved only the integer callee-saved set, did not).
+`inline` is mandatory: the clobbers only force the compiler to preserve live registers when the asm is emitted *at the real call site* (`resume_`/`yield`/`trampoline`), not behind a call boundary. A non-inline wrapper would save and restore registers around a stack it is about to switch away from, corrupting state. The clobber list includes `mxcsr`/`fpcr`/direction flag, preserving FP and direction state across a swap.
 
 For a never-run fiber the jump target is the trampoline, seeded directly into `Context.rip`/`pc` by `bootstrapContext` (no return address is pushed). The trampoline can't receive arguments through the ABI, so a fiber finds itself via a thread-local `current` pointer that `resume_` sets before swapping in and restores on return.
 

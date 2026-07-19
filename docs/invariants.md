@@ -27,7 +27,7 @@ These span subsystems, so they're collected here. Violating one usually shows up
 ## GC rooting
 
 - **The operand stack is a precise root; force in place.** Ops force with `forceAt`/`forceTop` and write back — never pop-then-force — so a value stays rooted across a possibly-collecting force. → [runtime/thunks](runtime/thunks.md), [vm/dispatch](vm/dispatch.md)
-- **In-flight thunks are rooted by the force chain.** An `.evaluating` thunk is off the stack; `vm.gc_force_chain` roots its target/upvalues for the body's duration. Loop-based builtins root accumulators via `gc_temp_roots`. → [gc](gc.md)
+- **In-flight thunks are rooted by the force chain.** An `.evaluating` thunk is off the stack; `vm.gc_roots.force_chain` roots its target/upvalues for the body's duration. Loop-based builtins use `vm.gc_roots.temporary`. → [gc](gc.md)
 - **`heap_token` invalidates caches.** It bumps on every collection (and per `Evaluator`); the attr inline cache and the [thunk-result memo](runtime/thunks.md) key on it so stale entries auto-miss. Any new cross-eval cache must key on it too. → [gc](gc.md)
 - **Single-owner ranges.** Every `ValueRange`/`AttrRange` belongs to exactly one object; the GC marks objects, not ranges. Don't alias a range into two objects. → [gc](gc.md)
 - **Collections fire only at `native_depth == 0`** (a `forceThunk` safepoint), never mid-builtin. → [gc](gc.md)
@@ -36,7 +36,7 @@ These span subsystems, so they're collected here. Violating one usually shows up
 
 - **Fiber resumption is deduplicated and serialized.** `ReadyNode.queued` (0→1 CAS) keeps a fiber on the ready queue at most once; a per-fiber `run_mu` serializes concurrent `resume_` from different threads. Both are load-bearing against real crashes. → [parallel/fibers](parallel/fibers.md)
 - **Stolen fibers return home.** A finished fiber goes back to its *allocator*-worker's free list, not the stealer's, so teardown ownership is unambiguous. → [parallel/workers](parallel/workers.md)
-- **Speculation stays one layer deep and bails only after demand.** `in_speculation` stops a speculative force from cascading more speculation; `SpeculativeBail` only triggers once the demanded result already exists — so byte-identity is preserved and there's nothing to tune. → [parallel/speculation](parallel/speculation.md)
+- **Speculation stays one layer deep and bails only after demand.** `speculation.active` stops a speculative force from cascading more speculation; `SpeculativeBail` only triggers once the demanded result already exists. → [parallel/speculation](parallel/speculation.md)
 - **Observation state is evaluator-scoped.** An evaluator owns a cheap, copyable `Observer` capability and passes it to its VMs and realization store. There is no process-global recorder and no single-writer stage stack: concurrent evaluators and helper fibers may emit spans independently, while the selected sink owns any synchronization. A disabled or verbosity-filtered span returns before a clock read, subject copy, lock, or indirect call.
 
 ## Observability

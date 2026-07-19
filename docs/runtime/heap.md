@@ -12,7 +12,7 @@ Every non-immediate [`Value`](values.md) refers to a boxed runtime object by **`
 
 ## The object store: `FlatStore`
 
-The `objects` store is a `FlatStore` — a single `mmap` region, **not** geometric segments. `object_max_slots = 2^30` slots are reserved virtually with `MAP_NORESERVE`; only touched pages cost physical memory (the ~6M objects a NixOS toplevel produces sit against that reservation for free). The base pointer is immutable after init, so `get(id)` collapses to one load — `base[id]` — with no segment decode and no per-access atomic. This access happens tens of millions of times on the NixOS toplevel, which is why the object store forgoes the segment machinery the range stores use. Allocation is still per-worker TLAB'd (workers reserve chunks of the flat region and fill them lock-free); the flat single-region layout is only about the `get` path, not about how slots are handed out. The `builtins.builtins` self-reference reserves its slot up front (`reserveObjectSlot` → `fillObjectSlot`) so it can embed its own id before the object is filled.
+The `objects` store is a `FlatStore` — a single `mmap` region, **not** geometric segments. `object_max_slots = 2^30` slots are reserved virtually with `MAP_NORESERVE`; only touched pages cost physical memory. The base pointer is immutable after init, so `get(id)` is `base[id]` with no segment decode or per-access atomic. Allocation remains per-worker TLAB-based; the flat layout only governs lookup. The `builtins.builtins` self-reference reserves its slot up front (`reserveObjectSlot` → `fillObjectSlot`) so it can embed its own id before the object is filled.
 
 ## The range stores: `StableSegments`
 
@@ -26,7 +26,7 @@ API: `append(v) → id`, `reserve(len) → Range`, `slice`/`sliceMut`, and tail-
 
 Each worker (including main, indexed by `worker_id`) owns a `HeapLocal` with a `LocalChunk` cursor per store (object/value/attr/attr_pos). A worker **reserves a chunk from the global store once under the store mutex** (256 objects / 1024 values / 512 attrs / 256 attr-positions per refill), then hands out slots lock-free (`fits`/`take`) until the chunk is exhausted and it refills. This keeps the allocation fast path off the global mutex on list/attrset/upvalue-heavy workloads.
 
-Reclaimed storage is reused off this same lock-free path: the free lists are **per-worker** (`HeapLocal.gc_free_*`), not shared. The stop-the-world sweep distributes freed object slots and ranges round-robin into the per-worker shards, and each worker's alloc path pops from *its own* shard with no lock; a shard-miss just bump-allocates. A single shared free list + mutex would serialize all allocation across workers (measured 3.8× wall at `--workers>1`), which is exactly what sharding avoids.
+Reclaimed storage uses **per-worker** free lists (`HeapLocal.gc_free_*`). A minor-sweep participant returns dead slots and ranges to its shard; a major sweep distributes them across shards. Allocation pops locally and can steal from a peer, avoiding a shared allocation mutex.
 
 ## `Object` union
 
@@ -42,7 +42,7 @@ boxed_int     i64                       // out-of-i48 escape; see values.md
 partial_app   { func: Value, args: ValueRange }
 ```
 
-Source positions live inside the `attrs` variant rather than in a field on every object: the thunk variant already sizes the union, so hanging positions off attrsets alone costs nothing on the objects that carry none — a ~20% saving across all objects, most of which carry no positions. `positions.len == 0` means "none" and is never sliced.
+Source positions live inside the `attrs` variant rather than in every object. `positions.len == 0` means "none" and is never sliced.
 
 ## Attrsets: sorted, binary-searched, dup-rejecting
 

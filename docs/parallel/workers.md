@@ -47,7 +47,7 @@ Priority within `drainStep` mirrors the scheduler's discipline: **ready fibers �
 
 ## The Evaluator
 
-The **`Evaluator`** (defined in `eval.zig`) holds the state shared across all workers and fibers:
+The **`Evaluator`** (defined in `evaluator.zig`) holds the state shared across all workers and fibers:
 
 - **chunk registry** (compiled [bytecode](../compiler/pipeline.md)), **[intern](../runtime/interning.md) table**, **[heap](../runtime/heap.md)**, **scheduler**, **file/[import](imports.md) caches**, [derivation](../derivation/model.md) caches.
 - Cross-worker sharing goes through the heap and interned tables, which *are* concurrency-safe; the hot per-fiber allocation path takes no lock because it lands in the fiber's private scratch arena.
@@ -82,7 +82,7 @@ The parallel path rests on a small set of invariants proven load-bearing by real
 - **Fiber resume:** `ReadyNode.queued` CAS + per-slot `run_mu` — a [fiber](fibers.md) is enqueued once and resumed by one thread at a time.
 - **Waiter wake:** a waiter re-checks thunk state under the [`Future`](../runtime/thunks.md) claim/wait protocol before parking.
 - **Fiber ownership returns home** to the allocator-worker's free-list.
-- **Speculation is one layer deep** (`in_speculation`): a spec fiber does not itself spawn further speculation — the [speculation](speculation.md) brake that bounds fan-out.
+- **Speculation is one layer deep** (`speculation.active`): a spec fiber does not itself spawn further speculation — the [speculation](speculation.md) brake that bounds fan-out.
 
 For *why* all this parallelism buys a bounded speedup — the serial critical-path floor where helpers sit mostly idle — see [perf/model](../perf/model.md).
 

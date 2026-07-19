@@ -31,7 +31,7 @@ Thunk
   }
 ```
 
-`ErrorInfo` (`{err, message}`) is stored out-of-band and pointed at from the `result` slot only in the errored state — inlining it would widen every thunk for the handful that ever error (measured as a 10–15% regression).
+`ErrorInfo` (`{err, message}`) is stored out-of-band and pointed at from the `result` slot only in the errored state, so uncommon failures do not widen every thunk.
 
 ## `ThunkTarget` kinds
 
@@ -100,15 +100,15 @@ The result store *happens-before* the state release-store; a reader that acquire
 - `attr_access` → frameless `getAttrValue`
 - `pass_through` → recurse `forceValueImpl` on the wrapped value
 
-The safepoint sits at this force boundary, never mid-allocation. The fiber that wins collection coordination may request a collection at any native builtin depth; soundness rests on the precise-root discipline (operand stack, call/arg rooting, the in-flight force chain, and container temp-roots). At multiple workers, peers park only at native-depth-zero boundaries, then assist the parallel mark and evacuation before resuming.
+The safepoint sits at this force boundary, never mid-allocation. The fiber that wins collection coordination may request a collection at any native builtin depth; soundness rests on the precise-root discipline (operand stack, call/arg rooting, the in-flight force chain, and container temp-roots). At multiple workers, peers park only at native-depth-zero boundaries, then assist the minor mark and sweep before resuming.
 
 On `.busy`, spin a bounded `busy_spin_before_enroll` (1024) times in case the owner is about to publish, then enroll + yield, and retry the loop on resume. On `.blackhole` → `error.RecursiveThunk`; on `.errored` → replay the cached error.
 
-**In-place forcing.** Ops force operands with `forceAt(depth)` / `forceTop` — the value is forced *while it stays in its stack slot* and written back, never popped first. This keeps the operand stack a precise GC root across the (possibly collecting) force. The in-flight thunk itself is rooted by pushing its id onto `vm.gc_force_chain` for the duration of its body (it's `.evaluating` and off the stack). See [gc](../gc.md).
+**In-place forcing.** Ops force operands with `forceAt(depth)` / `forceTop` — the value is forced *while it stays in its stack slot* and written back, never popped first. This keeps the operand stack a precise GC root across the (possibly collecting) force. The in-flight thunk itself is rooted by pushing its id onto `vm.gc_roots.force_chain` for the duration of its body (it's `.evaluating` and off the stack). See [gc](../gc.md).
 
 ## Thread-local thunk-result memo
 
-nixpkgs re-evaluates the same pure `lib` helpers (`lib.types.*`, `lib.mkXxx`, …) with identical arguments across thousands of modules — distinct thunk objects computing identical values, which per-object memoization can't share. ~10.8% of bytecode-thunk computations on the NixOS toplevel are such duplicates.
+nixpkgs can re-evaluate pure `lib` helpers with identical arguments across many modules, producing distinct thunk objects that per-object memoization cannot share.
 
 The memo is a bounded **per-worker, zero-contention** table (`memo_size = 1 << 14` = 16384 slots) keyed by `(heap_token, chunk_id, upvalue count, ≤2 upvalue Value-bits) → Value`:
 
@@ -129,8 +129,8 @@ Checked on the freshly-claimed path before running the body; a hit resolves the 
 - **`reset()` is transient-only.** It drops to `.unresolved` and wakes waiters to retry — used *only* for `error.OutOfMemory`, `error.StackOverflow`, `error.SpeculativeBail` (the target arm is untouched; a transient failure never wrote a result). **It is NOT a safe general retry:** re-running a body after `StackOverflow` can yield a *different* value (a shrunk VM stack changes what the body computes). Deterministic failures instead go **sticky** via `.errored`, replaying the cached `ErrorInfo` on every later force.
 - **Terminal states never revert** — except the binding-cell's deliberate `.evaluating → .unresolved` publish.
 - **Claim is per-fiber**, not per-worker. Never key blackhole/claim decisions on the OS thread.
-- **Thunks are GC-rooted through the in-flight force chain** (`vm.gc_force_chain` roots the `.evaluating` thunk's target closure / upvalues / attr-access base). See [gc](../gc.md).
-- **Speculative forcing** (`forceValueSpeculative`) resolves without setting `demanded` and raises `in_speculation`, which (a) stops new thunks from cascading further speculation and (b) lets big builtin loops `error.SpeculativeBail` (a transient reset) once the demanded result is already in hand — bounding one wrong guess. See [speculation](../parallel/speculation.md).
+- **Thunks are GC-rooted through the in-flight force chain** (`vm.gc_roots.force_chain` roots the `.evaluating` thunk's target closure / upvalues / attr-access base). See [gc](../gc.md).
+- **Speculative forcing** (`forceValueSpeculative`) resolves without setting `demanded` and raises `speculation.active`, which (a) stops new thunks from cascading further speculation and (b) lets big builtin loops `error.SpeculativeBail` (a transient reset) once the demanded result is already in hand — bounding one wrong guess. See [speculation](../parallel/speculation.md).
 - **Single-owner ranges.** Every `ValueRange` / `AttrRange` a thunk's upvalues spill into is single-owner (a structural invariant), so the GC marks objects not ranges.
 
 Code: `src/runtime/thunk.zig`, `src/expr/vm/force.zig`

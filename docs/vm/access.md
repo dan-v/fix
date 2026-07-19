@@ -33,7 +33,7 @@ A cache **miss** is also the trigger point for the **demand-sibling prefetch** (
 
 The compiler collapses pervasive read chains into single opcodes, saving a dispatch and the intermediate push/pop (fusion is chosen at emit time; see [compiler/pipeline.md](../compiler/pipeline.md)):
 
-- **`up_get_attr`** (upvalue idx + name): force upvalue, select attr, push. Profiling puts `up_get` at 10% of all executed ops and `attr_get` at 3%, much of the latter being the same upvalue→attr chain (`lib.foo`, `config.bar`).
+- **`up_get_attr`** (upvalue idx + name): force upvalue, select attr, push.
 - **`loc_get_attr`** / **`loc_get_attr_w`**: same for a local slot (narrow / wide).
 - **Value-returning `_ret` fusions** — `push_const_ret`, `loc_get_ret` (`_w`), `up_get_ret`: load-and-return in one op, collapsing the two dispatches that dominate per-thunk overhead. These also drive the trivial-body thunk short-circuit (see [runtime/thunks.md](../runtime/thunks.md)).
 

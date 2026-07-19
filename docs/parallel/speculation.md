@@ -23,7 +23,7 @@ Neither changes results. Both are pure earliness: the [claim/waiter protocol](..
 - for a **user closure**, its chunk's `body_is_substantial` bit — set at chunk registration when the compiled body (plus fusion savings) is ≥ `speculation_min_code_bytes` = **256 bytes**;
 - for a **`builtin_closure`** whose builtin id is `mapValue`, `mapAttrValue`, or `zipAttrsValue` (the per-element wrappers `map` / `mapAttrs` / `zipAttrsWith` build around a user function), when that inner function (its `args[0]`) is itself a substantial closure or a *known-expensive* builtin — `import`, `scopedImport`, `fetchurl`/`fetchTarball`/`fetchGit`/`fetchTree`, `readFile`/`readFileType`/`readDir`, `derivation` (`isExpensiveBuiltin`). Trivial map bodies (`x: x + 1`) fail the closure size gate, and `derivationLazyAttr` is explicitly excluded, so speculation doesn't wander into unobserved package graphs.
 
-When it fires, a `force_thunk` task for the body goes to the speculation queue and the caller continues with a lazy thunk; the task runs the force with `in_speculation = true`.
+When it fires, a `force_thunk` task for the body goes to the speculation queue and the caller continues with a lazy thunk; the task runs the force with `speculation.active = true`.
 
 **Why a size gate.** A trivial body (return-upvalue, constant) is cheaper to run inline than to package as a task — the [trivial-body short-circuit](../compiler/lazy-compile.md) skips thunk allocation for those entirely. The 256-byte line is where packaging pays off.
 
@@ -43,7 +43,7 @@ Helpers running these urgent tasks **fan out recursively** — forcing a list of
 Saturated uncurried calls also use the chunk's strictness-derived `strict_params` mask (`forceStrictArgs`) to force must-force argument positions to WHNF in place on the stack. This is ordinary demand evaluation, not a scheduler submission.
 
 ### Sibling prefetch
-On a **demand** fiber's inline-cache miss that lands on a still-unresolved thunk member of a plain attrset whose entry count is in `[sibling_min, sibling_max)` = **[16, 64)**, `maybeSiblingSweep` submits one `force_attrs_sweep` task for the whole set (`FIX_SIBLING`, on by default at `2..16` workers; past 16 the urgent-priority sweeps fanned across that many helpers measured as a net loss at w=32, so it defaults off there). Reading one member of such a set strongly predicts reading its siblings; the size gate excludes big pkgs-like sets, where sweeping would evaluate all of nixpkgs. The sweep is deduped once-per-set, submitted urgently by default (`FIX_SIBLING_URGENT`), and each swept member runs under bounded per-member claim/creation budgets so a mispredicted member's cascade is abandoned rather than run to completion.
+On a **demand** fiber's inline-cache miss that lands on a still-unresolved thunk member of a plain attrset whose entry count is in `[sibling_min, sibling_max)` = **[16, 64)**, `maybeSiblingSweep` submits one `force_attrs_sweep` task for the whole set. `FIX_SIBLING` defaults on for 2–16 workers and can override that gate. The size range avoids sweeping large package sets; once-per-set deduplication and per-member claim/creation budgets bound wasted work.
 
 A further `readdir_prefetch` lane (`FIX_READDIR_PREFETCH`, on by default whenever helpers exist) warms the [file cache](workers.md) with a directory-of-directories' children when a cold `builtins.readDir` is about to walk them serially on the chain.
 
@@ -53,14 +53,14 @@ A further `readdir_prefetch` lane (`FIX_READDIR_PREFETCH`, on by default wheneve
 
 The danger: a speculatively-forced sibling that real demand *never touches* could be enormous (a whole unused package tree) and extend wall time past the serial baseline. Three guards prevent this.
 
-### The `in_speculation` brake
-Speculation and fan-out only fire from the **demand path**, never from within an already-speculative force (`in_speculation` short-circuits re-submission). Cascades stay **one layer deep**: a spec task can fan out its immediate children, but those children do not spawn their own speculation. This is the load-bearing invariant that keeps the working set finite.
+### The speculation brake
+Speculation and fan-out only fire from the **demand path**, never from within an already-speculative force (`speculation.active` short-circuits re-submission). Cascades stay **one layer deep**: a spec task can fan out its immediate children, but those children do not spawn their own speculation. This is the load-bearing invariant that keeps the working set finite.
 
 ### Bail-on-demand
 Once the *demanded* result exists, the [worker driver](workers.md) sets `suppress_background`. Speculative [fibers](fibers.md) poll a cheap predicate before any long loop or large allocation and abandon:
 
 ```
-specBailRequested(vm)  ==  vm.in_speculation and
+specBailRequested(vm)  ==  vm.speculation.active and
                            (scheduler.backgroundSuppressed() or over-budget)
 
   at each checkpoint:
@@ -86,7 +86,7 @@ Fan-out and speculation are independent levers and each contributes a substantia
 ## Invariants
 
 - Speculation/fan-out **never** change a result — earliness only; the [claim protocol](../runtime/thunks.md) enforces exactly-once resolution.
-- Cascades are **one layer deep** (`in_speculation` gate).
+- Cascades are **one layer deep** (`speculation.active` gate).
 - Bail fires **only after** the demanded result exists (or a budget is blown) ⇒ byte-identical, untunable.
 - `SpeculativeBail` is **transient** — the thunk is reset and recomputed on real demand, never cached as an error.
 - Submission fires **only from the demand path**.

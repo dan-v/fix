@@ -41,7 +41,7 @@ Handlers return `anyerror!void`. `anyerror!Value` is 24 bytes on x86-64 SysV, wh
 
 ### Why many small handlers, not one switch
 
-An equivalent monolithic ~70-arm `switch` compiles to a single ~32 KB function. At that size LLVM's register allocator abandons aggressive stack-slot coloring, so every arm spills conservatively and adding a single case grew the frame by 16 bytes for *every* arm. Splitting each opcode into a standalone function restores local, per-handler register allocation, removes the shared-spill tax, and makes adding an opcode genuinely free at the codegen level. The static `handlers` table (indexed by opcode byte) is the only thing tying them together.
+Each opcode has a standalone handler so its locals and register pressure remain isolated from unrelated operations. A static table indexed by opcode byte provides dispatch without a monolithic switch body.
 
 ## Value stack and frames
 
