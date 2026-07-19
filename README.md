@@ -1,6 +1,8 @@
 # fix
 
-`fix` is a parallel evaluator and command-line tool for the Nix language, written in Zig. It parses and evaluates expressions, fetches sources, computes derivations, and uses `nix-daemon` for store operations and builds. It targets byte-for-byte compatibility with `nix-instantiate`'s `.drv` output.
+`fix` is a performance-focused parallel evaluator and command-line tool for the Nix language, written in Zig. It parses and evaluates expressions, fetches sources, computes derivations, and uses `nix-daemon` for store operations and builds. It targets byte-for-byte compatibility with `nix-instantiate`'s `.drv` output and is tested against the Lix and snix language test suites.
+
+![fix evaluator benchmark](demo/benchmark.png)
 
 ![Building a NixOS toplevel with fix](demo/build-toplevel.gif)
 
