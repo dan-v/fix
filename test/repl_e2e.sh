@@ -68,6 +68,16 @@ out=$(printf '1 + 2\n:vm ls 1\n:vm chunks 1\n' | "$FIX" repl 2>/dev/null)
 t "bare: :vm name tree is queryable" "@0 <root>" "$out"
 t "bare: :vm listings report bounded overflow" "increase LIMIT" "$out"
 
+out=$(printf '1\n:vm heap\n' | "$FIX" repl --bare --color=never 2>/dev/null)
+t "bare: :vm heap has bounded aggregate output" "object slots" "$out"
+t "bare: :vm heap includes object variants" "thunk states" "$out"
+heap_lines=$(wc -l <<<"$out")
+if (( heap_lines <= 24 )); then
+    echo "ok   bare: :vm heap stays bounded"
+else
+    echo "FAIL bare: :vm heap emitted $heap_lines lines"; fails=$((fails+1))
+fi
+
 out=$(printf ':i builtins.map\n' | "$FIX" repl 2>/dev/null)
 t "bare: :i function" "a function" "$out"
 
@@ -102,6 +112,27 @@ out=$(pty '1 + 2\r')
 t "tty: banner hint" ":? for help" "$out"
 t "tty: prompt" "fix>" "$out"
 t "tty: evaluates" "3" "$out"
+if [[ "$out" == *$'\x1b[?1049h'* ]]; then
+    echo "FAIL tty: inline repl does not claim alternate screen"; fails=$((fails+1))
+else
+    echo "ok   tty: inline repl does not claim alternate screen"
+fi
+
+# The VM workspace is entered explicitly, and leaving it restores the normal
+# terminal before replaying expressions evaluated inside the workspace.
+out=$(
+    ( sleep 0.4; printf 'x: x + 1\r'; sleep 0.3; printf ':vm\r'; sleep 0.5;
+      printf 'i1 + 1\r'; sleep 0.4; printf '\033'; sleep 0.2; printf 'q';
+      sleep 0.3; printf '\004'; sleep 0.2 ) |
+        script -qec "$FIX repl" /dev/null 2>/dev/null
+)
+if [[ "$out" == *$'\x1b[?1049h'* && "$out" == *$'\x1b[?1049l'* ]]; then
+    echo "ok   tty: :vm owns and restores alternate screen"
+else
+    echo "FAIL tty: :vm screen lifecycle"; fails=$((fails+1))
+fi
+after_vm=${out##*$'\x1b[?1049l'}
+t "tty: vm transcript survives screen exit" "fix> 1 + 1" "$after_vm"
 
 # Tab completion: a unique candidate completes fully in-line.
 out=$(pty 'builtins.getFla\t\r')
