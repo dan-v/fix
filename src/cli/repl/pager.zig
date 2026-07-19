@@ -61,8 +61,14 @@ const HeapView = enum { overview, objects, values, attrs, attr_positions };
 const RowAction = union(enum) {
     none,
     heading: Panel,
+    instruction,
     chunk: ChunkId,
     object: runtime.types.ObjectId,
+};
+
+const BreakpointLocation = struct {
+    file: []const u8,
+    line: u32,
 };
 
 /// One rendered inspector document (or the help screen). Actions are parallel
@@ -72,6 +78,7 @@ const Page = struct {
     title: []u8,
     lines: [][]u8,
     actions: []RowAction,
+    locations: []const ?BreakpointLocation = &.{},
     source_lines: []const []const u8 = &.{},
 };
 
@@ -79,10 +86,16 @@ const PageBuilder = struct {
     arena: std.mem.Allocator,
     lines: std.ArrayListUnmanaged([]u8) = .empty,
     actions: std.ArrayListUnmanaged(RowAction) = .empty,
+    locations: std.ArrayListUnmanaged(?BreakpointLocation) = .empty,
 
     fn line(self: *PageBuilder, line_text: []const u8, action: RowAction) !void {
+        try self.lineAt(line_text, action, null);
+    }
+
+    fn lineAt(self: *PageBuilder, line_text: []const u8, action: RowAction, location: ?BreakpointLocation) !void {
         try self.lines.append(self.arena, try self.arena.dupe(u8, line_text));
         try self.actions.append(self.arena, action);
+        try self.locations.append(self.arena, location);
     }
 
     fn text(self: *PageBuilder, contents: []const u8) !void {
@@ -91,6 +104,7 @@ const PageBuilder = struct {
         if (self.lines.items.len > 0 and self.lines.items[self.lines.items.len - 1].len == 0) {
             _ = self.lines.pop();
             _ = self.actions.pop();
+            _ = self.locations.pop();
         }
     }
 };
@@ -424,12 +438,13 @@ const Tui = struct {
     tree_rows: std.ArrayListUnmanaged(TreeRow) = .empty,
     transcript_lines: std.ArrayListUnmanaged(LineRange) = .empty,
     status_msg: []const u8 = "",
+    status_buf: [256]u8 = undefined,
     indexing: bool = false,
     focus: Focus = .disassembly,
     tree_selection: usize = 0,
     detail_selection: usize = 0,
     x_scroll: usize = 0,
-    panels: [4]bool = .{ true, false, true, false },
+    panel: Panel = .code,
     category_expanded: [2]bool = .{ false, false },
     heap_view_expanded: [5]bool = @splat(false),
     heap_stats: ?runtime.ObjectHeap.Stats = null,
@@ -596,14 +611,14 @@ const Tui = struct {
             }
             if (ref_job.poll(&self.ref_graph)) {
                 self.reference_indexing = false;
-                if (self.currentChunk() != null and self.panels[@intFromEnum(Panel.references)]) try self.refreshPage(self.currentKind());
+                if (self.currentChunk() != null and self.panel == .references) try self.refreshPage(self.currentKind());
             }
             const reference_failed = ref_job.failed.load(.acquire);
             if (reference_failed != self.reference_index_failed) {
                 self.reference_index_failed = reference_failed;
-                if (self.currentChunk() != null and self.panels[@intFromEnum(Panel.references)]) try self.refreshPage(self.currentKind());
+                if (self.currentChunk() != null and self.panel == .references) try self.refreshPage(self.currentKind());
             }
-            const wants_references = self.currentChunk() != null and self.panels[@intFromEnum(Panel.references)];
+            const wants_references = self.currentChunk() != null and self.panel == .references;
             if (wants_references and reference_failed) self.status_msg = "(reference index failed)";
             const refs_stale = self.ref_graph == null or self.ref_graph.?.registry_count != registry.count();
             if (wants_references and refs_stale and ref_job.thread == null and !ref_job.failed.load(.acquire)) {
@@ -758,40 +773,22 @@ const Tui = struct {
                     };
                 };
                 var page: PageBuilder = .{ .arena = arena };
-                const source_lines = if (self.panels[@intFromEnum(Panel.source)])
+                const source_lines = if (self.panel == .source)
                     try self.sourceDocument(id, chunk)
                 else
                     &.{};
-                for (std.meta.tags(Panel)) |panel| {
-                    if (!self.panels[@intFromEnum(panel)]) continue;
-                    try page.line(panelLabel(panel), .{ .heading = panel });
-
-                    switch (panel) {
-                        .code, .tables => {
-                            var text: std.Io.Writer.Allocating = .init(arena);
-                            const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
-                            var options = disasm_options;
-                            options.color_depth = self.color_depth;
-                            options.show_constants = panel == .tables;
-                            options.show_code = panel == .code;
-                            options.line_width = @intCast(@min(self.layout().main_width, std.math.maxInt(u16)));
-                            try disasm.writeChunk(arena, &text.writer, id, chunk, symbols, options);
-                            try page.text(text.written());
-                        },
-                        .source => {
-                            if (self.layout().source_split) {
-                                try page.line("  source is shown alongside the inspector", .none);
-                            } else {
-                                for (source_lines) |source_line| try page.line(source_line, .none);
-                            }
-                        },
-                        .references => try self.appendRefs(&page, id),
-                    }
+                if (self.panel == .source and !self.layout().source_split) {
+                    for (source_lines) |source_line| try page.line(source_line, .none);
+                } else switch (self.panel) {
+                    .code, .source => try self.appendDisassembly(&page, id, chunk, .code),
+                    .tables => try self.appendDisassembly(&page, id, chunk, .tables),
+                    .references => try self.appendRefs(&page, id),
                 }
                 return .{
                     .title = try std.fmt.allocPrint(arena, "chunk[0x{x}]", .{id}),
                     .lines = page.lines.items,
                     .actions = page.actions.items,
+                    .locations = page.locations.items,
                     .source_lines = if (self.layout().source_split) source_lines else &.{},
                 };
             },
@@ -805,7 +802,8 @@ const Tui = struct {
                     \\  j/k, arrows     move between interactive rows
                     \\  Enter, →        expand a tree/group or open a reference
                     \\  ←               collapse a tree/group
-                    \\  c/t/s/r         show/hide code/tables/source/references panels
+                    \\  c/t/s/r         show code/tables/source/references panel
+                    \\  p               toggle breakpoint at selected instruction
                     \\  d/u, PgDn/PgUp  scroll the detail document
                     \\  b / f           back / forward through visited chunks
                     \\  /               search; n/N next/previous match
@@ -978,13 +976,31 @@ const Tui = struct {
         }
     }
 
-    fn panelLabel(panel: Panel) []const u8 {
-        return switch (panel) {
-            .code => "BYTECODE",
-            .tables => "TABLES",
-            .source => "SOURCE",
-            .references => "REFERENCES",
-        };
+    fn appendDisassembly(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk, panel: Panel) !void {
+        var text: std.Io.Writer.Allocating = .init(page.arena);
+        const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
+        var options = disasm_options;
+        options.color_depth = self.color_depth;
+        options.show_constants = panel == .tables;
+        options.show_code = panel == .code;
+        options.line_width = @intCast(@min(self.layout().main_width, std.math.maxInt(u16)));
+        try disasm.writeChunk(page.arena, &text.writer, id, chunk, symbols, options);
+
+        var lines = std.mem.splitScalar(u8, text.written(), '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0 and lines.peek() == null) break;
+            const plain = base.terminal_text.stripAnsiInPlace(try page.arena.dupe(u8, line));
+            const target = disasmTarget(plain);
+            const action: RowAction = if (target == .none and disasmOffset(chunk, plain) != null) .instruction else target;
+            try page.lineAt(line, action, self.disasmLocation(id, chunk, plain));
+        }
+    }
+
+    fn disasmLocation(self: *Tui, id: ChunkId, chunk: *const bytecode.Chunk, plain: []const u8) ?BreakpointLocation {
+        const offset = disasmOffset(chunk, plain) orelse return null;
+        const span = bytecode.inspect.bestSpan(chunk, offset) orelse return null;
+        const file_id = span.file orelse bytecode.inspect.chunkPrimaryFile(chunk, id, self.ev.chunkRegistry()) orelse return null;
+        return .{ .file = self.ev.internTable().get(file_id), .line = span.line };
     }
 
     fn appendRefs(self: *Tui, page: *PageBuilder, id: ChunkId) !void {
@@ -1147,7 +1163,7 @@ const Tui = struct {
         const body_rows = self.viewport_rows;
         const split = cols >= 96;
         const sidebar_width = if (split) @max(cols * 3 / 10, 28) else 0;
-        const source_split = split and cols >= 140 and self.currentChunk() != null and self.panels[@intFromEnum(Panel.source)];
+        const source_split = split and cols >= 140 and self.currentChunk() != null and self.panel == .source;
         const inspector_width = if (split) cols - sidebar_width - 1 else cols;
         const source_width = if (source_split) @max(cols * 3 / 10, 42) else 0;
         const main_width = inspector_width -| source_width -| @intFromBool(source_split);
@@ -1698,18 +1714,54 @@ const Tui = struct {
 
     fn rowActionable(self: *const Tui, index: usize) bool {
         if (index >= self.page.actions.len) return false;
+        if (index < self.page.locations.len and self.page.locations[index] != null) return true;
         return switch (self.page.actions[index]) {
-            .chunk, .object => true,
+            .chunk, .object, .instruction => true,
             .none, .heading => false,
         };
     }
 
     fn firstActionableRow(self: *const Tui) ?usize {
         for (self.page.actions, 0..) |action, i| switch (action) {
-            .chunk, .object => return i,
-            .none, .heading => {},
+            .chunk, .object, .instruction => return i,
+            .none, .heading => if (i < self.page.locations.len and self.page.locations[i] != null) return i,
         };
         return null;
+    }
+
+    fn toggleSelectedBreakpoint(self: *Tui) !void {
+        if (self.focus != .disassembly) {
+            self.status_msg = "(focus the code pane first)";
+            return;
+        }
+        if (self.detail_selection >= self.page.locations.len) {
+            self.status_msg = "(select an instruction with source)";
+            return;
+        }
+        const location = self.page.locations[self.detail_selection] orelse {
+            self.status_msg = "(selected row has no source location)";
+            return;
+        };
+        for (self.ev.listBreakpoints()) |breakpoint| {
+            if (breakpoint.line == location.line and sourceFileMatches(breakpoint.file, location.file)) {
+                _ = self.ev.deleteBreakpoint(breakpoint.id);
+                self.status_msg = std.fmt.bufPrint(&self.status_buf, "cleared breakpoint {d} at {s}:{d}", .{
+                    breakpoint.id,
+                    std.fs.path.basename(location.file),
+                    location.line,
+                }) catch "cleared breakpoint";
+                return;
+            }
+        }
+        const result = self.ev.setBreakpoint(location.file, location.line) catch |err| {
+            self.status_msg = std.fmt.bufPrint(&self.status_buf, "breakpoint failed: {s}", .{@errorName(err)}) catch "breakpoint failed";
+            return;
+        };
+        self.status_msg = std.fmt.bufPrint(&self.status_buf, "breakpoint {d} at {s}:{d}", .{
+            result.id,
+            std.fs.path.basename(location.file),
+            result.line,
+        }) catch "breakpoint set";
     }
 
     fn moveDetail(self: *Tui, forward: bool) void {
@@ -1739,10 +1791,9 @@ const Tui = struct {
         self.clampScroll();
     }
 
-    fn togglePanel(self: *Tui, panel: Panel) !void {
+    fn selectPanel(self: *Tui, panel: Panel) !void {
         if (self.currentChunk() == null) return;
-        const index = @intFromEnum(panel);
-        self.panels[index] = !self.panels[index];
+        self.panel = panel;
         try self.refreshPage(self.currentKind());
         self.focus = .disassembly;
     }
@@ -1752,7 +1803,7 @@ const Tui = struct {
         switch (self.page.actions[self.detail_selection]) {
             .chunk => |id| try self.open(.{ .chunk = id }),
             .object => |id| try self.open(.{ .object = id }),
-            .none, .heading => {},
+            .none, .heading, .instruction => {},
         }
     }
 
@@ -1821,10 +1872,11 @@ const Tui = struct {
                 },
                 'b' => try self.back(),
                 'f' => try self.goForward(),
-                'c' => try self.togglePanel(.code),
-                't' => try self.togglePanel(.tables),
-                's' => try self.togglePanel(.source),
-                'r' => try self.togglePanel(.references),
+                'c' => try self.selectPanel(.code),
+                't' => try self.selectPanel(.tables),
+                's' => try self.selectPanel(.source),
+                'r' => try self.selectPanel(.references),
+                'p' => try self.toggleSelectedBreakpoint(),
                 '?' => try self.toggleHelp(),
                 '/' => {
                     if (self.focus == .disassembly) try self.searchPrompt();
@@ -2040,7 +2092,7 @@ const Tui = struct {
         else if (prompt_active)
             " Enter evaluate · Esc explorer · Ctrl-D leave VM · Tab complete · Ctrl-R history "
         else
-            std.fmt.bufPrint(&footer_buf, " q/Esc exit · i expression · : command · Tab pane · c/t/s/r panels · ↵ interact{s} ", .{
+            std.fmt.bufPrint(&footer_buf, " q/Esc exit · i expression · : command · Tab pane · c/t/s/r panel · p breakpoint · ↵ inspect{s} ", .{
                 if (self.indexing) " · indexing" else "",
             }) catch " q exit ";
         try frame.bar(screen_rows, footer, cols, .footer);
@@ -2101,8 +2153,9 @@ const Tui = struct {
         const idx = self.scroll + row;
         if (idx < self.page.lines.len) {
             const selected = idx == self.detail_selection and self.focus == .disassembly and self.rowActionable(idx);
-            if (selected and width >= 2) {
-                try frame.text("› ", 0, 2, .selection_marker);
+            const breakpoint = idx < self.page.locations.len and if (self.page.locations[idx]) |location| self.hasBreakpoint(location) else false;
+            if ((selected or breakpoint) and width >= 2) {
+                try frame.text(if (selected and breakpoint) "◆ " else if (selected) "› " else "● ", 0, 2, if (selected) .selection_marker else .current);
                 try frame.text(self.page.lines[idx], self.x_scroll, width - 2, self.detailRole(idx));
             } else {
                 try frame.text(self.page.lines[idx], self.x_scroll, width, self.detailRole(idx));
@@ -2112,11 +2165,18 @@ const Tui = struct {
         }
     }
 
+    fn hasBreakpoint(self: *const Tui, location: BreakpointLocation) bool {
+        for (self.ev.listBreakpoints()) |breakpoint| {
+            if (breakpoint.line == location.line and sourceFileMatches(breakpoint.file, location.file)) return true;
+        }
+        return false;
+    }
+
     fn detailRole(self: *const Tui, index: usize) tui.Role {
         if (index < self.page.actions.len) switch (self.page.actions[index]) {
             .heading => return .section,
             .chunk, .object => return .chunk,
-            .none => {},
+            .none, .instruction => {},
         };
         return if (std.mem.startsWith(u8, self.page.lines[index], "▶")) .source_focus else .plain;
     }
@@ -2487,3 +2547,47 @@ const Tui = struct {
         }
     }
 };
+
+fn disasmTarget(line: []const u8) RowAction {
+    const chunk_prefixes = [_][]const u8{ "chunk[0x", "function[0x" };
+    for (chunk_prefixes) |prefix| if (storeRefId(line, prefix)) |id| {
+        return .{ .chunk = @intCast(id) };
+    };
+    const object_prefixes = [_][]const u8{
+        "list[0x",
+        "attrs[0x",
+        "closure[0x",
+        "thunk[0x",
+        "builtin_closure[0x",
+        "string_ctx[0x",
+        "boxed_int[0x",
+        "partial_app[0x",
+    };
+    for (object_prefixes) |prefix| if (storeRefId(line, prefix)) |id| {
+        return .{ .object = @intCast(id) };
+    };
+    return .none;
+}
+
+fn disasmOffset(chunk: *const bytecode.Chunk, line: []const u8) ?usize {
+    const trimmed = std.mem.trimLeft(u8, line, " │\t");
+    const end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return null;
+    const offset = std.fmt.parseInt(usize, trimmed[0..end], 16) catch return null;
+    return if (offset < chunk.code.len) offset else null;
+}
+
+fn storeRefId(line: []const u8, prefix: []const u8) ?u64 {
+    const start = (std.mem.indexOf(u8, line, prefix) orelse return null) + prefix.len;
+    const end = std.mem.indexOfScalarPos(u8, line, start, ']') orelse return null;
+    return std.fmt.parseInt(u64, line[start..end], 16) catch null;
+}
+
+fn sourceFileMatches(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b) or std.mem.eql(u8, std.fs.path.basename(a), std.fs.path.basename(b));
+}
+
+test "disassembly targets recognize chunk and heap links" {
+    try std.testing.expectEqual(@as(ChunkId, 0x2a), disasmTarget("closure chunk[0x2a]").chunk);
+    try std.testing.expectEqual(@as(runtime.types.ObjectId, 0x31), disasmTarget("push thunk[0x31]").object);
+    try std.testing.expect(disasmTarget("push str[0x1]") == .none);
+}

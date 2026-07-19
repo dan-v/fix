@@ -238,7 +238,8 @@ pub const DebuggerTui = struct {
                         try self.editor.insertText(":");
                     },
                     'i' => self.prompt_active = true,
-                    'b' => {
+                    'b' => try self.toggleFrameBreakpoint(session),
+                    'B' => {
                         self.prompt_active = true;
                         try self.editor.insertText("break ");
                     },
@@ -314,6 +315,25 @@ pub const DebuggerTui = struct {
             result.sites,
         });
         try self.setLog(out.written());
+    }
+
+    fn toggleFrameBreakpoint(self: *DebuggerTui, session: *DebugSession) !void {
+        if (session.frameCount() == 0) return self.setLog("no frame selected");
+        const frame = session.frame(self.selected_frame);
+        const file = frame.file orelse return self.setLog("selected frame has no source file");
+        if (frame.line == 0) return self.setLog("selected frame has no executable source line");
+        for (session.listBreakpoints()) |breakpoint| {
+            if (breakpoint.line == frame.line and fileMatches(breakpoint.file, file)) {
+                _ = session.deleteBreakpoint(breakpoint.id);
+                var message: [96]u8 = undefined;
+                return self.setLog(std.fmt.bufPrint(&message, "cleared breakpoint {d} at line {d}", .{ breakpoint.id, frame.line }) catch "cleared breakpoint");
+            }
+        }
+        const result = session.setBreakpoint(file, frame.line) catch |err| {
+            return self.setError(err);
+        };
+        var message: [128]u8 = undefined;
+        try self.setLog(std.fmt.bufPrint(&message, "breakpoint {d} at {s}:{d}", .{ result.id, std.fs.path.basename(file), result.line }) catch "breakpoint set");
     }
 
     fn showBreakpoints(self: *DebuggerTui, session: *DebugSession) !void {
@@ -527,9 +547,10 @@ pub const DebuggerTui = struct {
         const start_line = @max(@as(usize, 1), focus_line -| (rows / 2) + self.detail_scroll);
         const line_no = start_line + row;
         const bounds = sourceLine(source, line_no) orelse return;
+        const breakpoint = if (info.file) |file| hasBreakpoint(session, file, @intCast(line_no)) else false;
         const prefix = try std.fmt.allocPrint(arena, "{d: >5} {s} ", .{
             line_no,
-            if (line_no == info.line) "▶" else "┆",
+            if (breakpoint and line_no == info.line) "◆" else if (breakpoint) "●" else if (line_no == info.line) "▶" else "┆",
         });
         try frame.text(prefix, 0, width, if (line_no == info.line) .source_focus else .muted);
         const prefix_width = width_mod.strWidth(prefix);
@@ -668,13 +689,25 @@ fn reasonName(reason: engine.BreakReason) []const u8 {
 const help_text =
     \\s / n / f      step into / next / finish
     \\c              continue and close the debug screen
-    \\b              enter `break FILE:LINE`
+    \\b              toggle a breakpoint on the selected source line
+    \\B              enter `break FILE:LINE`
     \\i              evaluate an expression in the selected pause scope
     \\v / Tab        toggle source and disassembly
     \\j/k, arrows    select a stack frame
     \\:              enter any console command
     \\q / Ctrl-D     abort evaluation
 ;
+
+fn hasBreakpoint(session: *const DebugSession, file: []const u8, line: u32) bool {
+    for (session.listBreakpoints()) |breakpoint| {
+        if (breakpoint.line == line and fileMatches(breakpoint.file, file)) return true;
+    }
+    return false;
+}
+
+fn fileMatches(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b) or std.mem.eql(u8, std.fs.path.basename(a), std.fs.path.basename(b));
+}
 
 test "sourceLine returns one-based source rows" {
     try std.testing.expectEqualStrings("two", blk: {

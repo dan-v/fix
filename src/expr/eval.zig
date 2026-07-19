@@ -268,20 +268,17 @@ pub const DebugSession = struct {
     /// line carrying code, or remains pending until the file is compiled.
     /// Applies to already compiled chunks and any that compile later.
     pub fn setBreakpoint(self: *DebugSession, file: []const u8, line: u32) !bytecode.BreakpointTable.SetResult {
-        if (self.ev.debugger.breakpoints) |*bp| return bp.set(&self.ev.registry, file, line);
-        return error.DebuggerUnavailable;
+        return self.ev.setBreakpoint(file, line);
     }
 
     /// All active breakpoint requests (for a `:breakpoints` listing).
     pub fn listBreakpoints(self: *const DebugSession) []const bytecode.BreakpointTable.Request {
-        if (self.ev.debugger.breakpoints) |*bp| return bp.list();
-        return &.{};
+        return self.ev.listBreakpoints();
     }
 
     /// Remove a breakpoint by id; true if it existed.
     pub fn deleteBreakpoint(self: *DebugSession, id: u32) bool {
-        if (self.ev.debugger.breakpoints) |*bp| return bp.remove(&self.ev.registry, id);
-        return false;
+        return self.ev.deleteBreakpoint(id);
     }
 
     pub const StepKind = debug_session.StepKind;
@@ -1178,9 +1175,30 @@ pub const Evaluator = struct {
     /// upcalls through this seam, so the layering stays down-only.
     pub fn setDebugUi(self: *Evaluator, ctx: *anyopaque, run: *const fn (*anyopaque, *DebugSession) anyerror!void) void {
         self.debugger.setUi(.{ .ctx = ctx, .run = run });
-        if (self.debugger.breakpoints == null) {
+        self.ensureBreakpointTable();
+    }
+
+    /// Breakpoint tooling is also available to the VM explorer, before a
+    /// debugger UI is attached. A later `:debug`/`--debugger` session reuses
+    /// the same requests and patched sites.
+    pub fn setBreakpoint(self: *Evaluator, file: []const u8, line: u32) !bytecode.BreakpointTable.SetResult {
+        self.ensureBreakpointTable();
+        return self.debugger.breakpoints.?.set(&self.registry, file, line);
+    }
+
+    pub fn listBreakpoints(self: *const Evaluator) []const bytecode.BreakpointTable.Request {
+        if (self.debugger.breakpoints) |*breakpoints| return breakpoints.list();
+        return &.{};
+    }
+
+    pub fn deleteBreakpoint(self: *Evaluator, id: u32) bool {
+        if (self.debugger.breakpoints) |*breakpoints| return breakpoints.remove(&self.registry, id);
+        return false;
+    }
+
+    fn ensureBreakpointTable(self: *Evaluator) void {
+        if (self.debugger.breakpoints == null)
             self.debugger.breakpoints = bytecode.BreakpointTable.init(self.allocator, &self.intern);
-        }
     }
 
     pub fn clearDebugUi(self: *Evaluator) void {
