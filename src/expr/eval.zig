@@ -1198,6 +1198,10 @@ pub const Evaluator = struct {
         return self.heap.stats();
     }
 
+    pub fn heapCounts(self: *const Evaluator) ObjectHeap.Counts {
+        return self.heap.counts();
+    }
+
     pub fn internStats(self: *const Evaluator) InternTable.Stats {
         return self.intern.stats();
     }

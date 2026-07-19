@@ -7,6 +7,33 @@ const InternId = heap_mod.InternId;
 const ChunkId = heap_mod.ChunkId;
 const Thunk = @import("../thunk.zig").Thunk;
 
+test "object heap exposes cheap backing-store counts" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const empty = heap.counts();
+    try std.testing.expectEqual(@as(u32, 0), empty.objects);
+    try std.testing.expectEqual(@as(u32, 0), empty.values);
+    try std.testing.expectEqual(@as(u32, 0), empty.attrs);
+    try std.testing.expectEqual(@as(u32, 0), empty.attr_positions);
+    _ = try heap.addList(&.{ Value.int(1), Value.int(2) });
+    const with_list = heap.counts();
+    try std.testing.expect(with_list.objects > empty.objects);
+    try std.testing.expect(with_list.values > empty.values);
+    try std.testing.expectEqual(empty.attrs, with_list.attrs);
+    try std.testing.expectEqual(empty.attr_positions, with_list.attr_positions);
+
+    _ = try heap.addAttrsWithPositions(
+        &.{.{ .name = 10, .value = Value.int(3) }},
+        &.{.{ .name = 10, .pos = .{ .file = 1, .line = 2, .column = 3 } }},
+    );
+    const with_attrs = heap.counts();
+    try std.testing.expect(with_attrs.objects >= with_list.objects);
+    try std.testing.expect(with_attrs.values >= with_list.values);
+    try std.testing.expect(with_attrs.attrs > with_list.attrs);
+    try std.testing.expect(with_attrs.attr_positions > with_list.attr_positions);
+}
+
 test "object heap stores list and attrs payloads behind object ids" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();

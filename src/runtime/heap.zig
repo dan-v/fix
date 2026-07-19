@@ -563,6 +563,26 @@ pub const ObjectHeap = struct {
         self.errored_infos.deinit(self.allocator);
     }
 
+    pub const Counts = struct {
+        objects: u32,
+        values: u32,
+        attrs: u32,
+        attr_positions: u32,
+    };
+
+    /// Constant-time backing-store reservation counts for interactive
+    /// inspection. Unlike `stats`, this does not walk object/value slots, and
+    /// the range stores exclude the unbacked id-space gap reserved for their
+    /// copying nurseries.
+    pub fn counts(self: *const ObjectHeap) Counts {
+        return .{
+            .objects = self.objects.count(),
+            .values = self.values.reservedSlots(),
+            .attrs = self.attrs.reservedSlots(),
+            .attr_positions = self.attr_positions.reservedSlots(),
+        };
+    }
+
     pub const Stats = struct {
         objects: u32,
         values: u32,

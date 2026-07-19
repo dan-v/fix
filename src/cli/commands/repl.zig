@@ -160,6 +160,7 @@ const Repl = struct {
     output_capture: ?*std.Io.Writer = null,
     tui_active: bool = false,
     vm_requested: bool = false,
+    vm_heap_requested: bool = false,
     history: history_mod.History,
     quit: bool = false,
 
@@ -296,6 +297,8 @@ const Repl = struct {
 
     fn runVmSession(self: *Repl, editor: *editor_mod.Editor) !void {
         self.vm_requested = false;
+        const start_heap = self.vm_heap_requested;
+        self.vm_heap_requested = false;
         var journal = transcript_mod.Capture.init(self.allocator, 4 * 1024 * 1024);
         defer journal.deinit();
 
@@ -307,6 +310,8 @@ const Repl = struct {
             .focusFn = sessionFocus,
             .sourceFn = sessionSource,
             .quitFn = sessionQuit,
+            .takeHeapRequestFn = sessionTakeHeapRequest,
+            .start_heap = start_heap,
         }) catch |err| switch (err) {
             error.NotATerminal => return,
             else => return err,
@@ -352,6 +357,13 @@ const Repl = struct {
     fn sessionQuit(raw: *anyopaque) bool {
         const self: *Repl = @ptrCast(@alignCast(raw));
         return self.quit;
+    }
+
+    fn sessionTakeHeapRequest(raw: *anyopaque) bool {
+        const self: *Repl = @ptrCast(@alignCast(raw));
+        const requested = self.vm_heap_requested;
+        self.vm_heap_requested = false;
+        return requested;
     }
 
     fn isCompleteThunk(ctx: *anyopaque, text: []const u8) bool {
@@ -726,6 +738,7 @@ const Repl = struct {
         if (std.mem.eql(u8, word, "help") or std.mem.eql(u8, word, "?")) return self.vmHelp();
         if (std.mem.eql(u8, word, "ls") or std.mem.eql(u8, word, "tree")) return self.vmList(rest);
         if (std.mem.eql(u8, word, "chunks")) return self.vmChunks(rest);
+        if (std.mem.eql(u8, word, "heap")) return self.vmHeap();
         if (std.mem.eql(u8, word, "chunk") or std.mem.eql(u8, word, "code")) {
             if (rest.len > 0) {
                 self.vm_focus = parseChunkId(rest) orelse {
@@ -756,11 +769,38 @@ const Repl = struct {
         }
         if (self.tui_active) return;
         if (self.interactive) {
+            self.vm_heap_requested = false;
             self.vm_requested = true;
         } else {
             var out = self.output();
             defer out.flush() catch {};
             try pager_mod.writePlain(self.allocator, out.writer(), self.ev, chunk_id);
+        }
+    }
+
+    fn vmHeap(self: *Repl) !void {
+        if (self.interactive) {
+            self.vm_heap_requested = true;
+            if (!self.tui_active) self.vm_requested = true;
+            return;
+        }
+        const heap_stats = self.ev.heapStats();
+        const heap_counts = self.ev.heapCounts();
+        var out = self.output();
+        defer out.flush() catch {};
+        const w = out.writer();
+        try w.print("heap: {d} object slots, {d} value slots, {d} attr slots, {d} attr-position slots\n", .{
+            heap_counts.objects,
+            heap_counts.values,
+            heap_counts.attrs,
+            heap_counts.attr_positions,
+        });
+        for (heap_stats.variant_counts, 0..) |count, i| {
+            try w.print("  {s:<20} {d:>12}\n", .{ runtime.ObjectHeap.Stats.variantName(i), count });
+        }
+        try w.writeAll("  thunk states\n");
+        for (heap_stats.thunk_states, 0..) |count, i| {
+            try w.print("    {s:<18} {d:>12}\n", .{ runtime.ObjectHeap.Stats.thunkStateName(i), count });
         }
     }
 
@@ -774,6 +814,7 @@ const Repl = struct {
             \\:vm ls [@NAME] [LIMIT]  list one bounded name-tree level
             \\:vm chunks [@NAME] [LIMIT]
             \\                         list chunks directly attached to a name
+            \\:vm heap                inspect heap stores and object census
             \\:vm eval EXPR            disambiguate an expression starting with
             \\                         a VM subcommand word
             \\Name and chunk ids printed by the explorer are stable for this
