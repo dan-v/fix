@@ -83,12 +83,20 @@ pub const ChunkRegistry = struct {
     const Store = segments.StableSegments(ChunkSlot, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
     const dedup_shard_count = 64;
+    /// Immutable collision-chain entry. Nodes are only prepended while the
+    /// shard is locked and live until registry teardown, so readers may walk a
+    /// snapshotted head without holding the lock.
+    const DedupCandidate = struct {
+        id: ChunkId,
+        next: ?*DedupCandidate,
+    };
+
     /// One shard of the content-addressed dedup map. `align(cache_line)` on
     /// the shard lock keeps neighboring shards out of each other's cache
     /// lines (each shard is padded to a full line).
     const DedupShard = struct {
         mu: sync.SpinMutex align(std.atomic.cache_line) = .{},
-        map: std.AutoHashMapUnmanaged(u64, ChunkId) = .empty,
+        map: std.AutoHashMapUnmanaged(u64, ?*DedupCandidate) = .empty,
     };
 
     allocator: std.mem.Allocator,
@@ -122,7 +130,9 @@ pub const ChunkRegistry = struct {
     /// compiling worker (deferred bodies + speculative compiles, ~264K at
     /// w=8), and one global lock held across the full structural memcmp
     /// burned ~3-4% of all w=8 cycles in spin. Each shard carries its own
-    /// lock, and the memcmp runs OUTSIDE it (see `registerDeduped`).
+    /// lock. Existing candidates are compared OUTSIDE it; only candidates
+    /// added by a concurrent racer are rechecked while locked (see
+    /// `registerDeduped`).
     dedup_shards: [dedup_shard_count]DedupShard = [_]DedupShard{.{}} ** dedup_shard_count,
     /// Single-threaded mode: when the owner guarantees exactly one thread
     /// ever registers chunks (a `--workers=1` evaluator; set before anything
@@ -219,7 +229,17 @@ pub const ChunkRegistry = struct {
         while (lit.next()) |v| self.allocator.free(v.*);
         self.local_names.deinit(self.allocator);
         self.name_tree.deinit(self.allocator);
-        for (&self.dedup_shards) |*shard| shard.map.deinit(self.allocator);
+        for (&self.dedup_shards) |*shard| {
+            var heads = shard.map.valueIterator();
+            while (heads.next()) |head| {
+                var candidate = head.*;
+                while (candidate) |entry| {
+                    candidate = entry.next;
+                    self.allocator.destroy(entry);
+                }
+            }
+            shard.map.deinit(self.allocator);
+        }
     }
 
     /// Record the source file a chunk was compiled from. No-op unless
@@ -428,6 +448,11 @@ pub const ChunkRegistry = struct {
         return true;
     }
 
+    /// Tooling-visible form of the registry's exact deduplication predicate.
+    pub fn structurallyEqual(a: *const Chunk, b: *const Chunk) bool {
+        return contentEql(a, b);
+    }
+
     fn lambdaPatternEql(a: LambdaPattern, b: LambdaPattern) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
@@ -445,8 +470,7 @@ pub const ChunkRegistry = struct {
     pub const RegisterResult = struct {
         id: ChunkId,
         reused: bool,
-        /// Slot published by this call. It can differ from `id` when a
-        /// concurrent equal registration wins canonical deduplication.
+        /// Slot published by this call, or null when an existing slot won.
         new_id: ?ChunkId,
     };
 
@@ -454,49 +478,47 @@ pub const ChunkRegistry = struct {
         const h = contentHash(&chunk);
         const shard = &self.dedup_shards[@as(usize, @intCast(h >> 58))];
 
-        // Snapshot the candidate id under the shard lock; run the full
-        // structural memcmp OUTSIDE it. Registered chunks are immutable and
-        // ids are never removed, so a snapshot can't go stale — the lock only
-        // has to protect the map itself.
+        // Snapshot the immutable candidate chain under the shard lock, then do
+        // the potentially large structural comparisons outside it.
         if (!self.solo) shard.mu.lock();
-        const candidate = shard.map.get(h);
+        const snapshot = shard.map.get(h) orelse null;
         if (!self.solo) shard.mu.unlock();
 
-        if (candidate) |existing| {
-            if (contentEql(self.get(existing).?, &chunk)) {
-                return .{ .id = existing, .reused = true, .new_id = null };
+        var candidate = snapshot;
+        while (candidate) |entry| : (candidate = entry.next) {
+            if (contentEql(self.get(entry.id).?, &chunk)) {
+                return .{ .id = entry.id, .reused = true, .new_id = null };
             }
-            // Hash collision with different content. `h`'s map entry is
-            // permanent (first writer wins, entries are never replaced), so
-            // there is nothing to insert: register plain, as before.
-            const id = try self.registerNamed(chunk, name);
-            return .{ .id = id, .reused = false, .new_id = id };
+        }
+
+        // Allocate the chain node before taking the lock again. No chunk slot
+        // is published until we know this registration won, so an equal racer
+        // cannot leave an unreferenced loser in the dense registry.
+        const new_candidate = try self.allocator.create(DedupCandidate);
+        errdefer self.allocator.destroy(new_candidate);
+
+        if (!self.solo) shard.mu.lock();
+        errdefer if (!self.solo) shard.mu.unlock();
+        const gop = try shard.map.getOrPut(self.allocator, h);
+        if (!gop.found_existing) gop.value_ptr.* = null;
+
+        // The old snapshot is still in this prepend-only chain. Recheck just
+        // the nodes which raced us; the common path compares nothing here.
+        candidate = gop.value_ptr.*;
+        while (candidate != snapshot) {
+            const entry = candidate.?;
+            if (contentEql(self.get(entry.id).?, &chunk)) {
+                if (!self.solo) shard.mu.unlock();
+                self.allocator.destroy(new_candidate);
+                return .{ .id = entry.id, .reused = true, .new_id = null };
+            }
+            candidate = entry.next;
         }
 
         const id = try self.registerNamed(chunk, name);
-        if (!self.solo) shard.mu.lock();
-        const inserted = blk: {
-            const gop = shard.map.getOrPut(self.allocator, h) catch |err| {
-                if (!self.solo) shard.mu.unlock();
-                return err;
-            };
-            if (gop.found_existing) break :blk gop.value_ptr.*;
-            gop.value_ptr.* = id;
-            break :blk null;
-        };
+        new_candidate.* = .{ .id = id, .next = gop.value_ptr.* };
+        gop.value_ptr.* = new_candidate;
         if (!self.solo) shard.mu.unlock();
-        const winner = inserted orelse return .{ .id = id, .reused = false, .new_id = id };
-
-        // A concurrent registration won the insert race for this hash while
-        // we were registering. When it is content-equal (the common case: the
-        // same body compiled speculatively on two workers), converge on the
-        // winner id so equal registrations always resolve to one id. Our copy
-        // is already owned by the registry — report reused=false so the
-        // caller doesn't deinit it; it stays registered but unreferenced
-        // (benign). A mere hash collision keeps our own id.
-        if (contentEql(self.get(winner).?, self.get(id).?)) {
-            return .{ .id = winner, .reused = false, .new_id = id };
-        }
         return .{ .id = id, .reused = false, .new_id = id };
     }
 
@@ -830,6 +852,22 @@ fn buildDedupTestChunk(allocator: std.mem.Allocator, const_val: i64, line: u32) 
     return builder.finish(allocator, 0);
 }
 
+/// Same content hash for every `middle_line`, but different full structure:
+/// the cheap source-map fingerprint deliberately covers only the first and
+/// last lines. This exercises collision buckets without relying on a random
+/// hash collision.
+fn buildDedupCollisionChunk(allocator: std.mem.Allocator, middle_line: u32) !Chunk {
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+    try builder.writeOp(allocator, .push_null);
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+    try builder.addSourceMapEntry(allocator, 0, 1, .{ .file = null, .offset = 0, .len = 1, .line = 1, .column = 1 });
+    try builder.addSourceMapEntry(allocator, 1, 2, .{ .file = null, .offset = 1, .len = 1, .line = middle_line, .column = 1 });
+    try builder.addSourceMapEntry(allocator, 2, 3, .{ .file = null, .offset = 2, .len = 1, .line = 3, .column = 1 });
+    return builder.finish(allocator, 0);
+}
+
 test "chunk dedup: structurally identical registrations share one id" {
     const allocator = std.testing.allocator;
     var registry = try ChunkRegistry.init(allocator);
@@ -865,10 +903,29 @@ test "chunk dedup: a differing constant or span is a distinct registration" {
     try std.testing.expect(other_const.id != other_span.id);
 }
 
+test "chunk dedup: every structural variant in a hash bucket is reusable" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+    const initial_count = registry.count();
+
+    const first = try registry.registerDeduped(try buildDedupCollisionChunk(allocator, 10), name_tree_mod.root_name_id);
+    const second = try registry.registerDeduped(try buildDedupCollisionChunk(allocator, 20), name_tree_mod.root_name_id);
+    var second_copy = try buildDedupCollisionChunk(allocator, 20);
+    const reused = try registry.registerDeduped(second_copy, name_tree_mod.root_name_id);
+    if (reused.reused) second_copy.deinit(allocator);
+
+    try std.testing.expect(first.id != second.id);
+    try std.testing.expect(reused.reused);
+    try std.testing.expectEqual(second.id, reused.id);
+    try std.testing.expectEqual(initial_count + 2, registry.count());
+}
+
 test "chunk dedup: concurrent registrations converge (equal) and stay distinct (unique)" {
     const allocator = std.testing.allocator;
     var registry = try ChunkRegistry.init(allocator);
     defer registry.deinit();
+    const initial_count = registry.count();
 
     const thread_count = 8;
     const iterations = 64;
@@ -917,6 +974,9 @@ test "chunk dedup: concurrent registrations converge (equal) and stay distinct (
             try std.testing.expect(!gop.found_existing);
         }
     }
+    // The converged body owns one slot, not one slot plus unreferenced race
+    // losers. Every other registration above is intentionally unique.
+    try std.testing.expectEqual(initial_count + 1 + thread_count * iterations, registry.count());
 }
 
 test "chunk sidecars support concurrent compiler writers" {
