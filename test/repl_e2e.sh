@@ -177,6 +177,17 @@ else
     echo "FAIL tty debug: screen lifecycle ($debug_enters enters, $debug_leaves leaves)"; fails=$((fails+1))
 fi
 
+# Finishing the outermost frame can complete without another debugger pause.
+# Its value must be printed after the alternate screen is restored, where it
+# remains in the ordinary REPL transcript.
+out=$(
+    ( sleep 0.4; printf ':d 40 + 2\r'; sleep 0.5; printf 'f'; sleep 0.5;
+      printf '\004'; sleep 0.2 ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+after_debug=${out##*$'\x1b[?1049l'}
+t "tty debug: completed result survives screen exit" "42" "$after_debug"
+
 # Inside :vm the debugger borrows the explorer's raw mode and alternate screen;
 # nested stepping must not emit another enter/leave pair.
 out=$(

@@ -540,6 +540,7 @@ const Repl = struct {
         else
             self.ev.evaluateWithScopeResult(source, self.scope)) catch |err| {
             try self.rememberVmSource(source, first_chunk, null);
+            if (debug_entry) self.endDebugScreen();
             try self.evalFailure(source, err);
             return null;
         };
@@ -564,11 +565,20 @@ const Repl = struct {
             if (self.debug_tui) |screen| screen.uninstall(self.ev) else console.uninstall(self.ev);
         };
 
-        if (try self.evalExprMode(source, true)) |value| {
-            try self.bind("it", value);
-            try self.printResult(value, source);
+        const value = try self.evalExprMode(source, true);
+        // A final step/finish can run straight through to completion without
+        // another pause. Close the debugger's alternate screen before writing
+        // the result, otherwise leaving that screen immediately discards it.
+        self.endDebugScreen();
+        if (value) |result| {
+            try self.bind("it", result);
+            try self.printResult(result, source);
             try self.collectBetweenInputs();
         }
+    }
+
+    fn endDebugScreen(self: *Repl) void {
+        if (self.debug_tui) |screen| screen.endEvaluation();
     }
 
     fn rememberVmSource(self: *Repl, source: []const u8, first: types.ChunkId, entry: ?types.ChunkId) !void {
