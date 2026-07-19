@@ -30,6 +30,7 @@ const segments = @import("base").segments;
 const sync = @import("base").sync;
 const worker_id_mod = @import("base").worker_id;
 const Value = @import("value.zig").Value;
+pub const ValueType = @import("value.zig").ValueType;
 const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
 const DeferredThunk = @import("thunk.zig").DeferredThunk;
@@ -224,6 +225,55 @@ pub const Object = union(enum) {
     /// 48-bit inline int payload. See `runtime/int.zig`.
     boxed_int: i64,
     partial_app: PartialAppObject,
+};
+
+/// A compact description of a runtime value for read-only tooling. It keeps
+/// heap/chunk/intern references navigable without exposing the Value bit
+/// representation or borrowing mutable heap storage.
+pub const ValueRef = struct {
+    kind: ValueType,
+    target: Target = .none,
+
+    pub const Target = union(enum) {
+        none,
+        object: ObjectId,
+        chunk: ChunkId,
+        intern: InternId,
+        builtin: u16,
+    };
+};
+
+pub const ThunkState = enum(u8) { unresolved, evaluating, resolved, blackhole, errored };
+
+pub const ThunkTargetInfo = union(enum) {
+    closure: ValueRef,
+    bytecode: struct { chunk: ChunkId, captures: u32 },
+    pass_through: ValueRef,
+    attr_access: struct { base: ValueRef, name: InternId },
+    deferred: struct { id: u32, captures: u32 },
+};
+
+pub const ThunkInfo = struct {
+    state: ThunkState,
+    demanded: bool,
+    body: union(enum) {
+        target: ThunkTargetInfo,
+        result: ValueRef,
+        error_name: []const u8,
+    },
+};
+
+/// Stable semantic projection of one object slot for the VM explorer.
+pub const ObjectInfo = union(enum) {
+    list: struct { len: u32 },
+    attrs: struct { len: u32, positions: u32, sibling_swept: bool },
+    merge_attrs: struct { base: ObjectId, overlay: ObjectId, depth: u16, flattened: ?ObjectId },
+    closure: struct { chunk: ChunkId, upvalues: u32 },
+    builtin_closure: struct { builtin: u16, args: u32 },
+    thunk: ThunkInfo,
+    context_string: struct { text: InternId, context: u32 },
+    boxed_int: i64,
+    partial_app: struct { function: ValueRef, args: u32 },
 };
 
 /// Per-worker thread-local allocation buffer. Each worker reserves a
@@ -569,6 +619,150 @@ pub const ObjectHeap = struct {
         attrs: u32,
         attr_positions: u32,
     };
+
+    /// Bitset snapshot of currently filled object slots. A NixOS evaluation
+    /// can have millions of objects, so the explorer keeps one bit per slot
+    /// and discovers rows lazily instead of materializing an ObjectId array.
+    /// Build and use this only while evaluation is idle.
+    pub const ObjectSnapshot = struct {
+        allocator: std.mem.Allocator,
+        live_bits: []u64,
+        high_water: ObjectId,
+        live_count: u32,
+
+        pub fn deinit(self: *ObjectSnapshot) void {
+            self.allocator.free(self.live_bits);
+            self.* = undefined;
+        }
+
+        pub fn isLive(self: *const ObjectSnapshot, id: ObjectId) bool {
+            if (id >= self.high_water) return false;
+            return self.live_bits[id >> 6] & (@as(u64, 1) << @intCast(id & 63)) != 0;
+        }
+
+        pub fn nextLive(self: *const ObjectSnapshot, start: ObjectId) ?ObjectId {
+            if (start >= self.high_water) return null;
+            var word_index: usize = start >> 6;
+            var word = self.live_bits[word_index] & (~@as(u64, 0) << @intCast(start & 63));
+            while (true) {
+                if (word != 0) {
+                    const id: ObjectId = @intCast(word_index * 64 + @ctz(word));
+                    return if (id < self.high_water) id else null;
+                }
+                word_index += 1;
+                if (word_index >= self.live_bits.len) return null;
+                word = self.live_bits[word_index];
+            }
+        }
+    };
+
+    pub fn objectSnapshot(self: *const ObjectHeap, allocator: std.mem.Allocator) !ObjectSnapshot {
+        const high_water = self.objects.count();
+        const words = (@as(usize, high_water) + 63) >> 6;
+        const bits = try allocator.alloc(u64, words);
+        @memset(bits, ~@as(u64, 0));
+        if (words > 0 and high_water & 63 != 0) {
+            bits[words - 1] = (@as(u64, 1) << @intCast(high_water & 63)) - 1;
+        }
+
+        const unfilled = self.collectUnfilled(.object);
+        for (unfilled.starts[0..unfilled.len], unfilled.ends[0..unfilled.len]) |start, end| {
+            clearSnapshotRange(bits, start, @min(end, high_water));
+        }
+        for (self.worker_locals) |*local| {
+            for (local.gc_free_objects.items) |id| clearSnapshotBit(bits, id);
+        }
+
+        // In the detector build reclaimed ids deliberately never enter a free
+        // list. Its authoritative allocation bitmap supplies those holes.
+        if (comptime gc_debug) if (self.gc_collect_enabled) {
+            const floor = self.gcSweepFloor();
+            var id = floor;
+            while (id < high_water) : (id += 1) {
+                if (!self.gcAllocBitSet(id)) clearSnapshotBit(bits, id);
+            }
+        };
+
+        var live: u32 = 0;
+        for (bits) |word| live += @intCast(@popCount(word));
+        return .{ .allocator = allocator, .live_bits = bits, .high_water = high_water, .live_count = live };
+    }
+
+    pub fn inspectObject(self: *const ObjectHeap, snapshot: *const ObjectSnapshot, id: ObjectId) !ObjectInfo {
+        if (!snapshot.isLive(id)) return error.InvalidObjectId;
+        return switch (self.objects.get(id).*) {
+            .list => |range| .{ .list = .{ .len = range.len } },
+            .attrs => |attrs| .{ .attrs = .{
+                .len = attrs.range.len,
+                .positions = attrs.positions.len,
+                .sibling_swept = attrs.sibling_swept,
+            } },
+            .merge_attrs => |merge| .{ .merge_attrs = .{
+                .base = merge.base,
+                .overlay = merge.overlay,
+                .depth = merge.depth,
+                .flattened = blk: {
+                    const flat = merge.flattened.load(.acquire);
+                    break :blk if (flat == no_flattened_attrs) null else flat;
+                },
+            } },
+            .closure => |closure| .{ .closure = .{ .chunk = closure.chunk_id, .upvalues = closure.upvalues.len } },
+            .builtin_closure => |closure| .{ .builtin_closure = .{ .builtin = closure.builtin_id, .args = closure.args.len } },
+            .thunk => |*thunk| .{ .thunk = inspectThunk(thunk) },
+            .context_string => |string| .{ .context_string = .{ .text = string.text, .context = string.context.len } },
+            .boxed_int => |value| .{ .boxed_int = value },
+            .partial_app => |partial| .{ .partial_app = .{ .function = inspectValue(partial.func), .args = partial.args.len } },
+        };
+    }
+
+    fn inspectThunk(thunk: *const Thunk) ThunkInfo {
+        const raw_state = thunk.future.state.load(.acquire);
+        const state: ThunkState = @enumFromInt(@min(raw_state, @intFromEnum(ThunkState.errored)));
+        const body: @TypeOf(@as(ThunkInfo, undefined).body) = switch (state) {
+            .resolved => .{ .result = inspectValue(thunk.payload.result) },
+            .errored => .{ .error_name = @errorName(thunk.cachedErrorInfo().err) },
+            .unresolved, .evaluating, .blackhole => .{ .target = switch (thunk.targetKind()) {
+                .closure => .{ .closure = inspectValue(thunk.payload.target.closure) },
+                .bytecode => .{ .bytecode = .{
+                    .chunk = thunk.payload.target.bytecode.chunk_id,
+                    .captures = thunk.payload.target.bytecode.upvalue_count,
+                } },
+                .pass_through => .{ .pass_through = inspectValue(thunk.payload.target.pass_through) },
+                .attr_access => .{ .attr_access = .{
+                    .base = inspectValue(thunk.payload.target.attr_access.base),
+                    .name = thunk.payload.target.attr_access.name,
+                } },
+                .deferred => .{ .deferred = .{
+                    .id = thunk.payload.target.deferred.deferred_id,
+                    .captures = thunk.payload.target.deferred.env_count,
+                } },
+            } },
+        };
+        return .{ .state = state, .demanded = thunk.isDemanded(), .body = body };
+    }
+
+    fn inspectValue(value: Value) ValueRef {
+        const kind = value.kind();
+        const target: ValueRef.Target = switch (kind) {
+            .list, .attrs, .thunk, .builtin_closure, .string_context, .boxed_int, .partial_app => .{ .object = value.asObjectId() },
+            .closure => if (value.isFunction()) .{ .chunk = value.asFunctionChunkId() } else .{ .object = value.asObjectId() },
+            .string, .path => .{ .intern = value.asInternId() },
+            .builtin => .{ .builtin = value.asBuiltinId() },
+            else => .none,
+        };
+        return .{ .kind = kind, .target = target };
+    }
+
+    fn clearSnapshotBit(bits: []u64, id: ObjectId) void {
+        const word = id >> 6;
+        if (word >= bits.len) return;
+        bits[word] &= ~(@as(u64, 1) << @intCast(id & 63));
+    }
+
+    fn clearSnapshotRange(bits: []u64, start: ObjectId, end: ObjectId) void {
+        var id = start;
+        while (id < end) : (id += 1) clearSnapshotBit(bits, id);
+    }
 
     /// Constant-time backing-store reservation counts for interactive
     /// inspection. Unlike `stats`, this does not walk object/value slots, and

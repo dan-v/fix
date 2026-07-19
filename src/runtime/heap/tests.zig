@@ -66,6 +66,28 @@ test "object heap stores list and attrs payloads behind object ids" {
     try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 13));
 }
 
+test "object snapshot indexes only filled slots and exposes semantic details" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const list_id = try heap.addList(&.{ Value.int(1), Value.int(2) });
+    const closure_id = try heap.addClosure(17, &.{Value.list(list_id)});
+
+    var snapshot = try heap.objectSnapshot(std.testing.allocator);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u32, 2), snapshot.live_count);
+    try std.testing.expectEqual(list_id, snapshot.nextLive(0).?);
+    try std.testing.expectEqual(closure_id, snapshot.nextLive(list_id + 1).?);
+    try std.testing.expect(snapshot.nextLive(closure_id + 1) == null);
+
+    const list = try heap.inspectObject(&snapshot, list_id);
+    try std.testing.expectEqual(@as(u32, 2), list.list.len);
+    const closure = try heap.inspectObject(&snapshot, closure_id);
+    try std.testing.expectEqual(@as(ChunkId, 17), closure.closure.chunk);
+    try std.testing.expectEqual(@as(u32, 1), closure.closure.upvalues);
+    try std.testing.expectError(error.InvalidObjectId, heap.inspectObject(&snapshot, snapshot.high_water - 1));
+}
+
 test "object heap sorts attrs for binary lookup" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();
@@ -254,6 +276,12 @@ test "object heap sweep frees unmarked objects and lets ids be reused" {
 
     const st = heap_collector.sweep(&heap, tr.mark_bits);
     try std.testing.expectEqual(@as(u64, 2), st.objects_freed);
+
+    var snapshot = try heap.objectSnapshot(std.testing.allocator);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u32, 2), snapshot.live_count);
+    try std.testing.expect(snapshot.isLive(live_a));
+    try std.testing.expect(snapshot.isLive(live_b));
 
     // The marked objects still read back their original contents.
     try std.testing.expectEqual(@as(i64, 1), (try heap.getListItem(live_a, 0)).asInt());

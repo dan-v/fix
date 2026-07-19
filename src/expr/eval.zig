@@ -1202,6 +1202,14 @@ pub const Evaluator = struct {
         return self.heap.counts();
     }
 
+    pub fn heapObjectSnapshot(self: *const Evaluator, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
+        return self.heap.objectSnapshot(allocator);
+    }
+
+    pub fn inspectHeapObject(self: *const Evaluator, snapshot: *const ObjectHeap.ObjectSnapshot, id: runtime.types.ObjectId) !runtime.heap.ObjectInfo {
+        return self.heap.inspectObject(snapshot, id);
+    }
+
     pub fn internStats(self: *const Evaluator) InternTable.Stats {
         return self.intern.stats();
     }

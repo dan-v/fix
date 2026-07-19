@@ -60,6 +60,7 @@ const RowAction = union(enum) {
     none,
     heading: Panel,
     chunk: ChunkId,
+    object: runtime.types.ObjectId,
 };
 
 /// One rendered inspector document (or the help screen). Actions are parallel
@@ -103,6 +104,7 @@ const Visit = struct {
     const Kind = union(enum) {
         chunk: ChunkId,
         heap: HeapView,
+        object: runtime.types.ObjectId,
         help,
     };
 };
@@ -297,6 +299,59 @@ const HeapJob = struct {
     }
 };
 
+const ObjectJob = struct {
+    ev: *Evaluator,
+    thread: ?std.Thread = null,
+    mutex: sync.BlockingMutex = .{},
+    ready: ?runtime.ObjectHeap.ObjectSnapshot = null,
+    running: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *ObjectJob) !void {
+        if (self.thread != null) return;
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.running.store(false, .release);
+            return err;
+        };
+    }
+
+    fn build(self: *ObjectJob) void {
+        const result = self.ev.heapObjectSnapshot(std.heap.smp_allocator) catch {
+            self.running.store(false, .release);
+            return;
+        };
+        self.mutex.lock();
+        self.ready = result;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    fn poll(self: *ObjectJob, target: *?runtime.ObjectHeap.ObjectSnapshot) bool {
+        if (self.thread == null or self.running.load(.acquire)) return false;
+        self.finish(target);
+        return true;
+    }
+
+    fn finish(self: *ObjectJob, target: *?runtime.ObjectHeap.ObjectSnapshot) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        if (self.ready) |snapshot| {
+            if (target.*) |*old| old.deinit();
+            target.* = snapshot;
+        }
+        self.ready = null;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    fn deinit(self: *ObjectJob) void {
+        var discard: ?runtime.ObjectHeap.ObjectSnapshot = null;
+        self.finish(&discard);
+        if (discard) |*snapshot| snapshot.deinit();
+    }
+};
+
 const RefJob = struct {
     registry: *const bytecode.ChunkRegistry,
     thread: ?std.Thread = null,
@@ -387,7 +442,9 @@ const Tui = struct {
     x_scroll: usize = 0,
     panels: [4]bool = .{ true, false, true, false },
     category_expanded: [2]bool = .{ false, false },
+    heap_view_expanded: [5]bool = @splat(false),
     heap_stats: ?runtime.ObjectHeap.Stats = null,
+    object_snapshot: ?runtime.ObjectHeap.ObjectSnapshot = null,
     ref_graph: ?bytecode.inspect.RefGraph = null,
     reference_indexing: bool = false,
 
@@ -398,8 +455,9 @@ const Tui = struct {
         chunk: struct { id: ChunkId, depth: u16 },
         range: Range,
         heap: struct { view: HeapView, depth: u16 },
+        object: struct { id: runtime.types.ObjectId, depth: u16 },
     };
-    const RangeKind = enum(u1) { names, chunks };
+    const RangeKind = enum(u2) { names, chunks, objects };
     const Range = struct {
         kind: RangeKind,
         parent: bytecode.name_tree.NameId,
@@ -429,6 +487,7 @@ const Tui = struct {
         self.tree_rows.deinit(self.allocator);
         self.transcript_lines.deinit(self.allocator);
         if (self.ref_graph) |*graph| graph.deinit();
+        if (self.object_snapshot) |*snapshot| snapshot.deinit();
         self.arena.deinit();
     }
 
@@ -530,6 +589,8 @@ const Tui = struct {
         defer index_job.deinit();
         var heap_job = HeapJob{ .ev = self.ev };
         defer heap_job.deinit();
+        var object_job = ObjectJob{ .ev = self.ev };
+        defer object_job.deinit();
         var ref_job = RefJob{ .registry = self.ev.chunkRegistry() };
         defer ref_job.deinit();
         var prompt_style_buf: [64]u8 = undefined;
@@ -573,6 +634,16 @@ const Tui = struct {
                     self.status_msg = "(heap census failed)";
                 };
             }
+            if (object_job.poll(&self.object_snapshot)) {
+                try self.rebuildTreeForCurrent();
+                if (self.currentObject() != null) try self.refreshPage(self.currentKind());
+            }
+            const wants_objects = self.currentObject() != null or self.heap_view_expanded[@intFromEnum(HeapView.objects)];
+            if (wants_objects and self.object_snapshot == null and object_job.thread == null) {
+                object_job.start() catch {
+                    self.status_msg = "(object index failed)";
+                };
+            }
             if (ref_job.poll(&self.ref_graph)) {
                 self.reference_indexing = false;
                 if (self.currentChunk() != null and self.panels[@intFromEnum(Panel.references)]) try self.refreshPage(self.currentKind());
@@ -603,7 +674,7 @@ const Tui = struct {
             // finished between drawing and this check; otherwise a very fast
             // build could leave us in an infinite blocking read before its
             // completed generation is adopted.
-            const timeout: i32 = if (decoder.wantsMore()) 40 else if (index_job.thread != null or heap_job.thread != null or ref_job.thread != null) 50 else -1;
+            const timeout: i32 = if (decoder.wantsMore()) 40 else if (index_job.thread != null or heap_job.thread != null or object_job.thread != null or ref_job.thread != null) 50 else -1;
             const result = term_mod.readInput(&read_buf, timeout);
             events.clearRetainingCapacity();
             switch (result) {
@@ -635,9 +706,12 @@ const Tui = struct {
                             try capture.writer.writeByte('\n');
                             _ = index_job.finish(self.name_index);
                             heap_job.finish(&self.heap_stats);
+                            object_job.finish(&self.object_snapshot);
                             _ = ref_job.finish(&self.ref_graph);
                             try host.execute(trimmed, &capture.writer);
                             self.heap_stats = null;
+                            if (self.object_snapshot) |*snapshot| snapshot.deinit();
+                            self.object_snapshot = null;
                             if (capture.written().len > 0 and capture.written()[capture.written().len - 1] != '\n')
                                 try capture.writer.writeByte('\n');
                             try self.rebuildTranscriptLines(capture.written());
@@ -761,6 +835,7 @@ const Tui = struct {
                 };
             },
             .heap => |view| return self.buildHeapPage(view),
+            .object => |id| return self.buildObjectPage(id),
             .help => {
                 const help_text =
                     \\The VM explorer
@@ -810,7 +885,6 @@ const Tui = struct {
                 .actions = page.actions.items,
             };
         };
-
         switch (view) {
             .overview, .objects => {
                 try page.line("OBJECT VARIANTS", .none);
@@ -842,6 +916,105 @@ const Tui = struct {
             .lines = page.lines.items,
             .actions = page.actions.items,
         };
+    }
+
+    fn buildObjectPage(self: *Tui, id: runtime.types.ObjectId) !Page {
+        const arena = self.arena.allocator();
+        var page: PageBuilder = .{ .arena = arena };
+        const snapshot = self.object_snapshot orelse {
+            try page.line("building the live-object index asynchronously…", .none);
+            return .{
+                .title = try std.fmt.allocPrint(arena, "object[#{d}]", .{id}),
+                .lines = page.lines.items,
+                .actions = page.actions.items,
+            };
+        };
+        const info = self.ev.inspectHeapObject(&snapshot, id) catch {
+            try page.line("this object is no longer live", .none);
+            return .{
+                .title = try std.fmt.allocPrint(arena, "object[#{d}]", .{id}),
+                .lines = page.lines.items,
+                .actions = page.actions.items,
+            };
+        };
+        try page.line(try std.fmt.allocPrint(arena, "OBJECT #{d} · {s}", .{ id, @tagName(info) }), .none);
+        try page.line("", .none);
+        switch (info) {
+            .list => |list| try page.line(try std.fmt.allocPrint(arena, "items       {d}", .{list.len}), .none),
+            .attrs => |attrs| {
+                try page.line(try std.fmt.allocPrint(arena, "attributes  {d}", .{attrs.len}), .none);
+                try page.line(try std.fmt.allocPrint(arena, "positions   {d}", .{attrs.positions}), .none);
+                try page.line(try std.fmt.allocPrint(arena, "swept       {s}", .{if (attrs.sibling_swept) "yes" else "no"}), .none);
+            },
+            .merge_attrs => |merge| {
+                try self.appendObjectRef(&page, "base", merge.base);
+                try self.appendObjectRef(&page, "overlay", merge.overlay);
+                try page.line(try std.fmt.allocPrint(arena, "depth       {d}", .{merge.depth}), .none);
+                if (merge.flattened) |flat| try self.appendObjectRef(&page, "flattened", flat) else try page.line("flattened   not materialized", .none);
+            },
+            .closure => |closure| {
+                try page.line(try std.fmt.allocPrint(arena, "chunk       #{d}", .{closure.chunk}), .{ .chunk = closure.chunk });
+                try page.line(try std.fmt.allocPrint(arena, "upvalues    {d}", .{closure.upvalues}), .none);
+            },
+            .builtin_closure => |closure| {
+                try page.line(try std.fmt.allocPrint(arena, "builtin     #{d}", .{closure.builtin}), .none);
+                try page.line(try std.fmt.allocPrint(arena, "arguments   {d}", .{closure.args}), .none);
+            },
+            .thunk => |thunk| {
+                try page.line(try std.fmt.allocPrint(arena, "state       {s}", .{@tagName(thunk.state)}), .none);
+                try page.line(try std.fmt.allocPrint(arena, "demanded    {s}", .{if (thunk.demanded) "yes" else "no"}), .none);
+                switch (thunk.body) {
+                    .result => |value| try self.appendValueRef(&page, "result", value),
+                    .error_name => |name| try page.line(try std.fmt.allocPrint(arena, "error       {s}", .{name}), .none),
+                    .target => |target| switch (target) {
+                        .closure => |value| try self.appendValueRef(&page, "closure", value),
+                        .bytecode => |body| {
+                            try page.line(try std.fmt.allocPrint(arena, "chunk       #{d}", .{body.chunk}), .{ .chunk = body.chunk });
+                            try page.line(try std.fmt.allocPrint(arena, "captures    {d}", .{body.captures}), .none);
+                        },
+                        .pass_through => |value| try self.appendValueRef(&page, "value", value),
+                        .attr_access => |access| {
+                            try self.appendValueRef(&page, "base", access.base);
+                            try page.line(try std.fmt.allocPrint(arena, "attribute   intern #{d}", .{access.name}), .none);
+                        },
+                        .deferred => |body| {
+                            try page.line(try std.fmt.allocPrint(arena, "deferred    #{d}", .{body.id}), .none);
+                            try page.line(try std.fmt.allocPrint(arena, "captures    {d}", .{body.captures}), .none);
+                        },
+                    },
+                }
+            },
+            .context_string => |string| {
+                try page.line(try std.fmt.allocPrint(arena, "text        intern #{d}", .{string.text}), .none);
+                try page.line(try std.fmt.allocPrint(arena, "context     {d} entries", .{string.context}), .none);
+            },
+            .boxed_int => |value| try page.line(try std.fmt.allocPrint(arena, "value       {d}", .{value}), .none),
+            .partial_app => |partial| {
+                try self.appendValueRef(&page, "function", partial.function);
+                try page.line(try std.fmt.allocPrint(arena, "arguments   {d}", .{partial.args}), .none);
+            },
+        }
+        return .{
+            .title = try std.fmt.allocPrint(arena, "object[#{d}]", .{id}),
+            .lines = page.lines.items,
+            .actions = page.actions.items,
+        };
+    }
+
+    fn appendObjectRef(self: *Tui, page: *PageBuilder, label: []const u8, id: runtime.types.ObjectId) !void {
+        _ = self;
+        try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} object #{d}", .{ label, id }), .{ .object = id });
+    }
+
+    fn appendValueRef(self: *Tui, page: *PageBuilder, label: []const u8, value: runtime.heap.ValueRef) !void {
+        _ = self;
+        switch (value.target) {
+            .none => try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{ label, @tagName(value.kind) }), .none),
+            .object => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} object #{d}", .{ label, @tagName(value.kind), id }), .{ .object = id }),
+            .chunk => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} chunk #{d}", .{ label, @tagName(value.kind), id }), .{ .chunk = id }),
+            .intern => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} intern #{d}", .{ label, @tagName(value.kind), id }), .none),
+            .builtin => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} #{d}", .{ label, @tagName(value.kind), id }), .none),
+        }
     }
 
     fn panelLabel(panel: Panel) []const u8 {
@@ -1027,7 +1200,7 @@ const Tui = struct {
     fn currentChunk(self: *const Tui) ?ChunkId {
         return switch (self.currentKind()) {
             .chunk => |id| id,
-            .heap, .help => null,
+            .heap, .object, .help => null,
         };
     }
 
@@ -1036,6 +1209,17 @@ const Tui = struct {
             .heap => |view| view,
             else => null,
         };
+    }
+
+    fn currentObject(self: *const Tui) ?runtime.types.ObjectId {
+        return switch (self.currentKind()) {
+            .object => |id| id,
+            else => null,
+        };
+    }
+
+    fn rebuildTreeForCurrent(self: *Tui) !void {
+        try self.rebuildTree(self.currentChunk() orelse std.math.maxInt(ChunkId));
     }
 
     fn expandFocusedPath(self: *Tui, chunk_id: ChunkId) !void {
@@ -1052,14 +1236,29 @@ const Tui = struct {
     fn rebuildTree(self: *Tui, focused_chunk: ChunkId) !void {
         self.tree_rows.clearRetainingCapacity();
         try self.tree_rows.append(self.allocator, .{ .category = .{ .kind = .heap, .depth = 0 } });
-        if (self.category_expanded[@intFromEnum(Category.heap)]) {
+        const heap_open = self.category_expanded[@intFromEnum(Category.heap)];
+        if (heap_open or self.currentObject() != null) {
             for (std.meta.tags(HeapView)) |view| {
+                if (!heap_open and view != .objects) continue;
                 try self.tree_rows.append(self.allocator, .{ .heap = .{ .view = view, .depth = 1 } });
+                if (view == .objects and (self.heap_view_expanded[@intFromEnum(view)] or self.currentObject() != null)) {
+                    if (self.object_snapshot) |*snapshot| {
+                        try self.appendObjectRange(
+                            snapshot,
+                            0,
+                            snapshot.high_water,
+                            2,
+                            !heap_open or !self.heap_view_expanded[@intFromEnum(view)],
+                        );
+                    }
+                }
             }
         }
         try self.tree_rows.append(self.allocator, .{ .category = .{ .kind = .bytecode, .depth = 0 } });
         if (self.category_expanded[@intFromEnum(Category.bytecode)]) {
             try self.appendNameRows(bytecode.root_name_id, 1, focused_chunk);
+        } else if (self.currentChunk() != null) {
+            try self.appendFocusedNameRows(bytecode.root_name_id, 1, focused_chunk);
         }
         self.tree_selection = 0;
         for (self.tree_rows.items, 0..) |row, i| switch (row) {
@@ -1067,8 +1266,78 @@ const Tui = struct {
                 self.tree_selection = i;
                 break;
             },
+            .object => |entry| if (entry.id == self.currentObject()) {
+                self.tree_selection = i;
+                break;
+            },
             else => {},
         };
+    }
+
+    fn appendFocusedNameRows(self: *Tui, name: bytecode.name_tree.NameId, depth: u16, focused_chunk: ChunkId) std.mem.Allocator.Error!void {
+        try self.tree_rows.append(self.allocator, .{ .name = .{ .id = name, .depth = depth } });
+        const next_depth = depth +| 1;
+        for (self.name_index.childrenOf(name)) |child| {
+            if (self.focus_path.contains(child)) try self.appendFocusedNameRows(child, next_depth, focused_chunk);
+        }
+        var attached = self.ev.chunkRegistry().nameOf(focused_chunk) orelse bytecode.root_name_id;
+        if (self.name_index.node(attached) == null) attached = bytecode.root_name_id;
+        if (attached == name and self.ev.getChunk(focused_chunk) != null) {
+            try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = focused_chunk, .depth = next_depth } });
+        }
+    }
+
+    fn appendObjectRange(
+        self: *Tui,
+        snapshot: *const runtime.ObjectHeap.ObjectSnapshot,
+        start: u32,
+        len: u32,
+        depth: u16,
+        projected_only: bool,
+    ) std.mem.Allocator.Error!void {
+        if (len == 0) return;
+        const end = start + len;
+        const focused = self.currentObject();
+        if (len <= range_leaf) {
+            if (projected_only) {
+                if (focused) |id| if (id >= start and id < end and snapshot.isLive(id)) {
+                    try self.tree_rows.append(self.allocator, .{ .object = .{ .id = id, .depth = depth } });
+                };
+                return;
+            }
+            var next = snapshot.nextLive(start);
+            while (next) |id| : (next = snapshot.nextLive(id + 1)) {
+                if (id >= end) break;
+                try self.tree_rows.append(self.allocator, .{ .object = .{ .id = id, .depth = depth } });
+            }
+            return;
+        }
+
+        var span: u32 = range_leaf;
+        while ((len + span - 1) / span > 64) span *= 64;
+        var offset: u32 = 0;
+        while (offset < len) : (offset += span) {
+            const child_start = start + offset;
+            const child_len = @min(span, len - offset);
+            const child_end = child_start + child_len;
+            const contains_focus = if (focused) |id| id >= child_start and id < child_end else false;
+            if (projected_only and !contains_focus) continue;
+            const first_live = snapshot.nextLive(child_start) orelse continue;
+            if (first_live >= child_end) continue;
+            const range: Range = .{
+                .kind = .objects,
+                .parent = 0,
+                .start = child_start,
+                .len = child_len,
+                .depth = depth,
+            };
+            try self.tree_rows.append(self.allocator, .{ .range = range });
+            if (self.expanded_ranges.contains(range.key())) {
+                try self.appendObjectRange(snapshot, child_start, child_len, depth +| 1, false);
+            } else if (contains_focus) {
+                try self.appendObjectRange(snapshot, child_start, child_len, depth +| 1, true);
+            }
+        }
     }
 
     fn appendNameRows(self: *Tui, name: bytecode.name_tree.NameId, depth: u16, focused_chunk: ChunkId) std.mem.Allocator.Error!void {
@@ -1186,8 +1455,7 @@ const Tui = struct {
             .category => |entry| {
                 const index = @intFromEnum(entry.kind);
                 self.category_expanded[index] = !self.category_expanded[index];
-                const focused = self.currentChunk() orelse 0;
-                try self.rebuildTree(focused);
+                try self.rebuildTreeForCurrent();
                 for (self.tree_rows.items, 0..) |row, i| switch (row) {
                     .category => |candidate| if (candidate.kind == entry.kind) {
                         self.tree_selection = i;
@@ -1202,8 +1470,7 @@ const Tui = struct {
                 } else {
                     try self.expanded.put(self.allocator, entry.id, {});
                 }
-                const focused = self.currentChunk() orelse 0;
-                try self.rebuildTree(focused);
+                try self.rebuildTreeForCurrent();
                 for (self.tree_rows.items, 0..) |row, i| switch (row) {
                     .name => |candidate| if (candidate.id == entry.id) {
                         self.tree_selection = i;
@@ -1213,11 +1480,18 @@ const Tui = struct {
                 };
             },
             .chunk => |entry| try self.open(.{ .chunk = entry.id }),
-            .heap => |entry| try self.open(.{ .heap = entry.view }),
+            .heap => |entry| {
+                if (entry.view == .objects) {
+                    const index = @intFromEnum(entry.view);
+                    self.heap_view_expanded[index] = !self.heap_view_expanded[index];
+                }
+                try self.open(.{ .heap = entry.view });
+                try self.rebuildTreeForCurrent();
+            },
+            .object => |entry| try self.open(.{ .object = entry.id }),
             .range => |range| {
                 if (!self.expanded_ranges.remove(range.key())) try self.expanded_ranges.put(self.allocator, range.key(), {});
-                const focused = self.currentChunk() orelse 0;
-                try self.rebuildTree(focused);
+                try self.rebuildTreeForCurrent();
                 for (self.tree_rows.items, 0..) |row, i| switch (row) {
                     .range => |candidate| if (candidate.key() == range.key()) {
                         self.tree_selection = i;
@@ -1237,8 +1511,7 @@ const Tui = struct {
                 const index = @intFromEnum(entry.kind);
                 if (self.category_expanded[index]) {
                     self.category_expanded[index] = false;
-                    const focused = self.currentChunk() orelse 0;
-                    try self.rebuildTree(focused);
+                    try self.rebuildTreeForCurrent();
                     for (self.tree_rows.items, 0..) |row, i| switch (row) {
                         .category => |candidate| if (candidate.kind == entry.kind) {
                             self.tree_selection = i;
@@ -1249,9 +1522,14 @@ const Tui = struct {
                 }
                 return;
             },
-            .heap => {
+            .heap => |entry| {
+                if (entry.view == .objects and self.heap_view_expanded[@intFromEnum(HeapView.objects)]) {
+                    self.heap_view_expanded[@intFromEnum(HeapView.objects)] = false;
+                    try self.rebuildTreeForCurrent();
+                    return;
+                }
                 for (self.tree_rows.items, 0..) |row, i| switch (row) {
-                    .category => |entry| if (entry.kind == .heap) {
+                    .category => |candidate| if (candidate.kind == .heap) {
                         self.tree_selection = i;
                         return;
                     },
@@ -1264,8 +1542,7 @@ const Tui = struct {
         if (selected == .range) {
             const range = selected.range;
             if (self.expanded_ranges.remove(range.key())) {
-                const focused = self.currentChunk() orelse 0;
-                try self.rebuildTree(focused);
+                try self.rebuildTreeForCurrent();
                 for (self.tree_rows.items, 0..) |row, i| switch (row) {
                     .range => |candidate| if (candidate.key() == range.key()) {
                         self.tree_selection = i;
@@ -1273,6 +1550,18 @@ const Tui = struct {
                     },
                     else => {},
                 };
+            }
+            if (range.kind == .objects) {
+                const selected_depth = range.depth;
+                var cursor = self.tree_selection;
+                while (cursor > 0) {
+                    cursor -= 1;
+                    const candidate = self.tree_rows.items[cursor];
+                    if (treeRowDepth(candidate) >= selected_depth) continue;
+                    self.tree_selection = cursor;
+                    return;
+                }
+                return;
             }
             for (self.tree_rows.items, 0..) |row, i| switch (row) {
                 .name => |entry| if (entry.id == range.parent) {
@@ -1286,6 +1575,17 @@ const Tui = struct {
         const name: bytecode.name_tree.NameId = switch (selected) {
             .name => |entry| entry.id,
             .chunk => |entry| self.ev.chunkRegistry().nameOf(entry.id) orelse bytecode.root_name_id,
+            .object => {
+                var cursor = self.tree_selection;
+                while (cursor > 0) {
+                    cursor -= 1;
+                    if (self.tree_rows.items[cursor] == .range) {
+                        self.tree_selection = cursor;
+                        return;
+                    }
+                }
+                return;
+            },
             .range => unreachable,
             .category, .heap => unreachable,
         };
@@ -1330,12 +1630,16 @@ const Tui = struct {
                 try self.expandFocusedPath(id);
                 try self.rebuildTree(id);
             },
+            .object => {
+                self.category_expanded[@intFromEnum(Category.heap)] = true;
+                try self.rebuildTreeForCurrent();
+            },
             .heap, .help => {},
         }
         self.x_scroll = 0;
         switch (kind) {
             .help => self.focus = .disassembly,
-            .heap => self.focus = .disassembly,
+            .heap, .object => self.focus = .disassembly,
             .chunk => {},
         }
         self.status_msg = "";
@@ -1349,6 +1653,11 @@ const Tui = struct {
         try self.forward.append(self.allocator, self.stack.pop().?);
         const visit = self.stack.items[self.stack.items.len - 1];
         try self.refreshPage(visit.kind);
+        switch (visit.kind) {
+            .chunk => |id| try self.expandFocusedPath(id),
+            else => {},
+        }
+        try self.rebuildTreeForCurrent();
         self.scroll = visit.scroll;
         self.tree_selection = visit.tree_selection;
         self.detail_selection = visit.detail_selection;
@@ -1370,6 +1679,11 @@ const Tui = struct {
         }
         try self.stack.append(self.allocator, visit);
         try self.refreshPage(visit.kind);
+        switch (visit.kind) {
+            .chunk => |id| try self.expandFocusedPath(id),
+            else => {},
+        }
+        try self.rebuildTreeForCurrent();
         self.scroll = visit.scroll;
         self.tree_selection = visit.tree_selection;
         self.detail_selection = visit.detail_selection;
@@ -1399,14 +1713,14 @@ const Tui = struct {
     fn rowActionable(self: *const Tui, index: usize) bool {
         if (index >= self.page.actions.len) return false;
         return switch (self.page.actions[index]) {
-            .chunk => true,
+            .chunk, .object => true,
             .none, .heading => false,
         };
     }
 
     fn firstActionableRow(self: *const Tui) ?usize {
         for (self.page.actions, 0..) |action, i| switch (action) {
-            .chunk => return i,
+            .chunk, .object => return i,
             .none, .heading => {},
         };
         return null;
@@ -1451,6 +1765,7 @@ const Tui = struct {
         if (self.detail_selection >= self.page.actions.len) return;
         switch (self.page.actions[self.detail_selection]) {
             .chunk => |id| try self.open(.{ .chunk = id }),
+            .object => |id| try self.open(.{ .object = id }),
             .none, .heading => {},
         }
     }
@@ -1865,7 +2180,7 @@ const Tui = struct {
     fn detailRole(self: *const Tui, index: usize) tui.Role {
         if (index < self.page.actions.len) switch (self.page.actions[index]) {
             .heading => return .section,
-            .chunk => return .chunk,
+            .chunk, .object => return .chunk,
             .none => {},
         };
         return if (std.mem.startsWith(u8, self.page.lines[index], "▶")) .source_focus else .plain;
@@ -1896,6 +2211,7 @@ const Tui = struct {
             .chunk => |entry| entry.depth,
             .range => |entry| entry.depth,
             .heap => |entry| entry.depth,
+            .object => |entry| entry.depth,
         };
     }
 
@@ -1955,6 +2271,11 @@ const Tui = struct {
         }
         if (row == 1) {
             const id = self.currentChunk() orelse {
+                if (self.currentObject()) |object_id| {
+                    const line = std.fmt.bufPrint(&line_buf, " ● object #{d}", .{object_id}) catch " object";
+                    try frame.text(line, 0, width, .current);
+                    return;
+                }
                 if (self.currentHeap()) |view| {
                     const line = std.fmt.bufPrint(&line_buf, " ● heap/{s}", .{@tagName(view)}) catch " heap";
                     try frame.text(line, 0, width, .current);
@@ -1991,14 +2312,18 @@ const Tui = struct {
         const line: []const u8 = switch (self.tree_rows.items[index]) {
             .category => |entry| blk: {
                 const is_open = self.category_expanded[@intFromEnum(entry.kind)];
+                const projected = !is_open and switch (entry.kind) {
+                    .bytecode => self.currentChunk() != null,
+                    .heap => self.currentObject() != null,
+                };
                 break :blk switch (entry.kind) {
                     .bytecode => blk2: {
                         const stats = self.name_index.statsOf(bytecode.root_name_id);
-                        break :blk2 std.fmt.bufPrint(&line_buf, " {s} BYTECODE  {d} chunks", .{ if (is_open) "▾" else "▸", stats.chunks }) catch " bytecode";
+                        break :blk2 std.fmt.bufPrint(&line_buf, " {s} BYTECODE  {d} chunks", .{ if (is_open) "▾" else if (projected) "›" else "▸", stats.chunks }) catch " bytecode";
                     },
                     .heap => blk2: {
                         const counts = self.ev.heapCounts();
-                        break :blk2 std.fmt.bufPrint(&line_buf, " {s} HEAP  {d} object slots", .{ if (is_open) "▾" else "▸", counts.objects }) catch " heap";
+                        break :blk2 std.fmt.bufPrint(&line_buf, " {s} HEAP  {d} object slots", .{ if (is_open) "▾" else if (projected) "›" else "▸", counts.objects }) catch " heap";
                     },
                 };
             },
@@ -2058,6 +2383,12 @@ const Tui = struct {
                             last,
                         }) catch " chunk range";
                     },
+                    .objects => std.fmt.bufPrint(&line_buf, " {s}{s} objects #{d}–#{d}", .{
+                        indent[0..indent_len],
+                        if (is_open) "▾" else if (self.currentObject()) |id| (if (id >= entry.start and id < entry.start + entry.len) "›" else "▸") else "▸",
+                        entry.start,
+                        entry.start + entry.len - 1,
+                    }) catch " object range",
                 };
             },
             .heap => |entry| blk: {
@@ -2071,7 +2402,26 @@ const Tui = struct {
                 var indent: [64]u8 = undefined;
                 const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                 @memset(indent[0..indent_len], ' ');
-                break :blk std.fmt.bufPrint(&line_buf, " {s}· {s}  {d}", .{ indent[0..indent_len], @tagName(entry.view), store_count }) catch " heap store";
+                const marker = if (entry.view == .objects)
+                    (if (self.heap_view_expanded[@intFromEnum(entry.view)]) "▾" else if (self.currentObject() != null) "›" else "▸")
+                else
+                    "·";
+                break :blk std.fmt.bufPrint(&line_buf, " {s}{s} {s}  {d}", .{ indent[0..indent_len], marker, @tagName(entry.view), store_count }) catch " heap store";
+            },
+            .object => |entry| blk: {
+                var indent: [64]u8 = undefined;
+                const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
+                @memset(indent[0..indent_len], ' ');
+                const kind = if (self.object_snapshot) |*snapshot|
+                    if (self.ev.inspectHeapObject(snapshot, entry.id)) |info| @tagName(info) else |_| "?"
+                else
+                    "?";
+                break :blk std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {s}", .{
+                    indent[0..indent_len],
+                    if (self.currentObject() == entry.id) "●" else "·",
+                    entry.id,
+                    kind,
+                }) catch " object";
             },
         };
         const role: tui.Role = if (selected and self.focus == .chunks)
@@ -2083,6 +2433,7 @@ const Tui = struct {
             .name => .name,
             .chunk => |entry| if (self.currentChunk() == entry.id) .current else .chunk,
             .range => .range,
+            .object => |entry| if (self.currentObject() == entry.id) .current else .chunk,
             .heap => |entry| switch (self.currentKind()) {
                 .heap => |view| if (view == entry.view) .current else .chunk,
                 else => .chunk,
