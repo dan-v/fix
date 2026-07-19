@@ -815,6 +815,10 @@ pub const Scheduler = struct {
         self.debug_serial.store(enabled, .release);
     }
 
+    pub fn swapDebugSerial(self: *Scheduler, enabled: bool) bool {
+        return self.debug_serial.swap(enabled, .acq_rel);
+    }
+
     pub inline fn backgroundSuppressed(self: *const Scheduler) bool {
         return self.suppress_background.load(.acquire);
     }

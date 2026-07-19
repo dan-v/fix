@@ -208,6 +208,10 @@ pub const VM = struct {
     /// VM containing the `import` call. The parent outlives this nested VM;
     /// normal execution never reads the link.
     debug_parent: ?*VM = null,
+    /// Select the debugger's fresh import memo table. This is carried by the
+    /// VM rather than the Evaluator so older helper VMs can safely finish a
+    /// normal evaluation while a serial debugger replay begins.
+    debug_import_replay: bool = false,
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.

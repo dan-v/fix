@@ -524,6 +524,12 @@ pub fn markRoots(ev: Context, tr: *gc.Tracer) void {
         if (entry.future.state.load(.monotonic) == @intFromEnum(future_mod.FutureState.resolved))
             tr.markValue(ev.heap, entry.result);
     }
+    var replay_it = ev.imports.replay_entries.iterator();
+    while (replay_it.next()) |e| {
+        const entry = e.value_ptr.*;
+        if (entry.future.state.load(.monotonic) == @intFromEnum(future_mod.FutureState.resolved))
+            tr.markValue(ev.heap, entry.result);
+    }
     // Lazy-derivation cache (Value bits keyed by attrs id). Only current-
     // token entries are live roots; stale ones (pre-GC id, now reused) are
     // dead and will miss on lookup, so don't retain them.

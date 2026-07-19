@@ -17,10 +17,25 @@ const SpinMutex = @import("base").sync.SpinMutex;
 /// actual evaluation.
 pub const Registry = struct {
     entries: std.StringHashMapUnmanaged(*ImportEntry) = .empty,
+    /// A separate memo table for the current debugger replay. Keeping it
+    /// distinct lets old normal-evaluation helpers finish against `entries`
+    /// while a serial debug run starts from a clean import graph.
+    replay_entries: std.StringHashMapUnmanaged(*ImportEntry) = .empty,
     mu: SpinMutex = .{},
 
     pub fn deinit(self: *Registry, allocator: std.mem.Allocator) void {
-        var it = self.entries.iterator();
+        clearEntries(&self.entries, allocator);
+        clearEntries(&self.replay_entries, allocator);
+    }
+
+    /// Start a fresh serial debugger replay while keeping the compiled chunk
+    /// registry and ordinary import memo table warm.
+    pub fn beginReplayQuiescent(self: *Registry, allocator: std.mem.Allocator) void {
+        clearEntries(&self.replay_entries, allocator);
+    }
+
+    fn clearEntries(entries: *std.StringHashMapUnmanaged(*ImportEntry), allocator: std.mem.Allocator) void {
+        var it = entries.iterator();
         while (it.next()) |kv| {
             const entry = kv.value_ptr.*;
             if (entry.error_info) |info| {
@@ -30,25 +45,27 @@ pub const Registry = struct {
             allocator.free(kv.key_ptr.*);
             allocator.destroy(entry);
         }
-        self.entries.deinit(allocator);
+        entries.clearAndFree(allocator);
     }
 
     pub fn lookupOrCreate(
         self: *Registry,
         allocator: std.mem.Allocator,
         path: []const u8,
+        replay: bool,
     ) !*ImportEntry {
         self.mu.lock();
         defer self.mu.unlock();
 
-        if (self.entries.get(path)) |entry| return entry;
+        const entries = if (replay) &self.replay_entries else &self.entries;
+        if (entries.get(path)) |entry| return entry;
 
         const key = try allocator.dupe(u8, path);
         errdefer allocator.free(key);
         const entry = try allocator.create(ImportEntry);
         errdefer allocator.destroy(entry);
         entry.* = .{ .future = future_mod.Future.init() };
-        try self.entries.put(allocator, key, entry);
+        try entries.put(allocator, key, entry);
         return entry;
     }
 };

@@ -382,6 +382,77 @@ test "step into follows an import compiled after the step is armed" {
     try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result)).asInt());
 }
 
+test "repeated debug evaluations replay memoized imports for stepping" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "replay.nix",
+        .data = "{ value = 42; }\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "replay.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).value", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const Ctl = struct {
+        imported_hits: usize = 0,
+        pauses_this_run: usize = 0,
+        stepping: bool = false,
+
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            s.clearStep();
+            self.pauses_this_run += 1;
+            try std.testing.expect(self.pauses_this_run < 8);
+            if (!self.stepping) return;
+            if (s.reason == .step) {
+                if (s.currentFrame()) |frame| {
+                    if (frame.file) |file| {
+                        if (std.mem.endsWith(u8, file, "replay.nix")) {
+                            self.imported_hits += 1;
+                            return;
+                        }
+                    }
+                }
+            }
+            try s.step(.into);
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    // First run continues from entry and warms the ordinary import memo.
+    const first = try ev.debugWithScopeResult(source, null);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(first.value)).asInt());
+    try std.testing.expectEqual(@as(usize, 0), ctl.imported_hits);
+
+    // Step-into must replay the import even though the ordinary result is
+    // cached, and a later debug session must be replayable again.
+    ctl.stepping = true;
+    ctl.pauses_this_run = 0;
+    const second = try ev.debugWithScopeResult(source, null);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(second.value)).asInt());
+    try std.testing.expectEqual(@as(usize, 1), ctl.imported_hits);
+
+    ctl.pauses_this_run = 0;
+    const third = try ev.debugWithScopeResult(source, null);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(third.value)).asInt());
+    try std.testing.expectEqual(@as(usize, 2), ctl.imported_hits);
+}
+
 test "pending import breakpoint preserves the parent stack and finish returns to it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

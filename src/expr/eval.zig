@@ -289,6 +289,16 @@ pub const DebugSession = struct {
     /// Arm a single step. It takes effect once the console resumes; the next
     /// pause is the step's landing point. See `clearStep`.
     pub fn step(self: *DebugSession, kind: StepKind) !void {
+        if (kind == .into and !self.vm.debug_import_replay) {
+            // `import` is memoized across REPL inputs. Continuing/finishing a
+            // debug expression may use that fast path, but step-into promises
+            // executable imported code. Give this paused VM chain a fresh,
+            // separately rooted memo table so old helpers using the ordinary
+            // table remain untouched.
+            self.ev.imports.beginReplayQuiescent(self.ev.allocator);
+            var cursor: ?*VM = self.vm;
+            while (cursor) |vm| : (cursor = vm.debug_parent) vm.debug_import_replay = true;
+        }
         return debug_session.step(debugContext(self), kind);
     }
 
@@ -1202,12 +1212,13 @@ pub const Evaluator = struct {
     /// ambient `scope` and run it on a fresh nested VM (sharing the registry,
     /// heap, and intern table). The nested VM leaves the paused VM's stack and
     /// frames untouched, so inspecting a value can't corrupt the pause point.
-    fn debugEvalScoped(self: *Evaluator, _: *VM, source: []const u8, scope: ?Value) !Value {
+    fn debugEvalScoped(self: *Evaluator, paused_vm: *VM, source: []const u8, scope: ?Value) !Value {
         const chunk_id = try self.compileSourceScoped(source, scope);
-        return self.runWithVm(debugRunBody, .{chunk_id});
+        return self.runWithVm(debugRunBody, .{ chunk_id, paused_vm.debug_import_replay });
     }
 
-    fn debugRunBody(vm: *VM, chunk_id: ChunkId) !Value {
+    fn debugRunBody(vm: *VM, chunk_id: ChunkId, import_replay: bool) !Value {
+        vm.debug_import_replay = import_replay;
         return vm.eval(chunk_id);
     }
 
@@ -1292,6 +1303,8 @@ pub const Evaluator = struct {
     /// instruction. The source is compiled unchanged; the UI must already be
     /// installed so the entry trap has somewhere to route.
     pub fn debugWithScopeResult(self: *Evaluator, source: []const u8, scope: ?Value) !EvaluationResult {
+        const was_debug_serial = self.scheduler.swapDebugSerial(true);
+        defer self.scheduler.setDebugSerial(was_debug_serial);
         return self.evaluateTopResult(source, self.base_path, null, scope, true);
     }
 
@@ -1307,6 +1320,14 @@ pub const Evaluator = struct {
         scope: ?Value,
         initial_break: bool,
     ) !EvaluationResult {
+        if (initial_break) {
+            if (self.debugger.breakpoints) |*breakpoints| breakpoints.clearStep(&self.registry);
+        }
+        defer if (initial_break) {
+            // A finish/step can run directly to the result without another
+            // pause at which the UI would normally clear its temporary sites.
+            if (self.debugger.breakpoints) |*breakpoints| breakpoints.clearStep(&self.registry);
+        };
         try self.prepareEvaluations();
         // Not routed through `evaluateSource`: its top-level detection is
         // `source_path == null`, so passing the path there would send the
@@ -1548,6 +1569,7 @@ pub const Evaluator = struct {
         var vm = try self.initVm(0, scratch.allocator());
         defer vm.deinit();
         vm.debug_parent = debug_parent;
+        vm.debug_import_replay = if (debug_parent) |parent| parent.debug_import_replay else false;
         // Depth-transparent import: the fresh nested VM inherits the caller's
         // depth minus 1 (dropping the `import` builtin's own +1), so a
         // top-level import evaluates at depth 0 (collects) while a nested one
@@ -2033,7 +2055,7 @@ pub const Evaluator = struct {
     }
 
     fn importResolvedPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
-        const entry = try self.imports.lookupOrCreate(self.allocator, path);
+        const entry = try self.imports.lookupOrCreate(self.allocator, path, debug_parent.debug_import_replay);
         return self.forceImportEntry(path, entry, parent_depth, debug_parent);
     }
 
