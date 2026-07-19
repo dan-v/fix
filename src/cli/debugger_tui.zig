@@ -17,6 +17,7 @@ const keys_mod = @import("repl/keys.zig");
 const editor_mod = @import("repl/editor.zig");
 const history_mod = @import("repl/history.zig");
 const width_mod = @import("repl/width.zig");
+const source_render = @import("source_render.zig");
 
 const tui = base.tui;
 const ColorDepth = base.terminal_color.Depth;
@@ -40,6 +41,7 @@ pub const DebuggerTui = struct {
     selected_frame: usize = 0,
     detail: enum { source, disassembly } = .source,
     detail_scroll: usize = 0,
+    pauses: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -125,6 +127,7 @@ pub const DebuggerTui = struct {
     fn drive(self: *DebuggerTui, session: *DebugSession) !void {
         try self.begin();
         errdefer self.endEvaluation();
+        self.pauses += 1;
         session.clearStep();
         self.selected_frame = session.frameCount() -| 1;
         self.detail_scroll = 0;
@@ -390,7 +393,8 @@ pub const DebuggerTui = struct {
         const selected = if (session.frameCount() > 0) session.frame(self.selected_frame) else null;
         var header_buf: [512]u8 = undefined;
         const header = if (selected) |f|
-            std.fmt.bufPrint(&header_buf, " fix debug · {s} · {s}:{d}:{d} · frame {d}/{d} ", .{
+            std.fmt.bufPrint(&header_buf, " fix debug · pause {d} · {s} · {s}:{d}:{d} · frame {d}/{d} ", .{
+                self.pauses,
                 reasonName(session.reason),
                 if (f.file) |file| std.fs.path.basename(file) else "<repl>",
                 f.line,
@@ -523,12 +527,28 @@ pub const DebuggerTui = struct {
         const start_line = @max(@as(usize, 1), focus_line -| (rows / 2) + self.detail_scroll);
         const line_no = start_line + row;
         const bounds = sourceLine(source, line_no) orelse return;
-        const text = try std.fmt.allocPrint(arena, "{d: >5} {s} {s}", .{
+        const prefix = try std.fmt.allocPrint(arena, "{d: >5} {s} ", .{
             line_no,
             if (line_no == info.line) "▶" else "┆",
-            source[bounds.start..bounds.end],
         });
-        try frame.text(text, 0, width, if (line_no == info.line) .source_focus else .plain);
+        try frame.text(prefix, 0, width, if (line_no == info.line) .source_focus else .muted);
+        const prefix_width = width_mod.strWidth(prefix);
+        if (prefix_width >= width) return;
+
+        const span_focus: ?source_render.Range = if (info.span) |span| blk: {
+            const span_start = @as(usize, span.offset);
+            const span_end = span_start +| @as(usize, @max(span.len, 1));
+            const start = @max(bounds.start, span_start);
+            const end = @min(bounds.end, span_end);
+            if (start >= end) break :blk null;
+            break :blk .{ .start = start - bounds.start, .end = end - bounds.start };
+        } else null;
+        var highlighted: std.Io.Writer.Allocating = .init(arena);
+        try source_render.writeLine(&highlighted.writer, source[bounds.start..bounds.end], .{
+            .color = self.color_depth.enabled(),
+            .focus = span_focus,
+        });
+        try frame.text(highlighted.written(), 0, width - prefix_width, .plain);
     }
 
     fn drawDisassemblyRow(
