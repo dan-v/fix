@@ -165,6 +165,10 @@ pub const Editor = struct {
         return self.buffer.items;
     }
 
+    pub fn cursorOffset(self: *const Editor) usize {
+        return self.cursor;
+    }
+
     /// Hand the buffer to the caller (owned); the editor is left reset.
     pub fn takeText(self: *Editor) ![]u8 {
         const out = try self.allocator.dupe(u8, self.buffer.items);

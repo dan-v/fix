@@ -15,6 +15,13 @@ const posix = std.posix;
 /// the signal handler must reach it without a context pointer.
 var saved_termios: ?posix.termios = null;
 
+/// Whether another full-screen surface currently owns raw terminal mode.
+/// Nested surfaces (the debugger entered from `:vm`) borrow that ownership
+/// instead of saving an already-raw termios as if it were the original.
+pub fn rawActive() bool {
+    return saved_termios != null;
+}
+
 /// SIGWINCH arrived since the last size query.
 var winch_flag = std.atomic.Value(bool).init(false);
 

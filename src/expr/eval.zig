@@ -175,6 +175,10 @@ pub const DebugSession = struct {
         return debug_session.frame(debugContext(self), i);
     }
 
+    pub fn frameChunkId(self: *const DebugSession, i: usize) ChunkId {
+        return debug_session.frameRef(self.vm, i).frame().chunk_id;
+    }
+
     /// The current (innermost) frame, or null if the stack is empty.
     pub fn currentFrame(self: *const DebugSession) ?DebugFrame {
         const count = self.frameCount();

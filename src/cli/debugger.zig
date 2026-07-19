@@ -17,6 +17,7 @@ const runtime = @import("runtime");
 const presentation = @import("presentation.zig");
 const term_mod = @import("repl/term.zig");
 const syntax = @import("syntax");
+const command_mod = @import("debugger_command.zig");
 
 const DebugSession = engine.DebugSession;
 const Value = runtime.Value;
@@ -161,67 +162,33 @@ pub const Console = struct {
     /// command interpretation. Arg commands (`break`, `delete`) match on their
     /// first word, which is never a valid expression prefix.
     fn dispatch(self: *Console, s: *DebugSession, line: []const u8, scope: ?Value) !bool {
-        if (line.len == 0) return false;
-        const explicit = line[0] == ':';
-        const cmd = if (explicit) std.mem.trim(u8, line[1..], " \t") else line;
-        if (cmd.len == 0) return false;
-        const word = firstWord(cmd);
-        const rest = std.mem.trim(u8, cmd[word.len..], " \t");
-        const bare = rest.len == 0; // no trailing content → unambiguous command
-
-        // No-arg commands: only when the line is exactly the word (or `:`-forced).
-        if (bare or explicit) {
-            if (isWord(word, &.{ "c", "cont", "continue" })) return true;
-            if (isWord(word, &.{ "q", "quit", "abort" })) return AbortError;
-            if (isWord(word, &.{ "n", "next" })) {
-                try self.armStep(s, .over);
+        switch (command_mod.parse(line)) {
+            .none => return false,
+            .proceed => return true,
+            .abort => return AbortError,
+            .step => |kind| {
+                try self.armStep(s, switch (kind) {
+                    .over => .over,
+                    .into => .into,
+                    .out => .out,
+                });
                 return true;
-            }
-            if (isWord(word, &.{ "s", "step" })) {
-                try self.armStep(s, .into);
-                return true;
-            }
-            if (isWord(word, &.{ "finish", "fin", "out" })) {
-                try self.armStep(s, .out);
-                return true;
-            }
-            if (isWord(word, &.{ "bt", "backtrace", "where", "w" })) {
-                try self.backtrace(s);
-                return false;
-            }
-            if (isWord(word, &.{ "l", "locals" })) {
-                try self.locals(s);
-                return false;
-            }
-            if (isWord(word, &.{ "v", "value" })) {
-                try self.printValue(s, s.value);
-                return false;
-            }
-            if (isWord(word, &.{ "breakpoints", "info" })) {
-                try self.listBreakpoints(s);
-                return false;
-            }
-            if (isWord(word, &.{ "help", "h", "?" })) {
-                try self.help();
-                return false;
-            }
+            },
+            .backtrace => try self.backtrace(s),
+            .locals => try self.locals(s),
+            .value => try self.printValue(s, s.value),
+            .breakpoint => |arg| try self.addBreakpoint(s, arg),
+            .breakpoints => try self.listBreakpoints(s),
+            .delete => |arg| try self.deleteBreakpoint(s, arg),
+            .help => try self.help(),
+            .eval => |source| {
+                const result = s.eval(source, scope) catch |e| {
+                    try self.reportErr("{s}", .{@errorName(e)});
+                    return false;
+                };
+                try self.printValue(s, result);
+            },
         }
-        // Arg commands: `break`/`delete` aren't valid expression prefixes.
-        if (isWord(word, &.{"break"})) {
-            try self.addBreakpoint(s, rest);
-            return false;
-        }
-        if (isWord(word, &.{"delete"})) {
-            try self.deleteBreakpoint(s, rest);
-            return false;
-        }
-
-        // Everything else is a Nix expression evaluated in the pause scope.
-        const result = s.eval(line, scope) catch |e| {
-            try self.reportErr("{s}", .{@errorName(e)});
-            return false;
-        };
-        try self.printValue(s, result);
         return false;
     }
 
@@ -571,11 +538,6 @@ const ScreenPause = struct {
     }
 };
 
-fn isWord(word: []const u8, aliases: []const []const u8) bool {
-    for (aliases) |a| if (std.mem.eql(u8, word, a)) return true;
-    return false;
-}
-
 const Bounds = struct { start: usize, end: usize };
 
 /// The [start,end) of the line containing byte `offset` (excluding the newline).
@@ -596,11 +558,6 @@ fn tokenColor(t: TokenType) ?[]const u8 {
         .integer, .float_val => col_number,
         else => null,
     };
-}
-
-fn firstWord(s: []const u8) []const u8 {
-    const end = std.mem.indexOfAny(u8, s, " \t") orelse s.len;
-    return s[0..end];
 }
 
 /// Shared scratch for the console's short-lived stderr writers (single fiber).

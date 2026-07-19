@@ -22,6 +22,7 @@ const progress_ui = @import("../progress.zig");
 const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 const debugger = @import("../debugger.zig");
+const debugger_tui = @import("../debugger_tui.zig");
 const render_err = @import("../render.zig");
 const stats = @import("../stats.zig");
 const engine = @import("expr");
@@ -91,7 +92,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var console: debugger.Console = .{ .allocator = allocator, .io = init.io, .use_color = term.use_color };
     if (options.debugger) {
         ev.setParallelismToggles(true, true);
-        console.install(&ev);
     }
 
     var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);
@@ -105,6 +105,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var repl = Repl.init(allocator, init, options, &ev, if (interactive) term.color_depth else .none, interactive);
     defer repl.deinit();
     repl.debug_console = &console;
+    var debug_screen = debugger_tui.DebuggerTui.init(allocator, init.io, &ev, term.color_depth, &repl.history);
+    defer debug_screen.deinit();
+    if (interactive) repl.debug_tui = &debug_screen;
+    if (options.debugger) {
+        if (interactive) debug_screen.install(&ev) else console.install(&ev);
+    }
 
     if (interactive) {
         try repl.runInteractive();
@@ -135,6 +141,9 @@ const Repl = struct {
     /// Shared by persistent `--debugger` sessions and transient `:debug`
     /// commands; the bare loop attaches its buffered stdin reader here.
     debug_console: ?*debugger.Console = null,
+    /// Full-screen debugger selected only for an interactive tty. Null in bare
+    /// mode, which deliberately retains the line-oriented console contract.
+    debug_tui: ?*debugger_tui.DebuggerTui = null,
 
     /// Scope bindings, insertion-ordered. Keys are owned; values are heap
     /// Values kept alive via `gc_extra_roots` + the scope attrset.
@@ -379,6 +388,7 @@ const Repl = struct {
     // -- input processing (shared by both modes) -------------------------------
 
     fn processInput(self: *Repl, input: []const u8) !void {
+        defer if (self.debug_tui) |screen| screen.endEvaluation();
         const trimmed = std.mem.trim(u8, input, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == ':') {
@@ -536,15 +546,19 @@ const Repl = struct {
 
     fn debugExpr(self: *Repl, source: []const u8) !void {
         const console = self.debug_console orelse {
-            try self.printError("debug console unavailable", .{});
+            try self.printError("debugger unavailable", .{});
             return;
         };
         self.ev.setDebugSerial(true);
         defer self.ev.setDebugSerial(false);
 
         const transient = !self.options.debugger;
-        if (transient) console.install(self.ev);
-        defer if (transient) console.uninstall(self.ev);
+        if (transient) {
+            if (self.debug_tui) |screen| screen.install(self.ev) else console.install(self.ev);
+        }
+        defer if (transient) {
+            if (self.debug_tui) |screen| screen.uninstall(self.ev) else console.uninstall(self.ev);
+        };
 
         if (try self.evalExprMode(source, true)) |value| {
             try self.bind("it", value);
