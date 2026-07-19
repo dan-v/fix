@@ -38,14 +38,14 @@ Domain modules call `emit` to write bytes; `emit` sees only opcodes/operands and
 - **function_args** — attrset-pattern parameter names + a has-default flag, retained for `builtins.functionArgs`.
 - **source_map** — sparse `bytecode byte-range → SourceSpan` entries, added at `compileNode` exit; runtime stack traces bind a program counter back to file/line/col.
 - **body_span** — a single representative span for the whole body, stamped even when `source_map` is empty (it is sparse). Labels a thunk quantum / demand wait in the timeline.
-- **fusion_savings** — bytes elided by fusion rewrites (see below).
+- **fused_dispatch_weight** — dispatch-equivalent weight elided by fusion rewrites (see below).
 - **strictness / strict_param / strict_via_upvalue / arity / strict_params** — scheduling metadata written by the `strictness` stamp and `compileLambda` before `finish`.
 
 The strictness stamp (`strictness.stampOnBuilder`) runs at the **end of body compilation**, before `finish`: it computes the [must-force upvalue masks](strictness.md) and records `body_span`.
 
 At **finish** (`ChunkBuilder.finish`), in one pass, the builder freezes into an immutable **Chunk**:
 
-1. **body_is_substantial** — `code.len + fusion_savings + sideTableWeight() ≥ speculation_min_code_bytes` (256), gating [speculation](../parallel/speculation.md); `sideTableWeight` re-adds the bytes the attr-name/position side tables moved out of the code stream, mirroring their old inline encodings.
+1. **body_is_substantial** — `code.len + fused_dispatch_weight + schedulingSideTableWeight() ≥ speculation_min_code_bytes` (256), gating [speculation](../parallel/speculation.md); the side-table weight accounts for attr-name/position and capture work moved out of the code stream.
 2. **Trivial-body classify** — the finished body is classified once into a `TrivialBody` variant, else `none` (see [lazy-compile.md](lazy-compile.md) and [runtime/thunks.md](../runtime/thunks.md)); safe because thunk bodies have `local_count == 0`.
 3. The strictness masks, `strict_param`, `strict_via_upvalue`, `arity`, and `strict_params` are copied through into the Chunk.
 
@@ -56,7 +56,7 @@ The frozen **Chunk** carries: `code`, `constants`, `local_count`, `arity`, `stri
 ```
 ChunkBuilder (mutable, arena)                 Chunk (immutable, persistent)
   code[] constants[] function_args[]  stamp   code arity local_count
-  source_map[] fusion_savings         ─────▶   strict_params SchedulingHints
+  source_map[] fused_dispatch_weight  ─────▶   strict_params SchedulingHints
   + strictness masks + body_span      finish    source_map body_span  → ChunkId
 ```
 
@@ -75,7 +75,7 @@ Fusion rewrites the *last emitted op in place* when the next emission completes 
 
 A branch fixup (`patchJump`) that lands at the current write position drops the `last_op_offset` fusion hint, so a multi-predecessor join never fuses across control flow.
 
-The `*_get_attr` and `*_st(_cell)` rewrites each add their one saved byte to **`fusion_savings`** (the `<op>_ret` rewrite does not); `fusion_savings` is added back to `code.len` when deciding `body_is_substantial`, so the [speculation](../parallel/speculation.md) size threshold measures the pre-fusion body size. String-interpolation lowering (`literals.zig`) also adjusts `fusion_savings` so a `str_cat` body keeps the scheduling weight of its unfused encoding.
+The `*_get_attr` and `*_st(_cell)` rewrites add their saved dispatch weight to **`fused_dispatch_weight`** (the `<op>_ret` rewrite does not); it is added back to `code.len` when deciding `body_is_substantial`. String-interpolation lowering (`literals.zig`) also adjusts the weight so a `str_cat` body keeps the scheduling cost of its expanded encoding.
 
 ## Tail-position lowering
 

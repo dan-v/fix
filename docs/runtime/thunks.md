@@ -10,7 +10,7 @@ Correctness oracle: byte-identical `.drv`. Speculation and fan-out are *scheduli
 
 ## Representation
 
-Millions of thunks are live at once on a real eval, so thunk-only metadata stays on `Thunk` while the reusable synchronization primitive remains small. A normal `Future` is 24 bytes and a normal `Thunk` is 80 bytes; tests pin both sizes. Two ideas keep unrelated future users from paying for evaluator state and keep the thunk payload bounded:
+Millions of thunks are live at once on a real eval, so thunk-only metadata stays on `Thunk` while the reusable synchronization primitive remains small. A normal `Future` is 24 bytes; a production `Thunk` is at most 56 bytes, while safety builds retain an active-union tag and allow up to 80. Tests enforce those bounds. Two ideas keep unrelated future users from paying for evaluator state and keep the thunk payload bounded:
 
 - **Separated responsibilities.** `Future` owns only state, claimer identity, and waiters. `Thunk` adds `demanded`, the `TargetKind` discriminant, and optional profiling fields. Imports, realization claims, and I/O futures therefore do not carry thunk scheduling metadata.
 - **`target` XOR `result` overlap.** The `Payload` is a bare 24-byte union: `.target` (what to evaluate) is the live arm while unresolved/evaluating; `.result` (the resolved `Value`, or an `*ErrorInfo`'s bits) is live once terminal. They are *never both live* — the body reads `target`, then the resolver overwrites the same bytes with `result`. So resolving costs no growth. `future.state` is the discriminant that says which arm is live.

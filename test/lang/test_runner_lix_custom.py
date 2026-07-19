@@ -2,8 +2,10 @@ import ast
 import importlib.util
 import sys
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("lang_runner_custom", HERE / "run.py")
@@ -20,6 +22,29 @@ EXPECTED = {
     "parser-token-whitespace": 68,
     "search-path": 6,
 }
+
+
+class AdapterInvocationTests(unittest.TestCase):
+    def test_expression_adapters_use_the_supported_uppercase_short_flag(self):
+        completed = subprocess.CompletedProcess([], 1, "", "Hello")
+        with mock.patch.object(runner, "run_fix", return_value=completed) as run_fix:
+            case = next(runner._build_err_context(Path(".")))
+            self.assertEqual("pass", case.handler(Path("fix")).status)
+        args = run_fix.call_args.args[1]
+        self.assertIn("-E", args)
+        self.assertNotIn("-e", args)
+
+        with tempfile.TemporaryDirectory() as td:
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(runner, "run_fix", return_value=completed) as run_fix:
+                case = runner._ptw_case(Path(td), "case", "with {}; (1)", [], 0)
+                self.assertEqual("pass", case.handler(Path("fix")).status)
+            args = run_fix.call_args.args[1]
+            self.assertIn("-E", args)
+            self.assertNotIn("-e", args)
+
+        self.assertIn("-E", runner.SUPPORTED_FLAGS)
+        self.assertNotIn("-e", runner.SUPPORTED_FLAGS)
 
 
 def lix_root():

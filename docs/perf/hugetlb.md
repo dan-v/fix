@@ -1,7 +1,6 @@
 # Huge-page heap backing (`--hugetlb`)
 
-*Explicit 2 MB hugetlb pages under the evaluator's big mappings — the largest
-single-lever wall win that isn't on the critical chain itself.*
+*Explicit 2 MB hugetlb pages under the evaluator's large mappings.*
 
 ## What it does
 
@@ -22,7 +21,7 @@ traffic are backed by explicit `MAP_HUGETLB` mappings instead of 4 KB pages:
   parse/compile arenas, and retained ASTs.
 
 One 2 MB TLB entry replaces 512 4 KB entries and first-touch faults drop
-512×. Measured on `test/nixos_toplevel.nix` (ReleaseFast): **w=1 −8.3%**
+512×. Point-in-time measurements from 2026-07-10 on `test/nixos_toplevel.nix` (ReleaseFast): **w=1 −8.3%**
 wall (exact, 3/3 interleaved pairs), w=8 **page faults −57% / dTLB misses
 −47%**, and it eliminates a +202 ms bimodal slow mode under memory-pressure
 co-load entirely (w=16 co-loaded −20%). Output is byte-identical on/off.
@@ -102,9 +101,9 @@ diagnostic consumers fold them in:
   the kernel-truth faulted figure from smaps (`Private_Hugetlb`).
 - the `--timeline` `rss_mb` counter carries a separate `hugetlb` series.
 - the **GC budget needs no fix**: it gates on internal
-  `totalReservedBytes()` slot counting, not RSS. Note the *default* budget
-  (half `MemAvailable`) is conservative on a pool-provisioned box, since
-  `MemAvailable` already excludes the pool the heap actually draws from.
+  `totalReservedBytes()` slot counting, not RSS. The default budget is half
+  `MemTotal`, with default bounds of 256 MiB–8 GiB, so it is stable and independent of
+  hugetlb RSS accounting.
 
 External monitoring that watches `fix`'s RSS will under-read by the hugetlb
 share; check `HugetlbPages:` in `/proc/<pid>/status` or the pool counters in

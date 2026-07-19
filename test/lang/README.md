@@ -8,8 +8,8 @@ Each case is a tiny Nix program with golden output; the runner drives it through
 This is a **differential** suite, separate from `zig build test` (the unit
 tests). It is a complete, **no-skip** inventory: every case is *attempted*, and
 every divergence from the reference evaluator is a `FAIL`. Any `FAIL` exits
-non-zero. There is no known-failures list — the conformance gap is meant to be
-visible (a red run), not papered over. `fix` does **not** pass the suite yet.
+non-zero. There is no known-failures list: any future conformance gap stays
+visible instead of being papered over. `fix` currently passes both pinned suites.
 
 ## Running
 

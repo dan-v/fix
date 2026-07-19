@@ -8,7 +8,7 @@
 
 One number decides when the collector runs: a heap-reserved-bytes budget, defended against.
 
-- Resolution order: `--gc-budget=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemTotal**, clamped to 256 MiB–8 GiB (fallback: half of an assumed 4 GiB). The budget covers the evaluator heap stores, not total process RSS; side allocations such as chunks, interned strings, and thread stacks sit outside it. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
+- Resolution order: `--gc-budget=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemTotal**, clamped by defaults of 256 MiB–8 GiB (fallback: half of an assumed 4 GiB). `FIX_GC_FLOOR` and `FIX_GC_CEILING` override those bounds with the same size syntax. The budget covers the evaluator heap stores, not total process RSS; side allocations such as chunks, interned strings, and thread stacks sit outside it. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
 - **Lazy arming**: below budget/2 the heap only compares its reserved-bytes cursor against the threshold once per TLAB refill — no young-slot tracking, no write barrier, no free-list probes. The first budget/2 crossing runs an arming stop-the-world safepoint (`armLazy`): everything allocated so far becomes untracked/old (the unreclaimable floor, ≈ reserved at budget/2 by construction), and real collections start at the full budget, re-armed to `max(budget, reserved + clamp(budget/8, 64MB, 1GB))` after each.
 - Consequence: evaluations below the arming threshold do not collect, while constrained budgets begin reclamation before heap reservations grow without bound.
 

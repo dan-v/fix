@@ -14,17 +14,20 @@ A subcommand is **required** (there is no default command). POSIX conventions: `
 
 ## Subcommands
 
-Each is a self-contained tool with its own `-h`. `eval`/`repl` share the compiler/VM and the standard evaluate-and-render path; `instantiate`/`build`/`run`/`shell` evaluate the same way but then realize the resulting derivation to the store through the nix-daemon worker protocol; the rest are introspection tools.
+Each is a self-contained tool with its own `-h`. `eval`/`repl` evaluate expressions; `instantiate`/`build`/`run`/`shell`/`switch` also realize derivations through the nix-daemon. `parse`, `disasm`, and the conditional trace commands expose intermediate representations; `completions` generates shell integration.
 
 | Subcommand | Purpose | Link |
 |---|---|---|
+| `build` | evaluate to a derivation, build its outputs via the nix-daemon, and link `./result` | [derivation/model.md](derivation/model.md) |
+| `completions bash|zsh|fish` | generate a shell completion script on stdout | — |
+| `disasm` | decompile bytecode per-chunk with source-span, constant, and local/upvalue-name annotation | [compiler/pipeline.md](compiler/pipeline.md), [vm/dispatch.md](vm/dispatch.md) |
 | `eval` | evaluate mixed expression/file/flake inputs and render each value | — |
 | `instantiate` | evaluate to a derivation and add its `.drv` closure to the store (à la `nix-instantiate`) | [derivation/model.md](derivation/model.md) |
-| `build` | evaluate to a derivation, build its outputs via the nix-daemon, and link `./result` | [derivation/model.md](derivation/model.md) |
+| `parse` | parse and statically validate an expression, then print the `nix-instantiate --parse` JSON AST | [syntax/parsing.md](syntax/parsing.md) |
+| `repl` | interactive read-eval loop | — |
 | `run` | build a derivation and run a program from its output | — |
 | `shell` | build a derivation and open a shell with its `bin/` on `PATH` (`-p NAMES...` pulls packages from `<nixpkgs>`) | — |
-| `repl` | interactive read-eval loop | — |
-| `disasm` | decompile bytecode per-chunk with source-span, constant, and local/upvalue-name annotation | [compiler/pipeline.md](compiler/pipeline.md), [vm/dispatch.md](vm/dispatch.md) |
+| `switch` | build and activate a NixOS, nix-darwin, or home-manager configuration | — |
 | `trace dump PATH` / `trace diff A B` | read binary VM-execution trace files: `dump` pretty-prints one as text; `diff` walks two in lockstep to the first divergent event (`-Dvm-trace` builds only) | [vm/dispatch.md](vm/dispatch.md) |
 | `thunks diff A B` | diff two thunk-resolution logs → first divergence by source location (`-Dthunks-log` builds only) | below |
 
@@ -63,7 +66,7 @@ The explorer describes semantic content and behavior rather than emitting termin
 - **a source-line breakpoint** — `break FILE:LINE` from the console. See [Source-line breakpoints](#source-line-breakpoints).
 - **an evaluation error** — an uncaught `throw`, `abort`, or failed `assert` pauses at the origin (call frames still live) *before* the error unwinds and prints. Errors caught by `builtins.tryEval` do **not** pause.
 
-`--debugger` forces `--workers=1` and disables speculation so the pause point is deterministic — a single demand fiber, no helper racing ahead of the break. An interactive REPL uses a full-screen debugger with live stack, syntax-highlighted source, exact-span focus, disassembly, and lazy locals/output panes. Every stop carries an increasing pause number so a loop that returns to the same span still visibly advances. In its source view, `b` toggles a breakpoint on the selected frame line (`B` opens the explicit `break FILE:LINE` prompt), and breakpoint lines remain marked in the gutter. It owns an alternate screen when entered from the ordinary inline prompt, but borrows the already-active screen and raw mode when entered from `:vm`; the VM explorer redraws as soon as evaluation resumes. `fix eval --debugger`, a non-TTY REPL, and `fix repl --no-tui` retain the line-oriented console, which reads stdin and writes stderr so redirected stdout receives only the final value and automation sees no escape sequences.
+`--debugger` forces `--workers=1` and disables speculation and fan-out so the pause point is deterministic — a single demand fiber, no helper racing ahead of the break. An interactive REPL uses a full-screen debugger with live stack, syntax-highlighted source, exact-span focus, disassembly, and lazy locals/output panes. Every stop carries an increasing pause number so a loop that returns to the same span still visibly advances. In its source view, `b` toggles a breakpoint on the selected frame line (`B` opens the explicit `break FILE:LINE` prompt), and breakpoint lines remain marked in the gutter. It owns an alternate screen when entered from the ordinary inline prompt, but borrows the already-active screen and raw mode when entered from `:vm`; the VM explorer redraws as soon as evaluation resumes. `fix eval --debugger`, a non-TTY REPL, and `fix repl --no-tui` retain the line-oriented console, which reads stdin and writes stderr so redirected stdout receives only the final value and automation sees no escape sequences.
 
 The REPL also offers `:debug EXPR` / `:d EXPR` without requiring a persistent `--debugger` session. It installs the debugger for that evaluation, gates speculative and fan-out submissions through an atomic scheduler switch, and patches a one-shot entry stop into the expression's own bytecode before it runs. The expression is compiled unchanged, so the first pause and every later step refer to user source rather than a synthetic wrapper. Continuing evaluates, binds, and prints the result normally; afterward the UI and scheduler gate are detached, so later REPL evaluations regain their configured parallel behavior.
 
@@ -104,22 +107,22 @@ One honest caveat: this is a **lazy** language, so stepping follows *demand* ord
 
 **Source locations.** A frame's `ip` is resolved with `disasm.frameSpan` — the narrowest covering source span, but with an *inclusive* end and a `body_span` fallback. The inclusive end matters for a caller frame, whose `ip` points *past* the call it's suspended on (exactly at the covering span's exclusive end); plain `bestSpan` (used by `fix disasm` for the instruction about to execute) would miss it and the frame would show no location. This is why a backtrace reads `f.nix:11:8 f ← 13:42 ← 13:3` rather than blank caller lines.
 
-**Architecture.** The engine exposes a neutral break seam so the layering stays down-only: `vm.BreakSink` on the VM (null in every normal run — `builtins.break` is then a plain identity, zero cost off the debug path), the `breakpoint` opcode + `bytecode.BreakpointTable` (patch/restore, lazy re-patch via `ChunkRegistry.breakpoint_sink`), an `expr.DebugSession` view over the paused VM (backtrace, scope, evaluate-in-place, value rendering, breakpoint set/list/delete, stepping), and `Evaluator.setDebugUi`. The `cli` layer supplies either the console (`src/cli/debugger.zig`) or interactive screen (`src/cli/debugger_tui.zig`) through that view; both share `debugger_command.zig`, and neither names a `vm` type.
+**Architecture.** The engine exposes a neutral break seam so the layering stays down-only: `vm.BreakSink` on the VM (null in every normal run — `builtins.break` is then a plain identity, zero cost off the debug path), the `breakpoint` opcode + `bytecode.BreakpointTable` (patch/restore, with new chunks patched by the evaluator's `chunkRegistered` callback), an `expr.DebugSession` view over the paused VM (backtrace, scope, evaluate-in-place, value rendering, breakpoint set/list/delete, stepping), and `Evaluator.setDebugUi`. The `cli` layer supplies either the console (`src/cli/debugger.zig`) or interactive screen (`src/cli/debugger_tui.zig`) through that view; both share `debugger_command.zig`, and neither names a `vm` type.
 
 ## Key flags
 
 The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it drives parsing *and* per-command `--help` visibility (each spec lists the subcommands it applies to). Defaults shown; `[=X]` means the value is optional.
 
-### Source selection (`eval`/`instantiate`/`build`/`run`/`shell`/`disasm`)
+### Source input (`eval`/`parse`/`instantiate`/`build`/`run`/`shell`/`disasm`/`switch`)
 
 | Flag | Meaning |
 |---|---|
-| `FILEISH` (positional) | append a legacy fileish input; without any source, `./default.nix` |
+| `FILEISH` (positional) | append a legacy fileish input. `eval`, `parse`, `instantiate`, `build`, `run`, and `disasm` default to `./default.nix`; `shell` requires a source or `-p`; `switch` has a target-specific default. |
 | `-E, --expr EXPR` | append expression text; repeatable |
 | `-f, --file FILEISH` | append a fileish input (same as a bare argument); `-` reads stdin; repeatable |
-| `--flake INSTALLABLE` | append one flake output `<flakeref>[#<attrpath>]`; repeatable; requires the `flakes` feature |
-| `-A, --attr ATTR` | select attribute path ATTR from the result |
-| `--arg NAME EXPR` / `--argstr NAME STR` | pass an expression / a string as top-level function argument NAME |
+| `--flake INSTALLABLE` | append one flake output `<flakeref>[#<attrpath>]`; repeatable; requires the `flakes` feature; not accepted by `parse` |
+| `-A, --attr ATTR` | select attribute path ATTR from the result; not accepted by `parse` |
+| `--arg NAME EXPR` / `--argstr NAME STR` | pass an expression / a string as top-level function argument NAME; not accepted by `parse` |
 | `-I, --include PATH` | prepend a search-path entry (as in `NIX_PATH`; `prefix=path` form allowed). Repeatable. |
 | `--option NAME VALUE` | override a nix.conf setting |
 | `--find-file` | (`instantiate`) resolve each source argument as a `NIX_PATH` name and print its absolute path, without evaluation |
@@ -137,12 +140,13 @@ explicit typed flake-output/installable form.
 
 | Flag | Meaning |
 |---|---|
-| `--json` / `--xml` | render the value as JSON / XML instead of Nix |
+| `--json` / `--xml` | (`eval`, `repl`) render the value as JSON / XML instead of Nix; `--no-location` omits XML source positions. `parse` always writes JSON and accepts `--json` as a compatibility no-op |
 | `--raw` | (`eval`) coerce to a string and write it without quotes or a trailing newline |
 | `--strict` | recursively force attr values + list items before writing |
 | `--read-write-mode` | (`eval`) register evaluated derivations and store-backed fetched sources while still printing the evaluated value |
 | `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call; `flakes` — gates the flake builtins (`getFlake`, `parseFlakeRef`, `flakeRefToString`) and the `--flake` installable, and implies `fetch-tree`. All off by default; a disabled builtin raises a hard (tryEval-uncatchable) error. |
-| `--workers N` | worker threads; default `min(8, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |
+| `--deprecated-features FEATS` / `--extra-deprecated-features FEATS` | replace / append compatibility features. Available: `nul-bytes`, `floor-ceil-corrupt-integers`. |
+| `--workers N` | worker threads; default `min(12, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |
 | `--gc-budget SIZE` | evaluator-heap budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default RAM-scaled) → [gc.md](gc.md) |
 | `--hugetlb auto\|on\|off` | back the evaluation heap with explicit 2 MB huge pages (default `auto`: only when the kernel pool has ≥256 MB unreserved capacity). Provision the pool with `sysctl vm.nr_hugepages=N` → [perf/hugetlb.md](perf/hugetlb.md) |
 | `--show-trace` | full evaluation traces on error |
@@ -152,7 +156,7 @@ explicit typed flake-output/installable form.
 | `-v, --verbose` | increase progress detail (checks at `-v`; parse/compile completions at `-vv` and openings at `-vvv`) and daemon build verbosity |
 | `--no-tui` (repl) | keep the interactive editor and inline output, but do not open full-screen `:debug` or `:vm` workspaces |
 
-### Store links & realization (`instantiate`/`build`/`run`/`shell`)
+### Store links & realization (`instantiate`/`build`/`run`/`shell`/`switch`)
 
 | Flag | Meaning |
 |---|---|
@@ -168,6 +172,10 @@ explicit typed flake-output/installable form.
 | `-K, --keep-failed` | keep the build tree of failed builds |
 | `--max-silent-time SECS` / `--timeout SECS` | abort builds silent/running too long (`0` = no limit) |
 | `-p, --packages NAMES...` | (`shell`) packages (attr paths) from `<nixpkgs>`, e.g. `-p ripgrep jq` |
+
+### System activation (`switch`)
+
+The optional action is `switch` (default), `boot`, `test`, `build`, or `dry-activate`. Select the platform with `--nixos`, `--darwin`, or `--home-manager`; `--target-host [USER@]HOST` copies and activates remotely, and `--use-remote-sudo` runs the remote activation under `sudo`.
 
 ### Introspection / trace flags
 
@@ -191,7 +199,7 @@ Speculation and fan-out are **on by default**; these toggles disable them for co
 |---|---|
 | `--no-spec-thunks` | disable speculative thunk evaluation → [parallel/speculation.md](parallel/speculation.md) |
 | `--no-fanout` | disable strict-argument fan-out → [parallel/speculation.md](parallel/speculation.md) |
-| `--timeline-flows=N\|off\|all` | steal-arrow flow-event density in the `--timeline` trace (default `all`; `off` drops flows; `N` keeps 1/N) |
+| `--timeline-flows off\|all` | record all scheduler steal-flow arrows or none (default `all`) |
 
 Use the disable toggles to isolate whether a wrong parallel result (or a hang) comes from speculation vs fan-out: rerun with each disabled and see which one restores correctness.
 

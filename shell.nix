@@ -10,6 +10,7 @@ in
         pkgs.pkg-config
         pkgs.perf
         pkgs.hyperfine
+        pkgs.vhs
         pkgs.curl
         pkgs.libgit2
         pkgs.mercurial

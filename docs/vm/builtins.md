@@ -1,6 +1,6 @@
 # Builtins
 
-*How the primops — 106 named builtins plus 5 compiler-internal ids (111 `BuiltinId` variants) — are structured, dispatched, and made GC- and parallel-safe.*
+*How the primops — 107 named builtins plus 7 compiler-internal ids (114 `BuiltinId` variants) — are structured, dispatched, and made GC- and parallel-safe.*
 
 ## Mental model
 
@@ -14,9 +14,9 @@ A builtin is a native Zig function reachable from Nix as a `BuiltinId`-tagged va
    - `args.len < arity` → return a **builtin closure** capturing the partial args (undersupply; see [partial application](calls.md)).
    - `args.len > arity` → `error.TooManyArguments` (oversupply is a hard error — Nix rejects it).
    - exact → dispatch.
-2. **`switch (id)`** — one arm per `BuiltinId`, almost all forwarding to a group-module implementation (`.constantValue` returns `args[0]` inline; `.break_` just forces `args[0]`). The switch has no `else` arm, so it is exhaustive over `BuiltinId` — adding a variant without an arm is a compile error.
+2. **`switch (id)`** — one arm per `BuiltinId`, almost all forwarding to a group-module implementation (`.constantValue` returns `args[0]` inline). The switch has no `else` arm, so it is exhaustive over `BuiltinId` — adding a variant without an arm is a compile error.
 
-The one-hop wrapper `access.applyBuiltin` fronts this: it raises the per-thread native depth for the builtin's duration (the GC gate, below) before calling the switch.
+The one-hop wrapper `access.applyBuiltin` fronts this: it raises the fiber-local native depth for the builtin's duration (the GC gate, below) before calling the switch.
 
 Applying a saturated closure (`applyBuiltinClosure`) copies the captured args, appends the final arg, and re-enters `applyBuiltin` at full arity. Curried calls therefore round-trip through the same dispatch; a builtin needing *n* args produces *n−1* intermediate closure values.
 
@@ -33,10 +33,10 @@ Two constructors in `shared.zig`, both keyed off a `BuiltinId` + captured args:
 
 ## GC safety
 
-Arguments live in Zig locals / a C-stack slice, never on the VM operand stack, so a force mid-body could otherwise sweep them (and their reachable graph). Two overlapping guards make builtins correct across [collection](../gc.md):
+Arguments live in Zig locals / a C-stack slice, never on the VM operand stack, so a force mid-body could otherwise sweep them (and their reachable graph). Two overlapping rules make builtins correct across [collection](../gc.md):
 
-- **Native-depth gate**: `access.applyBuiltin` raises the per-thread native depth for the whole call; collections only fire at depth 0, so no builtin's Zig-local heap refs are observable mid-call. (`import`/`scopedImport` drop back to the caller's depth for the nested eval so it can still collect.) This is why the switch arms need no rooting of their own.
-- **Caller-side arg rooting**: the calling convention already roots the arguments before entry — `doCall`/`doTailCall`/`callValue` `rootKeep` their arg, `doCallN` leaves the args on the operand stack, and an in-flight `builtin_closure` force keeps them on the force chain. So a builtin's arguments survive any force it performs, and the arm only has to manage the intermediates *it* freshly produces.
+- **Native-depth gate**: `access.applyBuiltin` raises the fiber-local native depth for the whole call. This prevents a peer fiber from parking for collection while it holds unrooted native locals; it does **not** prevent the current demand fiber from initiating a collection at a nested force boundary. (`import`/`scopedImport` lower the inherited depth for the nested evaluation.)
+- **Explicit roots**: the calling convention roots arguments before entry — `doCall`/`doTailCall`/`callValue` use `rootKeep`, `doCallN` leaves args on the operand stack, and an in-flight `builtin_closure` stays on the force chain. A builtin must also `rootKeep` every fresh heap intermediate that remains live across a force or nested call.
 
 Builtins that merge [string context](../derivation/context.md) or build large intermediates (`toJSON` in `serial`, `derivationStrict` in `derivation`, the `fetch*` family, string ops in `strings`/`string_context`) open their own `rootsBegin`/`rootKeep`/`rootsEnd` scope around those intermediates.
 
@@ -44,6 +44,7 @@ Builtins that merge [string context](../derivation/context.md) or build large in
 
 | Group | Holds |
 |---|---|
+| `arguments` | shared argument coercion and validation helpers |
 | `shared` | builtin closure/thunk value construction (`makeBuiltinClosure`, `makeBuiltinThunk`), the JSON cycle guard, and the adaptive `NameIndex` used by accumulate-by-name builtins |
 | `strings` | `toString`, `stringLength`, `substring`, `concatStringsSep`, `replaceStrings`; coercion & interning. `concatStringsSep` coerces and roots every part, computes the exact output length, then fills one buffer before interning while merging string context in language order. |
 | `attrsets` | attrset ops: `hasAttr`, `getAttr`, `attrNames`, `attrValues`, `mapAttrs`, `zipAttrsWith`, `catAttrs`, `intersectAttrs`, `removeAttrs`, `functionArgs`, plus the internal per-key thunk bodies `mapAttrValue`/`zipAttrsValue` |
@@ -51,7 +52,9 @@ Builtins that merge [string context](../derivation/context.md) or build large in
 | `paths` | `baseNameOf`, `dirOf`, `path`, `storePath`, `placeholder` |
 | `hash` | `hashString`, `hashFile` |
 | `io` | `readFile`, `readDir`, `readFileType`, `pathExists`, `import`/`scopedImport` |
-| `fetch` | `fetchGit`, `fetchurl`, `fetchTarball`, `fetchTree`, `fetchMercurial`, `getFlake`, `filterSource`, `getEnv`, `toPath`, `toFile` |
+| `fetch` | transport-backed `fetchGit`, `fetchurl`, `fetchTarball`, `fetchMercurial`, and fetched-tree NAR hashing |
+| `flakes` / `flake_registry` | `fetchTree`, `getFlake`, flake-ref conversion, lazy flake-input resolution, registry lookup |
+| `source_store` | `filterSource`, `getEnv`, `toPath`, `toFile` and source-store ingestion |
 | `arithmetic` | `add`, `sub`, `mul`, `div`, `lessThan`, bitwise ops, `floor`, `ceil` |
 | `predicates` | `typeOf`, `isString`/`isInt`/`isBool`/`isList`/`isAttrs`/`isNull`/`isFloat`/`isPath`/`isFunction` |
 | `serial` | `toJSON`/`fromJSON`, `toXML`, `fromTOML`, `compareVersions`, `splitVersion`, `parseDrvName`, `split`, `match` |
@@ -61,9 +64,9 @@ Builtins that merge [string context](../derivation/context.md) or build large in
 
 ## Concurrency stance
 
-Builtins are **logically sequential**: a builtin's own logic runs to completion on one fiber and never blocks on, nor forks its computation across, other threads. It may, however, *submit* independent per-element thunks to the [scheduler](../parallel/scheduler.md) — `map`, `genList`, and `mapAttrs` speculatively enqueue `force_thunk` tasks for their elements when the per-element function is substantial enough to speculate on (`isSpeculatableUserFunc`) — so [helper workers](../parallel/workers.md) force those thunks ahead of demand while main drives the serial critical path. Such a builtin is thus a parallelism *source*: it hands the scheduler independent work without itself becoming concurrent.
+Builtin evaluation is **fiber-sequential**: language-visible logic resumes on one fiber. A builtin may submit independent per-element thunks to the [scheduler](../parallel/scheduler.md) — `map`, `genList`, and `mapAttrs` enqueue eligible element work — so helpers can force them ahead of demand. Blocking fetch and nix-daemon work instead runs on dedicated I/O threads while the calling fiber parks; those threads are separate from the `--workers` compute pool.
 
-Some builtins do internal I/O within their one frame — `readFile`/`readDir`, the `fetch*` family, `import`. Import results are cached and deduplicated so concurrent importers of the same path converge (see [imports.md](../parallel/imports.md)); other I/O runs inline in the calling fiber.
+Local filesystem operations (`readFile`, `readDir`, import discovery) use the shared file cache on the calling fiber. Import results are cached and deduplicated so concurrent importers of the same path converge (see [imports.md](../parallel/imports.md)); network/subprocess fetches and daemon store operations use the blocking executors above.
 
 ## Hot builtins
 
@@ -78,7 +81,7 @@ Some builtins do internal I/O within their one frame — `readFile`/`readDir`, t
 - Dispatch is exhaustive over `BuiltinId`; a builtin is reachable *only* by id, never by name lookup at call time.
 - Undersupply ⇒ closure; oversupply ⇒ error. Never silently drop or ignore extra args.
 - Every argument is GC-rooted for the whole call; a builtin may force args and allocate freely without losing them to a sweep.
-- A builtin's own logic never runs across threads; parallelism is expressed by producing independent per-element thunks (and optionally submitting them to the scheduler for speculative forcing), not by the builtin computing concurrently.
+- Language-visible builtin logic is fiber-sequential; parallelism comes from submitted thunks, and blocking fetch/store work is isolated on dedicated I/O threads while the fiber parks.
 - Result parity is byte-identical `.drv`; the interpreter path is canonical.
 
 Code: `src/expr/vm/builtins/`

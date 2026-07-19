@@ -13,12 +13,12 @@ Each worker `i` owns (see [scheduler](scheduler.md) for the queue internals):
 
 ### The fiber free-list
 
-Creating a fiber costs an 8 MiB `mmap` plus a VM; [`reset`](fibers.md)ting one is a single trampoline-slot store — so workers pool them:
+Creating a fiber costs a 16 MiB virtual `mmap` plus a VM; [`reset`](fibers.md)ting one is a single trampoline-slot store — so workers pool them:
 
 - **Prewarm** `prewarm_fiber_count = 4` fibers per worker at `Worker.init`; **grow on demand** when more blocking work is in flight than the pool holds. There is no fixed pool size.
 - `acquireFreeFiber` pops the free-list LIFO (hottest cache) or allocates a fresh slot; a finished fiber is **`reset` in place** (stack pointer rewound, new entry/arg installed) rather than freed and re-allocated, so the per-task cost is a memcpy of the trampoline address.
 - **Ownership returns home.** A fiber stolen and run by another worker is, once `.finished`, pushed back onto its **allocator-worker's** free-list — not the thief's — and that owner is nudged in case it is parked waiting on this very fiber. This keeps free-lists balanced and bounds each worker's fiber count. The per-slot `run_mu` SpinMutex and `in_runfiber` atomic coordinate the hand-back safely (below).
-- **Overflow stacks are trimmed.** When a worker is about to park it calls `sweepFreeStacks`: free-list fibers deeper than the prewarm count are spike overflow (a burst of blocking work grew the pool) and give their dirty 8 MiB stacks back to the OS via [`releaseStackPages`](fibers.md), keeping a 64 KiB warm top. A `stack_released` flag (cleared on reuse) makes each park-cycle release a fiber at most once. This runs only at park time — never on the task-completion path, where `madvise` volume would dominate.
+- **Overflow stacks are trimmed.** When a worker is about to park it calls `sweepFreeStacks`: free-list fibers deeper than the prewarm count are spike overflow (a burst of blocking work grew the pool) and give their dirty 16 MiB mappings back to the OS via [`releaseStackPages`](fibers.md), keeping a 64 KiB warm top. A `stack_released` flag (cleared on reuse) makes each park-cycle release a fiber at most once. This runs only at park time — never on the task-completion path, where `madvise` volume would dominate.
 
 Each fiber also owns a **scratch arena** backing its VM's run-path allocations (builtin temp buffers, drv hashing, equality scratch). Arena semantics are load-bearing: run paths free best-effort and error/suspend paths abandon allocations wholesale. `recycleScratch` resets the arena (retaining one 64 KiB chunk) each time the fiber returns to the free-list, so a never-reset arena's dead interleaved pages don't accumulate.
 
@@ -82,7 +82,7 @@ The parallel path rests on a small set of invariants proven load-bearing by real
 - **Fiber resume:** `ReadyNode.queued` CAS + per-slot `run_mu` — a [fiber](fibers.md) is enqueued once and resumed by one thread at a time.
 - **Waiter wake:** a waiter re-checks thunk state under the [`Future`](../runtime/thunks.md) claim/wait protocol before parking.
 - **Fiber ownership returns home** to the allocator-worker's free-list.
-- **Speculation is one layer deep** (`speculation.active`): a spec fiber does not itself spawn further speculation — the [speculation](speculation.md) brake that bounds fan-out.
+- **Speculative cascades are bounded:** `speculation.active` blocks recursive creation-time speculation and sibling sweeps; queue caps and task budgets bound recursive fan-out and map-style submissions. See [speculation](speculation.md).
 
 For *why* all this parallelism buys a bounded speedup — the serial critical-path floor where helpers sit mostly idle — see [perf/model](../perf/model.md).
 

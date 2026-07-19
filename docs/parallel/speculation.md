@@ -6,7 +6,7 @@
 
 Nix evaluation is lazy: a value is computed only when forced. On one core that is optimal. On many cores it leaves helper [workers](workers.md) idle, because demand is a narrow serial chain. Speculation and fan-out **manufacture demand early** — they force thunks the demanded result *will probably* need, off the critical path, so the answer is already resolved (or in flight) by the time real demand arrives.
 
-Neither changes results. Both are pure earliness: the [claim/waiter protocol](../runtime/thunks.md) guarantees each thunk resolves exactly once regardless of who forces it first, so a bad guess costs CPU, never correctness.
+Neither changes results. Both are pure earliness: the [claim/waiter protocol](../runtime/thunks.md) publishes at most one terminal result and makes concurrent forcers converge, so a bad guess costs work, never correctness.
 
 | Mechanism | Trigger | Action |
 |---|---|---|
@@ -27,9 +27,9 @@ When it fires, a `force_thunk` task for the body goes to the speculation queue a
 
 **Why a size gate.** A trivial body (return-upvalue, constant) is cheaper to run inline than to package as a task — the [trivial-body short-circuit](../compiler/lazy-compile.md) skips thunk allocation for those entirely. The 256-byte line is where packaging pays off.
 
-**Novel-chunk priority lane.** The **first** speculative instance of any chunk — a new code region, a potential subsystem or chain root — is routed to the high-priority [novel lane](scheduler.md) (`FIX_SPEC_NOVEL`) via `submitNovel` instead of the bulk backlog; repeat instances stay in the bulk lane. `novelClosureChunk` is a test-and-set on the chunk's "spec submitted" bit, so the routing costs one flag flip and the lane's total volume is bounded at one task per chunk. This keeps a lone chain-seed thunk from having to win a pop/steal race against hundreds of repeat-instance junk tasks.
+**Novel-chunk priority lane.** The **first** speculative instance of any chunk — a new code region, a potential subsystem or chain root — is routed to the high-priority [novel lane](scheduler.md) (`FIX_SPEC_NOVEL`) via `submitNovel` instead of the bulk backlog; repeat instances stay in the bulk lane. `isNovelClosureChunk` test-and-sets the chunk's "spec submitted" bit, so the routing costs one flag flip and the lane's total volume is bounded at one task per chunk. This keeps a lone chain-seed thunk from having to win a pop/steal race against repeat-instance work.
 
-**The real cost is churn, not waste.** Because the [claim protocol](../runtime/thunks.md) resolves each thunk once, a wrong guess is rarely *wasted* on undemanded work — it is *duplicate* work (the force memo is per-worker, so a value one worker speculated can be recomputed by another) and *allocation pressure* (speculation inflates thunk creation). At high worker counts cores are mostly idle, so the duplicate CPU is nearly free; the pressure it puts on the heap is the cost that matters, which the bounding below caps.
+**The cost is work and allocation pressure.** A bad guess can evaluate an undemanded thunk and allocate transient objects. Distinct equivalent thunks may also be recomputed across workers because the result cache is per-worker; each thunk object itself remains single-assignment under the claim protocol.
 
 ---
 
@@ -54,7 +54,7 @@ A further `readdir_prefetch` lane (`FIX_READDIR_PREFETCH`, on by default wheneve
 The danger: a speculatively-forced sibling that real demand *never touches* could be enormous (a whole unused package tree) and extend wall time past the serial baseline. Three guards prevent this.
 
 ### The speculation brake
-Speculation and fan-out only fire from the **demand path**, never from within an already-speculative force (`speculation.active` short-circuits re-submission). Cascades stay **one layer deep**: a spec task can fan out its immediate children, but those children do not spawn their own speculation. This is the load-bearing invariant that keeps the working set finite.
+Creation-time `makeThunk` speculation and sibling sweeps stop re-submitting while `speculation.active` is set. Strict consumer fan-out may recurse, and map-style builtins may submit element thunks; fixed queue capacities, the speculative backlog cap, and per-task budgets bound those cascades.
 
 ### Bail-on-demand
 Once the *demanded* result exists, the [worker driver](workers.md) sets `suppress_background`. Speculative [fibers](fibers.md) poll a cheap predicate before any long loop or large allocation and abandon:
@@ -72,7 +72,7 @@ specBailRequested(vm)  ==  vm.speculation.active and
 `SpeculativeBail` is a **transient** error: it resets the thunk to unresolved so it is simply recomputed if *real* demand ever arrives (never cached as a sticky error). Nothing observable is lost. Long-running builtins poll too: `genList` calls `specBailRequested` every 8192 iterations.
 
 ### Per-task creation budgets
-`specBailRequested` also fires when an untrusted-band spec task exceeds its creation budget (`FIX_SPEC_BAND_BUDGET`), or a sibling sweep exceeds its per-member claim/creation budgets. A wrong guess's cascade is abandoned once it reaches its budget, while urgent, demand-adjacent tasks stay unbounded. Bailing here is likewise a transient reset — resolved sub-thunks are kept.
+`specBailRequested` also fires when an untrusted-band spec task exceeds its creation budget (`FIX_SPEC_BAND_BUDGET`), or a sibling sweep exceeds its per-member claim/creation budgets. Urgent tasks do not carry that speculative creation budget, but their queue is fixed-capacity. Bailing is a transient reset; resolved sub-thunks are kept.
 
 ### Why byte-identity is free here
 Bail fires **only after** the demanded result already exists (or a bounded budget is blown) — so whatever a bailed speculation would have produced is either already computed or genuinely undemanded. The `.drv` is byte-identical regardless of how aggressively we bail. **There is no correctness knob to tune.**
@@ -85,11 +85,11 @@ Fan-out and speculation are independent levers and each contributes a substantia
 
 ## Invariants
 
-- Speculation/fan-out **never** change a result — earliness only; the [claim protocol](../runtime/thunks.md) enforces exactly-once resolution.
-- Cascades are **one layer deep** (`speculation.active` gate).
+- Speculation/fan-out **never** change a result — earliness only; the [claim protocol](../runtime/thunks.md) serializes publication.
+- Creation-time speculation and sibling sweeps do not recursively submit from speculative work; queue and task budgets bound the paths that may cascade.
 - Bail fires **only after** the demanded result exists (or a budget is blown) ⇒ byte-identical, untunable.
 - `SpeculativeBail` is **transient** — the thunk is reset and recomputed on real demand, never cached as an error.
-- Submission fires **only from the demand path**.
+- Urgent fan-out may recurse; speculative admission remains bounded.
 
 ## Debug flags
 

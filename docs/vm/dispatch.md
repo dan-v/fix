@@ -78,7 +78,7 @@ This is what makes the interpreter **re-entrant**. `runIsolatedFrame(ch, chunk_i
 
 - 1-byte opcode + **0…N operand bytes**, opcode-dependent. There is **no uniform instruction width**; each handler knows its own operand layout and advances `ip` accordingly.
 - Multi-byte operands are **little-endian**: `u8`, `u16`, `u32`, `InternId` (2- or 4-byte "wide" variants where a narrow id might overflow), and repeated 3-byte capture descriptors `(kind:1, index:2)`.
-- Many opcodes come in narrow/`_w` pairs (2- vs 4-byte id) and in **fused super-op** forms that collapse common pairs into one dispatch — e.g. `up_get_attr`, `loc_get_attr`, and the value-returning `push_const_ret` / `loc_get_ret` / `up_get_ret` (see [access.md](access.md), [calls.md](calls.md)). Fusion is an emit-time decision in the [compiler](../compiler/pipeline.md); the `fusion_savings` counter keeps fusion from perturbing the speculation size threshold.
+- Many opcodes come in narrow/`_w` pairs (2- vs 4-byte id) and in **fused super-op** forms that collapse common pairs into one dispatch — e.g. `up_get_attr`, `loc_get_attr`, and the value-returning `push_const_ret` / `loc_get_ret` / `up_get_ret` (see [access.md](access.md), [calls.md](calls.md)). Fusion is an emit-time decision in the [compiler](../compiler/pipeline.md); `fused_dispatch_weight` keeps it from perturbing the speculation size threshold.
 
 ## Chunk and registry
 

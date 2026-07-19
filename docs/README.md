@@ -50,7 +50,7 @@
 - [hugetlb](perf/hugetlb.md) — 2 MB huge-page heap backing (`--hugetlb`)
 
 **Memory** — the interpreter stays canonical
-- [gc](gc.md) — non-moving generational collector that bounds RSS; never changes output
+- [gc](gc.md) — non-moving generational collector that bounds evaluator-heap growth; never changes output
 
 **Operating**
 - [build](build.md) — module layout, `-D` flags, lint, tests
@@ -58,6 +58,5 @@
 
 ## Conventions
 
-- Docs describe **the system** — mechanisms, data flow, invariants, and the *why* — not the text of specific `.zig` files. Each doc ends with a `Code:` pointer to its area.
+- Docs describe **the system** — mechanisms, data flow, invariants, and the *why* — not the text of specific `.zig` files. Subsystem docs include a `Code:` pointer to their implementation area.
 - The **interpreter is the sole engine and is canonical**; collection and diagnostic probes never change output. Byte-identical `.drv` is the ground truth for correctness.
-- Historical implementation plans are in [`superpowers/plans/`](superpowers/plans/) — design intent and point-in-time status, kept separate from these maintained system docs.

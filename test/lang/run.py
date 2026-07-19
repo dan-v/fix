@@ -61,7 +61,7 @@ LANG_DIR = Path(__file__).resolve().parent
 SUPPORTED_FLAGS = {
     "-A", "--attr", "--arg", "--argstr", "--option",
     "-I", "--include", "--xml", "--json", "--strict", "--no-location",
-    "--expr", "-e", "--file", "--show-trace",
+    "--expr", "-E", "--file", "--show-trace",
 }
 DROP_FLAGS_NO_ARG = {"--no-warning"}
 
@@ -743,7 +743,7 @@ def _build_err_context(case_dir: Path):
     def h(fix):
         with tempfile.TemporaryDirectory(prefix="fixlang-") as td:
             tmp = Path(td)
-            p = run_fix(fix, ["--show-trace", "-e", expr], tmp)
+            p = run_fix(fix, ["--show-trace", "-E", expr], tmp)
             if p.returncode != 0 and "Hello" in p.stderr:
                 return Result("lix", ident, "pass")
             return Result("lix", ident, "fail",
@@ -772,7 +772,7 @@ def _ptw_case(case_dir: Path, golden_base: str, full: str, flags: list[str], exp
         expected_out = out_g.read_text() if out_g.exists() else ""
         expected_err = err_g.read_text() if err_g.exists() else ""
         with tempfile.TemporaryDirectory(prefix="fixlang-") as td:
-            p = run_fix(fix, [*flags, "-e", full], Path(td), subcmd=("parse", "--json"))
+            p = run_fix(fix, [*flags, "-E", full], Path(td), subcmd=("parse", "--json"))
         if p.returncode != expected_rc:
             return Result("lix", ident, "fail",
                           f"rc={p.returncode} (expected {expected_rc})\n  stderr={p.stderr.strip()!r}")

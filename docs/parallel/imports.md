@@ -28,7 +28,7 @@ Because `Future` is value-less, the entry carries its own `result`, written *bef
 
 ## Resolution state machine
 
-`forceEntry` drives the claim loop. Every fiber calls `tryClaim(myClaimerId)` and dispatches on the outcome:
+`forceImportEntry` drives the claim loop. Every fiber calls `tryClaim(myClaimerId)` and dispatches on the outcome:
 
 ```
 loop:
@@ -68,12 +68,7 @@ A spec-lane prefetch (`FIX_IMPORT_PREFETCH`) submits `import_prefetch` [tasks](s
 
 `scopedImport scope path` **bypasses dedup** — each call carries a distinct `scope` Value, so two scoped imports of the same path are genuinely different evaluations and must not share a registry entry.
 
-Cycle detection therefore cannot rely on the Future. Instead each in-progress scoped path is pushed onto a **thread-local linked list** (`ScopedFrame`) threaded through the import call stack:
-
-- `pushScopedFrame` links a frame and returns the prior top (restored on scope exit);
-- `checkScopedCycle` walks the chain for the path before evaluating → `error.ImportCycle`.
-
-Thread-local, no locking: `scoped_stack_top` is a `threadlocal` pointer and each `ScopedFrame` is a local on the evaluating call stack (a scoped import is compiled inline by its claimer, so the chain never leaves that native stack).
+Cycle detection therefore cannot rely on the Future. `scopedImportResolvedPath` walks the fiber's `ExecutionContext.scoped_import_top` chain and raises `error.ImportCycle` on a repeated path, then links a stack-local `ScopedImportFrame` for the evaluation and restores the previous head on return. The head travels with a stolen fiber, so migration cannot lose the active import chain; no lock is needed because only that fiber mutates it.
 
 ---
 
@@ -93,7 +88,7 @@ So the critical path is a **serial chain of parse+compile through the import gra
 
 - One resolved path ⇒ at most one non-scoped evaluation (registry dedup).
 - The claimer runs compile **inline**; waiters **park**, never spin — same protocol as [thunks](../runtime/thunks.md).
-- Cycle = same-claimer recursion (non-scoped) or thread-local frame hit (scoped) ⇒ `error.ImportCycle`.
+- Cycle = same-claimer recursion (non-scoped) or fiber-scoped frame hit (scoped) ⇒ `error.ImportCycle`.
 - `result` is written **before** `publish()`; waiters read it after wake.
 - Deterministic failures cache (`ErrorInfo`); resource-pressure failures fall back to transient `reset`.
 - Scoped imports never touch the registry (distinct scope Value).

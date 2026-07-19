@@ -25,7 +25,7 @@ Everything below is a matter of **which `ty`** and **which `inner_digest`** feed
 2. **Input-addressed output paths** — one *masked* hash-modulo (`mask_outputs=true`) for all outputs, then a path per output.
 3. **Back-patch** each output's `env` entry to its computed path.
 4. **`.drv` text path** — serialize the *actual* (unmasked, inputs-unresolved) `Drv` and text-hash it.
-5. **Dependency hash-modulo** — an *unmasked* hash-modulo (`mask_outputs=false`) recorded in the derivation `Registry` for consumers to resolve against. The realization-owned `DerivationStore` hosts that registry while an evaluation is running.
+5. **Dependency hash-modulo** — an *unmasked* hash-modulo (`mask_outputs=false`) recorded in the derivation `Registry` for consumers to resolve against. The realization-owned `RealizationStore` hosts that registry while an evaluation is running.
 
 The input-set resolution (`hashModuloInputs` — one resolver lookup + hash-dup + merge per input drv) is a pure function of `input_drvs` and the resolver, so `computePaths` runs it **once** and feeds the same resolved inputs to both the masked (step 2) and unmasked (step 5) hashes.
 
@@ -55,7 +55,7 @@ The hash-modulo is a single content hash summarizing a derivation's *inputs* (no
 **Fixed-output** derivation (`isFixedOutput`: exactly one output with a `hash_algo`): the hash is over a flat fingerprint, no ATerm, no input resolution:
 
 ```
-sha256_hex( "fixed:out:{hash_algo}:{hash}:{output_path}" )
+sha256Hex( "fixed:out:{hash_algo}:{hash}:{output_path}" )
 ```
 
 Returned as a per-output hash (`.outputs`).
@@ -65,7 +65,7 @@ Returned as a per-output hash (`.outputs`).
 - `hashModuloInputs` walks `input_drvs`; for each, `resolver.resolvePath(input.path)` returns the input's recorded hash-modulo (built earlier and stored in the derivation `Registry`).
   - Resolved to a single **drv** hash → that hash stands in for the path; the input's requested output-names are carried through, **merged by path** (union of output-name sets if the same path appears twice).
   - Resolved to **per-output** hashes → each requested output name is mapped to its output's hash, keyed under output name `"out"`, then merged by path as above.
-- The resulting substituted input list feeds `toATerm(mask_outputs, actual_inputs=...)` with input paths replaced by resolved hashes (and, under `mask_outputs=true`, output `path` fields and output-named `env` values blanked). `sha256_hex` of that ATerm is the modulo digest — a `HashModulo` with the `.drv` union tag (as opposed to the per-output `.outputs` tag of the fixed-output case).
+- The resulting substituted input list feeds `toATerm(mask_outputs, actual_inputs=...)` with input paths replaced by resolved hashes (and, under `mask_outputs=true`, output `path` fields and output-named `env` values blanked). `sha256Hex` of that ATerm is the modulo digest — a `HashModulo` with the `.drv` union tag (as opposed to the per-output `.outputs` tag of the fixed-output case).
 - Missing input → `error.UnknownInputDerivation`; missing requested output → `error.UnknownDerivationOutput`.
 
 `computePaths` renders two hashes from the one resolved input set: the `mask_outputs=true` hash derives this derivation's own output paths (its output paths aren't known yet, so they must be masked out), and the `mask_outputs=false` hash is **recorded per drv path** in the store as this derivation's dependency hash — the value a *consumer's* `hashModuloInputs` gets back when it resolves this drv as an input. This mirrors Nix: output paths come from the masked modulo, but inputs substitute the **unmasked** modulo of their dependencies.
@@ -88,7 +88,7 @@ fixedOutputPath(name, output, hash_algo, hash):
       storePathFromInnerDigest("source", hash, outputName)
   else:                                 // flat
       inner  = "fixed:out:{hash_algo}:{hash}:"
-      digest = sha256_hex(inner)
+      digest = sha256Hex(inner)
       storePathFromInnerDigest("output:out", digest, outputName)
 ```
 
@@ -100,7 +100,7 @@ The `.drv` store path uses **text** hashing over the *actual* (unmasked) ATerm �
 text     = toATerm(drv, mask_outputs=false, actual_inputs=null)
 refs     = unique(input_drvs paths ++ input_srcs)          // sorted before use
 textPath(name=".drv name", text, refs):
-  digest = sha256_hex(text)
+  digest = sha256Hex(text)
   ty     = "text" + (":" + ref for each sorted ref)        // refs appended to the type tag
   storePathFromInnerDigest(ty, digest, name)               // name = "{drv_name}.drv"
 ```
@@ -122,7 +122,7 @@ Store-path hashes are 32-character nixBase32, **not** standard base32:
 - **Compress**: XOR-fold the 32-byte sha256 into 20 bytes (`compressed[i % 20] ^= digest[i]`).
 - **Encode**: 5-bit radix over the alphabet `"0123456789abcdfghijklmnpqrsvwxyz"` (note: no `e`, `o`, `t`, `u` — Nix's set), emitting **bit-swapped**, i.e. output char *n* reads bits low-to-high and is placed at `len - 1 - n` (LSB→MSB). 20 bytes → 32 chars.
 
-This store-path encoder (`hash_codec.zig`) is distinct from the flat lowercase-hex encoder used for `sha256_hex`. It is also a separate function from the base-32 encoder behind the hash builtins (`hashBytesNixBase32` in `src/runtime/hash.zig`): that one shares the same 32-char alphabet and bit-swapped emission but encodes the **full** digest (`(len*8+4)/5` chars, for md5/sha1/sha256/sha512) with no 32→20 XOR fold — the fold is specific to store-path hashes, which always compress to 20 bytes → 32 chars.
+This store-path encoder (`hash_codec.zig`) is distinct from the flat lowercase-hex encoder `sha256Hex`. It is also separate from the base-32 encoder behind the hash builtins (`hashBytesNixBase32` in `src/runtime/hash.zig`): that one shares the same 32-char alphabet and bit-swapped emission but encodes the **full** digest (`(len*8+4)/5` chars, for md5/sha1/sha256/sha512) with no 32→20 XOR fold — the fold is specific to store-path hashes, which always compress to 20 bytes → 32 chars.
 
 ### NAR hashing
 

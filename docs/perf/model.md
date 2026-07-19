@@ -1,8 +1,8 @@
 # Performance model
 
-*Why the wall is dependency-chain depth, not throughput — and the only lever that moves it.*
+*Why the measured wall is dependency-chain depth, not throughput, and which lever moves it.*
 
-The correctness oracle is byte-identical `.drv` (see [invariants](../invariants.md)); every figure below holds that fixed. Wall figures are on `test/nixos_toplevel.nix`, ReleaseFast, 32-core machine.
+The correctness oracle is byte-identical `.drv` (see [invariants](../invariants.md)); every figure below holds that fixed. Wall figures are point-in-time measurements from 2026-07-11 on `test/nixos_toplevel.nix`, ReleaseFast, on a 16-core/32-thread host; they are evidence, not performance guarantees.
 
 ## The cost-model flip
 
@@ -23,7 +23,7 @@ Consequence: "eliminate duplicate work" and "add more parallelism" are both larg
 | `park_main_worker` | ~3 (~2 ms) | idle, queue empty — **almost never** |
 | `force_value` | ~68K (vs **~23M** at w=1) | helpers offload **~99.7%** of forces |
 
-**Main never waits.** It walks the entire critical chain end-to-end. Helpers offload ~99.7% of all forces — but only the work *off* the chain; the chain itself is a strict serial data-dependency main must traverse node by node, discovered just-in-time so helpers cannot get ahead of it.
+**Main almost never waits on this snapshot.** It walks the critical chain end-to-end. Helpers offload ~99.7% of all forces — but only the work *off* the chain; the chain itself is a strict serial data-dependency main must traverse node by node, discovered just-in-time so helpers cannot get ahead of it.
 
 **What's on the chain** (inherent to Nix semantics, not machinery):
 - **drv-hashing DAG** — `derivationLazyAttr` computing outPath/drvPath SHA256 over the input-derivation graph (~477–828 drvs, ~3 ATerm serializations each), memoized O(N) via the derivation `Registry` hosted by the realization store. See [derivation/hashing](../derivation/hashing.md).
@@ -41,9 +41,9 @@ Consequence: "eliminate duplicate work" and "add more parallelism" are both larg
 
 Parallelism buys ~0.69s of *earliness*, split ~50/50 between speculation and fanout — it does not raise the floor.
 
-## The only lever: eliminate on-chain WORK
+## The lever: eliminate on-chain work
 
-Since main runs the chain and never waits, the sole thing that moves the wall is removing real work *on the chain* (structurally — remove it, don't gate it behind a per-op runtime check, which taxes the hot majority). Landed wins, all byte-identical, all transfer to w=32:
+Since main runs the chain and rarely waits, the direct lever on this workload is removing real work *on the chain* (structurally — remove it rather than adding a per-op runtime check). Landed wins, all byte-identical, all transfer to w=32:
 
 | win | effect | doc |
 | --- | --- | --- |
@@ -51,7 +51,7 @@ Since main runs the chain and never waits, the sole thing that moves the wall is
 | direct formal binding (skip binding cells) | ~-1.5% w=1 & w=32 | [vm/calls](../vm/calls.md) |
 | frameless `attr_access` thunk (no frame/dispatch) | ~-2% w=32 | [runtime/thunks](../runtime/thunks.md) |
 | ATerm bulk-copy on drv-hash path | ~-3.7% best w=32 | [derivation/hashing](../derivation/hashing.md) |
-| lean thunk 64→48B | ~-2.4% w=32 | [runtime/thunks](../runtime/thunks.md) |
+| then-current thunk compaction | ~-2.4% w=32 | [runtime/thunks](../runtime/thunks.md) |
 | thunk-result memo (skip recomputing same chunk+ups) | ~-2% w=32, ~-2.5–3% w=1 | [runtime/thunks](../runtime/thunks.md) |
 | uncurry value-lambda chains + PAP + per-param strictness | ~-1.5% w=1 | [vm/calls](../vm/calls.md) |
 | flat object store (`get(id)=base[id]`) | ~-3–4% w=1 | [runtime/heap](../runtime/heap.md) |
@@ -68,17 +68,16 @@ Cumulative session ~-5.5% w=32. The cheap and medium on-chain work-elimination w
 | SHA-NI / faster crypto | Swap SHA256→free hash = w=1 0.6%, w=32 0%. drv-hash cost is ATerm build + encoding + alloc, not compression |
 | Lazy-attr materialization (lazy mapAttrs, mapped_attrs object) | Byte-identical but +1–2% REGRESSION w=1 AND w=32 (merge materializes immediately) |
 | Thunk-result memo past ≤2 upvalues | 3–4 ups ~0.1% redundant, 5+ ~0%, closure thunks 0 forces → nothing to gain |
-| Import prefetch (speculative parse+compile) | +10–17% REGRESSION w=32 (helper compiles contend during discovery); harvest-only cap=0 neutral → can't break the serial-eval floor → [imports](../parallel/imports.md) |
 | Burst dispatch / batched submit / long-spin | Wall-neutral or worse; wake/dispatch mechanics aren't the bottleneck — helpers idle because work doesn't exist yet |
 | Deep-fanout / dedup of duplicate drv builds | drv frontier ~92% already resolved-ahead at w=32; in-flight dedup byte-identical + stable but WALL-NEUTRAL (dups off-path on idle helpers) |
 | Parallel drv-hashing as an "option B" | ~95% of drv builds already run on helpers at w=32; main only ~5% — refuted; floor is serial module discovery |
 
-## Live headroom
+## Remaining headroom
 
 Both are large by **count / bytes**, not by wall — the opposite shape of an on-chain win — and both are caveated.
 
 - **Deforestation.** The module fixpoint builds single-use intermediate lists and attrsets by the million and consumes most exactly once. The ceiling is by **count, not wall**; realizing it needs an optimizer with reach (targeted fusion, or a trace deforester), and a naive lazy-materialization attempt already regressed (see dead-ends).
-- **GC for peak RSS.** The live set plateaus (~228 MB on nixos_toplevel) while total allocation grows linearly (~1.2 GB), so a collector bounds peak reserved memory (measured: `--gc-budget=512m` holds nixos_toplevel at ~850 MB reserved vs ~1.4 GB unbounded; see [gc](../gc.md)). Mark is a wall tax, so the win is **RSS, not wall**.
+- **GC policy for peak RSS.** The collector already bounds retained storage; budget and generation-policy changes trade pause cost against reserved memory. On this snapshot, `--gc-budget=512m` held nixos_toplevel at ~850 MB reserved versus ~1.4 GB with collection disabled. See [gc](../gc.md).
 
 ## Methodology
 

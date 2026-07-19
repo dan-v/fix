@@ -92,8 +92,8 @@ pub const OptionOverride = struct {
     value: []const u8,
 };
 
-/// Which subcommand is asking (used only to scope `--help` output; every
-/// subcommand shares this one parser and accepts the whole option set).
+/// Which subcommand is asking. The shared parser uses this to reject options
+/// outside their command and to scope help and completions.
 pub const Cmd = enum { eval, parse, instantiate, build, run, shell, repl, disasm, @"switch" };
 
 /// Semantic value classes consumed by the live shell completer. The parser's
@@ -454,6 +454,9 @@ const timeline_cmds = &[_]Cmd{ .eval, .instantiate, .build };
 /// `--xml`) and `--strict` apply. The realizing commands print store paths, not
 /// a value, and `disasm` prints bytecode.
 const value_cmds = &[_]Cmd{ .eval, .repl };
+/// `parse` always emits JSON but accepts `--json` for nix-instantiate and
+/// language-runner compatibility.
+const json_cmds = &[_]Cmd{ .eval, .parse, .repl };
 /// Commands that produce a top-level `.drv` a link/root can point at.
 const drv_cmds = &[_]Cmd{ .build, .instantiate };
 /// Commands that realize (build/substitute) derivations via the daemon.
@@ -473,7 +476,7 @@ const specs = [_]Spec{
     .{ .id = .arg, .long = "--arg", .arg = .req2, .metavar = "NAME EXPR", .help = "pass EXPR as top-level function argument NAME", .show_in = selected_source_cmds },
     .{ .id = .argstr, .long = "--argstr", .arg = .req2, .metavar = "NAME STR", .help = "pass string STR as top-level function argument NAME", .show_in = selected_source_cmds },
 
-    .{ .id = .json, .long = "--json", .help = "write the evaluated value as JSON", .show_in = value_cmds },
+    .{ .id = .json, .long = "--json", .help = "write output as JSON", .show_in = json_cmds },
     .{ .id = .raw, .long = "--raw", .help = "write a string value without quoting or a newline", .show_in = &.{.eval} },
     .{ .id = .xml, .long = "--xml", .help = "write the evaluated value as XML", .show_in = value_cmds },
     .{ .id = .no_location, .long = "--no-location", .help = "omit source positions from --xml output", .show_in = value_cmds },
@@ -1161,6 +1164,18 @@ test "lowercase expression short flag is rejected and flake requires a value" {
 test "parser enforces command option scope" {
     const argv = [_][*:0]const u8{ "fix", "--dry-run" };
     try std.testing.expectError(error.OptionNotValidForCommand, parseForTest(&argv, .eval));
+}
+
+test "parse accepts and advertises the json compatibility flag" {
+    const argv = [_][*:0]const u8{ "fix", "--json", "-E", "1" };
+    var options = try parseForTest(&argv, .parse);
+    defer options.deinit(std.testing.allocator);
+    try std.testing.expectEqual(OutputFormat.json, options.output);
+
+    var buffer: [32 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeHelpInner(&writer, "usage: fix parse", .parse);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "--json") != null);
 }
 
 test "repl no-tui flag and legacy alias select inline workspaces" {

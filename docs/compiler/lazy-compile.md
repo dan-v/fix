@@ -85,7 +85,7 @@ When such a body would be wrapped at a `thunk` site, the compiler instead **push
 
 ### Keeping the speculation threshold calibrated
 
-Emit-time super-op fusion (see [pipeline.md](pipeline.md)) shrinks a body's encoding, which would make it look *smaller* than it is to the [speculation](../parallel/speculation.md) size gate. The `*_get_attr` and `thunk*_st(_cell)` rewrites each add their saved byte to **`ChunkBuilder.fusion_savings`** (string-interpolation lowering adjusts it too); `fusion_savings` is added back to `code.len` when computing `body_is_substantial`, so `speculation_min_code_bytes` measures the *pre-fusion* body size and fusion never silently changes which bodies are deemed substantial enough to speculate. The `<op>_ret` rewrite that produces the trivial shapes above is not recorded — those bodies are a handful of bytes and never approach the 256-byte threshold anyway.
+Emit-time super-op fusion (see [pipeline.md](pipeline.md)) shrinks a body's encoding, which would make it look *smaller* than it is to the [speculation](../parallel/speculation.md) size gate. The `*_get_attr` and `thunk*_st(_cell)` rewrites add their saved dispatch weight to **`ChunkBuilder.fused_dispatch_weight`** (string-interpolation lowering adjusts it too); that weight is added back to `code.len` when computing `body_is_substantial`, so `speculation_min_code_bytes` measures the effective pre-fusion body size. The `<op>_ret` rewrite that produces the trivial shapes above is not recorded — those bodies never approach the 256-byte threshold.
 
 ---
 
@@ -94,7 +94,7 @@ Emit-time super-op fusion (see [pipeline.md](pipeline.md)) shrinks a body's enco
 - **Deferral changes only *when*.** Deferred bytecode ≡ eager bytecode (modulo internal upvalue numbering); output is byte-identical.
 - **Classify runs once, over the frozen body**, guarded by `local_count == 0` — the shape set is exhaustive for thunk bodies.
 - **Short-circuit ≡ force.** Pushing the trivial value directly yields exactly what forcing the thunk would have.
-- **Fusion is size-neutral to the scheduler.** `fusion_savings` (fed by the `*_get_attr` and store-fusion rewrites) restores the pre-fusion byte count for the `body_is_substantial` decision.
+- **Fusion is size-neutral to the scheduler.** `fused_dispatch_weight` restores the dispatch weight removed by the `*_get_attr` and store-fusion rewrites for the `body_is_substantial` decision.
 
 Out of scope: thunk states / how `thunk` and force behave → [runtime/thunks.md](../runtime/thunks.md); how substantial bodies get speculated → [parallel/speculation.md](../parallel/speculation.md); emission & fusion → [pipeline.md](pipeline.md).
 

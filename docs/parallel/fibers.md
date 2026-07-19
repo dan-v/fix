@@ -42,7 +42,7 @@ For a never-run fiber the jump target is the trampoline, seeded directly into `C
 
 ## Stacks
 
-Each fiber reserves an **8 MiB** anonymous mapping (`mmap` with `PROT_READ|PROT_WRITE`, `MAP_ANONYMOUS|MAP_PRIVATE`, demand-paged). The kernel commits pages only as the fiber recurses, so **RSS tracks actual depth, not the reservation**. 8 MiB buys thousands of frames of headroom on any realistic Nix eval while costing ~0 physical memory for shallow fibers. The mapping is registered with the [RSS attributor](../runtime/heap.md) (`vma`) so the process's most numerous large mappings don't merge into an unattributable anonymous blob.
+Each fiber reserves a **16 MiB** anonymous mapping (`mmap` with `PROT_READ|PROT_WRITE`, `MAP_ANONYMOUS|MAP_PRIVATE`, demand-paged). The kernel commits pages only as the fiber recurses, so **RSS tracks actual depth, not the reservation**. The mapping buys deep-recursion headroom while costing almost no physical memory for shallow fibers. It is registered with the RSS attributor (`vma`) so the process's most numerous large mappings do not merge into an unattributable anonymous blob.
 
 `releaseStackPages(retain_top, lazy)` gives a dead fiber's stack pages back to the OS — `MADV_FREE` (reclaimed only under pressure) or `MADV_DONTNEED` (immediate). It is only ever called on a `.finished`/`.ready` fiber, whose frames are garbage by definition: a later re-fault reading zeros is indistinguishable from a fresh stack (`reset` reseeds the trampoline address into the context, and running code always writes a frame before reading it). The [worker](workers.md) uses this to trim spike-overflow fibers when it parks.
 
@@ -63,7 +63,7 @@ Each fiber reserves an **8 MiB** anonymous mapping (`mmap` with `PROT_READ|PROT_
 - **`.suspended`** — yielded; `ctx` holds the resumable state.
 - **`.finished`** — `entry` returned; not resumable. `entry`/`arg` are cleared so a finished fiber holds no dangling capture.
 
-**Recycling.** `reset(entry, arg)` rewinds a `.finished` (or never-run `.ready`) fiber's `rsp` to the top of its existing stack and reinstalls entry/arg, returning it to `.ready`. This reuses the 8 MiB mapping and its already-committed pages instead of re-`mmap`ing — the [worker](workers.md)'s fiber free-list is built on this. Resuming a `.finished` or `.running` fiber is a caller bug (debug asserts guard it).
+**Recycling.** `reset(entry, arg)` rewinds a `.finished` (or never-run `.ready`) fiber's stack pointer to the top of its existing stack and reinstalls entry/arg, returning it to `.ready`. This reuses the 16 MiB mapping and its already-committed pages instead of re-`mmap`ing — the [worker](workers.md)'s fiber free-list is built on this. Resuming a `.finished` or `.running` fiber is a caller bug (debug asserts guard it).
 
 ## Cross-thread resume safety (load-bearing invariants)
 

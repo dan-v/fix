@@ -9,7 +9,7 @@ The scheduler owns, **per worker `i`**, a set of queues plus a wake word. Every 
 | Structure | Contents | Discipline |
 |---|---|---|
 | `ready_queues[i]` | woken/blocked [fibers](fibers.md) ready to resume | drained **first**; stealable; deduped |
-| `urgent_queues[i]` | demand tasks (fan-out of a strict consumer; the critical path) | drained next; not spec-rationed (fixed 4096-slot deque, full push → force inline) |
+| `urgent_queues[i]` | demand tasks (fan-out of a strict consumer; the critical path) | drained next; not spec-rationed (fixed 4096-slot deque; demand handles rejected work) |
 | `novel_queues[i]` | first-ever [speculative](speculation.md) force of each code region | drained before the bulk backlog; cap-exempt |
 | `spec_queues[i]` | bulk [speculative](speculation.md) tasks (bets on future demand) | drained last of the eager lanes; **capped** |
 | `wake_words[i]` | a futex word | parking / wake signalling |
@@ -24,7 +24,7 @@ A `Task` is a tagged union — `force_thunk`, `force_list_range`, `force_attrs_s
 
 The lanes use two different structures, chosen per lane's access pattern.
 
-### Chase-Lev deque — urgent & cont
+### Chase-Lev deque — urgent
 
 The `urgent` queue is a lock-free **Chase-Lev work-stealing deque** (the generic engine is `containers.Deque`):
 
@@ -33,11 +33,11 @@ The `urgent` queue is a lock-free **Chase-Lev work-stealing deque** (the generic
 - **Ordering:** bottom writes release / stealer reads acquire; the `top` CAS is seq_cst so the owner's last-element pop and a concurrent steal agree on who got it. A seq_cst fence in `pop` after the bottom write stops the owner "seeing past" a stealer.
 - **Last-element race:** when one element remains, the owner's pop races the stealer via the same `top` CAS; the loser restores `bottom`.
 
-LIFO-for-owner keeps freshly-spawned work hot in cache and deep-first (good for dependency chains); FIFO-for-stealer hands thieves the *oldest*, most-likely-independent work. A full push returns `false`, which is the caller's cue to force the work inline.
+LIFO-for-owner keeps freshly-spawned work hot in cache and deep-first (good for dependency chains); FIFO-for-stealer hands thieves the *oldest*, most-likely-independent work. A full push returns `false`, leaving the unqueued remainder to the caller's demand path.
 
 ### Mutexed ring — spec & novel
 
-The `spec` and `novel` lanes are **`SpinMutex`-guarded bounded rings** (`SpecQueue`), not Chase-Lev. Speculation is low-volume (tens of thousands of submissions per NixOS eval, against millions of forces), so a mutex ring is affordable. Bulk-spec owners pop newest, stealers take oldest, and a full push rejects. The novel lane instead overwrites its oldest entry and is consumed newest-first: the first speculative instance of a chunk (a potential subsystem/chain root) must not lose a pop/steal race against hundreds of repeat-instance junk tasks, so it gets a small, cap-exempt, always-fresh-first lane of its own.
+The `spec` and `novel` lanes are **`SpinMutex`-guarded bounded rings** (`SpecQueue`), not Chase-Lev. Bulk-spec owners pop newest, stealers take oldest, and a full push rejects. The novel lane instead overwrites its oldest entry and is consumed newest-first: the first speculative instance of a chunk (a potential subsystem/chain root) must not lose a pop/steal race against repeat-instance work, so it gets a cap-exempt, always-fresh-first lane of its own.
 
 ## Ready queues
 
@@ -45,22 +45,22 @@ Woken fibers land on `ready_queues[i]` — a **`SpinMutex`-guarded intrusive FIF
 
 ## The two-tier cap
 
-Demand is unbounded; speculation is *rationed* so a burst of bad bets can't bury the real work or exhaust memory.
+Urgent admission does not consult the speculative cap; speculation is *rationed* so a burst of bad bets cannot bury the real work or exhaust memory.
 
-- **Urgent: not spec-rationed.** Demand fan-out is on the critical path; refusing it would serialize the very work parallelism exists to spread, so it never consults the `pending_tasks` cap. It is not *unbounded*, though: the lane is a fixed 4096-slot Chase-Lev deque (`urgent_queue_capacity = 4096` per worker), and a full push returns `false`, whereupon the submitter forces the work inline — demand is at worst run serially, never dropped.
+- **Urgent: not spec-rationed.** Demand fan-out never consults the speculative backlog cap. The lane is still a fixed 4096-slot Chase-Lev deque (`urgent_queue_capacity = 4096` per worker); a full push returns `false`, and the caller's authoritative demand walk handles the unqueued remainder.
 - **Spec: capped** at `spec_backlog_per_helper × (N−1)` = **128 × (N−1)** = **3968 in-flight at N=32**, gated by a shared `pending_tasks` counter. `FIX_SPEC_BACKLOG` sweeps the per-helper figure — it is the primary peak-RSS↔wall knob.
 - **Spec drain is also capped by crew size** (`spec_helper_cap`, default **16**; `FIX_SPEC_HELPERS` overrides): workers above the cap never pop or steal bulk-spec tasks. Capped workers use a lane-aware pre-park probe (`takableWork`) so they do not spin on work they cannot take. The cap is inert when every worker is eligible.
-- **Over-cap spec submit returns `false`** → the caller **falls back to running the work serially, inline**. Speculation is best-effort; the fallback is what makes an over-cap submit harmless rather than lost work.
+- **Over-cap spec submit returns `false`** → that pre-force is skipped. The thunk remains lazy and ordinary demand computes it if needed.
 - **Novel: cap-exempt.** `submitNovel` does not test the backlog cap — its total volume is bounded structurally at one task per chunk. (A novel task still increments `pending_tasks` for pop/wake bookkeeping; it just is not *gated* by it.)
 
-This asymmetry encodes the cost model: at high worker counts cores are mostly idle, so speculative CPU is nearly free — but its real cost is *scheduling* (a spec task runs to completion once started) and *allocation pressure*, so it must be *rationed*, never allowed to displace demand.
+This asymmetry encodes the cost model: at high worker counts cores are mostly idle, but speculative work still adds scheduling and allocation pressure, so it is rationed and cooperatively bails at checkpoints.
 
 ## Submit & wake path
 
 ```
 submit / submitNovel / submitUrgent(task):
     push task onto own lane's queue[submitter_id]   # own queue, no contention
-    (spec only) if over cap → return false   # caller runs it inline
+    (spec only) if over cap → return false   # thunk remains lazy
     burst-wake / periodic re-wake a parked worker
 
 enqueueReady(fiber):
@@ -94,9 +94,9 @@ parkWorker(i):
 
 ## Scheduling discipline
 
-- **Demand preempts speculation.** A worker always drains ready fibers and urgent tasks before touching the novel or spec lanes. Both `pop` (own queues) and the steal scan walk lanes in priority order: urgent → novel → spec.
-- **Spec is rationed, not prioritized down mid-run.** Once a spec task starts, its fiber runs to completion (no preemption of a running fiber); the cap and inline fallback are the admission throttle. In-flight speculation is instead abandoned cooperatively via the [bail-on-demand brake](speculation.md).
-- **No cross-tier priority promotion.** When a *demand* fiber blocks on a thunk currently being computed by a *spec* fiber, the demand fiber simply parks on the [`Future`](../runtime/thunks.md) and the spec fiber finishes at spec priority. There is no mechanism to pull a blocking spec fiber up into the demand tier — do not assume one when reasoning about latency.
+- **Demand lanes win admission order.** A worker drains ready fibers and urgent tasks before touching the novel or spec lanes. Both `pop` (own queues) and the steal scan walk lanes in priority order: urgent → novel → spec.
+- **No scheduler preemption.** Once a spec task starts, only its cooperative [bail checkpoints](speculation.md) can stop it early.
+- **Priority inheritance is off by default.** Normally a demand fiber blocking on a spec-owned thunk parks on the [`Future`](../runtime/thunks.md). `FIX_RESCUE=1` enables advisory promotion: the owner stops bailing and routes its sub-forces urgently until the task boundary.
 
 [Imports](imports.md) submit and park through this same machinery (an `ImportEntry` wraps a `Future`; a helper compiling an import is just another claim/wait).
 
@@ -110,7 +110,7 @@ The steal scan is further short-circuited by **per-lane stealable-work summaries
 
 ## Garbage collection
 
-The scheduler hosts the collector's **stop-the-world barrier**: a worker that crosses the collection threshold at a safepoint CASes `gc_stop_requested`, becomes the sole collector, waits for every peer to park at its own safepoint, then (for `--workers>1`) opens a parallel-mark gate so parked peers drain the mark graph through an installed hook instead of spinning idle. The evaluator-owned `GcCoordinator` installs that hook together with the heap's collection callback as one lifecycle operation. It is a full two-phase barrier — the collector waits for all peers to *clear* their parked flag before returning — so a slow peer can never carry a stale state into the next collection. The scheduler also exposes `gcMarkPendingTasks`, marking every heap object referenced by a queued task (a queued force is a live reference).
+The scheduler hosts the collector's **stop-the-world barrier**: a worker that crosses the collection threshold wins `gcTryBeginCollection`, waits for every peer to park at its own safepoint, then (for `--workers>1`) opens a parallel-mark gate so parked peers drain the mark graph through an installed hook instead of spinning idle. The evaluator-owned `GcCoordinator` installs that hook together with the heap's collection callback as one lifecycle operation. It is a full two-phase barrier — the collector waits for all peers to *clear* their parked flag before returning — so a slow peer can never carry stale state into the next collection. The scheduler also exposes `gcMarkPendingTasks`, marking every heap object referenced by a queued task.
 
 ---
 

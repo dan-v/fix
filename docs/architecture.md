@@ -73,10 +73,10 @@ The spine of the system is the [thunk / `Future`](runtime/thunks.md). A thunk is
 
 ## The concurrency model
 
-- **[Fibers](parallel/fibers.md)** — stackful user-space coroutines with x86-64 stack-switching. A yielded fiber is fully-captured, movable state, so it can be stolen and resumed on any worker. This is why the engine uses fibers, not OS threads: "steal the work while it waits."
-- **[Scheduler](parallel/scheduler.md)** — per-worker work-stealing queues, classed by submission lane: an *urgent* lane (demand-driven fan-out, a lock-free Chase-Lev deque, uncapped) and capped, best-effort *speculative* lanes (a mutex-protected bounded ring). Idle workers steal; parked workers spin then futex-sleep.
+- **[Fibers](parallel/fibers.md)** — stackful user-space coroutines with x86-64 and AArch64 stack-switching. A yielded fiber is fully-captured, movable state, so it can be stolen and resumed on any worker. This is why the engine uses fibers, not OS threads: "steal the work while it waits."
+- **[Scheduler](parallel/scheduler.md)** — per-worker work-stealing queues, classed by submission lane: an *urgent* lane (demand-driven fan-out, a fixed-capacity lock-free Chase-Lev deque) and capped, best-effort *speculative* lanes (a mutex-protected bounded ring). Idle workers steal; parked workers spin then futex-sleep.
 - **[Workers](parallel/workers.md)** — N symmetric workers; the main thread runs a top-level fiber and, whenever it parks, joins the others in stealing. It never idle-waits.
-- **[Speculation & fan-out](parallel/speculation.md)** — the evaluator forces likely-needed thunks ahead of demand (speculation) and forks a collection's element thunks in parallel (fan-out), gated by [strictness](compiler/strictness.md) and bounded by a bail-on-demand brake so a wrong guess can't extend wall time.
+- **[Speculation & fan-out](parallel/speculation.md)** — the evaluator forces likely-needed thunks ahead of demand (speculation) and forks a collection's element thunks in parallel (fan-out), gated by [strictness](compiler/strictness.md) and bounded by bail-on-demand and per-task budgets.
 
 ## Why it's shaped this way (performance)
 
@@ -85,7 +85,7 @@ Parallel evaluation is ultimately bounded by the **serial critical path** throug
 ## Correctness posture
 
 - **Byte-identical `.drv`** vs Nix C++ is the oracle for every change. See [invariants](invariants.md).
-- **The interpreter is the sole execution engine and is canonical.** The [GC](gc.md) is part of every supported build; it bounds RSS and never changes output — evaluation is byte-identical whether it stays dormant or collects.
+- **The interpreter is the sole execution engine and is canonical.** The [GC](gc.md) is part of every supported build; it bounds evaluator-heap growth and never changes output — evaluation is byte-identical whether it stays dormant or collects.
 - **Headroom is measured before it's built.** A suite of [probes](perf/probes.md) (compile-time `-D` flags) quantifies each lever's ceiling first.
 
 ## Reading order
@@ -97,5 +97,3 @@ Parallel evaluation is ultimately bounded by the **serial critical path** throug
 5. **Parallelism:** [fibers](parallel/fibers.md) → [scheduler](parallel/scheduler.md) → [workers](parallel/workers.md) → [speculation](parallel/speculation.md) → [imports](parallel/imports.md).
 6. **Performance & memory:** [perf/model](perf/model.md) → [perf/probes](perf/probes.md); [gc](gc.md).
 7. **Operating it:** [build](build.md); [cli](cli.md).
-
-Historical design notes and A/B logs live in [`docs/superpowers/plans/`](superpowers/plans/).
