@@ -1,4 +1,4 @@
-# Speculation pathology probe (see docs/plans/parallel-redesign-plan.md).
+# Speculation pathology probe.
 #
 # A lazy outer list whose elements are individually expensive AND whose
 # producing lambda is "substantial" (>= SPECULATION_MIN_CODE_BYTES of
@@ -8,9 +8,9 @@
 #
 # This is the self-inflicted worst case: speculation guessing a large,
 # never-demanded body. It exists to keep that case bounded. Measure with:
-#   fix --file bench/workloads/torture/spec_pathology.nix --workers=1
-#   fix --file bench/workloads/torture/spec_pathology.nix --workers=32
-#   fix --file bench/workloads/torture/spec_pathology.nix --workers=32 --no-spec-thunks
+#   fix --file bench/workloads/torture/spec-pathology.nix --workers=1
+#   fix --file bench/workloads/torture/spec-pathology.nix --workers=32
+#   fix --file bench/workloads/torture/spec-pathology.nix --workers=32 --no-spec-thunks
 # w=32-spec should stay within a small factor of w=1, not blow up.
 let
   xs =

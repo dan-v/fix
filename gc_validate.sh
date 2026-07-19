@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GC copying-nursery validation: byte-identical vs golden + RSS + wall.
+# GC validation: output digest, collection report, and wall time.
 # Usage: gc_validate.sh <bin> [workers]
 set -uo pipefail
 bin="${1:-./zig-out/bin/fix}"
