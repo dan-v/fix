@@ -81,6 +81,20 @@ test "builtins.break drives the debug UI and is identity" {
     try std.testing.expectEqualStrings("5", probe.value());
 }
 
+test "native debug entry pauses on unchanged user source" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    var probe: Probe = .{};
+    probe.install(&ev);
+
+    const source = "let answer = 40; in answer + 2";
+    const result = try ev.debugWithScopeResult(source, null);
+    try std.testing.expectEqual(@as(usize, 1), probe.hits);
+    try std.testing.expectEqual(eval_mod.BreakReason.entry, probe.last_reason.?);
+    try std.testing.expect(probe.frame_count >= 1);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result.value)).asInt());
+}
+
 test "debug session evaluates expressions with the break value bound as it" {
     var ev = try Evaluator.init(std.testing.allocator, 1);
     defer ev.deinit();

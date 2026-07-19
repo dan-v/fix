@@ -1273,14 +1273,28 @@ pub const Evaluator = struct {
 
     /// `evaluateWithScope`, retaining the compiled entry chunk for tooling.
     pub fn evaluateWithScopeResult(self: *Evaluator, source: []const u8, scope: ?Value) !EvaluationResult {
-        return self.evaluateTopResult(source, self.base_path, null, scope);
+        return self.evaluateTopResult(source, self.base_path, null, scope, false);
+    }
+
+    /// Evaluate REPL source with a one-shot debugger pause at its first mapped
+    /// instruction. The source is compiled unchanged; the UI must already be
+    /// installed so the entry trap has somewhere to route.
+    pub fn debugWithScopeResult(self: *Evaluator, source: []const u8, scope: ?Value) !EvaluationResult {
+        return self.evaluateTopResult(source, self.base_path, null, scope, true);
     }
 
     fn evaluateTop(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value) !Value {
-        return (try self.evaluateTopResult(source, base_path, source_path, scope)).value;
+        return (try self.evaluateTopResult(source, base_path, source_path, scope, false)).value;
     }
 
-    fn evaluateTopResult(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value) !EvaluationResult {
+    fn evaluateTopResult(
+        self: *Evaluator,
+        source: []const u8,
+        base_path: ?[]const u8,
+        source_path: ?[]const u8,
+        scope: ?Value,
+        initial_break: bool,
+    ) !EvaluationResult {
         try self.prepareEvaluations();
         // Not routed through `evaluateSource`: its top-level detection is
         // `source_path == null`, so passing the path there would send the
@@ -1289,6 +1303,11 @@ pub const Evaluator = struct {
         // constants, the repl's ambient-scope mechanism), then run on the
         // main worker as usual.
         const chunk_id = try self.parseAndCompile(source, base_path, source_path, scope);
+        if (initial_break) {
+            if (self.debugger.breakpoints) |*breakpoints| {
+                _ = try breakpoints.armEntry(&self.registry, chunk_id);
+            }
+        }
         const subject = source_path orelse "expression";
         var observation = self.observer.begin(&evaluate_observation, observationDetails(subject));
         defer observation.cancel();

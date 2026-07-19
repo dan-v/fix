@@ -230,6 +230,7 @@ pub const Console = struct {
     fn banner(self: *Console, w: *std.Io.Writer, s: *DebugSession) !void {
         try self.style(w, .trace_label);
         const reason = switch (s.reason) {
+            .entry => "entry",
             .break_builtin => "break",
             .line_breakpoint => "breakpoint",
             .step => "step",
@@ -347,6 +348,8 @@ pub const Console = struct {
         try self.style(w, .path);
         if (f.file) |file| {
             try w.print("{s}", .{file});
+        } else if (s.frameSourceText(frame_idx) != null) {
+            try w.writeAll("<repl>");
         } else {
             try w.writeAll("<no source>");
         }

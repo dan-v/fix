@@ -449,7 +449,11 @@ fn opBreakpoint(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
         .{ .original = @intFromEnum(OpCode.halt), .pause = false, .kind = .none };
     if (h.pause) {
         if (vm.break_sink) |sink| {
-            const reason: vm_mod.BreakReason = if (h.kind == .step) .step else .line_breakpoint;
+            const reason: vm_mod.BreakReason = switch (h.kind) {
+                .step => .step,
+                .entry => .entry,
+                else => .line_breakpoint,
+            };
             sink.fire(sink.ctx, vm, Value.null_val, reason) catch |e| return e;
         }
     }

@@ -44,6 +44,7 @@ pub const BreakpointTable = struct {
     /// `placeRegisteredChunk` patches those entry points before they can run.
     step_follow_new_chunks: bool = false,
     step_armed: bool = false,
+    step_hit_kind: HitKind = .step,
 
     /// `req_id` sentinel marking a step temp rather than a user breakpoint.
     pub const step_request_id: u32 = 0;
@@ -52,7 +53,7 @@ pub const BreakpointTable = struct {
     pub const Site = struct { chunk_id: ChunkId, offset: u32 };
 
     /// What the `breakpoint` handler should do at a patched site.
-    pub const HitKind = enum { none, breakpoint, step };
+    pub const HitKind = enum { none, breakpoint, step, entry };
     pub const Hit = struct { original: u8, pause: bool, kind: HitKind };
 
     /// A user request: "break on FILE:LINE". `line` is the resolved line (the
@@ -162,7 +163,7 @@ pub const BreakpointTable = struct {
         }
         for (self.step_temps.items) |p| {
             if (p.chunk_id == chunk_id and p.offset == offset)
-                return .{ .original = p.original, .pause = frames_len <= self.step_max_depth, .kind = .step };
+                return .{ .original = p.original, .pause = frames_len <= self.step_max_depth, .kind = self.step_hit_kind };
         }
         return .{ .original = @intFromEnum(opcode.OpCode.halt), .pause = false, .kind = .none };
     }
@@ -180,10 +181,25 @@ pub const BreakpointTable = struct {
         self.step_max_depth = max_depth;
         self.step_follow_new_chunks = follow_new_chunks;
         self.step_armed = true;
+        self.step_hit_kind = .step;
         for (sites) |site| {
             const c = registry.get(site.chunk_id) orelse continue;
             try self.placeStepSite(site.chunk_id, site.offset, c);
         }
+    }
+
+    /// Arm a one-shot pause at the first source-mapped instruction in `chunk`.
+    /// This is the native `:debug` entry stop: user source is compiled exactly
+    /// as written, without a synthetic `builtins.break` wrapper.
+    pub fn armEntry(self: *BreakpointTable, registry: *ChunkRegistry, chunk_id: ChunkId) !bool {
+        self.clearStep(registry);
+        const chunk = registry.get(chunk_id) orelse return false;
+        const offset = firstMappedOffset(chunk) orelse return false;
+        self.step_max_depth = std.math.maxInt(u32);
+        self.step_armed = true;
+        self.step_hit_kind = .entry;
+        try self.placeStepSite(chunk_id, offset, chunk);
+        return self.placedAt(chunk_id, offset) or self.stepPlacedAt(chunk_id, offset);
     }
 
     /// Restore every step-temp byte and disarm the step.
@@ -197,6 +213,7 @@ pub const BreakpointTable = struct {
         self.step_max_depth = 0;
         self.step_follow_new_chunks = false;
         self.step_armed = false;
+        self.step_hit_kind = .step;
     }
 
     fn placedAt(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) bool {

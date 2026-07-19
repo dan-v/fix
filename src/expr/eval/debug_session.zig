@@ -70,9 +70,9 @@ pub fn step(ctx: Context, kind: StepKind) !void {
     };
 
     if (kind != .out) {
-        const cur_line: u32 = if (bytecode.inspect.frameSpan(cur.chunk_ptr, cur.ip)) |s| s.line else 0;
+        const cur_span = bytecode.inspect.frameSpan(cur.chunk_ptr, cur.ip);
         for (cur.chunk_ptr.source_map) |entry| {
-            if (entry.span.line == cur_line) continue;
+            if (cur_span) |span| if (sameSpan(entry.span, span)) continue;
             try sites.append(ctx.allocator, .{ .chunk_id = cur.chunk_id, .offset = entry.start });
         }
     }
@@ -163,4 +163,8 @@ fn firstMappedOffset(chunk: *const bytecode.chunk.Chunk) ?u32 {
         if (best == null or entry.start < best.?) best = entry.start;
     }
     return best;
+}
+
+fn sameSpan(a: bytecode.chunk.Chunk.SourceSpan, b: bytecode.chunk.Chunk.SourceSpan) bool {
+    return a.file == b.file and a.offset == b.offset and a.len == b.len;
 }

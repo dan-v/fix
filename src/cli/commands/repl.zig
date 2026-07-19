@@ -513,11 +513,18 @@ const Repl = struct {
     /// Evaluate an expression in the repl scope. Failures render to stderr
     /// and yield null.
     fn evalExpr(self: *Repl, source: []const u8) !?Value {
+        return self.evalExprMode(source, false);
+    }
+
+    fn evalExprMode(self: *Repl, source: []const u8, debug_entry: bool) !?Value {
         self.clearVmObjects();
         self.ev.setDebugSource(source);
         defer self.ev.setDebugSource(null);
         const first_chunk = self.ev.chunkRegistry().count();
-        const result = self.ev.evaluateWithScopeResult(source, self.scope) catch |err| {
+        const result = (if (debug_entry)
+            self.ev.debugWithScopeResult(source, self.scope)
+        else
+            self.ev.evaluateWithScopeResult(source, self.scope)) catch |err| {
             try self.rememberVmSource(source, first_chunk, null);
             try self.evalFailure(source, err);
             return null;
@@ -532,9 +539,6 @@ const Repl = struct {
             try self.printError("debug console unavailable", .{});
             return;
         };
-        const wrapper = try std.fmt.allocPrint(self.allocator, "builtins.seq (builtins.break null) (\n{s}\n)", .{source});
-        defer self.allocator.free(wrapper);
-
         self.ev.setDebugSerial(true);
         defer self.ev.setDebugSerial(false);
 
@@ -542,7 +546,7 @@ const Repl = struct {
         if (transient) console.install(self.ev);
         defer if (transient) console.uninstall(self.ev);
 
-        if (try self.evalExpr(wrapper)) |value| {
+        if (try self.evalExprMode(source, true)) |value| {
             try self.bind("it", value);
             try self.printResult(value, source);
             try self.collectBetweenInputs();
