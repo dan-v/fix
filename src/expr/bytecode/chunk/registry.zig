@@ -99,16 +99,12 @@ pub const ChunkRegistry = struct {
     /// `capture_names` sidecar below, this is cheap and thread-safe, so names
     /// are available in every run for traces/errors — not just under disasm.
     name_tree: name_tree_mod.NameTree = .{},
-    /// Best-effort chunk-name sidecar for `fix disasm`: maps a chunk id to the
-    /// attr/let binding name a lambda or thunk was compiled for. Populated only
-    /// while `capture_names` is set — off by default so ordinary compiles pay
-    /// nothing and the hot `Chunk` layout is untouched. Not concurrency-safe;
-    /// only enabled for the single-threaded disasm compile.
+    /// Best-effort debugger/disasm sidecars. Populated only while
+    /// `capture_names` is set — off by default so ordinary compiles pay nothing
+    /// and the hot `Chunk` layout is untouched. The REPL enables these while
+    /// retaining parallel import compilation, so map access is synchronized.
     capture_names: bool = false,
-    /// The thread that first recorded into the sidecar, captured lazily. The
-    /// maps are not synchronized, so every `recordName`/`recordFile` must come
-    /// from one thread; a debug assertion enforces it (see `checkSingleThread`).
-    sidecar_owner: ?std.Thread.Id = null,
+    sidecar_mu: sync.BlockingMutex = .{},
     /// The source file each chunk was compiled from (interned path id), so even
     /// chunks with no per-op source map get a file. Populated under name capture.
     files: std.AutoHashMapUnmanaged(ChunkId, types.InternId) = .empty,
@@ -226,23 +222,12 @@ pub const ChunkRegistry = struct {
         for (&self.dedup_shards) |*shard| shard.map.deinit(self.allocator);
     }
 
-    /// Assert the unsynchronized sidecar maps are only ever touched from a
-    /// single thread (the invariant that makes them safe without a lock). The
-    /// first caller claims ownership; later callers must match. Debug-only.
-    fn checkSingleThread(self: *ChunkRegistry) void {
-        const tid = std.Thread.getCurrentId();
-        if (self.sidecar_owner) |owner| {
-            std.debug.assert(owner == tid);
-        } else {
-            self.sidecar_owner = tid;
-        }
-    }
-
     /// Record the source file a chunk was compiled from. No-op unless
     /// `capture_names` is on.
     pub fn recordFile(self: *ChunkRegistry, id: ChunkId, file: types.InternId) !void {
         if (!self.capture_names) return;
-        self.checkSingleThread();
+        self.sidecar_mu.lock();
+        defer self.sidecar_mu.unlock();
         try self.files.put(self.allocator, id, file);
     }
 
@@ -250,16 +235,27 @@ pub const ChunkRegistry = struct {
     /// `capture_names` is on; the slice is duped into the registry.
     pub fn recordUpvalueNames(self: *ChunkRegistry, id: ChunkId, names_in: []const types.InternId) !void {
         if (!self.capture_names or names_in.len == 0) return;
-        self.checkSingleThread();
         const copy = try self.allocator.dupe(types.InternId, names_in);
         errdefer self.allocator.free(copy);
+        self.sidecar_mu.lock();
+        defer self.sidecar_mu.unlock();
         const gop = try self.upvalue_names.getOrPut(self.allocator, id);
-        if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
+        // Deduped chunks keep the first registration's diagnostic sidecar.
+        // Never replace/free it: readers may hold this append-stable slice
+        // after dropping the map lock.
+        if (gop.found_existing) {
+            self.allocator.free(copy);
+            return;
+        }
         gop.value_ptr.* = copy;
     }
 
     /// The chunk's recorded upvalue names (slot order), if any.
     pub fn upvalueNamesOf(self: *const ChunkRegistry, id: ChunkId) ?[]const types.InternId {
+        if (!self.capture_names) return null;
+        const mutable = @constCast(self);
+        mutable.sidecar_mu.lock();
+        defer mutable.sidecar_mu.unlock();
         return self.upvalue_names.get(id);
     }
 
@@ -267,16 +263,24 @@ pub const ChunkRegistry = struct {
     /// unless `capture_names` is on; the slice is duped into the registry.
     pub fn recordLocalNames(self: *ChunkRegistry, id: ChunkId, names_in: []const types.InternId) !void {
         if (!self.capture_names or names_in.len == 0) return;
-        self.checkSingleThread();
         const copy = try self.allocator.dupe(types.InternId, names_in);
         errdefer self.allocator.free(copy);
+        self.sidecar_mu.lock();
+        defer self.sidecar_mu.unlock();
         const gop = try self.local_names.getOrPut(self.allocator, id);
-        if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
+        if (gop.found_existing) {
+            self.allocator.free(copy);
+            return;
+        }
         gop.value_ptr.* = copy;
     }
 
     /// The chunk's recorded local names (slot order), if any.
     pub fn localNamesOf(self: *const ChunkRegistry, id: ChunkId) ?[]const types.InternId {
+        if (!self.capture_names) return null;
+        const mutable = @constCast(self);
+        mutable.sidecar_mu.lock();
+        defer mutable.sidecar_mu.unlock();
         return self.local_names.get(id);
     }
 
@@ -318,6 +322,10 @@ pub const ChunkRegistry = struct {
 
     /// The source file recorded for `id`, if any.
     pub fn fileOf(self: *const ChunkRegistry, id: ChunkId) ?types.InternId {
+        if (!self.capture_names) return null;
+        const mutable = @constCast(self);
+        mutable.sidecar_mu.lock();
+        defer mutable.sidecar_mu.unlock();
         return self.files.get(id);
     }
 
@@ -909,4 +917,47 @@ test "chunk dedup: concurrent registrations converge (equal) and stay distinct (
             try std.testing.expect(!gop.found_existing);
         }
     }
+}
+
+test "chunk sidecars support concurrent compiler writers" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+    registry.capture_names = true;
+
+    const thread_count = 8;
+    const iterations = 512;
+    const Worker = struct {
+        fn run(reg: *ChunkRegistry, t_idx: usize) void {
+            for (0..iterations) |i| {
+                const id: ChunkId = @intCast(t_idx * iterations + i);
+                const file: types.InternId = @intCast(10_000 + id);
+                const names = [_]types.InternId{ @intCast(t_idx), @intCast(i) };
+                reg.recordFile(id, file) catch @panic("recordFile failed");
+                reg.recordUpvalueNames(id, &names) catch @panic("recordUpvalueNames failed");
+                reg.recordLocalNames(id, &names) catch @panic("recordLocalNames failed");
+            }
+        }
+    };
+
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &registry, i });
+    }
+    for (&threads) |thread| thread.join();
+
+    for (0..thread_count) |t_idx| {
+        for (0..iterations) |i| {
+            const id: ChunkId = @intCast(t_idx * iterations + i);
+            try std.testing.expectEqual(@as(types.InternId, @intCast(10_000 + id)), registry.fileOf(id).?);
+            try std.testing.expectEqualSlices(types.InternId, &.{ @intCast(t_idx), @intCast(i) }, registry.upvalueNamesOf(id).?);
+            try std.testing.expectEqualSlices(types.InternId, &.{ @intCast(t_idx), @intCast(i) }, registry.localNamesOf(id).?);
+        }
+    }
+
+    // A deduped registration never invalidates a slice a reader may already
+    // hold; the first diagnostic sidecar remains canonical.
+    const replacement = [_]types.InternId{999};
+    try registry.recordLocalNames(0, &replacement);
+    try std.testing.expectEqualSlices(types.InternId, &.{ 0, 0 }, registry.localNamesOf(0).?);
 }

@@ -1154,8 +1154,8 @@ pub const Evaluator = struct {
     /// Enable best-effort chunk naming: the compiler records the attr/let
     /// binding name behind each lambda/thunk chunk into a registry sidecar, for
     /// `fix disasm` and the REPL explorer to display. Off by default (hot
-    /// compiles pay nothing); only safe to enable when compilation itself is
-    /// serialized. Set before compiling.
+    /// compiles pay nothing); sidecar writes are synchronized for the REPL's
+    /// parallel import compilation. Set before compiling.
     pub fn setCaptureChunkNames(self: *Evaluator, on: bool) void {
         self.registry.capture_names = on;
     }
