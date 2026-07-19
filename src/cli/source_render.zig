@@ -3,14 +3,16 @@
 //! debugger can emphasize an expression without painting its whole line.
 
 const std = @import("std");
+const terminal_color = @import("base").terminal_color;
 const syntax = @import("syntax");
 
 const TokenType = syntax.token.TokenType;
 
-const col_keyword = "\x1b[35m";
-const col_string = "\x1b[32m";
-const col_number = "\x1b[33m";
-const focus = "\x1b[4;7m";
+const col_keyword: terminal_color.Rgb = .{ 210, 143, 240 };
+const col_string: terminal_color.Rgb = .{ 111, 201, 145 };
+const col_number: terminal_color.Rgb = .{ 229, 192, 123 };
+const col_focus = terminal_color.hueColor(3);
+const focus_underline = "\x1b[4m";
 const reset = "\x1b[0m";
 
 pub const Range = struct {
@@ -19,9 +21,9 @@ pub const Range = struct {
 };
 
 pub const Options = struct {
-    color: bool,
+    color_depth: terminal_color.Depth,
     /// Byte range relative to `line`. Empty and out-of-bounds ranges are
-    /// ignored. Focus uses terminal attributes even when color is disabled.
+    /// ignored. Focus falls back to an underline when color is disabled.
     focus: ?Range = null,
 };
 
@@ -39,11 +41,11 @@ pub fn writeLine(w: *std.Io.Writer, line: []const u8, options: Options) !void {
         const start = @min(token.offset, line.len);
         const end = @min(token.offset +| token.len, line.len);
         if (end <= last) break;
-        if (start > last) try writeSpan(w, line, last, start, null, selected);
-        try writeSpan(w, line, start, end, if (options.color) tokenColor(token.type) else null, selected);
+        if (start > last) try writeSpan(w, line, last, start, null, selected, options.color_depth);
+        try writeSpan(w, line, start, end, tokenColor(token.type), selected, options.color_depth);
         last = end;
     }
-    if (last < line.len) try writeSpan(w, line, last, line.len, null, selected);
+    if (last < line.len) try writeSpan(w, line, last, line.len, null, selected, options.color_depth);
 }
 
 fn writeSpan(
@@ -51,28 +53,39 @@ fn writeSpan(
     line: []const u8,
     start: usize,
     end: usize,
-    color: ?[]const u8,
+    color: ?terminal_color.Rgb,
     selected: ?Range,
+    color_depth: terminal_color.Depth,
 ) !void {
     if (start >= end) return;
     if (selected) |range| {
         const selected_start = @max(start, range.start);
         const selected_end = @min(end, range.end);
         if (selected_start < selected_end) {
-            if (start < selected_start) try styled(w, line[start..selected_start], color, false);
-            try styled(w, line[selected_start..selected_end], color, true);
-            if (selected_end < end) try styled(w, line[selected_end..end], color, false);
+            if (start < selected_start) try styled(w, line[start..selected_start], color, false, color_depth);
+            try styled(w, line[selected_start..selected_end], color, true, color_depth);
+            if (selected_end < end) try styled(w, line[selected_end..end], color, false, color_depth);
             return;
         }
     }
-    try styled(w, line[start..end], color, false);
+    try styled(w, line[start..end], color, false, color_depth);
 }
 
-fn styled(w: *std.Io.Writer, text: []const u8, color: ?[]const u8, selected: bool) !void {
-    if (selected) try w.writeAll(focus);
-    if (color) |code| try w.writeAll(code);
+fn styled(
+    w: *std.Io.Writer,
+    text: []const u8,
+    color: ?terminal_color.Rgb,
+    selected: bool,
+    color_depth: terminal_color.Depth,
+) !void {
+    if (selected) {
+        try terminal_color.foreground(w, color_depth, col_focus, false);
+        try w.writeAll(focus_underline);
+    } else if (color) |rgb| {
+        try terminal_color.foreground(w, color_depth, rgb, false);
+    }
     try writeSafe(w, text);
-    if (selected or color != null) try w.writeAll(reset);
+    if (selected or (color != null and color_depth.enabled())) try w.writeAll(reset);
 }
 
 fn writeSafe(w: *std.Io.Writer, text: []const u8) !void {
@@ -85,7 +98,7 @@ fn writeSafe(w: *std.Io.Writer, text: []const u8) !void {
     };
 }
 
-fn tokenColor(token: TokenType) ?[]const u8 {
+fn tokenColor(token: TokenType) ?terminal_color.Rgb {
     return switch (token) {
         .kw_if, .kw_then, .kw_else, .kw_assert, .kw_with, .kw_let, .kw_in, .kw_rec, .kw_inherit, .kw_or, .kw_true, .kw_false, .kw_null => col_keyword,
         .string, .path, .search_path => col_string,
@@ -98,18 +111,20 @@ test "source rendering composes token color with an exact focus" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try writeLine(&output.writer, "if true then 42", .{
-        .color = true,
+        .color_depth = .truecolor,
         .focus = .{ .start = 3, .end = 7 },
     });
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[4;7m\x1b[35mtrue") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[33m42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[38;2;210;143;240mif") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[4mtrue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[38;2;229;192;123m42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[7m") == null);
 }
 
 test "source focus outside a token does not duplicate its text" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try writeLine(&output.writer, "if true", .{
-        .color = false,
+        .color_depth = .none,
         .focus = .{ .start = 3, .end = 7 },
     });
     const plain = @import("base").terminal_text.stripAnsiInPlace(output.written());

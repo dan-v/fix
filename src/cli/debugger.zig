@@ -246,7 +246,9 @@ pub const Console = struct {
         try self.style(w, .dim);
         try w.print("{d: >5} {s} ", .{ line_no, if (current) "▶" else "┆" });
         try presentation.reset(w, self.use_color);
-        try source_render.writeLine(w, line, .{ .color = self.use_color });
+        try source_render.writeLine(w, line, .{
+            .color_depth = if (self.use_color) .ansi16 else .none,
+        });
         try w.writeByte('\n');
     }
 

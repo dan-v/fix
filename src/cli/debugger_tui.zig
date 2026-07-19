@@ -566,7 +566,7 @@ pub const DebuggerTui = struct {
         } else null;
         var highlighted: std.Io.Writer.Allocating = .init(arena);
         try source_render.writeLine(&highlighted.writer, source[bounds.start..bounds.end], .{
-            .color = self.color_depth.enabled(),
+            .color_depth = self.color_depth,
             .focus = span_focus,
         });
         try frame.text(highlighted.written(), 0, width - prefix_width, .plain);

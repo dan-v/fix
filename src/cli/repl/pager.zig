@@ -1132,7 +1132,7 @@ const Tui = struct {
                 break :blk .{ .start = selected_start - cursor, .end = selected_end - cursor };
             } else null;
             try source_render.writeLine(&rendered.writer, source[cursor..shown_end], .{
-                .color = self.color_depth.enabled(),
+                .color_depth = self.color_depth,
                 .focus = selected,
             });
             if (line_end > cursor +| 4096) try rendered.writer.writeAll(" …");
