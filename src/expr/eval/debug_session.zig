@@ -30,6 +30,7 @@ pub const Context = struct {
 pub const DebugFrame = struct {
     chunk_id: types.ChunkId,
     instruction: ?u32,
+    instruction_name: ?[]const u8,
     file: ?[]const u8,
     line: u32,
     column: u32,
@@ -67,9 +68,15 @@ pub fn frame(ctx: Context, i: usize) DebugFrame {
     const f = ref.frame();
     const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip);
     const file_id = if (span) |s| s.file else bytecode.inspect.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, ctx.registry);
+    const instruction = if (ctx.breakpoints) |bp| bp.instructionForSavedIp(f.chunk_id, f.chunk_ptr, f.ip) else null;
+    const instruction_name = if (instruction) |offset|
+        if (ctx.breakpoints.?.instructionOpcode(f.chunk_id, f.chunk_ptr, offset)) |op| @tagName(op) else null
+    else
+        null;
     return .{
         .chunk_id = f.chunk_id,
-        .instruction = if (ctx.breakpoints) |bp| bp.instructionForSavedIp(f.chunk_id, f.chunk_ptr, f.ip) else null,
+        .instruction = instruction,
+        .instruction_name = instruction_name,
         .file = if (file_id) |fid| ctx.intern.get(fid) else null,
         .line = if (span) |s| s.line else 0,
         .column = if (span) |s| s.column else 0,
@@ -82,6 +89,54 @@ pub fn frameSourceText(ctx: Context, i: usize) ?[]const u8 {
     const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip) orelse return ctx.source;
     if (span.file) |fid| return ctx.files.readFile(ctx.intern.get(fid)) catch ctx.source;
     return ctx.source;
+}
+
+/// Describe a pause value without forcing it. Object ids make lazy/container
+/// results useful as stable targets for deeper heap inspection while scalars
+/// retain their actual value.
+pub fn writeValueSummary(ctx: Context, writer: *std.Io.Writer, value: Value) !void {
+    switch (value.kind()) {
+        .null => try writer.writeAll("null"),
+        .bool_false => try writer.writeAll("false"),
+        .bool_true => try writer.writeAll("true"),
+        .int => try writer.print("{d}", .{value.asInt()}),
+        .boxed_int => try writer.print("{d}", .{ctx.heap.getBoxedInt(value.asObjectId()) catch return error.InvalidObjectType}),
+        .float => try writer.print("{d}", .{value.asFloat()}),
+        .string => try writeQuotedSummary(writer, ctx.intern.get(value.asInternId())),
+        .path => {
+            try writer.writeAll("path ");
+            try writeQuotedSummary(writer, ctx.intern.get(value.asInternId()));
+        },
+        .list => try writer.print("list #{d}", .{value.asObjectId()}),
+        .attrs => try writer.print("attrs #{d}", .{value.asObjectId()}),
+        .closure => if (value.isFunction())
+            try writer.print("function chunk #{d}", .{value.asFunctionChunkId()})
+        else
+            try writer.print("closure #{d}", .{value.asObjectId()}),
+        .thunk => try writer.print("thunk #{d}", .{value.asObjectId()}),
+        .builtin => try writer.print("builtin #{d}", .{value.asBuiltinId()}),
+        .builtin_closure => try writer.print("builtin closure #{d}", .{value.asObjectId()}),
+        .string_context => try writer.print("context string #{d}", .{value.asObjectId()}),
+        .partial_app => try writer.print("partial application #{d}", .{value.asObjectId()}),
+    }
+}
+
+fn writeQuotedSummary(writer: *std.Io.Writer, text: []const u8) !void {
+    const max_bytes = 96;
+    var shown = text[0..@min(text.len, max_bytes)];
+    while (!std.unicode.utf8ValidateSlice(shown)) shown = shown[0 .. shown.len - 1];
+
+    try writer.writeByte('"');
+    for (shown) |byte| switch (byte) {
+        '\\' => try writer.writeAll("\\\\"),
+        '"' => try writer.writeAll("\\\""),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        else => try writer.writeByte(byte),
+    };
+    if (shown.len < text.len) try writer.writeAll("…");
+    try writer.writeByte('"');
 }
 
 pub fn step(ctx: Context, kind: StepKind) !void {
@@ -105,6 +160,8 @@ pub fn step(ctx: Context, kind: StepKind) !void {
             if (cur_span) |span| if (sameSpan(entry.span, span)) continue;
             try sites.append(ctx.allocator, .{ .chunk_id = cur.chunk_id, .offset = entry.start });
         }
+        const current_instruction = bp.instructionForSavedIp(cur.chunk_id, cur.chunk_ptr, cur.ip);
+        try bp.appendEvaluationStepSites(ctx.allocator, cur.chunk_id, cur.chunk_ptr, current_instruction, &sites);
     }
     if (depth >= 2) {
         const caller = frameRef(ctx.vm, depth - 2).frame();

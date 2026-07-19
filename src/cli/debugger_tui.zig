@@ -522,8 +522,10 @@ pub const DebuggerTui = struct {
         }
         if (row == 0) {
             const info = session.frame(self.selected_frame);
-            const title = try std.fmt.allocPrint(arena, " {s} · chunk #{d} · {s} ", .{
+            const title = try std.fmt.allocPrint(arena, " {s} · {s} @ 0x{x} · chunk #{d} · {s} ", .{
                 if (self.detail == .source) "source" else "disassembly",
+                info.instruction_name orelse "unknown",
+                info.instruction orelse 0,
                 session.frameChunkId(self.selected_frame),
                 if (info.file) |file| file else "<repl>",
             });
@@ -678,7 +680,13 @@ pub const DebuggerTui = struct {
         width: usize,
     ) !void {
         if (row == 0) {
-            try frame.text(if (self.log.items.len == 0) " locals (values are not forced) " else " debugger output ", 0, width, .section);
+            const title = if (self.log.items.len > 0)
+                " debugger output "
+            else if (session.reason == .return_step)
+                " return value · locals (values are not forced) "
+            else
+                " locals (values are not forced) ";
+            try frame.text(title, 0, width, .section);
             return;
         }
         if (self.log.items.len > 0) {
@@ -686,8 +694,16 @@ pub const DebuggerTui = struct {
             try frame.text(line, 0, width, .plain);
             return;
         }
+        const result_rows: usize = if (session.reason == .return_step) 1 else 0;
+        if (result_rows > 0 and row == 1) {
+            var summary: std.Io.Writer.Allocating = .init(arena);
+            try summary.writer.writeAll("=> ");
+            session.writeValueSummary(&summary.writer, session.value) catch try summary.writer.writeAll("<unavailable>");
+            try frame.text(summary.written(), 0, width, .current);
+            return;
+        }
         if (session.frameCount() == 0) {
-            if (row == 1) try frame.text("(locals unavailable)", 0, width, .muted);
+            if (row == 1 + result_rows) try frame.text("(locals unavailable)", 0, width, .muted);
             return;
         }
 
@@ -702,7 +718,7 @@ pub const DebuggerTui = struct {
             try locals.writer.print("↑ {s} : {s}\n", .{ name, @tagName(session.upvalueValue(index, slot).kind()) });
         }
         if (locals.written().len == 0) try locals.writer.writeAll("(no named locals or upvalues)");
-        const line = textLine(locals.written(), row - 1) orelse return;
+        const line = textLine(locals.written(), row - 1 - result_rows) orelse return;
         try frame.text(line, 0, width, .plain);
     }
 
@@ -767,6 +783,7 @@ fn reasonName(reason: engine.BreakReason) []const u8 {
         .break_builtin => "break",
         .line_breakpoint => "breakpoint",
         .step => "step",
+        .return_step => "return",
         .eval_error => "error",
     };
 }

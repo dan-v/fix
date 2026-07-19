@@ -160,8 +160,8 @@ pub const DebugFrame = debug_session.DebugFrame;
 pub const DebugSession = struct {
     ev: *Evaluator,
     vm: *VM,
-    /// The value passed to `builtins.break` (may be an unforced thunk), or the
-    /// value under evaluation at an error. Inspect via `writeValue`/`force`.
+    /// The value passed to `builtins.break`, returned by a stepped frame, or
+    /// under evaluation at an error. It may be an unforced thunk.
     value: Value,
     reason: BreakReason,
 
@@ -250,6 +250,13 @@ pub const DebugSession = struct {
     /// repl. Runs on the paused fiber's VM.
     pub fn writeValue(self: *DebugSession, writer: *std.Io.Writer, v: Value) !void {
         return eval_print.writeValue(valuePrintHost(self.ev), writer, v);
+    }
+
+    /// Render a concise value description without forcing it. This is safe for
+    /// automatic return-step annotations; `writeValue` remains the explicit,
+    /// potentially forcing full renderer.
+    pub fn writeValueSummary(self: *const DebugSession, writer: *std.Io.Writer, v: Value) !void {
+        return debug_session.writeValueSummary(debugContext(self), writer, v);
     }
 
     /// Look up interned text (e.g. a source file id).

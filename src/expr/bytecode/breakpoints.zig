@@ -205,6 +205,37 @@ pub const BreakpointTable = struct {
         return .{ .original = @intFromEnum(opcode.OpCode.halt), .pause = false, .kind = .none };
     }
 
+    /// A frame return is also a useful step boundary: the caller is live again
+    /// and the VM has the result available for display. Entry traps and
+    /// permanent breakpoints do not opt into these virtual stops.
+    pub fn pausesAfterReturn(self: *const BreakpointTable, frame_depth: u32) bool {
+        return self.step_armed and self.step_hit_kind == .step and frame_depth <= self.step_max_depth;
+    }
+
+    /// Add bytecode-level evaluation boundaries from one chunk. These fill the
+    /// gaps inside broad source-map spans (notably a curried `foo x y z`): the
+    /// debugger can stop before each force/call without putting probes in the
+    /// normal evaluator. `skip` is the instruction at the current pause.
+    pub fn appendEvaluationStepSites(
+        self: *const BreakpointTable,
+        allocator: std.mem.Allocator,
+        chunk_id: ChunkId,
+        chunk: *const Chunk,
+        skip: ?u32,
+        sites: *std.ArrayListUnmanaged(Site),
+    ) !void {
+        var start: usize = 0;
+        while (start < chunk.code.len) {
+            const op = self.instructionOpcode(chunk_id, chunk, @intCast(start)) orelse return;
+            if (evaluationStepBoundary(op) and (skip == null or start != skip.?)) {
+                try sites.append(allocator, .{ .chunk_id = chunk_id, .offset = @intCast(start) });
+            }
+            const next = self.instructionEnd(chunk_id, chunk, start) orelse return;
+            if (next <= start) return;
+            start = next;
+        }
+    }
+
     /// Arm a step: patch each site (unless a permanent breakpoint already sits
     /// there), and stop only at depth ≤ `max_depth`. Replaces any prior step.
     pub fn armStep(
@@ -292,6 +323,15 @@ pub const BreakpointTable = struct {
             start = end;
         }
         return null;
+    }
+
+    /// Decode an instruction through any debugger patch currently covering its
+    /// opcode byte. Used for both granular-step selection and UI breadcrumbs.
+    pub fn instructionOpcode(self: *const BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk, offset: u32) ?opcode.OpCode {
+        if (offset >= chunk.code.len) return null;
+        const raw = self.originalOpcodeByte(chunk_id, offset, chunk);
+        if (raw >= opcode.count) return null;
+        return @enumFromInt(raw);
     }
 
     fn instructionEnd(self: *const BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk, start: usize) ?usize {
@@ -437,6 +477,77 @@ fn firstMappedOffset(chunk: *const Chunk) ?u32 {
     return best;
 }
 
+/// Instructions whose execution can enter another frame, force one or more
+/// lazy values, or otherwise perform a strict evaluation boundary. Stack-only
+/// plumbing is intentionally absent: source stepping should be more precise,
+/// not a bytecode single-step firehose.
+fn evaluationStepBoundary(op: opcode.OpCode) bool {
+    return switch (op) {
+        .loc_get,
+        .loc_get_w,
+        .up_get,
+        .int_add,
+        .int_sub,
+        .int_mul,
+        .int_div,
+        .int_neg,
+        .flt_add,
+        .flt_sub,
+        .flt_mul,
+        .flt_div,
+        .cmp_eq,
+        .cmp_ne,
+        .cmp_lt,
+        .cmp_le,
+        .cmp_gt,
+        .cmp_ge,
+        .cmp_eq_null,
+        .cmp_ne_null,
+        .bool_not,
+        .jump_false,
+        .attrs_new,
+        .attrs_merge_strict,
+        .attrs_merge,
+        .list_cat,
+        .list_cat_n,
+        .str_cat,
+        .path_cat,
+        .thunk_arg,
+        .call,
+        .call_tail,
+        .call_n,
+        .call_tail_n,
+        .loc_get_ret,
+        .loc_get_ret_w,
+        .up_get_ret,
+        .up_get_attr,
+        .loc_get_attr,
+        .loc_get_attr_w,
+        .attr_get,
+        .attr_get_w,
+        .attr_has_strict,
+        .attr_has_strict_w,
+        .attr_get_dyn,
+        .attr_get_dyn_or,
+        .attr_get_path_dyn_or,
+        .attr_get_path_dyn_or_w,
+        .attr_get_path_or,
+        .attr_get_path_or_w,
+        .attr_get_path_mix_or,
+        .attr_has_path,
+        .attr_has_path_w,
+        .attr_has_path_mix,
+        .attr_bind,
+        .attr_bind_w,
+        .with_lookup,
+        .with_lookup_w,
+        .arg_or_lit,
+        .attrs_apply_overrides,
+        => true,
+        else => false,
+    };
+}
+
 test "step sites advance suspended operand ips to instruction boundaries" {
     var intern = try InternTable.init(std.testing.allocator);
     defer intern.deinit();
@@ -470,4 +581,27 @@ test "step sites advance suspended operand ips to instruction boundaries" {
     try std.testing.expectEqual(@as(?u32, 0), table.instructionForSavedIp(9, &chunk, 2));
     try std.testing.expectEqual(@as(?u32, 2), table.instructionForSavedIp(9, &chunk, 3));
     try std.testing.expectEqual(@as(?u32, 2), table.instructionForSavedIp(9, &chunk, 5));
+}
+
+test "evaluation step sites include forces and calls but skip stack plumbing" {
+    var intern = try InternTable.init(std.testing.allocator);
+    defer intern.deinit();
+    var table = BreakpointTable.init(std.testing.allocator, &intern);
+    defer table.deinit();
+
+    var code = [_]u8{
+        @intFromEnum(opcode.OpCode.push_null),
+        @intFromEnum(opcode.OpCode.loc_get),
+        0,
+        @intFromEnum(opcode.OpCode.pop),
+        @intFromEnum(opcode.OpCode.call),
+        @intFromEnum(opcode.OpCode.halt),
+    };
+    var constants: [0]Value = .{};
+    var chunk: Chunk = .{ .code = &code, .constants = &constants, .local_count = 1 };
+    var sites: std.ArrayListUnmanaged(BreakpointTable.Site) = .empty;
+    defer sites.deinit(std.testing.allocator);
+
+    try table.appendEvaluationStepSites(std.testing.allocator, 3, &chunk, 1, &sites);
+    try std.testing.expectEqualSlices(BreakpointTable.Site, &.{.{ .chunk_id = 3, .offset = 4 }}, sites.items);
 }

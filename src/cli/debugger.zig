@@ -193,6 +193,7 @@ pub const Console = struct {
             .break_builtin => "break",
             .line_breakpoint => "breakpoint",
             .step => "step",
+            .return_step => "return",
             .eval_error => "error",
         };
         try w.print("\n-- debugger #{d} ({s}) --", .{ self.hits, reason });
@@ -202,8 +203,13 @@ pub const Console = struct {
             try self.writeFrameLine(w, s, 0, s.frameCount() - 1, true);
             try self.sourceSnippet(w, s, f);
         }
-        // Only break/error carry a meaningful value; a line/step stop doesn't.
-        if (s.reason == .break_builtin or s.reason == .eval_error) {
+        if (s.reason == .return_step) {
+            try self.style(w, .note_label);
+            try w.writeAll("=> ");
+            try presentation.reset(w, self.use_color);
+            s.writeValueSummary(w, s.value) catch try w.writeAll("<unavailable>");
+            try w.writeByte('\n');
+        } else if (s.reason == .break_builtin or s.reason == .eval_error) {
             try w.writeAll("value: ");
             self.renderTo(w, s, s.value) catch try w.writeAll("<unavailable>");
             try w.writeByte('\n');
@@ -293,6 +299,11 @@ pub const Console = struct {
             try w.writeAll(" ");
             try self.style(w, .name);
             try s.writeFrameName(w, frame_idx);
+            try presentation.reset(w, self.use_color);
+        }
+        if (f.instruction_name) |name| {
+            try self.style(w, .dim);
+            try w.print("  {s} @ 0x{x}", .{ name, f.instruction.? });
             try presentation.reset(w, self.use_color);
         }
         try w.print("  (chunk #{d})\n", .{f.chunk_id});
@@ -443,7 +454,7 @@ pub const Console = struct {
             \\expression like `n + 1` to evaluate — or `:n` to force the command.
             \\  bt / backtrace    show the call stack with source locations
             \\  l / locals        show in-scope locals and upvalues, per frame
-            \\  v / value         print the value passed to builtins.break
+            \\  v / value         print the current pause value/result
             \\  break FILE:LINE   set a source-line breakpoint (nearest code line)
             \\  breakpoints       list breakpoints
             \\  delete N          remove breakpoint N

@@ -273,7 +273,7 @@ test "stepping pauses again and preserves the result" {
         fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             s.clearStep();
-            if (s.reason == .step) {
+            if (s.reason == .step or s.reason == .return_step) {
                 self.steps += 1;
                 return; // stop stepping; run to completion
             }
@@ -513,7 +513,8 @@ test "pending import breakpoint preserves the parent stack and finish returns to
                     try s.step(.out);
                 },
                 .finishing => {
-                    try std.testing.expectEqual(eval_mod.BreakReason.step, s.reason);
+                    try std.testing.expectEqual(eval_mod.BreakReason.return_step, s.reason);
+                    try std.testing.expectEqual(.attrs, s.value.kind());
                     try std.testing.expect(s.currentFrame().?.file == null);
                     try std.testing.expect(s.frameCount() < self.imported_frames);
                     self.state = .returned;
@@ -528,6 +529,57 @@ test "pending import breakpoint preserves the parent stack and finish returns to
     const result = try ev.debugWithScopeResult(source, null);
     try std.testing.expectEqual(.returned, ctl.state);
     try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result.value)).asInt());
+}
+
+test "finish pauses in the caller with the returned value" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+
+    const Ctl = struct {
+        state: enum { at_break, forced_argument, returned } = .at_break,
+        frames_before: usize = 0,
+        saw_return: bool = false,
+
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            s.clearStep();
+            switch (self.state) {
+                .at_break => {
+                    try std.testing.expectEqual(eval_mod.BreakReason.break_builtin, s.reason);
+                    self.frames_before = s.frameCount();
+                    self.state = .forced_argument;
+                    try s.step(.out);
+                },
+                .forced_argument => {
+                    // `x` was being forced for builtins.break: its passthrough
+                    // frame returns first, before the surrounding function.
+                    try std.testing.expectEqual(eval_mod.BreakReason.return_step, s.reason);
+                    try std.testing.expect(s.frameCount() < self.frames_before);
+                    try std.testing.expectEqual(@as(i64, 41), s.value.asInt());
+                    self.frames_before = s.frameCount();
+                    self.state = .returned;
+                    try s.step(.out);
+                },
+                .returned => {
+                    try std.testing.expectEqual(eval_mod.BreakReason.return_step, s.reason);
+                    try std.testing.expect(s.frameCount() < self.frames_before);
+                    try std.testing.expectEqual(@as(i64, 42), s.value.asInt());
+                    var text: [32]u8 = undefined;
+                    var writer: std.Io.Writer = .fixed(&text);
+                    try s.writeValueSummary(&writer, s.value);
+                    try std.testing.expectEqualStrings("42", text[0..writer.end]);
+                    self.saw_return = true;
+                },
+            }
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    const source = "let f = x: builtins.seq (builtins.break x) (x + 1); in (f 41) + 0";
+    const result = try ev.evaluatePath(source, "return-step.nix");
+    try std.testing.expect(ctl.saw_return);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result)).asInt());
 }
 
 test "clearStep after a step leaves no patched bytecode behind" {

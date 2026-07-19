@@ -150,13 +150,14 @@ pub const ImportHost = struct {
 /// Why evaluation paused into the debugger. `entry` is the one-shot stop at
 /// the start of a `:debug` expression; `break_builtin` is a `builtins.break x`
 /// call; `line_breakpoint` is a patched source-line breakpoint; `step` is a
-/// completed single-step; `eval_error` is an evaluation error caught with
-/// `--debugger`.
-pub const BreakReason = enum { entry, break_builtin, line_breakpoint, step, eval_error };
+/// completed single-step; `return_step` is the virtual stop after a stepped
+/// frame has returned to its caller; `eval_error` is an evaluation error caught
+/// with `--debugger`.
+pub const BreakReason = enum { entry, break_builtin, line_breakpoint, step, return_step, eval_error };
 
 /// A debugger attachment. Installed on every VM by `Evaluator.initVm` when a
-/// debugger is active; null (the default) means "no debugger" and the break
-/// path is a plain identity — so this costs nothing in normal evaluation.
+/// debugger is active; null (the default) means "no debugger" and ordinary
+/// return paths pay only one unlikely null check.
 ///
 /// `fire` is an upcall into the owning layer (the `fix` Evaluator, then the
 /// `cli` debug console): it runs the interactive session synchronously on the

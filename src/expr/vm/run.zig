@@ -1141,9 +1141,25 @@ inline fn retEpilogue(vm: *VM, stop_depth: usize, result: Value) anyerror!void {
     }
     vm.sp = finished_frame.frame_base;
     try stack.push(vm, result);
+    if (vm.break_sink != null) {
+        @branchHint(.unlikely);
+        try pauseAfterReturn(vm, result);
+    }
     if (vm.frames_len == stop_depth) return;
     const new_frame = stack.currentFrame(vm);
     return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+}
+
+/// A debugger-only virtual instruction after frame teardown. Keeping the slow
+/// path out of `retEpilogue` leaves ordinary returns with one predictable null
+/// check; the result is already rooted on the VM stack before the UI may
+/// re-enter evaluation.
+noinline fn pauseAfterReturn(vm: *VM, result: Value) anyerror!void {
+    const sink = vm.break_sink orelse return;
+    const bps = vm.breakpoints orelse return;
+    const depth = vm.debugFrameDepth();
+    if (depth == 0 or !bps.pausesAfterReturn(depth)) return;
+    try sink.fire(sink.ctx, vm, result, .return_step);
 }
 
 // ---- handler table ----
