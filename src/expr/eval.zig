@@ -1992,9 +1992,34 @@ pub const Evaluator = struct {
         /// False when collection is disabled by policy (`--gc-budget=0`)
         /// or nothing has run yet.
         ran: bool,
-        reserved_before: u64,
-        reserved_after: u64,
+        /// Number of actual mark/sweep cycles completed by this request. The
+        /// first request may only arm lazy tracking.
+        collections: u64,
+        objects_freed: u64,
+        live_bytes: u64,
+        /// Append-store high-water retained for reuse; collection does not
+        /// shrink these cursors, so presenting it as before/after is misleading.
+        capacity_bytes: u64,
     };
+
+    fn collectNowResult(self: *Evaluator) CollectNowResult {
+        return .{
+            .ran = false,
+            .collections = 0,
+            .objects_freed = 0,
+            .live_bytes = 0,
+            .capacity_bytes = self.heap.totalReservedBytes(),
+        };
+    }
+
+    fn finishCollectNow(self: *Evaluator, result: *CollectNowResult, before: gc.LiveReport) void {
+        const after = gc.liveReport(&self.heap.gc_report);
+        result.ran = true;
+        result.collections = after.collections -| before.collections;
+        result.objects_freed = after.freed_objects -| before.freed_objects;
+        result.live_bytes = after.live_bytes;
+        result.capacity_bytes = self.heap.totalReservedBytes();
+    }
 
     /// GC: run a stop-the-world collection right now, from outside
     /// any evaluation — the repl's between-inputs reclaim. Drives the same
@@ -2006,16 +2031,13 @@ pub const Evaluator = struct {
     /// Callable only between evaluations (no fiber may be mid-flight on the
     /// calling thread); helpers park at their safepoints as in any STW.
     pub fn collectNow(self: *Evaluator) CollectNowResult {
-        var result: CollectNowResult = .{
-            .ran = false,
-            .reserved_before = self.heap.totalReservedBytes(),
-            .reserved_after = self.heap.totalReservedBytes(),
-        };
+        var result = self.collectNowResult();
         // No hook yet (nothing evaluated) or reclaim disabled by policy
         // (threshold never armed): nothing to do.
         if (self.main_worker == null) return result;
         if (self.heap.gc_threshold_bytes == std.math.maxInt(u64)) return result;
         if (!self.scheduler.gcTryBeginCollection()) return result;
+        const before = gc.liveReport(&self.heap.gc_report);
         self.scheduler.gcWaitAllParked(0);
         // Invalidate the token-keyed thread-local caches (thunk memo, attr
         // IC) BEFORE marking: they root the previous evaluation's hottest
@@ -2027,8 +2049,7 @@ pub const Evaluator = struct {
         self.heap.token = runtime.heap.next_heap_token.fetchAdd(1, .monotonic);
         heap_collector.runCollect(&self.heap, 0);
         self.scheduler.gcEndCollection(0);
-        result.ran = true;
-        result.reserved_after = self.heap.totalReservedBytes();
+        self.finishCollectNow(&result, before);
         return result;
     }
 
@@ -2039,20 +2060,16 @@ pub const Evaluator = struct {
     /// more objects tenure, repl memory would otherwise ratchet up). Same STW
     /// dance + cache-invalidating token bump as `collectNow`.
     pub fn collectMajorNow(self: *Evaluator) CollectNowResult {
-        var result: CollectNowResult = .{
-            .ran = false,
-            .reserved_before = self.heap.totalReservedBytes(),
-            .reserved_after = self.heap.totalReservedBytes(),
-        };
+        var result = self.collectNowResult();
         if (self.main_worker == null) return result;
         if (self.heap.gc_threshold_bytes == std.math.maxInt(u64)) return result;
         if (!self.scheduler.gcTryBeginCollection()) return result;
+        const before = gc.liveReport(&self.heap.gc_report);
         self.scheduler.gcWaitAllParked(0);
         self.heap.token = runtime.heap.next_heap_token.fetchAdd(1, .monotonic);
         gc_controller.collectMajor(gcContext(self), 0);
         self.scheduler.gcEndCollection(0);
-        result.ran = true;
-        result.reserved_after = self.heap.totalReservedBytes();
+        self.finishCollectNow(&result, before);
         return result;
     }
 

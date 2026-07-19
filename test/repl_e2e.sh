@@ -240,13 +240,12 @@ else
     echo "ok   tty+bare: no CSI output"
 fi
 
-# --- GC between inputs: RSS/reserved plateau ---------------------------------
+# --- GC between inputs: retained-capacity plateau -----------------------------
 #
-# Checks that reclaiming a heavy input's garbage between inputs holds reserved
-# memory flat. `:gc` runs a MAJOR (full) collection, which reclaims the tenured
-# old generation too — without it, under parallel workers more objects tenure
-# and reserved would ratchet up input to input (a minor only frees the young
-# survivors). Runs at the default worker count on purpose, to exercise that.
+# Checks that reclaiming a heavy input's garbage between inputs lets the heap
+# reuse its retained capacity. `:gc` runs a MAJOR (full) collection, which
+# reclaims the tenured old generation; without reuse the capacity would ratchet
+# up input to input. Runs at the default worker count on purpose.
 
 gc_soak() {
     local n=$1
@@ -261,12 +260,12 @@ first=$(gc_soak 3)
 last=$(gc_soak 24)
 echo "gc soak: after 3 inputs:  $first"
 echo "gc soak: after 24 inputs: $last"
-mb() { echo "$1" | sed -n 's/.*-> \([0-9.]*\) MiB.*/\1/p' | cut -d. -f1; }
+mb() { echo "$1" | sed -n 's/.*capacity \([0-9.]*\) MiB.*/\1/p' | cut -d. -f1; }
 a=$(mb "$first"); b=$(mb "$last")
 if [[ -n "$a" && -n "$b" ]] && (( b < a * 3 + 64 )); then
-    echo "ok   gc: reserved plateaus (${a} MiB -> ${b} MiB across 8x the inputs)"
+    echo "ok   gc: capacity plateaus (${a} MiB -> ${b} MiB across 8x the inputs)"
 else
-    echo "FAIL gc: reserved grew (${a:-?} MiB -> ${b:-?} MiB)"
+    echo "FAIL gc: capacity grew (${a:-?} MiB -> ${b:-?} MiB)"
     fails=$((fails+1))
 fi
 

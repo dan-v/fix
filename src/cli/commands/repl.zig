@@ -512,10 +512,16 @@ const Repl = struct {
                 const w = out.writer();
                 if (!r.ran) {
                     try w.writeAll("gc: collector inactive (non-gc build, --gc-budget=0, or nothing evaluated yet)\n");
+                } else if (r.collections == 0) {
+                    try w.print("gc: collector armed; heap capacity {d:.1} MiB retained for reuse\n", .{
+                        @as(f64, @floatFromInt(r.capacity_bytes)) / (1 << 20),
+                    });
                 } else {
-                    try w.print("gc: heap reserved {d:.1} MiB -> {d:.1} MiB\n", .{
-                        @as(f64, @floatFromInt(r.reserved_before)) / (1 << 20),
-                        @as(f64, @floatFromInt(r.reserved_after)) / (1 << 20),
+                    try w.print("gc: freed {d} object{s}; live {d:.1} MiB; heap capacity {d:.1} MiB retained for reuse\n", .{
+                        r.objects_freed,
+                        if (r.objects_freed == 1) "" else "s",
+                        @as(f64, @floatFromInt(r.live_bytes)) / (1 << 20),
+                        @as(f64, @floatFromInt(r.capacity_bytes)) / (1 << 20),
                     });
                 }
             },
