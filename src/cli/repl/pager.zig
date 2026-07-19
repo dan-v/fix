@@ -181,9 +181,9 @@ const IndexJob = struct {
 
     fn start(self: *IndexJob) !void {
         if (self.thread != null) return;
-        self.failed.store(false, .release);
         self.running.store(true, .release);
         self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.failed.store(true, .release);
             self.running.store(false, .release);
             return err;
         };
@@ -284,11 +284,13 @@ const ObjectJob = struct {
     mutex: sync.BlockingMutex = .{},
     ready: ?runtime.ObjectHeap.ObjectSnapshot = null,
     running: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
 
     fn start(self: *ObjectJob) !void {
         if (self.thread != null) return;
         self.running.store(true, .release);
         self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.failed.store(true, .release);
             self.running.store(false, .release);
             return err;
         };
@@ -296,6 +298,7 @@ const ObjectJob = struct {
 
     fn build(self: *ObjectJob) void {
         const result = self.ev.heapObjectSnapshot(std.heap.smp_allocator) catch {
+            self.failed.store(true, .release);
             self.running.store(false, .release);
             return;
         };
@@ -337,11 +340,13 @@ const RefJob = struct {
     mutex: sync.BlockingMutex = .{},
     ready: ?bytecode.inspect.RefGraph = null,
     running: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
 
     fn start(self: *RefJob) !void {
         if (self.thread != null) return;
         self.running.store(true, .release);
         self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.failed.store(true, .release);
             self.running.store(false, .release);
             return err;
         };
@@ -349,6 +354,7 @@ const RefJob = struct {
 
     fn build(self: *RefJob) void {
         const result = bytecode.inspect.RefGraph.build(std.heap.smp_allocator, self.registry) catch {
+            self.failed.store(true, .release);
             self.running.store(false, .release);
             return;
         };
@@ -424,8 +430,10 @@ const Tui = struct {
     heap_view_expanded: [5]bool = @splat(false),
     heap_stats: ?runtime.ObjectHeap.Stats = null,
     object_snapshot: ?runtime.ObjectHeap.ObjectSnapshot = null,
+    object_index_failed: bool = false,
     ref_graph: ?bytecode.inspect.RefGraph = null,
     reference_indexing: bool = false,
+    reference_index_failed: bool = false,
 
     const Focus = enum { chunks, disassembly };
     const TreeRow = union(enum) {
@@ -546,12 +554,14 @@ const Tui = struct {
             }
             const registry = self.ev.chunkRegistry();
             const stale = self.name_index.registry_count != registry.count() or self.name_index.name_count != registry.nameCount();
-            if (stale and index_job.thread == null) {
+            if (stale and index_job.thread == null and !index_job.failed.load(.acquire)) {
                 index_job.start() catch {
                     self.status_msg = "(name index failed)";
                 };
             }
-            self.indexing = stale or index_job.running.load(.acquire);
+            const name_failed = index_job.failed.load(.acquire);
+            self.indexing = !name_failed and (stale or index_job.running.load(.acquire));
+            if (stale and name_failed) self.status_msg = "(name index failed)";
             if (heap_job.poll(&self.heap_stats)) {
                 if (self.currentHeap() != null) try self.refreshPage(self.currentKind());
             }
@@ -564,8 +574,14 @@ const Tui = struct {
                 try self.rebuildTreeForCurrent();
                 if (self.currentObject() != null) try self.refreshPage(self.currentKind());
             }
+            const object_failed = object_job.failed.load(.acquire);
+            if (object_failed != self.object_index_failed) {
+                self.object_index_failed = object_failed;
+                if (self.currentObject() != null) try self.refreshPage(self.currentKind());
+            }
             const wants_objects = self.currentObject() != null or self.heap_view_expanded[@intFromEnum(HeapView.objects)];
-            if (wants_objects and self.object_snapshot == null and object_job.thread == null) {
+            if (wants_objects and object_failed) self.status_msg = "(object index failed)";
+            if (wants_objects and self.object_snapshot == null and object_job.thread == null and !object_job.failed.load(.acquire)) {
                 object_job.start() catch {
                     self.status_msg = "(object index failed)";
                 };
@@ -574,14 +590,20 @@ const Tui = struct {
                 self.reference_indexing = false;
                 if (self.currentChunk() != null and self.panels[@intFromEnum(Panel.references)]) try self.refreshPage(self.currentKind());
             }
+            const reference_failed = ref_job.failed.load(.acquire);
+            if (reference_failed != self.reference_index_failed) {
+                self.reference_index_failed = reference_failed;
+                if (self.currentChunk() != null and self.panels[@intFromEnum(Panel.references)]) try self.refreshPage(self.currentKind());
+            }
             const wants_references = self.currentChunk() != null and self.panels[@intFromEnum(Panel.references)];
+            if (wants_references and reference_failed) self.status_msg = "(reference index failed)";
             const refs_stale = self.ref_graph == null or self.ref_graph.?.registry_count != registry.count();
-            if (wants_references and refs_stale and ref_job.thread == null) {
+            if (wants_references and refs_stale and ref_job.thread == null and !ref_job.failed.load(.acquire)) {
                 ref_job.start() catch {
                     self.status_msg = "(reference index failed)";
                 };
             }
-            const now_reference_indexing = wants_references and (refs_stale or ref_job.running.load(.acquire));
+            const now_reference_indexing = wants_references and !reference_failed and (refs_stale or ref_job.running.load(.acquire));
             if (now_reference_indexing != self.reference_indexing) {
                 self.reference_indexing = now_reference_indexing;
                 try self.refreshPage(self.currentKind());
@@ -635,6 +657,11 @@ const Tui = struct {
                             object_job.finish(&self.object_snapshot);
                             _ = ref_job.finish(&self.ref_graph);
                             try host.execute(trimmed, &capture.writer);
+                            index_job.failed.store(false, .release);
+                            object_job.failed.store(false, .release);
+                            ref_job.failed.store(false, .release);
+                            self.object_index_failed = false;
+                            self.reference_index_failed = false;
                             self.heap_stats = null;
                             if (self.object_snapshot) |*snapshot| snapshot.deinit();
                             self.object_snapshot = null;
@@ -848,7 +875,7 @@ const Tui = struct {
         const arena = self.arena.allocator();
         var page: PageBuilder = .{ .arena = arena };
         const snapshot = self.object_snapshot orelse {
-            try page.line("building the live-object index asynchronously…", .none);
+            try page.line(if (self.object_index_failed) "live-object index unavailable" else "building the live-object index asynchronously…", .none);
             return .{
                 .title = try std.fmt.allocPrint(arena, "object[#{d}]", .{id}),
                 .lines = page.lines.items,
@@ -954,7 +981,7 @@ const Tui = struct {
 
     fn appendRefs(self: *Tui, page: *PageBuilder, id: ChunkId) !void {
         const graph = self.ref_graph orelse {
-            try page.line("indexing the chunk reference graph asynchronously…", .none);
+            try page.line(if (self.reference_index_failed) "chunk reference index unavailable" else "indexing the chunk reference graph asynchronously…", .none);
             return;
         };
         const outgoing = graph.outgoing(id);
@@ -964,7 +991,9 @@ const Tui = struct {
         const incoming = graph.incoming(id);
         try page.line(try std.fmt.allocPrint(page.arena, "incoming ({d})", .{incoming.len}), .none);
         for (incoming) |source| try self.appendChunkLabel(page, "  ←", source);
-        if (self.reference_indexing) {
+        if (self.reference_index_failed) {
+            try page.line("reference update failed; showing the previous graph", .none);
+        } else if (self.reference_indexing) {
             try page.line("updating references for newly compiled chunks…", .none);
         }
     }
@@ -1193,6 +1222,10 @@ const Tui = struct {
                 break;
             },
             .object => |entry| if (entry.id == self.currentObject()) {
+                self.tree_selection = i;
+                break;
+            },
+            .heap => |entry| if (self.currentHeap() == entry.view) {
                 self.tree_selection = i;
                 break;
             },
@@ -1560,7 +1593,11 @@ const Tui = struct {
                 self.category_expanded[@intFromEnum(Category.heap)] = true;
                 try self.rebuildTreeForCurrent();
             },
-            .heap, .help => {},
+            .heap => {
+                self.category_expanded[@intFromEnum(Category.heap)] = true;
+                try self.rebuildTreeForCurrent();
+            },
+            .help => {},
         }
         self.x_scroll = 0;
         switch (kind) {
@@ -1945,6 +1982,11 @@ const Tui = struct {
         else if (self.currentHeap()) |view|
             std.fmt.bufPrint(&header_buf, " fix vm  ·  heap/{s}  ·  {s} ", .{
                 @tagName(view),
+                if (prompt_active) "repl" else if (self.focus == .chunks) "tree" else "inspector",
+            }) catch " fix vm "
+        else if (self.currentObject()) |id|
+            std.fmt.bufPrint(&header_buf, " fix vm  ·  object #{d}  ·  {s} ", .{
+                id,
                 if (prompt_active) "repl" else if (self.focus == .chunks) "tree" else "inspector",
             }) catch " fix vm "
         else
