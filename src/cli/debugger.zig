@@ -15,6 +15,7 @@ const std = @import("std");
 const engine = @import("expr");
 const runtime = @import("runtime");
 const presentation = @import("presentation.zig");
+const term_mod = @import("repl/term.zig");
 const syntax = @import("syntax");
 
 const DebugSession = engine.DebugSession;
@@ -74,6 +75,14 @@ pub const Console = struct {
     }
 
     fn drive(self: *Console, s: *DebugSession) !void {
+        // A debugger pause is a nested prompt inside the full-screen REPL.
+        // Temporarily reveal the ordinary terminal and restore canonical input;
+        // returning to the evaluator re-enters the alternate screen/raw mode,
+        // which the REPL immediately redraws. `fix eval --debugger` and bare
+        // mode are already cooked, so this becomes a no-op there.
+        var screen_pause = ScreenPause.begin(self.io);
+        defer screen_pause.end();
+
         self.hits += 1;
         // Whatever step brought us here (if any) is complete — disarm its temps.
         s.clearStep();
@@ -88,7 +97,14 @@ pub const Console = struct {
             try self.banner(w, s);
         }
 
-        var in = self.inputReader();
+        // In the nested case, read a byte at a time so the debugger cannot
+        // buffer a command typed ahead for the resumed REPL. Other modes keep
+        // the persistent buffered reader (or the bare REPL's shared reader).
+        var nested_buf: [1]u8 = undefined;
+        var nested_reader = std.Io.File.stdin().readerStreaming(self.io, &nested_buf);
+        const in = if (screen_pause.cooked.active) &nested_reader else self.inputReader();
+        var nested_line: std.ArrayListUnmanaged(u8) = .empty;
+        defer nested_line.deinit(self.allocator);
         while (true) {
             {
                 var out = self.stderr();
@@ -97,15 +113,39 @@ pub const Console = struct {
                 try out.interface.writeAll("(debug) ");
                 try presentation.reset(&out.interface, self.use_color);
             }
-            const raw = in.interface.takeDelimiter('\n') catch |err| switch (err) {
+            const raw = (if (screen_pause.cooked.active)
+                self.takeNestedLine(in, &nested_line)
+            else
+                in.interface.takeDelimiter('\n')) catch |err| switch (err) {
                 error.StreamTooLong => {
-                    _ = in.interface.discardDelimiterInclusive('\n') catch {};
+                    if (!screen_pause.cooked.active) _ = in.interface.discardDelimiterInclusive('\n') catch {};
                     continue;
                 },
                 else => return err,
             } orelse return; // EOF: resume as if `continue`.
             const line = std.mem.trim(u8, raw, " \t\r\n");
             if (try self.dispatch(s, line, scope)) return;
+        }
+    }
+
+    /// Read one canonical-mode line without consuming bytes after its newline.
+    /// The one-byte `File.Reader` backing this path makes `takeByte` leave any
+    /// type-ahead for the resumed full-screen REPL in the kernel input queue.
+    fn takeNestedLine(self: *Console, in: *std.Io.File.Reader, line: *std.ArrayListUnmanaged(u8)) !?[]const u8 {
+        line.clearRetainingCapacity();
+        while (true) {
+            const byte = in.interface.takeByte() catch |err| switch (err) {
+                error.EndOfStream => return if (line.items.len == 0) null else line.items,
+                else => return err,
+            };
+            if (byte == '\n') return line.items;
+            if (line.items.len == 64 * 1024) {
+                while (true) {
+                    const discarded = in.interface.takeByte() catch return error.StreamTooLong;
+                    if (discarded == '\n') return error.StreamTooLong;
+                }
+            }
+            try line.append(self.allocator, byte);
         }
     }
 
@@ -501,6 +541,30 @@ pub const Console = struct {
         try w.writeAll("error");
         try presentation.reset(w, self.use_color);
         try w.print(": " ++ fmt ++ "\n", fmt_args);
+    }
+};
+
+const ScreenPause = struct {
+    io: std.Io,
+    cooked: term_mod.CookedPause,
+
+    fn begin(io: std.Io) ScreenPause {
+        const cooked = term_mod.CookedPause.begin();
+        if (cooked.active) writeScreenMode(io, "\x1b[?2004l\x1b[?1049l\x1b[?25h");
+        return .{ .io = io, .cooked = cooked };
+    }
+
+    fn end(self: *ScreenPause) void {
+        if (!self.cooked.active) return;
+        self.cooked.end();
+        writeScreenMode(self.io, "\x1b[?1049h\x1b[?2004h\x1b[?25l");
+    }
+
+    fn writeScreenMode(io: std.Io, bytes: []const u8) void {
+        var buffer: [128]u8 = undefined;
+        var out = std.Io.File.stdout().writerStreaming(io, &buffer);
+        out.interface.writeAll(bytes) catch return;
+        out.interface.flush() catch {};
     }
 };
 

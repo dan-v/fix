@@ -101,18 +101,7 @@ pub const RawMode = struct {
         const orig = try posix.tcgetattr(stdin_fd);
         installHandlers();
 
-        var raw = orig;
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = false;
-        raw.iflag.IXON = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.BRKINT = false;
-        raw.iflag.INPCK = false;
-        raw.iflag.ISTRIP = false;
-        raw.cc[@intFromEnum(posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+        const raw = rawTermios(orig);
         try posix.tcsetattr(stdin_fd, .DRAIN, raw);
         saved_termios = orig;
         return .{ .active = true };
@@ -138,19 +127,48 @@ pub const RawMode = struct {
         posix.raise(.TSTP) catch {};
         // …stopped; resumed here on SIGCONT.
         if (orig) |o| {
-            var raw = o;
-            raw.lflag.ICANON = false;
-            raw.lflag.ECHO = false;
-            raw.lflag.IEXTEN = false;
-            raw.lflag.ISIG = false;
-            raw.iflag.IXON = false;
-            raw.iflag.ICRNL = false;
-            raw.cc[@intFromEnum(posix.V.MIN)] = 1;
-            raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+            const raw = rawTermios(o);
             posix.tcsetattr(stdin_fd, .DRAIN, raw) catch {};
             saved_termios = o;
             self.active = true;
         }
+    }
+};
+
+fn rawTermios(orig: posix.termios) posix.termios {
+    var raw = orig;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.IEXTEN = false;
+    raw.lflag.ISIG = false;
+    raw.iflag.IXON = false;
+    raw.iflag.ICRNL = false;
+    raw.iflag.BRKINT = false;
+    raw.iflag.INPCK = false;
+    raw.iflag.ISTRIP = false;
+    raw.cc[@intFromEnum(posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+    return raw;
+}
+
+/// Temporarily put an already-owned raw terminal back into its original
+/// cooked state without releasing `RawMode`'s restore/fatal-signal contract.
+/// The debugger uses this for its nested line-oriented prompt, then returns
+/// control to the full-screen REPL and re-enters the exact same raw mode.
+pub const CookedPause = struct {
+    active: bool = false,
+
+    pub fn begin() CookedPause {
+        const orig = saved_termios orelse return .{};
+        posix.tcsetattr(stdin_fd, .DRAIN, orig) catch return .{};
+        return .{ .active = true };
+    }
+
+    pub fn end(self: *CookedPause) void {
+        if (!self.active) return;
+        self.active = false;
+        const orig = saved_termios orelse return;
+        posix.tcsetattr(stdin_fd, .DRAIN, rawTermios(orig)) catch {};
     }
 };
 
