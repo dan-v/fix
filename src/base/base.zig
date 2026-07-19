@@ -25,6 +25,7 @@ pub const worker_id = @import("worker_id.zig");
 pub const blocking_pool = @import("blocking_pool.zig");
 pub const terminal_text = @import("terminal_text.zig");
 pub const terminal_color = @import("terminal_color.zig");
+pub const tui = @import("tui.zig");
 pub const observ = @import("observ.zig");
 
 // Common flat re-exports for the most-used types.
@@ -50,5 +51,6 @@ test {
     _ = blocking_pool;
     _ = terminal_text;
     _ = terminal_color;
+    _ = tui;
     _ = observ;
 }

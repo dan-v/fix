@@ -14,7 +14,9 @@ const width_mod = @import("width.zig");
 const editor_mod = @import("editor.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("transcript.zig");
-const ColorDepth = @import("base").terminal_color.Depth;
+const base = @import("base");
+const tui = base.tui;
+const ColorDepth = base.terminal_color.Depth;
 const sync = @import("base").sync;
 
 const Evaluator = engine.Evaluator;
@@ -111,7 +113,7 @@ pub fn browse(
 ) !void {
     var name_index = try bytecode.inspect.NameIndex.build(allocator, ev.chunkRegistry());
     defer name_index.deinit();
-    var tui = Tui{
+    var explorer = Tui{
         .allocator = allocator,
         .io = io,
         .ev = ev,
@@ -119,8 +121,8 @@ pub fn browse(
         .name_index = &name_index,
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
-    defer tui.deinit();
-    try tui.run(start);
+    defer explorer.deinit();
+    try explorer.run(start);
 }
 
 /// The REPL owns evaluation semantics; the screen owns input/output placement.
@@ -166,7 +168,7 @@ pub fn runSession(
 ) !void {
     var name_index = try bytecode.inspect.NameIndex.build(allocator, ev.chunkRegistry());
     defer name_index.deinit();
-    var tui = Tui{
+    var explorer = Tui{
         .allocator = allocator,
         .io = io,
         .ev = ev,
@@ -175,8 +177,8 @@ pub fn runSession(
         .session_host = host,
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
-    defer tui.deinit();
-    try tui.runSession(editor, transcript, host);
+    defer explorer.deinit();
+    try explorer.runSession(editor, transcript, host);
 }
 
 const IndexJob = struct {
@@ -255,6 +257,8 @@ const Tui = struct {
     scroll: usize = 0,
     search: std.ArrayListUnmanaged(u8) = .empty,
     expanded: std.AutoHashMapUnmanaged(bytecode.name_tree.NameId, void) = .empty,
+    expanded_ranges: std.AutoHashMapUnmanaged(u128, void) = .empty,
+    focus_path: std.AutoHashMapUnmanaged(bytecode.name_tree.NameId, void) = .empty,
     tree_rows: std.ArrayListUnmanaged(TreeRow) = .empty,
     transcript_lines: std.ArrayListUnmanaged(LineRange) = .empty,
     status_msg: []const u8 = "",
@@ -270,18 +274,35 @@ const Tui = struct {
     const TreeRow = union(enum) {
         name: struct { id: bytecode.name_tree.NameId, depth: u16 },
         chunk: struct { id: ChunkId, depth: u16 },
-        more: struct { count: usize, depth: u16 },
+        range: Range,
+    };
+    const RangeKind = enum(u1) { names, chunks };
+    const Range = struct {
+        kind: RangeKind,
+        parent: bytecode.name_tree.NameId,
+        start: u32,
+        len: u32,
+        depth: u16,
+
+        fn key(self: Range) u128 {
+            return (@as(u128, @intFromEnum(self.kind)) << 96) |
+                (@as(u128, self.parent) << 64) |
+                (@as(u128, self.start) << 32) |
+                @as(u128, self.len);
+        }
     };
     const LineRange = struct { start: usize, end: usize };
 
-    const tree_child_cap = 200;
-    const tree_chunk_cap = 100;
+    const range_leaf = 128;
+    const range_branch = 4096;
 
     fn deinit(self: *Tui) void {
         self.stack.deinit(self.allocator);
         self.forward.deinit(self.allocator);
         self.search.deinit(self.allocator);
         self.expanded.deinit(self.allocator);
+        self.expanded_ranges.deinit(self.allocator);
+        self.focus_path.deinit(self.allocator);
         self.tree_rows.deinit(self.allocator);
         self.transcript_lines.deinit(self.allocator);
         self.arena.deinit();
@@ -295,10 +316,9 @@ const Tui = struct {
         var out = std.Io.File.stdout().writerStreaming(self.io, &out_buf);
         const w = &out.interface;
 
-        // Alternate screen + hidden cursor; both restored on the way out.
-        try w.writeAll("\x1b[?1049h\x1b[?25l");
+        var screen = try tui.Screen.enter(w, .{});
         defer {
-            w.writeAll("\x1b[?1049l\x1b[?25h") catch {};
+            screen.leave() catch {};
             w.flush() catch {};
         }
 
@@ -348,9 +368,9 @@ const Tui = struct {
         var out_buf: [64 * 1024]u8 = undefined;
         var out = std.Io.File.stdout().writerStreaming(self.io, &out_buf);
         const w = &out.interface;
-        try w.writeAll("\x1b[?1049h\x1b[?2004h");
+        var screen = try tui.Screen.enter(w, .{ .bracketed_paste = true });
         defer {
-            w.writeAll("\x1b[?2004l\x1b[?1049l\x1b[?25h") catch {};
+            screen.leave() catch {};
             w.flush() catch {};
         }
 
@@ -370,11 +390,12 @@ const Tui = struct {
 
         var index_job = IndexJob{ .registry = self.ev.chunkRegistry() };
         defer index_job.deinit();
+        var prompt_style_buf: [64]u8 = undefined;
         var prompt_renderer = render_mod.Renderer.init(
             self.allocator,
             term_mod.size().cols,
             self.color_depth.enabled(),
-            "\x1b[1;36m",
+            try tui.roleCode(&prompt_style_buf, self.color_depth, .section),
         );
         defer prompt_renderer.deinit();
         var frame_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -465,7 +486,7 @@ const Tui = struct {
                             try capture.writer.writeAll("^C\n");
                             try self.rebuildTranscriptLines(capture.written());
                         },
-                        .clear_screen => try w.writeAll("\x1b[2J"),
+                        .clear_screen => try screen.clear(),
                         .suspend_process => {
                             try w.flush();
                             raw.suspendProcess();
@@ -595,9 +616,6 @@ const Tui = struct {
             .source => "SOURCE",
             .references => "REFERENCES",
         };
-        if (self.color_depth.enabled()) {
-            return std.fmt.allocPrint(arena, "\x1b[1;36m{s} {s}\x1b[0m", .{ if (is_open) "▾" else "▸", label });
-        }
         return std.fmt.allocPrint(arena, "{s} {s}", .{ if (is_open) "▾" else "▸", label });
     }
 
@@ -697,7 +715,7 @@ const Tui = struct {
         return document.lines.items;
     }
 
-    fn appendSourceExcerpt(self: *Tui, document: *PageBuilder, source: []const u8, span: bytecode.Chunk.SourceSpan) !void {
+    fn appendSourceExcerpt(_: *Tui, document: *PageBuilder, source: []const u8, span: bytecode.Chunk.SourceSpan) !void {
         const focus_start = @min(@as(usize, span.offset), source.len);
         const focus_end = @min(focus_start +| @as(usize, span.len), source.len);
 
@@ -724,11 +742,9 @@ const Tui = struct {
             const line_end = @min(newline, end);
             const active = cursor < focus_end and line_end >= focus_start;
             var rendered: std.Io.Writer.Allocating = .init(document.arena);
-            if (active and self.color_depth.enabled()) try rendered.writer.writeAll("\x1b[1;33m");
             try rendered.writer.print("{s} {d:>5} │ ", .{ if (active) "▶" else " ", line_number });
             try writeSanitizedSource(&rendered.writer, source[cursor..@min(line_end, cursor +| 4096)]);
             if (line_end > cursor +| 4096) try rendered.writer.writeAll(" …");
-            if (active and self.color_depth.enabled()) try rendered.writer.writeAll("\x1b[0m");
             try document.line(rendered.written(), .none);
             line_number += 1;
             if (newline >= end or newline == source.len) break;
@@ -787,10 +803,13 @@ const Tui = struct {
     }
 
     fn expandFocusedPath(self: *Tui, chunk_id: ChunkId) !void {
+        self.focus_path.clearRetainingCapacity();
         try self.expanded.put(self.allocator, bytecode.root_name_id, {});
+        try self.focus_path.put(self.allocator, bytecode.root_name_id, {});
         var name = self.ev.chunkRegistry().nameOf(chunk_id) orelse bytecode.root_name_id;
         while (name != bytecode.root_name_id) {
             try self.expanded.put(self.allocator, name, {});
+            try self.focus_path.put(self.allocator, name, {});
             name = (self.name_index.node(name) orelse break).parent;
         }
     }
@@ -808,34 +827,92 @@ const Tui = struct {
         };
     }
 
-    fn appendNameRows(self: *Tui, name: bytecode.name_tree.NameId, depth: u16, focused_chunk: ChunkId) !void {
+    fn appendNameRows(self: *Tui, name: bytecode.name_tree.NameId, depth: u16, focused_chunk: ChunkId) std.mem.Allocator.Error!void {
         try self.tree_rows.append(self.allocator, .{ .name = .{ .id = name, .depth = depth } });
         if (!self.expanded.contains(name)) return;
         const next_depth = depth +| 1;
-
-        var child_total: usize = 0;
-        var child_shown: usize = 0;
-        for (self.name_index.childrenOf(name)) |child| {
-            if (self.name_index.statsOf(child).chunks == 0) continue;
-            child_total += 1;
-            if (child_shown >= tree_child_cap) continue;
-            try self.appendNameRows(child, next_depth, focused_chunk);
-            child_shown += 1;
-        }
+        const children = self.name_index.childrenOf(name);
+        try self.appendNameRange(name, children, 0, @intCast(children.len), next_depth, focused_chunk);
 
         const chunks = self.name_index.chunksOf(name);
-        const chunk_shown = @min(chunks.len, tree_chunk_cap);
-        var focus_shown = false;
-        for (chunks[0..chunk_shown]) |id| {
-            try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = id, .depth = next_depth } });
-            focus_shown = focus_shown or id == focused_chunk;
-        }
-        if (!focus_shown and std.mem.indexOfScalar(ChunkId, chunks, focused_chunk) != null) {
-            try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = focused_chunk, .depth = next_depth } });
+        try self.appendChunkRange(name, chunks, 0, @intCast(chunks.len), next_depth, focused_chunk);
+    }
+
+    fn appendNameRange(
+        self: *Tui,
+        parent: bytecode.name_tree.NameId,
+        children: []const bytecode.name_tree.NameId,
+        start: u32,
+        len: u32,
+        depth: u16,
+        focused_chunk: ChunkId,
+    ) std.mem.Allocator.Error!void {
+        if (len == 0) return;
+        if (len <= range_leaf) {
+            for (children[start .. start + len]) |child| {
+                if (self.name_index.statsOf(child).chunks == 0) continue;
+                try self.appendNameRows(child, depth, focused_chunk);
+            }
+            return;
         }
 
-        const omitted = (child_total -| child_shown) + (chunks.len -| chunk_shown);
-        if (omitted > 0) try self.tree_rows.append(self.allocator, .{ .more = .{ .count = omitted, .depth = next_depth } });
+        const span: u32 = if (len > range_branch) range_branch else range_leaf;
+        var offset: u32 = 0;
+        while (offset < len) : (offset += span) {
+            const range: Range = .{
+                .kind = .names,
+                .parent = parent,
+                .start = start + offset,
+                .len = @min(span, len - offset),
+                .depth = depth,
+            };
+            try self.tree_rows.append(self.allocator, .{ .range = range });
+            var contains_focus = false;
+            for (children[range.start .. range.start + range.len]) |child| {
+                if (self.focus_path.contains(child)) {
+                    contains_focus = true;
+                    break;
+                }
+            }
+            if (contains_focus or self.expanded_ranges.contains(range.key())) {
+                try self.appendNameRange(parent, children, range.start, range.len, depth +| 1, focused_chunk);
+            }
+        }
+    }
+
+    fn appendChunkRange(
+        self: *Tui,
+        parent: bytecode.name_tree.NameId,
+        chunks: []const ChunkId,
+        start: u32,
+        len: u32,
+        depth: u16,
+        focused_chunk: ChunkId,
+    ) std.mem.Allocator.Error!void {
+        if (len == 0) return;
+        if (len <= range_leaf) {
+            for (chunks[start .. start + len]) |id| {
+                try self.tree_rows.append(self.allocator, .{ .chunk = .{ .id = id, .depth = depth } });
+            }
+            return;
+        }
+
+        const span: u32 = if (len > range_branch) range_branch else range_leaf;
+        var offset: u32 = 0;
+        while (offset < len) : (offset += span) {
+            const range: Range = .{
+                .kind = .chunks,
+                .parent = parent,
+                .start = start + offset,
+                .len = @min(span, len - offset),
+                .depth = depth,
+            };
+            try self.tree_rows.append(self.allocator, .{ .range = range });
+            const slice = chunks[range.start .. range.start + range.len];
+            if (std.mem.indexOfScalar(ChunkId, slice, focused_chunk) != null or self.expanded_ranges.contains(range.key())) {
+                try self.appendChunkRange(parent, chunks, range.start, range.len, depth +| 1, focused_chunk);
+            }
+        }
     }
 
     fn moveTree(self: *Tui, forward: bool) void {
@@ -868,17 +945,50 @@ const Tui = struct {
                 };
             },
             .chunk => |entry| try self.open(.{ .chunk = entry.id }),
-            .more => self.status_msg = "(bounded; use :vm chunks in the prompt)",
+            .range => |range| {
+                if (!self.expanded_ranges.remove(range.key())) try self.expanded_ranges.put(self.allocator, range.key(), {});
+                const focused = self.currentChunk() orelse 0;
+                try self.rebuildTree(focused);
+                for (self.tree_rows.items, 0..) |row, i| switch (row) {
+                    .range => |candidate| if (candidate.key() == range.key()) {
+                        self.tree_selection = i;
+                        break;
+                    },
+                    else => {},
+                };
+            },
         }
     }
 
     fn collapseTreeRow(self: *Tui) !void {
         if (self.tree_selection >= self.tree_rows.items.len) return;
         const selected = self.tree_rows.items[self.tree_selection];
+        if (selected == .range) {
+            const range = selected.range;
+            if (self.expanded_ranges.remove(range.key())) {
+                const focused = self.currentChunk() orelse 0;
+                try self.rebuildTree(focused);
+                for (self.tree_rows.items, 0..) |row, i| switch (row) {
+                    .range => |candidate| if (candidate.key() == range.key()) {
+                        self.tree_selection = i;
+                        return;
+                    },
+                    else => {},
+                };
+            }
+            for (self.tree_rows.items, 0..) |row, i| switch (row) {
+                .name => |entry| if (entry.id == range.parent) {
+                    self.tree_selection = i;
+                    return;
+                },
+                else => {},
+            };
+            return;
+        }
         const name: bytecode.name_tree.NameId = switch (selected) {
             .name => |entry| entry.id,
             .chunk => |entry| self.ev.chunkRegistry().nameOf(entry.id) orelse bytecode.root_name_id,
-            .more => return,
+            .range => unreachable,
         };
         if (self.expanded.remove(name)) {
             const focused = self.currentChunk() orelse 0;
@@ -982,7 +1092,7 @@ const Tui = struct {
 
     fn maxXScroll(self: *const Tui) usize {
         var widest: usize = 0;
-        for (self.page.lines) |line| widest = @max(widest, displayWidth(line));
+        for (self.page.lines) |line| widest = @max(widest, tui.displayWidth(line, width_mod.cpWidth));
         return widest -| self.layout().main_width;
     }
 
@@ -1199,7 +1309,12 @@ const Tui = struct {
 
         while (true) {
             const size = term_mod.size();
-            try w.print("\x1b[{d};1H\x1b[K/{s}", .{ size.rows, self.search.items });
+            var frame = tui.Frame.init(w, self.color_depth, width_mod.cpWidth);
+            try frame.clearRow(size.rows);
+            try frame.at(size.rows, 1);
+            var search_buf: [1024]u8 = undefined;
+            const search_line = std.fmt.bufPrint(&search_buf, "/{s}", .{self.search.items}) catch "/";
+            try frame.text(search_line, 0, size.cols, .section);
             try w.flush();
             const result = term_mod.readInput(&read_buf, if (decoder.wantsMore()) 40 else -1);
             events.clearRetainingCapacity();
@@ -1266,6 +1381,7 @@ const Tui = struct {
         capture: *const transcript_mod.Capture,
         prompt_active: bool,
     ) !void {
+        var frame = tui.Frame.init(w, self.color_depth, width_mod.cpWidth);
         const size = term_mod.size();
         const cols = @max(@as(usize, 1), size.cols);
         const screen_rows = @max(@as(usize, 3), size.rows);
@@ -1296,20 +1412,22 @@ const Tui = struct {
             }) catch " fix repl "
         else
             " fix repl  ·  prompt ";
-        try moveTo(w, 1, 1);
-        try writeBar(w, header, cols, self.color_depth.enabled(), .header);
+        try frame.bar(1, header, cols, .header);
 
         if (explorer_rows > 0) {
-            try self.drawExplorerBody(w, 2, explorer_rows, cols);
+            try self.drawExplorerBody(&frame, 2, explorer_rows, cols);
             const separator_row = 2 + explorer_rows;
-            try moveTo(w, separator_row, 1);
-            try w.writeAll("\x1b[0m\x1b[K\x1b[2m ─ transcript ");
-            if (self.indexing) try w.writeAll("· indexing VM names asynchronously ");
-            try w.writeAll("\x1b[0m");
+            try frame.clearRow(separator_row);
+            const separator = if (self.indexing)
+                " ─ transcript · indexing VM names asynchronously "
+            else
+                " ─ transcript ";
+            try frame.at(separator_row, 1);
+            try frame.text(separator, 0, cols, .muted);
         }
 
         const transcript_start = 2 + explorer_rows + @intFromBool(explorer_rows > 0);
-        try self.drawTranscript(w, transcript_start, transcript_rows, cols, capture.written());
+        try self.drawTranscript(&frame, transcript_start, transcript_rows, cols, capture.written());
 
         var footer_buf: [512]u8 = undefined;
         const footer = if (prompt_active and capture.omitted() > 0)
@@ -1320,58 +1438,59 @@ const Tui = struct {
             std.fmt.bufPrint(&footer_buf, " q/Esc exit · : prompt · Tab pane · c/t/s/r sections · ↵ interact{s} ", .{
                 if (self.indexing) " · indexing" else "",
             }) catch " q exit ";
-        try moveTo(w, screen_rows, 1);
-        try writeBar(w, footer, cols, self.color_depth.enabled(), .footer);
+        try frame.bar(screen_rows, footer, cols, .footer);
 
-        try moveTo(w, prompt_start, 1);
+        try frame.at(prompt_start, 1);
         prompt_renderer.invalidate();
-        if (prompt_active) try w.writeAll("\x1b[?25h") else try w.writeAll("\x1b[?25l");
+        try frame.cursor(prompt_active);
         try prompt_renderer.draw(w, prompt_view);
-        if (!prompt_active) try w.writeAll("\x1b[?25l");
+        if (!prompt_active) try frame.cursor(false);
     }
 
-    fn drawExplorerBody(self: *Tui, w: *std.Io.Writer, first_row: usize, rows: usize, cols: usize) !void {
+    fn drawExplorerBody(self: *Tui, frame: *tui.Frame, first_row: usize, rows: usize, cols: usize) !void {
         const layout_now = self.layout();
         self.clampScroll();
         self.tree_selection = @min(self.tree_selection, self.tree_rows.items.len -| 1);
         for (0..rows) |row| {
-            try moveTo(w, first_row + row, 1);
-            try w.writeAll("\x1b[0m\x1b[K");
+            const screen_row = first_row + row;
+            try frame.clearRow(screen_row);
             if (layout_now.split) {
-                try self.drawChunkRow(w, row, layout_now.sidebar_width, rows);
-                try moveTo(w, first_row + row, layout_now.sidebar_width + 1);
-                try w.writeAll("\x1b[2m│\x1b[0m");
-                try moveTo(w, first_row + row, layout_now.main_col);
-                try self.drawDisasmRow(w, row, layout_now.main_width);
+                try frame.at(screen_row, 1);
+                try self.drawChunkRow(frame, row, layout_now.sidebar_width, rows);
+                try frame.divider(screen_row, layout_now.sidebar_width + 1);
+                try frame.at(screen_row, layout_now.main_col);
+                try self.drawDisasmRow(frame, row, layout_now.main_width);
                 if (layout_now.source_split) {
-                    try moveTo(w, first_row + row, layout_now.source_col - 1);
-                    try w.writeAll("\x1b[2m│\x1b[0m");
-                    try moveTo(w, first_row + row, layout_now.source_col);
-                    try self.drawSourceRow(w, row, layout_now.source_width);
+                    try frame.divider(screen_row, layout_now.source_col - 1);
+                    try frame.at(screen_row, layout_now.source_col);
+                    try self.drawSourceRow(frame, row, layout_now.source_width);
                 }
             } else if (self.focus == .chunks) {
-                try self.drawChunkRow(w, row, cols, rows);
+                try frame.at(screen_row, 1);
+                try self.drawChunkRow(frame, row, cols, rows);
             } else {
-                try self.drawDisasmRow(w, row, layout_now.main_width);
+                try frame.at(screen_row, 1);
+                try self.drawDisasmRow(frame, row, layout_now.main_width);
             }
         }
     }
 
-    fn drawTranscript(self: *Tui, w: *std.Io.Writer, first_row: usize, rows: usize, cols: usize, text: []const u8) !void {
+    fn drawTranscript(self: *Tui, frame: *tui.Frame, first_row: usize, rows: usize, cols: usize, text: []const u8) !void {
         const shown = @min(rows, self.transcript_lines.items.len);
         const first_line = self.transcript_lines.items.len -| shown;
         const top_padding = rows -| shown;
         for (0..rows) |row| {
-            try moveTo(w, first_row + row, 1);
-            try w.writeAll("\x1b[0m\x1b[K");
+            try frame.clearRow(first_row + row);
             if (row < top_padding) continue;
             const range = self.transcript_lines.items[first_line + row - top_padding];
             const line = std.mem.trimEnd(u8, text[range.start..range.end], "\r");
-            try writeAnsiWindow(w, line, 0, cols);
+            try frame.at(first_row + row, 1);
+            try frame.text(line, 0, cols, .plain);
         }
     }
 
     fn draw(self: *Tui, w: *std.Io.Writer) !void {
+        var frame = tui.Frame.init(w, self.color_depth, width_mod.cpWidth);
         const layout_now = self.layout();
         const rows = layout_now.body_rows;
         self.clampScroll();
@@ -1382,29 +1501,29 @@ const Tui = struct {
             self.page.title,
             if (self.focus == .chunks) "tree" else "detail",
         }) catch " fix vm ";
-        try moveTo(w, 1, 1);
-        try writeBar(w, header, layout_now.cols, self.color_depth.enabled(), .header);
+        try frame.bar(1, header, layout_now.cols, .header);
 
         var row: usize = 0;
         while (row < rows) : (row += 1) {
-            try moveTo(w, row + 2, 1);
-            try w.writeAll("\x1b[0m\x1b[K");
+            const screen_row = row + 2;
+            try frame.clearRow(screen_row);
             if (layout_now.split) {
-                try self.drawChunkRow(w, row, layout_now.sidebar_width, rows);
-                try moveTo(w, row + 2, layout_now.sidebar_width + 1);
-                try w.writeAll("\x1b[2m│\x1b[0m");
-                try moveTo(w, row + 2, layout_now.main_col);
-                try self.drawDisasmRow(w, row, layout_now.main_width);
+                try frame.at(screen_row, 1);
+                try self.drawChunkRow(&frame, row, layout_now.sidebar_width, rows);
+                try frame.divider(screen_row, layout_now.sidebar_width + 1);
+                try frame.at(screen_row, layout_now.main_col);
+                try self.drawDisasmRow(&frame, row, layout_now.main_width);
                 if (layout_now.source_split) {
-                    try moveTo(w, row + 2, layout_now.source_col - 1);
-                    try w.writeAll("\x1b[2m│\x1b[0m");
-                    try moveTo(w, row + 2, layout_now.source_col);
-                    try self.drawSourceRow(w, row, layout_now.source_width);
+                    try frame.divider(screen_row, layout_now.source_col - 1);
+                    try frame.at(screen_row, layout_now.source_col);
+                    try self.drawSourceRow(&frame, row, layout_now.source_width);
                 }
             } else if (self.focus == .chunks) {
-                try self.drawChunkRow(w, row, layout_now.cols, rows);
+                try frame.at(screen_row, 1);
+                try self.drawChunkRow(&frame, row, layout_now.cols, rows);
             } else {
-                try self.drawDisasmRow(w, row, layout_now.main_width);
+                try frame.at(screen_row, 1);
+                try self.drawDisasmRow(&frame, row, layout_now.main_width);
             }
         }
 
@@ -1420,30 +1539,102 @@ const Tui = struct {
             self.x_scroll,
             self.status_msg,
         }) catch " q quit ";
-        try moveTo(w, layout_now.rows, 1);
-        try writeBar(w, footer, layout_now.cols, self.color_depth.enabled(), .footer);
+        try frame.bar(layout_now.rows, footer, layout_now.cols, .footer);
     }
 
-    fn drawDisasmRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize) !void {
+    fn drawDisasmRow(self: *Tui, frame: *tui.Frame, row: usize, width: usize) !void {
         const idx = self.scroll + row;
         if (idx < self.page.lines.len) {
             const selected = idx == self.detail_selection and self.focus == .disassembly and self.rowActionable(idx);
             if (selected and width >= 2) {
-                if (self.color_depth.enabled()) try w.writeAll("\x1b[1;33m› \x1b[0m") else try w.writeAll("> ");
-                try writeAnsiWindow(w, self.page.lines[idx], self.x_scroll, width - 2);
+                try frame.text("› ", 0, 2, .selection_marker);
+                try frame.text(self.page.lines[idx], self.x_scroll, width - 2, self.detailRole(idx));
             } else {
-                try writeAnsiWindow(w, self.page.lines[idx], self.x_scroll, width);
+                try frame.text(self.page.lines[idx], self.x_scroll, width, self.detailRole(idx));
             }
         } else if (idx == self.page.lines.len and self.page.lines.len != 0) {
-            try writeAnsiWindow(w, "\x1b[2m(end)\x1b[0m", 0, width);
+            try frame.text("(end)", 0, width, .muted);
         }
     }
 
-    fn drawSourceRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize) !void {
-        if (row < self.page.source_lines.len) try writeAnsiWindow(w, self.page.source_lines[row], 0, width);
+    fn detailRole(self: *const Tui, index: usize) tui.Role {
+        if (index < self.page.actions.len) switch (self.page.actions[index]) {
+            .section => return .section,
+            .chunk => return .chunk,
+            .none => {},
+        };
+        return if (std.mem.startsWith(u8, self.page.lines[index], "▶")) .source_focus else .plain;
     }
 
-    fn drawChunkRow(self: *Tui, w: *std.Io.Writer, row: usize, width: usize, rows: usize) !void {
+    fn drawSourceRow(self: *Tui, frame: *tui.Frame, row: usize, width: usize) !void {
+        if (row < self.page.source_lines.len) {
+            const role: tui.Role = if (std.mem.startsWith(u8, self.page.source_lines[row], "▶")) .source_focus else .plain;
+            try frame.text(self.page.source_lines[row], 0, width, role);
+        }
+    }
+
+    const TreeViewport = struct {
+        pinned: [64]usize = undefined,
+        pin_count: usize = 0,
+        start: usize = 0,
+
+        fn index(self: *const TreeViewport, slot: usize) ?usize {
+            if (slot < self.pin_count) return self.pinned[slot];
+            return self.start + slot - self.pin_count;
+        }
+    };
+
+    fn treeRowDepth(row: TreeRow) u16 {
+        return switch (row) {
+            .name => |entry| entry.depth,
+            .chunk => |entry| entry.depth,
+            .range => |entry| entry.depth,
+        };
+    }
+
+    fn treeViewport(self: *const Tui, slots: usize) TreeViewport {
+        var result: TreeViewport = .{};
+        const count = self.tree_rows.items.len;
+        if (slots == 0 or count == 0) return result;
+
+        var normal_slots = slots;
+        var pass: usize = 0;
+        while (pass < 2) : (pass += 1) {
+            result.start = @min(self.tree_selection -| (normal_slots / 2), count -| normal_slots);
+            var hidden_nearest: [64]usize = undefined;
+            const hidden_count = self.hiddenTreeAncestors(result.start, &hidden_nearest);
+            result.pin_count = @min(@min(hidden_count, hidden_nearest.len), slots -| 1);
+            var i: usize = 0;
+            while (i < result.pin_count) : (i += 1) {
+                result.pinned[i] = hidden_nearest[result.pin_count - i - 1];
+            }
+            normal_slots = slots - result.pin_count;
+        }
+        result.start = @min(self.tree_selection -| (normal_slots / 2), count -| normal_slots);
+        return result;
+    }
+
+    /// Collect off-screen ancestors nearest-first. Keeping the nearest entries
+    /// means very deep trees degrade into a useful partial breadcrumb.
+    fn hiddenTreeAncestors(self: *const Tui, start: usize, out: *[64]usize) usize {
+        if (self.tree_selection >= self.tree_rows.items.len) return 0;
+        var wanted_depth = treeRowDepth(self.tree_rows.items[self.tree_selection]);
+        var cursor = self.tree_selection;
+        var count: usize = 0;
+        while (cursor > 0 and wanted_depth > 0) {
+            cursor -= 1;
+            const depth = treeRowDepth(self.tree_rows.items[cursor]);
+            if (depth >= wanted_depth) continue;
+            if (cursor < start and count < out.len) {
+                out[count] = cursor;
+                count += 1;
+            }
+            wanted_depth = depth;
+        }
+        return count;
+    }
+
+    fn drawChunkRow(self: *Tui, frame: *tui.Frame, row: usize, width: usize, rows: usize) !void {
         var line_buf: [512]u8 = undefined;
         if (row == 0) {
             const root_stats = self.name_index.statsOf(bytecode.root_name_id);
@@ -1451,37 +1642,38 @@ const Tui = struct {
                 std.fmt.bufPrint(&line_buf, " VM TREE  ·  {d} chunks  ·  indexing…", .{root_stats.chunks}) catch " VM TREE"
             else
                 std.fmt.bufPrint(&line_buf, " VM TREE  ·  {d} chunks", .{root_stats.chunks}) catch " VM TREE";
-            if (self.focus == .chunks) try w.writeAll("\x1b[1m");
-            try writeAnsiWindow(w, line, 0, width);
+            try frame.text(line, 0, width, .section);
             return;
         }
         if (row == 1) {
             const id = self.currentChunk() orelse {
-                try writeAnsiWindow(w, " help", 0, width);
+                try frame.text(" help", 0, width, .muted);
                 return;
             };
             const line = if (self.ev.getChunk(id)) |chunk|
                 std.fmt.bufPrint(&line_buf, " ● #0x{x}  {d}b · {d}c · a{d}", .{ id, chunk.code.len, chunk.constants.len, chunk.arity }) catch " current chunk"
             else
                 std.fmt.bufPrint(&line_buf, " ● #0x{x}  missing", .{id}) catch " current chunk";
-            try writeAnsiWindow(w, line, 0, width);
+            try frame.text(line, 0, width, .current);
             return;
         }
         if (row == 2) {
-            try writeAnsiWindow(w, " ─ names / chunks ─", 0, width);
+            try frame.text(" ─ names / chunks ─", 0, width, .muted);
             return;
         }
 
         const count = self.tree_rows.items.len;
         if (count == 0) {
-            if (row == 3) try writeAnsiWindow(w, "   empty registry", 0, width);
+            if (row == 3) try frame.text("   empty registry", 0, width, .muted);
             return;
         }
         const slots = rows -| 3;
         if (slots == 0) return;
-        const start = @min(self.tree_selection -| (slots / 2), count -| slots);
-        const index = start + row - 3;
+        const viewport = self.treeViewport(slots);
+        const slot = row - 3;
+        const index = viewport.index(slot) orelse return;
         if (index >= count) return;
+        const pinned = slot < viewport.pin_count;
         const selected = index == self.tree_selection;
         const line: []const u8 = switch (self.tree_rows.items[index]) {
             .name => |entry| blk: {
@@ -1517,21 +1709,44 @@ const Tui = struct {
                 else
                     std.fmt.bufPrint(&line_buf, " {s}! #{d} missing", .{ indent[0..indent_len], entry.id }) catch " missing";
             },
-            .more => |entry| blk: {
+            .range => |entry| blk: {
                 var indent: [64]u8 = undefined;
                 const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                 @memset(indent[0..indent_len], ' ');
-                break :blk std.fmt.bufPrint(&line_buf, " {s}… {d} more", .{ indent[0..indent_len], entry.count }) catch " more";
+                const is_open = self.expanded_ranges.contains(entry.key());
+                break :blk switch (entry.kind) {
+                    .names => std.fmt.bufPrint(&line_buf, " {s}{s} names {d}–{d}", .{
+                        indent[0..indent_len],
+                        if (is_open) "▾" else "▸",
+                        entry.start + 1,
+                        entry.start + entry.len,
+                    }) catch " name range",
+                    .chunks => blk2: {
+                        const chunks = self.name_index.chunksOf(entry.parent);
+                        const first = chunks[entry.start];
+                        const last = chunks[entry.start + entry.len - 1];
+                        break :blk2 std.fmt.bufPrint(&line_buf, " {s}{s} chunks #{d}–#{d}", .{
+                            indent[0..indent_len],
+                            if (is_open) "▾" else "▸",
+                            first,
+                            last,
+                        }) catch " chunk range";
+                    },
+                };
             },
         };
-        if (selected and self.focus == .chunks) try w.writeAll("\x1b[7m");
-        try writeAnsiWindow(w, line, 0, width);
+        const role: tui.Role = if (selected and self.focus == .chunks)
+            .selection
+        else if (pinned)
+            .muted
+        else switch (self.tree_rows.items[index]) {
+            .name => .name,
+            .chunk => |entry| if (self.currentChunk() == entry.id) .current else .chunk,
+            .range => .range,
+        };
+        try frame.text(line, 0, width, role);
     }
 };
-
-fn moveTo(w: *std.Io.Writer, row: usize, col: usize) !void {
-    try w.print("\x1b[{d};{d}H", .{ row, col });
-}
 
 fn writeSanitizedSource(w: *std.Io.Writer, source: []const u8) !void {
     for (source) |byte| switch (byte) {
@@ -1541,115 +1756,4 @@ fn writeSanitizedSource(w: *std.Io.Writer, source: []const u8) !void {
         0...8, 10...12, 14...26, 28...0x1f, 0x7f => try w.writeByte('?'),
         else => try w.writeByte(byte),
     };
-}
-
-const BarKind = enum { header, footer };
-
-/// A full-width colored bar. Explicit spaces are emitted after clipped
-/// content because erase-to-EOL does not reliably retain background colors.
-fn writeBar(w: *std.Io.Writer, line: []const u8, width: usize, color: bool, kind: BarKind) !void {
-    const style = if (color)
-        switch (kind) {
-            .header => "\x1b[1;97;44m",
-            .footer => "\x1b[30;46m",
-        }
-    else
-        "\x1b[7m";
-    try w.writeAll(style);
-    try writeAnsiWindow(w, line, 0, width);
-    const used = @min(displayWidth(line), width);
-    if (used < width) {
-        try w.writeAll(style);
-        try w.splatByteAll(' ', width - used);
-    }
-    try w.writeAll("\x1b[0m");
-}
-
-/// Render a horizontal cell window without counting or splitting ANSI CSI
-/// sequences. This keeps the TUI faithful to the colorized `fix disasm`
-/// listing while clipping it safely to pane boundaries.
-fn writeAnsiWindow(w: *std.Io.Writer, line: []const u8, start: usize, width: usize) !void {
-    var i: usize = 0;
-    var col: usize = 0;
-    var written: usize = 0;
-    while (i < line.len) {
-        if (line[i] == 0x1b) {
-            const end = ansiSequenceEnd(line, i);
-            try w.writeAll(line[i..end]);
-            i = end;
-            continue;
-        }
-
-        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
-        const safe_len = if (i + len <= line.len) len else 1;
-        const cp = std.unicode.utf8Decode(line[i .. i + safe_len]) catch 0xFFFD;
-        const cell_width: usize = if (cp == '\t') 1 else width_mod.cpWidth(cp);
-        if (col + cell_width <= start) {
-            col += cell_width;
-            i += safe_len;
-            continue;
-        }
-        if (col < start) {
-            col += cell_width;
-            i += safe_len;
-            continue;
-        }
-        if (written + cell_width > width) break;
-        try w.writeAll(line[i .. i + safe_len]);
-        written += cell_width;
-        col += cell_width;
-        i += safe_len;
-    }
-    try w.writeAll("\x1b[0m");
-}
-
-fn displayWidth(line: []const u8) usize {
-    var i: usize = 0;
-    var result: usize = 0;
-    while (i < line.len) {
-        if (line[i] == 0x1b) {
-            i = ansiSequenceEnd(line, i);
-            continue;
-        }
-        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
-        const safe_len = if (i + len <= line.len) len else 1;
-        const cp = std.unicode.utf8Decode(line[i .. i + safe_len]) catch 0xFFFD;
-        result += if (cp == '\t') 1 else width_mod.cpWidth(cp);
-        i += safe_len;
-    }
-    return result;
-}
-
-fn ansiSequenceEnd(line: []const u8, start: usize) usize {
-    if (start + 1 >= line.len or line[start] != 0x1b) return @min(start + 1, line.len);
-    if (line[start + 1] != '[') return @min(start + 2, line.len);
-    var i = start + 2;
-    while (i < line.len) : (i += 1) {
-        if (line[i] >= 0x40 and line[i] <= 0x7e) return i + 1;
-    }
-    return line.len;
-}
-
-const testing = std.testing;
-
-test "ANSI-aware window clips cells without cutting color or UTF-8" {
-    const line = "\x1b[31mab中cd\x1b[0m";
-    try testing.expectEqual(@as(usize, 6), displayWidth(line));
-
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-    try writeAnsiWindow(&out.writer, line, 2, 3);
-    try testing.expectEqualStrings("\x1b[31m中c\x1b[0m", out.written());
-
-    out.clearRetainingCapacity();
-    try writeAnsiWindow(&out.writer, line, 3, 2);
-    try testing.expectEqualStrings("\x1b[31mc\x1b[0m", out.written());
-}
-
-test "full-width bars explicitly paint their trailing cells" {
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-
-    try writeBar(&out.writer, " vm ", 8, false, .header);
-    try testing.expectEqualStrings("\x1b[7m vm \x1b[0m\x1b[7m    \x1b[0m", out.written());
 }
