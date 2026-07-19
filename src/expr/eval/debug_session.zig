@@ -89,7 +89,7 @@ pub fn step(ctx: Context, kind: StepKind) !void {
             if (firstMappedOffset(chunk)) |off| try sites.append(ctx.allocator, .{ .chunk_id = rid, .offset = off });
         }
     }
-    try bp.armStep(ctx.registry, sites.items, max_depth);
+    try bp.armStep(ctx.registry, sites.items, max_depth, kind == .into);
 }
 
 pub fn scopeAttrs(ctx: Context) !Value {

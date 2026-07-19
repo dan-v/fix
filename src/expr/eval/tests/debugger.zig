@@ -279,6 +279,65 @@ test "stepping pauses again and preserves the result" {
     try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result)).asInt());
 }
 
+test "step into follows an import compiled after the step is armed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "imported.nix",
+        .data = "{ value = 42; }\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "imported.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.seq (builtins.break null) ((import {s}).value)",
+        .{file_path},
+    );
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const Ctl = struct {
+        imported_step: bool = false,
+        pauses: usize = 0,
+
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            s.clearStep();
+            self.pauses += 1;
+            try std.testing.expect(self.pauses < 8);
+            if (s.reason == .step) {
+                if (s.currentFrame()) |frame| {
+                    if (frame.file) |file| {
+                        if (std.mem.endsWith(u8, file, "imported.nix")) {
+                            self.imported_step = true;
+                            return;
+                        }
+                    }
+                }
+            }
+            try s.step(.into);
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    const result = try ev.evaluate(source);
+    try std.testing.expect(ctl.imported_step);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result)).asInt());
+}
+
 test "clearStep after a step leaves no patched bytecode behind" {
     var ev = try Evaluator.init(std.testing.allocator, 1);
     defer ev.deinit();

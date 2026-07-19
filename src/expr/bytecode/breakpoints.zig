@@ -39,6 +39,11 @@ pub const BreakpointTable = struct {
     /// A step stops only when the frame depth is ≤ this (so a step-over doesn't
     /// stop inside a deeper recursion of the same chunk). `maxInt` = any depth.
     step_max_depth: u32 = 0,
+    /// `step into` must also follow code which does not exist yet when the
+    /// command is issued (an import or deferred body compiled on demand).
+    /// `placeRegisteredChunk` patches those entry points before they can run.
+    step_follow_new_chunks: bool = false,
+    step_armed: bool = false,
 
     /// `req_id` sentinel marking a step temp rather than a user breakpoint.
     pub const step_request_id: u32 = 0;
@@ -90,6 +95,10 @@ pub const BreakpointTable = struct {
     /// debugger mutation hook.
     pub fn placeRegisteredChunk(self: *BreakpointTable, chunk_id: ChunkId, chunk: *Chunk) void {
         for (self.requests.items) |req| self.placeRequestInChunk(req, chunk_id, chunk) catch {};
+        if (self.step_armed and self.step_follow_new_chunks) {
+            const offset = firstMappedOffset(chunk) orelse return;
+            self.placeStepSite(chunk_id, offset, chunk) catch {};
+        }
     }
 
     /// Set a breakpoint at FILE:LINE. Resolves LINE to the nearest line ≥ LINE
@@ -160,21 +169,20 @@ pub const BreakpointTable = struct {
 
     /// Arm a step: patch each site (unless a permanent breakpoint already sits
     /// there), and stop only at depth ≤ `max_depth`. Replaces any prior step.
-    pub fn armStep(self: *BreakpointTable, registry: *ChunkRegistry, sites: []const Site, max_depth: u32) !void {
+    pub fn armStep(
+        self: *BreakpointTable,
+        registry: *ChunkRegistry,
+        sites: []const Site,
+        max_depth: u32,
+        follow_new_chunks: bool,
+    ) !void {
         self.clearStep(registry);
         self.step_max_depth = max_depth;
+        self.step_follow_new_chunks = follow_new_chunks;
+        self.step_armed = true;
         for (sites) |site| {
             const c = registry.get(site.chunk_id) orelse continue;
-            if (site.offset >= c.code.len) continue;
-            if (c.code[site.offset] == breakpoint_byte) continue; // already patched (perm or dup)
-            if (self.placedAt(site.chunk_id, site.offset)) continue;
-            try self.step_temps.append(self.gpa, .{
-                .req_id = step_request_id,
-                .chunk_id = site.chunk_id,
-                .offset = site.offset,
-                .original = c.code[site.offset],
-            });
-            c.code[site.offset] = breakpoint_byte;
+            try self.placeStepSite(site.chunk_id, site.offset, c);
         }
     }
 
@@ -187,6 +195,8 @@ pub const BreakpointTable = struct {
         }
         self.step_temps.clearRetainingCapacity();
         self.step_max_depth = 0;
+        self.step_follow_new_chunks = false;
+        self.step_armed = false;
     }
 
     fn placedAt(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) bool {
@@ -194,6 +204,26 @@ pub const BreakpointTable = struct {
             if (p.chunk_id == chunk_id and p.offset == offset) return true;
         }
         return false;
+    }
+
+    fn stepPlacedAt(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) bool {
+        for (self.step_temps.items) |p| {
+            if (p.chunk_id == chunk_id and p.offset == offset) return true;
+        }
+        return false;
+    }
+
+    fn placeStepSite(self: *BreakpointTable, chunk_id: ChunkId, offset: u32, chunk: *const Chunk) !void {
+        if (offset >= chunk.code.len) return;
+        if (self.placedAt(chunk_id, offset) or self.stepPlacedAt(chunk_id, offset)) return;
+        if (chunk.code[offset] == breakpoint_byte) return;
+        try self.step_temps.append(self.gpa, .{
+            .req_id = step_request_id,
+            .chunk_id = chunk_id,
+            .offset = offset,
+            .original = chunk.code[offset],
+        });
+        chunk.code[offset] = breakpoint_byte;
     }
 
     pub fn list(self: *const BreakpointTable) []const Request {
@@ -256,3 +286,11 @@ pub const BreakpointTable = struct {
         return std.mem.eql(u8, std.fs.path.basename(text), std.fs.path.basename(wanted));
     }
 };
+
+fn firstMappedOffset(chunk: *const Chunk) ?u32 {
+    var best: ?u32 = null;
+    for (chunk.source_map) |entry| {
+        if (best == null or entry.start < best.?) best = entry.start;
+    }
+    return best;
+}
