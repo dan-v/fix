@@ -21,6 +21,7 @@ const clock = @import("base").clock;
 const SpinMutex = @import("base").sync.SpinMutex;
 const Value = @import("runtime").value.Value;
 const VM = @import("../vm/context.zig").VM;
+const Frame = @import("../vm/context.zig").Frame;
 const Worker = @import("workers/worker.zig").Worker;
 const Scheduler = @import("workers/scheduler.zig").Scheduler;
 const ChunkRegistry = @import("../bytecode.zig").ChunkRegistry;
@@ -544,7 +545,58 @@ pub fn markVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: *VM) void {
     for (vm.gc_roots.force_chain.items) |id| tr.markObject(heap, id); // in-flight force chain
     for (vm.gc_roots.temporary.items) |v| tr.markValue(heap, v); // native builtin roots
     for (vm.stack[0..vm.sp]) |v| tr.markValue(heap, v);
-    for (vm.frames[0..vm.frames_len]) |frame| {
-        if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);
-    }
+    for (vm.frames[0..vm.frames_len]) |*frame| markFrame(tr, heap, frame);
+}
+
+fn markFrame(tr: *gc.Tracer, heap: *ObjectHeap, frame: *const Frame) void {
+    if (frame.upvalue_owner) |id| tr.markObject(heap, id);
+    if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);
+}
+
+test "frame roots closure owner until its raw upvalue slice unwinds" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const captures = [_]Value{
+        Value.int(0), Value.int(1), Value.int(2), Value.int(3), Value.int(4),
+        Value.int(5), Value.int(6), Value.int(7), Value.int(8), Value.int(9),
+    };
+    const owner = try heap.addClosure(0, &captures);
+    const closure = try heap.getClosure(owner);
+    const owned_range = switch (heap.get(owner).*) {
+        .closure => |stored| stored.upvalues,
+        else => unreachable,
+    };
+    const frame: Frame = .{
+        .chunk_ptr = undefined,
+        .chunk_id = 0,
+        .ip = 0,
+        .frame_base = 0,
+        .local_count = 0,
+        .upvalues = closure.upvalues,
+        .upvalue_owner = owner,
+    };
+
+    var tr = gc.Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.resetMajor(heap.objects.count());
+    markFrame(&tr, &heap, &frame);
+    tr.drain(&heap);
+    try std.testing.expect(tr.isMarked(owner));
+    try std.testing.expectEqual(@as(u64, captures.len), tr.stats.values);
+    try std.testing.expectEqual(@as(u64, 0), heap_collector.sweep(&heap, tr.mark_bits).objects_freed);
+
+    // Once the frame is gone, the owner and its range are reclaimable.
+    try tr.resetMajor(heap.objects.count());
+    tr.drain(&heap);
+    try std.testing.expectEqual(@as(u64, 1), heap_collector.sweep(&heap, tr.mark_bits).objects_freed);
+    const replacement = try heap.addList(&captures);
+    const replacement_range = switch (heap.get(replacement).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(owned_range.segment, replacement_range.segment);
+    try std.testing.expectEqual(owned_range.offset, replacement_range.offset);
 }

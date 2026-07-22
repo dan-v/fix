@@ -963,7 +963,7 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
 /// ChunkId is computed lazily).
 fn runBytecodeChunk(self: *VM, ch: *const Chunk, chunk_id: ChunkId, upvalues: []const Value) anyerror!Value {
     // Passthrough: forcing a thunk body is not a function application.
-    return closures.runIsolatedFrame(self, ch, chunk_id, 0, upvalues, false);
+    return closures.runIsolatedFrame(self, ch, chunk_id, 0, upvalues, null, false);
 }
 
 pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
@@ -971,7 +971,7 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
         .closure => {
             const closure = try closures.closureRef(self, closure_val);
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-            return closures.runIsolatedFrame(self, ch, closure.chunk_id, 0, closure.upvalues, false);
+            return closures.runIsolatedFrame(self, ch, closure.chunk_id, 0, closure.upvalues, closure.owner, false);
         },
         .builtin_closure => {
             const closure = try self.heap.getBuiltinClosure(closure_val.asObjectId());

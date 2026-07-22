@@ -23,7 +23,7 @@ const ChunkId = types.ChunkId;
 ///
 /// `inline` lets the literal `is_call` argument remove irrelevant depth
 /// accounting branches at each call site.
-pub inline fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32, upvalues: ?[]const Value, is_call: bool) !void {
+pub inline fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32, upvalues: ?[]const Value, upvalue_owner: ?types.ObjectId, is_call: bool) !void {
     if (self.frames_len >= types.max_frames) return error.FrameOverflow;
     if (arg_count > ch.local_count) return error.InvalidCallFrame;
     const parent_depth: u32 = if (self.frames_len > 0) self.frames[self.frames_len - 1].call_depth else 0;
@@ -47,6 +47,7 @@ pub inline fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_coun
         .frame_base = frame_base,
         .local_count = ch.local_count,
         .upvalues = upvalues,
+        .upvalue_owner = upvalue_owner,
         .call_depth = new_depth,
     };
     self.frames_len += 1;

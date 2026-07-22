@@ -51,13 +51,15 @@ pub fn makeClosure(self: *VM, chunk_id: ChunkId, upvalue_count: u16) !void {
 pub const ClosureRef = struct {
     chunk_id: ChunkId,
     upvalues: []const Value,
+    owner: ?ObjectId,
 };
 
 pub inline fn closureRef(self: *VM, value: Value) !ClosureRef {
-    if (value.isFunction()) return .{ .chunk_id = value.asFunctionChunkId(), .upvalues = &.{} };
+    if (value.isFunction()) return .{ .chunk_id = value.asFunctionChunkId(), .upvalues = &.{}, .owner = null };
     if (!value.isClosure()) return error.NotCallable;
-    const closure = try getClosureById(self, value.asObjectId());
-    return .{ .chunk_id = closure.chunk_id, .upvalues = closure.upvalues };
+    const owner = value.asObjectId();
+    const closure = try getClosureById(self, owner);
+    return .{ .chunk_id = closure.chunk_id, .upvalues = closure.upvalues, .owner = owner };
 }
 
 pub fn stageCaptureDescriptors(self: *VM, descriptors: []const u8, frame: *const Frame) !u16 {
@@ -233,7 +235,7 @@ pub fn evalArgEager(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame
     // logical call depth matches Nix's `max-call-depth` accounting (e.g.
     // `f (f 0)` reaches depth 2). It pushes-and-pops within this call, so
     // sequential eager arguments do not accumulate depth.
-    const result = try runIsolatedFrame(self, ch, chunk_id, 0, upvalues, true);
+    const result = try runIsolatedFrame(self, ch, chunk_id, 0, upvalues, null, true);
     self.sp = base; // drop the staged upvalues
     try stack.push(self, result);
 }
@@ -434,7 +436,7 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
             return stack.push(self, Value.partialApp(id));
         }
         try stack.push(self, arg); // arg is first local
-        try stack.pushFrame(self, ch, closure.chunk_id, 1, closure.upvalues, true);
+        try stack.pushFrame(self, ch, closure.chunk_id, 1, closure.upvalues, closure.owner, true);
     } else if (callee.isPartialApp()) {
         try applyToPartial(self, callee, arg);
     } else if (callee.isBuiltin()) {
@@ -469,7 +471,7 @@ fn applyToPartial(self: *VM, pap: Value, arg: Value) !void {
     for (pa.args) |a| try stack.push(self, a);
     try stack.push(self, arg);
     try forceStrictArgs(self, ch, args_base, ch.arity);
-    try stack.pushFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues, true);
+    try stack.pushFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues, closure.owner, true);
 }
 
 pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
@@ -496,7 +498,7 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
                     const id = try self.heap.addPartialApp(current, &.{arg});
                     return stack.push(self, Value.partialApp(id));
                 }
-                try replaceCurrentFrame(self, ch, closure.chunk_id, arg, closure.upvalues);
+                try replaceCurrentFrame(self, ch, closure.chunk_id, arg, closure.upvalues, closure.owner);
                 return;
             },
             .partial_app => {
@@ -525,7 +527,7 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
     }
 }
 
-pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg: Value, upvalues: []const Value) !void {
+pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg: Value, upvalues: []const Value, upvalue_owner: ?ObjectId) !void {
     if (ch.local_count == 0) return error.InvalidCallFrame;
 
     const stack_cap: u32 = @intCast(types.vm_stack_capacity);
@@ -557,6 +559,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
         .frame_base = frame_base,
         .local_count = ch.local_count,
         .upvalues = upvalues,
+        .upvalue_owner = upvalue_owner,
         .call_depth = new_depth,
     };
     debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrame");
@@ -568,7 +571,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
 /// args currently live at the top of the stack at `args_base..args_base+n`
 /// (the caller has already removed the callee). They're copied down to the
 /// reused frame's base and the frame is re-pointed at `ch` with ip=0.
-fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, args_base: u32, n: u16, upvalues: []const Value) !void {
+fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, args_base: u32, n: u16, upvalues: []const Value, upvalue_owner: ?ObjectId) !void {
     if (ch.local_count < n) return error.InvalidCallFrame;
     const stack_cap: u32 = @intCast(types.vm_stack_capacity);
     const frame = stack.currentFrame(self);
@@ -595,6 +598,7 @@ fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId
         .frame_base = frame_base,
         .local_count = ch.local_count,
         .upvalues = upvalues,
+        .upvalue_owner = upvalue_owner,
         .call_depth = new_depth,
     };
     debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrameMulti");
@@ -630,7 +634,7 @@ pub fn doCallN(self: *VM, n: u16) !void {
             while (j < n) : (j += 1) self.stack[base - 1 + j] = self.stack[base + j];
             self.sp -= 1;
             try forceStrictArgs(self, ch, base - 1, n);
-            return stack.pushFrame(self, ch, closure.chunk_id, n, closure.upvalues, true);
+            return stack.pushFrame(self, ch, closure.chunk_id, n, closure.upvalues, closure.owner, true);
         }
     }
     // Saturated (or under-applied) builtin: hand all n args to applyBuiltin
@@ -675,7 +679,7 @@ pub fn doTailCallN(self: *VM, n: u16) !void {
         const ch = try closureChunkViaIC(self, closure.chunk_id);
         if (ch.arity == n) {
             try forceStrictArgs(self, ch, base, n);
-            return replaceCurrentFrameMulti(self, ch, closure.chunk_id, base, n, closure.upvalues);
+            return replaceCurrentFrameMulti(self, ch, closure.chunk_id, base, n, closure.upvalues, closure.owner);
         }
     }
     // Same saturated/under-applied builtin shortcut as doCallN — skip the
@@ -720,7 +724,7 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
             return Value.partialApp(id);
         }
         try stack.push(self, arg);
-        return runIsolatedFrame(self, ch, closure.chunk_id, 1, closure.upvalues, true);
+        return runIsolatedFrame(self, ch, closure.chunk_id, 1, closure.upvalues, closure.owner, true);
     }
     if (callee.isPartialApp()) {
         return callValuePartial(self, callee, arg);
@@ -756,18 +760,18 @@ fn callValuePartial(self: *VM, pap: Value, arg: Value) anyerror!Value {
     const args_base = self.sp;
     for (buf[0..total]) |a| try stack.push(self, a);
     try forceStrictArgs(self, ch, args_base, ch.arity);
-    return runIsolatedFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues, true);
+    return runIsolatedFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues, closure.owner, true);
 }
 
 /// `is_call` marks a real function application (a saturated `callValue`),
 /// vs. a passthrough thunk-force / argument evaluation. See
 /// `stack.pushFrame` — only calls advance the logical call depth.
-pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg_count: u32, upvalues: ?[]const Value, is_call: bool) anyerror!Value {
+pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg_count: u32, upvalues: ?[]const Value, upvalue_owner: ?ObjectId, is_call: bool) anyerror!Value {
     const t = prof.start(.run_isolated_frame);
     defer prof.end(.run_isolated_frame, t);
     const stop_depth = self.frames_len;
     const base_sp = self.sp - arg_count;
-    stack.pushFrame(self, ch, chunk_id, arg_count, upvalues, is_call) catch |err| {
+    stack.pushFrame(self, ch, chunk_id, arg_count, upvalues, upvalue_owner, is_call) catch |err| {
         self.sp = base_sp;
         return err;
     };

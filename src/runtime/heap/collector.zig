@@ -490,6 +490,9 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
             .list => |r| for (heap.values.sliceMut(r)) |*v| {
                 v.* = poison;
             },
+            .closure => |c| for (heap.values.sliceMut(c.upvalues)) |*v| {
+                v.* = poison;
+            },
             .attrs => |a| for (heap.attrs.sliceMut(a.range)) |*e| {
                 e.value = poison;
             },
@@ -507,6 +510,7 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
     }
     switch (obj.*) {
         .list => |r| if (r.len > 0) ranges.add("values", "gc_free_values", .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
+        .closure => |c| if (c.upvalues.len > 0) ranges.add("values", "gc_free_values", .{ .segment = c.upvalues.segment, .offset = c.upvalues.offset, .len = c.upvalues.len }),
         .attrs => |a| {
             if (a.range.len > 0) ranges.add("attrs", "gc_free_attrs", .{ .segment = a.range.segment, .offset = a.range.offset, .len = a.range.len });
             if (a.positions.len > 0) ranges.add("attr_pos", "gc_free_attr_pos", .{ .segment = a.positions.segment, .offset = a.positions.offset, .len = a.positions.len });
@@ -515,10 +519,6 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
         .partial_app => |p| if (p.args.len > 0) ranges.add("values", "gc_free_values", .{ .segment = p.args.segment, .offset = p.args.offset, .len = p.args.len }),
         .context_string => |c| if (c.context.len > 0) ranges.add("attrs", "gc_free_attrs", .{ .segment = c.context.segment, .offset = c.context.offset, .len = c.context.len }),
         .thunk => |t| if (t.targetSpillRange()) |r| ranges.add("values", "gc_free_values", .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
-        // NOT reclaimed yet: an executing frame aliases its
-        // `upvalues` slice owned by a .closure object. Freeing the range while
-        // a frame runs would dangle it. Reclaiming closures needs each frame
-        // to root its executing closure (a follow-up RSS optimization).
-        .closure, .merge_attrs, .boxed_int => {},
+        .merge_attrs, .boxed_int => {},
     }
 }

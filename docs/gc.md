@@ -33,7 +33,7 @@ Marking starts from every place a live ObjectId can be reached without going thr
 Root set (all must be enumerated — precise):
   • Every worker VM (via each fiber's VM):
       – operand stack + all Frames        (vm/dispatch.md)
-      – Frame.upvalues                     (runtime/thunks.md)
+      – Frame.upvalue_owner + upvalues     (runtime/thunks.md)
       – builtins + the value in-flight at the safepoint
   • In-flight force chain    vm.gc_roots.force_chain (the suspended
         forceThunk stack, runtime/thunks.md)
@@ -61,7 +61,7 @@ Root set (all must be enumerated — precise):
 
 - Processing each young object: **marked ⇒ survivor**, promoted in place (`gcSetOld`, id unchanged, ranges stay put); **unmarked ⇒ dead**, its store ranges returned to the free lists in place and its slot id recycled.
 - **Worker-local caches with shared overflow** in the [heap](runtime/heap.md) (`HeapLocal.gc_free_objects` for slot ids; `gc_free_values` / `gc_free_attrs` / `gc_free_attr_pos` are range lists keyed by length). Minor sweep first returns dead storage to its allocation worker even when a different helper processes that worker's young list. At the stop-the-world boundary, unused slots and ranges move to shared overflow. Mutators refill object ids 4096 at a time and compatible range classes 256 at a time, so cross-worker reuse needs one lock per batch rather than the old lock and peer probes on every allocation. Consecutive adjacent ranges are coalesced as sweep streams them back, without allocating per-range address metadata. TLAB suffixes that cannot fit the next request and unused worst-case merge capacity are returned explicitly because no owner exists for sweep to find. Allocation takes exact range matches first, otherwise uses a non-empty-class best-fit index and splits the smallest suitable range; slot ids are LIFO.
-- Spilled bytecode/deferred-thunk captures record their value-store range. An unresolved dead thunk returns that range during sweep; a forced thunk returns it immediately after its evaluation frame unwinds and just before publishing its result or sticky error. Transient failures keep the range for retry. Closure captures still remain allocated because a running frame can hold their raw slice without rooting the owning closure.
+- Spilled bytecode/deferred-thunk captures record their value-store range. An unresolved dead thunk returns that range during sweep; a forced thunk returns it immediately after its evaluation frame unwinds and just before publishing its result or sticky error. Transient failures keep the range for retry. Closure frames record and root the heap closure that owns their raw upvalue slice, so a live executing closure keeps its captures while dead closures return their value-store ranges during sweep.
 - Non-moving: no compaction pass, so scattered death can leave fragmentation.
 - A major sweeps every allocated object slot rather than the young lists, then tenures every survivor and clears the remembered set. The full sweep is currently serial.
 

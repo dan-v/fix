@@ -12,7 +12,7 @@ fn eval(self: *context.VM, chunk_id: @import("runtime").types.ChunkId) !@import(
 
     // The top-level expression is not a function application, so the initial
     // passthrough frame starts at logical call depth zero.
-    try stack.pushFrame(self, chunk, chunk_id, 0, null, false);
+    try stack.pushFrame(self, chunk, chunk_id, 0, null, null, false);
     return run.run(self) catch |err| {
         errors.captureErrorTrace(self, err) catch {};
         return err;

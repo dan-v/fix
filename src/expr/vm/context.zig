@@ -15,6 +15,7 @@ const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
+const ObjectId = types.ObjectId;
 const bytecode_mod = @import("../bytecode.zig");
 const build_options = @import("build_options");
 const chunk = bytecode_mod.chunk;
@@ -118,6 +119,11 @@ pub const Frame = struct {
     local_count: u32,
     /// Upvalues for the closure or direct thunk currently executing.
     upvalues: ?[]const Value,
+    /// Heap closure whose value-store range backs `upvalues`. A frame keeps
+    /// only a raw slice, so the precise collector must root this owner before
+    /// closure ranges can be reclaimed. Null for immediate functions and
+    /// thunk/stack-backed upvalue slices whose owners are rooted elsewhere.
+    upvalue_owner: ?ObjectId,
     /// Logical call depth of this frame — the length of the function-
     /// application chain that reached it, matching Nix's `max-call-depth`
     /// accounting. A function-application frame is one deeper than the

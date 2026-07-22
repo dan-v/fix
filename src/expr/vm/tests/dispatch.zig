@@ -89,7 +89,7 @@ fn runChunk(h: *Harness, comptime build: fn (*ChunkBuilder, std.mem.Allocator) a
     // `register` takes ownership of `ch` (stores it by value and frees it
     // from `ChunkRegistry.deinit`) — don't also free it here.
     const chunk_id = try h.ev.registry.register(ch);
-    return closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, false);
+    return closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, null, false);
 }
 
 // ---- harness round-trip ----
@@ -207,7 +207,7 @@ test "attr_get selects an attribute from a hand-built attrset" {
 
     const ch = try builder.finish(testing.allocator, 0);
     const chunk_id = try h.ev.registry.register(ch);
-    const result = try closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, false);
+    const result = try closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, null, false);
 
     try testing.expect(result.isInt());
     try testing.expectEqual(@as(i64, 2), result.asInt());
@@ -417,7 +417,7 @@ test "pushFrame surfaces StackOverflow when locals exceed remaining capacity" {
     const chunk_id = try h.ev.registry.register(ch);
 
     h.vm.sp = @intCast(types.vm_stack_capacity - 1);
-    try testing.expectError(error.StackOverflow, stack.pushFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, false));
+    try testing.expectError(error.StackOverflow, stack.pushFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, null, false));
 }
 
 // ---- fused thunk+store super-ops (thunkStoreOp) ----
@@ -465,7 +465,7 @@ test "thunk_w_st creates a thunk from a wide chunk id and stores it into a local
     const ch = try main_b.finish(testing.allocator, 2);
     const chunk_id = try h.ev.registry.register(ch);
 
-    const result = try closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, false);
+    const result = try closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, null, false);
     try testing.expect(result.isInt());
     try testing.expectEqual(@as(i64, 42), result.asInt());
 }
@@ -501,7 +501,7 @@ test "thunk_w_st_cell publishes the thunk into a cell-initialized slot" {
     const ch = try main_b.finish(testing.allocator, 1);
     const chunk_id = try h.ev.registry.register(ch);
 
-    const result = try closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, false);
+    const result = try closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, null, false);
     try testing.expect(result.isInt());
     try testing.expectEqual(@as(i64, 42), result.asInt());
 }

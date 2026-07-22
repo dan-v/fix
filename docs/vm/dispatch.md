@@ -57,8 +57,9 @@ Each opcode has a standalone handler so its locals and register pressure remain 
 | `frame_base` | index in `vm.stack` where this frame's locals begin |
 | `local_count` | slots reserved for locals |
 | `upvalues` | the closure's captured values (`null` for a bare chunk run) |
+| `upvalue_owner` | heap closure backing the raw `upvalues` slice; rooted by GC while the frame is live (`null` for immediate functions and slices rooted elsewhere) |
 
-`pushFrame(ch, chunk_id, arg_count, upvalues)`: the top `arg_count` operands are the frame's first locals (they stay on the stack; `frame_base = sp - arg_count`), the remaining `local_count - arg_count` slots are reserved and `@memset` to `null`, `ip = 0`. Overflow is checked on both frame count (`FrameOverflow`) and slot reservation (`StackOverflow`); `arg_count > local_count` is `InvalidCallFrame`. Locals live *in the operand stack* at `[frame_base .. frame_base + local_count)` — there is no separate locals array.
+`pushFrame(ch, chunk_id, arg_count, upvalues, upvalue_owner)`: the top `arg_count` operands are the frame's first locals (they stay on the stack; `frame_base = sp - arg_count`), the remaining `local_count - arg_count` slots are reserved and `@memset` to `null`, `ip = 0`. Overflow is checked on both frame count (`FrameOverflow`) and slot reservation (`StackOverflow`); `arg_count > local_count` is `InvalidCallFrame`. Locals live *in the operand stack* at `[frame_base .. frame_base + local_count)` — there is no separate locals array.
 
 Local access is force-vs-capture split, matching the recursive-`let` cell discipline (see [runtime/thunks.md](../runtime/thunks.md)): `loc_get` forces the slot on read; `loc_grab` / `up_grab` read it raw (so an unresolved cell can be captured without triggering evaluation).
 
@@ -70,7 +71,7 @@ Local access is force-vs-capture split, matching the recursive-`let` cell discip
 2. if `frames_len == stop_depth`, **returns** (leaving the chain) — `runUntil` pops `result` and returns it to its caller;
 3. otherwise dispatches into the resumed caller frame (`ret_frame.ip` already points past the call site).
 
-This is what makes the interpreter **re-entrant**. `runIsolatedFrame(ch, chunk_id, arg_count, upvalues)` records `stop_depth = frames_len`, pushes one frame over the pre-staged args, then `runUntil(stop_depth)`; the nested chain runs until exactly that frame rets, yielding its single value. On error it unwinds `frames_len`/`sp` back to the mark and captures a trace. Isolated frames are the universal "run this body and give me the value" primitive — used by thunk forcing ([runtime/thunks.md](../runtime/thunks.md)) and by `callValue`/PAP saturation ([calls.md](calls.md)).
+This is what makes the interpreter **re-entrant**. `runIsolatedFrame(ch, chunk_id, arg_count, upvalues, upvalue_owner)` records `stop_depth = frames_len`, pushes one frame over the pre-staged args, then `runUntil(stop_depth)`; the nested chain runs until exactly that frame rets, yielding its single value. On error it unwinds `frames_len`/`sp` back to the mark and captures a trace. Isolated frames are the universal "run this body and give me the value" primitive — used by thunk forcing ([runtime/thunks.md](../runtime/thunks.md)) and by `callValue`/PAP saturation ([calls.md](calls.md)).
 
 `halt` (chunk sentinel) and running off the end of `code` both terminate the chain, ensuring at least one value is on the stack for the caller.
 
