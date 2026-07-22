@@ -847,7 +847,7 @@ pub const ObjectHeap = struct {
                     const cell = &cells[if (t.created_demand) 0 else 1];
                     cell.n += 1;
                     const state = t.future.state.load(.acquire);
-                    if (t.future.isDemanded()) {
+                    if (t.isDemanded()) {
                         if (t.demanded_old) cell.dem_old += 1 else cell.dem_young += 1;
                     } else switch (state) {
                         2 => cell.never_resolved_spec += 1, // resolved
@@ -927,7 +927,7 @@ pub const ObjectHeap = struct {
                 switch (self.objects.get(entry.value.asObjectId()).*) {
                     .thunk => |t| {
                         members += 1;
-                        if (t.future.isDemanded()) {
+                        if (t.isDemanded()) {
                             if (t.demanded_old) dem_old += 1 else dem_young += 1;
                         } else if (t.future.state.load(.acquire) == 2) {
                             spec_resolved += 1;
