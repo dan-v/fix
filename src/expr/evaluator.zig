@@ -48,6 +48,7 @@ const mem_report = @import("eval/mem_report.zig");
 const tuning = @import("eval/tuning.zig");
 const debugger_state = @import("eval/debugger_state.zig");
 const debug_session = @import("eval/debug_session.zig");
+const effects_mod = @import("effects.zig");
 
 const worker_mod = execution.worker;
 const gc_controller = @import("eval/gc_controller.zig");
@@ -417,8 +418,10 @@ pub const Evaluator = struct {
     /// pipes, tests, JSON/XML paths). See `eval/print.zig`.
     value_color: bool = false,
     observer: observ.Observer = .{},
+    effects: effects_mod.Store,
     vm_trace: ?*VmTrace,
     thunk_trace: if (vm_mod.thunks_log_enabled) ?*ThunkTrace else void,
+    trace_verbose: bool = false,
     /// Per-evaluation state (diagnostics + trace + string arena). Cleared
     /// at the start of each `evaluate()`; helpers writing diagnostics from
     /// import error paths serialize on `report.mu`.
@@ -480,6 +483,7 @@ pub const Evaluator = struct {
             .regexes = regex_mod.PatternCache.init(allocator),
             .builtins_value = null,
             .observer = .{},
+            .effects = effects_mod.Store.init(allocator),
             .vm_trace = null,
             .thunk_trace = if (vm_mod.thunks_log_enabled) null else {},
             .report = EvaluationReport.init(allocator),
@@ -546,6 +550,7 @@ pub const Evaluator = struct {
         self.sources.search_paths.deinit(self.allocator);
         self.sources.fetchers.deinit();
         self.regexes.deinit();
+        self.effects.deinit();
         self.store.realization.releaseRecipePayloads();
         self.sources.files.deinit();
         self.heap.deinit();
@@ -766,6 +771,22 @@ pub const Evaluator = struct {
     pub fn setObserver(self: *Evaluator, observer: observ.Observer) void {
         self.observer = observer;
         self.store.realization.setObserver(observer);
+    }
+
+    /// Install a language-effect sink. The callback can run concurrently from
+    /// independent demanded fibers and is responsible for synchronizing its
+    /// destination. Primarily useful to embedding applications and tests.
+    pub fn setEffectSink(self: *Evaluator, sink: effects_mod.Sink) void {
+        self.effects.setSink(sink);
+    }
+
+    /// Stream language effects to synchronized stderr, flushing each record.
+    pub fn setEffectStderr(self: *Evaluator, io: std.Io) void {
+        self.effects.setStderr(io);
+    }
+
+    pub fn setTraceVerbose(self: *Evaluator, enabled: bool) void {
+        self.trace_verbose = enabled;
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
@@ -1143,6 +1164,10 @@ pub const Evaluator = struct {
     /// the UI implementation (terminal I/O lives in `cli`); the engine only
     /// upcalls through this seam, so the layering stays down-only.
     pub fn setDebugUi(self: *Evaluator, ctx: *anyopaque, run: *const fn (*anyopaque, *DebugSession) anyerror!void) void {
+        // Interactive pauses are observable and cannot run on helper fibers.
+        // Keep every debugger entry on the deterministic demand path even for
+        // embedding applications that do not use the CLI's --debugger setup.
+        self.setParallelismToggles(true, true);
         self.debugger.setUi(.{ .ctx = ctx, .run = run });
         self.ensureBreakpointTable();
     }
@@ -1515,6 +1540,7 @@ pub const Evaluator = struct {
         defer vm.deinit();
         vm.debug.parent = debug_parent;
         vm.debug.import_replay = if (debug_parent) |parent| parent.debug.import_replay else false;
+        if (debug_parent) |parent| vm.speculation.active = parent.speculation.active;
         // Depth-transparent import: the fresh nested VM inherits the caller's
         // depth minus 1 (dropping the `import` builtin's own +1), so a
         // top-level import evaluates at depth 0 (collects) while a nested one
@@ -1524,7 +1550,11 @@ pub const Evaluator = struct {
         // This VM isn't in a Worker's fiber list; make its roots visible to GC.
         gc_controller.registerVm(gcContext(self), &vm);
         defer gc_controller.unregisterVm(gcContext(self), &vm);
-        const value = try vm.eval(chunk_id);
+        const value = vm.eval(chunk_id) catch |err| {
+            try mergeNestedEffects(debug_parent, &vm);
+            return err;
+        };
+        try mergeNestedEffects(debug_parent, &vm);
         observation.finish(.{});
         return value;
     }
@@ -1557,6 +1587,7 @@ pub const Evaluator = struct {
             // it's a side effect of *real* evaluation, so speculative force
             // stays invisible to it.
             .trace_sink = if (worker_id == 0) &self.report.trace else null,
+            .effects = &self.effects,
             // The observer is a cheap evaluator-scoped capability. Every VM
             // receives it, including helper VMs, while the sink is responsible
             // for any synchronization needed by the selected outputs.
@@ -1576,6 +1607,7 @@ pub const Evaluator = struct {
             .break_sink = if (self.debugger.ui != null) .{ .ctx = self, .fire = fireBreak } else null,
             .breakpoints = if (self.debugger.breakpoints != null) &self.debugger.breakpoints.? else null,
             .policy = self.policy,
+            .trace_verbose = self.trace_verbose,
             .lazy_shells_visible = self.lazy_shells_visible,
         });
         // A nested VM runs on the surrounding fiber, so it borrows that
@@ -2026,9 +2058,15 @@ pub const Evaluator = struct {
         const me = currentImportClaimer();
         while (true) {
             switch (entry.future.tryClaim(me)) {
-                .already_resolved => return entry.result,
+                .already_resolved => {
+                    try vm_force.observeEffectGroup(debug_parent, entry.effect_group, true);
+                    return entry.result;
+                },
                 .blackhole => return error.ImportCycle,
-                .errored => return entry.error_info.?.err,
+                .errored => {
+                    try vm_force.observeEffectGroup(debug_parent, entry.effect_group, true);
+                    return entry.error_info.?.err;
+                },
                 .busy => {
                     const inner = fiber_mod.currentFiber() orelse
                         @panic("import entry became busy outside an evaluator fiber");
@@ -2041,10 +2079,23 @@ pub const Evaluator = struct {
                     continue;
                 },
                 .claimed => {
+                    const effect_checkpoint = debug_parent.effect_journal.items.len;
                     const value = self.compileImportPath(path, parent_depth, debug_parent) catch |err| {
+                        if (debug_parent.speculation.active and !isTransientImportError(err)) {
+                            entry.effect_group = self.effects.makeGroup(debug_parent.effect_journal.items[effect_checkpoint..]) catch {
+                                self.publishImportFailure(entry, error.OutOfMemory);
+                                return error.OutOfMemory;
+                            };
+                        }
                         self.publishImportFailure(entry, err);
                         return err;
                     };
+                    if (debug_parent.speculation.active) {
+                        entry.effect_group = self.effects.makeGroup(debug_parent.effect_journal.items[effect_checkpoint..]) catch {
+                            self.publishImportFailure(entry, error.OutOfMemory);
+                            return error.OutOfMemory;
+                        };
+                    }
                     entry.result = value;
                     entry.future.publish();
                     return value;
@@ -2055,13 +2106,15 @@ pub const Evaluator = struct {
 
     fn publishImportFailure(self: *Evaluator, entry: *imports_mod.ImportEntry, err: anyerror) void {
         switch (err) {
-            error.OutOfMemory, error.StackOverflow => {
+            error.OutOfMemory, error.StackOverflow, error.SpeculativeBail => {
+                entry.effect_group = 0;
                 entry.future.reset();
                 return;
             },
             else => {},
         }
         const info = self.allocator.create(thunk_mod.ErrorInfo) catch {
+            entry.effect_group = 0;
             entry.future.reset();
             return;
         };
@@ -2326,6 +2379,23 @@ fn printForceValue(context: *anyopaque, value: Value) anyerror!Value {
     return ev.forceValue(value);
 }
 
+fn mergeNestedEffects(parent: ?*VM, nested: *VM) !void {
+    const outer = parent orelse return;
+    // A nested import VM has its own effect epoch. Propagate the fact that it
+    // performed an effect even on the demand path, so the caller's bytecode
+    // result cannot enter the pure-thunk memo and suppress a later call.
+    if (nested.effect_epoch != 0) outer.effect_epoch +%= 1;
+    if (!outer.speculation.active or nested.effect_journal.items.len == 0) return;
+    try outer.effect_journal.appendSlice(outer.allocator, nested.effect_journal.items);
+}
+
+fn isTransientImportError(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory, error.StackOverflow, error.SpeculativeBail => true,
+        else => false,
+    };
+}
+
 fn currentImportClaimer() future_mod.ClaimerId {
     const inner = fiber_mod.currentFiber() orelse return future_mod.invalid_claimer;
     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
@@ -2360,6 +2430,110 @@ fn gcContext(ev: *Evaluator) gc_controller.Context {
         .parallel_cap = ev.collection.parallel_cap,
         .observer = ev.observer,
     };
+}
+
+const TestEffectCapture = struct {
+    count: usize = 0,
+    lengths: [8]usize = undefined,
+    messages: [8][128]u8 = undefined,
+
+    fn emit(raw: ?*anyopaque, _: effects_mod.Kind, text: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.count == self.messages.len or text.len > self.messages[0].len)
+            @panic("effect capture overflow");
+        self.lengths[self.count] = text.len;
+        @memcpy(self.messages[self.count][0..text.len], text);
+        self.count += 1;
+    }
+
+    fn message(self: *const @This(), index: usize) []const u8 {
+        return self.messages[index][0..self.lengths[index]];
+    }
+};
+
+test "speculative effects wait for demand and fire exactly once" {
+    var capture: TestEffectCapture = .{};
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev_live = true;
+    defer if (ev_live) ev.deinit();
+    ev.setEffectSink(.{ .context = &capture, .emit_fn = TestEffectCapture.emit });
+
+    const attrs = try ev.evaluate(
+        \\{
+        \\  held = (builtins.trace "held" 40) + 2;
+        \\  bad = (builtins.seq (builtins.trace "before-error" null) (builtins.throw "boom")) + 0;
+        \\  untouched = builtins.trace "untouched" 0;
+        \\}
+    );
+    const attrs_id = attrs.asObjectId();
+
+    const held = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("held"));
+    try std.testing.expect(held.isThunk());
+    const held_spec = try ev.runWithVm(vm_force.forceValueSpeculative, .{held});
+    try std.testing.expectEqual(@as(i64, 42), held_spec.asInt());
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+
+    const held_demand = try ev.forceValue(held);
+    try std.testing.expectEqual(@as(i64, 42), held_demand.asInt());
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("held", capture.message(0));
+    _ = try ev.forceValue(held);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+
+    // Effects are retained on cached failures too: demand replays the error
+    // and commits the trace that preceded it.
+    const bad = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("bad"));
+    try std.testing.expectError(error.NixThrow, ev.runWithVm(vm_force.forceValueSpeculative, .{bad}));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectError(error.NixThrow, ev.forceValue(bad));
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqualStrings("before-error", capture.message(1));
+
+    // Work that remains purely speculative never becomes language-visible.
+    const untouched = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("untouched"));
+    _ = try ev.runWithVm(vm_force.forceValueSpeculative, .{untouched});
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    ev.deinit();
+    ev_live = false;
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+}
+
+test "speculative imported traces are committed by their demander" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "traced.nix",
+        .data = "builtins.trace \"imported\" 5\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "traced.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(std.testing.allocator, "{{ held = import {s}; }}", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var capture: TestEffectCapture = .{};
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    ev.setEffectSink(.{ .context = &capture, .emit_fn = TestEffectCapture.emit });
+
+    const attrs = try ev.evaluate(source);
+    const held = try ev.heap.getAttrValue(attrs.asObjectId(), try ev.intern.intern("held"));
+    const spec = try ev.runWithVm(vm_force.forceValueSpeculative, .{held});
+    try std.testing.expectEqual(@as(i64, 5), spec.asInt());
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    const demanded = try ev.forceValue(held);
+    try std.testing.expectEqual(@as(i64, 5), demanded.asInt());
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqualStrings("imported", capture.message(0));
 }
 
 test {

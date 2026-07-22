@@ -8,6 +8,8 @@ const heap_mod = @import("runtime").heap;
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
 const vm_trace = @import("../trace.zig");
+const effect_message = @import("../effect_message.zig");
+const effects = @import("../../effects.zig");
 
 /// Pause into the debugger at an evaluation error, unless we're inside a
 /// `tryEval` (a caught error) or no debugger is attached. `value` is shown as
@@ -16,7 +18,10 @@ const vm_trace = @import("../trace.zig");
 /// abort from the console surfaces as an error here.
 pub fn debugBreakError(self: *VM, value: Value) !void {
     if (self.debug.tryeval_depth != 0) return;
-    if (self.debug.break_sink) |sink| try sink.fire(sink.ctx, self, value, .eval_error);
+    if (self.debug.break_sink) |sink| {
+        self.effect_epoch +%= 1;
+        try sink.fire(sink.ctx, self, value, .eval_error);
+    }
 }
 
 pub fn builtinThrow(self: *VM, message_arg: Value) !Value {
@@ -63,18 +68,31 @@ pub fn builtinAddErrorContext(self: *VM, message_arg: Value, value_arg: Value) !
 /// is a plain forced identity, so it costs nothing off the debug path.
 pub fn builtinBreak(self: *VM, arg: Value) !Value {
     if (self.debug.break_sink) |sink| {
+        // Debugger installation disables speculation at the Evaluator seam;
+        // marking this body effectful also keeps repeated calls out of the
+        // bytecode-result memo.
+        self.effect_epoch +%= 1;
         try sink.fire(sink.ctx, self, arg, .break_builtin);
     }
     return vm_force.forceValue(self, arg);
 }
 
 pub fn builtinTrace(self: *VM, message_arg: Value, value_arg: Value) !Value {
-    _ = try vm_force.forceValue(self, message_arg);
+    const message = try effect_message.render(self, try vm_force.forceValue(self, message_arg));
+    try emitLanguageEffect(self, .trace, message);
     return vm_force.forceValue(self, value_arg);
 }
 
 pub fn builtinTraceVerbose(self: *VM, message_arg: Value, value_arg: Value) !Value {
-    _ = try vm_force.forceValue(self, message_arg);
+    // Matching Nix: when trace-verbose is off the message is not forced.
+    // Still keep the enclosing body out of the pure memo: the setting is an
+    // evaluator option and embeddings may change it between evaluations.
+    if (!self.trace_verbose) {
+        self.effect_epoch +%= 1;
+        return vm_force.forceValue(self, value_arg);
+    }
+    const message = try effect_message.render(self, try vm_force.forceValue(self, message_arg));
+    try emitLanguageEffect(self, .trace, message);
     return vm_force.forceValue(self, value_arg);
 }
 
@@ -82,8 +100,19 @@ pub fn builtinTraceVerbose(self: *VM, message_arg: Value, value_arg: Value) !Val
 /// warning (to stderr, which the conformance runner ignores). `msg` must be a
 /// string, matching Nix.
 pub fn builtinWarn(self: *VM, message_arg: Value, value_arg: Value) !Value {
-    _ = try strings.stringArg(self, message_arg);
+    const message = try effect_message.sanitizeString(self, try strings.stringArg(self, message_arg));
+    try emitLanguageEffect(self, .warning, message);
     return vm_force.forceValue(self, value_arg);
+}
+
+fn emitLanguageEffect(self: *VM, kind: effects.Kind, message: []const u8) !void {
+    const store = self.effects orelse return;
+    self.effect_epoch +%= 1;
+    if (self.speculation.active) {
+        try store.hold(&self.effect_journal, self.allocator, kind, message);
+    } else {
+        store.emitNow(kind, message);
+    }
 }
 
 pub fn tryEvalResult(self: *VM, success: bool, value: Value) !Value {

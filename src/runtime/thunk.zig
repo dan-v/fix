@@ -197,6 +197,12 @@ pub const Thunk = struct {
     demanded: std.atomic.Value(u8),
     /// Active arm of `payload.target` while the future is non-terminal.
     target_kind: TargetKind,
+    /// Evaluator-owned demand-effect group (0 = none). Written by the claiming
+    /// fiber before it release-publishes a resolved/errored state and therefore
+    /// safely read after the corresponding acquire-load. A raw u32 keeps the
+    /// runtime module independent of the expression engine's effect store and
+    /// fits in the struct's existing alignment hole in production builds.
+    effect_group: u32,
     /// `-Dprof-main` probe state; all fields are zero-sized in normal builds.
     created_tsc: CreatedTsc,
     created_demand: CreatedDemand = initCreatedDemand(),
@@ -218,6 +224,7 @@ pub const Thunk = struct {
             .future = future_cell,
             .demanded = .init(0),
             .target_kind = kind,
+            .effect_group = 0,
             .created_tsc = nowCreatedTsc(),
             .payload = payload,
         };

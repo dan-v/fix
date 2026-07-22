@@ -199,6 +199,8 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
     // speculation — they shouldn't, otherwise a single speculative task
     // can cascade into the rest of the dependency graph.
     const saved = self.speculation.active;
+    const journal_start = self.effect_journal.items.len;
+    const owns_journal = !saved;
     self.speculation.active = true;
     // Mirror the fiber-state flag into the per-worker-thread creation-
     // context flag so thunks created inside this speculative force (incl.
@@ -207,6 +209,7 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
     // different fiber resumes on this thread.
     self.heap.setSpecCtx(true);
     defer {
+        if (owns_journal) self.effect_journal.shrinkRetainingCapacity(journal_start);
         self.speculation.active = saved;
         self.heap.setSpecCtx(saved);
     }
@@ -241,7 +244,9 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     const thunk = self.heap.getThunkAssumeValid(value.asObjectId());
     const state = thunk.future.state.load(.acquire);
     if (state == @intFromEnum(future_mod.FutureState.resolved)) {
-        if (demand) {
+        const real_demand = demand and !self.speculation.active;
+        try observeEffectGroup(self, thunk.effect_group, real_demand);
+        if (real_demand) {
             // Discovery probe: main is the first real demander of an
             // already-resolved thunk ⇒ a helper resolved it ahead of demand.
             if (comptime prof.enabled) {
@@ -259,7 +264,7 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
         // observe a thunk where it expects WHNF (the "got thunk" bug). The
         // guard is one predictable branch, almost always not taken; the cold
         // helper follows the chain (non-inline, so this stays `inline`-safe).
-        if (r.isThunk()) return derefForwarder(self, r, demand);
+        if (r.isThunk()) return try derefForwarder(self, r, real_demand);
         return r;
     }
     return forceThunkImpl(self, value, demand);
@@ -273,15 +278,34 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
 /// here would evaluate a thunk (often a fixpoint binding cell) out of order and
 /// race the fiber that owns it. Cold: reached only when a resolved thunk's
 /// payload is unexpectedly another thunk.
-fn derefForwarder(self: *VM, start: Value, demand: bool) Value {
+fn derefForwarder(self: *VM, start: Value, demand: bool) anyerror!Value {
     var r = start;
     while (r.isThunk()) {
         const t = self.heap.getThunkAssumeValid(r.asObjectId());
         if (t.future.state.load(.acquire) != @intFromEnum(future_mod.FutureState.resolved)) return r;
+        try observeEffectGroup(self, t.effect_group, demand and !self.speculation.active);
         if (demand) t.markDemanded();
         r = t.payload.result;
     }
     return r;
+}
+
+/// Commit or propagate a previously published effect group. Public for the
+/// import-future path, which uses the same groups but is not a runtime Thunk.
+pub fn observeEffectGroup(self: *VM, group_id: u32, demand: bool) !void {
+    const effects = self.effects orelse return;
+    if (try effects.observe(
+        group_id,
+        demand and !self.speculation.active,
+        &self.effect_journal,
+        self.allocator,
+    )) self.effect_epoch +%= 1;
+}
+
+fn attachSpeculativeEffects(self: *VM, thunk: *Thunk, checkpoint: usize) !void {
+    const effects = self.effects orelse return;
+    std.debug.assert(thunk.effect_group == 0);
+    thunk.effect_group = try effects.makeGroup(self.effect_journal.items[checkpoint..]);
 }
 
 pub fn forceDeep(self: *VM, value: Value) !void {
@@ -604,18 +628,21 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     defer prof.end(.force_thunk_slow, t);
     const thunk_id = thunk_val.asObjectId();
     const thunk = self.heap.getThunkAssumeValid(thunk_id);
+    const real_demand = demand and !self.speculation.active;
 
     while (true) {
         switch (tryForceDispatch(self, thunk)) {
             .already_resolved => |v| {
-                if (demand) thunk.markDemanded();
-                return v;
+                try observeEffectGroup(self, thunk.effect_group, real_demand);
+                if (real_demand) thunk.markDemanded();
+                return if (v.isThunk()) try derefForwarder(self, v, real_demand) else v;
             },
             .blackhole => {
                 recordBlackhole(self, thunk_id);
                 return error.RecursiveThunk;
             },
             .errored => |info| {
+                try observeEffectGroup(self, thunk.effect_group, real_demand);
                 replayCachedMessage(self, info.*.message);
                 return info.*.err;
             },
@@ -626,7 +653,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // forcible before main reached it (look-ahead ceiling).
                 var age_t: u64 = std.math.maxInt(u64);
                 if (comptime prof.enabled) {
-                    if (demand and self.workerId() == 0) {
+                    if (real_demand and self.workerId() == 0) {
                         prof_census.disc.claimed_by_main += 1;
                         // Coverage-miss breakdown: main is computing this
                         // itself, so speculation did NOT cover it. Split by
@@ -648,7 +675,10 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 try enforceSpeculationBudget(self, thunk, thunk_id);
                 const memo_key = claimedMemoKey(self, thunk);
                 if (memo_key) |key|
-                    if (reuseMemoizedThunk(self, thunk, thunk_id, key, demand)) |value| return value;
+                    if (reuseMemoizedThunk(self, thunk, thunk_id, key, real_demand)) |value| return value;
+
+                const effect_checkpoint = self.effect_journal.items.len;
+                const effect_epoch = self.effect_epoch;
 
                 const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
                 defer prof_path.exit(pp);
@@ -678,43 +708,48 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
                 const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {
+                    if (self.speculation.active and !isTransientThunkError(err)) {
+                        attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |effect_err| {
+                            publishThunkFailure(self, thunk, thunk_id, effect_err);
+                            trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
+                            return effect_err;
+                        };
+                    }
                     publishThunkFailure(self, thunk, thunk_id, err);
                     trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
                     return err;
                 };
-                // A tail `call`/functor/builtin can leave a *forwarding* thunk
-                // on the stack, which plain `ret` returns un-forced — so the
-                // computed result may itself be a thunk rather than WHNF. It is
-                // published as-is (dereferencing it here would either force
-                // mid-resolution, re-entering the operand stack unsafely, or
-                // read a `payload.result` a concurrent `publishCellBinding` can
-                // flip). The forwarding chain is followed safely on the read
-                // path instead, via `derefForwarder`.
+                // If a tail call/functor/builtin left a *forwarding* thunk as
+                // result, peek through already-resolved links before publishing
+                // this thunk. Besides finding the WHNF, speculative peeking
+                // propagates any held effects into this thunk's journal group.
+                const whnf = if (result.isThunk()) try derefForwarder(self, result, real_demand) else result;
+                if (self.speculation.active) attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |err| {
+                    publishThunkFailure(self, thunk, thunk_id, err);
+                    trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
+                    return err;
+                };
                 resolveDispatch(self, thunk, result);
                 self.heap.gcRecordEdge(thunk_id, result); // old→young barrier
-                // If a tail call/functor/builtin left a *forwarding* thunk as
-                // the result (see above), hand back — and memoize — the WHNF at
-                // the end of the resolved chain, not the thunk wrapper, so the
-                // caller (e.g. `getAttrValue`) never sees a thunk. The published
-                // `thunk.payload` keeps the wrapper; later reads deref it the
-                // same way via the resolved fast path. Almost always not a
-                // thunk → no work.
-                const whnf = if (result.isThunk()) derefForwarder(self, result, demand) else result;
-                if (memo_key) |k| thread_caches.get().thunk_memo[k.idx] = .{
-                    .token = self.heap.token,
-                    .chunk = k.chunk,
-                    .count = k.count,
-                    .up0 = k.up0,
-                    .up1 = k.up1,
-                    .value = whnf,
-                };
+                if (memo_key) |k| {
+                    if (self.effect_epoch == effect_epoch) {
+                        thread_caches.get().thunk_memo[k.idx] = .{
+                            .token = self.heap.token,
+                            .chunk = k.chunk,
+                            .count = k.count,
+                            .up0 = k.up0,
+                            .up1 = k.up1,
+                            .value = whnf,
+                        };
+                    }
+                }
                 recordResolve(self, thunk_id, whnf);
                 trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, true);
-                if (demand) thunk.markDemanded();
+                if (real_demand) thunk.markDemanded();
                 return whnf;
             },
             .busy => {
-                waitForBusyThunk(self, thunk, thunk_id, demand);
+                waitForBusyThunk(self, thunk, thunk_id, real_demand);
                 continue;
             },
         }

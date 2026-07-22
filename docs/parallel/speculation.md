@@ -8,6 +8,14 @@ Nix evaluation is lazy: a value is computed only when forced. On one core that i
 
 Neither changes results. Both are pure earliness: the [claim/waiter protocol](../runtime/thunks.md) publishes at most one terminal result and makes concurrent forcers converge, so a bad guess costs work, never correctness.
 
+Language-visible effects are demand-committed too. A helper that reaches
+`builtins.trace`, `traceVerbose`, or `warn` records the sanitized message in its
+fiber journal instead of writing it. The record is published with the terminal
+thunk/import result and propagated through speculative parents. The first real
+demander atomically emits it; an undemanded guess emits nothing. Shared records
+preserve exactly-once behavior even when several speculative parents contain
+the same child effect.
+
 | Mechanism | Trigger | Action |
 |---|---|---|
 | **Speculation** | creating a thunk whose body is *substantial* | submit the body-force to the speculation [queue](scheduler.md); continue with a lazy thunk |
@@ -89,6 +97,7 @@ Fan-out and speculation are independent levers and each contributes a substantia
 - Creation-time speculation and sibling sweeps do not recursively submit from speculative work; queue and task budgets bound the paths that may cascade.
 - Bail fires **only after** the demanded result exists (or a budget is blown) ⇒ byte-identical, untunable.
 - `SpeculativeBail` is **transient** — the thunk is reset and recomputed on real demand, never cached as an error.
+- Language-visible effects are journaled by helpers and committed exactly once by real demand; transiently abandoned work drops only its journal reference, not a visible effect.
 - Urgent fan-out may recurse; speculative admission remains bounded.
 
 ## Debug flags

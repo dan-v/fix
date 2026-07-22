@@ -35,6 +35,7 @@ const DeferredTable = @import("../compiler/deferred_table.zig").Table;
 const ChunkRegistrationSink = @import("../compiler/context.zig").ChunkRegistrationSink;
 const ThunkTrace = @import("../probe.zig").thunk_trace.ThunkTrace;
 const LanguagePolicy = @import("../policy.zig").LanguagePolicy;
+const effects_mod = @import("../effects.zig");
 
 pub const exec_context = @import("../eval/workers/context.zig");
 pub const ExecutionContext = exec_context.ExecutionContext;
@@ -232,6 +233,15 @@ pub const VM = struct {
     scheduler: *Scheduler,
     /// Evaluator-owned error trace collector.
     trace: ?*eval_trace.Trace,
+    /// Sparse demand-committed language-effect store. Null only in isolated
+    /// VM unit harnesses that do not exercise effecting builtins.
+    effects: ?*effects_mod.Store,
+    /// Effects observed during the current speculative task. Nested thunk
+    /// forces leave records here so each containing thunk can publish a group.
+    effect_journal: effects_mod.Journal = .empty,
+    /// Monotonic per-VM marker used to keep effectful bodies out of the pure
+    /// bytecode-result memo. Wrapping is harmless; only equality is tested.
+    effect_epoch: u64 = 0,
     /// Evaluator-scoped structured observation capability. Disabled handles
     /// are cheap values and all workers may use an enabled handle safely.
     observer: observ.Observer,
@@ -304,6 +314,8 @@ pub const VM = struct {
 
     /// Compatibility policy applied while parsing and compiling this code.
     policy: LanguagePolicy,
+    /// Nix's `trace-verbose` setting gates `builtins.traceVerbose`.
+    trace_verbose: bool,
 
     /// Values held off the VM stack across GC safepoints.
     gc_roots: GcRoots = .{},
@@ -320,6 +332,7 @@ pub const VM = struct {
         realization: *RealizationStore,
         scheduler: *Scheduler,
         trace_sink: ?*eval_trace.Trace = null,
+        effects: ?*effects_mod.Store = null,
         observer: observ.Observer = .{},
         executor: ?FiberExecutor = null,
         vm_trace: ?*VmTrace = null,
@@ -332,6 +345,7 @@ pub const VM = struct {
         break_sink: ?BreakSink = null,
         breakpoints: ?*bytecode_mod.BreakpointTable = null,
         policy: LanguagePolicy = .{},
+        trace_verbose: bool = false,
         lazy_shells_visible: bool = false,
     };
 
@@ -363,6 +377,7 @@ pub const VM = struct {
             .realization = options.realization,
             .scheduler = options.scheduler,
             .trace = options.trace_sink,
+            .effects = options.effects,
             .observer = options.observer,
             .executor = options.executor,
             .vm_trace = options.vm_trace,
@@ -383,6 +398,7 @@ pub const VM = struct {
             .solo = options.scheduler.worker_count == 1,
             .lazy_shells_visible = options.lazy_shells_visible,
             .policy = options.policy,
+            .trace_verbose = options.trace_verbose,
         };
     }
 
@@ -411,13 +427,16 @@ pub const VM = struct {
     pub fn onScratchReset(self: *VM) void {
         std.debug.assert(self.gc_roots.force_chain.items.len == 0);
         std.debug.assert(self.gc_roots.temporary.items.len == 0);
+        std.debug.assert(self.effect_journal.items.len == 0);
         self.gc_roots.force_chain = .empty;
         self.gc_roots.temporary = .empty;
+        self.effect_journal = .empty;
     }
 
     pub fn deinit(self: *VM) void {
         self.gc_roots.force_chain.deinit(self.allocator);
         self.gc_roots.temporary.deinit(self.allocator);
+        self.effect_journal.deinit(self.allocator);
         if (self.buffer_pool) |bp| {
             bp.release(.{ .stack = self.stack, .frames = self.frames });
         } else {

@@ -1,0 +1,139 @@
+//! Shallow, terminal-safe rendering for `builtins.trace` messages.
+//!
+//! Nix accepts any value as a trace message. The outer value is forced by the
+//! builtin, but lazy children are displayed as `«thunk»` rather than demanded
+//! merely for logging. Strings at the root are written raw; nested strings use
+//! the ordinary quoted Nix form.
+
+const std = @import("std");
+const VM = @import("context.zig").VM;
+const Value = @import("runtime").value.Value;
+const ObjectId = @import("runtime").types.ObjectId;
+const FutureState = @import("runtime").future.FutureState;
+const terminal_text = @import("base").terminal_text;
+
+pub fn render(self: *VM, forced: Value) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    defer out.deinit();
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(self.allocator);
+    try writeValue(self, &out.writer, forced, true, &seen);
+    const owned = try out.toOwnedSlice();
+    defer self.allocator.free(owned);
+    return self.intern.get(try self.intern.intern(terminal_text.stripAnsiInPlace(owned)));
+}
+
+pub fn sanitizeString(self: *VM, raw: []const u8) ![]const u8 {
+    const copy = try self.allocator.dupe(u8, raw);
+    defer self.allocator.free(copy);
+    return self.intern.get(try self.intern.intern(terminal_text.stripAnsiInPlace(copy)));
+}
+
+fn writeValue(
+    self: *VM,
+    writer: *std.Io.Writer,
+    value: Value,
+    root: bool,
+    seen: *std.AutoHashMapUnmanaged(u64, void),
+) anyerror!void {
+    switch (value.kind()) {
+        .null => try writer.writeAll("null"),
+        .bool_false => try writer.writeAll("false"),
+        .bool_true => try writer.writeAll("true"),
+        .int => try writer.print("{d}", .{value.asInt()}),
+        .boxed_int => try writer.print("{d}", .{try self.heap.getBoxedInt(value.asObjectId())}),
+        .float => try writer.print("{d}", .{value.asFloat()}),
+        .string => try writeString(writer, self.intern.get(value.asInternId()), root),
+        .path => try writer.writeAll(self.intern.get(value.asInternId())),
+        .string_context => {
+            const string = try self.heap.getContextString(value.asObjectId());
+            try writeString(writer, self.intern.get(string.text), root);
+        },
+        .list => try writeList(self, writer, value.asObjectId(), seen),
+        .attrs => try writeAttrs(self, writer, value.asObjectId(), seen),
+        .thunk => try writeThunk(self, writer, value.asObjectId(), root, seen),
+        .closure => try writer.writeAll("«lambda»"),
+        .builtin => try writer.writeAll("«primop»"),
+        .builtin_closure, .partial_app => try writer.writeAll("«primop-app»"),
+    }
+}
+
+fn writeList(self: *VM, writer: *std.Io.Writer, id: ObjectId, seen: *std.AutoHashMapUnmanaged(u64, void)) !void {
+    if (!try enter(seen, self.allocator, id, 1)) return writer.writeAll("«repeated»");
+    const items = try self.heap.getList(id);
+    try writer.writeAll("[ ");
+    for (items, 0..) |item, index| {
+        if (index != 0) try writer.writeByte(' ');
+        try writeValue(self, writer, item, false, seen);
+    }
+    try writer.writeAll(" ]");
+}
+
+fn writeAttrs(self: *VM, writer: *std.Io.Writer, id: ObjectId, seen: *std.AutoHashMapUnmanaged(u64, void)) !void {
+    if (!try enter(seen, self.allocator, id, 2)) return writer.writeAll("«repeated»");
+    const stored = try self.heap.getAttrs(id);
+    const Entry = std.meta.Elem(@TypeOf(stored));
+    const entries = try self.allocator.dupe(Entry, stored);
+    defer self.allocator.free(entries);
+    const Cmp = struct {
+        intern: @TypeOf(self.intern),
+        fn lessThan(ctx: @This(), a: Entry, b: Entry) bool {
+            return std.mem.lessThan(u8, ctx.intern.get(a.name), ctx.intern.get(b.name));
+        }
+    };
+    std.mem.sort(Entry, entries, Cmp{ .intern = self.intern }, Cmp.lessThan);
+
+    try writer.writeAll("{ ");
+    for (entries) |entry| {
+        try writeAttrName(writer, self.intern.get(entry.name));
+        try writer.writeAll(" = ");
+        try writeValue(self, writer, entry.value, false, seen);
+        try writer.writeAll("; ");
+    }
+    try writer.writeByte('}');
+}
+
+fn writeThunk(
+    self: *VM,
+    writer: *std.Io.Writer,
+    id: ObjectId,
+    root: bool,
+    seen: *std.AutoHashMapUnmanaged(u64, void),
+) !void {
+    if (!try enter(seen, self.allocator, id, 3)) return writer.writeAll("«repeated»");
+    const thunk = try self.heap.getThunk(id);
+    const state: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
+    // A helper may have resolved this child ahead of demand. Keep that work
+    // invisible in a shallow trace message just as lazy XML does.
+    if (state != .resolved or !thunk.isDemanded()) return writer.writeAll("«thunk»");
+    try writeValue(self, writer, thunk.payload.result, root, seen);
+}
+
+fn writeString(writer: *std.Io.Writer, text: []const u8, root: bool) !void {
+    if (root) return writer.writeAll(text);
+    try writer.writeByte('"');
+    for (text) |c| switch (c) {
+        '\\' => try writer.writeAll("\\\\"),
+        '"' => try writer.writeAll("\\\""),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        else => try writer.writeByte(c),
+    };
+    try writer.writeByte('"');
+}
+
+fn writeAttrName(writer: *std.Io.Writer, name: []const u8) !void {
+    if (name.len != 0 and (std.ascii.isAlphabetic(name[0]) or name[0] == '_')) {
+        for (name[1..]) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '\'')) {
+            return writeString(writer, name, false);
+        };
+        return writer.writeAll(name);
+    }
+    try writeString(writer, name, false);
+}
+
+fn enter(seen: *std.AutoHashMapUnmanaged(u64, void), allocator: std.mem.Allocator, id: ObjectId, tag: u2) !bool {
+    const gop = try seen.getOrPut(allocator, (@as(u64, id) << 2) | tag);
+    return !gop.found_existing;
+}

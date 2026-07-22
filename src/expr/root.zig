@@ -4,6 +4,7 @@
 const evaluator = @import("evaluator.zig");
 const policy = @import("policy.zig");
 const memory_config = @import("memory_config.zig");
+const effects = @import("effects.zig");
 
 pub const bytecode = @import("tooling/bytecode.zig");
 pub const workers = @import("eval/workers.zig");
@@ -19,6 +20,8 @@ pub const DebugSession = evaluator.DebugSession;
 pub const DebugFrame = evaluator.DebugFrame;
 pub const BreakReason = evaluator.BreakReason;
 pub const ReleaseAction = evaluator.ReleaseAction;
+pub const EffectKind = effects.Kind;
+pub const EffectSink = effects.Sink;
 pub const LanguagePolicy = policy.LanguagePolicy;
 pub const ExperimentalFeature = policy.ExperimentalFeature;
 pub const ExperimentalFeatures = policy.ExperimentalFeatures;

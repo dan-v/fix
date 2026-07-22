@@ -1094,6 +1094,20 @@ fn specRootBandSmall(f: *WorkerFiber, thunk_id: types.ObjectId) bool {
 /// Run one scheduled task's body (the entry's dispatch switch, factored
 /// out so the census wrapper can bracket it without duplicating arms).
 fn runTask(f: *WorkerFiber, task: Task) void {
+    // Every scheduled helper task is ahead of language demand, including the
+    // urgent fan-out lane and import prefetch. Keep language effects in the
+    // fiber journal; the thunk/import future being computed publishes them for
+    // a later genuine demander. (`forceValueSpeculative` nests under this for
+    // thunk tasks and preserves the already-active journal.)
+    const saved_active = f.vm.speculation.active;
+    const journal_start = f.vm.effect_journal.items.len;
+    f.vm.speculation.active = true;
+    f.vm.heap.setSpecCtx(true);
+    defer {
+        f.vm.effect_journal.shrinkRetainingCapacity(journal_start);
+        f.vm.speculation.active = saved_active;
+        f.vm.heap.setSpecCtx(saved_active);
+    }
     switch (task) {
         .force_thunk => |thunk_id| runForceThunkTask(f, thunk_id),
         .force_list_range => |range| runListRangeTask(f, range),

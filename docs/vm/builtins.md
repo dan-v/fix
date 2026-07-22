@@ -58,7 +58,7 @@ Builtins that merge [string context](../derivation/context.md) or build large in
 | `arithmetic` | `add`, `sub`, `mul`, `div`, `lessThan`, bitwise ops, `floor`, `ceil` |
 | `predicates` | `typeOf`, `isString`/`isInt`/`isBool`/`isList`/`isAttrs`/`isNull`/`isFloat`/`isPath`/`isFunction` |
 | `serial` | `toJSON`/`fromJSON`, `toXML`, `fromTOML`, `compareVersions`, `splitVersion`, `parseDrvName`, `split`, `match` |
-| `errors` | `throw`, `abort`, `tryEval`, `trace`, `traceVerbose`, `addErrorContext` |
+| `errors` | `throw`, `abort`, `tryEval`, `trace`, `traceVerbose`, `warn`, `addErrorContext` |
 | `string_context` | context tracking (`getContext`, `hasContext`, `appendContext`, `unsafeDiscardStringContext`, …) — see [derivation/context.md](../derivation/context.md) |
 | `derivation` | `derivation`/`derivationStrict`, `derivationLazyAttr` — see [derivation/model.md](../derivation/model.md) |
 
@@ -67,6 +67,13 @@ Builtins that merge [string context](../derivation/context.md) or build large in
 Builtin evaluation is **fiber-sequential**: language-visible logic resumes on one fiber. A builtin may submit independent per-element thunks to the [scheduler](../parallel/scheduler.md) — `map`, `genList`, and `mapAttrs` enqueue eligible element work — so helpers can force them ahead of demand. Blocking fetch and nix-daemon work instead runs on dedicated I/O threads while the calling fiber parks; those threads are separate from the `--workers` compute pool.
 
 Local filesystem operations (`readFile`, `readDir`, import discovery) use the shared file cache on the calling fiber. Import results are cached and deduplicated so concurrent importers of the same path converge (see [imports.md](../parallel/imports.md)); network/subprocess fetches and daemon store operations use the blocking executors above.
+
+`trace`, enabled `traceVerbose`, and `warn` stream synchronized, flushed stderr
+records on the demand path. Messages are stripped of ANSI/terminal control
+sequences before they reach the sink. Speculative fibers journal these effects
+and publish them with their thunk or import result, so unused work stays silent
+without losing an effect that is demanded later. Disabled `traceVerbose` does
+not force its message; the `trace-verbose` Nix setting enables it.
 
 ## Hot builtins
 

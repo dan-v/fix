@@ -113,7 +113,10 @@ nixpkgs can re-evaluate pure `lib` helpers with identical arguments across many 
 The memo is a bounded **per-worker, zero-contention** table (`memo_size = 1 << 14` = 16384 slots) keyed by `(heap_token, chunk_id, upvalue count, ≤2 upvalue Value-bits) → Value`:
 
 - Only `bytecode` thunks with ≤2 upvalues (the inline-storage majority) — the key compares exactly with no allocation.
-- **Sound because bytecode thunks are pure** — same chunk + same upvalues ⇒ same value.
+- **Sound for pure executions** — same chunk + same upvalues ⇒ same value. A
+  per-VM effect epoch detects `trace`/`warn`, debugger callbacks, and effects
+  returned through nested imports; such executions are not inserted into the
+  memo.
 - Keyed by `heap_token`, which **bumps on every GC collection**, auto-invalidating stale entries across heap generations / `Evaluator` instances (same trick as the attr inline cache).
 - **Does not cross workers** (thread-local). Each worker publishes its memo's address into a registry so the STW collector can mark current-token entries (a memo slot can be the momentary sole reference to a shared result). The heap token is bumped after collection, invalidating those old slots before ObjectIds can be reused.
 
@@ -123,6 +126,11 @@ Checked on the freshly-claimed path before running the body; a hit resolves the 
 
 - **Lazy shell** (`initLazyShell`): born **`.resolved`** with `demanded = 0` and `result` already live. Forces in O(1) (resolved fast path). Used when the compiler has an eager-buildable shape (list/attrset/lambda) sitting in an observably-lazy position — it wraps the already-built shell instead of registering a chunk and dispatching bytecode. Lazy renderers (XML lazy mode) see *resolved but undemanded* and print `<unevaluated />` until a real consumer marks it demanded — this is how speculation stays invisible.
 - **Binding cell** (`initBindingCell`): created for recursive `let` bindings *before* the RHS is computed, born **`.evaluating` claimed** by the creating fiber. A concurrent force therefore sees `.busy` and parks, rather than CAS-claiming a placeholder. The creator later calls `publishCellBinding(val)`, which writes `target = pass_through(val)` and transitions back to **`.unresolved`** (keeping laziness — the cell forces `val` only when actually forced). Without the born-claimed guard, a racing fiber could claim the cell while it still wrapped the placeholder null and freeze the binding to null before the creator published — a real race that this fixes.
+- **Demand-effect group** (`effect_group`): a claiming speculative fiber freezes
+  its effect-journal suffix before release-publishing `.resolved` or `.errored`.
+  Acquire readers either propagate that immutable group while speculating or
+  atomically emit it on genuine demand. The raw group id fits the thunk's
+  existing alignment hole; records themselves are evaluator-owned.
 
 ## Invariants & gotchas
 

@@ -50,6 +50,9 @@ pub fn applyMemoryBacking(cli_mode: ?hugetlb.Mode) void {
 /// parallelism, environment, base path, NIX_PATH) and resolve the terminal
 /// color/progress policy. Enables ANSI on stderr when coloring.
 pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) !Terminal {
+    // Language effects are durable stderr records, independent of progress
+    // verbosity. The evaluator sink synchronizes and flushes each one.
+    ev.setEffectStderr(init.io);
     // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap is
     // pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.setLazyShellsVisible(options.output == .xml);
@@ -76,6 +79,7 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     defer settings.deinit();
     // `--option NAME VALUE` overrides; `--option extra-NAME VALUE` appends (Nix).
     for (options.option_overrides.items) |o| try settings.setOrAppend(o.name, o.value);
+    ev.setTraceVerbose(boolSetting(&settings, "trace-verbose", false));
     if (!options.experimental_features_reset) {
         if (settings.get("experimental-features")) |list|
             args.mergeConfigFeatures(&features, list);

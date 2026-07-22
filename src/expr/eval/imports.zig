@@ -75,6 +75,9 @@ pub const ImportEntry = struct {
     /// The resolved import value. `Future` is value-less, so the entry
     /// owns its own result slot, written before `future.publish()`.
     result: Value = Value.null_val,
+    /// Demand-effect group discovered while a speculative import evaluated.
+    /// Published before `future` reaches a terminal state, like `result`.
+    effect_group: u32 = 0,
     /// Owned by this entry. Allocated when the compile fails so the
     /// future can transition to `.errored` with a sidecar. Freed by
     /// `Registry.deinit`.

@@ -449,6 +449,7 @@ fn opBreakpoint(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
                 .entry => .entry,
                 else => .line_breakpoint,
             };
+            vm.effect_epoch +%= 1;
             sink.fire(sink.ctx, vm, Value.null_val, reason) catch |e| return e;
         }
     }
@@ -1151,6 +1152,7 @@ noinline fn pauseAfterReturn(vm: *VM, result: Value) anyerror!void {
     const bps = vm.debug.breakpoints orelse return;
     const depth = vm.debugFrameDepth();
     if (depth == 0 or !bps.pausesAfterReturn(depth)) return;
+    vm.effect_epoch +%= 1;
     try sink.fire(sink.ctx, vm, result, .return_step);
 }
 
