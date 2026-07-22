@@ -19,7 +19,7 @@ One number decides when the collector runs: a heap-reserved-bytes budget, defend
 
 ## Generational structure
 
-Collections are **minor** and young-gated: each minor examines only the objects allocated since the last collection — recorded per-worker in `HeapLocal.gc_young_slots` (appended on allocation once tracking is armed, cleared after each minor) — so the work is O(young), not O(total).
+Routine collections are **minor** and young-gated: each minor examines only the objects allocated since the last collection — recorded per-worker in `HeapLocal.gc_young_slots` (appended on allocation once tracking is armed, cleared after each minor) — so the work is O(young), not O(total). Once promoted objects reach the major gate (the previous major's live-object count, with a one-million-object floor), the next collection performs a full, non-gated mark and sweep to reclaim unreachable old objects.
 
 - **Young/old.** Objects allocated after arming are young; a minor promotes marked survivors to old (in place) and reclaims the dead.
 - **Remembered set.** An old→young write barrier records old objects that come to reference young ones, so the young-gated mark can seed from roots *plus* the remembered set and stop at old boundaries without missing live young children.
@@ -54,6 +54,7 @@ Root set (all must be enumerated — precise):
 - Precise **bitmap**: one bit per ObjectId (marked/live).
 - Explicit **worklist**, no recursion (heap graphs are deep).
 - From each root, follow exact heap edges via the trace map; mark reached young objects and account live bytes / objects / ranges. The mark stops at old objects (reached only through the remembered set).
+- A major uses the same trace map without the young gate, rescans all chunk constants, and also seeds remembered mutable edges that cannot always be recovered by rescanning their source object.
 - Single-owner ranges (below) mean a `ValueRange`/`AttrRange` is marked as part of its owner — no separate range roots.
 
 ## Sweep (reclaim)
@@ -61,6 +62,7 @@ Root set (all must be enumerated — precise):
 - Processing each young object: **marked ⇒ survivor**, promoted in place (`gcSetOld`, id unchanged, ranges stay put); **unmarked ⇒ dead**, its store ranges returned to the free lists in place and its slot id recycled.
 - **Per-worker** free lists in the [heap](runtime/heap.md) (`HeapLocal.gc_free_objects` for slot ids; `gc_free_values` / `gc_free_attrs` / `gc_free_attr_pos` are exact-fit range lists keyed by length). A dead object's slot id and ranges are pushed into the free shard of the worker that swept its young-slot list, then **reused lock-free** by that worker's subsequent allocations (exact-length range match; slot ids LIFO). No shared allocation mutex.
 - Non-moving: no compaction pass, so scattered death can leave fragmentation.
+- A major sweeps every allocated object slot rather than the young lists, then tenures every survivor and clears the remembered set. The full sweep is currently serial.
 
 ## Safepoints
 
@@ -77,17 +79,17 @@ At `--workers=1` a minor is serial on the lone mutator. At `--workers>1` every l
 
 - **Parallel mark** — an atomic bitmap plus per-worker work-stealing deques. The collector seeds roots and the remembered set, then parked peers help drain to global termination. `FIX_GC_PAR_CAP` caps participants.
 - **Parallel minor sweep** — the per-worker young-object lists form a shared claim loop; each participant promotes marked survivors in place and returns dead slots and ranges to its own free shard.
+- **Parallel major mark** — the same parked peers drain a non-young-gated full mark, then remain parked while the collector performs the full sweep serially.
 - Evaluation still runs `worker_count`-wide; collection participation is capped. Peers over the cap remain parked.
-- **Major collection is currently single-worker-only.** Multi-worker runs perform minor collections but can retain unreachable old-generation objects until evaluator teardown.
 
 ## Status
 
 | Mode | State |
 |------|-------|
 | w=1 | Minor and major collection are enabled; detector builds validate reads and mark closure. |
-| w>1 | Minor mark and sweep run across parked peers; free lists are per-worker sharded. Major collection remains disabled while parallel full-mark root closure is unresolved. |
+| w>1 | Minor mark/sweep and major mark run across parked peers; major sweep is serial and free lists are per-worker sharded. |
 
-**Cost model:** force-chain and temporary-root maintenance must stay complete across the arming boundary. Once collection is active, pauses consist of survivor marking and young-list sweep; frequency is budget-driven. Non-moving fragmentation limits how much storage can be returned directly to the OS.
+**Cost model:** force-chain and temporary-root maintenance must stay complete across the arming boundary. Once collection is active, minor pauses consist of survivor marking and young-list sweep; a less-frequent major adds a full-heap sweep. Frequency is budget-driven. Non-moving fragmentation limits how much storage can be returned directly to the OS.
 
 ## Correctness tooling
 

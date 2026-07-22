@@ -91,9 +91,12 @@ pub fn helpMark(ev: Context, worker_id: u8) void {
     const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
     const slot = ev.heap.gcMarkSlotGrab();
     if (slot >= marker_count) return;
-    // Join the mark, then claim young-object lists from the shared sweep queue.
+    // Join the mark. A minor then claims young-object lists from the shared
+    // sweep queue; a major leaves every peer parked while the collector runs
+    // the full sweep serially.
     ev.tracer.drainParallel(ev.heap, slot);
-    heap_collector.minorSweepClaimLoop(ev.heap, ev.tracer.mark_bits);
+    if (!ev.heap.collection.collecting_major)
+        heap_collector.minorSweepClaimLoop(ev.heap, ev.tracer.mark_bits);
 }
 
 /// Run one stop-the-world generational collection at a safepoint.
@@ -104,10 +107,10 @@ pub fn collect(ev: Context, collector_id: u8) void {
         heap_collector.armLazy(ev.heap);
         return;
     }
-    // Major collection remains single-worker until full-mark root closure is
-    // proven under parallel evaluation. Multi-worker runs therefore reclaim
-    // young garbage but may accumulate unreachable old objects.
-    if (ev.worker_count == 1 and ev.heap.gcShouldMajor()) {
+    // A full mark is safe with multiple evaluator workers: the collection
+    // coordinator has already parked every peer, and markRoots walks every
+    // registered worker/fiber plus the scheduler and evaluator-owned roots.
+    if (ev.heap.gcShouldMajor()) {
         collectMajor(ev, collector_id);
         return;
     }
@@ -200,9 +203,8 @@ pub fn collect(ev: Context, collector_id: u8) void {
 /// GC: one stop-the-world MAJOR (full) collection at a safepoint.
 /// Unlike `collect` (the young-gated minor), this marks the whole reachable
 /// graph from roots and sweeps EVERY unmarked object — reclaiming the tenured
-/// old-generation garbage a minor can't. Serial mark+sweep; gated to
-/// `--workers=1` by the caller (see `collect` — the w>1 full mark has an
-/// unresolved missing-root bug).
+/// old-generation garbage a minor can't. Parked evaluator workers help with
+/// the full mark; the collector performs the full sweep serially.
 pub fn collectMajor(ev: Context, collector_id: u8) void {
     _ = collector_id; // marker slot grabbed dynamically, like the minor
     // Same lazy-arm as the minor: the first crossing arms tracking (everything
@@ -220,23 +222,44 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     // minor, but a non-gated mark must trace old referents too. (The remembered
     // set IS also seeded below — see the note before `forEachRemsetSource`.)
     ev.chunks_scanned.* = 0;
-    tr.resetMajor(ev.heap.objects.count()) catch {
-        heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
-        return;
+    const SeedCtx = struct { tr: *gc.Tracer, heap: *ObjectHeap };
+    const Seed = struct {
+        fn cb(ctx: SeedCtx, source: types.ObjectId) void {
+            ctx.tr.markRemsetSource(ctx.heap, source);
+        }
     };
-    markRoots(ev, tr);
-    // Mutable edges recorded by the write barrier must seed the full mark too;
-    // not every such edge is recoverable by re-scanning its source object.
-    {
-        const SeedCtx = struct { tr: *gc.Tracer, heap: *ObjectHeap };
-        const Seed = struct {
-            fn cb(ctx: SeedCtx, source: types.ObjectId) void {
-                ctx.tr.markRemsetSource(ctx.heap, source);
-            }
+    if (ev.worker_count > 1) {
+        const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
+        tr.resetParallel(ev.heap.objects.count(), marker_count) catch {
+            heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
+            return;
         };
+        // The minor resets this dispenser in beginMinorSweep. A major has no
+        // parallel sweep phase, so reset it directly before taking slot zero.
+        ev.heap.collection.mark_slot.store(0, .release);
+        // Published before gcOpenMark's release store; peers acquire that gate
+        // before entering helpMark and consequently skip the minor sweep.
+        ev.heap.collection.collecting_major = true;
+        const collector_slot = ev.heap.gcMarkSlotGrab();
+        tr.beginSeeding(collector_slot);
+        markRoots(ev, tr);
         heap_collector.forEachRemsetSource(ev.heap, SeedCtx{ .tr = tr, .heap = ev.heap }, Seed.cb);
+        tr.endSeeding();
+        ev.scheduler.gcOpenMark();
+        tr.drainParallel(ev.heap, collector_slot);
+        ev.scheduler.gcCloseMark();
+        tr.sumStats();
+    } else {
+        tr.resetMajor(ev.heap.objects.count()) catch {
+            heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
+            return;
+        };
+        markRoots(ev, tr);
+        // Mutable edges recorded by the write barrier must seed the full mark
+        // too; not every edge is recoverable by re-scanning its source object.
+        heap_collector.forEachRemsetSource(ev.heap, SeedCtx{ .tr = tr, .heap = ev.heap }, Seed.cb);
+        tr.drain(ev.heap);
     }
-    tr.drain(ev.heap);
     const st = heap_collector.sweep(ev.heap, tr.mark_bits); // serial full sweep
     const t1 = nowNs();
     // Tenure every survivor, then clear the remembered set because no live
@@ -245,6 +268,9 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     // shards, so a demand-concentrated workload still reuses the whole pool.
     ev.heap.gcMajorReconcile(tr.mark_bits);
     heap_collector.remsetClear(ev.heap);
+    // Every helper finished its full-mark drain before the sweep began and has
+    // skipped the minor phase. Restore the mode for the next collection.
+    ev.heap.collection.collecting_major = false;
     // Re-arm the major gate to the surviving live set: the next major fires once
     // the old generation has roughly doubled with fresh tenurings again.
     ev.heap.gcNoteMajor(tr.stats.objects);

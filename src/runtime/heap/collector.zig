@@ -57,7 +57,7 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     heap.collection.step_bytes = step_bytes;
     heap.collection.budget_bytes = budget;
     // Collect after fresh reservations cross the configured threshold.
-    heap.collection.threshold_bytes = if (step_bytes > 0) ObjectHeap.gc_min_threshold else budget;
+    heap.collection.threshold_bytes = if (step_bytes > 0) heap.totalReservedBytes() + step_bytes else budget;
     // Validation path arms eagerly (bootstrap_end == the arming count, so the
     // pre-arming region is empty), but turn on constrained mode so the always-
     // on transient-root gates are exercised. `armTracking` enables root tracking.

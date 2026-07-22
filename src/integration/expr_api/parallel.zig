@@ -59,6 +59,38 @@ test "parallel: list operations with 4 workers" {
     try std.testing.expectEqual(@as(i64, 10), result.asInt());
 }
 
+test "parallel: automatic collector dispatches a major with 4 workers" {
+    const alloc = std.testing.allocator;
+    var ev = try Evaluator.init(alloc, 4);
+    defer ev.deinit();
+    ev.configureMemory(64 << 20, null, false);
+
+    // Install the workers/collector, then use the first explicit safepoint to
+    // arm tracking. Objects made below are consequently eligible for sweep.
+    _ = try ev.evaluate("1");
+    const armed = ev.collectNow();
+    try std.testing.expect(armed.ran);
+    try std.testing.expectEqual(@as(u64, 0), armed.collections);
+
+    const live = try ev.evaluate("{ answer = 42; }");
+    try ev.gcSetExternalRoots(&.{live});
+    defer ev.gcSetExternalRoots(&.{}) catch {};
+    const garbage = try ev.evaluate("{ discard = [ 1 2 3 4 ]; }");
+    const garbage_id = garbage.asObjectId();
+
+    // Force the normal collection hook (not collectMajorNow's direct call) to
+    // take its major branch. This is the policy state a sufficiently large
+    // preceding minor would establish in a real evaluation.
+    ev.heap.gcNoteMinorPromoted(std.math.maxInt(u64));
+    const collected = ev.collectNow();
+    try std.testing.expectEqual(@as(u64, 1), collected.collections);
+    try std.testing.expect(!ev.heap.isObjectAllocatedForTest(garbage_id));
+
+    const attrs = try ev.heap.getAttrs(live.asObjectId());
+    try std.testing.expectEqual(@as(usize, 1), attrs.len);
+    try std.testing.expectEqual(@as(i64, 42), attrs[0].value.asInt());
+}
+
 test "parallel: forceDeep fans wide attrset out to helpers" {
     // Constructs an attrset where every value is a thunk whose body is
     // big enough to make speculation worth it, then strict-forces the

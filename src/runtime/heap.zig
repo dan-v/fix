@@ -403,6 +403,10 @@ pub const HeapCollectionState = struct {
     minor_sweep_done: std.atomic.Value(u32) = .init(0),
     minor_sweep_count: u32 = 0,
     mark_slot: std.atomic.Value(u32) = .init(0),
+    /// Set before opening a parallel full mark so helpers skip the minor-only
+    /// young-list sweep after they drain their marker slot. The mark-open
+    /// release/acquire handshake publishes this non-atomic phase bit.
+    collecting_major: bool = false,
     minor_sweep_promoted: std.atomic.Value(u64) = .init(0),
     minor_sweep_freed: std.atomic.Value(u64) = .init(0),
 };
@@ -1263,8 +1267,6 @@ pub const ObjectHeap = struct {
 
     // --- GC allocation and reclamation state ---
 
-    /// Floor on the collection threshold.
-    pub const gc_min_threshold: u64 = 256 << 20;
     /// Floor on the major-collection gate (see `collection.major_gate`): promote at
     /// least this many objects since the last major before the next one, so a
     /// small heap never major-thrashes. Above the floor the gate tracks the
@@ -1330,11 +1332,9 @@ pub const ObjectHeap = struct {
     /// set bits incrementally. Filled = every tracked id `[track_from,
     /// count)` MINUS (a) each worker's reserved-but-unfilled object-chunk
     /// tail and (b) the currently-free slots. Relies on the object id space
-    /// being dense with no gaps other than the per-worker current-chunk tail
-    /// — true at `--workers=1` (the only mode reclaim runs in), where the
-    /// lone worker fills each chunk fully before refilling. Release builds
-    /// only; the detector build keeps the incremental bitmap (it asserts
-    /// liveness on every read, between collections).
+    /// being dense with no gaps other than every worker's current-chunk tail.
+    /// Release builds only; the detector build keeps the incremental bitmap
+    /// (it asserts liveness on every read, between collections).
     /// Lowest ObjectId a major sweep may reclaim: the pre-arming boundary in
     /// constrained mode (`collection.root_always`), else the arming boundary (pre-arming
     /// region pinned). Doubles as the detector's read-after-free assert floor.
