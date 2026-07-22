@@ -231,6 +231,7 @@ pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
         heap.totalReservedBytes() + heap.collection.step_bytes
     else
         @max(budget, heap.totalReservedBytes() + headroom);
+    heap.gcArmObjectMissCollection();
     // Invalidate all thread-local caches (thunk memo, attr IC, call IC)
     // that key on `token`. Current thunk-memo and attr-cache values were
     // traced as roots for this collection because a cache may momentarily be

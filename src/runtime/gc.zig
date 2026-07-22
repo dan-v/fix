@@ -558,6 +558,8 @@ pub const Breakdown = struct {
     val_reserved: u64,
     attr_live: u64,
     attr_reserved: u64,
+    attr_pos_live: u64,
+    attr_pos_reserved: u64,
 };
 pub fn recordTiming(state: *ReportState, mark_ns: u64, sweep_ns: u64) void {
     _ = state.mark_ns_total.fetchAdd(mark_ns, .monotonic);
@@ -581,7 +583,16 @@ pub fn recordBarrier(state: *ReportState, ns: u64) void {
 }
 
 pub fn recordBreakdown(state: *ReportState, b: Breakdown) void {
-    const values = [_]u64{ b.obj_live, b.obj_reserved, b.val_live, b.val_reserved, b.attr_live, b.attr_reserved };
+    const values = [_]u64{
+        b.obj_live,
+        b.obj_reserved,
+        b.val_live,
+        b.val_reserved,
+        b.attr_live,
+        b.attr_reserved,
+        b.attr_pos_live,
+        b.attr_pos_reserved,
+    };
     for (&state.breakdown, values) |*slot, value| slot.store(value, .monotonic);
 }
 
@@ -593,15 +604,27 @@ fn loadBreakdown(state: *const ReportState) Breakdown {
         .val_reserved = state.breakdown[3].load(.monotonic),
         .attr_live = state.breakdown[4].load(.monotonic),
         .attr_reserved = state.breakdown[5].load(.monotonic),
+        .attr_pos_live = state.breakdown[6].load(.monotonic),
+        .attr_pos_reserved = state.breakdown[7].load(.monotonic),
     };
 }
 
+pub const CollectionKind = enum { minor, major };
+
 /// Record one completed collection: objects freed, surviving live bytes,
 /// and total reserved bytes (the committed-RSS high-water for this cycle).
-pub fn recordCollection(state: *ReportState, objects_freed: u64, live_bytes: u64, total_after: u64) void {
+pub fn recordCollection(state: *ReportState, kind: CollectionKind, objects_freed: u64, live: LiveStats, total_after: u64) void {
     _ = state.collections.fetchAdd(1, .monotonic);
+    switch (kind) {
+        .minor => _ = state.minor_collections.fetchAdd(1, .monotonic),
+        .major => {
+            _ = state.major_collections.fetchAdd(1, .monotonic);
+            const values = [_]u64{ live.objects, live.values, live.attrs, live.attr_pos, live.bytes };
+            for (&state.peak_major_live, values) |*peak, value| _ = peak.fetchMax(value, .monotonic);
+        },
+    }
     _ = state.objects_freed_total.fetchAdd(objects_freed, .monotonic);
-    state.last_live_bytes.store(live_bytes, .monotonic);
+    state.last_live_bytes.store(live.bytes, .monotonic);
     _ = state.peak_total_bytes.fetchMax(total_after, .monotonic);
 }
 
@@ -691,7 +714,11 @@ pub fn report(state: *const ReportState, budget_bytes: u64) void {
     const barrier_ns_total = state.barrier_ns_total.load(.monotonic);
     const drain_ns_total = state.drain_ns_total.load(.monotonic);
     std.debug.print("memory budget (reserved-bytes ceiling): {d:.1} MB\n", .{mb(budget_bytes)});
-    std.debug.print("collections: {d}\n", .{live.collections});
+    std.debug.print("collections: {d} ({d} minor, {d} major)\n", .{
+        live.collections,
+        state.minor_collections.load(.monotonic),
+        state.major_collections.load(.monotonic),
+    });
     std.debug.print("objects freed (total): {d}\n", .{live.freed_objects});
     std.debug.print("live after last collect: {d:.1} MB\n", .{mb(live.live_bytes)});
     std.debug.print("peak reserved (RSS ceiling held): {d:.1} MB\n", .{mb(peak_total_bytes)});
@@ -718,6 +745,16 @@ pub fn report(state: *const ReportState, budget_bytes: u64) void {
     std.debug.print("  objects: {d} / {d} ({d:.0}% live)\n", .{ b.obj_live, b.obj_reserved, pct(b.obj_live, b.obj_reserved) });
     std.debug.print("  values:  {d} / {d} ({d:.0}% live)\n", .{ b.val_live, b.val_reserved, pct(b.val_live, b.val_reserved) });
     std.debug.print("  attrs:   {d} / {d} ({d:.0}% live)\n", .{ b.attr_live, b.attr_reserved, pct(b.attr_live, b.attr_reserved) });
+    std.debug.print("  attrpos: {d} / {d} ({d:.0}% live)\n", .{ b.attr_pos_live, b.attr_pos_reserved, pct(b.attr_pos_live, b.attr_pos_reserved) });
+    if (state.major_collections.load(.monotonic) > 0) {
+        std.debug.print("peak full-mark live: {d:.1} MB (objects {d}, values {d}, attrs {d}, attrpos {d})\n", .{
+            mb(state.peak_major_live[4].load(.monotonic)),
+            state.peak_major_live[0].load(.monotonic),
+            state.peak_major_live[1].load(.monotonic),
+            state.peak_major_live[2].load(.monotonic),
+            state.peak_major_live[3].load(.monotonic),
+        });
+    }
     if (live.collections == 0)
         std.debug.print("(no collection — eval stayed under the threshold)\n", .{});
 }
@@ -960,6 +997,82 @@ test "gc sweep coalesces consecutive adjacent dead ranges" {
     };
     try std.testing.expectEqual(range_a.segment, tail_range.segment);
     try std.testing.expectEqual(range_a.offset + 4, tail_range.offset);
+}
+
+test "major coalescing joins adjacent ranges freed by different collections" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 2);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const saved_worker = containers.worker_id.current;
+    defer containers.worker_id.current = saved_worker;
+    containers.worker_id.current = 0;
+
+    const dead_first = try heap.addList(&.{ Value.int(1), Value.int(2) });
+    const live_first = try heap.addList(&.{ Value.int(3), Value.int(4), Value.int(5) });
+    const first_range = switch (heap.get(dead_first).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    const second_range = switch (heap.get(live_first).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(first_range.segment, second_range.segment);
+    try std.testing.expectEqual(first_range.offset + first_range.len, second_range.offset);
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    tr.markValue(&heap, Value.list(live_first));
+    tr.drain(&heap);
+    try std.testing.expectEqual(@as(u64, 1), heap_collector.sweep(&heap, tr.mark_bits).objects_freed);
+
+    // The separating owner dies only in the next collection, so the streaming
+    // sweep cannot see the two free intervals together.
+    try tr.reset(heap.objects.count());
+    try std.testing.expectEqual(@as(u64, 1), heap_collector.sweep(&heap, tr.mark_bits).objects_freed);
+    const fragmented = heap.freeRangesStats().values;
+    try std.testing.expectEqual(@as(u64, 2), fragmented.ranges);
+    try std.testing.expectEqual(@as(u64, 5), fragmented.slots);
+    try std.testing.expectEqual(@as(u32, 3), fragmented.max_len);
+
+    heap.gcCoalesceFreeRanges();
+    const coalesced = heap.freeRangesStats().values;
+    try std.testing.expectEqual(@as(u64, 1), coalesced.ranges);
+    try std.testing.expectEqual(@as(u64, 5), coalesced.slots);
+    try std.testing.expectEqual(@as(u32, 5), coalesced.max_len);
+
+    const values_before = heap.values.count();
+    const reused = try heap.addList(&.{ Value.int(6), Value.int(7), Value.int(8), Value.int(9), Value.int(10) });
+    const reused_range = switch (heap.get(reused).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(first_range.segment, reused_range.segment);
+    try std.testing.expectEqual(first_range.offset, reused_range.offset);
+    try std.testing.expectEqual(values_before, heap.values.count());
+}
+
+test "exhausting a reclaimed object pool requests an early collection once" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    // `afterCollect` normally arms this only after a worthwhile reclaimed
+    // pool was published. Model that post-collection state, then verify that
+    // the first true pool miss requests a safepoint collection and consumes
+    // the one-shot arm.
+    heap.collection.object_miss_collect_armed.store(true, .monotonic);
+    _ = try heap.reserveObjectSlot();
+    try std.testing.expect(heap.collection.collect_requested);
+    try std.testing.expect(!heap.collection.object_miss_collect_armed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), heap.collection.object_miss_collect_requests.load(.monotonic));
+
+    _ = try heap.reserveObjectSlot();
+    try std.testing.expectEqual(@as(u64, 1), heap.collection.object_miss_collect_requests.load(.monotonic));
 }
 
 test "minor sweep publishes every allocation worker's storage for reuse" {
@@ -1219,18 +1332,23 @@ test "gc stat recorders accumulate observable deltas" {
         .val_reserved = 12,
         .attr_live = 5,
         .attr_reserved = 14,
+        .attr_pos_live = 6,
+        .attr_pos_reserved = 16,
     };
     recordBreakdown(&state, breakdown);
     try std.testing.expectEqual(breakdown, loadBreakdown(&state));
 
-    recordCollection(&state, 7, 1234, 999);
+    recordCollection(&state, .major, 7, .{ .objects = 3, .values = 4, .attrs = 5, .attr_pos = 6, .bytes = 1234 }, 999);
     try std.testing.expectEqual(@as(u64, 1), state.collections.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), state.major_collections.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), state.minor_collections.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 7), state.objects_freed_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1234), state.last_live_bytes.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 999), state.peak_total_bytes.load(.monotonic));
 
     // A smaller total-after must not lower the running peak.
-    recordCollection(&state, 0, 1234, 1);
+    recordCollection(&state, .minor, 0, .{ .bytes = 1234 }, 1);
+    try std.testing.expectEqual(@as(u64, 1), state.minor_collections.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 999), state.peak_total_bytes.load(.monotonic));
 
     recordFinalTotal(&state, 999);
@@ -1259,7 +1377,7 @@ test "gc policy and reports are isolated per heap" {
     try std.testing.expectEqual(@as(u64, 0), right.collection.step_bytes);
     try std.testing.expect(!right.collection.disable_reuse);
 
-    recordCollection(&left.collection.report, 3, 4096, 8192);
+    recordCollection(&left.collection.report, .minor, 3, .{ .bytes = 4096 }, 8192);
     try std.testing.expectEqual(@as(u64, 1), liveReport(&left.collection.report).collections);
     try std.testing.expectEqual(@as(u64, 0), liveReport(&right.collection.report).collections);
 }

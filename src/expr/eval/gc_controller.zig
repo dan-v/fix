@@ -184,7 +184,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
     // accumulated in the old generation, the next collection escalates.
     ev.heap.gcNoteMinorPromoted(st.promoted);
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
-    gc.recordCollection(&ev.heap.collection.report, st.freed, tr.stats.bytes, ev.heap.totalReservedBytes());
+    gc.recordCollection(&ev.heap.collection.report, .minor, st.freed, tr.stats, ev.heap.totalReservedBytes());
     gc.recordTiming(&ev.heap.collection.report, t1 - t0, t2 - t1);
     gc.recordBreakdown(&ev.heap.collection.report, .{
         .obj_live = tr.stats.objects,
@@ -193,6 +193,8 @@ pub fn collect(ev: Context, collector_id: u8) void {
         .val_reserved = ev.heap.values.count(),
         .attr_live = tr.stats.attrs,
         .attr_reserved = ev.heap.attrs.count(),
+        .attr_pos_live = tr.stats.attr_pos,
+        .attr_pos_reserved = ev.heap.attr_positions.count(),
     });
     observation.finish(.{ .metrics = &.{
         .{ .name = "freed", .value = .{ .unsigned = st.freed }, .unit = .items },
@@ -261,6 +263,10 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
         tr.drain(ev.heap);
     }
     const st = heap_collector.sweep(ev.heap, tr.mark_bits); // serial full sweep
+    // Minor sweeps coalesce only consecutive owners encountered together.
+    // A full STW is the infrequent point where we can cheaply merge free
+    // intervals accumulated across collections and worker shards.
+    ev.heap.gcCoalesceFreeRanges();
     const t1 = nowNs();
     // Tenure every survivor, then clear the remembered set because no live
     // young objects remain. Swept slots stay
@@ -276,8 +282,18 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     ev.heap.gcNoteMajor(tr.stats.objects);
     const t2 = nowNs();
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
-    gc.recordCollection(&ev.heap.collection.report, st.objects_freed, tr.stats.bytes, ev.heap.totalReservedBytes());
+    gc.recordCollection(&ev.heap.collection.report, .major, st.objects_freed, tr.stats, ev.heap.totalReservedBytes());
     gc.recordTiming(&ev.heap.collection.report, t1 - t0, t2 - t1);
+    gc.recordBreakdown(&ev.heap.collection.report, .{
+        .obj_live = tr.stats.objects,
+        .obj_reserved = ev.heap.objects.count(),
+        .val_live = tr.stats.values,
+        .val_reserved = ev.heap.values.count(),
+        .attr_live = tr.stats.attrs,
+        .attr_reserved = ev.heap.attrs.count(),
+        .attr_pos_live = tr.stats.attr_pos,
+        .attr_pos_reserved = ev.heap.attr_positions.count(),
+    });
     observation.finish(.{ .metrics = &.{
         .{ .name = "freed", .value = .{ .unsigned = st.objects_freed }, .unit = .items },
         .{ .name = "live", .value = .{ .unsigned = tr.stats.bytes }, .unit = .bytes },

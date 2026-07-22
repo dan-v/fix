@@ -63,8 +63,13 @@ pub const AttrPosEntry = struct {
 /// data-race-free.
 pub const GcReportState = struct {
     collections: std.atomic.Value(u64) = .init(0),
+    minor_collections: std.atomic.Value(u64) = .init(0),
+    major_collections: std.atomic.Value(u64) = .init(0),
     objects_freed_total: std.atomic.Value(u64) = .init(0),
     last_live_bytes: std.atomic.Value(u64) = .init(0),
+    /// Per-field maxima from full-heap marks: objects, values, attrs,
+    /// attr-positions, and aggregate bytes.
+    peak_major_live: [5]std.atomic.Value(u64) = @splat(.init(0)),
     peak_total_bytes: std.atomic.Value(u64) = .init(0),
     final_total_bytes: std.atomic.Value(u64) = .init(0),
     mark_ns_total: std.atomic.Value(u64) = .init(0),
@@ -75,7 +80,7 @@ pub const GcReportState = struct {
     remset_ns_total: std.atomic.Value(u64) = .init(0),
     drain_ns_total: std.atomic.Value(u64) = .init(0),
     remset_sources_total: std.atomic.Value(u64) = .init(0),
-    breakdown: [6]std.atomic.Value(u64) = @splat(.init(0)),
+    breakdown: [8]std.atomic.Value(u64) = @splat(.init(0)),
 };
 
 /// The object store is backed by a single mmap-reserved contiguous
@@ -335,6 +340,12 @@ pub const HeapLocal = struct {
     range_reuse_exact: [3]u64 = @splat(0),
     range_reuse_split: [3]u64 = @splat(0),
     range_reuse_miss: [3]u64 = @splat(0),
+    range_reuse_miss_slots: [3]u64 = @splat(0),
+    range_fresh_refills: [3]u64 = @splat(0),
+    range_fresh_slots: [3]u64 = @splat(0),
+    object_reuse_hits: u64 = 0,
+    object_reuse_misses: u64 = 0,
+    object_fresh_refills: u64 = 0,
 
     fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
         self.gc_free_objects.deinit(allocator);
@@ -355,6 +366,58 @@ pub const GcHook = struct {
     ctx: *anyopaque,
     sample: *const fn (*anyopaque, collector_id: u8) void,
 };
+
+fn lowBitMask(count: usize) u64 {
+    std.debug.assert(count <= 64);
+    return if (count == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
+}
+
+fn setBitmapRange(bitmap: []u64, start_in: u32, end_in: u32) void {
+    var start: usize = start_in;
+    const end: usize = end_in;
+    if (start >= end) return;
+
+    const bit_offset = start & 63;
+    if (bit_offset != 0) {
+        const count = @min(64 - bit_offset, end - start);
+        bitmap[start >> 6] |= lowBitMask(count) << @intCast(bit_offset);
+        start += count;
+    }
+    while (end - start >= 64) : (start += 64)
+        bitmap[start >> 6] = std.math.maxInt(u64);
+    if (start < end)
+        bitmap[start >> 6] |= lowBitMask(end - start);
+}
+
+fn nextSetBit(bitmap: []const u64, start: usize, end: usize) ?usize {
+    if (start >= end) return null;
+    var word_index = start >> 6;
+    var word = bitmap[word_index] & (@as(u64, std.math.maxInt(u64)) << @as(u6, @intCast(start & 63)));
+    while (true) {
+        if (word != 0) {
+            const bit = word_index * 64 + @ctz(word);
+            return if (bit < end) bit else null;
+        }
+        word_index += 1;
+        if (word_index >= bitmap.len or word_index * 64 >= end) return null;
+        word = bitmap[word_index];
+    }
+}
+
+fn nextClearBit(bitmap: []const u64, start: usize, end: usize) usize {
+    if (start >= end) return end;
+    var word_index = start >> 6;
+    var word = ~bitmap[word_index] & (@as(u64, std.math.maxInt(u64)) << @as(u6, @intCast(start & 63)));
+    while (true) {
+        if (word != 0) {
+            const bit = word_index * 64 + @ctz(word);
+            return @min(bit, end);
+        }
+        word_index += 1;
+        if (word_index >= bitmap.len or word_index * 64 >= end) return end;
+        word = ~bitmap[word_index];
+    }
+}
 
 /// Free list of reclaimed ranges in one segmented store, keyed by length:
 /// `len -> stack of packed (segment<<32 | offset)`. Allocation first takes an
@@ -515,6 +578,41 @@ const RangeFreeList = struct {
         return total;
     }
 
+    /// Add every recorded free interval to a compact global-slot bitmap.
+    /// The caller is at a stop-the-world boundary, so no mutator can remove a
+    /// range while this snapshot is being built.
+    fn markBitmap(self: *const RangeFreeList, comptime StoreT: type, bitmap: []u64, slot_count: u32) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const len = entry.key_ptr.*;
+            for (entry.value_ptr.*.ranges.items) |range_bits| {
+                const loc = unpack(range_bits);
+                const start = StoreT.globalIdOf(loc.segment, loc.offset);
+                const end = @as(u64, start) + len;
+                std.debug.assert(end <= slot_count);
+                if (end > slot_count) continue;
+                setBitmapRange(bitmap, start, @intCast(end));
+            }
+        }
+    }
+
+    /// Empty the active lists while retaining their class maps and backing
+    /// arrays. Rebuilding after a major collection can then reuse almost all
+    /// of the metadata allocation already paid for by the fragmented form.
+    fn clearRetainingCapacity(self: *RangeFreeList) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |class_ptr| {
+            const class = class_ptr.*;
+            if (!class.active) {
+                std.debug.assert(class.ranges.items.len == 0);
+                continue;
+            }
+            class.ranges.clearRetainingCapacity();
+            self.deactivateClass(class);
+        }
+        std.debug.assert(self.nonempty.root == null);
+    }
+
     /// Move up to `count` packed ranges of one length class to `dst`. The
     /// caller either owns both lists at STW or holds the shared-source lock.
     /// On allocation failure the source remains unchanged.
@@ -593,6 +691,12 @@ pub const HeapCollectionState = struct {
     collecting_major: bool = false,
     minor_sweep_promoted: std.atomic.Value(u64) = .init(0),
     minor_sweep_freed: std.atomic.Value(u64) = .init(0),
+    /// Armed after a collection leaves a worthwhile object-id reserve. The
+    /// first allocation that exhausts that reserve requests another collection
+    /// instead of silently bumping until unrelated range-store growth reaches
+    /// the global byte threshold.
+    object_miss_collect_armed: std.atomic.Value(bool) = .init(false),
+    object_miss_collect_requests: std.atomic.Value(u64) = .init(0),
 };
 
 pub const ObjectHeap = struct {
@@ -1287,6 +1391,7 @@ pub const ObjectHeap = struct {
         store: *StoreT,
         chunk: *LocalChunk,
         free_list: *RangeFreeList,
+        store_index: usize,
         chunk_size: u32,
         n: u32,
     ) !StoreT.Range {
@@ -1306,10 +1411,16 @@ pub const ObjectHeap = struct {
         }
         if (n > chunk_size) {
             const range = try store.reserve(self.allocator, n);
+            const local = self.currentLocal();
+            local.range_fresh_refills[store_index] += 1;
+            local.range_fresh_slots[store_index] += n;
             self.gcCheckThreshold();
             return range;
         }
         const refilled = try store.reserve(self.allocator, chunk_size);
+        const local = self.currentLocal();
+        local.range_fresh_refills[store_index] += 1;
+        local.range_fresh_slots[store_index] += chunk_size;
         self.gcCheckThreshold();
         chunk.segment = refilled.segment;
         chunk.cursor = refilled.offset;
@@ -1375,7 +1486,10 @@ pub const ObjectHeap = struct {
             return hit.loc;
         }
         if (n > self.gc_shared_free_range_max[store_index].load(.acquire)) {
-            if (n > 0) local.range_reuse_miss[store_index] += 1;
+            if (n > 0) {
+                local.range_reuse_miss[store_index] += 1;
+                local.range_reuse_miss_slots[store_index] += n;
+            }
             return null;
         }
         self.gc_shared_free_range_mu.lock();
@@ -1393,7 +1507,10 @@ pub const ObjectHeap = struct {
             if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
             return hit.loc;
         }
-        if (n > 0) local.range_reuse_miss[store_index] += 1;
+        if (n > 0) {
+            local.range_reuse_miss[store_index] += 1;
+            local.range_reuse_miss_slots[store_index] += n;
+        }
         return null;
     }
 
@@ -1401,6 +1518,9 @@ pub const ObjectHeap = struct {
         exact: u64 = 0,
         split: u64 = 0,
         miss: u64 = 0,
+        miss_slots: u64 = 0,
+        fresh_refills: u64 = 0,
+        fresh_slots: u64 = 0,
     };
 
     pub const RangeReuseStats = struct {
@@ -1426,8 +1546,29 @@ pub const ObjectHeap = struct {
                 dst.exact += local.range_reuse_exact[i];
                 dst.split += local.range_reuse_split[i];
                 dst.miss += local.range_reuse_miss[i];
+                dst.miss_slots += local.range_reuse_miss_slots[i];
+                dst.fresh_refills += local.range_fresh_refills[i];
+                dst.fresh_slots += local.range_fresh_slots[i];
             }
         }
+        return total;
+    }
+
+    pub const ObjectReuseStats = struct {
+        hits: u64 = 0,
+        misses: u64 = 0,
+        fresh_refills: u64 = 0,
+        collect_requests: u64 = 0,
+    };
+
+    pub fn objectReuseStats(self: *const ObjectHeap) ObjectReuseStats {
+        var total: ObjectReuseStats = .{};
+        for (self.worker_locals) |*local| {
+            total.hits += local.object_reuse_hits;
+            total.misses += local.object_reuse_misses;
+            total.fresh_refills += local.object_fresh_refills;
+        }
+        total.collect_requests = self.collection.object_miss_collect_requests.load(.monotonic);
         return total;
     }
 
@@ -1459,6 +1600,17 @@ pub const ObjectHeap = struct {
         self.gc_shared_free_count.store(self.gc_shared_free_objects.items.len, .release);
     }
 
+    /// Re-arm the object-pool exhaustion trigger only when the completed
+    /// collection produced enough reusable slots to amortize another pause.
+    /// If a growing live set leaves little or nothing free, the ordinary byte
+    /// headroom remains the sole trigger and prevents collection thrashing.
+    pub fn gcArmObjectMissCollection(self: *ObjectHeap) void {
+        const min_reclaimed_slots: usize = 1 << 16;
+        var available = self.gc_shared_free_count.load(.acquire);
+        for (self.worker_locals) |*local| available += local.gc_free_objects.items.len;
+        self.collection.object_miss_collect_armed.store(available >= min_reclaimed_slots, .release);
+    }
+
     /// Stop-the-world publication for worker-owned free lists. With one worker,
     /// preserve the original local-only path. With multiple workers, unused
     /// local cache contents become central overflow so future demand, rather
@@ -1477,6 +1629,77 @@ pub const ObjectHeap = struct {
         }
     }
 
+    /// At a full-heap stop-the-world boundary, merge adjacent intervals that
+    /// accumulated in different collections, worker shards, or size classes.
+    ///
+    /// This deliberately starts from the existing free lists rather than from
+    /// the complement of the live set. Consequently it cannot mistake an
+    /// unpublished allocation or an active TLAB tail for free storage. One bit
+    /// per reserved slot avoids sorting tens of millions of tiny intervals;
+    /// stores are processed sequentially, bounding temporary memory to the
+    /// largest store's bitmap.
+    pub fn gcCoalesceFreeRanges(self: *ObjectHeap) void {
+        inline for (.{
+            .{ ValueStore, "values", "gc_free_values", "gc_shared_free_values", 0 },
+            .{ AttrStore, "attrs", "gc_free_attrs", "gc_shared_free_attrs", 1 },
+            .{ AttrPosStore, "attr_positions", "gc_free_attr_pos", "gc_shared_free_attr_pos", 2 },
+        }) |fields| self.gcCoalesceRangeStore(fields[0], fields[1], fields[2], fields[3], fields[4]);
+    }
+
+    fn gcCoalesceRangeStore(
+        self: *ObjectHeap,
+        comptime StoreT: type,
+        comptime store_field: []const u8,
+        comptime local_field: []const u8,
+        comptime shared_field: []const u8,
+        comptime store_index: usize,
+    ) void {
+        const slot_count = @field(self, store_field).count();
+        if (slot_count == 0) return;
+        const word_count = (@as(usize, slot_count) + 63) >> 6;
+        const bitmap = self.allocator.alloc(u64, word_count) catch return;
+        defer self.allocator.free(bitmap);
+        @memset(bitmap, 0);
+
+        @field(self, shared_field).markBitmap(StoreT, bitmap, slot_count);
+        for (self.worker_locals) |*local|
+            @field(local, local_field).markBitmap(StoreT, bitmap, slot_count);
+
+        // The bitmap is now a complete snapshot of known-free storage. Only
+        // after that succeeds do we destructively replace the fragmented form.
+        @field(self, shared_field).clearRetainingCapacity();
+        for (self.worker_locals) |*local|
+            @field(local, local_field).clearRetainingCapacity();
+
+        const dst = if (self.worker_locals.len == 1)
+            &@field(self.worker_locals[0], local_field)
+        else
+            &@field(self, shared_field);
+        const last_segment = StoreT.locationOf(slot_count - 1).segment;
+        var segment: u32 = 0;
+        while (segment <= last_segment) : (segment += 1) {
+            const segment_start = StoreT.globalIdOf(segment, 0);
+            const segment_end = if (segment == last_segment)
+                slot_count
+            else
+                StoreT.globalIdOf(segment + 1, 0);
+            const segment_start_usize: usize = segment_start;
+            const segment_end_usize: usize = segment_end;
+            var cursor = segment_start_usize;
+            while (nextSetBit(bitmap, cursor, segment_end_usize)) |run_start| {
+                const run_end = nextClearBit(bitmap, run_start, segment_end_usize);
+                dst.push(
+                    self.allocator,
+                    segment,
+                    @intCast(run_start - segment_start_usize),
+                    @intCast(run_end - run_start),
+                );
+                cursor = run_end;
+            }
+        }
+        self.gc_shared_free_range_max[store_index].store(@field(self, shared_field).maxLen(), .release);
+    }
+
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
         const local = self.currentLocal();
         // NON-MOVING reuse: a swept dead range of at least `n` is reused (and
@@ -1485,7 +1708,7 @@ pub const ObjectHeap = struct {
         if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_values", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(ValueStore, &self.values, &local.value, &local.gc_free_values, value_chunk_size, n);
+        return self.reserveRangeLocal(ValueStore, &self.values, &local.value, &local.gc_free_values, 0, value_chunk_size, n);
     }
 
     /// Reserve `n` slots of attr storage for a merge in progress.
@@ -1518,7 +1741,7 @@ pub const ObjectHeap = struct {
         if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_attrs", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, &local.gc_free_attrs, attr_chunk_size, n);
+        return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, &local.gc_free_attrs, 1, attr_chunk_size, n);
     }
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
@@ -1526,7 +1749,7 @@ pub const ObjectHeap = struct {
         if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_attr_pos", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, &local.gc_free_attr_pos, attr_position_chunk_size, n);
+        return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, &local.gc_free_attr_pos, 2, attr_position_chunk_size, n);
     }
 
     fn releaseAttrsTail(self: *ObjectHeap, range: AttrRange, actual: u32) void {
@@ -1582,7 +1805,15 @@ pub const ObjectHeap = struct {
             // work-steal from a peer). Detector leaves freed slots unused so
             // use-after-free is caught.
             if (self.collection.collect_enabled and !self.collection.disable_reuse and !gc_debug) {
-                if (self.gcReuseObject(local)) |rid| break :blk rid;
+                if (self.gcReuseObject(local)) |rid| {
+                    local.object_reuse_hits += 1;
+                    break :blk rid;
+                }
+                local.object_reuse_misses += 1;
+                if (self.collection.object_miss_collect_armed.swap(false, .acq_rel)) {
+                    self.collection.collect_requested = true;
+                    _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
+                }
             }
             const chunk = &local.object;
             if (chunk.cursor < chunk.end) {
@@ -1591,6 +1822,7 @@ pub const ObjectHeap = struct {
                 break :blk cid;
             }
             const refilled = try self.objects.reserve(self.allocator, object_chunk_size);
+            local.object_fresh_refills += 1;
             chunk.segment = refilled.segment;
             chunk.cursor = refilled.offset;
             chunk.end = refilled.offset + refilled.len;

@@ -69,11 +69,22 @@ pub fn report(
     p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), heap.attrs.count() });
     p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
     p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
+    const object_reuse = heap.objectReuseStats();
+    p("  object reuse (hit / miss / fresh 256-slot refills / pool-empty collects): {d} / {d} / {d} / {d}\n", .{
+        object_reuse.hits,
+        object_reuse.misses,
+        object_reuse.fresh_refills,
+        object_reuse.collect_requests,
+    });
     const reuse = heap.rangeReuseStats();
     p("  range reuse (exact / split / miss):\n", .{});
     p("    values:   {d} / {d} / {d}\n", .{ reuse.values.exact, reuse.values.split, reuse.values.miss });
     p("    attrs:    {d} / {d} / {d}\n", .{ reuse.attrs.exact, reuse.attrs.split, reuse.attrs.miss });
     p("    attr-pos: {d} / {d} / {d}\n", .{ reuse.attr_pos.exact, reuse.attr_pos.split, reuse.attr_pos.miss });
+    p("  range miss slots / fresh refills / fresh slots:\n", .{});
+    p("    values:   {d} / {d} / {d}\n", .{ reuse.values.miss_slots, reuse.values.fresh_refills, reuse.values.fresh_slots });
+    p("    attrs:    {d} / {d} / {d}\n", .{ reuse.attrs.miss_slots, reuse.attrs.fresh_refills, reuse.attrs.fresh_slots });
+    p("    attr-pos: {d} / {d} / {d}\n", .{ reuse.attr_pos.miss_slots, reuse.attr_pos.fresh_refills, reuse.attr_pos.fresh_slots });
     const free = heap.freeRangesStats();
     p("  free pool (ranges / slots / nonempty classes / max range):\n", .{});
     p("    objects:  {d} slots\n", .{free.objects});
