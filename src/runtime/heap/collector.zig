@@ -20,10 +20,77 @@ pub const SweepStats = struct {
     objects_freed: u64 = 0,
 };
 
+const FreeRange = struct {
+    segment: u32,
+    offset: u32,
+    len: u32,
+};
+
+/// Collection-local streaming coalescer. Sweep order follows allocation order
+/// closely (exactly on one worker, per-worker for a parallel minor), so adjacent
+/// dead owners normally arrive consecutively. Holding one interval per store
+/// merges those runs with no per-range allocation, sorting, or address hash.
+const RangeBatch = struct {
+    heap: *ObjectHeap,
+    fixed_dst: ?*HeapLocal,
+    shard: usize = 0,
+    values: ?FreeRange = null,
+    attrs: ?FreeRange = null,
+    attr_pos: ?FreeRange = null,
+
+    fn global(heap: *ObjectHeap) RangeBatch {
+        return .{ .heap = heap, .fixed_dst = null };
+    }
+
+    fn local(heap: *ObjectHeap, dst: *HeapLocal) RangeBatch {
+        return .{ .heap = heap, .fixed_dst = dst };
+    }
+
+    fn add(self: *RangeBatch, comptime pending_field: []const u8, comptime free_field: []const u8, range: FreeRange) void {
+        const pending = &@field(self, pending_field);
+        if (pending.*) |*last| {
+            if (last.segment == range.segment and last.offset + last.len == range.offset) {
+                last.len += range.len;
+                return;
+            }
+            if (last.segment == range.segment and range.offset + range.len == last.offset) {
+                last.offset = range.offset;
+                last.len += range.len;
+                return;
+            }
+            self.emit(free_field, last.*);
+        }
+        pending.* = range;
+    }
+
+    fn emit(self: *RangeBatch, comptime free_field: []const u8, range: FreeRange) void {
+        const dst = self.fixed_dst orelse blk: {
+            const selected = &self.heap.worker_locals[self.shard];
+            self.shard += 1;
+            if (self.shard == self.heap.worker_locals.len) self.shard = 0;
+            break :blk selected;
+        };
+        @field(dst, free_field).push(self.heap.allocator, range.segment, range.offset, range.len);
+    }
+
+    fn flushOne(self: *RangeBatch, comptime pending_field: []const u8, comptime free_field: []const u8) void {
+        const pending = &@field(self, pending_field);
+        if (pending.*) |range| self.emit(free_field, range);
+        pending.* = null;
+    }
+
+    fn flush(self: *RangeBatch) void {
+        self.flushOne("values", "gc_free_values");
+        self.flushOne("attrs", "gc_free_attrs");
+        self.flushOne("attr_pos", "gc_free_attr_pos");
+    }
+};
+
 /// Free every filled object that `mark_bits` left unmarked. Must run at a
 /// safepoint with no concurrent allocation.
 pub fn sweep(heap: *ObjectHeap, mark_bits: []const u64) SweepStats {
     var stats: SweepStats = .{};
+    var ranges = RangeBatch.global(heap);
     if (comptime !gc_debug) heap.gcReconstructAllocBits();
     if (comptime gc_debug) verifyMarkClosed(heap, mark_bits);
     const object_count = heap.objects.count();
@@ -38,13 +105,14 @@ pub fn sweep(heap: *ObjectHeap, mark_bits: []const u64) SweepStats {
         const is_marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
         if (is_marked) continue;
         const local = &heap.worker_locals[shard];
-        freeObjectRanges(heap, local, heap.objects.get(id));
+        freeObjectRanges(heap, &ranges, heap.objects.get(id));
         heap.collection.alloc_bits[word] &= ~bit;
         local.gc_free_objects.append(heap.allocator, id) catch {};
         stats.objects_freed += 1;
         shard += 1;
         if (shard >= shard_count) shard = 0;
     }
+    ranges.flush();
     return stats;
 }
 
@@ -257,16 +325,18 @@ pub fn minorCollect(heap: *ObjectHeap, mark_bits: []const u64) ObjectHeap.MinorS
     verifyMinorClosure(heap, mark_bits);
     // The calling worker owns the free-list shard receiving serial results.
     const dst = heap.currentLocal();
+    var ranges = RangeBatch.local(heap, dst);
     for (heap.worker_locals) |*local| {
-        sweepYoungListInto(heap, local.gc_young_slots.items, dst, mark_bits, &st);
+        sweepYoungListInto(heap, local.gc_young_slots.items, dst, &ranges, mark_bits, &st);
         local.gc_young_slots.clearRetainingCapacity();
     }
+    ranges.flush();
     return st;
 }
 
 /// Sweep one young-object list into the processing worker's free-list shard.
 /// Lists are disjoint, and each worker writes only its own destination shard.
-pub fn sweepYoungListInto(heap: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLocal, mark_bits: []const u64, st: *ObjectHeap.MinorStats) void {
+fn sweepYoungListInto(heap: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLocal, ranges: *RangeBatch, mark_bits: []const u64, st: *ObjectHeap.MinorStats) void {
     for (src_ids) |id| {
         const word = id >> 6;
         const bit = @as(u64, 1) << @intCast(id & 63);
@@ -276,7 +346,7 @@ pub fn sweepYoungListInto(heap: *ObjectHeap, src_ids: []const ObjectId, dst: *He
             st.promoted += 1;
         } else {
             // Detector builds retain the slot so stale reads trap reliably.
-            freeObjectRanges(heap, dst, heap.objects.get(id));
+            freeObjectRanges(heap, ranges, heap.objects.get(id));
             if (comptime gc_debug) {
                 if (word < heap.collection.alloc_bits.len) _ = @atomicRmw(u64, &heap.collection.alloc_bits[word], .And, ~bit, .monotonic);
             } else {
@@ -311,10 +381,14 @@ pub fn minorSweepClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
     while (!heap.collection.minor_sweep_open.load(.acquire)) std.atomic.spinLoopHint();
     const dst = heap.currentLocal();
     var local_st: ObjectHeap.MinorStats = .{};
+    var ranges = RangeBatch.local(heap, dst);
     while (true) {
         const i = heap.collection.minor_sweep_next.fetchAdd(1, .monotonic);
         if (i >= heap.collection.minor_sweep_count) break;
-        sweepYoungListInto(heap, heap.worker_locals[i].gc_young_slots.items, dst, mark_bits, &local_st);
+        sweepYoungListInto(heap, heap.worker_locals[i].gc_young_slots.items, dst, &ranges, mark_bits, &local_st);
+        // Publish the final pending intervals before declaring this source
+        // list swept; the coordinator uses `minor_sweep_done` as its fence.
+        ranges.flush();
         heap.worker_locals[i].gc_young_slots.clearRetainingCapacity();
         _ = heap.collection.minor_sweep_done.fetchAdd(1, .release);
     }
@@ -395,10 +469,10 @@ pub fn verifyMarkClosed(heap: *ObjectHeap, mark_bits: []const u64) void {
 /// Return a dead object's owned store ranges to the free lists. Ranges
 /// are single-owner (every construction site reserves fresh + copies),
 /// so this is the only owner — see docs/gc.md. Thunk *spilled*
-/// upvalue/env storage is a bare slice (no segment/offset to recover),
-/// so it is not reclaimed yet (thunks with >2 upvalues — a minority);
+/// upvalue/env storage records its segment range and is reclaimed either here
+/// (unresolved dead thunk) or immediately after a force publishes its result.
 /// `attrs_merge`/`boxed_int` own no ranges.
-pub fn freeObjectRanges(heap: *ObjectHeap, local: *HeapLocal, obj: *const Object) void {
+fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) void {
     // Detector: poison the freed range so a dangling raw `getList`/`getAttrs`
     // slice (owner swept while a Zig local held the slice — the class the
     // reuse-off object-read assert can't see) traps on next access instead
@@ -426,21 +500,19 @@ pub fn freeObjectRanges(heap: *ObjectHeap, local: *HeapLocal, obj: *const Object
         }
     }
     switch (obj.*) {
-        .list => |r| if (r.len > 0) local.gc_free_values.push(heap.allocator, r.segment, r.offset, r.len),
+        .list => |r| if (r.len > 0) ranges.add("values", "gc_free_values", .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
         .attrs => |a| {
-            if (a.range.len > 0) local.gc_free_attrs.push(heap.allocator, a.range.segment, a.range.offset, a.range.len);
-            if (a.positions.len > 0) local.gc_free_attr_pos.push(heap.allocator, a.positions.segment, a.positions.offset, a.positions.len);
+            if (a.range.len > 0) ranges.add("attrs", "gc_free_attrs", .{ .segment = a.range.segment, .offset = a.range.offset, .len = a.range.len });
+            if (a.positions.len > 0) ranges.add("attr_pos", "gc_free_attr_pos", .{ .segment = a.positions.segment, .offset = a.positions.offset, .len = a.positions.len });
         },
-        .builtin_closure => |c| if (c.args.len > 0) local.gc_free_values.push(heap.allocator, c.args.segment, c.args.offset, c.args.len),
-        .partial_app => |p| if (p.args.len > 0) local.gc_free_values.push(heap.allocator, p.args.segment, p.args.offset, p.args.len),
-        .context_string => |c| if (c.context.len > 0) local.gc_free_attrs.push(heap.allocator, c.context.segment, c.context.offset, c.context.len),
+        .builtin_closure => |c| if (c.args.len > 0) ranges.add("values", "gc_free_values", .{ .segment = c.args.segment, .offset = c.args.offset, .len = c.args.len }),
+        .partial_app => |p| if (p.args.len > 0) ranges.add("values", "gc_free_values", .{ .segment = p.args.segment, .offset = p.args.offset, .len = p.args.len }),
+        .context_string => |c| if (c.context.len > 0) ranges.add("attrs", "gc_free_attrs", .{ .segment = c.context.segment, .offset = c.context.offset, .len = c.context.len }),
+        .thunk => |t| if (t.targetSpillRange()) |r| ranges.add("values", "gc_free_values", .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
         // NOT reclaimed yet: an executing frame aliases its
-        // `upvalues` slice, which is owned by the .closure object (or a
-        // .thunk's spilled storage). Freeing the range while a frame
-        // runs would dangle it. Reclaiming these needs the frame to
-        // root its executing closure/thunk (a follow-up RSS opt);
-        // until then their ranges leak. `attrs_merge`/`boxed_int` own
-        // no reclaimable range.
-        .closure, .thunk, .merge_attrs, .boxed_int => {},
+        // `upvalues` slice owned by a .closure object. Freeing the range while
+        // a frame runs would dangle it. Reclaiming closures needs each frame
+        // to root its executing closure (a follow-up RSS optimization).
+        .closure, .merge_attrs, .boxed_int => {},
     }
 }

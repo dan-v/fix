@@ -329,6 +329,11 @@ pub const HeapLocal = struct {
     /// exactly these — O(young) — and clears the list. Reuse- and TLAB-tail-
     /// safe, unlike an id-range frontier.
     gc_young_slots: std.ArrayListUnmanaged(ObjectId) = .empty,
+    /// Range-reuse diagnostics. Single-writer (this worker's allocation
+    /// path), read only after evaluation has quiesced for `--mem-report`.
+    range_reuse_exact: [3]u64 = @splat(0),
+    range_reuse_split: [3]u64 = @splat(0),
+    range_reuse_miss: [3]u64 = @splat(0),
 
     fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
         self.gc_free_objects.deinit(allocator);
@@ -350,34 +355,106 @@ pub const GcHook = struct {
     sample: *const fn (*anyopaque, collector_id: u8) void,
 };
 
-/// Exact-fit free list of reclaimed ranges in one segmented store, keyed
-/// by length: `len -> stack of packed (segment<<32 | offset)`. Exact-fit
-/// (no rounding to size classes) keeps internal fragmentation at zero,
-/// which matters for the RSS goal; the module fixpoint re-builds
-/// same-shaped structures so same-length reuse hits often. All ops are
-/// best-effort — on OOM growing the list we simply don't record the free
+/// Free list of reclaimed ranges in one segmented store, keyed by length:
+/// `len -> stack of packed (segment<<32 | offset)`. Allocation first takes an
+/// exact match, then takes from the largest available class and returns its
+/// prefix, putting the remainder back. The largest-class cursor avoids a scan
+/// across every distinct remainder length on each miss; it is rescanned only
+/// when that class drains. Reuse introduces no internal fragmentation. All ops
+/// are best-effort — on OOM growing the list we simply don't record a free
 /// range (it stays allocated), never corrupting state.
 const RangeFreeList = struct {
     map: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(u64)) = .empty,
+    largest_len: u32 = 0,
+
+    const Stats = struct {
+        classes: u64 = 0,
+        ranges: u64 = 0,
+        slots: u64 = 0,
+        max_len: u32 = 0,
+
+        fn add(self: *Stats, other: Stats) void {
+            self.classes += other.classes;
+            self.ranges += other.ranges;
+            self.slots += other.slots;
+            self.max_len = @max(self.max_len, other.max_len);
+        }
+    };
 
     pub fn push(self: *RangeFreeList, allocator: std.mem.Allocator, segment: u32, offset: u32, len: u32) void {
+        if (len == 0) return;
         const gop = self.map.getOrPut(allocator, len) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         gop.value_ptr.append(allocator, (@as(u64, segment) << 32) | offset) catch {};
+        self.largest_len = @max(self.largest_len, len);
     }
 
     pub const Loc = struct { segment: u32, offset: u32 };
+    const Hit = struct {
+        loc: Loc,
+        split: bool,
+    };
 
-    fn pop(self: *RangeFreeList, len: u32) ?Loc {
-        const entry = self.map.getPtr(len) orelse return null;
-        const bits = entry.pop() orelse return null;
+    fn pop(self: *RangeFreeList, allocator: std.mem.Allocator, len: u32) ?Hit {
+        if (len == 0) return null;
+        // Preserve the common O(1) same-shape path.
+        if (self.map.getPtr(len)) |entry| {
+            if (entry.pop()) |bits| return .{ .loc = unpack(bits), .split = false };
+        }
+
+        const larger = self.popLargestAtLeast(len) orelse return null;
+        const free_len = larger.len;
+        const bits = larger.bits;
+        const loc = unpack(bits);
+        // `free_len > len`, so this is non-empty. If recording the remainder
+        // OOMs, only reuse opportunity is lost; the returned prefix is valid.
+        self.push(allocator, loc.segment, loc.offset + len, free_len - len);
+        return .{ .loc = loc, .split = true };
+    }
+
+    inline fn unpack(bits: u64) Loc {
         return .{ .segment = @intCast(bits >> 32), .offset = @intCast(bits & 0xFFFF_FFFF) };
+    }
+
+    const Larger = struct { bits: u64, len: u32 };
+
+    /// The cursor may name an empty class after an exact pop drained it. Find
+    /// the next non-empty maximum once, then serve/split it until it drains.
+    fn popLargestAtLeast(self: *RangeFreeList, minimum: u32) ?Larger {
+        while (self.largest_len >= minimum and self.largest_len > 0) {
+            const len = self.largest_len;
+            if (self.map.getPtr(len)) |entry| {
+                if (entry.pop()) |bits| return .{ .bits = bits, .len = len };
+            }
+            self.largest_len = 0;
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.items.len > 0) self.largest_len = @max(self.largest_len, entry.key_ptr.*);
+            }
+        }
+        return null;
+    }
+
+    fn stats(self: *const RangeFreeList) Stats {
+        var total: Stats = .{};
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const count = entry.value_ptr.items.len;
+            if (count == 0) continue;
+            const len = entry.key_ptr.*;
+            total.classes += 1;
+            total.ranges += count;
+            total.slots += @as(u64, len) * count;
+            total.max_len = @max(total.max_len, len);
+        }
+        return total;
     }
 
     fn deinit(self: *RangeFreeList, allocator: std.mem.Allocator) void {
         var it = self.map.valueIterator();
         while (it.next()) |v| v.deinit(allocator);
         self.map.deinit(allocator);
+        self.largest_len = 0;
     }
 };
 
@@ -1113,29 +1190,90 @@ pub const ObjectHeap = struct {
         return null;
     }
 
-    /// Reuse a freed range of exactly `n` slots from the `field` free list
+    /// Reuse a freed range of at least `n` slots from the `field` free list
     /// (`gc_free_values`/`gc_free_attrs`/`gc_free_attr_pos`): own shard first,
-    /// then work-steal from a peer. Same one-lock-at-a-time discipline.
+    /// then work-steal from a peer. An exact match wins; otherwise the list
+    /// splits a larger range. Same one-lock-at-a-time discipline.
     fn gcReuseRange(self: *ObjectHeap, local: *HeapLocal, comptime field: []const u8, n: u32) ?RangeFreeList.Loc {
+        const store_index = comptime if (std.mem.eql(u8, field, "gc_free_values"))
+            0
+        else if (std.mem.eql(u8, field, "gc_free_attrs"))
+            1
+        else if (std.mem.eql(u8, field, "gc_free_attr_pos"))
+            2
+        else
+            @compileError("unknown GC range store");
         local.gc_free_mu.lock();
-        const own = @field(local, field).pop(n);
+        const own = @field(local, field).pop(self.allocator, n);
         local.gc_free_mu.unlock();
-        if (own) |loc| return loc;
+        if (own) |hit| {
+            if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
+            return hit.loc;
+        }
         for (self.worker_locals) |*peer| {
             if (peer == local) continue;
             peer.gc_free_mu.lock();
-            const stolen = @field(peer, field).pop(n);
+            const stolen = @field(peer, field).pop(self.allocator, n);
             peer.gc_free_mu.unlock();
-            if (stolen) |loc| return loc;
+            if (stolen) |hit| {
+                if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
+                return hit.loc;
+            }
         }
+        if (n > 0) local.range_reuse_miss[store_index] += 1;
         return null;
+    }
+
+    pub const RangeReuseCounts = struct {
+        exact: u64 = 0,
+        split: u64 = 0,
+        miss: u64 = 0,
+    };
+
+    pub const RangeReuseStats = struct {
+        values: RangeReuseCounts = .{},
+        attrs: RangeReuseCounts = .{},
+        attr_pos: RangeReuseCounts = .{},
+    };
+
+    pub const FreeRangeStats = RangeFreeList.Stats;
+
+    pub const FreeRangesStats = struct {
+        objects: u64 = 0,
+        values: FreeRangeStats = .{},
+        attrs: FreeRangeStats = .{},
+        attr_pos: FreeRangeStats = .{},
+    };
+
+    /// Aggregate diagnostics after evaluation has quiesced.
+    pub fn rangeReuseStats(self: *const ObjectHeap) RangeReuseStats {
+        var total: RangeReuseStats = .{};
+        for (self.worker_locals) |*local| {
+            inline for (.{ &total.values, &total.attrs, &total.attr_pos }, 0..) |dst, i| {
+                dst.exact += local.range_reuse_exact[i];
+                dst.split += local.range_reuse_split[i];
+                dst.miss += local.range_reuse_miss[i];
+            }
+        }
+        return total;
+    }
+
+    pub fn freeRangesStats(self: *const ObjectHeap) FreeRangesStats {
+        var total: FreeRangesStats = .{};
+        for (self.worker_locals) |*local| {
+            total.objects += local.gc_free_objects.items.len;
+            total.values.add(local.gc_free_values.stats());
+            total.attrs.add(local.gc_free_attrs.stats());
+            total.attr_pos.add(local.gc_free_attr_pos.stats());
+        }
+        return total;
     }
 
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
         const local = self.currentLocal();
-        // NON-MOVING reuse: a swept dead range of exactly `n` is reused in
-        // place before touching the bump cursor. Ranges never relocate, so the
-        // returned slice remains stable across forces.
+        // NON-MOVING reuse: a swept dead range of at least `n` is reused (and
+        // split when larger) before touching the bump cursor. Ranges never
+        // relocate, so the returned slice remains stable across forces.
         if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_values", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
@@ -1509,6 +1647,12 @@ pub const ObjectHeap = struct {
     /// have tenured since the last major that the old generation likely holds a
     /// live-set's worth of reclaimable garbage.
     pub fn gcShouldMajor(self: *const ObjectHeap) bool {
+        // Constrained mode keeps precise transient roots from evaluation start
+        // specifically so the pre-arming half-budget can be reclaimed. Until
+        // one major reconciles it, `track_from` still points at the later
+        // arming boundary; don't leave that large region pinned merely because
+        // a short allocation-heavy run never reaches the promotion gate.
+        if (self.collection.root_always and self.collection.track_from != self.collection.bootstrap_end) return true;
         return self.collection.promoted_since_major >= self.collection.major_gate;
     }
 
@@ -2165,7 +2309,7 @@ pub const ObjectHeap = struct {
         }
         const range = try self.appendValues(upvalues);
         errdefer self.values.rollback(range);
-        return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, self.values.slice(range)) });
+        return self.add(.{ .thunk = Thunk.initBytecodeSpilled(chunk_id, self.values.slice(range), range.segment, range.offset) });
     }
 
     /// A deferred-compile thunk (lazy per-attr compilation). Same inline
@@ -2176,7 +2320,7 @@ pub const ObjectHeap = struct {
         }
         const range = try self.appendValues(env);
         errdefer self.values.rollback(range);
-        return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, self.values.slice(range)) });
+        return self.add(.{ .thunk = Thunk.initDeferredSpilled(deferred_id, self.values.slice(range), range.segment, range.offset) });
     }
 
     /// Wrap `value` in a pre-resolved, undemanded thunk. Used by the
@@ -2201,7 +2345,23 @@ pub const ObjectHeap = struct {
 
     pub fn commitBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) !ObjectId {
         errdefer self.values.rollback(pending.range);
-        return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.values.slice(pending.range)) });
+        const upvalues = self.values.slice(pending.range);
+        if (upvalues.len <= BytecodeThunk.inline_capacity)
+            return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, upvalues) });
+        return self.add(.{ .thunk = Thunk.initBytecodeSpilled(pending.chunk_id, upvalues, pending.range.segment, pending.range.offset) });
+    }
+
+    /// Return a thunk target's spilled captures once evaluation has unwound
+    /// and the caller is about to overwrite the target with a result/error.
+    /// Runtime release can race peer allocation/stealing, so take this shard's
+    /// small lock (STW sweep uses the lock-free RangeBatch path instead).
+    pub fn gcReleaseThunkSpill(self: *ObjectHeap, thunk: *const Thunk) void {
+        if (!self.collection.root_active) return;
+        const range = thunk.targetSpillRange() orelse return;
+        const local = self.currentLocal();
+        local.gc_free_mu.lock();
+        local.gc_free_values.push(self.allocator, range.segment, range.offset, range.len);
+        local.gc_free_mu.unlock();
     }
 
     pub fn rollbackBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) void {

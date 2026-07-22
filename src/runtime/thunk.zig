@@ -81,9 +81,21 @@ pub const BytecodeThunk = struct {
     /// inline storage needs no tag word.
     pub const inline_capacity: u32 = 2;
 
+    pub const SpillRange = struct {
+        segment: u32,
+        offset: u32,
+        len: u32,
+    };
+
+    const Spilled = struct {
+        ptr: [*]const Value,
+        segment: u32,
+        offset: u32,
+    };
+
     const Storage = union {
         inline_vals: [inline_capacity]Value,
-        spilled: []const Value,
+        spilled: Spilled,
     };
 
     /// The captured upvalues. For inline storage the returned slice
@@ -92,7 +104,16 @@ pub const BytecodeThunk = struct {
     /// addresses) — never on a by-value copy of the thunk.
     pub fn upvalues(self: *const BytecodeThunk) []const Value {
         if (self.upvalue_count <= inline_capacity) return self.storage.inline_vals[0..self.upvalue_count];
-        return self.storage.spilled;
+        return self.storage.spilled.ptr[0..self.upvalue_count];
+    }
+
+    pub fn spillRange(self: *const BytecodeThunk) ?SpillRange {
+        if (self.upvalue_count <= inline_capacity) return null;
+        return .{
+            .segment = self.storage.spilled.segment,
+            .offset = self.storage.spilled.offset,
+            .len = self.upvalue_count,
+        };
     }
 };
 
@@ -114,16 +135,31 @@ pub const DeferredThunk = struct {
 
     pub const inline_capacity: u32 = BytecodeThunk.inline_capacity;
 
+    const Spilled = struct {
+        ptr: [*]const Value,
+        segment: u32,
+        offset: u32,
+    };
+
     const Storage = union {
         inline_vals: [inline_capacity]Value,
-        spilled: []const Value,
+        spilled: Spilled,
     };
 
     /// The captured environment (the enclosing-scope snapshot). Same
     /// stable-pointer contract as `BytecodeThunk.upvalues`.
     pub fn env(self: *const DeferredThunk) []const Value {
         if (self.env_count <= inline_capacity) return self.storage.inline_vals[0..self.env_count];
-        return self.storage.spilled;
+        return self.storage.spilled.ptr[0..self.env_count];
+    }
+
+    pub fn spillRange(self: *const DeferredThunk) ?BytecodeThunk.SpillRange {
+        if (self.env_count <= inline_capacity) return null;
+        return .{
+            .segment = self.storage.spilled.segment,
+            .offset = self.storage.spilled.offset,
+            .len = self.env_count,
+        };
     }
 };
 
@@ -234,18 +270,14 @@ pub const Thunk = struct {
         return initWithFuture(Future.init(), .closure, .{ .target = .{ .closure = closure } });
     }
 
-    /// `upvalues` of length <= `BytecodeThunk.inline_capacity` are copied
-    /// inline; wider captures keep the passed slice (the caller is
-    /// responsible for it living in stable `values` storage).
+    /// Inline bytecode thunk. Wider captures use `initBytecodeSpilled` so the
+    /// owning heap can reclaim their stable value-store range on resolution.
     pub fn initBytecode(chunk_id: ChunkId, upvalues: []const Value) Thunk {
+        std.debug.assert(upvalues.len <= BytecodeThunk.inline_capacity);
         var storage: BytecodeThunk.Storage = undefined;
-        if (upvalues.len <= BytecodeThunk.inline_capacity) {
-            var arr: [BytecodeThunk.inline_capacity]Value = undefined;
-            @memcpy(arr[0..upvalues.len], upvalues);
-            storage = .{ .inline_vals = arr };
-        } else {
-            storage = .{ .spilled = upvalues };
-        }
+        var arr: [BytecodeThunk.inline_capacity]Value = undefined;
+        @memcpy(arr[0..upvalues.len], upvalues);
+        storage = .{ .inline_vals = arr };
         return initWithFuture(Future.init(), .bytecode, .{ .target = .{ .bytecode = .{
             .chunk_id = chunk_id,
             .upvalue_count = @intCast(upvalues.len),
@@ -253,23 +285,49 @@ pub const Thunk = struct {
         } } });
     }
 
-    /// A deferred-compile thunk (see `DeferredThunk`). `env` of length
-    /// <= `inline_capacity` is copied inline; wider snapshots keep the passed
-    /// slice (caller owns its stable `values` storage).
+    pub fn initBytecodeSpilled(chunk_id: ChunkId, upvalues: []const Value, segment: u32, offset: u32) Thunk {
+        std.debug.assert(upvalues.len > BytecodeThunk.inline_capacity);
+        return initWithFuture(Future.init(), .bytecode, .{ .target = .{ .bytecode = .{
+            .chunk_id = chunk_id,
+            .upvalue_count = @intCast(upvalues.len),
+            .storage = .{ .spilled = .{ .ptr = upvalues.ptr, .segment = segment, .offset = offset } },
+        } } });
+    }
+
+    /// Inline deferred-compile thunk (see `DeferredThunk`). Wider
+    /// environments use `initDeferredSpilled`.
     pub fn initDeferred(deferred_id: u32, env: []const Value) Thunk {
+        std.debug.assert(env.len <= DeferredThunk.inline_capacity);
         var storage: DeferredThunk.Storage = undefined;
-        if (env.len <= DeferredThunk.inline_capacity) {
-            var arr: [DeferredThunk.inline_capacity]Value = undefined;
-            @memcpy(arr[0..env.len], env);
-            storage = .{ .inline_vals = arr };
-        } else {
-            storage = .{ .spilled = env };
-        }
+        var arr: [DeferredThunk.inline_capacity]Value = undefined;
+        @memcpy(arr[0..env.len], env);
+        storage = .{ .inline_vals = arr };
         return initWithFuture(Future.init(), .deferred, .{ .target = .{ .deferred = .{
             .deferred_id = deferred_id,
             .env_count = @intCast(env.len),
             .storage = storage,
         } } });
+    }
+
+    pub fn initDeferredSpilled(deferred_id: u32, env: []const Value, segment: u32, offset: u32) Thunk {
+        std.debug.assert(env.len > DeferredThunk.inline_capacity);
+        return initWithFuture(Future.init(), .deferred, .{ .target = .{ .deferred = .{
+            .deferred_id = deferred_id,
+            .env_count = @intCast(env.len),
+            .storage = .{ .spilled = .{ .ptr = env.ptr, .segment = segment, .offset = offset } },
+        } } });
+    }
+
+    /// Value-store range owned by the still-live target arm. Resolved/errored
+    /// thunks have overwritten that arm and therefore own no capture range.
+    pub fn targetSpillRange(self: *const Thunk) ?BytecodeThunk.SpillRange {
+        const state: FutureState = @enumFromInt(self.future.state.load(.acquire));
+        if (state == .resolved or state == .errored) return null;
+        return switch (self.targetKind()) {
+            .bytecode => self.payload.target.bytecode.spillRange(),
+            .deferred => self.payload.target.deferred.spillRange(),
+            else => null,
+        };
     }
 
     /// A frameless attr-access thunk (see `AttrAccess`). Forcing computes

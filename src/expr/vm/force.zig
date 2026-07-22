@@ -729,6 +729,10 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
                     return err;
                 };
+                // The body frame has unwound, so no raw upvalue slice aliases
+                // this target's spilled capture range. Return it before the
+                // target arm is overwritten by the resolved result.
+                self.heap.gcReleaseThunkSpill(thunk);
                 resolveDispatch(self, thunk, result);
                 self.heap.gcRecordEdge(thunk_id, result); // old→young barrier
                 if (memo_key) |k| {
@@ -1154,6 +1158,10 @@ fn publishErrored(self: *VM, thunk: *thunk_mod.Thunk, err: anyerror, owned_messa
         thunk.reset();
         return;
     };
+    // All fallible sticky-error setup has succeeded and the evaluating frame
+    // has unwound. Release spilled captures immediately before overwriting the
+    // target arm. Transient/reset paths above deliberately retain them.
+    self.heap.gcReleaseThunkSpill(thunk);
     thunk.markErrored(info);
 }
 

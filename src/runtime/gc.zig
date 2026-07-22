@@ -762,6 +762,147 @@ test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses the
     try std.testing.expectEqual(@as(i64, 200), (try heap.getListItem(reused, 1)).asInt());
 }
 
+test "gc range reuse splits a larger range and preserves the remainder" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const live = try heap.addList(&.{Value.int(1)});
+    const dead = try heap.addList(&.{
+        Value.int(10),
+        Value.int(20),
+        Value.int(30),
+        Value.int(40),
+        Value.int(50),
+        Value.int(60),
+        Value.int(70),
+    });
+    const dead_range = switch (heap.get(dead).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    tr.markValue(&heap, Value.list(live));
+    tr.drain(&heap);
+    const st = heap_collector.sweep(&heap, tr.mark_bits);
+    try std.testing.expectEqual(@as(u64, 1), st.objects_freed);
+
+    // The len-3 request has no exact class, so it takes the prefix of the
+    // reclaimed len-7 range. The len-4 request then consumes the remainder.
+    const prefix = try heap.addList(&.{ Value.int(2), Value.int(3), Value.int(4) });
+    const prefix_range = switch (heap.get(prefix).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(dead_range.segment, prefix_range.segment);
+    try std.testing.expectEqual(dead_range.offset, prefix_range.offset);
+    try std.testing.expectEqual(@as(u32, 3), prefix_range.len);
+
+    const remainder = try heap.addList(&.{ Value.int(5), Value.int(6), Value.int(7), Value.int(8) });
+    const remainder_range = switch (heap.get(remainder).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(dead_range.segment, remainder_range.segment);
+    try std.testing.expectEqual(dead_range.offset + 3, remainder_range.offset);
+    try std.testing.expectEqual(@as(u32, 4), remainder_range.len);
+}
+
+test "gc sweep coalesces consecutive adjacent dead ranges" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const live = try heap.addList(&.{Value.int(1)});
+    const dead_a = try heap.addList(&.{ Value.int(2), Value.int(3) });
+    const dead_b = try heap.addList(&.{ Value.int(4), Value.int(5), Value.int(6) });
+    const range_a = switch (heap.get(dead_a).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    const range_b = switch (heap.get(dead_b).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(range_a.segment, range_b.segment);
+    try std.testing.expectEqual(range_a.offset + range_a.len, range_b.offset);
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    tr.markValue(&heap, Value.list(live));
+    tr.drain(&heap);
+    const st = heap_collector.sweep(&heap, tr.mark_bits);
+    try std.testing.expectEqual(@as(u64, 2), st.objects_freed);
+
+    // Neither dead object alone can satisfy len 4. Streaming sweep combines
+    // their adjacent ranges to len 5; split reuse returns this prefix and tail.
+    const prefix = try heap.addList(&.{ Value.int(7), Value.int(8), Value.int(9), Value.int(10) });
+    const prefix_range = switch (heap.get(prefix).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(range_a.segment, prefix_range.segment);
+    try std.testing.expectEqual(range_a.offset, prefix_range.offset);
+
+    const tail = try heap.addList(&.{Value.int(11)});
+    const tail_range = switch (heap.get(tail).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(range_a.segment, tail_range.segment);
+    try std.testing.expectEqual(range_a.offset + 4, tail_range.offset);
+}
+
+test "resolved thunk returns its spilled capture range" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const thunk_id = try heap.addBytecodeThunk(1, &.{ Value.int(1), Value.int(2), Value.int(3) });
+    const thunk = try heap.getThunk(thunk_id);
+    const spill = thunk.targetSpillRange().?;
+
+    // Mirrors the force publication order: evaluation has unwound, return the
+    // captures, then overwrite the target arm with the resolved result.
+    heap.gcReleaseThunkSpill(thunk);
+    thunk.resolve(Value.int(42));
+    const list_id = try heap.addList(&.{ Value.int(4), Value.int(5), Value.int(6) });
+    const list_range = switch (heap.get(list_id).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(spill.segment, list_range.segment);
+    try std.testing.expectEqual(spill.offset, list_range.offset);
+    try std.testing.expectEqual(@as(i64, 42), (try heap.getThunk(thunk_id)).payload.result.asInt());
+}
+
+test "constrained GC makes the first post-arm collection major" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableBudget(&heap, 512 << 20, true);
+
+    // This allocation precedes lazy arming, but constrained mode has kept its
+    // roots precise so the first major may reclaim it if unreachable.
+    _ = try heap.addList(&.{Value.int(1)});
+    try std.testing.expect(!heap.gcShouldMajor());
+    heap_collector.armLazy(&heap);
+    try std.testing.expect(heap.gcShouldMajor());
+
+    // Major reconciliation lowers the generation boundary and returns to the
+    // ordinary promotion-count gate.
+    heap.gcMajorReconcile(&.{});
+    heap.gcNoteMajor(0);
+    try std.testing.expect(!heap.gcShouldMajor());
+}
+
 test "tracer collectLiveIds returns exactly the marked set" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);

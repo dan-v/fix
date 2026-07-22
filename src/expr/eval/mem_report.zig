@@ -69,6 +69,17 @@ pub fn report(
     p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), heap.attrs.count() });
     p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
     p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
+    const reuse = heap.rangeReuseStats();
+    p("  range reuse (exact / split / miss):\n", .{});
+    p("    values:   {d} / {d} / {d}\n", .{ reuse.values.exact, reuse.values.split, reuse.values.miss });
+    p("    attrs:    {d} / {d} / {d}\n", .{ reuse.attrs.exact, reuse.attrs.split, reuse.attrs.miss });
+    p("    attr-pos: {d} / {d} / {d}\n", .{ reuse.attr_pos.exact, reuse.attr_pos.split, reuse.attr_pos.miss });
+    const free = heap.freeRangesStats();
+    p("  free pool (ranges / slots / nonempty classes / max range):\n", .{});
+    p("    objects:  {d} slots\n", .{free.objects});
+    p("    values:   {d} / {d} / {d} / {d}\n", .{ free.values.ranges, free.values.slots, free.values.classes, free.values.max_len });
+    p("    attrs:    {d} / {d} / {d} / {d}\n", .{ free.attrs.ranges, free.attrs.slots, free.attrs.classes, free.attrs.max_len });
+    p("    attr-pos: {d} / {d} / {d} / {d}\n", .{ free.attr_pos.ranges, free.attr_pos.slots, free.attr_pos.classes, free.attr_pos.max_len });
     p("  interned strs:  {d:>8.1} MB  ({d} entries, {d:.1} MB data)\n", .{ mb(intern_b), is.entries, mb(is.data_bytes) });
     p("  bytecode:       {d:>8.1} MB  ({d} chunks, {d:.1} MB code)\n", .{ mb(code_b), cs.chunks, mb(cs.code_bytes) });
     p("  retained AST:   {d:>8.1} MB  ({d} arenas)\n", .{ mb(arena_b), retained_arenas.len });

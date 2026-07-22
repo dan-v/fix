@@ -60,7 +60,8 @@ Root set (all must be enumerated — precise):
 ## Sweep (reclaim)
 
 - Processing each young object: **marked ⇒ survivor**, promoted in place (`gcSetOld`, id unchanged, ranges stay put); **unmarked ⇒ dead**, its store ranges returned to the free lists in place and its slot id recycled.
-- **Per-worker** free lists in the [heap](runtime/heap.md) (`HeapLocal.gc_free_objects` for slot ids; `gc_free_values` / `gc_free_attrs` / `gc_free_attr_pos` are exact-fit range lists keyed by length). A dead object's slot id and ranges are pushed into the free shard of the worker that swept its young-slot list, then **reused lock-free** by that worker's subsequent allocations (exact-length range match; slot ids LIFO). No shared allocation mutex.
+- **Per-worker** free lists in the [heap](runtime/heap.md) (`HeapLocal.gc_free_objects` for slot ids; `gc_free_values` / `gc_free_attrs` / `gc_free_attr_pos` are range lists keyed by length). Consecutive adjacent ranges are coalesced as sweep streams them back, without allocating per-range address metadata. Allocation takes exact range matches first, otherwise splits the current largest range; slot ids are LIFO. Peers may steal under the shard's small spin lock; no shared allocation mutex is involved.
+- Spilled bytecode/deferred-thunk captures record their value-store range. An unresolved dead thunk returns that range during sweep; a forced thunk returns it immediately after its evaluation frame unwinds and just before publishing its result or sticky error. Transient failures keep the range for retry. Closure captures still remain allocated because a running frame can hold their raw slice without rooting the owning closure.
 - Non-moving: no compaction pass, so scattered death can leave fragmentation.
 - A major sweeps every allocated object slot rather than the young lists, then tenures every survivor and clears the remembered set. The full sweep is currently serial.
 
