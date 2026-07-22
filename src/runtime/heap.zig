@@ -312,10 +312,11 @@ pub const HeapLocal = struct {
     /// read at thunk creation to tag demand-created thunks for the
     /// `-Dprof-main` creation-context probe.
     spec_ctx: bool = false,
-    // Per-worker reclamation lists. A sweep returns ranges to its worker's
-    // shard; allocation pops locally and may steal from a peer. `gc_free_mu`
-    // guards steals, while stop-the-world sweep writers need no lock.
-    gc_free_mu: sync.SpinMutex = .{},
+    // Per-worker reclamation caches. Minor sweep returns each allocation
+    // worker's dead storage to that same worker, then the STW coordinator
+    // publishes unused entries to shared overflow. Only the owning mutator
+    // reads/writes these lists outside a collection, so allocation and
+    // thunk-spill release need no local lock or peer probes.
     gc_free_objects: std.ArrayListUnmanaged(ObjectId) = .empty,
     gc_free_values: RangeFreeList = .{},
     gc_free_attrs: RangeFreeList = .{},
@@ -357,15 +358,26 @@ pub const GcHook = struct {
 
 /// Free list of reclaimed ranges in one segmented store, keyed by length:
 /// `len -> stack of packed (segment<<32 | offset)`. Allocation first takes an
-/// exact match, then takes from the largest available class and returns its
-/// prefix, putting the remainder back. The largest-class cursor avoids a scan
-/// across every distinct remainder length on each miss; it is rescanned only
-/// when that class drains. Reuse introduces no internal fragmentation. All ops
-/// are best-effort — on OOM growing the list we simply don't record a free
-/// range (it stays allocated), never corrupting state.
+/// exact match, then takes the smallest available class large enough for the
+/// request and returns its prefix, putting the remainder back. A treap indexes
+/// only non-empty length classes, giving O(log active classes) lower-bound
+/// lookup without scanning historic, drained classes; the hash map preserves
+/// the common O(1) exact-shape path. Best-fit prevents tiny requests from
+/// shredding the scarce large ranges needed by later large attrsets. Reuse
+/// introduces no internal fragmentation. All ops are best-effort — on OOM
+/// growing the list we simply don't record a free range (it stays allocated),
+/// never corrupting state.
 const RangeFreeList = struct {
-    map: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(u64)) = .empty,
-    largest_len: u32 = 0,
+    const ClassTree = std.Treap(u32, std.math.order);
+
+    const Class = struct {
+        ranges: std.ArrayListUnmanaged(u64) = .empty,
+        node: ClassTree.Node,
+        active: bool = false,
+    };
+
+    map: std.AutoHashMapUnmanaged(u32, *Class) = .empty,
+    nonempty: ClassTree = .{},
 
     const Stats = struct {
         classes: u64 = 0,
@@ -383,10 +395,10 @@ const RangeFreeList = struct {
 
     pub fn push(self: *RangeFreeList, allocator: std.mem.Allocator, segment: u32, offset: u32, len: u32) void {
         if (len == 0) return;
-        const gop = self.map.getOrPut(allocator, len) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        gop.value_ptr.append(allocator, (@as(u64, segment) << 32) | offset) catch {};
-        self.largest_len = @max(self.largest_len, len);
+        const class = self.getOrCreateClass(allocator, len) orelse return;
+        const was_empty = class.ranges.items.len == 0;
+        class.ranges.append(allocator, (@as(u64, segment) << 32) | offset) catch return;
+        if (was_empty) self.activateClass(class, len);
     }
 
     pub const Loc = struct { segment: u32, offset: u32 };
@@ -398,11 +410,14 @@ const RangeFreeList = struct {
     fn pop(self: *RangeFreeList, allocator: std.mem.Allocator, len: u32) ?Hit {
         if (len == 0) return null;
         // Preserve the common O(1) same-shape path.
-        if (self.map.getPtr(len)) |entry| {
-            if (entry.pop()) |bits| return .{ .loc = unpack(bits), .split = false };
+        if (self.map.get(len)) |class| {
+            if (class.ranges.pop()) |bits| {
+                if (class.ranges.items.len == 0) self.deactivateClass(class);
+                return .{ .loc = unpack(bits), .split = false };
+            }
         }
 
-        const larger = self.popLargestAtLeast(len) orelse return null;
+        const larger = self.popSmallestAtLeast(len) orelse return null;
         const free_len = larger.len;
         const bits = larger.bits;
         const loc = unpack(bits);
@@ -418,28 +433,78 @@ const RangeFreeList = struct {
 
     const Larger = struct { bits: u64, len: u32 };
 
-    /// The cursor may name an empty class after an exact pop drained it. Find
-    /// the next non-empty maximum once, then serve/split it until it drains.
-    fn popLargestAtLeast(self: *RangeFreeList, minimum: u32) ?Larger {
-        while (self.largest_len >= minimum and self.largest_len > 0) {
-            const len = self.largest_len;
-            if (self.map.getPtr(len)) |entry| {
-                if (entry.pop()) |bits| return .{ .bits = bits, .len = len };
-            }
-            self.largest_len = 0;
-            var it = self.map.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.items.len > 0) self.largest_len = @max(self.largest_len, entry.key_ptr.*);
+    fn smallestClassAtLeast(self: *RangeFreeList, minimum: u32) ?*Class {
+        var node = self.nonempty.root;
+        var best: ?*ClassTree.Node = null;
+        while (node) |current| {
+            if (current.key >= minimum) {
+                best = current;
+                node = current.children[0];
+            } else {
+                node = current.children[1];
             }
         }
-        return null;
+        const selected = best orelse return null;
+        return @fieldParentPtr("node", selected);
+    }
+
+    fn activateClass(self: *RangeFreeList, class: *Class, len: u32) void {
+        std.debug.assert(!class.active and class.ranges.items.len > 0);
+        var entry = self.nonempty.getEntryFor(len);
+        std.debug.assert(entry.node == null);
+        entry.set(&class.node);
+        class.active = true;
+    }
+
+    fn deactivateClass(self: *RangeFreeList, class: *Class) void {
+        std.debug.assert(class.active and class.ranges.items.len == 0);
+        var entry = self.nonempty.getEntryForExisting(&class.node);
+        entry.set(null);
+        class.active = false;
+    }
+
+    fn getOrCreateClass(self: *RangeFreeList, allocator: std.mem.Allocator, len: u32) ?*Class {
+        if (self.map.get(len)) |class| return class;
+        const class = allocator.create(Class) catch return null;
+        class.* = .{
+            .node = .{
+                .key = len,
+                .priority = 0,
+                .parent = null,
+                .children = .{ null, null },
+            },
+        };
+        const gop = self.map.getOrPut(allocator, len) catch {
+            allocator.destroy(class);
+            return null;
+        };
+        if (gop.found_existing) {
+            allocator.destroy(class);
+            return gop.value_ptr.*;
+        }
+        gop.value_ptr.* = class;
+        return class;
+    }
+
+    /// Best-fit fallback over non-empty classes only.
+    fn popSmallestAtLeast(self: *RangeFreeList, minimum: u32) ?Larger {
+        const class = self.smallestClassAtLeast(minimum) orelse return null;
+        const bits = class.ranges.pop().?;
+        const len = class.node.key;
+        if (class.ranges.items.len == 0) self.deactivateClass(class);
+        return .{ .bits = bits, .len = len };
+    }
+
+    fn maxLen(self: *const RangeFreeList) u32 {
+        const node = self.nonempty.getMax() orelse return 0;
+        return node.key;
     }
 
     fn stats(self: *const RangeFreeList) Stats {
         var total: Stats = .{};
         var it = self.map.iterator();
         while (it.next()) |entry| {
-            const count = entry.value_ptr.items.len;
+            const count = entry.value_ptr.*.ranges.items.len;
             if (count == 0) continue;
             const len = entry.key_ptr.*;
             total.classes += 1;
@@ -450,11 +515,53 @@ const RangeFreeList = struct {
         return total;
     }
 
+    /// Move up to `count` packed ranges of one length class to `dst`. The
+    /// caller either owns both lists at STW or holds the shared-source lock.
+    /// On allocation failure the source remains unchanged.
+    fn moveClassTo(self: *RangeFreeList, dst: *RangeFreeList, allocator: std.mem.Allocator, len: u32, count: usize) bool {
+        if (count == 0 or self == dst) return true;
+        const src = self.map.get(len) orelse return false;
+        const take = @min(count, src.ranges.items.len);
+        if (take == 0) return false;
+        const dst_class = dst.getOrCreateClass(allocator, len) orelse return false;
+        dst_class.ranges.ensureUnusedCapacity(allocator, take) catch return false;
+        const dst_was_empty = dst_class.ranges.items.len == 0;
+        const start = src.ranges.items.len - take;
+        dst_class.ranges.appendSliceAssumeCapacity(src.ranges.items[start..]);
+        if (dst_was_empty) dst.activateClass(dst_class, len);
+        src.ranges.items.len = start;
+        if (start == 0) self.deactivateClass(src);
+        return true;
+    }
+
+    /// Refill a mutator cache with a batch from the smallest suitable shared
+    /// class. The caller serializes access to `self`; `dst` belongs solely to
+    /// that mutator.
+    fn moveBestFitBatchTo(self: *RangeFreeList, dst: *RangeFreeList, allocator: std.mem.Allocator, minimum: u32, limit: usize, divisor: usize) bool {
+        const class = self.smallestClassAtLeast(minimum) orelse return false;
+        const available = class.ranges.items.len;
+        const fair_share = (available + divisor - 1) / divisor;
+        return self.moveClassTo(dst, allocator, class.node.key, @min(limit, fair_share));
+    }
+
+    /// Publish all active ranges into `dst` at a stop-the-world boundary.
+    fn moveAllTo(self: *RangeFreeList, dst: *RangeFreeList, allocator: std.mem.Allocator) void {
+        std.debug.assert(self != dst);
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const count = entry.value_ptr.*.ranges.items.len;
+            if (count > 0) _ = self.moveClassTo(dst, allocator, entry.key_ptr.*, count);
+        }
+    }
+
     fn deinit(self: *RangeFreeList, allocator: std.mem.Allocator) void {
         var it = self.map.valueIterator();
-        while (it.next()) |v| v.deinit(allocator);
+        while (it.next()) |class_ptr| {
+            const class = class_ptr.*;
+            class.ranges.deinit(allocator);
+            allocator.destroy(class);
+        }
         self.map.deinit(allocator);
-        self.largest_len = 0;
     }
 };
 
@@ -497,6 +604,22 @@ pub const ObjectHeap = struct {
     /// One entry per worker (including the main thread). Indexed by
     /// `worker_id_mod.current`.
     worker_locals: []HeapLocal,
+    /// Cross-worker overflow for reclaimed object ids. Mutators refill their
+    /// lock-free local stack in large batches, so imbalance costs one lock per
+    /// thousands of allocations rather than one lock (plus peer probes) per
+    /// allocation. Collection publishes local leftovers here at STW.
+    gc_shared_free_objects: std.ArrayListUnmanaged(ObjectId),
+    gc_shared_free_mu: sync.SpinMutex,
+    gc_shared_free_count: std.atomic.Value(usize),
+    /// Central overflow for range classes. Worker-local lists are mutator
+    /// caches; collection publishes their leftovers here, and mutators refill
+    /// a compatible class in batches. The per-store maximum is a stable
+    /// lock-avoidance hint between collections/refills.
+    gc_shared_free_values: RangeFreeList,
+    gc_shared_free_attrs: RangeFreeList,
+    gc_shared_free_attr_pos: RangeFreeList,
+    gc_shared_free_range_mu: sync.SpinMutex,
+    gc_shared_free_range_max: [3]std.atomic.Value(u32),
     /// All `ErrorInfo` allocations produced by `Thunk.errored`, recorded
     /// at publish time so `deinit` can release them in O(errored_thunks)
     /// rather than walking every object slot.
@@ -522,6 +645,14 @@ pub const ObjectHeap = struct {
             .attrs = .empty,
             .attr_positions = .empty,
             .worker_locals = locals,
+            .gc_shared_free_objects = .empty,
+            .gc_shared_free_mu = .{},
+            .gc_shared_free_count = .init(0),
+            .gc_shared_free_values = .{},
+            .gc_shared_free_attrs = .{},
+            .gc_shared_free_attr_pos = .{},
+            .gc_shared_free_range_mu = .{},
+            .gc_shared_free_range_max = .{ .init(0), .init(0), .init(0) },
             .errored_infos = .empty,
             .errored_infos_mu = .{},
             .token = next_heap_token.fetchAdd(1, .monotonic),
@@ -535,6 +666,10 @@ pub const ObjectHeap = struct {
         self.allocator.free(self.collection.old_bits);
         for (self.worker_locals) |*l| l.deinit(self.allocator);
         self.allocator.free(self.worker_locals);
+        self.gc_shared_free_objects.deinit(self.allocator);
+        self.gc_shared_free_values.deinit(self.allocator);
+        self.gc_shared_free_attrs.deinit(self.allocator);
+        self.gc_shared_free_attr_pos.deinit(self.allocator);
         self.attr_positions.deinit(self.allocator);
         self.attrs.deinit(self.allocator);
         self.values.deinit(self.allocator);
@@ -617,6 +752,7 @@ pub const ObjectHeap = struct {
         for (self.worker_locals) |*local| {
             for (local.gc_free_objects.items) |id| clearSnapshotBit(bits, id);
         }
+        for (self.gc_shared_free_objects.items) |id| clearSnapshotBit(bits, id);
 
         // In the detector build reclaimed ids deliberately never enter a free
         // list. Its authoritative allocation bitmap supplies those holes.
@@ -1150,12 +1286,23 @@ pub const ObjectHeap = struct {
         comptime StoreT: type,
         store: *StoreT,
         chunk: *LocalChunk,
+        free_list: *RangeFreeList,
         chunk_size: u32,
         n: u32,
     ) !StoreT.Range {
         if (chunk.fits(n)) {
             const r = chunk.take(n);
             return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+        }
+        // A variable-size request can leave a tail too small for the next
+        // request. It has no owning object, so sweep can never discover it;
+        // publish it explicitly before replacing this TLAB once reclaim is
+        // active. Constrained mode has root_active from startup; the roomy
+        // lazy path retains its zero-free-list-tax pre-arm phase.
+        if (chunk.cursor < chunk.end) {
+            if (self.collection.collect_enabled or self.collection.root_active)
+                free_list.push(self.allocator, chunk.segment, chunk.cursor, chunk.end - chunk.cursor);
+            chunk.* = .{};
         }
         if (n > chunk_size) {
             const range = try store.reserve(self.allocator, n);
@@ -1171,29 +1318,43 @@ pub const ObjectHeap = struct {
         return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
     }
 
-    /// Reuse a freed object slot: pop this worker's shard, else work-steal one
-    /// from a peer whose shard still has slots. One lock held at a time (own
-    /// released before locking a peer) — no deadlock. Returns null only when
-    /// the whole free pool is empty (⇒ bump-allocate).
+    const gc_object_refill_batch: usize = 4096;
+
+    /// Reuse from the worker-owned stack. On empty, refill it from the shared
+    /// overflow in one bulk copy. The mutex is therefore cold (roughly once per
+    /// 4K successful reuses), and an empty global pool costs one lock per local
+    /// batch exhaustion rather than peer probes on every allocation.
     fn gcReuseObject(self: *ObjectHeap, local: *HeapLocal) ?ObjectId {
-        local.gc_free_mu.lock();
-        const own = local.gc_free_objects.pop();
-        local.gc_free_mu.unlock();
-        if (own) |id| return id;
-        for (self.worker_locals) |*peer| {
-            if (peer == local) continue;
-            peer.gc_free_mu.lock();
-            const stolen = peer.gc_free_objects.pop();
-            peer.gc_free_mu.unlock();
-            if (stolen) |id| return id;
-        }
-        return null;
+        if (local.gc_free_objects.pop()) |id| return id;
+        // No object ids enter the overflow between collections, so zero is a
+        // stable negative hint for the rest of this mutator phase. This keeps
+        // bump allocation completely off the mutex once reuse is exhausted.
+        if (self.gc_shared_free_count.load(.acquire) == 0) return null;
+        self.gc_shared_free_mu.lock();
+        defer self.gc_shared_free_mu.unlock();
+        const available = self.gc_shared_free_objects.items.len;
+        const fair_share = (available + self.worker_locals.len - 1) / self.worker_locals.len;
+        const take = @min(gc_object_refill_batch, fair_share);
+        if (take == 0) return null;
+        local.gc_free_objects.ensureUnusedCapacity(self.allocator, take) catch {
+            const id = self.gc_shared_free_objects.pop();
+            self.gc_shared_free_count.store(self.gc_shared_free_objects.items.len, .release);
+            return id;
+        };
+        const start = self.gc_shared_free_objects.items.len - take;
+        local.gc_free_objects.appendSliceAssumeCapacity(self.gc_shared_free_objects.items[start..]);
+        self.gc_shared_free_objects.items.len = start;
+        self.gc_shared_free_count.store(start, .release);
+        return local.gc_free_objects.pop();
     }
 
-    /// Reuse a freed range of at least `n` slots from the `field` free list
-    /// (`gc_free_values`/`gc_free_attrs`/`gc_free_attr_pos`): own shard first,
-    /// then work-steal from a peer. An exact match wins; otherwise the list
-    /// splits a larger range. Same one-lock-at-a-time discipline.
+    const gc_range_refill_batch: usize = 256;
+
+    /// Reuse a worker-owned freed range of at least `n` slots from `field`.
+    /// An exact match wins; otherwise the list splits a larger range. On a
+    /// local miss, refill one compatible size class from the central overflow
+    /// in bulk. The fast path remains lock-free, while no worker can strand an
+    /// entire shard of ranges that another worker needs.
     fn gcReuseRange(self: *ObjectHeap, local: *HeapLocal, comptime field: []const u8, n: u32) ?RangeFreeList.Loc {
         const store_index = comptime if (std.mem.eql(u8, field, "gc_free_values"))
             0
@@ -1203,22 +1364,34 @@ pub const ObjectHeap = struct {
             2
         else
             @compileError("unknown GC range store");
-        local.gc_free_mu.lock();
-        const own = @field(local, field).pop(self.allocator, n);
-        local.gc_free_mu.unlock();
-        if (own) |hit| {
+        const shared_field = comptime if (std.mem.eql(u8, field, "gc_free_values"))
+            "gc_shared_free_values"
+        else if (std.mem.eql(u8, field, "gc_free_attrs"))
+            "gc_shared_free_attrs"
+        else
+            "gc_shared_free_attr_pos";
+        if (@field(local, field).pop(self.allocator, n)) |hit| {
             if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
             return hit.loc;
         }
-        for (self.worker_locals) |*peer| {
-            if (peer == local) continue;
-            peer.gc_free_mu.lock();
-            const stolen = @field(peer, field).pop(self.allocator, n);
-            peer.gc_free_mu.unlock();
-            if (stolen) |hit| {
-                if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
-                return hit.loc;
-            }
+        if (n > self.gc_shared_free_range_max[store_index].load(.acquire)) {
+            if (n > 0) local.range_reuse_miss[store_index] += 1;
+            return null;
+        }
+        self.gc_shared_free_range_mu.lock();
+        const refilled = @field(self, shared_field).moveBestFitBatchTo(
+            &@field(local, field),
+            self.allocator,
+            n,
+            gc_range_refill_batch,
+            self.worker_locals.len,
+        );
+        self.gc_shared_free_range_max[store_index].store(@field(self, shared_field).maxLen(), .release);
+        self.gc_shared_free_range_mu.unlock();
+        if (refilled) {
+            const hit = @field(local, field).pop(self.allocator, n).?;
+            if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
+            return hit.loc;
         }
         if (n > 0) local.range_reuse_miss[store_index] += 1;
         return null;
@@ -1259,7 +1432,10 @@ pub const ObjectHeap = struct {
     }
 
     pub fn freeRangesStats(self: *const ObjectHeap) FreeRangesStats {
-        var total: FreeRangesStats = .{};
+        var total: FreeRangesStats = .{ .objects = self.gc_shared_free_objects.items.len };
+        total.values.add(self.gc_shared_free_values.stats());
+        total.attrs.add(self.gc_shared_free_attrs.stats());
+        total.attr_pos.add(self.gc_shared_free_attr_pos.stats());
         for (self.worker_locals) |*local| {
             total.objects += local.gc_free_objects.items.len;
             total.values.add(local.gc_free_values.stats());
@@ -1267,6 +1443,38 @@ pub const ObjectHeap = struct {
             total.attr_pos.add(local.gc_free_attr_pos.stats());
         }
         return total;
+    }
+
+    /// Publish every worker's unused local object-id batch to the shared
+    /// overflow while the world is stopped. If growing the shared vector fails,
+    /// leave all locals untouched; correctness and reuse remain local.
+    fn gcPoolFreeObjects(self: *ObjectHeap) void {
+        var publish_count: usize = 0;
+        for (self.worker_locals) |*local| publish_count += local.gc_free_objects.items.len;
+        self.gc_shared_free_objects.ensureUnusedCapacity(self.allocator, publish_count) catch return;
+        for (self.worker_locals) |*local| {
+            self.gc_shared_free_objects.appendSliceAssumeCapacity(local.gc_free_objects.items);
+            local.gc_free_objects.clearRetainingCapacity();
+        }
+        self.gc_shared_free_count.store(self.gc_shared_free_objects.items.len, .release);
+    }
+
+    /// Stop-the-world publication for worker-owned free lists. With one worker,
+    /// preserve the original local-only path. With multiple workers, unused
+    /// local cache contents become central overflow so future demand, rather
+    /// than the previous interval's worker assignment, controls distribution.
+    pub fn gcRebalanceFreeLists(self: *ObjectHeap) void {
+        if (self.worker_locals.len < 2) return;
+        gcPoolFreeObjects(self);
+        inline for (.{
+            .{ "gc_free_values", "gc_shared_free_values", 0 },
+            .{ "gc_free_attrs", "gc_shared_free_attrs", 1 },
+            .{ "gc_free_attr_pos", "gc_shared_free_attr_pos", 2 },
+        }) |fields| {
+            for (self.worker_locals) |*local|
+                @field(local, fields[0]).moveAllTo(&@field(self, fields[1]), self.allocator);
+            self.gc_shared_free_range_max[fields[2]].store(@field(self, fields[1]).maxLen(), .release);
+        }
     }
 
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
@@ -1277,7 +1485,7 @@ pub const ObjectHeap = struct {
         if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_values", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(ValueStore, &self.values, &local.value, value_chunk_size, n);
+        return self.reserveRangeLocal(ValueStore, &self.values, &local.value, &local.gc_free_values, value_chunk_size, n);
     }
 
     /// Reserve `n` slots of attr storage for a merge in progress.
@@ -1293,12 +1501,10 @@ pub const ObjectHeap = struct {
         return self.attrs.sliceMut(range);
     }
 
-    /// Commit a partially-filled reservation as a new attrs object.
-    /// `actual` is the number of entries written (<= range.len). The
-    /// trailing unused slots remain reserved but unreferenced; on the
-    /// merge workload the overlap rate makes this waste small
-    /// relative to the steady-state attr storage footprint.
+    /// Commit a partially-filled reservation as a new attrs object. Return the
+    /// unused suffix immediately: it has no owner for sweep to find later.
     pub fn publishMergedAttrs(self: *ObjectHeap, range: AttrRange, actual: u32) !ObjectId {
+        self.releaseAttrsTail(range, actual);
         const trimmed: AttrRange = .{
             .segment = range.segment,
             .offset = range.offset,
@@ -1312,7 +1518,7 @@ pub const ObjectHeap = struct {
         if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_attrs", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, attr_chunk_size, n);
+        return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, &local.gc_free_attrs, attr_chunk_size, n);
     }
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
@@ -1320,7 +1526,19 @@ pub const ObjectHeap = struct {
         if (self.collection.collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_attr_pos", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, attr_position_chunk_size, n);
+        return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, &local.gc_free_attr_pos, attr_position_chunk_size, n);
+    }
+
+    fn releaseAttrsTail(self: *ObjectHeap, range: AttrRange, actual: u32) void {
+        std.debug.assert(actual <= range.len);
+        if (actual == range.len) return;
+        if (!self.collection.collect_enabled and !self.collection.root_active) return;
+        self.currentLocal().gc_free_attrs.push(
+            self.allocator,
+            range.segment,
+            range.offset + actual,
+            range.len - actual,
+        );
     }
 
     /// Threshold hook: once reserved bytes cross `collection.threshold_bytes`, request a
@@ -1514,6 +1732,10 @@ pub const ObjectHeap = struct {
                 const word = id >> 6;
                 if (word < self.collection.alloc_bits.len) self.collection.alloc_bits[word] &= ~(@as(u64, 1) << @intCast(id & 63));
             }
+        }
+        for (self.gc_shared_free_objects.items) |id| {
+            const word = id >> 6;
+            if (word < self.collection.alloc_bits.len) self.collection.alloc_bits[word] &= ~(@as(u64, 1) << @intCast(id & 63));
         }
     }
 
@@ -1920,6 +2142,7 @@ pub const ObjectHeap = struct {
             }
         }
 
+        self.releaseAttrsTail(reserved, @intCast(out));
         const range: AttrRange = .{ .segment = reserved.segment, .offset = reserved.offset, .len = @intCast(out) };
         return self.add(.{ .attrs = .{ .range = range } });
     }
@@ -2100,11 +2323,8 @@ pub const ObjectHeap = struct {
         // the in-order walk produces sorted+unique output by
         // construction.
         //
-        // Slight wastage: if entries overlap, we leave the trailing
-        // unused slots reserved (the segment cursor doesn't roll
-        // back). On NixOS module merge the overlap rate is high but
-        // the absolute waste is small compared to the steady-state
-        // attr storage footprint.
+        // Reserve the no-overlap upper bound. Any suffix made unnecessary by
+        // duplicate names is returned to the range free list below.
         const cap: u32 = @intCast(left.len + right.len);
         const reserved = try self.reserveAttrsLocal(cap);
         const dst = self.attrs.sliceMut(reserved);
@@ -2149,6 +2369,7 @@ pub const ObjectHeap = struct {
             .offset = reserved.offset,
             .len = @intCast(out),
         };
+        self.releaseAttrsTail(reserved, range.len);
         return self.add(.{ .attrs = .{ .range = range, .positions = positions } });
     }
 
@@ -2353,15 +2574,13 @@ pub const ObjectHeap = struct {
 
     /// Return a thunk target's spilled captures once evaluation has unwound
     /// and the caller is about to overwrite the target with a result/error.
-    /// Runtime release can race peer allocation/stealing, so take this shard's
-    /// small lock (STW sweep uses the lock-free RangeBatch path instead).
+    /// The running worker owns this shard; collections only touch it while all
+    /// mutators are stopped, so publication needs no synchronization here.
     pub fn gcReleaseThunkSpill(self: *ObjectHeap, thunk: *const Thunk) void {
         if (!self.collection.root_active) return;
         const range = thunk.targetSpillRange() orelse return;
         const local = self.currentLocal();
-        local.gc_free_mu.lock();
         local.gc_free_values.push(self.allocator, range.segment, range.offset, range.len);
-        local.gc_free_mu.unlock();
     }
 
     pub fn rollbackBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) void {

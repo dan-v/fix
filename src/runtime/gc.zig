@@ -812,6 +812,109 @@ test "gc range reuse splits a larger range and preserves the remainder" {
     try std.testing.expectEqual(@as(u32, 4), remainder_range.len);
 }
 
+test "gc range best-fit preserves a larger class for a later request" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const large = try heap.addList(&.{ Value.int(1), Value.int(2), Value.int(3), Value.int(4), Value.int(5), Value.int(6), Value.int(7) });
+    const large_range = switch (heap.get(large).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    const live = try heap.addList(&.{Value.int(8)}); // separates the dead ranges
+    const small = try heap.addList(&.{ Value.int(9), Value.int(10), Value.int(11), Value.int(12) });
+    const small_range = switch (heap.get(small).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    tr.markValue(&heap, Value.list(live));
+    tr.drain(&heap);
+    _ = heap_collector.sweep(&heap, tr.mark_bits);
+
+    // A worst-fit fallback would split len 7 here and strand the later len-7
+    // request. Best-fit consumes len 4 and leaves the scarce large class whole.
+    const three = try heap.addList(&.{ Value.int(13), Value.int(14), Value.int(15) });
+    const three_range = switch (heap.get(three).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(small_range.segment, three_range.segment);
+    try std.testing.expectEqual(small_range.offset, three_range.offset);
+
+    const seven = try heap.addList(&.{ Value.int(16), Value.int(17), Value.int(18), Value.int(19), Value.int(20), Value.int(21), Value.int(22) });
+    const seven_range = switch (heap.get(seven).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(large_range.segment, seven_range.segment);
+    try std.testing.expectEqual(large_range.offset, seven_range.offset);
+}
+
+test "partially filled attr reservation returns its unowned tail" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const reserved = try heap.reserveAttrsForMerge(7);
+    const dst = heap.attrsMutSlice(reserved);
+    dst[0] = .{ .name = 1, .value = Value.int(1) };
+    dst[1] = .{ .name = 2, .value = Value.int(2) };
+    _ = try heap.publishMergedAttrs(reserved, 2);
+
+    const tail_owner = try heap.addAttrs(&.{
+        .{ .name = 3, .value = Value.int(3) },
+        .{ .name = 4, .value = Value.int(4) },
+        .{ .name = 5, .value = Value.int(5) },
+        .{ .name = 6, .value = Value.int(6) },
+        .{ .name = 7, .value = Value.int(7) },
+    });
+    const tail_range = switch (heap.get(tail_owner).*) {
+        .attrs => |attrs| attrs.range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(reserved.segment, tail_range.segment);
+    try std.testing.expectEqual(reserved.offset + 2, tail_range.offset);
+}
+
+test "range TLAB refill returns the abandoned tail" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const first_values = try allocator.alloc(Value, 900);
+    defer allocator.free(first_values);
+    @memset(first_values, Value.int(1));
+    const first = try heap.addList(first_values);
+    const first_range = switch (heap.get(first).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+
+    const second_values = try allocator.alloc(Value, 200);
+    defer allocator.free(second_values);
+    @memset(second_values, Value.int(2));
+    _ = try heap.addList(second_values); // replaces the TLAB with 124 slots left
+
+    const tail_values = try allocator.alloc(Value, 124);
+    defer allocator.free(tail_values);
+    @memset(tail_values, Value.int(3));
+    const tail = try heap.addList(tail_values);
+    const tail_range = switch (heap.get(tail).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(first_range.segment, tail_range.segment);
+    try std.testing.expectEqual(first_range.offset + 900, tail_range.offset);
+}
+
 test "gc sweep coalesces consecutive adjacent dead ranges" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
@@ -857,6 +960,97 @@ test "gc sweep coalesces consecutive adjacent dead ranges" {
     };
     try std.testing.expectEqual(range_a.segment, tail_range.segment);
     try std.testing.expectEqual(range_a.offset + 4, tail_range.offset);
+}
+
+test "minor sweep publishes every allocation worker's storage for reuse" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 2);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const saved_worker = containers.worker_id.current;
+    defer containers.worker_id.current = saved_worker;
+
+    containers.worker_id.current = 0;
+    const dead_0 = try heap.addList(&.{ Value.int(1), Value.int(2), Value.int(3) });
+    const range_0 = switch (heap.get(dead_0).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+
+    containers.worker_id.current = 1;
+    const dead_1 = try heap.addList(&.{ Value.int(4), Value.int(5), Value.int(6) });
+    const range_1 = switch (heap.get(dead_1).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    const st = heap_collector.minorCollect(&heap, tr.mark_bits);
+    try std.testing.expectEqual(@as(u64, 2), st.freed);
+
+    // The coordinator ran with worker 1 current. Object slots and ranges may
+    // cross workers through their shared batch pools.
+    const objects_before = heap.objects.count();
+    containers.worker_id.current = 0;
+    const reused_0 = try heap.addList(&.{ Value.int(7), Value.int(8), Value.int(9) });
+    const reused_range_0 = switch (heap.get(reused_0).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    containers.worker_id.current = 1;
+    const reused_1 = try heap.addList(&.{ Value.int(10), Value.int(11), Value.int(12) });
+    const reused_range_1 = switch (heap.get(reused_1).*) {
+        .list => |range| range,
+        else => unreachable,
+    };
+    const reused_0_bits = (@as(u64, reused_range_0.segment) << 32) | reused_range_0.offset;
+    const reused_1_bits = (@as(u64, reused_range_1.segment) << 32) | reused_range_1.offset;
+    const range_0_bits = (@as(u64, range_0.segment) << 32) | range_0.offset;
+    const range_1_bits = (@as(u64, range_1.segment) << 32) | range_1.offset;
+    try std.testing.expect((reused_0_bits == range_0_bits or reused_0_bits == range_1_bits) and
+        (reused_1_bits == range_0_bits or reused_1_bits == range_1_bits) and
+        reused_0_bits != reused_1_bits);
+    try std.testing.expectEqual(objects_before, heap.objects.count());
+    try std.testing.expect(reused_0 != reused_1);
+    try std.testing.expect((reused_0 == dead_0 or reused_0 == dead_1) and (reused_1 == dead_0 or reused_1 == dead_1));
+}
+
+test "collection boundary makes free storage available to an idle worker" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 2);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const saved_worker = containers.worker_id.current;
+    defer containers.worker_id.current = saved_worker;
+    containers.worker_id.current = 0;
+
+    var live: [3]ObjectId = undefined;
+    for (&live) |*root| {
+        _ = try heap.addList(&.{Value.int(1)}); // dead; leaves a len-1 hole
+        root.* = try heap.addList(&.{Value.int(2)}); // live; prevents coalescing
+    }
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    for (live) |id| tr.markValue(&heap, Value.list(id));
+    tr.drain(&heap);
+    const st = heap_collector.minorCollect(&heap, tr.mark_bits);
+    try std.testing.expectEqual(@as(u64, 3), st.freed);
+
+    // Worker 1 allocated nothing before collection. Shared overflow must still
+    // give it one dead slot and len-1 range, so its first allocation grows
+    // neither backing store.
+    const objects_before = heap.objects.count();
+    const values_before = heap.values.count();
+    containers.worker_id.current = 1;
+    _ = try heap.addList(&.{Value.int(3)});
+    try std.testing.expectEqual(objects_before, heap.objects.count());
+    try std.testing.expectEqual(values_before, heap.values.count());
 }
 
 test "resolved thunk returns its spilled capture range" {

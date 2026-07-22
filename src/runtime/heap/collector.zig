@@ -113,6 +113,7 @@ pub fn sweep(heap: *ObjectHeap, mark_bits: []const u64) SweepStats {
         if (shard >= shard_count) shard = 0;
     }
     ranges.flush();
+    heap.gcRebalanceFreeLists();
     return stats;
 }
 
@@ -323,19 +324,22 @@ pub fn minorCollect(heap: *ObjectHeap, mark_bits: []const u64) ObjectHeap.MinorS
     var st: ObjectHeap.MinorStats = .{};
     heap.gcGrowOldBits(heap.objects.count());
     verifyMinorClosure(heap, mark_bits);
-    // The calling worker owns the free-list shard receiving serial results.
-    const dst = heap.currentLocal();
-    var ranges = RangeBatch.local(heap, dst);
+    // Return each dead allocation to its originating worker's shard. This
+    // keeps mutator reuse local and lock-free even though the coordinator is
+    // performing this serial sweep on every worker's behalf.
     for (heap.worker_locals) |*local| {
-        sweepYoungListInto(heap, local.gc_young_slots.items, dst, &ranges, mark_bits, &st);
+        var ranges = RangeBatch.local(heap, local);
+        sweepYoungListInto(heap, local.gc_young_slots.items, local, &ranges, mark_bits, &st);
+        ranges.flush();
         local.gc_young_slots.clearRetainingCapacity();
     }
-    ranges.flush();
+    heap.gcRebalanceFreeLists();
     return st;
 }
 
-/// Sweep one young-object list into the processing worker's free-list shard.
-/// Lists are disjoint, and each worker writes only its own destination shard.
+/// Sweep one young-object list into its allocation worker's free-list shard.
+/// Lists are disjoint, so parallel helpers still have exactly one writer per
+/// destination even when the helper and allocation worker differ.
 fn sweepYoungListInto(heap: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLocal, ranges: *RangeBatch, mark_bits: []const u64, st: *ObjectHeap.MinorStats) void {
     for (src_ids) |id| {
         const word = id >> 6;
@@ -379,17 +383,17 @@ pub fn openMinorSweep(heap: *ObjectHeap) void {
 /// Claim and sweep young-object lists until the queue drains.
 pub fn minorSweepClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
     while (!heap.collection.minor_sweep_open.load(.acquire)) std.atomic.spinLoopHint();
-    const dst = heap.currentLocal();
     var local_st: ObjectHeap.MinorStats = .{};
-    var ranges = RangeBatch.local(heap, dst);
     while (true) {
         const i = heap.collection.minor_sweep_next.fetchAdd(1, .monotonic);
         if (i >= heap.collection.minor_sweep_count) break;
-        sweepYoungListInto(heap, heap.worker_locals[i].gc_young_slots.items, dst, &ranges, mark_bits, &local_st);
+        const dst = &heap.worker_locals[i];
+        var ranges = RangeBatch.local(heap, dst);
+        sweepYoungListInto(heap, dst.gc_young_slots.items, dst, &ranges, mark_bits, &local_st);
         // Publish the final pending intervals before declaring this source
         // list swept; the coordinator uses `minor_sweep_done` as its fence.
         ranges.flush();
-        heap.worker_locals[i].gc_young_slots.clearRetainingCapacity();
+        dst.gc_young_slots.clearRetainingCapacity();
         _ = heap.collection.minor_sweep_done.fetchAdd(1, .release);
     }
     _ = heap.collection.minor_sweep_promoted.fetchAdd(local_st.promoted, .monotonic);
@@ -403,6 +407,7 @@ pub fn waitMinorSweepDone(heap: *ObjectHeap) void {
 
 /// Return the aggregate result after every list has drained.
 pub fn finishMinorSweep(heap: *ObjectHeap) ObjectHeap.MinorStats {
+    heap.gcRebalanceFreeLists();
     return .{ .promoted = heap.collection.minor_sweep_promoted.load(.monotonic), .freed = heap.collection.minor_sweep_freed.load(.monotonic) };
 }
 
