@@ -52,7 +52,9 @@ pub fn applyMemoryBacking(cli_mode: ?hugetlb.Mode) void {
 pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) !Terminal {
     // Language effects are durable stderr records, independent of progress
     // verbosity. The evaluator sink synchronizes and flushes each one.
-    ev.setEffectStderr(init.io);
+    // Interactive terminals additionally get ANSI sync-wrapped records so a
+    // streamed frame can't tear mid-repaint.
+    ev.setEffectStderr(init.io, presentation.isStderrInteractive(init.io, init.environ_map));
     // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap is
     // pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.setLazyShellsVisible(options.output == .xml);

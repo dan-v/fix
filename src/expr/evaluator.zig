@@ -781,8 +781,10 @@ pub const Evaluator = struct {
     }
 
     /// Stream language effects to synchronized stderr, flushing each record.
-    pub fn setEffectStderr(self: *Evaluator, io: std.Io) void {
-        self.effects.setStderr(io);
+    /// `sync_updates` wraps records in ANSI synchronized-output markers; pass
+    /// true only when stderr is an interactive terminal.
+    pub fn setEffectStderr(self: *Evaluator, io: std.Io, sync_updates: bool) void {
+        self.effects.setStderr(io, sync_updates);
     }
 
     pub fn setTraceVerbose(self: *Evaluator, enabled: bool) void {
