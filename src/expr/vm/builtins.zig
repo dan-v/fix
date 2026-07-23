@@ -12,6 +12,7 @@ const attrsets = @import("builtins/attrsets.zig");
 const serial = @import("builtins/serial.zig");
 const fetch = @import("builtins/fetch.zig");
 const flakes = @import("builtins/flakes.zig");
+const purity = @import("builtins/purity.zig");
 const source_store = @import("builtins/source_store.zig");
 const derivation_builtins = @import("builtins/derivation.zig");
 const predicates = @import("builtins/predicates.zig");
@@ -152,6 +153,7 @@ pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
         .derivationLazyAttr => derivation_builtins.builtinDerivationLazyAttr(self, args[0], args[1]),
         .mapValue => lists.builtinMapValue(self, args[0], args[1]),
         .constantValue => args[0],
+        .pure_guarded => purity.guardedPureValue(self, args[0]),
         .resolve_flake_node => flakes.resolveFlakeNode(self, args[0], args[1], args[2]),
         .compute_nar_hash => fetch.computeNarHash(self, args[0], args[1]),
     };

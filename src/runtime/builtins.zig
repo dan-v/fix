@@ -6,6 +6,7 @@ const InternTable = @import("intern.zig").InternTable;
 const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const AttrEntry = heap_mod.AttrEntry;
+const Thunk = @import("thunk.zig").Thunk;
 const Value = @import("value.zig").Value;
 
 pub const NixPathEntry = struct {
@@ -141,6 +142,11 @@ pub const BuiltinId = enum(u16) {
     /// "" — e.g. ".git"/".hg" to drop the VCS dir). See fetch.zig.
     compute_nar_hash = 112,
     warn = 113,
+    /// Internal: force-time pure-eval guard. Backs `builtins.currentSystem` /
+    /// `currentTime` — returns its single argument (the constant) in impure
+    /// eval, or raises `RestrictedInPureEval` under pure eval. Seeded as a thunk
+    /// so the check happens on the forcing VM's policy. Arg: (constant value).
+    pure_guarded = 114,
 };
 
 const BuiltinBinding = struct {
@@ -368,6 +374,7 @@ pub fn arity(id: BuiltinId) u8 {
         .flakeRefToString,
         .break_,
         .constantValue,
+        .pure_guarded,
         .floor,
         .ceil,
         .baseNameOf,
@@ -448,13 +455,16 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
         .name = try intern.intern("storeDir"),
         .value = Value.string(try intern.intern("/nix/store")),
     });
+    // `currentSystem` / `currentTime` are impure: wrapped in a force-time guard
+    // that raises `RestrictedInPureEval` under pure eval (a flake must take
+    // `system` explicitly), and otherwise resolves to the constant.
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("currentSystem"),
-        .value = Value.string(try intern.intern(hostSystemName())),
+        .value = try pureGuardedThunk(heap, Value.string(try intern.intern(hostSystemName()))),
     });
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("currentTime"),
-        .value = Value.int(0),
+        .value = try pureGuardedThunk(heap, Value.int(0)),
     });
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("nixVersion"),
@@ -477,6 +487,13 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
     const attr_range = try heap.prepareAttrsRange(entries.items);
     heap.fillObjectSlot(self_id, .{ .attrs = .{ .range = attr_range } });
     return Value.attrs(self_id);
+}
+
+/// A thunk that resolves through the `pure_guarded` builtin, so forcing it runs
+/// the pure-eval check against the forcing VM's policy (see `BuiltinId`).
+fn pureGuardedThunk(heap: *ObjectHeap, value: Value) !Value {
+    const closure = Value.builtinClosure(try heap.addBuiltinClosure(@intFromEnum(BuiltinId.pure_guarded), &.{value}));
+    return Value.thunk(try heap.addThunk(Thunk.init(closure)));
 }
 
 fn builtinEntry(intern: *InternTable, binding: BuiltinBinding) !AttrEntry {

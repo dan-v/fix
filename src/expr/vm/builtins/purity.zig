@@ -60,6 +60,13 @@ pub fn enforceFetchLocked(self: *VM, locked: bool) !void {
     return restrict(self, "fetching without a pinned hash (narHash/rev/sha256) is not allowed in pure evaluation mode (use --impure to allow)", .{});
 }
 
+/// Backs the `pure_guarded` builtin wrapping `builtins.currentSystem` /
+/// `currentTime`: the constant in impure eval, an error under pure eval.
+pub fn guardedPureValue(self: *VM, value: Value) !Value {
+    if (!self.policy.pure_eval) return value;
+    return restrict(self, "'builtins.currentSystem'/'currentTime' is not available in pure evaluation mode; take 'system' as an output argument instead (use --impure to allow)", .{});
+}
+
 fn restrict(self: *VM, comptime fmt: []const u8, fmt_args: anytype) error{RestrictedInPureEval} {
     if (self.trace) |trace| {
         const message = std.fmt.allocPrint(self.allocator, fmt, fmt_args) catch return error.RestrictedInPureEval;

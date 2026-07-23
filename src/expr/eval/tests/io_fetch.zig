@@ -837,6 +837,10 @@ test "pure evaluation sandboxes env, out-of-tree reads, search paths, and unlock
     try std.testing.expectEqualStrings("INSIDE", ev.intern.get(in_val.asInternId()));
     try std.testing.expectError(error.RestrictedInPureEval, ev.evaluate("builtins.readFile \"/etc/hostname\""));
 
+    // currentSystem / currentTime are unavailable in pure eval.
+    try std.testing.expectError(error.RestrictedInPureEval, ev.evaluate("builtins.currentSystem"));
+    try std.testing.expectError(error.RestrictedInPureEval, ev.evaluate("builtins.currentTime"));
+
     // Search-path lookups and unlocked fetches are forbidden.
     try std.testing.expectError(error.RestrictedInPureEval, ev.evaluate("builtins.findFile builtins.nixPath \"nixpkgs\""));
     try std.testing.expectError(
