@@ -91,6 +91,10 @@ pub fn report(
     p("    values:   {d} / {d} / {d} / {d}\n", .{ free.values.ranges, free.values.slots, free.values.classes, free.values.max_len });
     p("    attrs:    {d} / {d} / {d} / {d}\n", .{ free.attrs.ranges, free.attrs.slots, free.attrs.classes, free.attrs.max_len });
     p("    attr-pos: {d} / {d} / {d} / {d}\n", .{ free.attr_pos.ranges, free.attr_pos.slots, free.attr_pos.classes, free.attr_pos.max_len });
+    p("  free-range vector capacity (used / allocated MB):\n", .{});
+    p("    values:   {d:.1} / {d:.1}\n", .{ mb(free.values.ranges * @sizeOf(u64)), mb(free.values.capacity * @sizeOf(u64)) });
+    p("    attrs:    {d:.1} / {d:.1}\n", .{ mb(free.attrs.ranges * @sizeOf(u64)), mb(free.attrs.capacity * @sizeOf(u64)) });
+    p("    attr-pos: {d:.1} / {d:.1}\n", .{ mb(free.attr_pos.ranges * @sizeOf(u64)), mb(free.attr_pos.capacity * @sizeOf(u64)) });
     p("  interned strs:  {d:>8.1} MB  ({d} entries, {d:.1} MB data)\n", .{ mb(intern_b), is.entries, mb(is.data_bytes) });
     p("  bytecode:       {d:>8.1} MB  ({d} chunks, {d:.1} MB code)\n", .{ mb(code_b), cs.chunks, mb(cs.code_bytes) });
     p("  retained AST:   {d:>8.1} MB  ({d} arenas)\n", .{ mb(arena_b), retained_arenas.len });

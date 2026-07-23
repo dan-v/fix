@@ -1043,6 +1043,8 @@ test "major coalescing joins adjacent ranges freed by different collections" {
     try std.testing.expectEqual(@as(u64, 1), coalesced.ranges);
     try std.testing.expectEqual(@as(u64, 5), coalesced.slots);
     try std.testing.expectEqual(@as(u32, 5), coalesced.max_len);
+    try std.testing.expect(coalesced.capacity < fragmented.capacity);
+    try std.testing.expect(coalesced.capacity >= coalesced.ranges);
 
     const values_before = heap.values.count();
     const reused = try heap.addList(&.{ Value.int(6), Value.int(7), Value.int(8), Value.int(9), Value.int(10) });

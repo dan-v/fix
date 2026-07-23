@@ -445,12 +445,14 @@ const RangeFreeList = struct {
     const Stats = struct {
         classes: u64 = 0,
         ranges: u64 = 0,
+        capacity: u64 = 0,
         slots: u64 = 0,
         max_len: u32 = 0,
 
         fn add(self: *Stats, other: Stats) void {
             self.classes += other.classes;
             self.ranges += other.ranges;
+            self.capacity += other.capacity;
             self.slots += other.slots;
             self.max_len = @max(self.max_len, other.max_len);
         }
@@ -567,7 +569,9 @@ const RangeFreeList = struct {
         var total: Stats = .{};
         var it = self.map.iterator();
         while (it.next()) |entry| {
-            const count = entry.value_ptr.*.ranges.items.len;
+            const ranges = entry.value_ptr.*.ranges;
+            total.capacity += ranges.capacity;
+            const count = ranges.items.len;
             if (count == 0) continue;
             const len = entry.key_ptr.*;
             total.classes += 1;
@@ -611,6 +615,20 @@ const RangeFreeList = struct {
             self.deactivateClass(class);
         }
         std.debug.assert(self.nonempty.root == null);
+    }
+
+    /// Return backing arrays for classes that a coalesce left empty. A class
+    /// map entry is cheap and useful to retain, but keeping every vector's
+    /// historical high-water duplicates hundreds of megabytes across the
+    /// shared list and worker shards after their ranges have moved into new,
+    /// coalesced length classes.
+    fn releaseEmptyCapacity(self: *RangeFreeList, allocator: std.mem.Allocator) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |class_ptr| {
+            const class = class_ptr.*;
+            if (class.ranges.items.len == 0 and class.ranges.capacity > 0)
+                class.ranges.clearAndFree(allocator);
+        }
     }
 
     /// Move up to `count` packed ranges of one length class to `dst`. The
@@ -1697,6 +1715,12 @@ pub const ObjectHeap = struct {
                 cursor = run_end;
             }
         }
+        // Coalescing changes the range-length distribution. Drop the empty
+        // vectors for obsolete classes (including emptied worker shards)
+        // instead of retaining every distribution's historical peak forever.
+        @field(self, shared_field).releaseEmptyCapacity(self.allocator);
+        for (self.worker_locals) |*local|
+            @field(local, local_field).releaseEmptyCapacity(self.allocator);
         self.gc_shared_free_range_max[store_index].store(@field(self, shared_field).maxLen(), .release);
     }
 
