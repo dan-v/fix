@@ -18,6 +18,7 @@ const path_ops = @import("runtime").paths;
 const source_paths = @import("store").realization.source_path;
 const shared = @import("shared.zig");
 const strings = @import("strings.zig");
+const purity = @import("purity.zig");
 const string_context = @import("string_context.zig");
 const arguments = @import("arguments.zig");
 const vm_force = @import("../force.zig");
@@ -215,7 +216,16 @@ pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype) anyerror!@
     return cell.res;
 }
 
+/// Pure eval requires a fetch to be content-locked (a `rev`/`narHash`/`sha256`
+/// on the argument attrset); a bare-string URL is never locked. No-op off pure.
+fn enforcePureFetch(self: *VM, arg: Value) !void {
+    if (!purity.pure(self)) return;
+    const forced = try vm_force.forceValue(self, arg);
+    try purity.enforceFetchLocked(self, purity.attrsHaveLock(self, forced));
+}
+
 pub fn builtinFetchGit(self: *VM, arg: Value) !Value {
+    try enforcePureFetch(self, arg);
     const spec = try fetchGitSpec(self, arg);
     defer spec.deinit(self.allocator);
 
@@ -349,6 +359,7 @@ pub const FetchUrlSpec = struct {
 };
 
 pub fn builtinFetchurl(self: *VM, arg: Value) !Value {
+    try enforcePureFetch(self, arg);
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
     const expected_hash = try expectedFetchSha256Hex(self, arg);
@@ -476,6 +487,7 @@ pub fn fetchUrlSpecFromAttrs(self: *VM, attrs_id: ObjectId, default_name: ?[]con
 }
 
 pub fn builtinFetchTarball(self: *VM, arg: Value) !Value {
+    try enforcePureFetch(self, arg);
     const tree_name = try tarballTreeName(self, arg);
     defer self.allocator.free(tree_name);
     const spec = try fetchUrlSpec(self, arg);
@@ -622,6 +634,7 @@ pub const FetchMercurialSpec = struct {
 };
 
 pub fn builtinFetchMercurial(self: *VM, arg: Value) !Value {
+    try enforcePureFetch(self, arg);
     const spec = try fetchMercurialSpec(self, arg);
     defer spec.deinit(self.allocator);
 

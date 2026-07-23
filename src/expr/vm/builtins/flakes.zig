@@ -11,6 +11,7 @@ const derivation = @import("store").derivation;
 const path_ops = @import("runtime").paths;
 const flake_registry = @import("flake_registry.zig");
 const shared = @import("shared.zig");
+const purity = @import("purity.zig");
 const attrsets = @import("attrsets.zig");
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
@@ -51,6 +52,20 @@ pub fn builtinFetchTreeEntry(self: *VM, arg: Value) !Value {
         // (which only intercepts NixThrow/NixAbort/AssertionFailed/FileNotFound).
         try vm_trace.setErrorMessage(self, "builtins.fetchTree is disabled; pass --extra-experimental-features fetch-tree to enable it");
         return error.MissingExperimentalFeature;
+    }
+    // Pure eval requires user-facing fetches to be content-locked. (getFlake's
+    // own input fetches go through `builtinFetchTree` directly, bypassing this;
+    // they are pinned by the lock's narHash instead.)
+    if (purity.pure(self)) {
+        const forced = try vm_force.forceValue(self, arg);
+        // Parse only explicit-scheme strings (`github:…`, `git+…`); a bare
+        // indirect id (`nixpkgs`) is inherently unlocked, so don't hit the
+        // registry just to reject it.
+        const ref_attrs: Value = if (forced.isString() and std.mem.indexOfScalar(u8, self.intern.get(forced.asInternId()), ':') != null)
+            try builtinParseFlakeRef(self, forced)
+        else
+            forced;
+        try purity.enforceFetchLocked(self, purity.attrsHaveLock(self, ref_attrs));
     }
     return builtinFetchTree(self, arg);
 }
@@ -209,14 +224,21 @@ pub fn builtinGetFlake(self: *VM, arg: Value) !Value {
     if (!try resolveRootInputs(self, out_path, dir, &input_entries)) {
         try buildFlakeNixInputThunks(self, flake_value, &input_entries);
     }
-    try input_entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = try flakeSelfInput(self, source_info) });
+    // `self` is the flake's own fixpoint: outputs may read `self.packages`,
+    // `self.lib`, etc. Bind it through a placeholder cell (as recursive
+    // `let`/`rec` do), then publish the assembled result once outputs return.
+    const self_cell = try vm_force.makeBindingCell(self);
+    vm_force.rootKeep(self, self_cell);
+    try input_entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = self_cell });
 
     const inputs = Value.attrs(try self.heap.addAttrs(input_entries.items));
     vm_force.rootKeep(self, inputs);
     const outputs = try vm_force.forceValue(self, try vm_closures.callValue(self, outputs_func, inputs));
     if (!outputs.isAttrs()) return error.TypeError;
 
-    return flakeResultValue(self, source_info, inputs, outputs);
+    const result = try flakeResultValue(self, source_info, inputs, outputs);
+    publishSelfCell(self, self_cell, result);
+    return result;
 }
 
 /// Import + force the flake.nix attrset at `<out_path>[/dir]`.
@@ -261,6 +283,10 @@ fn resolveRootInputs(self: *VM, out_path: []const u8, dir: ?[]const u8, out_entr
     var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, lock_data, .{}) catch return error.InvalidFlakeLock;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidFlakeLock;
+    // Nix errors on an unknown lock version; it reads formats 5–7. Our node
+    // parser (`locked`/`inputs`/`follows`) is common to all three.
+    const version_v = parsed.value.object.get("version") orelse return error.InvalidFlakeLock;
+    if (version_v != .integer or version_v.integer < 5 or version_v.integer > 7) return error.UnsupportedFlakeLockVersion;
     const nodes_v = parsed.value.object.get("nodes") orelse return error.InvalidFlakeLock;
     const root_name_v = parsed.value.object.get("root") orelse return error.InvalidFlakeLock;
     if (nodes_v != .object or root_name_v != .string) return error.InvalidFlakeLock;
@@ -296,8 +322,27 @@ fn buildFlakeNixInputThunks(self: *VM, flake_value: Value, out_entries: *std.Arr
     const inputs = try vm_force.forceValue(self, inputs_v);
     if (!inputs.isAttrs()) return;
 
+    // Two passes: build the concrete inputs first (recording name → thunk), then
+    // resolve `inputs.<name>.follows = "<sibling>"` aliases against them. Without
+    // this a `follows` decl (which carries no `url`/`type`) would be handed to
+    // the fetcher as a ref and hard-error.
+    const follows_id = try self.intern.intern("follows");
+    var built: std.StringHashMapUnmanaged(Value) = .empty;
+    defer built.deinit(self.allocator);
+    const Follow = struct { name: @TypeOf(inputs_id), target: []const u8 };
+    var follows: std.ArrayListUnmanaged(Follow) = .empty;
+    defer follows.deinit(self.allocator);
+
     for (try self.heap.getAttrs(inputs.asObjectId())) |entry| {
         const decl = try vm_force.forceValue(self, entry.value);
+        if (decl.isAttrs()) {
+            if (try self.heap.getAttrValueOpt(decl.asObjectId(), follows_id)) |f| {
+                const fv = try vm_force.forceValue(self, f);
+                if (!fv.isString()) return error.InvalidFlakeRef;
+                try follows.append(self.allocator, .{ .name = entry.name, .target = self.intern.get(fv.asInternId()) });
+                continue;
+            }
+        }
         const as_flake = if (decl.isAttrs())
             (try optionalBoolAttr(self, decl.asObjectId(), "flake")) orelse true
         else
@@ -314,6 +359,19 @@ fn buildFlakeNixInputThunks(self: *VM, flake_value: Value, out_entries: *std.Arr
         const thunk = try shared.makeBuiltinThunk(self, .resolve_flake_node, &.{ ref_attrs, Value.null_val, Value.boolVal(as_flake) });
         vm_force.rootKeep(self, thunk);
         try out_entries.append(self.allocator, .{ .name = entry.name, .value = thunk });
+        try built.put(self.allocator, self.intern.get(entry.name), thunk);
+    }
+
+    for (follows.items) |fe| {
+        // A flake.nix `follows` is a `/`-separated input path. The single-segment
+        // case (`inputs.a.follows = "b"`) aliases a sibling; deeper paths
+        // (`"b/c"` → b's own input c) need the sibling's resolved input graph and
+        // are deferred (they need the same machinery as lockfile follows).
+        var segs = std.mem.splitScalar(u8, fe.target, '/');
+        const first = segs.next() orelse continue;
+        const sibling = built.get(first) orelse return error.InvalidFlakeFollows;
+        if (segs.next() != null) return error.UnsupportedFlakeFollows;
+        try out_entries.append(self.allocator, .{ .name = fe.name, .value = sibling });
     }
 }
 
@@ -358,12 +416,16 @@ pub fn resolveFlakeNode(self: *VM, ref_attrs: Value, sub_inputs: Value, is_flake
     } else {
         try buildFlakeNixInputThunks(self, flake_value, &entries);
     }
-    try entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = try flakeSelfInput(self, src_info) });
+    const self_cell = try vm_force.makeBindingCell(self);
+    vm_force.rootKeep(self, self_cell);
+    try entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = self_cell });
     const inputs = Value.attrs(try self.heap.addAttrs(entries.items));
     vm_force.rootKeep(self, inputs);
     const outputs = try vm_force.forceValue(self, try vm_closures.callValue(self, outputs_func, inputs));
     if (!outputs.isAttrs()) return error.TypeError;
-    return flakeResultValue(self, src_info, inputs, outputs);
+    const result = try flakeResultValue(self, src_info, inputs, outputs);
+    publishSelfCell(self, self_cell, result);
+    return result;
 }
 
 /// Resolve `input_target` (a node name string, or a `follows` path array from
@@ -514,43 +576,46 @@ fn jsonObjectToAttrs(self: *VM, obj: std.json.ObjectMap) !Value {
         const v: Value = switch (e.value_ptr.*) {
             .string => |s| Value.string(try self.intern.intern(s)),
             .integer => |n| Value.int(n),
-            else => continue, // skip bools/null/nested — fetch specs only read strings/ints
+            .bool => |b| Value.boolVal(b), // e.g. locked `submodules`/`shallow`
+            else => continue, // skip null/nested — fetch specs only read scalars
         };
         try entries.append(self.allocator, .{ .name = try self.intern.intern(e.key_ptr.*), .value = v });
     }
     return Value.attrs(try self.heap.addAttrs(entries.items));
 }
 
-fn flakeSelfInput(self: *VM, source_info: Value) !Value {
-    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
-    defer entries.deinit(self.allocator);
-    try entries.append(self.allocator, .{ .name = try self.intern.intern("_type"), .value = Value.string(try self.intern.intern("flake")) });
-    try entries.append(self.allocator, .{ .name = try self.intern.intern("sourceInfo"), .value = source_info });
-    // Promote the sourceInfo fields onto `self`, as Nix does — flakes (nixpkgs
-    // among them) read `self.lastModified`, `self.rev`, etc. directly.
-    const source_id = source_info.asObjectId();
-    for ([_][]const u8{ "outPath", "narHash", "lastModified", "lastModifiedDate", "rev", "revCount", "shortRev" }) |field| {
-        try appendExistingAttr(self, &entries, source_id, field);
-    }
-    return Value.attrs(try self.heap.addAttrs(entries.items));
+/// Publish the fully-assembled flake result into the `self` binding cell, so
+/// the outputs function's `self` argument resolves to its own fixpoint (the
+/// same value `getFlake` returns — `_type`, `sourceInfo`, the promoted
+/// source-info fields, and the merged outputs). Mirrors the `cell_set` op that
+/// recursive `let`/`rec` use to publish into a pre-captured binding cell.
+fn publishSelfCell(self: *VM, self_cell: Value, result: Value) void {
+    const cell_thunk = self.heap.getThunkAssumeValid(self_cell.asObjectId());
+    if (self.solo) cell_thunk.publishCellBindingSolo(result) else cell_thunk.publishCellBinding(result);
+    self.heap.gcRecordEdge(self_cell.asObjectId(), result);
 }
 
 fn flakeResultValue(self: *VM, source_info: Value, inputs: Value, outputs: Value) !Value {
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
 
+    // Nix: `result = outputs // sourceInfo // { inputs; outputs; sourceInfo;
+    // _type; }`. The explicit fields win over sourceInfo, which wins over
+    // outputs — so we append explicit first, then the whole sourceInfo, then
+    // outputs, each deduped against what's already present.
     try entries.append(self.allocator, .{ .name = try self.intern.intern("_type"), .value = Value.string(try self.intern.intern("flake")) });
     try entries.append(self.allocator, .{ .name = try self.intern.intern("inputs"), .value = inputs });
     try entries.append(self.allocator, .{ .name = try self.intern.intern("outputs"), .value = outputs });
     try entries.append(self.allocator, .{ .name = try self.intern.intern("sourceInfo"), .value = source_info });
 
-    const source_attrs_id = source_info.asObjectId();
-    try appendExistingAttr(self, &entries, source_attrs_id, "lastModified");
-    try appendExistingAttr(self, &entries, source_attrs_id, "lastModifiedDate");
-    try appendExistingAttr(self, &entries, source_attrs_id, "narHash");
-    try appendExistingAttr(self, &entries, source_attrs_id, "outPath");
-    try appendExistingAttr(self, &entries, source_attrs_id, "rev");
-    try appendExistingAttr(self, &entries, source_attrs_id, "shortRev");
+    // Promote every sourceInfo field (outPath, narHash, rev, revCount,
+    // shortRev, lastModified, submodules, …) — not a fixed subset — so `self`
+    // and the returned flake carry whatever the fetcher produced, as Nix does.
+    for (try self.heap.getAttrs(source_info.asObjectId())) |entry| {
+        if (attrEntryNameIndex(entries.items, entry.name) == null) {
+            try entries.append(self.allocator, entry);
+        }
+    }
 
     for (try self.heap.getAttrs(outputs.asObjectId())) |entry| {
         if (attrEntryNameIndex(entries.items, entry.name) == null) {
@@ -558,15 +623,6 @@ fn flakeResultValue(self: *VM, source_info: Value, inputs: Value, outputs: Value
         }
     }
     return Value.attrs(try self.heap.addAttrs(entries.items));
-}
-
-fn appendExistingAttr(self: *VM, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), attrs_id: ObjectId, name: []const u8) !void {
-    const name_id = try self.intern.intern(name);
-    const value = self.heap.getAttrValue(attrs_id, name_id) catch |err| switch (err) {
-        error.MissingAttribute => return,
-        else => return err,
-    };
-    try entries.append(self.allocator, .{ .name = name_id, .value = value });
 }
 
 /// A 40-char lowercase-hex git revision (as opposed to a branch/tag `ref`).
@@ -586,6 +642,19 @@ pub fn builtinParseFlakeRef(self: *VM, arg: Value) !Value {
     const q_idx = std.mem.indexOfScalar(u8, ref, '?');
     const base = if (q_idx) |i| ref[0..i] else ref;
     const query = if (q_idx) |i| ref[i + 1 ..] else "";
+
+    // Explicit indirect scheme `flake:<id>` — the same thing as a bare id, just
+    // spelled out. Strip the prefix and re-parse (re-attaching the query) so it
+    // reaches the registry resolution below.
+    if (std.mem.startsWith(u8, base, "flake:")) {
+        const rest = base["flake:".len..];
+        const full = if (q_idx != null)
+            try std.fmt.allocPrint(self.allocator, "{s}?{s}", .{ rest, query })
+        else
+            try self.allocator.dupe(u8, rest);
+        defer self.allocator.free(full);
+        return builtinParseFlakeRef(self, Value.string(try self.intern.intern(full)));
+    }
 
     // Shorthand forge refs: github:/gitlab:/sourcehut: owner/repo[/refOrRev].
     inline for (.{ "github", "gitlab", "sourcehut" }) |forge| {
@@ -663,42 +732,56 @@ pub fn builtinParseFlakeRef(self: *VM, arg: Value) !Value {
 pub fn builtinFlakeRefToString(self: *VM, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
     if (!attrs.isAttrs()) return error.TypeError;
+    const id = attrs.asObjectId();
 
-    const type_value = try requiredStringAttr(self, attrs.asObjectId(), "type");
+    const type_value = try requiredStringAttr(self, id, "type");
     defer self.allocator.free(type_value);
-    if (std.mem.eql(u8, type_value, "github")) {
-        const owner = try requiredStringAttr(self, attrs.asObjectId(), "owner");
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(self.allocator);
+
+    if (std.mem.eql(u8, type_value, "github") or std.mem.eql(u8, type_value, "gitlab") or std.mem.eql(u8, type_value, "sourcehut")) {
+        const owner = try requiredStringAttr(self, id, "owner");
         defer self.allocator.free(owner);
-        const repo = try requiredStringAttr(self, attrs.asObjectId(), "repo");
+        const repo = try requiredStringAttr(self, id, "repo");
         defer self.allocator.free(repo);
-        const ref = try optionalStringAttr(self, attrs.asObjectId(), "ref");
-        defer if (ref) |owned| self.allocator.free(owned);
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        defer out.deinit(self.allocator);
-        const base = if (ref) |branch|
-            try std.fmt.allocPrint(self.allocator, "github:{s}/{s}/{s}", .{ owner, repo, branch })
+        // A pinned `rev` (or else a `ref`) goes in the path segment, as Nix does.
+        const pin = (try optionalStringAttr(self, id, "rev")) orelse (try optionalStringAttr(self, id, "ref"));
+        defer if (pin) |seg| self.allocator.free(seg);
+        const head = if (pin) |seg|
+            try std.fmt.allocPrint(self.allocator, "{s}:{s}/{s}/{s}", .{ type_value, owner, repo, seg })
         else
-            try std.fmt.allocPrint(self.allocator, "github:{s}/{s}", .{ owner, repo });
-        defer self.allocator.free(base);
-        try out.appendSlice(self.allocator, base);
-        // Query params (Nix appends `dir` / `host` as `?key=val`).
-        var first_query = true;
-        try appendFlakeQueryString(self, attrs.asObjectId(), "host", &out, &first_query);
-        try appendFlakeQueryString(self, attrs.asObjectId(), "dir", &out, &first_query);
+            try std.fmt.allocPrint(self.allocator, "{s}:{s}/{s}", .{ type_value, owner, repo });
+        defer self.allocator.free(head);
+        try out.appendSlice(self.allocator, head);
+        var first = true;
+        try appendFlakeQueryStrings(self, id, &.{ "host", "dir", "narHash", "submodules" }, &out, &first);
         return Value.string(try self.intern.intern(out.items));
     }
 
     if (std.mem.eql(u8, type_value, "path")) {
-        const path = try requiredStringAttr(self, attrs.asObjectId(), "path");
+        const path = try requiredStringAttr(self, id, "path");
         defer self.allocator.free(path);
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        defer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, "path:");
         try out.appendSlice(self.allocator, path);
-        var first_query = true;
-        try appendFlakeQueryString(self, attrs.asObjectId(), "ref", &out, &first_query);
-        try appendFlakeQueryString(self, attrs.asObjectId(), "rev", &out, &first_query);
-        try appendFlakeQueryString(self, attrs.asObjectId(), "narHash", &out, &first_query);
+        var first = true;
+        try appendFlakeQueryStrings(self, id, &.{ "ref", "rev", "narHash", "dir" }, &out, &first);
+        return Value.string(try self.intern.intern(out.items));
+    }
+
+    // URL-backed types serialize as `<prefix><url>` + query. `tarball` uses a
+    // bare http(s) URL (Nix infers tarball from the scheme) and only prefixes
+    // when the scheme wouldn't round-trip.
+    const url_type: ?struct { prefix: []const u8, bare_http: bool } =
+        if (std.mem.eql(u8, type_value, "git")) .{ .prefix = "git+", .bare_http = false } else if (std.mem.eql(u8, type_value, "mercurial")) .{ .prefix = "hg+", .bare_http = false } else if (std.mem.eql(u8, type_value, "file")) .{ .prefix = "file+", .bare_http = false } else if (std.mem.eql(u8, type_value, "tarball")) .{ .prefix = "tarball+", .bare_http = true } else null;
+    if (url_type) |ut| {
+        const url = try requiredStringAttr(self, id, "url");
+        defer self.allocator.free(url);
+        const http = std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
+        if (!(ut.bare_http and http)) try out.appendSlice(self.allocator, ut.prefix);
+        try out.appendSlice(self.allocator, url);
+        var first = true;
+        try appendFlakeQueryStrings(self, id, &.{ "ref", "rev", "narHash", "dir", "host", "submodules", "shallow" }, &out, &first);
         return Value.string(try self.intern.intern(out.items));
     }
 
@@ -712,13 +795,18 @@ fn appendFlakeQueryAttrs(self: *VM, entries: *std.ArrayListUnmanaged(heap_mod.At
         const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
         const key = part[0..eq];
         const value = part[eq + 1 ..];
-        inline for (.{ "ref", "rev", "narHash", "dir", "host", "submodules" }) |known| {
+        inline for (.{ "ref", "rev", "narHash", "dir", "host", "submodules", "shallow", "lastModified", "revCount" }) |known| {
             if (std.mem.eql(u8, key, known)) {
                 try appendStringAttr(self, entries, key, value);
                 break;
             }
         }
     }
+}
+
+/// Append `?k1=v1&k2=v2` for each of `names` present on `attrs_id`, in order.
+fn appendFlakeQueryStrings(self: *VM, attrs_id: ObjectId, names: []const []const u8, out: *std.ArrayListUnmanaged(u8), first: *bool) !void {
+    for (names) |name| try appendFlakeQueryString(self, attrs_id, name, out, first);
 }
 
 fn appendFlakeQueryString(self: *VM, attrs_id: ObjectId, name: []const u8, out: *std.ArrayListUnmanaged(u8), first: *bool) !void {

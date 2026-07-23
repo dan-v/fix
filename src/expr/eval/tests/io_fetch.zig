@@ -564,21 +564,26 @@ test "parseFlakeRef rejects malformed refs" {
     try std.testing.expectError(error.InvalidFlakeRef, renderWithFlakes("builtins.parseFlakeRef \"\""));
 }
 
-test "flakeRefToString round-trips path refs and rejects unsupported types" {
-    const path_only = try renderWithFlakes("builtins.flakeRefToString { type = \"path\"; path = \"/tmp/source\"; }");
-    defer std.testing.allocator.free(path_only);
-    try std.testing.expectEqualStrings("\"path:/tmp/source\"", path_only);
+test "flakeRefToString serializes each ref type and its query params" {
+    const cases = [_]struct { expr: []const u8, want: []const u8 }{
+        .{ .expr = "{ type = \"path\"; path = \"/tmp/source\"; }", .want = "\"path:/tmp/source\"" },
+        .{ .expr = "{ type = \"path\"; path = \"/tmp/source\"; rev = \"abc\"; narHash = \"sha256-test\"; }", .want = "\"path:/tmp/source?rev=abc&narHash=sha256-test\"" },
+        // `rev` is preferred over `ref` in the forge path segment (pin fidelity).
+        .{ .expr = "{ type = \"github\"; owner = \"NixOS\"; repo = \"nixpkgs\"; rev = \"deadbeef\"; ref = \"main\"; }", .want = "\"github:NixOS/nixpkgs/deadbeef\"" },
+        .{ .expr = "{ type = \"github\"; owner = \"NixOS\"; repo = \"nixpkgs\"; ref = \"main\"; dir = \"sub\"; }", .want = "\"github:NixOS/nixpkgs/main?dir=sub\"" },
+        .{ .expr = "{ type = \"gitlab\"; owner = \"foo\"; repo = \"bar\"; }", .want = "\"gitlab:foo/bar\"" },
+        .{ .expr = "{ type = \"git\"; url = \"https://example.com/repo\"; ref = \"main\"; }", .want = "\"git+https://example.com/repo?ref=main\"" },
+        // A bare http(s) URL round-trips as a tarball with no `tarball+` prefix.
+        .{ .expr = "{ type = \"tarball\"; url = \"https://example.com/x.tar.gz\"; }", .want = "\"https://example.com/x.tar.gz\"" },
+    };
+    for (cases) |c| {
+        const expr = try std.fmt.allocPrint(std.testing.allocator, "builtins.flakeRefToString {s}", .{c.expr});
+        defer std.testing.allocator.free(expr);
+        const got = try renderWithFlakes(expr);
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
 
-    const path_with_query = try renderWithFlakes(
-        "builtins.flakeRefToString { type = \"path\"; path = \"/tmp/source\"; rev = \"abc\"; narHash = \"sha256-test\"; }",
-    );
-    defer std.testing.allocator.free(path_with_query);
-    try std.testing.expectEqualStrings("\"path:/tmp/source?rev=abc&narHash=sha256-test\"", path_with_query);
-
-    try std.testing.expectError(
-        error.InvalidFlakeRef,
-        renderWithFlakes("builtins.flakeRefToString { type = \"git\"; url = \"https://example.com/repo\"; }"),
-    );
     try std.testing.expectError(
         error.MissingAttribute,
         renderWithFlakes("builtins.flakeRefToString { type = \"github\"; owner = \"NixOS\"; }"),
@@ -649,6 +654,57 @@ test "evaluate getFlake builtin for local path ref" {
     try std.testing.expectEqualStrings(flake_dir, ev.intern.get(self_path.asInternId()));
 }
 
+test "getFlake ties self into the outputs fixpoint" {
+    // `self` must reference the flake's own outputs (self.packages, self.lib,
+    // …), not just the source-info fields — the fixpoint back-edge.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "flake.nix",
+        .data =
+        \\{
+        \\  outputs = { self, ... }: {
+        \\    base = 21;
+        \\    doubled = self.base * 2;
+        \\    packages.x = self.base + 1;
+        \\    viaOutputs = self.outputs.base;
+        \\    selfPath = self.outPath;
+        \\    viaSourceInfo = self.sourceInfo.outPath;
+        \\  };
+        \\}
+        ,
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const flake_dir = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(flake_dir);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    ev.policy.flakes_enabled = true;
+
+    const doubled = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").doubled", .{flake_dir});
+    defer std.testing.allocator.free(doubled);
+    const pkg = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").packages.x", .{flake_dir});
+    defer std.testing.allocator.free(pkg);
+    const via = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").viaOutputs", .{flake_dir});
+    defer std.testing.allocator.free(via);
+    const self_path = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").selfPath", .{flake_dir});
+    defer std.testing.allocator.free(self_path);
+    const via_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").viaSourceInfo", .{flake_dir});
+    defer std.testing.allocator.free(via_source);
+
+    try std.testing.expectEqual(@as(i64, 42), (try ev.evaluate(doubled)).asInt());
+    try std.testing.expectEqual(@as(i64, 22), (try ev.evaluate(pkg)).asInt());
+    try std.testing.expectEqual(@as(i64, 21), (try ev.evaluate(via)).asInt());
+    // `self.outPath` is the flake's source path, and `self.sourceInfo.outPath`
+    // is the same value — both reachable through the fixpoint.
+    try std.testing.expectEqualStrings(flake_dir, ev.intern.get((try ev.evaluate(self_path)).asInternId()));
+    try std.testing.expectEqualStrings(flake_dir, ev.intern.get((try ev.evaluate(via_source)).asInternId()));
+}
+
 test "getFlake resolves inputs from flake.lock (transitive + follows + diamond)" {
     // Three flakes: c (leaf), b (input c via a follows path), root (inputs b + c).
     // Exercises transitive resolution, `follows` arrays, and diamond memoization
@@ -711,7 +767,10 @@ test "getFlake resolves inputs from flake.nix when there is no lock" {
     defer std.testing.allocator.free(dir_r);
 
     try td.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = "{ outputs = i: { v = 55; }; }" });
-    const root_flake = try std.fmt.allocPrint(std.testing.allocator, "{{ inputs.dep.url = \"path:{s}\"; outputs = i: {{ x = i.dep.v; }}; }}", .{dir_d});
+    // `alias` has no url of its own — it `follows` the `dep` input, so
+    // `i.alias.v` must resolve to the same flake as `i.dep.v` (no fetch, no
+    // crash from the fetcher seeing a ref with no `type`).
+    const root_flake = try std.fmt.allocPrint(std.testing.allocator, "{{ inputs.dep.url = \"path:{s}\"; inputs.alias.follows = \"dep\"; outputs = i: {{ x = i.dep.v + i.alias.v; }}; }}", .{dir_d});
     defer std.testing.allocator.free(root_flake);
     try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = root_flake });
     // deliberately no flake.lock
@@ -723,7 +782,74 @@ test "getFlake resolves inputs from flake.nix when there is no lock" {
 
     const src = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").x", .{dir_r});
     defer std.testing.allocator.free(src);
-    try std.testing.expectEqual(@as(i64, 55), (try ev.evaluate(src)).asInt());
+    try std.testing.expectEqual(@as(i64, 110), (try ev.evaluate(src)).asInt());
+}
+
+test "getFlake rejects an unsupported flake.lock version" {
+    var tr = std.testing.tmpDir(.{});
+    defer tr.cleanup();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const dir_r = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tr.sub_path });
+    defer std.testing.allocator.free(dir_r);
+
+    try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = "{ outputs = i: { x = 1; }; }" });
+    try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.lock", .data = "{ \"nodes\": {\"root\":{}}, \"root\": \"root\", \"version\": 99 }" });
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    ev.policy.flakes_enabled = true;
+
+    const src = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").x", .{dir_r});
+    defer std.testing.allocator.free(src);
+    try std.testing.expectError(error.UnsupportedFlakeLockVersion, ev.evaluate(src));
+}
+
+test "pure evaluation sandboxes env, out-of-tree reads, search paths, and unlocked fetches" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "inside.txt", .data = "INSIDE" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const dir = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(dir);
+    const inside = try std.fs.path.join(std.testing.allocator, &.{ dir, "inside.txt" });
+    defer std.testing.allocator.free(inside);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    ev.policy.flakes_enabled = true;
+    ev.policy.fetch_tree_enabled = true;
+    // Pure eval, with `dir` as the single readable root besides the store.
+    try ev.setPureEval(true, &.{dir});
+
+    // getEnv is hidden.
+    const env = try ev.evaluate("builtins.getEnv \"HOME\"");
+    try std.testing.expectEqualStrings("", ev.intern.get(env.asInternId()));
+
+    // A read inside the allowed root succeeds; outside is forbidden.
+    const in_src = try std.fmt.allocPrint(std.testing.allocator, "builtins.readFile \"{s}\"", .{inside});
+    defer std.testing.allocator.free(in_src);
+    const in_val = try ev.evaluate(in_src);
+    try std.testing.expectEqualStrings("INSIDE", ev.intern.get(in_val.asInternId()));
+    try std.testing.expectError(error.RestrictedInPureEval, ev.evaluate("builtins.readFile \"/etc/hostname\""));
+
+    // Search-path lookups and unlocked fetches are forbidden.
+    try std.testing.expectError(error.RestrictedInPureEval, ev.evaluate("builtins.findFile builtins.nixPath \"nixpkgs\""));
+    try std.testing.expectError(
+        error.RestrictedInPureEval,
+        ev.evaluate("builtins.fetchTree { type = \"github\"; owner = \"o\"; repo = \"r\"; }"),
+    );
+
+    // `--impure` (pure_eval off) lifts the restriction: an out-of-tree read no
+    // longer fails *for purity reasons* (it may still fail to find the file).
+    try ev.setPureEval(false, &.{});
+    if (ev.evaluate("builtins.readFile \"/no/such/file/here\"")) |_| {} else |err| {
+        try std.testing.expect(err != error.RestrictedInPureEval);
+    }
 }
 
 test "flake builtins are gated on the flakes experimental feature" {

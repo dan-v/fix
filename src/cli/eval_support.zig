@@ -232,7 +232,7 @@ fn getSourceMode(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Op
     var base: Source = switch (source) {
         .expr => |text| .{ .text = text, .owned = false },
         .file => |path| try fileish.load(ev, io, path),
-        .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable), .owned = true },
+        .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable, options), .owned = true },
     };
 
     // If selector wrapping fails, `base` (owned flake text and/or file
@@ -308,7 +308,51 @@ fn applySelectors(ev: *Evaluator, base_text: []const u8, options: args.Options, 
 /// `getFlake`. The attrpath is dot-split into quoted selections, so component
 /// names may contain any character except `.`. The returned text is owned by
 /// the evaluator's host allocator and lives for the rest of the (one-shot) run.
-fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
+/// The output namespaces a flake fragment resolves against, per command. Nix's
+/// installable resolution is command-specific: `build` looks in `packages`,
+/// `eval` resolves the attr path from the flake root, etc.
+const FlakeProfile = struct {
+    /// System-scoped output sets tried in order (`<ns>.<system>.<attr>`).
+    namespaces: []const []const u8,
+    /// Try the flake root (`f.<attr>`) before the namespaces. `eval` does; the
+    /// derivation-building commands try their package set first.
+    root_first: bool,
+    /// Attr to resolve for an empty fragment (`.#`): the default output. null →
+    /// an empty fragment yields the whole flake (for `eval`).
+    default_attr: ?[]const u8,
+};
+
+fn flakeProfile(cmd: args.Cmd) FlakeProfile {
+    return switch (cmd) {
+        // devShells first for `shell` (a dev shell IS a derivation, so building
+        // it works); packages as the fallback for `fix shell nixpkgs#hello`.
+        .shell => .{ .namespaces = &.{ "devShells", "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },
+        // `run`'s app support (`apps.<sys>.x.program`) needs execution wiring
+        // beyond resolution, so it stays package-based for now.
+        .build, .run, .@"switch" => .{ .namespaces = &.{ "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },
+        // Value commands resolve the attr path from the flake root, as Nix's
+        // `nix eval .#a.b` does, with packages as a convenience fallback.
+        .eval, .parse, .instantiate, .repl, .disasm => .{ .namespaces = &.{ "packages", "legacyPackages" }, .root_first = true, .default_attr = null },
+    };
+}
+
+/// Emit one candidate selection: `f.<ns>.${s}<suffix>`, or `f<suffix>` at the
+/// flake root when `ns` is null. Candidates are `or`-chained so a miss at any
+/// selection level falls through to the next.
+fn appendFlakeCandidate(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, ns: ?[]const u8, suffix: []const u8) !void {
+    if (!first.*) try out.appendSlice(alloc, " or ");
+    first.* = false;
+    if (ns) |n| {
+        try out.appendSlice(alloc, "f.");
+        try out.appendSlice(alloc, n);
+        try out.appendSlice(alloc, ".${s}");
+    } else {
+        try out.appendSlice(alloc, "f");
+    }
+    try out.appendSlice(alloc, suffix);
+}
+
+fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8, options: args.Options) ![]const u8 {
     const alloc = ev.hostAllocator();
     const hash = std.mem.indexOfScalar(u8, installable, '#');
     const flake_ref = if (hash) |i| installable[0..i] else installable;
@@ -316,6 +360,18 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
 
     const resolved = try resolveFlakeRef(ev, flake_ref);
     defer if (resolved.owned) alloc.free(resolved.ref);
+
+    // Flake installables evaluate in pure mode (Nix's default); `--impure` opts
+    // out. A local-path flake's own source tree is readable besides the store.
+    const flake_dir: ?[]const u8 = if (std.mem.startsWith(u8, resolved.ref, "path:"))
+        resolved.ref["path:".len..]
+    else if (resolved.ref.len > 0 and resolved.ref[0] == '/')
+        resolved.ref
+    else
+        null;
+    try ev.setPureEval(!options.impure, if (flake_dir) |d| &.{d} else &.{});
+
+    const profile = flakeProfile(options.cmd);
 
     // Build the attr-select suffix (`."a"."b"`) from the fragment.
     var suffix: std.ArrayListUnmanaged(u8) = .empty;
@@ -325,26 +381,31 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    // No attr path: the whole flake.
+    // Empty fragment: the whole flake (for `eval`), or the default output (for
+    // the derivation-building commands — `.#` means `packages.<system>.default`).
     if (!has_attr) {
-        try out.appendSlice(alloc, "(builtins.getFlake \"");
-        try appendNixEscaped(alloc, &out, resolved.ref);
-        try out.appendSlice(alloc, "\")");
-        return out.toOwnedSlice(alloc);
+        if (profile.default_attr) |d| {
+            _ = try appendAttrPathSuffix(alloc, &suffix, d);
+        } else {
+            try out.appendSlice(alloc, "(builtins.getFlake \"");
+            try appendNixEscaped(alloc, &out, resolved.ref);
+            try out.appendSlice(alloc, "\")");
+            return out.toOwnedSlice(alloc);
+        }
     }
 
-    // With an attr path, try the `nix build`/`nix eval` installable prefixes —
-    // `packages.<system>.<attr>`, then `legacyPackages.<system>.<attr>` (for
-    // `nixpkgs#hello`), falling back to the literal `<attr>` (for flake outputs
-    // at top level). `or` catches a missing attr at any point in each path.
+    // The system is injected as a string literal (not `builtins.currentSystem`)
+    // so the lowered expression is valid under pure evaluation.
     try out.appendSlice(alloc, "(let f = builtins.getFlake \"");
     try appendNixEscaped(alloc, &out, resolved.ref);
-    try out.appendSlice(alloc, "\"; s = builtins.currentSystem; in f.packages.${s}");
-    try out.appendSlice(alloc, suffix.items);
-    try out.appendSlice(alloc, " or f.legacyPackages.${s}");
-    try out.appendSlice(alloc, suffix.items);
-    try out.appendSlice(alloc, " or f");
-    try out.appendSlice(alloc, suffix.items);
+    try out.appendSlice(alloc, "\"; s = \"");
+    try appendNixEscaped(alloc, &out, ev.systemName());
+    try out.appendSlice(alloc, "\"; in ");
+
+    var first = true;
+    if (profile.root_first) try appendFlakeCandidate(alloc, &out, &first, null, suffix.items);
+    for (profile.namespaces) |ns| try appendFlakeCandidate(alloc, &out, &first, ns, suffix.items);
+    if (!profile.root_first) try appendFlakeCandidate(alloc, &out, &first, null, suffix.items);
     try out.appendSlice(alloc, ")");
     return out.toOwnedSlice(alloc);
 }
@@ -368,7 +429,9 @@ pub fn lowerFlakeCompletion(ev: *Evaluator, flake_ref: []const u8, parent: []con
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, "(let f = builtins.getFlake \"");
     try appendNixEscaped(alloc, &out, resolved.ref);
-    try out.appendSlice(alloc, "\"; s = builtins.currentSystem; add = a: b: if builtins.isAttrs b then a // b else a; in add (add (add {} (f.packages.${s}");
+    try out.appendSlice(alloc, "\"; s = \"");
+    try appendNixEscaped(alloc, &out, ev.systemName());
+    try out.appendSlice(alloc, "\"; add = a: b: if builtins.isAttrs b then a // b else a; in add (add (add {} (f.packages.${s}");
     try out.appendSlice(alloc, suffix.items);
     try out.appendSlice(alloc, " or {})) (f.legacyPackages.${s}");
     try out.appendSlice(alloc, suffix.items);
@@ -444,4 +507,41 @@ test "completion auto-calls a top-level function with defaulted formals" {
     const value = try ev.evaluate(source.text);
     try std.testing.expect((try ev.attrPathValue(value, "answer")) != null);
     try std.testing.expect((try ev.attrPathValue(value, "hello")) != null);
+}
+
+test "flake installable lowering: profiles, default attr, literal system" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    const alloc = ev.hostAllocator();
+
+    // The system is injected as a string literal, never `builtins.currentSystem`
+    // (which pure eval forbids).
+    const build_hello = try lowerFlakeInstallable(&ev, "github:o/r#hello", .{ .cmd = .build });
+    defer alloc.free(build_hello);
+    try std.testing.expect(std.mem.indexOf(u8, build_hello, "builtins.currentSystem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, build_hello, ev.systemName()) != null);
+    // build tries the package sets before the flake root.
+    const p_idx = std.mem.indexOf(u8, build_hello, "f.packages.${s}").?;
+    const root_idx = std.mem.indexOf(u8, build_hello, " or f.\"hello\"").?;
+    try std.testing.expect(p_idx < root_idx);
+
+    // eval resolves the attr path from the flake root first.
+    const eval_x = try lowerFlakeInstallable(&ev, "github:o/r#a.b", .{ .cmd = .eval });
+    defer alloc.free(eval_x);
+    try std.testing.expect(std.mem.indexOf(u8, eval_x, "in f.\"a\".\"b\" or f.packages.${s}") != null);
+
+    // Empty fragment: default output for build, whole flake for eval.
+    const build_default = try lowerFlakeInstallable(&ev, "github:o/r", .{ .cmd = .build });
+    defer alloc.free(build_default);
+    try std.testing.expect(std.mem.indexOf(u8, build_default, "f.packages.${s}.\"default\"") != null);
+    const eval_whole = try lowerFlakeInstallable(&ev, "github:o/r", .{ .cmd = .eval });
+    defer alloc.free(eval_whole);
+    try std.testing.expectEqualStrings("(builtins.getFlake \"github:o/r\")", eval_whole);
+
+    // shell resolves devShells before packages.
+    const shell_x = try lowerFlakeInstallable(&ev, "github:o/r#dev", .{ .cmd = .shell });
+    defer alloc.free(shell_x);
+    const dev_idx = std.mem.indexOf(u8, shell_x, "f.devShells.${s}").?;
+    const pkg_idx = std.mem.indexOf(u8, shell_x, "f.packages.${s}").?;
+    try std.testing.expect(dev_idx < pkg_idx);
 }

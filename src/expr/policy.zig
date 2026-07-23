@@ -67,6 +67,14 @@ pub const LanguagePolicy = struct {
     allow_cr_line_endings: bool = false,
     allow_tokens_no_whitespace: bool = false,
     allow_nix_path_shadow: bool = false,
+    /// Pure evaluation mode (Nix's default for flake commands, `--impure` to
+    /// disable). Restricts impure builtins: `getEnv` → "", `<...>`/NIX_PATH and
+    /// out-of-tree filesystem reads are forbidden, and fetches must be
+    /// content-locked. See `vm/builtins/purity.zig`.
+    pure_eval: bool = false,
+    /// Extra filesystem roots readable under `pure_eval` (besides the store):
+    /// the flake's own source tree(s). Borrowed; owned by the Evaluator.
+    allowed_path_roots: []const []const u8 = &.{},
 
     pub fn applyFeatureSets(
         self: *LanguagePolicy,

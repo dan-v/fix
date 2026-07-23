@@ -509,7 +509,7 @@ fn buildNixPathValue(intern: *InternTable, heap: *ObjectHeap, nix_path: []const 
     return Value.list(try heap.addList(values));
 }
 
-fn hostSystemName() []const u8 {
+pub fn hostSystemName() []const u8 {
     return switch (builtin.target.os.tag) {
         .linux => switch (builtin.target.cpu.arch) {
             .x86_64 => "x86_64-linux",

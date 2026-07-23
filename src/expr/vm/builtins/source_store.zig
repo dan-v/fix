@@ -26,6 +26,8 @@ const stringTextInternId = strings.stringTextInternId;
 
 pub fn builtinGetEnv(self: *VM, name_arg: Value) !Value {
     const name = try stringArg(self, name_arg);
+    // Pure eval hides the process environment (Nix returns "" for every var).
+    if (self.policy.pure_eval) return Value.string(try self.intern.intern(""));
     const host = self.import_host orelse return Value.string(try self.intern.intern(""));
     const value = try host.get_env(host.context, name);
     return Value.string(try self.intern.intern(value));

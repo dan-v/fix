@@ -125,6 +125,10 @@ pub const CompletionOption = struct {
 pub const SwitchTarget = enum { nixos, darwin, home_manager };
 
 pub const Options = struct {
+    /// Which subcommand these options belong to. Set by `parse`; used to pick
+    /// the flake-installable resolution profile (which output namespaces a
+    /// fragment resolves against).
+    cmd: Cmd = .eval,
     output: OutputFormat = .nix,
     strict: bool = false,
     /// Legacy `nix-instantiate --eval --read-write-mode`: permit evaluation to
@@ -136,6 +140,10 @@ pub const Options = struct {
     /// compatibility (Nix's `nix-instantiate --eval --xml --no-location`) and
     /// is effectively a no-op — the output already matches Nix's no-location form.
     no_location: bool = false,
+    /// `--impure`: disable pure evaluation. Flake installables evaluate in pure
+    /// mode by default (getEnv hidden, out-of-tree reads and unlocked fetches
+    /// forbidden); this opts back out.
+    impure: bool = false,
     experimental_features: ExperimentalFeatures = .{},
     /// True once `--experimental-features` (the replace form) has been seen on
     /// the CLI. It overrides the `nix.conf` base entirely; without it the config
@@ -319,6 +327,7 @@ const Opt = enum {
     strict,
     read_write_mode,
     no_location,
+    impure,
     // Settings / features.
     experimental_features,
     extra_experimental_features,
@@ -482,6 +491,7 @@ const specs = [_]Spec{
     .{ .id = .no_location, .long = "--no-location", .help = "omit source positions from --xml output", .show_in = value_cmds },
     .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing", .show_in = value_cmds },
     .{ .id = .read_write_mode, .long = "--read-write-mode", .help = "allow eval to register derivations and sources in\nthe store", .show_in = &.{.eval} },
+    .{ .id = .impure, .long = "--impure", .help = "disable pure evaluation for flake installables\n(allow env, out-of-tree reads, unlocked fetches)", .show_in = selected_source_cmds },
 
     .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)", .completion_help = "replace enabled experimental features", .complete = .{ .experimental_feature, .none } },
     .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set", .complete = .{ .experimental_feature, .none } },
@@ -764,7 +774,7 @@ fn writeFishEscaped(w: *std.Io.Writer, text: []const u8) !void {
 // ---------------------------------------------------------------------------
 
 pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, first: ?[:0]const u8, cmd: Cmd) !Options {
-    var options: Options = .{};
+    var options: Options = .{ .cmd = cmd };
     errdefer options.deinit(allocator);
 
     var carried = first;
@@ -882,6 +892,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .raw => options.output = .raw,
         .xml => options.output = .xml,
         .no_location => options.no_location = true,
+        .impure => options.impure = true,
         .strict => options.strict = true,
         .read_write_mode => options.read_write_mode = true,
 

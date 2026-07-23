@@ -136,6 +136,27 @@ Prefix a special-looking local filename with `./` to disambiguate it. These
 are source inputs and can be mixed freely; `--flake`, by contrast, is the
 explicit typed flake-output/installable form.
 
+A `--flake <flakeref>[#<attr>]` fragment resolves against the outputs the
+command cares about: `build`/`run`/`switch` try `packages.<system>.<attr>` then
+`legacyPackages.<system>.<attr>`; `shell` tries `devShells.<system>.<attr>`
+first; `eval` (and the other value commands) resolve `<attr>` from the flake
+root first. An empty fragment (`--flake .#`) selects the `default` output for
+the derivation-building commands, or the whole flake for `eval`. The system is
+resolved once (from the host) and baked in, so lowering never depends on
+`builtins.currentSystem`. (`nix run` app outputs and `nix switch`
+`nixosConfigurations` are not yet resolved as such — both stay package-based.)
+
+**Pure evaluation.** A `--flake` installable evaluates in *pure mode* by default
+(matching Nix's flake commands): `builtins.getEnv` returns `""`, filesystem
+reads are confined to the store and the flake's own source tree, `<...>` /
+`NIX_PATH` search-path lookups are rejected, and `builtins.fetchTree` /
+`fetchGit` / `fetchTarball` / `fetchurl` / `fetchMercurial` must be
+content-locked (a `narHash` / `rev` / `sha256`). Pass `--impure` to lift all of
+these. Plain expression/file inputs (`-E`, a path) are impure as before. (Not
+yet restricted in pure mode: `builtins.currentSystem` / `currentTime` — a
+baked-in constant that would need a force-time guard — and lockless flake-input
+fetches, which pair with lockfile computation.)
+
 ### Evaluation / output
 
 | Flag | Meaning |
@@ -144,6 +165,7 @@ explicit typed flake-output/installable form.
 | `--raw` | (`eval`) coerce to a string and write it without quotes or a trailing newline |
 | `--strict` | recursively force attr values + list items before writing |
 | `--read-write-mode` | (`eval`) register evaluated derivations and store-backed fetched sources while still printing the evaluated value |
+| `--impure` | disable pure evaluation for `--flake` installables (see below). Restores `builtins.getEnv`, out-of-tree filesystem reads, `<...>`/`NIX_PATH` lookups, and unlocked fetches |
 | `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call; `flakes` — gates the flake builtins (`getFlake`, `parseFlakeRef`, `flakeRefToString`) and the `--flake` installable, and implies `fetch-tree`. All off by default; a disabled builtin raises a hard (tryEval-uncatchable) error. |
 | `--deprecated-features FEATS` / `--extra-deprecated-features FEATS` | replace / append compatibility features. Available: `nul-bytes`, `floor-ceil-corrupt-integers`. |
 | `--workers N` | worker threads; default `min(12, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |

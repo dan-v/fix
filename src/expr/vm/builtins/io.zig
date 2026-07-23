@@ -11,6 +11,7 @@ const path_ops = @import("runtime").paths;
 const FileCache = @import("store").FileCache;
 const strings = @import("strings.zig");
 const fetch = @import("fetch.zig");
+const purity = @import("purity.zig");
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
 const vm_trace = @import("../trace.zig");
@@ -63,6 +64,9 @@ pub fn demandPathArg(self: *VM, arg: Value) ![]const u8 {
     const value = try vm_strings.stringLikeValue(self, forced);
     vm_force.rootKeep(self, value);
     const path = self.intern.get(try vm_strings.stringTextInternId(self, value));
+
+    // Pure eval confines filesystem reads to the store and the flake source.
+    try purity.enforceReadPath(self, path);
 
     if (!isStorePath(path, self.realization.store_dir)) return path;
     // Deliberately uncached: recording a pre-build false in FileCache would
@@ -250,6 +254,10 @@ pub fn builtinFindFile(self: *VM, search_path_arg: Value, name_arg: Value) !Valu
     // `nix/fetchurl.nix`, is an error unless `nix-path-shadow` is enabled (in
     // which case a matching prefixless entry wins over the corepkgs default).
     const is_corepkgs = std.mem.eql(u8, name, "nix/fetchurl.nix");
+
+    // Pure eval forbids `<...>` / NIX_PATH lookups, except the synthetic
+    // `<nix/fetchurl.nix>` corepkgs file (not a real search-path entry).
+    if (!is_corepkgs) try purity.enforceNoSearchPath(self);
 
     const path_id = try self.intern.intern("path");
     const prefix_id = try self.intern.intern("prefix");
