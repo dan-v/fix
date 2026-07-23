@@ -79,7 +79,8 @@ pub fn builtinBreak(self: *VM, arg: Value) !Value {
 
 pub fn builtinTrace(self: *VM, message_arg: Value, value_arg: Value) !Value {
     const message = try effect_message.render(self, try vm_force.forceValue(self, message_arg));
-    try emitLanguageEffect(self, .trace, message);
+    defer message.deinit(self.allocator);
+    try emitLanguageEffect(self, .trace, message.text);
     return vm_force.forceValue(self, value_arg);
 }
 
@@ -92,7 +93,8 @@ pub fn builtinTraceVerbose(self: *VM, message_arg: Value, value_arg: Value) !Val
         return vm_force.forceValue(self, value_arg);
     }
     const message = try effect_message.render(self, try vm_force.forceValue(self, message_arg));
-    try emitLanguageEffect(self, .trace, message);
+    defer message.deinit(self.allocator);
+    try emitLanguageEffect(self, .trace, message.text);
     return vm_force.forceValue(self, value_arg);
 }
 
@@ -101,7 +103,8 @@ pub fn builtinTraceVerbose(self: *VM, message_arg: Value, value_arg: Value) !Val
 /// string, matching Nix.
 pub fn builtinWarn(self: *VM, message_arg: Value, value_arg: Value) !Value {
     const message = try effect_message.sanitizeString(self, try strings.stringArg(self, message_arg));
-    try emitLanguageEffect(self, .warning, message);
+    defer message.deinit(self.allocator);
+    try emitLanguageEffect(self, .warning, message.text);
     return vm_force.forceValue(self, value_arg);
 }
 

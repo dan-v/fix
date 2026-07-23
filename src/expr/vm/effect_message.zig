@@ -12,21 +12,54 @@ const ObjectId = @import("runtime").types.ObjectId;
 const FutureState = @import("runtime").future.FutureState;
 const terminal_text = @import("base").terminal_text;
 
-pub fn render(self: *VM, forced: Value) ![]const u8 {
+/// A rendered effect message. `text` is either borrowed (an interned string
+/// that needed no sanitizing) or a prefix of `owned`; call `deinit` once the
+/// effect has been emitted. Messages are never interned: they are consumed
+/// synchronously by the sink or copied by the speculation journal, so keeping
+/// them in the intern table would only grow it without dedup benefit.
+pub const Message = struct {
+    text: []const u8,
+    owned: ?[]u8 = null,
+
+    pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
+        if (self.owned) |buf| allocator.free(buf);
+    }
+};
+
+pub fn render(self: *VM, forced: Value) !Message {
+    // Fast path: a root string-like value renders as its raw text, so when the
+    // text is already terminal-safe the interned bytes can be borrowed
+    // directly — no render buffer, no copy, no intern.
+    const text_id = switch (forced.kind()) {
+        .string, .path => forced.asInternId(),
+        .string_context => (try self.heap.getContextString(forced.asObjectId())).text,
+        else => null,
+    };
+    if (text_id) |id| return sanitizeString(self, self.intern.get(id));
+
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(self.allocator);
     try writeValue(self, &out.writer, forced, true, &seen);
     const owned = try out.toOwnedSlice();
-    defer self.allocator.free(owned);
-    return self.intern.get(try self.intern.intern(terminal_text.stripAnsiInPlace(owned)));
+    return .{ .text = terminal_text.stripAnsiInPlace(owned), .owned = owned };
 }
 
-pub fn sanitizeString(self: *VM, raw: []const u8) ![]const u8 {
+pub fn sanitizeString(self: *VM, raw: []const u8) !Message {
+    if (!needsSanitize(raw)) return .{ .text = raw };
     const copy = try self.allocator.dupe(u8, raw);
-    defer self.allocator.free(copy);
-    return self.intern.get(try self.intern.intern(terminal_text.stripAnsiInPlace(copy)));
+    return .{ .text = terminal_text.stripAnsiInPlace(copy), .owned = copy };
+}
+
+/// Mirrors the byte classes `stripAnsiInPlace` removes: ESC, C0 controls
+/// other than `\n` and `\t`, and DEL. Clean text strips to itself and can be
+/// borrowed instead of copied.
+fn needsSanitize(text: []const u8) bool {
+    for (text) |c| {
+        if (c == 0x1b or c == 0x7f or (c < 0x20 and c != '\n' and c != '\t')) return true;
+    }
+    return false;
 }
 
 fn writeValue(
