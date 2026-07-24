@@ -759,6 +759,34 @@ pub fn report(state: *const ReportState, budget_bytes: u64) void {
         std.debug.print("(no collection — eval stayed under the threshold)\n", .{});
 }
 
+test "gc census excludes object TLAB tails discarded at arming" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+
+    // Two real objects. The first allocation reserves a whole object-slot
+    // chunk from the store, of which only these two slots are ever filled.
+    _ = try heap.addList(&.{Value.int(1)});
+    _ = try heap.addAttrs(&.{});
+    const reserved = heap.objects.count();
+    try std.testing.expect(reserved > 2); // a full chunk was reserved
+
+    // Arming discards the partially-used object TLAB; its reserved-but-unfilled
+    // tail is zeroed memory that decodes as the object union's tag-0 variant,
+    // an empty `[ ]`. The census must exclude it, not report ~chunk-many
+    // phantom empty lists.
+    heap_collector.armTracking(&heap);
+    try std.testing.expect(heap.discarded_object_tails.items.len == 1);
+
+    const stats = heap.stats();
+    try std.testing.expectEqual(@as(u32, 1), stats.variant_counts[0]); // the one real list
+    try std.testing.expectEqual(@as(u32, 1), stats.variant_counts[1]); // the one real attrs
+
+    var snap = try heap.objectSnapshot(allocator);
+    defer snap.deinit();
+    try std.testing.expectEqual(@as(u32, 2), snap.live_count);
+}
+
 test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses them" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);

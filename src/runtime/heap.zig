@@ -768,6 +768,13 @@ pub const ObjectHeap = struct {
     /// keep the old fresh-allocation behavior.
     empty_list_id: ?ObjectId = null,
     empty_attrs_id: ?ObjectId = null,
+    /// Object-slot `[start, end)` ranges reserved into a worker TLAB but
+    /// discarded (never filled) when `armTracking` reset the TLABs at GC
+    /// arming. They sit below the tracking floor — pinned, never reused — so
+    /// the heap census (`stats`, `objectSnapshot`, `usage`) must exclude them;
+    /// otherwise their zeroed memory reads as live empty `[ ]` (the object
+    /// union's tag-0 variant). See `discardObjectTLABs`.
+    discarded_object_tails: std.ArrayListUnmanaged([2]ObjectId) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
         var objects = try ObjectStore.init();
@@ -798,6 +805,7 @@ pub const ObjectHeap = struct {
 
     pub fn deinit(self: *ObjectHeap) void {
         self.freeErroredInfos();
+        self.discarded_object_tails.deinit(self.allocator);
         self.allocator.free(self.collection.alloc_bits);
         self.allocator.free(self.collection.old_bits);
         for (self.worker_locals) |*l| l.deinit(self.allocator);
@@ -836,6 +844,36 @@ pub const ObjectHeap = struct {
         attrs: u32,
         attr_positions: u32,
     };
+
+    /// Append the discarded-TLAB tails to an object-store `SkipSet` (from
+    /// `collectUnfilled(.object)`) so slot scans skip their zeroed payload.
+    /// Both lists are bounded by worker count, so the fixed `SkipSet` capacity
+    /// is never a constraint in practice; excess is dropped defensively.
+    fn addDiscardedObjectTails(self: *const ObjectHeap, set: *SkipSet) void {
+        for (self.discarded_object_tails.items) |r| {
+            if (set.len >= set.starts.len) break;
+            set.starts[set.len] = r[0];
+            set.ends[set.len] = r[1];
+            set.len += 1;
+        }
+    }
+
+    /// Discard every worker's partially-used object TLAB at GC arming: the
+    /// reserved ids below the new tracking boundary must not be handed out
+    /// again (so subsequent allocations enter the young-slot lists). Record
+    /// each discarded `[cursor, end)` tail first — those slots stay reserved
+    /// but forever unfilled, and `stats`/`objectSnapshot` must exclude them or
+    /// they masquerade as live empty lists. Called at STW by `armTracking`.
+    pub fn discardObjectTLABs(self: *ObjectHeap) void {
+        for (self.worker_locals) |*l| {
+            if (l.object.end > l.object.cursor) {
+                const start = ObjectStore.globalIdOf(l.object.segment, l.object.cursor);
+                const end = ObjectStore.globalIdOf(l.object.segment, l.object.end);
+                self.discarded_object_tails.append(self.allocator, .{ start, end }) catch {};
+            }
+            l.object = .{};
+        }
+    }
 
     /// Bitset snapshot of currently filled object slots. The explorer keeps
     /// one bit per slot and discovers rows lazily.
@@ -884,6 +922,10 @@ pub const ObjectHeap = struct {
         const unfilled = self.collectUnfilled(.object);
         for (unfilled.starts[0..unfilled.len], unfilled.ends[0..unfilled.len]) |start, end| {
             clearSnapshotRange(bits, start, @min(end, high_water));
+        }
+        // Object TLAB tails discarded at GC arming: reserved, never filled.
+        for (self.discarded_object_tails.items) |r| {
+            clearSnapshotRange(bits, r[0], @min(r[1], high_water));
         }
         for (self.worker_locals) |*local| {
             for (local.gc_free_objects.items) |id| clearSnapshotBit(bits, id);
@@ -1086,7 +1128,8 @@ pub const ObjectHeap = struct {
         // but fill them one at a time. Slots between `cursor` and `end`
         // are reserved but unfilled — their payload is undefined memory.
         // Build per-store skip sets so the scans below don't read garbage.
-        const obj_skip = self.collectUnfilled(.object);
+        var obj_skip = self.collectUnfilled(.object);
+        self.addDiscardedObjectTails(&obj_skip);
         const val_skip = self.collectUnfilled(.value);
         const attr_skip = self.collectUnfilled(.attr);
 
@@ -1183,7 +1226,8 @@ pub const ObjectHeap = struct {
             errored: u64 = 0,
         };
         var cells: [2]Cell = @splat(.{}); // [0]=demand-created, [1]=spec-created
-        const obj_skip = self.collectUnfilled(.object);
+        var obj_skip = self.collectUnfilled(.object);
+        self.addDiscardedObjectTails(&obj_skip);
         var id: u32 = 0;
         const total = self.objects.count();
         scan: while (id < total) : (id += 1) {
@@ -1245,7 +1289,8 @@ pub const ObjectHeap = struct {
         };
         var buckets: [bucket_lo.len]Bucket = @splat(.{});
         var merge_attrs_n: u64 = 0;
-        const obj_skip = self.collectUnfilled(.object);
+        var obj_skip = self.collectUnfilled(.object);
+        self.addDiscardedObjectTails(&obj_skip);
         var id: u32 = 0;
         const total = self.objects.count();
         scan: while (id < total) : (id += 1) {
