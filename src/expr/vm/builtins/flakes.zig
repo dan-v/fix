@@ -213,6 +213,7 @@ pub fn builtinGetFlake(self: *VM, arg: Value) !Value {
     vm_force.rootKeep(self, source_info);
     const out_path = try requiredStringAttr(self, source_info.asObjectId(), "outPath");
     defer self.allocator.free(out_path);
+    try ensureFlakeSourceOnDisk(self, out_path);
     // Subflake: `?dir=sub` puts flake.nix (and flake.lock) in a subdirectory.
     const dir = try optionalStringAttr(self, parsed.asObjectId(), "dir");
     defer if (dir) |d| self.allocator.free(d);
@@ -259,6 +260,19 @@ fn resolveCwdRelative(self: *VM, ref: []const u8) ![]u8 {
     const cwd = try std.process.currentPathAlloc(io, self.allocator);
     defer self.allocator.free(cwd);
     return std.fs.path.resolve(self.allocator, &.{ cwd, ref });
+}
+
+/// Under store writes, a fetched flake's `outPath` is a store path whose NAR is
+/// only *recorded* (writes are demand-driven), so it isn't on disk yet. Reading
+/// `flake.nix`/`flake.lock` from it — or resolving inputs — needs it
+/// materialized first; force the write here (a source path has no dependencies,
+/// so this is just its own NAR). No-op in plain eval, where `outPath` is the
+/// readable cache path.
+fn ensureFlakeSourceOnDisk(self: *VM, out_path: []const u8) !void {
+    if (!self.realization.storeWritesEnabled()) return;
+    const store_dir = self.realization.store_dir;
+    if (!std.mem.startsWith(u8, out_path, store_dir)) return;
+    try self.realization.ensureClosure(out_path);
 }
 
 /// Import + force the flake.nix attrset at `<out_path>[/dir]`.
@@ -608,6 +622,7 @@ fn lockInput(gen: *LockGen, name: []const u8, decl: Value, override: ?Value, dep
     if (is_flake) {
         const out_path = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
         defer self.allocator.free(out_path);
+        try ensureFlakeSourceOnDisk(self, out_path);
         const sub_dir = try optionalStringAttr(self, ref_attrs.asObjectId(), "dir");
         defer if (sub_dir) |d| self.allocator.free(d);
         if (importFlakeValue(self, out_path, sub_dir)) |child_flake| {
@@ -756,6 +771,7 @@ pub fn resolveFlakeNode(self: *VM, ref_attrs: Value, sub_inputs: Value, is_flake
 
     const src_out = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
     defer self.allocator.free(src_out);
+    try ensureFlakeSourceOnDisk(self, src_out);
     const dir = try optionalStringAttr(self, ref_attrs.asObjectId(), "dir");
     defer if (dir) |d| self.allocator.free(d);
     const fnix_path = if (dir) |d|
