@@ -74,7 +74,9 @@ fi
 
 # The automation frontend remains line-oriented while exercising the same
 # entry stop, deferred import stepping, pending breakpoints, and logical stack.
-out=$(printf ':d (import ./test/imported.nix).value\nbreak test/imported.nix:1\nbreakpoints\ns\nbt\nfinish\nc\n' |
+# Crossing the import boundary takes two steps: push_const -> the import `call`,
+# then a step into the imported chunk (where the pending breakpoint resolves).
+out=$(printf ':d (import ./test/imported.nix).value\nbreak test/imported.nix:1\nbreakpoints\ns\ns\nbt\nfinish\nc\n' |
     "$FIX" repl --bare --color=never 2>&1)
 t "bare debug: native entry" "-- debugger #1 (entry) --" "$out"
 t "bare debug: pending import breakpoint" "test/imported.nix:1 (pending)" "$out"
@@ -174,6 +176,8 @@ out=$(
         sleep 0.6
         printf 's'
         sleep 0.5
+        printf 's'
+        sleep 0.5
         printf 'c'
         sleep 0.4
         printf '\004'
@@ -182,7 +186,8 @@ out=$(
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
 t "tty debug: opens integrated screen" "fix debug · pause 1 · entry" "$out"
-t "tty debug: import step stays in screen" "fix debug · pause 2 · step · imported.nix" "$out"
+# Two steps to cross into the import (pause 2 is still the <repl> `call`).
+t "tty debug: import step stays in screen" "fix debug · pause 3 · step · imported.nix" "$out"
 debug_enters=$(grep -o $'\x1b\[?1049h' <<<"$out" | wc -l)
 debug_leaves=$(grep -o $'\x1b\[?1049l' <<<"$out" | wc -l)
 if ((debug_enters == 1 && debug_leaves == 1)); then
