@@ -347,7 +347,7 @@ const warning_kinds = [_]struct { keys: []const []const u8 }{
     .{ .keys = &.{"line endings are not supported"} }, // cr-line-endings
 };
 
-fn warningKinds(text: []const u8) u32 {
+pub fn warningKinds(text: []const u8) u32 {
     var mask: u32 = 0;
     for (warning_kinds, 0..) |wk, bit| {
         for (wk.keys) |k| {

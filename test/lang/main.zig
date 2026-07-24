@@ -8,6 +8,7 @@ const proc = @import("proc.zig");
 const fsx = @import("fsx.zig");
 const snix = @import("snix.zig");
 const lix = @import("lix.zig");
+const lix_custom = @import("lix_custom.zig");
 const Result = @import("result.zig").Result;
 
 const Options = struct {
@@ -98,10 +99,14 @@ fn runLix(arena: std.mem.Allocator, base: snix.Ctx, repo: []const u8, progress: 
         leaf.end();
         node.completeOne();
     }
-    if (disc.custom_dirs.len > 0)
-        std.debug.print("[lix] note: {d} python-backed dir(s) not yet ported (skipped): ", .{disc.custom_dirs.len});
-    for (disc.custom_dirs) |d| std.debug.print("{s} ", .{d});
-    if (disc.custom_dirs.len > 0) std.debug.print("\n", .{});
+    for (disc.custom_dirs) |d| {
+        const leaf = node.start(d, 0);
+        const rs = lix_custom.run(ctx, d, arena) catch |e|
+            &[_]Result{Result.fail("lix", d, @errorName(e))};
+        try results.appendSlice(arena, rs);
+        leaf.end();
+        node.completeOne();
+    }
     return report("lix", results.items);
 }
 
