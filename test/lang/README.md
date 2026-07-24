@@ -14,16 +14,16 @@ visible instead of being papered over. `fix` currently passes both pinned suites
 ## Running
 
 ```sh
-zig build test-lang                      # both suites against zig-out/bin/fix
-zig build test-lang -- --suite lix -v    # one suite, with expected/actual diffs
-bash test/lang/run.sh --suite snix       # snix only
-bash test/lang/run-unit.sh               # inventory / no-skip / false-green unit tests
+zig build test-lang                    # both suites against zig-out/bin/fix
+zig build test-lang -- --suite lix     # one suite
+zig build test-lang -- --suite snix    # snix only
 ```
 
-Hard requirements: **Nix** (to resolve the pinned corpora) and a **python3 with
-pyyaml** — the wrapper borrows one from `nix-shell -p python3
-python3Packages.pyyaml` when none is on `PATH`. pyyaml normalizes `fix parse
---json` output the way the Lix lang-runner does.
+The runner is a self-contained Zig program (`test/lang/*.zig`, built by the
+`test-lang` step). Its only hard requirement is **Nix**, to resolve the pinned
+corpora. It reads pyyaml's block-YAML goldens directly (`yaml.zig`) and compares
+each `parse-okay` AST to `fix parse --json` *structurally* — no python or pyyaml
+dependency.
 
 ## Status model
 
@@ -52,11 +52,11 @@ with `npins update lix snix`.
 
 - **Lix** — `tests/functional2/lang/`. 211 declarative `eval-okay`/`eval-fail`
   cases (`fix eval --strict`), 67 declarative `parse-*` cases (`fix parse
-  --json`, JSON→YAML normalized vs the golden; `parse-fail` is attempted but a
-  visible fail), and the 7 python-backed custom dirs (79 cases:
+  --json`, AST compared structurally against the golden; `parse-fail` is
+  attempted but a visible fail), and 7 custom-adapter dirs (79 cases:
   `builtins.getEnv`/`pathExists`/`readDir`/`readFileType`/`err_context` = 1 each,
-  `parser-token-whitespace` = 68, `search-path` = 6), driven as explicit fix
-  adapters using the upstream fixtures/goldens.
+  `parser-token-whitespace` = 68, `search-path` = 6; see `lix_custom.zig`),
+  driven as explicit fix adapters using the upstream fixtures/goldens.
 - **snix** — `contrib/nix-language-test-suite/`, an explicitly
   cross-implementation suite (116 `.kdl` cases; `meta.kdl` is docs). `.nix` input
   + `.kdl` descriptor + `.exp` (golden value) or `.err` (an error *kind*, matched
@@ -64,12 +64,11 @@ with `npins update lix snix`.
 
 ## Inventory guard
 
-`run-unit.sh` runs unittest-style tests that independently re-scan the corpora
-and assert the counts (211 eval, 67 parse, 79 custom = 1/1/1/1/1/68/6, 116 snix),
-that discovery omits nothing, that the false-green sites stay closed (eval-fail
-requires `rc == 1`, missing goldens fail, unsupported flags/features fail), and
-that `blocked` does not fail the build while any other non-pass status does. A
-pin bump that changes an inventory count or adds an unrecognised case fails these.
+Discovery (`lix.zig`, `snix.zig`) attempts every case and does not carry a
+known-failures list, so drift shows up rather than hiding: a missing input or
+golden makes the case a visible `FAIL`, and a python-backed dir the adapter
+dispatch (`lix_custom.zig`) does not recognise is reported as a `FAIL` (pin
+drift) instead of being dropped.
 
 ## Scope / caveats
 

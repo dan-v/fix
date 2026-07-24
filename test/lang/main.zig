@@ -1,7 +1,9 @@
 //! Differential language-conformance runner: drives the pinned Lix + snix
-//! corpora through `fix` and diffs against the reference goldens. A Zig port of
-//! test/lang/run.py (dropping the python dependency). This slice implements the
-//! snix suite end to end; the lix suite is being ported next.
+//! corpora through `fix` and diffs against the reference goldens. A self-
+//! contained Zig program (no python/pyyaml dependency) — `zig build test-lang`.
+//! Lix declarative cases live in lix.zig, the custom adapters in lix_custom.zig,
+//! the snix suite in snix.zig; yaml.zig reads the pyyaml goldens for structural
+//! AST comparison.
 
 const std = @import("std");
 const proc = @import("proc.zig");
