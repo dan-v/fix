@@ -197,7 +197,12 @@ pub fn builtinFlakeRefToStringEntry(self: *VM, arg: Value) !Value {
 
 pub fn builtinGetFlake(self: *VM, arg: Value) !Value {
     const ref = try stringArg(self, arg);
-    const ref_value = Value.string(try self.intern.intern(ref));
+    // A relative path ref (`.`, `./x`, `../x`) resolves against the process CWD,
+    // as Nix does for an impure relative flakeref. Absolute paths and scheme
+    // refs pass through unchanged.
+    const abs_ref: ?[]u8 = if (isRelativePathRef(ref)) try resolveCwdRelative(self, ref) else null;
+    defer if (abs_ref) |r| self.allocator.free(r);
+    const ref_value = Value.string(try self.intern.intern(abs_ref orelse ref));
     // GC: many intermediate flake values are held live across fetches / output
     // forces that can collect. Root everything created here until we return.
     const gc_roots = vm_force.rootsBegin(self);
@@ -244,6 +249,18 @@ pub fn builtinGetFlake(self: *VM, arg: Value) !Value {
     return result;
 }
 
+fn isRelativePathRef(ref: []const u8) bool {
+    return std.mem.eql(u8, ref, ".") or std.mem.startsWith(u8, ref, "./") or std.mem.startsWith(u8, ref, "../");
+}
+
+/// Resolve a relative path ref to an absolute one against the process CWD.
+fn resolveCwdRelative(self: *VM, ref: []const u8) ![]u8 {
+    const io = self.files.io orelse return error.FileIoUnavailable;
+    const cwd = try std.process.currentPathAlloc(io, self.allocator);
+    defer self.allocator.free(cwd);
+    return std.fs.path.resolve(self.allocator, &.{ cwd, ref });
+}
+
 /// Import + force the flake.nix attrset at `<out_path>[/dir]`.
 fn importFlakeValue(self: *VM, out_path: []const u8, dir: ?[]const u8) !Value {
     const flake_path = if (dir) |d|
@@ -260,7 +277,11 @@ fn importFlakeValue(self: *VM, out_path: []const u8, dir: ?[]const u8) !Value {
 /// The (forced) `outputs` function of an imported flake attrset.
 fn flakeOutputs(self: *VM, flake_value: Value) !Value {
     const outputs_id = try self.intern.intern("outputs");
-    return vm_force.forceValue(self, try self.heap.getAttrValue(flake_value.asObjectId(), outputs_id));
+    const outputs = (try self.heap.getAttrValueOpt(flake_value.asObjectId(), outputs_id)) orelse {
+        try vm_trace.setErrorMessage(self, "flake has no 'outputs' attribute (flake.nix must define `outputs`)");
+        return error.InvalidFlake;
+    };
+    return vm_force.forceValue(self, outputs);
 }
 
 /// Import the flake.nix at `<out_path>[/dir]` and return its (forced) `outputs`.
