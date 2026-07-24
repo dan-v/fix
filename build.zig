@@ -296,6 +296,31 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_lang.addArgs(args);
     lang_step.dependOn(&run_lang.step);
 
+    // Bench-fixture differential correctness: evaluate every bench/workloads
+    // fixture under fix and a reference Nix and compare (NOT a timing run — it
+    // reuses the fixtures to confirm agreement). Needs Nix + the pinned nixpkgs.
+    // e.g. `zig build test-bench-fixtures -- torture`.
+    const bench_check_step = b.step("test-bench-fixtures", "Differentially check bench fixtures: fix vs reference Nix");
+    const bench_check_exe = b.addExecutable(.{
+        .name = "bench-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/bench_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .use_llvm = true,
+    });
+    const run_bench_check = b.addRunArtifact(bench_check_exe);
+    run_bench_check.step.dependOn(b.getInstallStep());
+    run_bench_check.has_side_effects = true;
+    run_bench_check.addArg("--repo");
+    run_bench_check.addArg(b.pathFromRoot("."));
+    run_bench_check.addArg("--fix");
+    run_bench_check.addArg(b.pathFromRoot("zig-out/bin/fix"));
+    if (b.args) |args| run_bench_check.addArgs(args);
+    bench_check_step.dependOn(&run_bench_check.step);
+
     // End-to-end CLI suites (test/e2e/): drive the freshly built `fix` through
     // behavioral checks (repl pipe+PTY contract, `fix flake` subcommands, ...).
     // Adding coverage is dropping a `test/e2e/<name>.sh` fragment. Pipe-mode

@@ -9,6 +9,12 @@ The benchmark harness has three independent suites:
 - `json`: wide result trees evaluated and serialized as JSON, including
   Determinate Nix and fix scaling rows.
 
+These fixtures are also reused for a *correctness* check, separate from the
+timing harness: `zig build test-bench-fixtures` evaluates every workload under
+`fix` and a reference Nix (`--eval --strict --json`) and compares the results
+structurally, so a divergence on any fixture is a visible failure. Filter with
+e.g. `zig build test-bench-fixtures -- torture`.
+
 Build the contained harness and run one or more suites:
 
 ```console
