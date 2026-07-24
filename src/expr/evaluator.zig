@@ -1929,6 +1929,15 @@ pub const Evaluator = struct {
         return if (forced.isInt()) forced.asInt() else null;
     }
 
+    /// Compute and write `flake.lock` for `ref` as a first-class operation
+    /// (`fix flake update`/`lock`) — no `outputs` evaluation. `update_all`
+    /// re-pins every input; otherwise only `update_names` (and newly-declared
+    /// inputs) are re-fetched and the rest keep their current pins.
+    pub fn updateFlakeLock(self: *Evaluator, ref: []const u8, update_all: bool, update_names: []const []const u8) !void {
+        if (!self.policy.flakes_enabled) return error.FlakesFeatureRequired;
+        return self.runWithVm(vm_builtins.computeFlakeLock, .{ ref, update_all, update_names });
+    }
+
     pub fn forceDeep(self: *Evaluator, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "strict result" } });
         defer observation.cancel();

@@ -176,12 +176,14 @@ defaults to `.`. All subcommands require the `flakes` feature.
 | `metadata` | print the flake's resolved path, locked `narHash`, description, revision, last-modified time, and declared inputs |
 | `show` | print the outputs as a tree (`packages`/`apps`/`devShells`/`checks` per system; `nixosConfigurations`, `overlays`, `templates`, … flat) |
 | `check` | evaluate every output and report the ones that fail (non-zero exit on any failure) |
-| `lock` | create `flake.lock` if it is missing (keeps an existing lock) |
-| `update` | re-pin `flake.lock` to the latest inputs (backs up and restores the old lock if the recompute fails) |
+| `lock` | complete `flake.lock` for the cwd flake — add missing inputs, keep every existing pin |
+| `update [inputs…]` | re-pin the cwd flake's lock: all inputs, or only the named ones (the rest keep their current pins) |
 
-`update`/`lock` need a local flake (a path ref). Lock (re)generation reuses the
-same path as ordinary evaluation — `getFlake` writes the lock when the flake has
-inputs and its directory is writable.
+`update`/`lock` are a first-class lock operation (`Evaluator.updateFlakeLock`):
+they fetch the inputs and (re)write `flake.lock` directly, without evaluating
+`outputs`. Untouched inputs are copied forward from the existing lock, so
+`flake update nixpkgs` re-pins only `nixpkgs`. `getFlake`'s auto-lock-on-first-
+eval is just the "pin everything" caller of the same machinery.
 
 ### Evaluation / output
 

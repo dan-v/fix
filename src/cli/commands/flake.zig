@@ -17,14 +17,15 @@ pub const synopsis =
     \\usage: fix flake <subcommand> [flakeref] [options]
     \\
     \\subcommands:
-    \\  metadata   show the flake's source info, revision, and inputs
-    \\  show       show the flake's outputs as a tree
-    \\  check      evaluate every output and report failures
-    \\  update     re-pin the lock file to the latest inputs
-    \\  lock       create the lock file if it is missing
+    \\  metadata [flakeref]   show the flake's source info, revision, and inputs
+    \\  show     [flakeref]   show the flake's outputs as a tree
+    \\  check    [flakeref]   evaluate every output and report failures
+    \\  update   [inputs...]  re-pin the cwd flake's lock (all inputs, or the
+    \\                        named ones; the rest keep their current pins)
+    \\  lock                  complete the cwd flake's lock without re-pinning
     \\
-    \\the flakeref defaults to `.` (the current directory). requires the flakes
-    \\experimental feature.
+    \\metadata/show/check take a flakeref (default `.`); update/lock act on the
+    \\current directory. requires the flakes experimental feature.
 ;
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
@@ -57,8 +58,6 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
     defer options.deinit(allocator);
 
-    const flakeref = flakeRefOf(options);
-
     var ev = try Evaluator.init(allocator, try setup.workerCount(options));
     defer ev.deinit();
     _ = try setup.configure(&ev, init, options);
@@ -67,11 +66,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         return 2;
     }
 
-    if (std.mem.eql(u8, sub, "metadata")) return metadata(&ev, init.io, allocator, flakeref);
-    if (std.mem.eql(u8, sub, "show")) return show(&ev, init.io, allocator, flakeref);
-    if (std.mem.eql(u8, sub, "check")) return check(&ev, init.io, allocator, flakeref);
-    if (std.mem.eql(u8, sub, "update")) return update(&ev, init.io, allocator, flakeref, true);
-    if (std.mem.eql(u8, sub, "lock")) return update(&ev, init.io, allocator, flakeref, false);
+    if (std.mem.eql(u8, sub, "metadata")) return metadata(&ev, init.io, allocator, flakeRefOf(options));
+    if (std.mem.eql(u8, sub, "show")) return show(&ev, init.io, allocator, flakeRefOf(options));
+    if (std.mem.eql(u8, sub, "check")) return check(&ev, init.io, allocator, flakeRefOf(options));
+    // update/lock operate on the cwd flake; positionals are input names.
+    if (std.mem.eql(u8, sub, "update")) return lockCmd(&ev, init.io, allocator, options, true);
+    if (std.mem.eql(u8, sub, "lock")) return lockCmd(&ev, init.io, allocator, options, false);
 
     std.debug.print("error: unknown flake subcommand '{s}'\n\n{s}\n", .{ sub, synopsis });
     return 2;
@@ -323,47 +323,36 @@ fn reportCheckFailure(out: *std.Io.Writer, category: []const u8, system: ?[]cons
 
 // ---- update / lock --------------------------------------------------------
 
-fn update(ev: *Evaluator, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8, force: bool) !u8 {
-    const dir = localFlakeDir(allocator, io, flakeref) orelse {
-        std.debug.print("error: `flake {s}` needs a local flake (got '{s}')\n", .{ if (force) "update" else "lock", flakeref });
-        return 2;
+/// `flake update [inputs…]` / `flake lock` — compute and write the lock of the
+/// cwd flake as a first-class operation (`Evaluator.updateFlakeLock`), NOT a
+/// side effect of evaluating outputs. `update` with no inputs re-pins
+/// everything; `update x y` re-pins only x and y; `lock` just completes a
+/// missing lock, keeping existing pins.
+fn lockCmd(ev: *Evaluator, io: std.Io, allocator: std.mem.Allocator, options: args.Options, is_update: bool) !u8 {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer names.deinit(allocator);
+    for (options.sources.items) |src| switch (src) {
+        .file => |p| try names.append(allocator, p),
+        .expr => |e| try names.append(allocator, e),
+        .flake => |f| try names.append(allocator, f),
+    };
+
+    // Resolve the cwd flake to an absolute path (parseFlakeRef needs it).
+    const dir = std.process.currentPathAlloc(io, allocator) catch |err| {
+        std.debug.print("error: resolving current directory: {s}\n", .{@errorName(err)});
+        return 1;
     };
     defer allocator.free(dir);
-    const lock_path = try std.fs.path.join(allocator, &.{ dir, "flake.lock" });
-    defer allocator.free(lock_path);
 
-    // `update` re-pins to latest: back up and remove the existing lock so
-    // getFlake's no-lock path recomputes it. `lock` keeps an existing lock.
-    var backup: ?[]u8 = null;
-    defer if (backup) |b| allocator.free(b);
-    if (force) {
-        backup = std.Io.Dir.cwd().readFileAlloc(io, lock_path, allocator, .limited(1 << 24)) catch null;
-        if (backup != null) std.Io.Dir.cwd().deleteFile(io, lock_path) catch {};
-    }
+    // `lock` never re-pins existing inputs (it only completes the lock);
+    // `update` re-pins all inputs, or just the named ones.
+    const update_all = is_update and names.items.len == 0;
+    const update_names: []const []const u8 = if (is_update) names.items else &.{};
 
-    _ = evalFlake(ev, allocator, flakeref) catch |err| {
-        // Restore the previous lock so a failed relock doesn't lose it.
-        if (backup) |b| std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lock_path, .data = b }) catch {};
-        return printEvalError(err);
+    ev.updateFlakeLock(dir, update_all, update_names) catch |err| {
+        std.debug.print("error: {s} lock: {s}\n", .{ if (is_update) "update" else "lock", @errorName(err) });
+        return 1;
     };
-
-    // getFlake writes the lock during eval — but only when the flake has inputs.
-    if (std.Io.Dir.cwd().access(io, lock_path, .{})) |_| {
-        std.debug.print("{s} lock file: {s}\n", .{ if (force) "updated" else "wrote", lock_path });
-    } else |_| {
-        std.debug.print("flake has no inputs; no lock file needed\n", .{});
-    }
+    std.debug.print("{s} flake.lock\n", .{if (is_update) "updated" else "wrote"});
     return 0;
-}
-
-/// The local directory of a flakeref, or null for a remote/scheme ref.
-fn localFlakeDir(allocator: std.mem.Allocator, io: std.Io, flakeref: []const u8) ?[]u8 {
-    if (std.mem.startsWith(u8, flakeref, "path:")) return allocator.dupe(u8, flakeref["path:".len..]) catch null;
-    if (flakeref.len > 0 and flakeref[0] == '/') return allocator.dupe(u8, flakeref) catch null;
-    if (std.mem.eql(u8, flakeref, ".") or std.mem.startsWith(u8, flakeref, "./") or std.mem.startsWith(u8, flakeref, "../")) {
-        const cwd = std.process.currentPathAlloc(io, allocator) catch return null;
-        defer allocator.free(cwd);
-        return std.fs.path.resolve(allocator, &.{ cwd, flakeref }) catch null;
-    }
-    return null;
 }

@@ -4,6 +4,8 @@
 # NOTE: runs the binary — hold the perf compute lock when invoking.
 set -u
 FIX=${1:-zig-out/bin/fix}
+# Absolute so `cd`-ing into a temp flake dir (for update/lock) still finds it.
+FIX=$(cd "$(dirname "$FIX")" && pwd)/$(basename "$FIX")
 FF="--extra-experimental-features flakes --impure"
 fails=0
 t() { # t <name> <expected-substring> <actual>
@@ -58,24 +60,49 @@ code=$?
 t "check: reports failure" "FAIL packages.x86_64-linux.broken" "$out"
 if [[ $code -ne 0 ]]; then echo "ok   check: nonzero exit on failure"; else echo "FAIL check: exit was 0"; fails=$((fails+1)); fi
 
-# --- lock (creates flake.lock) ----------------------------------------------
-rm -f "$root/flake.lock"
-out=$($FIX flake lock $FF "$root" 2>&1)
-t "lock: reports written" "wrote lock file" "$out"
-if [[ -f "$root/flake.lock" ]]; then echo "ok   lock: flake.lock exists"; else echo "FAIL lock: no flake.lock"; fails=$((fails+1)); fi
+# --- lock / update operate on the cwd flake; positionals are input names ----
+# Fresh two-input root so partial updates are observable.
+a=$(mktemp -d); b=$(mktemp -d); r2=$(mktemp -d)
+trap 'rm -rf "$sub" "$root" "$a" "$b" "$r2"' EXIT
+echo '{ outputs = i: { v = 1; }; }' > "$a/flake.nix"
+echo '{ outputs = i: { v = 2; }; }' > "$b/flake.nix"
+cat > "$r2/flake.nix" <<EOF
+{ inputs.a.url = "path:$a"; inputs.b.url = "path:$b"; outputs = i: { x = 1; }; }
+EOF
+hashes() { grep -o '"narHash":"[^"]*"' "$r2/flake.lock" | tr '\n' ' '; }
+anode() { grep -A3 "\"$1\":" "$r2/flake.lock" | grep -o '"narHash":"[^"]*"' | head -1; }
 
-# --- update (re-pins; preserves a valid lock on success) --------------------
-out=$($FIX flake update $FF "$root" 2>&1)
-t "update: reports updated" "updated lock file" "$out"
-if [[ -f "$root/flake.lock" ]]; then echo "ok   update: flake.lock present"; else echo "FAIL update: lost flake.lock"; fails=$((fails+1)); fi
+out=$(cd "$r2" && $FIX flake lock $FF 2>&1)
+t "lock: reports written" "wrote flake.lock" "$out"
+if [[ -f "$r2/flake.lock" ]]; then echo "ok   lock: flake.lock exists"; else echo "FAIL lock: no flake.lock"; fails=$((fails+1)); fi
+a0=$(anode a); b0=$(anode b)
+
+# Change input a, then update ONLY a: a re-pins, b stays.
+echo '{ outputs = i: { v = 999; }; }' > "$a/flake.nix"
+out=$(cd "$r2" && $FIX flake update a $FF 2>&1)
+t "update a: reports updated" "updated flake.lock" "$out"
+a1=$(anode a); b1=$(anode b)
+if [[ "$a0" != "$a1" ]]; then echo "ok   update a: a re-pinned"; else echo "FAIL update a: a unchanged"; fails=$((fails+1)); fi
+if [[ "$b0" == "$b1" ]]; then echo "ok   update a: b left frozen"; else echo "FAIL update a: b changed"; fails=$((fails+1)); fi
+
+# update (no args) re-pins everything.
+echo '{ outputs = i: { v = 3; }; }' > "$b/flake.nix"
+out=$(cd "$r2" && $FIX flake update $FF 2>&1)
+b2=$(anode b)
+if [[ "$b1" != "$b2" ]]; then echo "ok   update (all): b re-pinned"; else echo "FAIL update (all): b unchanged"; fails=$((fails+1)); fi
+
+# lock completes a missing input without touching existing pins.
+a2=$(anode a); b3=$(anode b)
+cat > "$r2/flake.nix" <<EOF
+{ inputs.a.url = "path:$a"; inputs.b.url = "path:$b"; inputs.c.url = "path:$sub"; outputs = i: { x = 1; }; }
+EOF
+out=$(cd "$r2" && $FIX flake lock $FF 2>&1)
+if grep -q '"c":' "$r2/flake.lock"; then echo "ok   lock: added new input c"; else echo "FAIL lock: c not added"; fails=$((fails+1)); fi
+if [[ "$a2" == "$(anode a)" && "$b3" == "$(anode b)" ]]; then echo "ok   lock: existing pins untouched"; else echo "FAIL lock: existing pins changed"; fails=$((fails+1)); fi
 
 # --- errors -----------------------------------------------------------------
 out=$($FIX flake bogus 2>&1)
 t "unknown subcommand" "unknown flake subcommand 'bogus'" "$out"
-out=$($FIX flake metadata github:NixOS/nonesuch --extra-experimental-features flakes 2>&1 || true)
-# update/lock on a remote ref is rejected as non-local.
-out=$($FIX flake update $FF github:owner/repo 2>&1 || true)
-t "update: rejects remote ref" "needs a local flake" "$out"
 
 echo
 if [[ $fails -eq 0 ]]; then echo "all flake e2e checks passed"; else echo "$fails flake e2e check(s) failed"; fi

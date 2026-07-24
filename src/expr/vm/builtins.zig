@@ -27,6 +27,7 @@ const prof = @import("../probe.zig").prof;
 pub const writeJsonValue = serial.writeJsonValue;
 pub const writeLazyXmlValue = serial.writeLazyXmlValue;
 pub const demandPathArg = io.demandPathArg;
+pub const computeFlakeLock = flakes.computeFlakeLock;
 
 pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
     const t = prof.startBuiltin(builtin_id);

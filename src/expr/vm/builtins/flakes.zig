@@ -460,6 +460,14 @@ const LockGen = struct {
     by_locked: std.StringHashMapUnmanaged([]const u8) = .empty, // serialized locked → node key
     names: std.StringHashMapUnmanaged(u32) = .empty, // base name → next disambiguator
 
+    // Merge context (`flake update`/`lock`): an existing lock whose untouched
+    // root inputs are copied forward rather than re-fetched. Null → pin all.
+    existing_nodes: ?std.json.ObjectMap = null,
+    existing_root: []const u8 = "root",
+    update_all: bool = true, // re-pin every root input
+    update_names: []const []const u8 = &.{}, // …or only these
+    imported: std.StringHashMapUnmanaged([]const u8) = .empty, // existing node name → new key
+
     /// A node key that is unique in the graph: the input name, or `name_N`.
     fn uniqueKey(self: *LockGen, name: []const u8) ![]const u8 {
         const gop = try self.names.getOrPut(self.arena, name);
@@ -470,6 +478,25 @@ const LockGen = struct {
         const n = gop.value_ptr.*;
         gop.value_ptr.* = n + 1;
         return std.fmt.allocPrint(self.arena, "{s}_{d}", .{ name, n });
+    }
+
+    /// The existing lock's root-node `inputs` map, or null when there is no
+    /// reusable lock.
+    fn existingRootInputs(self: *LockGen) ?std.json.ObjectMap {
+        const nodes = self.existing_nodes orelse return null;
+        const root = nodes.get(self.existing_root) orelse return null;
+        if (root != .object) return null;
+        const inputs = root.object.get("inputs") orelse return null;
+        return if (inputs == .object) inputs.object else null;
+    }
+
+    /// Whether root input `name` must be re-fetched (vs. copied from the existing
+    /// lock): when there's no lock, `update` was asked for it, or it's new.
+    fn shouldRepin(self: *LockGen, name: []const u8) bool {
+        if (self.update_all) return true;
+        for (self.update_names) |n| if (std.mem.eql(u8, n, name)) return true;
+        const root_inputs = self.existingRootInputs() orelse return true;
+        return root_inputs.get(name) == null; // a newly-declared input has no pin yet
     }
 };
 
@@ -640,6 +667,82 @@ fn lockInput(gen: *LockGen, name: []const u8, decl: Value, override: ?Value, dep
     return .{ .name = name, .node_key = key };
 }
 
+/// Convert a parsed lock JSON value into a `JVal`, preserving object key order.
+fn jsonToJVal(gen: *LockGen, v: std.json.Value) anyerror!JVal {
+    return switch (v) {
+        .string => |s| .{ .string = try gen.arena.dupe(u8, s) },
+        .integer => |n| .{ .integer = n },
+        .float => |f| .{ .integer = @intFromFloat(f) },
+        .bool => |b| .{ .boolean = b },
+        .array => |arr| blk: {
+            var items: std.ArrayListUnmanaged(JVal) = .empty;
+            for (arr.items) |item| try items.append(gen.arena, try jsonToJVal(gen, item));
+            break :blk .{ .array = items.items };
+        },
+        .object => |obj| blk: {
+            var fields: std.ArrayListUnmanaged(JField) = .empty;
+            var it = obj.iterator();
+            while (it.next()) |e| try fields.append(gen.arena, .{ .key = try gen.arena.dupe(u8, e.key_ptr.*), .val = try jsonToJVal(gen, e.value_ptr.*) });
+            break :blk .{ .object = fields.items };
+        },
+        else => .{ .string = "" }, // null / number_string don't appear in a lock node
+    };
+}
+
+/// Copy an existing-lock input edge (a node-name string, or a follows path) into
+/// the new graph, importing the referenced node subtree.
+fn importExistingEdge(gen: *LockGen, name: []const u8, edge: std.json.Value) anyerror!LockEdge {
+    switch (edge) {
+        .string => |node_name| return .{ .name = name, .node_key = try importExistingNode(gen, node_name) },
+        .array => |arr| {
+            var segs: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (arr.items) |seg| if (seg == .string) try segs.append(gen.arena, try gen.arena.dupe(u8, seg.string));
+            return .{ .name = name, .follows = segs.items };
+        },
+        else => return error.InvalidFlakeLock,
+    }
+}
+
+/// Import an existing-lock node (and its subtree) into the new graph, keeping
+/// its pin. Deduplicates against already-present nodes by locked identity.
+fn importExistingNode(gen: *LockGen, node_name: []const u8) anyerror![]const u8 {
+    if (gen.imported.get(node_name)) |k| return k;
+    const nodes = gen.existing_nodes orelse return error.InvalidFlakeLock;
+    const node_v = nodes.get(node_name) orelse return error.InvalidFlakeLock;
+    if (node_v != .object) return error.InvalidFlakeLock;
+    const node = node_v.object;
+    const locked = try jsonToJVal(gen, node.get("locked") orelse return error.InvalidFlakeLock);
+
+    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+    try writeLockJson(&key_buf, gen.arena, locked);
+    if (gen.by_locked.get(key_buf.items)) |k| {
+        try gen.imported.put(gen.arena, try gen.arena.dupe(u8, node_name), k);
+        return k;
+    }
+
+    const key = try gen.uniqueKey(node_name);
+    try gen.by_locked.put(gen.arena, key_buf.items, key);
+    try gen.imported.put(gen.arena, try gen.arena.dupe(u8, node_name), key);
+    const node_index = gen.nodes.items.len;
+    const is_flake = switch (node.get("flake") orelse std.json.Value{ .bool = true }) {
+        .bool => |b| b,
+        else => true,
+    };
+    try gen.nodes.append(gen.arena, .{
+        .key = key,
+        .locked = locked,
+        .original = if (node.get("original")) |o| try jsonToJVal(gen, o) else locked,
+        .is_flake = is_flake,
+    });
+    if (node.get("inputs")) |ins| if (ins == .object) {
+        var edges: std.ArrayListUnmanaged(LockEdge) = .empty;
+        var it = ins.object.iterator();
+        while (it.next()) |e| try edges.append(gen.arena, try importExistingEdge(gen, try gen.arena.dupe(u8, e.key_ptr.*), e.value_ptr.*));
+        gen.nodes.items[node_index].inputs = edges.items;
+    };
+    return key;
+}
+
 /// Whether `v` looks like a concrete input ref (a string/path, or an attrset
 /// with `url`/`type`) as opposed to a bare `{ follows = …; }` / overrides map.
 fn refLike(self: *VM, v: Value) bool {
@@ -673,6 +776,16 @@ fn lockFlakeInputs(gen: *LockGen, flake_value: Value, overrides: ?Value, depth: 
 
     for (try self.heap.getAttrs(inputs.asObjectId())) |entry| {
         const name = self.intern.get(entry.name);
+        // At the root, an input the user didn't ask to update keeps its existing
+        // pin: copy the old node subtree instead of re-fetching.
+        if (depth == 0 and !gen.shouldRepin(name)) {
+            if (gen.existingRootInputs()) |root_inputs| {
+                if (root_inputs.get(name)) |edge| {
+                    try edges.append(gen.arena, try importExistingEdge(gen, try gen.arena.dupe(u8, name), edge));
+                    continue;
+                }
+            }
+        }
         const decl = try vm_force.forceValue(self, entry.value);
         const override = if (overrides) |o| (if (o.isAttrs()) try self.heap.getAttrValueOpt(o.asObjectId(), entry.name) else null) else null;
         const forced_override = if (override) |ov| try vm_force.forceValue(self, ov) else null;
@@ -724,32 +837,93 @@ fn writeEdges(gen: *LockGen, out: *std.ArrayListUnmanaged(u8), edges: []const Lo
     try appendFmt(out, a, "\n{s}}}", .{indent});
 }
 
-/// Compute a `flake.lock` for a flake with inputs but no lock, write it back
-/// when the directory is writable, and resolve the root inputs from it. Returns
-/// false when the flake declares no inputs (caller then has nothing to do).
-fn generateAndUseLock(self: *VM, flake_value: Value, out_path: []const u8, dir: ?[]const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !bool {
-    // Nothing to lock if there are no declared inputs.
-    const inputs_v = (self.heap.getAttrValueOpt(flake_value.asObjectId(), try self.intern.intern("inputs")) catch return false) orelse return false;
+/// `<out_path>[/dir]/flake.lock`, owned by `self.allocator`.
+fn flakeLockPath(self: *VM, out_path: []const u8, dir: ?[]const u8) ![]u8 {
+    return if (dir) |d|
+        std.fs.path.join(self.allocator, &.{ out_path, d, "flake.lock" })
+    else
+        std.fs.path.join(self.allocator, &.{ out_path, "flake.lock" });
+}
+
+/// The forced `inputs` attrset of a flake, or null when it declares none.
+fn flakeInputsAttrs(self: *VM, flake_value: Value) !?Value {
+    const inputs_v = (self.heap.getAttrValueOpt(flake_value.asObjectId(), try self.intern.intern("inputs")) catch return null) orelse return null;
     const inputs = try vm_force.forceValue(self, inputs_v);
-    if (!inputs.isAttrs() or (try self.heap.getAttrs(inputs.asObjectId())).len == 0) return false;
+    if (!inputs.isAttrs() or (try self.heap.getAttrs(inputs.asObjectId())).len == 0) return null;
+    return inputs;
+}
+
+/// getFlake's no-lock branch: compute a lock (pin every input), write it when
+/// the tree is writable, and resolve the root inputs from it. Returns false when
+/// the flake declares no inputs. This is the "generate all" caller of the same
+/// lock machinery `computeFlakeLock` (flake update/lock) uses.
+fn generateAndUseLock(self: *VM, flake_value: Value, out_path: []const u8, dir: ?[]const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !bool {
+    if ((try flakeInputsAttrs(self, flake_value)) == null) return false;
 
     var arena_state = std.heap.ArenaAllocator.init(self.allocator);
     defer arena_state.deinit();
     var gen = LockGen{ .vm = self, .arena = arena_state.allocator() };
-    const root_edges = try lockFlakeInputs(&gen, flake_value, null, 0);
-    const lock_json = try serializeLock(&gen, root_edges);
+    const lock_json = try serializeLock(&gen, try lockFlakeInputs(&gen, flake_value, null, 0));
 
     // Persist next to flake.nix when writable (a store path / read-only tree is
     // left alone — the in-memory lock is still used for this evaluation).
-    const lock_path = if (dir) |d|
-        try std.fs.path.join(self.allocator, &.{ out_path, d, "flake.lock" })
-    else
-        try std.fs.path.join(self.allocator, &.{ out_path, "flake.lock" });
+    const lock_path = try flakeLockPath(self, out_path, dir);
     defer self.allocator.free(lock_path);
     self.files.writeFile(lock_path, lock_json) catch {};
 
     try resolveInputsFromLockData(self, lock_json, out_entries);
     return true;
+}
+
+/// Compute and write `flake.lock` as a standalone operation — `fix flake
+/// update`/`lock`. Fetches the flake and its inputs and pins them, but does NOT
+/// evaluate `outputs`. `update_all` re-pins every input; otherwise only the
+/// inputs named in `update_names` (and any newly-declared ones) are re-fetched,
+/// with the rest copied forward from the current lock.
+pub fn computeFlakeLock(self: *VM, ref: []const u8, update_all: bool, update_names: []const []const u8) !void {
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+
+    const parsed_ref = try builtinParseFlakeRef(self, Value.string(try self.intern.intern(ref)));
+    vm_force.rootKeep(self, parsed_ref);
+    const src_info = try builtinFetchTree(self, parsed_ref);
+    vm_force.rootKeep(self, src_info);
+    const out_path = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
+    defer self.allocator.free(out_path);
+    try ensureFlakeSourceOnDisk(self, out_path);
+    const dir = try optionalStringAttr(self, parsed_ref.asObjectId(), "dir");
+    defer if (dir) |d| self.allocator.free(d);
+    const flake_value = try importFlakeValue(self, out_path, dir);
+    vm_force.rootKeep(self, flake_value);
+    if ((try flakeInputsAttrs(self, flake_value)) == null) return; // nothing to lock
+
+    const lock_path = try flakeLockPath(self, out_path, dir);
+    defer self.allocator.free(lock_path);
+
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+
+    // The existing lock (if any) is the merge base; its parse tree must outlive
+    // the generator, which references its node objects for untouched inputs.
+    var parsed_lock: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_lock) |p| p.deinit();
+    var gen = LockGen{ .vm = self, .arena = arena_state.allocator(), .update_all = update_all, .update_names = update_names };
+    if (self.files.readFile(lock_path)) |data| {
+        if (std.json.parseFromSlice(std.json.Value, self.allocator, data, .{})) |p| {
+            parsed_lock = p;
+            if (p.value == .object) {
+                if (p.value.object.get("nodes")) |n| {
+                    if (n == .object) gen.existing_nodes = n.object;
+                }
+                if (p.value.object.get("root")) |r| {
+                    if (r == .string) gen.existing_root = r.string;
+                }
+            }
+        } else |_| {}
+    } else |_| {}
+
+    const lock_json = try serializeLock(&gen, try lockFlakeInputs(&gen, flake_value, null, 0));
+    try self.files.writeFile(lock_path, lock_json);
 }
 
 /// Internal builtin backing a lazy flake input (`inputs.<name>`): forced only
