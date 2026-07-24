@@ -241,6 +241,45 @@ test "object heap supports empty lists and empty attrs" {
     try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 1));
 }
 
+test "empty lists and attrs are interned to shared singletons after bootstrap" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    // Before bootstrap: every empty construction allocates a fresh slot, so
+    // direct-heap unit tests keep their old object identities.
+    const pre_list = try heap.addList(&.{});
+    const pre_attrs = try heap.addAttrs(&.{});
+    try std.testing.expect(pre_list != try heap.addList(&.{}));
+    try std.testing.expect(pre_attrs != try heap.addAttrs(&.{}));
+
+    try heap.ensureEmptySingletons();
+    try std.testing.expect(heap.empty_list_id != null);
+    try std.testing.expect(heap.empty_attrs_id != null);
+
+    // After bootstrap every empty (across all construction paths) collapses to
+    // the one shared id, and it still reads back as an empty container.
+    const a = try heap.addList(&.{});
+    const b = try heap.addList(&.{});
+    try std.testing.expectEqual(heap.empty_list_id.?, a);
+    try std.testing.expectEqual(a, b);
+    try std.testing.expectEqual(@as(usize, 0), try heap.getListLen(a));
+
+    const p = try heap.addAttrs(&.{});
+    const q = try heap.addAttrsSorted(&.{});
+    const r = try heap.addAttrsFromValuesSorted(&.{}, &.{}, &.{});
+    const s = try heap.addAttrsFromStackPairs(&.{});
+    try std.testing.expectEqual(heap.empty_attrs_id.?, p);
+    try std.testing.expectEqual(p, q);
+    try std.testing.expectEqual(p, r);
+    try std.testing.expectEqual(p, s);
+    try std.testing.expectEqual(@as(usize, 0), (try heap.getAttrs(p)).len);
+
+    // Bootstrapping again is a no-op — the ids are stable.
+    const list_before = heap.empty_list_id.?;
+    try heap.ensureEmptySingletons();
+    try std.testing.expectEqual(list_before, heap.empty_list_id.?);
+}
+
 test "object heap supports a single-entry attrs object" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();

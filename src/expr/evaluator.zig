@@ -2380,6 +2380,10 @@ pub const Evaluator = struct {
 
     fn ensureBuiltins(self: *Evaluator) !Value {
         if (self.builtins_value) |value| return value;
+        // Create the shared `[]`/`{}` singletons as the heap's first objects,
+        // before builtins allocate and before any worker arms the GC — so they
+        // land below `bootstrap_end` and stay pinned for the eval's lifetime.
+        try self.heap.ensureEmptySingletons();
         const nix_path = try self.sources.search_paths.toNixPath(self.allocator);
         defer self.allocator.free(nix_path);
         const value = try builtins.buildAttrSet(&self.intern, &self.heap, nix_path);

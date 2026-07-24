@@ -754,6 +754,20 @@ pub const ObjectHeap = struct {
     token: u64,
     /// Collection policy, barriers, bitmaps, and parallel minor-sweep state.
     collection: HeapCollectionState,
+    /// Shared immutable singletons for `[]` and `{}`: every empty list/attrs
+    /// literal (and every builtin that produces one) returns these ids instead
+    /// of allocating a fresh slot. Both are created once by
+    /// `ensureEmptySingletons` at bootstrap — before GC arming, so they land
+    /// below `collection.bootstrap_end` and the collector pins them for the
+    /// heap's lifetime (never marked-out, never swept). Lists and attrsets are
+    /// immutable, so sharing is safe: value equality is unaffected (and the
+    /// `asObjectId() == asObjectId()` fast path now fires for `[] == []` /
+    /// `{} == {}`), and the value printer already renders empty containers in
+    /// full *before* its «repeated» identity check (see `print.writeList`).
+    /// Null until bootstrapped: direct-heap unit tests that skip the bootstrap
+    /// keep the old fresh-allocation behavior.
+    empty_list_id: ?ObjectId = null,
+    empty_attrs_id: ?ObjectId = null,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
         var objects = try ObjectStore.init();
@@ -1752,6 +1766,7 @@ pub const ObjectHeap = struct {
     /// unused suffix immediately: it has no owner for sweep to find later.
     pub fn publishMergedAttrs(self: *ObjectHeap, range: AttrRange, actual: u32) !ObjectId {
         self.releaseAttrsTail(range, actual);
+        if (actual == 0) if (self.empty_attrs_id) |id| return id;
         const trimmed: AttrRange = .{
             .segment = range.segment,
             .offset = range.offset,
@@ -1799,6 +1814,18 @@ pub const ObjectHeap = struct {
     /// a safepoint via `gcRunCollect` when a collection has been requested.
     pub fn setGcHook(self: *ObjectHeap, hook: GcHook) void {
         self.collection.hook = hook;
+    }
+
+    /// Allocate the shared empty-`[]`/`{}` singletons if not already present.
+    /// Call once at bootstrap (see `Evaluator.ensureBuiltins`), on the main
+    /// thread and before GC arming, so both ids fall below
+    /// `collection.bootstrap_end` and stay pinned. Idempotent. The `addList`/
+    /// `addAttrs` calls below observe `empty_*_id == null` and allocate real
+    /// slots, which we then cache; every later empty returns these ids.
+    pub fn ensureEmptySingletons(self: *ObjectHeap) !void {
+        if (self.empty_list_id != null) return;
+        self.empty_list_id = try self.addList(&.{});
+        self.empty_attrs_id = try self.addAttrs(&.{});
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
@@ -2399,6 +2426,7 @@ pub const ObjectHeap = struct {
         }
 
         self.releaseAttrsTail(reserved, @intCast(out));
+        if (out == 0) if (self.empty_attrs_id) |id| return id;
         const range: AttrRange = .{ .segment = reserved.segment, .offset = reserved.offset, .len = @intCast(out) };
         return self.add(.{ .attrs = .{ .range = range } });
     }
@@ -2459,6 +2487,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addList(self: *ObjectHeap, items: []const Value) !ObjectId {
+        if (items.len == 0) if (self.empty_list_id) |id| return id;
         const range = try self.reserveValuesLocal(@intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);
         return self.add(.{ .list = range });
@@ -2519,6 +2548,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
+        if (entries.len == 0) if (self.empty_attrs_id) |id| return id;
         const range = try self.prepareAttrsRange(entries);
         return self.add(.{ .attrs = .{ .range = range } });
     }
@@ -2529,6 +2559,7 @@ pub const ObjectHeap = struct {
     /// Use this from merge-walk style builders (`mergeAttrs`,
     /// `intersectAttrs`) whose output is sorted+unique by construction.
     pub fn addAttrsSorted(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
+        if (entries.len == 0) if (self.empty_attrs_id) |id| return id;
         const range = try self.appendAttrEntries(entries);
         return self.add(.{ .attrs = .{ .range = range } });
     }
@@ -2626,6 +2657,9 @@ pub const ObjectHeap = struct {
             .len = @intCast(out),
         };
         self.releaseAttrsTail(reserved, range.len);
+        // Both operands empty (`{} // {}` strict): the tail release above
+        // already returned the reserved storage; hand back the shared `{ }`.
+        if (range.len == 0 and positions.len == 0) if (self.empty_attrs_id) |id| return id;
         return self.add(.{ .attrs = .{ .range = range, .positions = positions } });
     }
 
@@ -2643,6 +2677,7 @@ pub const ObjectHeap = struct {
         positions: []const AttrPosEntry,
     ) !ObjectId {
         std.debug.assert(names.len == values.len);
+        if (names.len == 0) if (self.empty_attrs_id) |id| return id;
         const range = try self.reserveAttrsLocal(@intCast(names.len));
         const entries = self.attrs.sliceMut(range);
         for (entries, names, values) |*e, n, v| e.* = .{ .name = n, .value = v };
@@ -2684,6 +2719,8 @@ pub const ObjectHeap = struct {
                 else => return error.TypeError,
             }
         }
+        // Every key was a dynamic `null` (or there were no pairs): `{ }`.
+        if (count == 0) if (self.empty_attrs_id) |id| return id;
 
         const range = try self.reserveAttrsLocal(count);
         const entries = self.attrs.sliceMut(range);
