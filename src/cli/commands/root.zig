@@ -7,6 +7,7 @@ pub const eval = @import("eval.zig");
 pub const flake = @import("flake.zig");
 pub const completions = @import("completions.zig");
 pub const parse = @import("parse.zig");
+pub const print_dev_env = @import("print_dev_env.zig");
 pub const instantiate = @import("instantiate.zig");
 pub const build = @import("build.zig");
 pub const run = @import("run.zig");

@@ -326,7 +326,8 @@ fn flakeProfile(cmd: args.Cmd) FlakeProfile {
     return switch (cmd) {
         // devShells first for `shell` (a dev shell IS a derivation, so building
         // it works); packages as the fallback for `fix shell nixpkgs#hello`.
-        .shell => .{ .namespaces = &.{ "devShells", "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },
+        // A dev shell IS a derivation; devShells first, then packages.
+        .shell, .print_dev_env => .{ .namespaces = &.{ "devShells", "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },
         // `run` resolves `apps.<sys>.x` first (execed directly by realize), then
         // falls back to a package's default binary.
         .run => .{ .namespaces = &.{ "apps", "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },

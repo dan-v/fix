@@ -94,7 +94,7 @@ pub const OptionOverride = struct {
 
 /// Which subcommand is asking. The shared parser uses this to reject options
 /// outside their command and to scope help and completions.
-pub const Cmd = enum { eval, parse, instantiate, build, run, shell, repl, disasm, @"switch" };
+pub const Cmd = enum { eval, parse, instantiate, build, run, shell, repl, disasm, @"switch", print_dev_env };
 
 /// Semantic value classes consumed by the live shell completer. The parser's
 /// option table owns these hints so help, parsing, and completion cannot drift.
@@ -447,14 +447,14 @@ const Spec = struct {
 /// Commands that take a source expression and its selectors (everything but the
 /// streaming `repl`). `disasm` compiles rather than evaluates, but shares the same
 /// source model (bare path / `-E` / `--file` / `--flake` / `-A` / `-I`).
-const source_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .disasm, .@"switch" };
+const source_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .disasm, .@"switch", .print_dev_env };
 /// Source wrappers/selectors operate on evaluated text. `parse` consumes the
 /// original file/expression bytes and therefore intentionally excludes these.
-const selected_source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .disasm, .@"switch" };
+const selected_source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .disasm, .@"switch", .print_dev_env };
 /// Commands that run the evaluator, so diagnostics (`--show-trace`, `--color`),
 /// progress, and the GC memory budget apply. `disasm` stops at compilation, so
 /// it is excluded.
-const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .@"switch" };
+const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .@"switch", .print_dev_env };
 /// Commands with a meaningful evaluator/bytecode statistics report.
 const stats_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .disasm, .@"switch" };
 /// One-shot evaluator commands that can write a complete Perfetto capture.
@@ -469,12 +469,12 @@ const json_cmds = &[_]Cmd{ .eval, .parse, .repl };
 /// Commands that produce a top-level `.drv` a link/root can point at.
 const drv_cmds = &[_]Cmd{ .build, .instantiate };
 /// Commands that realize (build/substitute) derivations via the daemon.
-const realize_cmds = &[_]Cmd{ .build, .run, .shell, .@"switch" };
+const realize_cmds = &[_]Cmd{ .build, .run, .shell, .@"switch", .print_dev_env };
 /// Legacy nix-instantiate accepts daemon build settings in all of its modes;
 /// eval can use them for IFD, while parse/find-file simply accept them as
 /// process-wide compatibility settings. Realizing commands use them directly.
-const daemon_setting_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .@"switch" };
-const verbose_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .repl, .@"switch" };
+const daemon_setting_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .@"switch", .print_dev_env };
+const verbose_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .repl, .@"switch", .print_dev_env };
 
 const specs = [_]Spec{
     .{ .id = .expr, .short = "-E", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text; repeatable", .completion_help = "evaluate expression text", .repeatable = true, .show_in = source_cmds },
