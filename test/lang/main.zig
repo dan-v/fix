@@ -7,6 +7,7 @@ const std = @import("std");
 const proc = @import("proc.zig");
 const fsx = @import("fsx.zig");
 const snix = @import("snix.zig");
+const lix = @import("lix.zig");
 const Result = @import("result.zig").Result;
 
 const Options = struct {
@@ -66,12 +67,42 @@ pub fn main(init: std.process.Init) !void {
     defer progress.end();
 
     var total_fail: usize = 0;
+    if (opts.suite == .lix or opts.suite == .all)
+        total_fail += try runLix(arena, ctx, repo_abs, progress);
     if (opts.suite == .snix or opts.suite == .all)
         total_fail += try runSnix(arena, ctx, repo_abs, progress);
-    if (opts.suite == .lix or opts.suite == .all)
-        std.debug.print("[lix] (zig port in progress — run test/lang/run.py for the lix suite)\n", .{});
 
     std.process.exit(if (total_fail > 0) 1 else 0);
+}
+
+fn runLix(arena: std.mem.Allocator, base: snix.Ctx, repo: []const u8, progress: std.Progress.Node) !usize {
+    const pin = try proc.resolvePin(base.gpa, base.io, repo, "lix");
+    const lang_dir = try std.fmt.allocPrint(arena, "{s}/tests/functional2/lang", .{pin});
+    const disc = try lix.discover(arena, base.io, lang_dir);
+    const ctx: lix.Ctx = .{
+        .gpa = base.gpa,
+        .io = base.io,
+        .fix = base.fix,
+        .parent_env = base.parent_env,
+        .lang_dir = lang_dir,
+    };
+    const node = progress.start("lix", disc.cases.len);
+    defer node.end();
+
+    var results: std.ArrayListUnmanaged(Result) = .empty;
+    for (disc.cases) |case| {
+        const leaf = node.start(case.ident, 0);
+        const r = lix.runCase(ctx, case, arena) catch |e|
+            Result.fail("lix", case.ident, @errorName(e));
+        try results.append(arena, r);
+        leaf.end();
+        node.completeOne();
+    }
+    if (disc.custom_dirs.len > 0)
+        std.debug.print("[lix] note: {d} python-backed dir(s) not yet ported (skipped): ", .{disc.custom_dirs.len});
+    for (disc.custom_dirs) |d| std.debug.print("{s} ", .{d});
+    if (disc.custom_dirs.len > 0) std.debug.print("\n", .{});
+    return report("lix", results.items);
 }
 
 fn runSnix(arena: std.mem.Allocator, ctx: snix.Ctx, repo: []const u8, progress: std.Progress.Node) !usize {
