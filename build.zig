@@ -253,7 +253,9 @@ pub fn build(b: *std.Build) void {
     const test_syntax_step = b.step("test-syntax", "Run only the syntax (lexer/parser/AST) tests");
     test_syntax_step.dependOn(&run_syntax_tests.step);
 
-    // Parse microbenchmark: `zig build bench -- <file.nix> ...`
+    // Parse microbenchmark: `zig build bench-parse -- <file.nix> ...`. Named to
+    // avoid colliding with the differential *eval* benchmark (nix/bench.nix,
+    // driven by ./bench.sh) — this one times the front-end parser alone.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("tools/parse_bench.zig"),
         .target = target,
@@ -263,7 +265,7 @@ pub fn build(b: *std.Build) void {
     const bench_exe = b.addExecutable(.{ .name = "parse-bench", .root_module = bench_mod, .use_llvm = true });
     const run_bench = b.addRunArtifact(bench_exe);
     if (b.args) |args| run_bench.addArgs(args);
-    const bench_step = b.step("bench", "Parse microbenchmark");
+    const bench_step = b.step("bench-parse", "Parse microbenchmark (front-end only; eval benchmark lives in nix/bench.nix)");
     bench_step.dependOn(&run_bench.step);
 
     // Language conformance: run the pinned Lix + snix language test corpora
@@ -286,4 +288,19 @@ pub fn build(b: *std.Build) void {
     _ = run_lang.captureStdErr(.{});
     if (b.args) |args| run_lang.addArgs(args);
     lang_step.dependOn(&run_lang.step);
+
+    // End-to-end CLI suites (test/e2e/): drive the freshly built `fix` through
+    // behavioral checks (repl pipe+PTY contract, `fix flake` subcommands, ...).
+    // Adding coverage is dropping a `test/e2e/<name>.sh` fragment. Pipe-mode
+    // checks run everywhere; PTY checks self-skip without a util-linux script(1)
+    // (e.g. macOS). Part of `zig build test`, and runnable alone, e.g.
+    // `zig build test-e2e -- flake`.
+    const e2e_step = b.step("test-e2e", "Run the end-to-end CLI suites (test/e2e/) against fix");
+    const run_e2e = b.addSystemCommand(&.{"bash"});
+    run_e2e.addFileArg(b.path("test/e2e/run.sh"));
+    run_e2e.step.dependOn(b.getInstallStep());
+    run_e2e.has_side_effects = true;
+    if (b.args) |args| run_e2e.addArgs(args);
+    e2e_step.dependOn(&run_e2e.step);
+    test_step.dependOn(&run_e2e.step);
 }

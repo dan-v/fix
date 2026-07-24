@@ -1,4 +1,4 @@
-//! Parse microbenchmark: `zig build bench -- <file.nix> [file2.nix ...]`.
+//! Parse microbenchmark: `zig build bench-parse -- <file.nix> [file2.nix ...]`.
 //! Reports best-of-N cycles/byte for parsing each file (tables come from the
 //! wired `parser_tables`, so it measures the real driver).
 

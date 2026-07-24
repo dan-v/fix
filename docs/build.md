@@ -58,7 +58,7 @@ The threaded VM dispatcher (`src/expr/vm/run.zig`) chains handlers with `@call(.
 test → base_tests, syntax_tests, runtime_tests, store_tests, fetchers_tests, expr_tests, integration_tests, cli_tests
 ```
 
-Relative imports inside each durable root let its test artifact discover subsystem tests recursively. `zig build test-syntax` runs the front-end tests alone; `zig build bench -- <file.nix>` runs the parse microbenchmark against `syntax`.
+Relative imports inside each durable root let its test artifact discover subsystem tests recursively. `zig build test-syntax` runs the front-end tests alone; `zig build bench-parse -- <file.nix>` runs the parse microbenchmark against `syntax`.
 
 Expression-engine integration tests live under `src/integration/expr_api`; evaluator, compiler, and VM unit tests live with their `src/expr` subsystems, while the store realization facade owns its socket-backed tests and fake daemon. `test/*.nix` holds pathology and spec fixtures driven through evaluation.
 
