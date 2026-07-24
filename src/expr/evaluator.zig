@@ -1767,6 +1767,42 @@ pub const Evaluator = struct {
         return self.forcedStringAttr(id, "name");
     }
 
+    pub const AppProgram = struct {
+        /// The absolute program path to exec (`$store/bin/…`).
+        program: []const u8,
+        /// A `.drv` in the program's string context to build first, if any.
+        drv_path: ?[]const u8,
+    };
+
+    /// If `value` is a flake app (`{ type = "app"; program = …; }`), return its
+    /// program path and (from the program's string context) the derivation to
+    /// build before running it. Null when `value` is not an app.
+    pub fn appProgram(self: *Evaluator, value: Value) !?AppProgram {
+        const forced = try self.forceValueUntraced(value);
+        if (!forced.isAttrs()) return null;
+        const id = forced.asObjectId();
+        const ty = (try self.forcedStringAttr(id, "type")) orelse return null;
+        if (!std.mem.eql(u8, ty, "app")) return null;
+        const prog_attr = (try self.heap.getAttrValueOpt(id, try self.intern.intern("program"))) orelse return null;
+        const forced_prog = try self.forceValueUntraced(prog_attr);
+        const program = switch (forced_prog.kind()) {
+            .string, .path => self.intern.get(forced_prog.asInternId()),
+            .string_context => self.intern.get((try self.heap.getContextString(forced_prog.asObjectId())).text),
+            else => return null,
+        };
+        var drv_path: ?[]const u8 = null;
+        if (forced_prog.kind() == .string_context) {
+            for ((try self.heap.getContextString(forced_prog.asObjectId())).context) |entry| {
+                const name = self.intern.get(entry.name);
+                if (std.mem.endsWith(u8, name, ".drv")) {
+                    drv_path = name;
+                    break;
+                }
+            }
+        }
+        return .{ .program = program, .drv_path = drv_path };
+    }
+
     /// Force attribute `name` of `id` and return its text (string/path/context),
     /// or null if absent or non-string. Borrowed from the intern table.
     fn forcedStringAttr(self: *Evaluator, id: types.ObjectId, name: []const u8) !?[]const u8 {

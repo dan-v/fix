@@ -15,11 +15,16 @@ pub const Realized = struct {
     drv_path: []const u8,
     out_path: []const u8,
     program: ?[]const u8 = null,
+    /// Set when the installable is a flake `app` (`{ type = "app"; program; }`):
+    /// the absolute program path to exec directly, instead of
+    /// `<out_path>/bin/<program>`.
+    app_program: ?[]const u8 = null,
 
     pub fn deinit(self: Realized, allocator: std.mem.Allocator) void {
         allocator.free(self.drv_path);
         allocator.free(self.out_path);
         if (self.program) |program| allocator.free(program);
+        if (self.app_program) |program| allocator.free(program);
     }
 };
 
@@ -519,6 +524,46 @@ pub fn realize(
     const value = ev.evaluatePathAt(source.text, source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
         return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.text, err) };
     };
+
+    // A flake `app` (`{ type = "app"; program = …; }`): build the derivation in
+    // the program's context, then exec the program path directly (not
+    // `$out/bin/<name>`). Strings are duped before the build phase releases the
+    // language heap.
+    if (want_program) {
+        if (try ev.appProgram(value)) |app| {
+            const app_program = try allocator.dupe(u8, app.program);
+            const app_drv = if (app.drv_path) |d| try allocator.dupe(u8, d) else null;
+            if (app_drv) |drv| {
+                const derived_app = try std.fmt.allocPrint(allocator, "{s}!*", .{drv});
+                defer allocator.free(derived_app);
+                if (options.stats) stats.report(ev);
+                var bps = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, &progress);
+                var bop = bps.operation();
+                var session = ev.beginBuildPhase(&.{derived_app}, release_action) catch |err| {
+                    bop.finish(false);
+                    bps.deinit();
+                    return .{ .failed = eval_support.buildFailure(io, terminal.use_color, ev.lastStoreError(), err) };
+                };
+                defer session.deinit();
+                session.buildPaths(&.{derived_app}, bop.sink(), eval_support.buildMode(options)) catch |err| {
+                    bop.finish(false);
+                    bps.deinit();
+                    return .{ .failed = eval_support.buildFailure(io, terminal.use_color, session.lastStoreError(), err) };
+                };
+                bop.finish(true);
+                bps.deinit();
+            }
+            progress.deinit(true);
+            torn_down = true;
+            return .{ .ok = .{
+                .drv_path = app_drv orelse try allocator.dupe(u8, ""),
+                .out_path = try allocator.dupe(u8, ""),
+                .program = null,
+                .app_program = app_program,
+            } };
+        }
+    }
+
     const drv_path = (ev.derivationDrvPath(value) catch |err| {
         return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.text, err) };
     }) orelse {

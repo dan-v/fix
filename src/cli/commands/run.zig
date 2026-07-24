@@ -63,11 +63,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         .ok => |r| r,
     };
     defer realized.deinit(allocator);
-    const out_path = realized.out_path;
-    const program = realized.program.?;
 
-    // Assemble argv = [$out/bin/<program>] ++ (args after `--`) and exec it.
-    const exe = try std.fmt.allocPrint(allocator, "{s}/bin/{s}", .{ out_path, program });
+    // A flake `app` yields an absolute program path to exec directly; a
+    // derivation yields `<out_path>/bin/<mainProgram|pname|name>`.
+    const exe = if (realized.app_program) |app|
+        try allocator.dupe(u8, app)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/bin/{s}", .{ realized.out_path, realized.program.? });
     defer allocator.free(exe);
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);

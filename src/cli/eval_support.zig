@@ -327,9 +327,10 @@ fn flakeProfile(cmd: args.Cmd) FlakeProfile {
         // devShells first for `shell` (a dev shell IS a derivation, so building
         // it works); packages as the fallback for `fix shell nixpkgs#hello`.
         .shell => .{ .namespaces = &.{ "devShells", "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },
-        // `run`'s app support (`apps.<sys>.x.program`) needs execution wiring
-        // beyond resolution, so it stays package-based for now.
-        .build, .run, .@"switch" => .{ .namespaces = &.{ "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },
+        // `run` resolves `apps.<sys>.x` first (execed directly by realize), then
+        // falls back to a package's default binary.
+        .run => .{ .namespaces = &.{ "apps", "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },
+        .build, .@"switch" => .{ .namespaces = &.{ "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },
         // Value commands resolve the attr path from the flake root, as Nix's
         // `nix eval .#a.b` does, with packages as a convenience fallback.
         .eval, .parse, .instantiate, .repl, .disasm => .{ .namespaces = &.{ "packages", "legacyPackages" }, .root_first = true, .default_attr = null },

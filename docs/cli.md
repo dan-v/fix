@@ -139,12 +139,14 @@ explicit typed flake-output/installable form.
 A `--flake <flakeref>[#<attr>]` fragment resolves against the outputs the
 command cares about: `build`/`run`/`switch` try `packages.<system>.<attr>` then
 `legacyPackages.<system>.<attr>`; `shell` tries `devShells.<system>.<attr>`
-first; `eval` (and the other value commands) resolve `<attr>` from the flake
-root first. An empty fragment (`--flake .#`) selects the `default` output for
-the derivation-building commands, or the whole flake for `eval`. The system is
+first; `run` tries `apps.<system>.<attr>` first (a flake `app`, execed
+directly), then packages; `switch --nixos/--darwin/--home-manager` resolves the
+`nixosConfigurations`/`darwinConfigurations`/`homeConfigurations` toplevel;
+`eval` (and the other value commands) resolve `<attr>` from the flake root
+first. An empty fragment (`--flake .#`) selects the `default` output for the
+derivation-building commands, or the whole flake for `eval`. The system is
 resolved once (from the host) and baked in, so lowering never depends on
-`builtins.currentSystem`. (`nix run` app outputs and `nix switch`
-`nixosConfigurations` are not yet resolved as such — both stay package-based.)
+`builtins.currentSystem`.
 
 **Pure evaluation.** A `--flake` installable evaluates in *pure mode* by default
 (matching Nix's flake commands): `builtins.getEnv` returns `""`, filesystem
