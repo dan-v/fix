@@ -28,6 +28,7 @@ const dupPathAttr = arguments.dupPathAttr;
 const optionalStringAttr = arguments.optionalStringAttr;
 const requiredStringAttr = arguments.requiredStringAttr;
 const optionalBoolAttr = arguments.optionalBoolAttr;
+const optionalIntAttr = arguments.optionalIntAttr;
 
 const ingestFetchedTree = fetch.ingestFetchedTree;
 const pathTreeValue = fetch.pathTreeValue;
@@ -222,7 +223,9 @@ pub fn builtinGetFlake(self: *VM, arg: Value) !Value {
     var input_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer input_entries.deinit(self.allocator);
     if (!try resolveRootInputs(self, out_path, dir, &input_entries)) {
-        try buildFlakeNixInputThunks(self, flake_value, &input_entries);
+        // No lock: compute one (fetch + pin inputs), write it back when the
+        // flake tree is writable, and resolve inputs from it.
+        _ = try generateAndUseLock(self, flake_value, out_path, dir, &input_entries);
     }
     // `self` is the flake's own fixpoint: outputs may read `self.packages`,
     // `self.lib`, etc. Bind it through a placeholder cell (as recursive
@@ -279,7 +282,13 @@ fn resolveRootInputs(self: *VM, out_path: []const u8, dir: ?[]const u8, out_entr
         error.FileNotFound => return false,
         else => return err,
     };
+    try resolveInputsFromLockData(self, lock_data, out_entries);
+    return true;
+}
 
+/// Parse a `flake.lock` (from disk or freshly generated) and resolve the root
+/// flake's declared inputs into `out_entries`.
+fn resolveInputsFromLockData(self: *VM, lock_data: []const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, lock_data, .{}) catch return error.InvalidFlakeLock;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidFlakeLock;
@@ -295,7 +304,7 @@ fn resolveRootInputs(self: *VM, out_path: []const u8, dir: ?[]const u8, out_entr
 
     const root_node = nodes.get(root_name) orelse return error.InvalidFlakeLock;
     if (root_node != .object) return error.InvalidFlakeLock;
-    const root_inputs = root_node.object.get("inputs") orelse return true; // lock exists, flake has no inputs
+    const root_inputs = root_node.object.get("inputs") orelse return; // lock exists, flake has no inputs
     if (root_inputs != .object) return error.InvalidFlakeLock;
 
     var memo: std.StringHashMapUnmanaged(Value) = .empty;
@@ -307,7 +316,6 @@ fn resolveRootInputs(self: *VM, out_path: []const u8, dir: ?[]const u8, out_entr
         const thunk = try buildNodeThunk(self, nodes, target_node, root_name, &memo, 0);
         try out_entries.append(self.allocator, .{ .name = try self.intern.intern(entry.key_ptr.*), .value = thunk });
     }
-    return true;
 }
 
 /// Lockless: build a lazy thunk for each of a flake's flake.nix `inputs`
@@ -373,6 +381,338 @@ fn buildFlakeNixInputThunks(self: *VM, flake_value: Value, out_entries: *std.Arr
         if (segs.next() != null) return error.UnsupportedFlakeFollows;
         try out_entries.append(self.allocator, .{ .name = fe.name, .value = sibling });
     }
+}
+
+// ---- flake.lock generation ------------------------------------------------
+//
+// When a flake has inputs but no `flake.lock`, compute one: fetch each input to
+// pin its `locked` ref (rev/narHash/lastModified), recurse into its own inputs
+// (honoring `follows` and `inputs.x.inputs.y` overrides declared in the parent),
+// deduplicate identical nodes, and serialize the Nix version-7 graph. The
+// result is written back next to `flake.nix` when that directory is writable,
+// and is fed to the normal lock reader so evaluation uses the pinned graph.
+
+/// A minimal, insertion-ordered JSON value for emitting a lock (std.json's
+/// ObjectMap doesn't preserve order and its API varies across Zig versions).
+const JField = struct { key: []const u8, val: JVal };
+const JVal = union(enum) {
+    string: []const u8,
+    integer: i64,
+    boolean: bool,
+    array: []const JVal,
+    object: []const JField,
+};
+
+const LockEdge = struct {
+    name: []const u8,
+    node_key: ?[]const u8 = null, // a concrete node…
+    follows: ?[]const []const u8 = null, // …or a root-relative follows path
+};
+
+const LockNode = struct {
+    key: []const u8,
+    locked: JVal,
+    original: JVal,
+    is_flake: bool,
+    inputs: []const LockEdge = &.{},
+};
+
+const LockGen = struct {
+    vm: *VM,
+    arena: std.mem.Allocator,
+    nodes: std.ArrayListUnmanaged(LockNode) = .empty,
+    by_locked: std.StringHashMapUnmanaged([]const u8) = .empty, // serialized locked → node key
+    names: std.StringHashMapUnmanaged(u32) = .empty, // base name → next disambiguator
+
+    /// A node key that is unique in the graph: the input name, or `name_N`.
+    fn uniqueKey(self: *LockGen, name: []const u8) ![]const u8 {
+        const gop = try self.names.getOrPut(self.arena, name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = 2;
+            return name;
+        }
+        const n = gop.value_ptr.*;
+        gop.value_ptr.* = n + 1;
+        return std.fmt.allocPrint(self.arena, "{s}_{d}", .{ name, n });
+    }
+};
+
+/// `std.fmt` into an unmanaged byte list (which has no `print` of its own).
+fn appendFmt(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    const s = try std.fmt.allocPrint(alloc, fmt, args);
+    try out.appendSlice(alloc, s);
+}
+
+/// Serialize a `JVal` into `out`.
+fn writeLockJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: JVal) !void {
+    switch (v) {
+        .string => |s| {
+            try out.append(alloc, '"');
+            for (s) |c| switch (c) {
+                '"' => try out.appendSlice(alloc, "\\\""),
+                '\\' => try out.appendSlice(alloc, "\\\\"),
+                '\n' => try out.appendSlice(alloc, "\\n"),
+                '\t' => try out.appendSlice(alloc, "\\t"),
+                else => try out.append(alloc, c),
+            };
+            try out.append(alloc, '"');
+        },
+        .integer => |n| try appendFmt(out, alloc, "{d}", .{n}),
+        .boolean => |b| try out.appendSlice(alloc, if (b) "true" else "false"),
+        .array => |arr| {
+            try out.append(alloc, '[');
+            for (arr, 0..) |item, i| {
+                if (i != 0) try out.append(alloc, ',');
+                try writeLockJson(out, alloc, item);
+            }
+            try out.append(alloc, ']');
+        },
+        .object => |fields| {
+            try out.append(alloc, '{');
+            for (fields, 0..) |f, i| {
+                if (i != 0) try out.append(alloc, ',');
+                try writeLockJson(out, alloc, .{ .string = f.key });
+                try out.append(alloc, ':');
+                try writeLockJson(out, alloc, f.val);
+            }
+            try out.append(alloc, '}');
+        },
+    }
+}
+
+/// A forced ref attrset's scalar fields as a JSON object (arena-owned, in attr
+/// order).
+fn refAttrsToFields(gen: *LockGen, ref_attrs: Value) !std.ArrayListUnmanaged(JField) {
+    var fields: std.ArrayListUnmanaged(JField) = .empty;
+    if (ref_attrs.isAttrs()) {
+        for (try gen.vm.heap.getAttrs(ref_attrs.asObjectId())) |e| {
+            const name = try gen.arena.dupe(u8, gen.vm.intern.get(e.name));
+            const val = try vm_force.forceValue(gen.vm, e.value);
+            const jv: JVal = if (val.isString())
+                .{ .string = try gen.arena.dupe(u8, gen.vm.intern.get(val.asInternId())) }
+            else if (val.isInt())
+                .{ .integer = val.asInt() }
+            else if (val.isBool())
+                .{ .boolean = val.asBool() }
+            else
+                continue;
+            try fields.append(gen.arena, .{ .key = name, .val = jv });
+        }
+    }
+    return fields;
+}
+
+fn refAttrsToJson(gen: *LockGen, ref_attrs: Value) !JVal {
+    return .{ .object = (try refAttrsToFields(gen, ref_attrs)).items };
+}
+
+fn hasField(fields: []const JField, key: []const u8) bool {
+    for (fields) |f| if (std.mem.eql(u8, f.key, key)) return true;
+    return false;
+}
+
+/// The `locked` node: the ref's identity fields plus the fetched pin
+/// (rev/narHash/lastModified/revCount). `ref` is dropped once a `rev` pins it.
+fn lockedJson(gen: *LockGen, ref_attrs: Value, src_info: Value) !JVal {
+    var fields = try refAttrsToFields(gen, ref_attrs);
+    for ([_][]const u8{ "narHash", "rev", "shortRev" }) |field| {
+        if (try optionalStringAttr(gen.vm, src_info.asObjectId(), field)) |s| {
+            defer gen.vm.allocator.free(s);
+            if (!hasField(fields.items, field))
+                try fields.append(gen.arena, .{ .key = field, .val = .{ .string = try gen.arena.dupe(u8, s) } });
+        }
+    }
+    for ([_][]const u8{ "lastModified", "revCount" }) |field| {
+        if (try optionalIntAttr(gen.vm, src_info.asObjectId(), field)) |n| {
+            if (!hasField(fields.items, field))
+                try fields.append(gen.arena, .{ .key = field, .val = .{ .integer = n } });
+        }
+    }
+    // A resolved `rev` supersedes the `ref` branch in the locked node (Nix).
+    if (hasField(fields.items, "rev")) {
+        var filtered: std.ArrayListUnmanaged(JField) = .empty;
+        for (fields.items) |f| if (!std.mem.eql(u8, f.key, "ref")) try filtered.append(gen.arena, f);
+        fields = filtered;
+    }
+    return .{ .object = fields.items };
+}
+
+/// Resolve one declared input (with an optional parent `override` decl) into an
+/// edge, creating/deduplicating its node and recursing into transitive inputs.
+fn lockInput(gen: *LockGen, name: []const u8, decl: Value, override: ?Value, depth: u32) anyerror!LockEdge {
+    if (depth > 64) return error.InvalidFlakeLock;
+    const self = gen.vm;
+
+    // A `follows` (on the declaration or a parent override) is a link, not a node.
+    const follows_src = override orelse decl;
+    if (follows_src.isAttrs()) {
+        if (try self.heap.getAttrValueOpt(follows_src.asObjectId(), try self.intern.intern("follows"))) |f| {
+            const fv = try vm_force.forceValue(self, f);
+            if (fv.isString()) {
+                var segs: std.ArrayListUnmanaged([]const u8) = .empty;
+                var it = std.mem.splitScalar(u8, self.intern.get(fv.asInternId()), '/');
+                while (it.next()) |seg| try segs.append(gen.arena, try gen.arena.dupe(u8, seg));
+                return .{ .name = name, .follows = segs.items };
+            }
+        }
+    }
+
+    // The effective ref: a parent override with a url/type wins over the child's
+    // own declaration (an input pin). Otherwise use the declaration.
+    const eff = if (override != null and refLike(self, override.?)) override.? else decl;
+    const ref_attrs = try parseInputRef(self, eff);
+    vm_force.rootKeep(self, ref_attrs);
+    const is_flake = if (eff.isAttrs()) (try optionalBoolAttr(self, eff.asObjectId(), "flake")) orelse true else true;
+
+    const src_info = try builtinFetchTree(self, ref_attrs);
+    vm_force.rootKeep(self, src_info);
+
+    const locked = try lockedJson(gen, ref_attrs, src_info);
+    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+    try writeLockJson(&key_buf, gen.arena, locked);
+    if (gen.by_locked.get(key_buf.items)) |existing| return .{ .name = name, .node_key = existing };
+
+    const key = try gen.uniqueKey(name);
+    try gen.by_locked.put(gen.arena, key_buf.items, key);
+    // Reserve the node slot before recursing (a diamond may point back at it).
+    const node_index = gen.nodes.items.len;
+    try gen.nodes.append(gen.arena, .{
+        .key = key,
+        .locked = locked,
+        .original = try refAttrsToJson(gen, ref_attrs),
+        .is_flake = is_flake,
+    });
+
+    // Recurse into the input flake's own inputs, threading this input's overrides.
+    if (is_flake) {
+        const out_path = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
+        defer self.allocator.free(out_path);
+        const sub_dir = try optionalStringAttr(self, ref_attrs.asObjectId(), "dir");
+        defer if (sub_dir) |d| self.allocator.free(d);
+        if (importFlakeValue(self, out_path, sub_dir)) |child_flake| {
+            vm_force.rootKeep(self, child_flake);
+            // Overrides for the child's inputs are declared in THIS input's own
+            // `inputs.<name>` map (`inputs.dep.inputs.sub.follows = "sub"`). The
+            // `inputs` attr is lazy, so force it before probing it as an attrset.
+            const co_lazy = if (eff.isAttrs()) try self.heap.getAttrValueOpt(eff.asObjectId(), try self.intern.intern("inputs")) else null;
+            const child_overrides = if (co_lazy) |c| try vm_force.forceValue(self, c) else null;
+            const edges = try lockFlakeInputs(gen, child_flake, child_overrides, depth + 1);
+            gen.nodes.items[node_index].inputs = edges;
+        } else |_| {}
+    }
+    return .{ .name = name, .node_key = key };
+}
+
+/// Whether `v` looks like a concrete input ref (a string/path, or an attrset
+/// with `url`/`type`) as opposed to a bare `{ follows = …; }` / overrides map.
+fn refLike(self: *VM, v: Value) bool {
+    if (v.isString() or v.isPath()) return true;
+    if (!v.isAttrs()) return false;
+    const has_url = (self.heap.getAttrValueOpt(v.asObjectId(), self.intern.intern("url") catch return false) catch null) != null;
+    const has_type = (self.heap.getAttrValueOpt(v.asObjectId(), self.intern.intern("type") catch return false) catch null) != null;
+    return has_url or has_type;
+}
+
+/// Parse an input declaration (`"github:…"` / `{ url = …; }` / inline ref) into
+/// ref attrs — the eager analogue of the dispatch in `buildFlakeNixInputThunks`.
+fn parseInputRef(self: *VM, decl: Value) !Value {
+    if (decl.isString() or decl.isPath()) return builtinParseFlakeRef(self, decl);
+    if (decl.isAttrs()) {
+        if (try self.heap.getAttrValueOpt(decl.asObjectId(), try self.intern.intern("url"))) |u|
+            return builtinParseFlakeRef(self, try vm_force.forceValue(self, u));
+        return decl; // inline { type = …; }
+    }
+    return error.InvalidFlakeRef;
+}
+
+/// Build the edges for every declared input of `flake_value`, applying parent
+/// `overrides` (a `{ <name> = { follows|url|inputs … }; }` map) where present.
+fn lockFlakeInputs(gen: *LockGen, flake_value: Value, overrides: ?Value, depth: u32) anyerror![]LockEdge {
+    const self = gen.vm;
+    var edges: std.ArrayListUnmanaged(LockEdge) = .empty;
+    const inputs_v = (self.heap.getAttrValueOpt(flake_value.asObjectId(), try self.intern.intern("inputs")) catch return edges.items) orelse return edges.items;
+    const inputs = try vm_force.forceValue(self, inputs_v);
+    if (!inputs.isAttrs()) return edges.items;
+
+    for (try self.heap.getAttrs(inputs.asObjectId())) |entry| {
+        const name = self.intern.get(entry.name);
+        const decl = try vm_force.forceValue(self, entry.value);
+        const override = if (overrides) |o| (if (o.isAttrs()) try self.heap.getAttrValueOpt(o.asObjectId(), entry.name) else null) else null;
+        const forced_override = if (override) |ov| try vm_force.forceValue(self, ov) else null;
+        try edges.append(gen.arena, try lockInput(gen, try gen.arena.dupe(u8, name), decl, forced_override, depth));
+    }
+    return edges.items;
+}
+
+/// Serialize the resolved graph as a Nix version-7 `flake.lock` (arena-owned).
+fn serializeLock(gen: *LockGen, root_edges: []const LockEdge) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    const a = gen.arena;
+    try out.appendSlice(a, "{\n  \"nodes\": {\n    \"root\": {");
+    try writeEdges(gen, &out, root_edges, "      ", false);
+    try out.appendSlice(a, "\n    }");
+    for (gen.nodes.items) |node| {
+        try out.appendSlice(a, ",\n    ");
+        try writeLockJson(&out, a, .{ .string = node.key });
+        try out.appendSlice(a, ": {\n      \"locked\": ");
+        try writeLockJson(&out, a, node.locked);
+        try out.appendSlice(a, ",\n      \"original\": ");
+        try writeLockJson(&out, a, node.original);
+        if (!node.is_flake) try out.appendSlice(a, ",\n      \"flake\": false");
+        try writeEdges(gen, &out, node.inputs, "      ", true);
+        try out.appendSlice(a, "\n    }");
+    }
+    try out.appendSlice(a, "\n  },\n  \"root\": \"root\",\n  \"version\": 7\n}\n");
+    return out.items;
+}
+
+fn writeEdges(gen: *LockGen, out: *std.ArrayListUnmanaged(u8), edges: []const LockEdge, indent: []const u8, leading_comma: bool) !void {
+    if (edges.len == 0) return;
+    const a = gen.arena;
+    if (leading_comma) try out.append(a, ',');
+    try appendFmt(out, a, "\n{s}\"inputs\": {{", .{indent});
+    for (edges, 0..) |edge, i| {
+        if (i != 0) try out.append(a, ',');
+        try appendFmt(out, a, "\n{s}  ", .{indent});
+        try writeLockJson(out, a, .{ .string = edge.name });
+        try out.appendSlice(a, ": ");
+        if (edge.follows) |path| {
+            var arr: std.ArrayListUnmanaged(JVal) = .empty;
+            for (path) |seg| try arr.append(a, .{ .string = seg });
+            try writeLockJson(out, a, .{ .array = arr.items });
+        } else {
+            try writeLockJson(out, a, .{ .string = edge.node_key.? });
+        }
+    }
+    try appendFmt(out, a, "\n{s}}}", .{indent});
+}
+
+/// Compute a `flake.lock` for a flake with inputs but no lock, write it back
+/// when the directory is writable, and resolve the root inputs from it. Returns
+/// false when the flake declares no inputs (caller then has nothing to do).
+fn generateAndUseLock(self: *VM, flake_value: Value, out_path: []const u8, dir: ?[]const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !bool {
+    // Nothing to lock if there are no declared inputs.
+    const inputs_v = (self.heap.getAttrValueOpt(flake_value.asObjectId(), try self.intern.intern("inputs")) catch return false) orelse return false;
+    const inputs = try vm_force.forceValue(self, inputs_v);
+    if (!inputs.isAttrs() or (try self.heap.getAttrs(inputs.asObjectId())).len == 0) return false;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    var gen = LockGen{ .vm = self, .arena = arena_state.allocator() };
+    const root_edges = try lockFlakeInputs(&gen, flake_value, null, 0);
+    const lock_json = try serializeLock(&gen, root_edges);
+
+    // Persist next to flake.nix when writable (a store path / read-only tree is
+    // left alone — the in-memory lock is still used for this evaluation).
+    const lock_path = if (dir) |d|
+        try std.fs.path.join(self.allocator, &.{ out_path, d, "flake.lock" })
+    else
+        try std.fs.path.join(self.allocator, &.{ out_path, "flake.lock" });
+    defer self.allocator.free(lock_path);
+    self.files.writeFile(lock_path, lock_json) catch {};
+
+    try resolveInputsFromLockData(self, lock_json, out_entries);
+    return true;
 }
 
 /// Internal builtin backing a lazy flake input (`inputs.<name>`): forced only

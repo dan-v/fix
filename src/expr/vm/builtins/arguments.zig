@@ -49,3 +49,14 @@ pub fn optionalBoolAttr(self: *VM, attrs_id: ObjectId, name: []const u8) !?bool 
     if (!forced.isBool()) return error.TypeError;
     return forced.asBool();
 }
+
+pub fn optionalIntAttr(self: *VM, attrs_id: ObjectId, name: []const u8) !?i64 {
+    const name_id = try self.intern.intern(name);
+    const value = self.heap.getAttrValue(attrs_id, name_id) catch |err| switch (err) {
+        error.MissingAttribute => return null,
+        else => return err,
+    };
+    const forced = try vm_force.forceValue(self, value);
+    if (!forced.isInt()) return null;
+    return forced.asInt();
+}

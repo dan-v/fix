@@ -806,6 +806,63 @@ test "getFlake rejects an unsupported flake.lock version" {
     try std.testing.expectError(error.UnsupportedFlakeLockVersion, ev.evaluate(src));
 }
 
+test "getFlake generates, writes, and uses a flake.lock when none exists" {
+    // sub (leaf); dep (input: its own sub, v=99); root (inputs dep + sub v=1,
+    // with dep.inputs.sub following root's sub). The generated lock must both
+    // evaluate correctly (follows redirects dep's sub to root's) and be written.
+    var t_root_sub = std.testing.tmpDir(.{});
+    defer t_root_sub.cleanup();
+    var t_dep_sub = std.testing.tmpDir(.{});
+    defer t_dep_sub.cleanup();
+    var t_dep = std.testing.tmpDir(.{});
+    defer t_dep.cleanup();
+    var t_root = std.testing.tmpDir(.{});
+    defer t_root.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const abs = struct {
+        fn p(a: std.mem.Allocator, base: []const u8, sub: []const u8) ![]u8 {
+            return std.fs.path.resolve(a, &.{ base, ".zig-cache", "tmp", sub });
+        }
+    }.p;
+    const d_root_sub = try abs(std.testing.allocator, cwd, &t_root_sub.sub_path);
+    defer std.testing.allocator.free(d_root_sub);
+    const d_dep_sub = try abs(std.testing.allocator, cwd, &t_dep_sub.sub_path);
+    defer std.testing.allocator.free(d_dep_sub);
+    const d_dep = try abs(std.testing.allocator, cwd, &t_dep.sub_path);
+    defer std.testing.allocator.free(d_dep);
+    const d_root = try abs(std.testing.allocator, cwd, &t_root.sub_path);
+    defer std.testing.allocator.free(d_root);
+
+    try t_root_sub.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = "{ outputs = i: { v = 1; }; }" });
+    try t_dep_sub.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = "{ outputs = i: { v = 99; }; }" });
+    const dep_nix = try std.fmt.allocPrint(std.testing.allocator, "{{ inputs.sub.url = \"path:{s}\"; outputs = {{ sub, ... }}: {{ d = sub.v; }}; }}", .{d_dep_sub});
+    defer std.testing.allocator.free(dep_nix);
+    try t_dep.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = dep_nix });
+    const root_nix = try std.fmt.allocPrint(std.testing.allocator, "{{ inputs.sub.url = \"path:{s}\"; inputs.dep.url = \"path:{s}\"; inputs.dep.inputs.sub.follows = \"sub\"; outputs = {{ dep, ... }}: {{ d = dep.d; }}; }}", .{ d_root_sub, d_dep });
+    defer std.testing.allocator.free(root_nix);
+    try t_root.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = root_nix });
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    ev.policy.flakes_enabled = true;
+
+    // follows redirects dep's `sub` to root's (v=1), not dep's own (v=99).
+    const src = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").d", .{d_root});
+    defer std.testing.allocator.free(src);
+    try std.testing.expectEqual(@as(i64, 1), (try ev.evaluate(src)).asInt());
+
+    // A flake.lock was written next to the root flake.nix, and it records the
+    // follows edge as a path array.
+    const lock = try t_root.dir.readFileAlloc(std.testing.io, "flake.lock", std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(lock);
+    try std.testing.expect(std.mem.indexOf(u8, lock, "\"version\": 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lock, "\"sub\": [\"sub\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lock, "narHash") != null);
+}
+
 test "pure evaluation sandboxes env, out-of-tree reads, search paths, and unlocked fetches" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
