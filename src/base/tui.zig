@@ -20,6 +20,10 @@ pub const Role = enum {
     selection_marker,
     name,
     chunk,
+    /// The chunk hue, bold — the currently-open chunk keeps its identity color
+    /// instead of switching to the green `current` used for live execution.
+    chunk_current,
+    object,
     current,
     range,
     source_focus,
@@ -38,6 +42,7 @@ pub const Palette = struct {
     section: color.Rgb = color.hueColor(2),
     name: color.Rgb = color.hueColor(4),
     chunk: color.Rgb = color.hueColor(7),
+    object: color.Rgb = color.hueColor(13),
     current: color.Rgb = color.hueColor(1),
     range: color.Rgb = color.hueColor(10),
     source_focus: color.Rgb = color.hueColor(3),
@@ -132,8 +137,8 @@ pub const Frame = struct {
             switch (role) {
                 .selection => try self.writer.writeAll("\x1b[7m"),
                 .muted, .border => try self.writer.writeAll("\x1b[2m"),
-                .section, .current, .source_focus, .selection_marker => try self.writer.writeAll("\x1b[1m"),
-                .name, .chunk, .range, .plain => {},
+                .section, .current, .source_focus, .selection_marker, .chunk_current => try self.writer.writeAll("\x1b[1m"),
+                .name, .chunk, .object, .range, .plain => {},
             }
             return;
         }
@@ -149,6 +154,8 @@ pub const Frame = struct {
             .selection_marker => try color.foreground(self.writer, self.depth, self.palette.source_focus, true),
             .name => try color.foreground(self.writer, self.depth, self.palette.name, false),
             .chunk => try color.foreground(self.writer, self.depth, self.palette.chunk, false),
+            .chunk_current => try color.foreground(self.writer, self.depth, self.palette.chunk, true),
+            .object => try color.foreground(self.writer, self.depth, self.palette.object, false),
             .current => try color.foreground(self.writer, self.depth, self.palette.current, true),
             .range => try color.foreground(self.writer, self.depth, self.palette.range, false),
             .source_focus => try color.foreground(self.writer, self.depth, self.palette.source_focus, true),

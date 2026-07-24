@@ -22,7 +22,6 @@ const progress_ui = @import("../progress.zig");
 const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 const debugger = @import("../debugger.zig");
-const debugger_tui = @import("../debugger_tui.zig");
 const render_err = @import("../render.zig");
 const stats = @import("../stats.zig");
 const engine = @import("expr");
@@ -107,11 +106,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var repl = Repl.init(allocator, init, options, &ev, if (interactive) term.color_depth else .none, interactive);
     defer repl.deinit();
     repl.debug_console = &console;
-    var debug_screen = debugger_tui.DebuggerTui.init(allocator, init.io, &ev, term.color_depth, &repl.history);
-    defer debug_screen.deinit();
-    if (tui_enabled) repl.debug_tui = &debug_screen;
+    var vm_debugger = pager_mod.VmDebugger.init(allocator, init.io, &ev, term.color_depth, &repl.history);
+    if (tui_enabled) repl.debug_ui = &vm_debugger;
     if (options.debugger) {
-        if (tui_enabled) debug_screen.install(&ev) else console.install(&ev);
+        if (tui_enabled) vm_debugger.install(&ev) else console.install(&ev);
     }
 
     if (interactive) {
@@ -144,9 +142,9 @@ const Repl = struct {
     /// Shared by persistent `--debugger` sessions and transient `:debug`
     /// commands; the streaming loop attaches its buffered stdin reader here.
     debug_console: ?*debugger.Console = null,
-    /// Full-screen debugger selected only when TUI workspaces are enabled.
-    /// Null for --no-tui/streaming sessions, which use the line console.
-    debug_tui: ?*debugger_tui.DebuggerTui = null,
+    /// The consolidated VM-explorer debug UI, selected only when TUI workspaces
+    /// are enabled. Null for --no-tui/streaming sessions (they use the console).
+    debug_ui: ?*pager_mod.VmDebugger = null,
 
     /// Scope bindings, insertion-ordered. Keys are owned; values are heap
     /// Values kept alive via the evaluator's external roots and scope attrset.
@@ -330,7 +328,7 @@ const Repl = struct {
             .quitFn = sessionQuit,
             .takeHeapRequestFn = sessionTakeHeapRequest,
             .start_heap = start_heap,
-        }) catch |err| switch (err) {
+        }, self.debug_ui) catch |err| switch (err) {
             error.NotATerminal => return,
             else => return err,
         };
@@ -392,7 +390,7 @@ const Repl = struct {
     // -- input processing (shared by both modes) -------------------------------
 
     fn processInput(self: *Repl, input: []const u8) !void {
-        defer if (self.debug_tui) |screen| screen.endEvaluation();
+        defer if (self.debug_ui) |ui| ui.endEvaluation();
         const trimmed = std.mem.trim(u8, input, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == ':') {
@@ -565,10 +563,10 @@ const Repl = struct {
 
         const transient = !self.options.debugger;
         if (transient) {
-            if (self.debug_tui) |screen| screen.install(self.ev) else console.install(self.ev);
+            if (self.debug_ui) |ui| ui.install(self.ev) else console.install(self.ev);
         }
         defer if (transient) {
-            if (self.debug_tui) |screen| screen.uninstall(self.ev) else console.uninstall(self.ev);
+            if (self.debug_ui) |ui| ui.uninstall(self.ev) else console.uninstall(self.ev);
         };
 
         const value = try self.evalExprMode(source, true);
@@ -584,7 +582,7 @@ const Repl = struct {
     }
 
     fn endDebugScreen(self: *Repl) void {
-        if (self.debug_tui) |screen| screen.endEvaluation();
+        if (self.debug_ui) |ui| ui.endEvaluation();
     }
 
     fn rememberVmSource(self: *Repl, source: []const u8, first: types.ChunkId, entry: ?types.ChunkId) !void {

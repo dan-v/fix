@@ -947,6 +947,62 @@ pub const ObjectHeap = struct {
         return .{ .allocator = allocator, .live_bits = bits, .high_water = high_water, .live_count = live };
     }
 
+    /// Live-slot bitmap for a range-allocated store (values/attrs/attr_positions),
+    /// mirroring `objectSnapshot`: every reserved id minus GC-freed ranges minus
+    /// each worker's unfilled TLAB tail. Lets the explorer browse only the real
+    /// records instead of the reserved backing capacity. Reuses `ObjectSnapshot`
+    /// (a plain id bitmap).
+    fn rangeStoreSnapshot(
+        self: *const ObjectHeap,
+        allocator: std.mem.Allocator,
+        comptime StoreT: type,
+        comptime store_field: []const u8,
+        comptime local_free_field: []const u8,
+        comptime shared_free_field: []const u8,
+        comptime tlab_field: []const u8,
+    ) !ObjectSnapshot {
+        const high_water = @field(self, store_field).count();
+        const words = (@as(usize, high_water) + 63) >> 6;
+        const bits = try allocator.alloc(u64, words);
+        @memset(bits, ~@as(u64, 0));
+        if (words > 0 and high_water & 63 != 0) {
+            bits[words - 1] = (@as(u64, 1) << @intCast(high_water & 63)) - 1;
+        }
+
+        if (high_water > 0) {
+            const freed = try allocator.alloc(u64, words);
+            defer allocator.free(freed);
+            @memset(freed, 0);
+            @field(self, shared_free_field).markBitmap(StoreT, freed, high_water);
+            for (self.worker_locals) |*local| @field(local, local_free_field).markBitmap(StoreT, freed, high_water);
+            for (bits, freed) |*b, f| b.* &= ~f;
+        }
+
+        for (self.worker_locals) |*local| {
+            const chunk = @field(local, tlab_field);
+            if (chunk.cursor >= chunk.end) continue;
+            const start = StoreT.globalIdOf(chunk.segment, chunk.cursor);
+            const end = StoreT.globalIdOf(chunk.segment, chunk.end);
+            clearSnapshotRange(bits, start, @min(end, high_water));
+        }
+
+        var live: u32 = 0;
+        for (bits) |word| live += @intCast(@popCount(word));
+        return .{ .allocator = allocator, .live_bits = bits, .high_water = high_water, .live_count = live };
+    }
+
+    pub fn valueSnapshot(self: *const ObjectHeap, allocator: std.mem.Allocator) !ObjectSnapshot {
+        return self.rangeStoreSnapshot(allocator, ValueStore, "values", "gc_free_values", "gc_shared_free_values", "value");
+    }
+
+    pub fn attrSnapshot(self: *const ObjectHeap, allocator: std.mem.Allocator) !ObjectSnapshot {
+        return self.rangeStoreSnapshot(allocator, AttrStore, "attrs", "gc_free_attrs", "gc_shared_free_attrs", "attr");
+    }
+
+    pub fn attrPosSnapshot(self: *const ObjectHeap, allocator: std.mem.Allocator) !ObjectSnapshot {
+        return self.rangeStoreSnapshot(allocator, AttrPosStore, "attr_positions", "gc_free_attr_pos", "gc_shared_free_attr_pos", "attr_pos");
+    }
+
     pub fn inspectObject(self: *const ObjectHeap, snapshot: *const ObjectSnapshot, id: ObjectId) !ObjectInfo {
         if (!snapshot.isLive(id)) return error.InvalidObjectId;
         return switch (self.objects.get(id).*) {
@@ -1000,7 +1056,7 @@ pub const ObjectHeap = struct {
         return .{ .state = state, .demanded = thunk.isDemanded(), .body = body };
     }
 
-    fn inspectValue(value: Value) ValueRef {
+    pub fn inspectValue(value: Value) ValueRef {
         const kind = value.kind();
         const target: ValueRef.Target = switch (kind) {
             .list, .attrs, .thunk, .builtin_closure, .string_context, .boxed_int, .partial_app => .{ .object = value.asObjectId() },
@@ -1032,6 +1088,28 @@ pub const ObjectHeap = struct {
             .attrs = self.attrs.count(),
             .attr_positions = self.attr_positions.count(),
         };
+    }
+
+    /// Direct access to a store slot by id, for the VM explorer's per-record
+    /// browsing. Ids below `count()` sit in allocated segments (dense append),
+    /// so a slot may hold current or GC-stale data — the explorer labels it as a
+    /// raw store slot rather than claiming reachability.
+    pub fn valueAt(self: *const ObjectHeap, id: u32) ?*const Value {
+        if (id >= self.values.count()) return null;
+        var next: u32 = id + 1;
+        return self.values.getIfAllocated(id, &next);
+    }
+
+    pub fn attrAt(self: *const ObjectHeap, id: u32) ?*const AttrEntry {
+        if (id >= self.attrs.count()) return null;
+        var next: u32 = id + 1;
+        return self.attrs.getIfAllocated(id, &next);
+    }
+
+    pub fn attrPosAt(self: *const ObjectHeap, id: u32) ?*const AttrPosEntry {
+        if (id >= self.attr_positions.count()) return null;
+        var next: u32 = id + 1;
+        return self.attr_positions.getIfAllocated(id, &next);
     }
 
     pub const Stats = struct {

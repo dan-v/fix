@@ -167,6 +167,47 @@ fi
 after_vm=${out##*$'\x1b[?1049l'}
 t "tty: vm transcript survives screen exit" "fix> 1 + 1" "$after_vm"
 
+# The code view for a chunk is one document (code + constants + references), and
+# the source view lists navigable sub-expression spans as breakpoint targets.
+out=$(
+    (
+        sleep 0.4
+        printf '1 + 2 * 3\r'
+        sleep 0.4
+        printf ':vm\r'
+        sleep 0.6
+        printf 's'
+        sleep 0.4
+        printf 'q'
+        sleep 0.3
+        printf '\004'
+        sleep 0.2
+    ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+t "tty vm: source view lists breakpoint spans" "SOURCE SPANS" "$out"
+
+# The tree filter modal is entered with F and echoes the query in the header.
+out=$(
+    (
+        sleep 0.4
+        printf '1 + 1\r'
+        sleep 0.4
+        printf ':vm\r'
+        sleep 0.6
+        printf 'F'
+        sleep 0.3
+        printf 'zqx\r'
+        sleep 0.4
+        printf 'q'
+        sleep 0.3
+        printf '\004'
+        sleep 0.2
+    ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+t "tty vm: filter modal echoes the query" "filter 'zqx'" "$out"
+
 # A debugger reached from the inline prompt owns one alternate-screen session
 # across multiple step stops, then restores the ordinary REPL on continue.
 out=$(
@@ -185,9 +226,10 @@ out=$(
     ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty debug: opens integrated screen" "fix debug · pause 1 · entry" "$out"
-# Two steps to cross into the import (pause 2 is still the <repl> `call`).
-t "tty debug: import step stays in screen" "fix debug · pause 3 · step · imported.nix" "$out"
+t "tty debug: opens integrated screen" "paused/entry" "$out"
+# Two steps to cross into the import (pause 2 is still the <repl> `call`); the
+# paused frame subtree shows the imported file within the same screen.
+t "tty debug: import step stays in screen" "imported.nix" "$out"
 debug_enters=$(grep -o $'\x1b\[?1049h' <<<"$out" | wc -l)
 debug_leaves=$(grep -o $'\x1b\[?1049l' <<<"$out" | wc -l)
 if ((debug_enters == 1 && debug_leaves == 1)); then
@@ -236,7 +278,7 @@ out=$(
     ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty vm debug: debugger is integrated" "fix debug · pause 1 · entry" "$out"
+t "tty vm debug: debugger is integrated" "paused/entry" "$out"
 t "tty vm debug: explorer redraws" "fix vm" "$out"
 vm_debug_enters=$(grep -o $'\x1b\[?1049h' <<<"$out" | wc -l)
 vm_debug_leaves=$(grep -o $'\x1b\[?1049l' <<<"$out" | wc -l)

@@ -88,6 +88,33 @@ test "object snapshot indexes only filled slots and exposes semantic details" {
     try std.testing.expectError(error.InvalidObjectId, heap.inspectObject(&snapshot, snapshot.high_water - 1));
 }
 
+test "range-store snapshots index only live records, not reserved capacity" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    // A 3-element list fills 3 value slots; the rest of the worker's value TLAB
+    // is reserved but unfilled and must NOT show up as live.
+    _ = try heap.addList(&.{ Value.int(1), Value.int(2), Value.int(3) });
+    const value_count = heap.counts().values;
+
+    var values = try heap.valueSnapshot(std.testing.allocator);
+    defer values.deinit();
+    try std.testing.expectEqual(value_count, values.high_water);
+    // The 3 filled slots are live; the reserved TLAB tail is excluded.
+    try std.testing.expectEqual(@as(u32, 3), values.live_count);
+    try std.testing.expect(values.live_count <= values.high_water);
+    try std.testing.expect(values.nextLive(0) != null);
+
+    _ = try heap.addAttrs(&.{
+        .{ .name = 10, .value = Value.int(1) },
+        .{ .name = 20, .value = Value.int(2) },
+    });
+    var attrs = try heap.attrSnapshot(std.testing.allocator);
+    defer attrs.deinit();
+    try std.testing.expectEqual(@as(u32, 2), attrs.live_count);
+    try std.testing.expect(attrs.live_count <= attrs.high_water);
+}
+
 test "object heap sorts attrs for binary lookup" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();

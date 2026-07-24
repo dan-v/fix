@@ -65,6 +65,10 @@ pub const BreakpointTable = struct {
         requested_line: u32,
         line: u32,
         pending: bool,
+        /// A per-instruction breakpoint pinned to one `(chunk_id, offset)` site
+        /// rather than a FILE:LINE. Not re-placeable by line, so lazy chunk
+        /// registration and pending-file resolution skip it.
+        site_only: bool = false,
     };
 
     /// A patched site realizing a request in a specific chunk.
@@ -100,6 +104,7 @@ pub const BreakpointTable = struct {
     /// debugger mutation hook.
     pub fn placeRegisteredChunk(self: *BreakpointTable, chunk_id: ChunkId, chunk: *Chunk) void {
         for (self.requests.items) |req| {
+            if (req.site_only) continue;
             if (!req.pending) self.placeRequestInChunk(req, chunk_id, chunk) catch {};
         }
         if (self.step_armed and self.step_follow_new_chunks) {
@@ -188,6 +193,45 @@ pub const BreakpointTable = struct {
             }
         }
         return found;
+    }
+
+    /// Set a per-instruction breakpoint at an exact `(chunk_id, offset)` site.
+    /// Unlike `set`, this does not resolve or track a source line: it patches
+    /// the one instruction the caller selected (asm view = an instruction row,
+    /// source view = a source-map span's entry offset).
+    pub fn setAt(self: *BreakpointTable, registry: *ChunkRegistry, chunk_id: ChunkId, offset: u32) !SetResult {
+        const id = self.next_id;
+        self.next_id += 1;
+        try self.requests.append(self.gpa, .{
+            .id = id,
+            .file = try self.gpa.dupe(u8, ""),
+            .requested_line = 0,
+            .line = 0,
+            .pending = false,
+            .site_only = true,
+        });
+        const before = self.placements.items.len;
+        if (registry.get(chunk_id)) |chunk| try self.placeSite(id, chunk_id, offset, chunk);
+        return .{
+            .id = id,
+            .line = 0,
+            .sites = self.placements.items.len - before,
+            .pending = false,
+        };
+    }
+
+    /// Remove whatever breakpoint owns the placement at `(chunk_id, offset)`,
+    /// restoring the patched byte. Returns true if a placement existed there.
+    pub fn removeAt(self: *BreakpointTable, registry: *ChunkRegistry, chunk_id: ChunkId, offset: u32) bool {
+        for (self.placements.items) |p| {
+            if (p.chunk_id == chunk_id and p.offset == offset) return self.remove(registry, p.req_id);
+        }
+        return false;
+    }
+
+    /// Whether a permanent breakpoint is currently placed at this exact site.
+    pub fn hasSite(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) bool {
+        return self.placedAt(chunk_id, offset);
     }
 
     /// Decide what the `breakpoint` handler does at `(chunk_id, offset)`: the
@@ -405,30 +449,34 @@ pub const BreakpointTable = struct {
             if (best_start == null or entry.start < best_start.?) best_start = entry.start;
         }
         const start = best_start orelse return;
-        if (start >= chunk.code.len) return;
-        if (self.instructionBoundaryAtOrAfter(chunk_id, chunk, start) != start) return;
-        // Already placed here?
+        try self.placeSite(req.id, chunk_id, start, chunk);
+    }
+
+    /// Patch one `(chunk_id, offset)` site to the breakpoint opcode under
+    /// `req_id`, saving the original byte. Rejects offsets that aren't a real
+    /// instruction boundary, sites already owned by another permanent
+    /// placement, and promotes an overlapping step temp so a resolving
+    /// permanent breakpoint doesn't get lost when the step clears.
+    fn placeSite(self: *BreakpointTable, req_id: u32, chunk_id: ChunkId, offset: u32, chunk: *const Chunk) !void {
+        if (offset >= chunk.code.len) return;
+        if (self.instructionBoundaryAtOrAfter(chunk_id, chunk, offset) != offset) return;
         for (self.placements.items) |p| {
-            if (p.chunk_id == chunk_id and p.offset == start) return;
+            if (p.chunk_id == chunk_id and p.offset == offset) return;
         }
         try self.placements.ensureUnusedCapacity(self.gpa, 1);
-        var original = chunk.code[start];
+        var original = chunk.code[offset];
         if (original == breakpoint_byte) {
-            // A pending permanent breakpoint can resolve while `step into`
-            // already owns this newly compiled entry. Promote that temporary
-            // patch instead of losing the permanent request when the step is
-            // cleared at the pause.
-            const promoted = self.takeStepPlacement(chunk_id, start) orelse return;
+            const promoted = self.takeStepPlacement(chunk_id, offset) orelse return;
             original = promoted.original;
         }
         self.placements.appendAssumeCapacity(.{
-            .req_id = req.id,
+            .req_id = req_id,
             .chunk_id = chunk_id,
-            .offset = start,
+            .offset = offset,
             .original = original,
         });
         // `chunk.code` is `[]u8`; the bytes are mutable even through `*const`.
-        chunk.code[start] = breakpoint_byte;
+        chunk.code[offset] = breakpoint_byte;
     }
 
     fn takeStepPlacement(self: *BreakpointTable, chunk_id: ChunkId, offset: u32) ?Placement {

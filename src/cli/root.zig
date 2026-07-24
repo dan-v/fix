@@ -16,7 +16,6 @@ test {
     _ = @import("build_progress.zig");
     _ = @import("debugger.zig");
     _ = @import("debugger_command.zig");
-    _ = @import("debugger_tui.zig");
     _ = @import("eval_support.zig");
     _ = @import("fileish.zig");
     _ = @import("nix_conf.zig");

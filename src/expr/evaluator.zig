@@ -207,6 +207,26 @@ pub const DebugSession = struct {
         return ref.vm.stack[f.frame_base + slot];
     }
 
+    /// The frame's live operand (working) stack — the VM stack slots above its
+    /// locals, up to the next frame's base (or the VM's stack pointer for the
+    /// innermost frame). Lets a pause show the raw VM stack, not just locals.
+    pub fn stackSlotCount(self: *const DebugSession, i: usize) usize {
+        const ref = debug_session.frameRef(self.vm, i);
+        const f = ref.frame();
+        const top: u32 = if (ref.index + 1 < ref.vm.frames_len)
+            ref.vm.frames[ref.index + 1].frame_base
+        else
+            ref.vm.sp;
+        const base = f.frame_base + f.local_count;
+        return if (top > base) top - base else 0;
+    }
+
+    pub fn stackSlot(self: *const DebugSession, i: usize, n: usize) Value {
+        const ref = debug_session.frameRef(self.vm, i);
+        const f = ref.frame();
+        return ref.vm.stack[f.frame_base + f.local_count + @as(u32, @intCast(n))];
+    }
+
     /// Write frame `i`'s always-on qualified name (`pkgs.hello`) to `w`, or
     /// nothing if anonymous. Available in every run — no `capture_names` flag.
     pub fn writeFrameName(self: *const DebugSession, w: *std.Io.Writer, i: usize) !void {
@@ -287,6 +307,19 @@ pub const DebugSession = struct {
     /// Remove a breakpoint by id; true if it existed.
     pub fn deleteBreakpoint(self: *DebugSession, id: u32) bool {
         return self.ev.deleteBreakpoint(id);
+    }
+
+    /// Per-instruction breakpoint toggling at an exact `(chunk_id, offset)`.
+    pub fn setBreakpointAt(self: *DebugSession, chunk_id: types.ChunkId, offset: u32) !bytecode.BreakpointTable.SetResult {
+        return self.ev.setBreakpointAt(chunk_id, offset);
+    }
+
+    pub fn deleteBreakpointAt(self: *DebugSession, chunk_id: types.ChunkId, offset: u32) bool {
+        return self.ev.deleteBreakpointAt(chunk_id, offset);
+    }
+
+    pub fn breakpointAt(self: *const DebugSession, chunk_id: types.ChunkId, offset: u32) bool {
+        return self.ev.breakpointAt(chunk_id, offset);
     }
 
     pub const StepKind = debug_session.StepKind;
@@ -1206,6 +1239,24 @@ pub const Evaluator = struct {
         return self.debugger.breakpoints.?.set(&self.registry, file, line);
     }
 
+    /// Per-instruction breakpoint at an exact `(chunk_id, offset)` site, for the
+    /// VM explorer's asm/source views. `line`-based `setBreakpoint` stays for
+    /// the console `break FILE:LINE` and pending/import resolution.
+    pub fn setBreakpointAt(self: *Evaluator, chunk_id: ChunkId, offset: u32) !bytecode.BreakpointTable.SetResult {
+        self.ensureBreakpointTable();
+        return self.debugger.breakpoints.?.setAt(&self.registry, chunk_id, offset);
+    }
+
+    pub fn deleteBreakpointAt(self: *Evaluator, chunk_id: ChunkId, offset: u32) bool {
+        if (self.debugger.breakpoints) |*breakpoints| return breakpoints.removeAt(&self.registry, chunk_id, offset);
+        return false;
+    }
+
+    pub fn breakpointAt(self: *const Evaluator, chunk_id: ChunkId, offset: u32) bool {
+        if (self.debugger.breakpoints) |*breakpoints| return breakpoints.hasSite(chunk_id, offset);
+        return false;
+    }
+
     pub fn listBreakpoints(self: *const Evaluator) []const bytecode.BreakpointTable.Request {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.list();
         return &.{};
@@ -1272,8 +1323,54 @@ pub const Evaluator = struct {
         return self.heap.objectSnapshot(allocator);
     }
 
+    /// Live-slot snapshots for the value/attr/attr-position stores, so the VM
+    /// explorer browses only real records, not reserved backing capacity.
+    pub fn heapValueSnapshot(self: *const Evaluator, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
+        return self.heap.valueSnapshot(allocator);
+    }
+
+    pub fn heapAttrSnapshot(self: *const Evaluator, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
+        return self.heap.attrSnapshot(allocator);
+    }
+
+    pub fn heapAttrPosSnapshot(self: *const Evaluator, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
+        return self.heap.attrPosSnapshot(allocator);
+    }
+
     pub fn inspectHeapObject(self: *const Evaluator, snapshot: *const ObjectHeap.ObjectSnapshot, id: runtime.types.ObjectId) !runtime.heap.ObjectInfo {
         return self.heap.inspectObject(snapshot, id);
+    }
+
+    /// Per-record access to the value/attr/attr-position stores, for the VM
+    /// explorer's heap-store browsing.
+    pub fn heapValueAt(self: *const Evaluator, id: u32) ?*const runtime.value.Value {
+        return self.heap.valueAt(id);
+    }
+
+    pub fn heapAttrAt(self: *const Evaluator, id: u32) ?*const runtime.heap.AttrEntry {
+        return self.heap.attrAt(id);
+    }
+
+    pub fn heapAttrPosAt(self: *const Evaluator, id: u32) ?*const runtime.heap.AttrPosEntry {
+        return self.heap.attrPosAt(id);
+    }
+
+    pub fn valueRef(_: *const Evaluator, value: Value) runtime.heap.ValueRef {
+        return ObjectHeap.inspectValue(value);
+    }
+
+    /// Enumerate an attrs / list object's members (non-forcing) for the VM
+    /// explorer, so a container value inspects into its actual entries.
+    pub fn heapAttrsOf(self: *Evaluator, id: runtime.types.ObjectId) ![]const runtime.heap.AttrEntry {
+        return self.heap.getAttrs(id);
+    }
+
+    pub fn heapListOf(self: *const Evaluator, id: runtime.types.ObjectId) ![]const Value {
+        return self.heap.getList(id);
+    }
+
+    pub fn heapBoxedInt(self: *const Evaluator, id: runtime.types.ObjectId) !i64 {
+        return self.heap.getBoxedInt(id);
     }
 
     pub fn internStats(self: *const Evaluator) InternTable.Stats {
