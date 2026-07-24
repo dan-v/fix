@@ -175,11 +175,11 @@ pub fn armTracking(heap: *ObjectHeap) void {
     heap.collection.collect_enabled = true;
     heap.collection.root_active = true; // arming turns rooting on (already on if constrained)
     heap.collection.track_from = heap.objects.count();
-    // A partially used object TLAB contains reserved ids below the tracking boundary.
-    // Discard it so every subsequent object enters the young-slot lists.
-    for (heap.worker_locals) |*l| {
-        l.object = .{};
-    }
+    // A partially used object TLAB contains reserved ids below the tracking
+    // boundary. Discard it so every subsequent object enters the young-slot
+    // lists; the discarded tails are recorded so the heap census keeps
+    // excluding them (they stay pinned but forever unfilled).
+    heap.discardObjectTLABs();
     // Detector build: pre-size the alloc bitmap to the whole object id
     // space so the incremental per-fill bit-set never reallocs (which
     // would free the array under a concurrent reader/setter at
