@@ -62,6 +62,8 @@ const zsh_script =
     \\    local response=($("$input[1]" completions --complete "$((CURRENT - 1))" -- "$input[@]" 2>/dev/null))
     \\    IFS="$ifs_bk"
     \\    local type="${response[1]%%$'\t'*}"
+    \\    local header="${response[1]#*$'\t'}"
+    \\    [[ "$header" == "$response[1]" ]] && header=
     \\    if [[ $type == filenames ]]; then
     \\        _files
     \\        return
@@ -137,7 +139,9 @@ const zsh_script =
     \\    if [[ $type == attrs ]]; then
     \\        compadd_args+=('-S' '')
     \\    fi
-    \\    compadd -V fix -l "${compadd_args[@]}" -d suggestions_display -a suggestions
+    \\    local -a header_args
+    \\    [[ -n "$header" ]] && header_args=(-X "$header")
+    \\    compadd -V fix -l "${compadd_args[@]}" "${header_args[@]}" -d suggestions_display -a suggestions
     \\}
     \\# When autoloaded from a site-functions directory, run the completion.
     \\# When sourced directly, register it instead of calling compadd outside ZLE.
@@ -356,6 +360,10 @@ fn complete(allocator: std.mem.Allocator, init: std.process.Init, w: *std.Io.Wri
         if (target == 2) try writeWordCandidates(w, current, "", &.{ "bash", "fish", "zsh" });
         return;
     }
+    if (command.kind == .flake) {
+        try completeFlake(allocator, init, w, words, target, current);
+        return;
+    }
     const cmd = command.args_cmd orelse {
         try w.writeAll("filenames\n");
         return;
@@ -389,6 +397,60 @@ fn complete(allocator: std.mem.Allocator, init: std.process.Init, w: *std.Io.Wri
         return;
     }
     try w.writeAll("filenames\n");
+}
+
+const flake_subcommands = [_][]const u8{ "check", "lock", "metadata", "show", "update" };
+
+/// Completions for `fix flake …`. Each context is a single category, labelled
+/// with a group header (rendered by zsh; ignored by bash/fish) so subcommands,
+/// input names, files, and flags never appear as one undifferentiated list.
+fn completeFlake(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    w: *std.Io.Writer,
+    words: []const [:0]const u8,
+    target: usize,
+    current: []const u8,
+) !void {
+    if (target <= 2) {
+        try w.writeAll("normal\tflake subcommand\n");
+        try writeWordCandidates(w, current, "", &flake_subcommands);
+        return;
+    }
+    // A flag anywhere → the shared (eval-grammar) option set.
+    if (std.mem.startsWith(u8, current, "-")) {
+        try w.writeAll("options\n");
+        try args.writeOptionCompletions(w, .eval, current);
+        return;
+    }
+    const sub = words[2];
+    if (std.mem.eql(u8, sub, "update")) {
+        // Positionals are the cwd flake's own input names.
+        try w.writeAll("normal\tflake input\n");
+        completeFlakeInputNames(allocator, init, w, current) catch {};
+        return;
+    }
+    if (std.mem.eql(u8, sub, "lock")) {
+        try w.writeAll("normal\n");
+        return;
+    }
+    // metadata / show / check take a flakeref → offer paths.
+    try w.writeAll("filenames\n");
+}
+
+/// List the declared input names of the flake in the current directory
+/// (`flake.nix`'s `inputs` attrset) — no fetch, no outputs.
+fn completeFlakeInputNames(allocator: std.mem.Allocator, init: std.process.Init, w: *std.Io.Writer, prefix: []const u8) !void {
+    var ev = try Evaluator.init(allocator, 1);
+    defer ev.deinit();
+    ev.setParallelismToggles(true, true);
+    ev.setFileIo(init.io);
+    const cwd = try std.process.currentPathAlloc(init.io, allocator);
+    defer allocator.free(cwd);
+    const expr = try std.fmt.allocPrint(allocator, "(import \"{s}/flake.nix\").inputs or {{}}", .{cwd});
+    defer allocator.free(expr);
+    const inputs = try ev.evaluate(expr);
+    try writeAttrEntries(allocator, w, &ev, inputs, prefix, "", "");
 }
 
 const Expected = struct {
@@ -801,6 +863,31 @@ test "attribute prefixes retain their completed parent" {
     const root = attrParts("rip");
     try std.testing.expectEqualStrings("", root.parent);
     try std.testing.expectEqualStrings("rip", root.partial);
+}
+
+test "flake subcommands complete under a group header, zsh renders it" {
+    // The subcommand position lists the subcommands, tagged with a group header.
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const words = [_][:0]const u8{ "fix", "flake", "" };
+    try complete(std.testing.allocator, undefined, &w, &words, 2);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "normal\tflake subcommand\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "metadata\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "update\n") != null);
+
+    // A partial subcommand filters the list.
+    var buf2: [4096]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&buf2);
+    const words2 = [_][:0]const u8{ "fix", "flake", "me" };
+    try complete(std.testing.allocator, undefined, &w2, &words2, 2);
+    const out2 = w2.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out2, "metadata\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "update\n") == null);
+
+    // The zsh adapter reads the header and passes it to `compadd -X`.
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "local header=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_script, "header_args=(-X \"$header\")") != null);
 }
 
 test "completion context tracks required and multi-value options" {
