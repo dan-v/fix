@@ -149,12 +149,13 @@ derivation-building commands, or the whole flake for `eval`. The system is
 resolved once (from the host) and baked in, so lowering never depends on
 `builtins.currentSystem`.
 
-**Flake `nixConfig`.** A local-path flake's `nixConfig` attrset is layered onto
-the settings exactly like `--option NAME VALUE` (config < `--option` <
-`nixConfig`), read up front by importing `flake.nix` (no outputs/inputs/store)
-so it applies before any daemon connection. Values are coerced as nix.conf
-expects: lists join with spaces, bools become `true`/`false`. (Remote-flakeref
-`nixConfig` is not yet read.)
+**Flake `nixConfig`.** A flake's `nixConfig` attrset is layered onto the settings
+exactly like `--option NAME VALUE` (config < `--option` < `nixConfig`), read up
+front by fetching the flake source and importing only its `flake.nix`
+`nixConfig` (no outputs/inputs/store) so it applies before any daemon
+connection. Remote flakes are fetched into the shared disk cache, so the real
+evaluation reuses the download. Values are coerced as nix.conf expects: lists
+join with spaces, bools become `true`/`false`.
 
 **Pure evaluation.** A `--flake` installable evaluates in *pure mode* by default
 (matching Nix's flake commands): `builtins.getEnv` returns `""`, filesystem

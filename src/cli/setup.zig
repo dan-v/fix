@@ -134,56 +134,64 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     };
 }
 
-/// Send per-connection daemon settings via `set_options` when the store
-/// connects. Like Nix, this is always sent: the client's resolved config is
-/// authoritative for the connection. The fixed fields come from the merged
-/// `nix.conf` (system + user + `$NIX_CONFIG` + `--option`/build-setting flags),
-/// and the whole merged map is forwarded as the overrides map (so any set key —
-/// `timeout`, `substituters`, … — reaches the daemon). `fix` reads the same
-/// `/etc/nix/nix.conf` the daemon does, so unchanged values are no-ops; only
-/// user/CLI overrides differ. `set_options` is only emitted when the store
-/// actually connects (build/instantiate/run/shell), never for plain `eval`.
-/// Fold each local-path flake installable's `nixConfig` into `settings`, exactly
-/// like `--option` overrides. Read via a throwaway evaluator that just `import`s
-/// `flake.nix` and coerces `nixConfig` to `name value` lines — no outputs,
-/// inputs, or store access, so it runs before any daemon connection. Remote
-/// flakerefs (github:, …) are skipped for now. Best-effort: any failure to read
+/// Fold each flake installable's `nixConfig` into `settings`, exactly like
+/// `--option` overrides (config < `--option` < `nixConfig`). Read via a
+/// throwaway evaluator that fetches the flake source and imports only its
+/// `flake.nix` `nixConfig` — no outputs, inputs, or store access — so it runs
+/// before any daemon connection. Remote flakes are fetched (disk-cached, so the
+/// real evaluation reuses it); a private/custom-registry flake may not resolve
+/// with the throwaway evaluator's minimal config. Best-effort: any failure
 /// leaves settings untouched.
 fn applyFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, options: args.Options, settings: *nix_conf.Settings) void {
     for (options.sources.items) |src| {
         if (src != .flake) continue;
         const inst = src.flake;
         const ref = if (std.mem.indexOfScalar(u8, inst, '#')) |h| inst[0..h] else inst;
-        const dir = localFlakeDir(allocator, init.io, ref) orelse continue;
-        defer allocator.free(dir);
-        foldFlakeNixConfig(allocator, init.io, dir, settings);
+        // A local `.`/`./` ref becomes an absolute path parseFlakeRef accepts.
+        const resolved = resolveNixConfigRef(allocator, init.io, ref);
+        defer if (resolved.owned) allocator.free(resolved.ref);
+        foldFlakeNixConfig(allocator, init, resolved.ref, settings);
     }
 }
 
-/// The local directory of a flake ref, or null for a non-local (scheme) ref.
-fn localFlakeDir(allocator: std.mem.Allocator, io: std.Io, ref: []const u8) ?[]u8 {
-    if (std.mem.startsWith(u8, ref, "path:")) return allocator.dupe(u8, ref["path:".len..]) catch null;
-    if (ref.len > 0 and ref[0] == '/') return allocator.dupe(u8, ref) catch null;
+const ResolvedNixConfigRef = struct { ref: []const u8, owned: bool };
+
+fn resolveNixConfigRef(allocator: std.mem.Allocator, io: std.Io, ref: []const u8) ResolvedNixConfigRef {
     if (std.mem.eql(u8, ref, ".") or std.mem.startsWith(u8, ref, "./") or std.mem.startsWith(u8, ref, "../")) {
-        const cwd = std.process.currentPathAlloc(io, allocator) catch return null;
+        const cwd = std.process.currentPathAlloc(io, allocator) catch return .{ .ref = ref, .owned = false };
         defer allocator.free(cwd);
-        return std.fs.path.resolve(allocator, &.{ cwd, ref }) catch null;
+        const abs = std.fs.path.resolve(allocator, &.{ cwd, ref }) catch return .{ .ref = ref, .owned = false };
+        return .{ .ref = abs, .owned = true };
     }
-    return null;
+    return .{ .ref = ref, .owned = false };
 }
 
-fn foldFlakeNixConfig(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, settings: *nix_conf.Settings) void {
+fn foldFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, ref: []const u8, settings: *nix_conf.Settings) void {
+    // A ref with quotes/backslashes is invalid; skip rather than mis-escape it.
+    if (std.mem.indexOfAny(u8, ref, "\"\\\n") != null) return;
     var ev = Evaluator.init(allocator, 1) catch return;
     defer ev.deinit();
-    ev.setFileIo(io);
-    // Coerce each nixConfig value to a string in-language: lists join with
-    // spaces (as nix.conf expects), bools become true/false, else `toString`.
+    ev.setFileIo(init.io);
+    ev.setEnvironment(init.environ_map);
+    // fetchTree / parseFlakeRef need the flakes feature (which implies fetch-tree).
+    var feats: args.ExperimentalFeatures = .{};
+    feats.insert(.flakes);
+    var policy = ev.languagePolicy();
+    policy.applyFeatureSets(feats, .{});
+    ev.configureLanguage(policy);
+    ev.setFlakeRegistryUrl(settings.get("flake-registry") orelse "https://channels.nixos.org/flake-registry.json") catch {};
+    if (settings.get("access-tokens")) |t| ev.setAccessTokens(t) catch {};
+    // Fetch the flake source, then coerce its nixConfig to `name value` lines:
+    // lists join with spaces (as nix.conf expects), bools become true/false.
     const expr = std.fmt.allocPrint(allocator,
-        \\let nc = (import "{s}/flake.nix").nixConfig or {{}};
+        \\let r = builtins.parseFlakeRef "{s}";
+        \\    src = builtins.fetchTree r;
+        \\    d = if r ? dir then "/" + r.dir else "";
+        \\    nc = (import (src.outPath + d + "/flake.nix")).nixConfig or {{}};
         \\    c = v: if builtins.isList v then builtins.concatStringsSep " " (map toString v)
         \\           else if builtins.isBool v then (if v then "true" else "false") else toString v;
         \\in builtins.concatStringsSep "\n" (map (n: n + " " + c nc.${{n}}) (builtins.attrNames nc))
-    , .{dir}) catch return;
+    , .{ref}) catch return;
     defer allocator.free(expr);
     const val = ev.evaluate(expr) catch return;
     var buf: [16384]u8 = undefined;
@@ -197,6 +205,15 @@ fn foldFlakeNixConfig(allocator: std.mem.Allocator, io: std.Io, dir: []const u8,
     }
 }
 
+/// Send per-connection daemon settings via `set_options` when the store
+/// connects. Like Nix, this is always sent: the client's resolved config is
+/// authoritative for the connection. The fixed fields come from the merged
+/// `nix.conf` (system + user + `$NIX_CONFIG` + `--option`/build-setting flags),
+/// and the whole merged map is forwarded as the overrides map (so any set key —
+/// `timeout`, `substituters`, … — reaches the daemon). `fix` reads the same
+/// `/etc/nix/nix.conf` the daemon does, so unchanged values are no-ops; only
+/// user/CLI overrides differ. `set_options` is only emitted when the store
+/// actually connects (build/instantiate/run/shell), never for plain `eval`.
 fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_conf.Settings) !void {
     const allocator = ev.hostAllocator();
     var overrides: std.ArrayListUnmanaged(store.daemon.Setting) = .empty;
