@@ -4,6 +4,7 @@ const thunks_log_enabled = @import("expr").vm.thunks_log_enabled;
 const vm_trace_enabled = @import("expr").vm.trace_log.enabled;
 
 pub const eval = @import("eval.zig");
+pub const flake = @import("flake.zig");
 pub const completions = @import("completions.zig");
 pub const parse = @import("parse.zig");
 pub const instantiate = @import("instantiate.zig");

@@ -230,7 +230,8 @@ pub fn builtinGetFlake(self: *VM, arg: Value) !Value {
     defer input_entries.deinit(self.allocator);
     if (!try resolveRootInputs(self, out_path, dir, &input_entries)) {
         // No lock: compute one (fetch + pin inputs), write it back when the
-        // flake tree is writable, and resolve inputs from it.
+        // flake tree is writable, and resolve inputs from it. `flake update`
+        // removes any existing lock first so this path re-pins to latest.
         _ = try generateAndUseLock(self, flake_value, out_path, dir, &input_entries);
     }
     // `self` is the flake's own fixpoint: outputs may read `self.packages`,

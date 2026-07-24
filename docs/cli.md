@@ -22,6 +22,7 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` evaluate expressi
 | `completions bash|zsh|fish` | generate a shell completion script on stdout | — |
 | `disasm` | decompile bytecode per-chunk with source-span, constant, and local/upvalue-name annotation | [compiler/pipeline.md](compiler/pipeline.md), [vm/dispatch.md](vm/dispatch.md) |
 | `eval` | evaluate mixed expression/file/flake inputs and render each value | — |
+| `flake metadata\|show\|check\|update\|lock [flakeref]` | inspect and manage a flake (see below) | — |
 | `instantiate` | evaluate to a derivation and add its `.drv` closure to the store (à la `nix-instantiate`) | [derivation/model.md](derivation/model.md) |
 | `parse` | parse and statically validate an expression, then print the `nix-instantiate --parse` JSON AST | [syntax/parsing.md](syntax/parsing.md) |
 | `repl` | interactive read-eval loop | — |
@@ -161,10 +162,26 @@ reads are confined to the store and the flake's own source tree, `<...>` /
 `NIX_PATH` search-path lookups are rejected, and `builtins.fetchTree` /
 `fetchGit` / `fetchTarball` / `fetchurl` / `fetchMercurial` must be
 content-locked (a `narHash` / `rev` / `sha256`). Pass `--impure` to lift all of
-these. Plain expression/file inputs (`-E`, a path) are impure as before. (Not
-yet restricted in pure mode: `builtins.currentSystem` / `currentTime` — a
-baked-in constant that would need a force-time guard — and lockless flake-input
-fetches, which pair with lockfile computation.)
+these. `builtins.currentSystem` / `currentTime` are also unavailable in pure
+mode (a flake must take `system` as an output argument). Plain expression/file
+inputs (`-E`, a path) are impure as before.
+
+### The flake command
+
+`fix flake <subcommand> [flakeref]` inspects and manages a flake; the flakeref
+defaults to `.`. All subcommands require the `flakes` feature.
+
+| Subcommand | Effect |
+|---|---|
+| `metadata` | print the flake's resolved path, locked `narHash`, description, revision, last-modified time, and declared inputs |
+| `show` | print the outputs as a tree (`packages`/`apps`/`devShells`/`checks` per system; `nixosConfigurations`, `overlays`, `templates`, … flat) |
+| `check` | evaluate every output and report the ones that fail (non-zero exit on any failure) |
+| `lock` | create `flake.lock` if it is missing (keeps an existing lock) |
+| `update` | re-pin `flake.lock` to the latest inputs (backs up and restores the old lock if the recompute fails) |
+
+`update`/`lock` need a local flake (a path ref). Lock (re)generation reuses the
+same path as ordinary evaluation — `getFlake` writes the lock when the flake has
+inputs and its directory is writable.
 
 ### Evaluation / output
 

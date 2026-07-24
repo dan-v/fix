@@ -29,6 +29,7 @@ fn commandRun(comptime kind: command_meta.Kind) SubcommandRun {
         .completions => commands.completions.run,
         .disasm => commands.disasm.run,
         .eval => commands.eval.run,
+        .flake => commands.flake.run,
         .instantiate => commands.instantiate.run,
         .parse => commands.parse.run,
         .repl => commands.repl.run,

@@ -1879,6 +1879,56 @@ pub const Evaluator = struct {
         return current;
     }
 
+    /// The sorted attribute names of `value` (owned outer slice; the names are
+    /// borrowed from the intern table). Null when `value` is not an attrset.
+    /// Used by the `flake` subcommands to walk a flake's outputs/inputs.
+    pub fn attrNames(self: *Evaluator, allocator: std.mem.Allocator, value: Value) !?[][]const u8 {
+        const forced = try self.forceValue(value);
+        if (!forced.isAttrs()) return null;
+        const attrs = try self.heap.getAttrs(forced.asObjectId());
+        const names = try allocator.alloc([]const u8, attrs.len);
+        for (attrs, 0..) |e, i| names[i] = self.intern.get(e.name);
+        std.mem.sort([]const u8, names, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        return names;
+    }
+
+    /// Force `value` and return its attribute `name` (unforced), or null if
+    /// `value` is not an attrset or has no such attribute.
+    pub fn getAttr(self: *Evaluator, value: Value, name: []const u8) !?Value {
+        const forced = try self.forceValue(value);
+        if (!forced.isAttrs()) return null;
+        return self.heap.getAttrValueOpt(forced.asObjectId(), try self.intern.intern(name));
+    }
+
+    /// The text of string attribute `name` on `value`, or null. Borrowed.
+    pub fn stringAttr(self: *Evaluator, value: Value, name: []const u8) !?[]const u8 {
+        const forced = try self.forceValue(value);
+        if (!forced.isAttrs()) return null;
+        return self.forcedStringAttr(forced.asObjectId(), name);
+    }
+
+    /// The text of `value` if it is a string/path (following string context),
+    /// or null otherwise. Borrowed from the intern table.
+    pub fn stringValue(self: *Evaluator, value: Value) !?[]const u8 {
+        const forced = try self.forceValue(value);
+        return switch (forced.kind()) {
+            .string, .path => self.intern.get(forced.asInternId()),
+            .string_context => self.intern.get((try self.heap.getContextString(forced.asObjectId())).text),
+            else => null,
+        };
+    }
+
+    /// The value of integer attribute `name` on `value`, or null.
+    pub fn intAttr(self: *Evaluator, value: Value, name: []const u8) !?i64 {
+        const attr = (try self.getAttr(value, name)) orelse return null;
+        const forced = try self.forceValue(attr);
+        return if (forced.isInt()) forced.asInt() else null;
+    }
+
     pub fn forceDeep(self: *Evaluator, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "strict result" } });
         defer observation.cancel();
