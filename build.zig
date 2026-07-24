@@ -289,6 +289,31 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_lang.addArgs(args);
     lang_step.dependOn(&run_lang.step);
 
+    // Zig port of the conformance runner (test/lang/*.zig). Runs alongside the
+    // python runner during the port; once at oracle parity it replaces it and
+    // `test/lang/*.py` + `run*.sh` are removed. e.g. `test-lang-zig -- --suite snix`.
+    const lang_zig_exe = b.addExecutable(.{
+        .name = "lang-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/lang/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            // POSIX special-file creation (mkfifo/mknod) for snix fixtures.
+            .link_libc = true,
+        }),
+        .use_llvm = true,
+    });
+    const run_lang_zig = b.addRunArtifact(lang_zig_exe);
+    run_lang_zig.step.dependOn(b.getInstallStep());
+    run_lang_zig.has_side_effects = true;
+    run_lang_zig.addArg("--repo");
+    run_lang_zig.addArg(b.pathFromRoot("."));
+    run_lang_zig.addArg("--fix");
+    run_lang_zig.addArg(b.pathFromRoot("zig-out/bin/fix"));
+    if (b.args) |args| run_lang_zig.addArgs(args);
+    const lang_zig_step = b.step("test-lang-zig", "Run the Zig conformance runner (port of test/lang/run.py)");
+    lang_zig_step.dependOn(&run_lang_zig.step);
+
     // End-to-end CLI suites (test/e2e/): drive the freshly built `fix` through
     // behavioral checks (repl pipe+PTY contract, `fix flake` subcommands, ...).
     // Adding coverage is dropping a `test/e2e/<name>.sh` fragment. Pipe-mode
