@@ -81,6 +81,9 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     defer settings.deinit();
     // `--option NAME VALUE` overrides; `--option extra-NAME VALUE` appends (Nix).
     for (options.option_overrides.items) |o| try settings.setOrAppend(o.name, o.value);
+    // A flake's own `nixConfig` layers on top, exactly like `--option` (read up
+    // front so it applies before daemon settings are sent — see below).
+    applyFlakeNixConfig(allocator, init, options, &settings);
     ev.setTraceVerbose(boolSetting(&settings, "trace-verbose", false));
     if (!options.experimental_features_reset) {
         if (settings.get("experimental-features")) |list|
@@ -140,6 +143,60 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
 /// `/etc/nix/nix.conf` the daemon does, so unchanged values are no-ops; only
 /// user/CLI overrides differ. `set_options` is only emitted when the store
 /// actually connects (build/instantiate/run/shell), never for plain `eval`.
+/// Fold each local-path flake installable's `nixConfig` into `settings`, exactly
+/// like `--option` overrides. Read via a throwaway evaluator that just `import`s
+/// `flake.nix` and coerces `nixConfig` to `name value` lines — no outputs,
+/// inputs, or store access, so it runs before any daemon connection. Remote
+/// flakerefs (github:, …) are skipped for now. Best-effort: any failure to read
+/// leaves settings untouched.
+fn applyFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, options: args.Options, settings: *nix_conf.Settings) void {
+    for (options.sources.items) |src| {
+        if (src != .flake) continue;
+        const inst = src.flake;
+        const ref = if (std.mem.indexOfScalar(u8, inst, '#')) |h| inst[0..h] else inst;
+        const dir = localFlakeDir(allocator, init.io, ref) orelse continue;
+        defer allocator.free(dir);
+        foldFlakeNixConfig(allocator, init.io, dir, settings);
+    }
+}
+
+/// The local directory of a flake ref, or null for a non-local (scheme) ref.
+fn localFlakeDir(allocator: std.mem.Allocator, io: std.Io, ref: []const u8) ?[]u8 {
+    if (std.mem.startsWith(u8, ref, "path:")) return allocator.dupe(u8, ref["path:".len..]) catch null;
+    if (ref.len > 0 and ref[0] == '/') return allocator.dupe(u8, ref) catch null;
+    if (std.mem.eql(u8, ref, ".") or std.mem.startsWith(u8, ref, "./") or std.mem.startsWith(u8, ref, "../")) {
+        const cwd = std.process.currentPathAlloc(io, allocator) catch return null;
+        defer allocator.free(cwd);
+        return std.fs.path.resolve(allocator, &.{ cwd, ref }) catch null;
+    }
+    return null;
+}
+
+fn foldFlakeNixConfig(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, settings: *nix_conf.Settings) void {
+    var ev = Evaluator.init(allocator, 1) catch return;
+    defer ev.deinit();
+    ev.setFileIo(io);
+    // Coerce each nixConfig value to a string in-language: lists join with
+    // spaces (as nix.conf expects), bools become true/false, else `toString`.
+    const expr = std.fmt.allocPrint(allocator,
+        \\let nc = (import "{s}/flake.nix").nixConfig or {{}};
+        \\    c = v: if builtins.isList v then builtins.concatStringsSep " " (map toString v)
+        \\           else if builtins.isBool v then (if v then "true" else "false") else toString v;
+        \\in builtins.concatStringsSep "\n" (map (n: n + " " + c nc.${{n}}) (builtins.attrNames nc))
+    , .{dir}) catch return;
+    defer allocator.free(expr);
+    const val = ev.evaluate(expr) catch return;
+    var buf: [16384]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    ev.writeRawValue(&w, val) catch return;
+    var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        settings.setOrAppend(line[0..sp], line[sp + 1 ..]) catch {};
+    }
+}
+
 fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_conf.Settings) !void {
     const allocator = ev.hostAllocator();
     var overrides: std.ArrayListUnmanaged(store.daemon.Setting) = .empty;
