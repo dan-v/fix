@@ -186,7 +186,7 @@ out=$(
     ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty vm: unified inspector lists source spans" "SOURCE SPANS" "$out"
+t "tty vm: unified inspector navigates source spans in place" "SOURCE · j/k selects sub-expressions" "$out"
 t "tty vm: unified inspector includes code" "CODE · chunk" "$out"
 
 # Nested expressions on one line may share a bytecode-entry offset. A source

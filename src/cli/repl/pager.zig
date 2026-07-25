@@ -1007,13 +1007,7 @@ const Tui = struct {
                 };
                 var page: PageBuilder = .{ .arena = arena };
                 try self.appendChunkEquivalence(&page, id);
-                const source_lines = try self.sourceDocument(arena, id, chunk, self.focusedSourceSpan(id));
-                try page.line("SOURCE", .none);
-                // `sourceDocument` includes its file:line:column label followed
-                // by the focused excerpt, matching the debugger frame layout.
-                for (source_lines) |source_line| try page.line(source_line, .none);
-                try page.line("", .none);
-                try self.appendSourceSpans(&page, id, chunk);
+                try self.appendSourceDocument(&page, id, chunk, self.focusedSourceSpan(id));
                 try page.line("", .none);
                 try page.line(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{id}), .none);
                 try self.appendDisassembly(&page, id, chunk, .code);
@@ -1332,16 +1326,16 @@ const Tui = struct {
             try page.line("", .none);
         }
 
-        if (self.focusedSourceSpan(chunk_id) orelse info.span) |span| if (session.frameSourceText(index)) |source| {
+        if (self.ev.getChunk(chunk_id)) |chunk| {
+            if (self.focusedSourceSpan(chunk_id) orelse info.span) |span| if (session.frameSourceText(index)) |source| {
+                try self.appendSourceDocumentWithText(&page, chunk_id, chunk, source, span);
+                try page.line("", .none);
+            };
+        } else if (info.span) |span| if (session.frameSourceText(index)) |source| {
             try page.line("SOURCE", .none);
-            try self.appendSourceExcerpt(&page, source, span);
+            try self.appendSourceExcerpt(&page, source, span, null);
             try page.line("", .none);
         };
-
-        if (self.ev.getChunk(chunk_id)) |chunk| {
-            try self.appendSourceSpans(&page, chunk_id, chunk);
-            try page.line("", .none);
-        }
 
         try page.line("LOCALS (values are not forced)", .none);
         var any = false;
@@ -1590,17 +1584,17 @@ const Tui = struct {
         std.mem.reverse(LineRange, self.transcript_lines.items);
     }
 
-    fn sourceDocument(
+    fn appendSourceDocument(
         self: *Tui,
-        arena: std.mem.Allocator,
+        document: *PageBuilder,
         id: ChunkId,
         chunk: *const bytecode.Chunk,
         focused_span: ?bytecode.Chunk.SourceSpan,
-    ) ![][]u8 {
-        const span = focused_span orelse chunk.body_span orelse if (chunk.source_map.len > 0) chunk.source_map[0].span else {
-            var missing: PageBuilder = .{ .arena = arena };
-            try missing.line("(no source information)", .none);
-            return missing.lines.items;
+    ) !void {
+        const span = focused_span orelse firstSourceSpan(chunk) orelse chunk.body_span orelse {
+            try document.line("SOURCE", .none);
+            try document.line("(no source information)", .none);
+            return;
         };
 
         const label, const source = if (span.file) |file| blk: {
@@ -1611,14 +1605,30 @@ const Tui = struct {
             break :blk .{ "<repl expression>", direct };
         };
 
-        var document: PageBuilder = .{ .arena = arena };
-        try document.line(try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ label, span.line, span.column }), .none);
+        try document.line("SOURCE · j/k selects sub-expressions · p toggles breakpoint", .none);
+        try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{ label, span.line, span.column }), .none);
         const bytes = source orelse {
             try document.line("(source text is unavailable)", .none);
-            return document.lines.items;
+            return;
         };
-        try self.appendSourceExcerpt(&document, bytes, span);
-        return document.lines.items;
+        try self.appendSourceExcerpt(document, bytes, span, sourceLocation(id, chunk, span));
+    }
+
+    fn appendSourceDocumentWithText(
+        self: *Tui,
+        document: *PageBuilder,
+        id: ChunkId,
+        chunk: *const bytecode.Chunk,
+        source: []const u8,
+        span: bytecode.Chunk.SourceSpan,
+    ) !void {
+        try document.line("SOURCE · j/k selects sub-expressions · p toggles breakpoint", .none);
+        try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{
+            if (span.file) |file| self.ev.internTable().get(file) else "<repl expression>",
+            span.line,
+            span.column,
+        }), .none);
+        try self.appendSourceExcerpt(document, source, span, sourceLocation(id, chunk, span));
     }
 
     fn focusedSourceSpan(self: *const Tui, chunk_id: ChunkId) ?bytecode.Chunk.SourceSpan {
@@ -1662,7 +1672,13 @@ const Tui = struct {
         return if (location.span != null) location else null;
     }
 
-    fn appendSourceExcerpt(self: *Tui, document: *PageBuilder, source: []const u8, span: bytecode.Chunk.SourceSpan) !void {
+    fn appendSourceExcerpt(
+        self: *Tui,
+        document: *PageBuilder,
+        source: []const u8,
+        span: bytecode.Chunk.SourceSpan,
+        location: ?BreakpointLocation,
+    ) !void {
         const focus_start = @min(@as(usize, span.offset), source.len);
         const focus_end = @min(focus_start +| @as(usize, span.len), source.len);
 
@@ -1702,7 +1718,11 @@ const Tui = struct {
                 .focus = selected,
             });
             if (line_end > cursor +| 4096) try rendered.writer.writeAll(" …");
-            try document.line(rendered.written(), .none);
+            if (active and location != null) {
+                try document.lineAt(rendered.written(), .instruction, location.?);
+            } else {
+                try document.line(rendered.written(), .none);
+            }
             line_number += 1;
             if (newline >= end or newline == source.len) break;
             cursor = newline + 1;
@@ -1720,82 +1740,63 @@ const Tui = struct {
         return null;
     }
 
-    /// A source-map span (sub-expression) breakpoint target: distinct spans in
-    /// source order, deduped, each keyed on the first instruction of its
-    /// bytecode range.
-    const SpanTarget = struct {
-        file: ?runtime.types.InternId,
-        offset: u32,
-        len: u32,
-        line: u32,
-        column: u32,
-        start: u32,
-    };
-
-    /// The breakpoint targets a chunk exposes in its source view. Unlike the
-    /// disassembly's per-instruction rows, these retain exact source-span
-    /// identity; the breakpoint table resolves each to the first instruction
-    /// owned by that span's tightest source mapping.
-    fn appendSourceSpans(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk) !void {
-        const arena = page.arena;
-        try page.line(" SOURCE SPANS · p toggles a breakpoint on the selected sub-expression", .none);
-        if (chunk.source_map.len == 0) {
-            try page.line("  (this chunk carries no source spans)", .none);
-            return;
-        }
-
-        var targets = try arena.alloc(SpanTarget, chunk.source_map.len);
-        var n: usize = 0;
-        for (chunk.source_map) |entry| {
-            targets[n] = .{
-                .file = entry.span.file,
-                .offset = entry.span.offset,
-                .len = entry.span.len,
-                .line = entry.span.line,
-                .column = entry.span.column,
-                .start = entry.start,
-            };
-            n += 1;
-        }
-        targets = targets[0..n];
-        std.mem.sort(SpanTarget, targets, {}, struct {
-            fn lt(_: void, a: SpanTarget, b: SpanTarget) bool {
-                if (a.offset != b.offset) return a.offset < b.offset;
-                if (a.len != b.len) return a.len < b.len;
-                return a.start < b.start;
-            }
-        }.lt);
-
-        const source = self.chunkSourceText(id, chunk);
-        var last_offset: ?u32 = null;
-        var last_len: ?u32 = null;
-        for (targets) |t| {
-            if (last_offset != null and t.offset == last_offset.? and t.len == last_len.?) continue;
-            last_offset = t.offset;
-            last_len = t.len;
-            const snippet = self.highlightedSpanSnippet(arena, source, t) catch "";
-            const text = try std.fmt.allocPrint(arena, "  L{d}:{d}  {s}", .{ t.line, t.column, snippet });
-            try page.lineAt(text, .instruction, .{
-                .chunk_id = id,
-                .offset = t.start,
-                .line = t.line,
-                .span = .{
-                    .file = t.file,
-                    .offset = t.offset,
-                    .len = t.len,
-                    .line = t.line,
-                    .column = t.column,
-                },
-            });
-        }
+    fn sameSourceSpan(a: bytecode.Chunk.SourceSpan, b: bytecode.Chunk.SourceSpan) bool {
+        return a.file == b.file and a.offset == b.offset and a.len == b.len;
     }
 
-    fn highlightedSpanSnippet(self: *Tui, arena: std.mem.Allocator, source: ?[]const u8, target: anytype) ![]const u8 {
-        const snippet = try spanSnippet(arena, source, target);
-        if (snippet.len == 0) return snippet;
-        var rendered: std.Io.Writer.Allocating = .init(arena);
-        try source_render.writeLine(&rendered.writer, snippet, .{ .color_depth = self.color_depth });
-        return rendered.written();
+    fn sourceSpanLess(a: bytecode.Chunk.SourceSpan, b: bytecode.Chunk.SourceSpan) bool {
+        if (a.offset != b.offset) return a.offset < b.offset;
+        if (a.len != b.len) return a.len < b.len;
+        if (a.line != b.line) return a.line < b.line;
+        return a.column < b.column;
+    }
+
+    fn firstSourceSpan(chunk: *const bytecode.Chunk) ?bytecode.Chunk.SourceSpan {
+        var first: ?bytecode.Chunk.SourceSpan = null;
+        for (chunk.source_map) |entry| {
+            if (first == null or sourceSpanLess(entry.span, first.?)) first = entry.span;
+        }
+        return first;
+    }
+
+    fn adjacentSourceSpan(
+        chunk: *const bytecode.Chunk,
+        current: bytecode.Chunk.SourceSpan,
+        forward: bool,
+    ) ?bytecode.Chunk.SourceSpan {
+        var candidate: ?bytecode.Chunk.SourceSpan = null;
+        for (chunk.source_map) |entry| {
+            const span = entry.span;
+            if (sameSourceSpan(span, current)) continue;
+            const follows = sourceSpanLess(current, span);
+            const precedes = sourceSpanLess(span, current);
+            if ((forward and !follows) or (!forward and !precedes)) continue;
+            if (candidate == null or
+                (forward and sourceSpanLess(span, candidate.?)) or
+                (!forward and sourceSpanLess(candidate.?, span)))
+            {
+                candidate = span;
+            }
+        }
+        return candidate;
+    }
+
+    fn sourceLocation(
+        id: ChunkId,
+        chunk: *const bytecode.Chunk,
+        span: bytecode.Chunk.SourceSpan,
+    ) ?BreakpointLocation {
+        var start: ?u32 = null;
+        for (chunk.source_map) |entry| {
+            if (!sameSourceSpan(entry.span, span)) continue;
+            if (start == null or entry.start < start.?) start = entry.start;
+        }
+        return .{
+            .chunk_id = id,
+            .offset = start orelse return null,
+            .line = span.line,
+            .span = span,
+        };
     }
 
     // -- navigation ------------------------------------------------------------
@@ -2684,6 +2685,28 @@ const Tui = struct {
 
     fn moveDetail(self: *Tui, forward: bool) void {
         if (self.page.actions.len == 0) return;
+        if (self.selectedSourceLocation()) |location| {
+            if (self.ev.getChunk(location.chunk_id)) |chunk| {
+                if (adjacentSourceSpan(chunk, location.span.?, forward)) |span| {
+                    self.source_focus = .{ .chunk_id = location.chunk_id, .span = span };
+                    const kind = self.currentKind();
+                    self.refreshPage(kind) catch {
+                        self.status_msg = "(source preview unavailable)";
+                        return;
+                    };
+                    for (self.page.locations, 0..) |candidate, i| {
+                        const next = candidate orelse continue;
+                        const next_span = next.span orelse continue;
+                        if (next.chunk_id == location.chunk_id and sameSourceSpan(next_span, span)) {
+                            self.navigation.detail_selection = i;
+                            self.ensureDetailVisible();
+                            break;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
         var cursor = self.navigation.detail_selection;
         while (true) {
             if (forward) {
