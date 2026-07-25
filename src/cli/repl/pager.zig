@@ -1454,21 +1454,23 @@ const Tui = struct {
     fn appendDisassemblyAt(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk, panel: Panel, current_offset: ?u32) !void {
         var text: std.Io.Writer.Allocating = .init(page.arena);
         const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
+        var inspected_chunk = chunk.*;
+        inspected_chunk.code = try self.ev.unpatchedChunkCode(page.arena, id, chunk);
         var options = disasm_options;
         options.color_depth = self.color_depth;
         options.show_constants = panel == .tables;
         options.show_code = panel == .code;
         options.current_offset = current_offset;
         options.line_width = @intCast(@min(self.layout().main_width, std.math.maxInt(u16)));
-        try disasm.writeChunk(page.arena, &text.writer, id, chunk, symbols, options);
+        try disasm.writeChunk(page.arena, &text.writer, id, &inspected_chunk, symbols, options);
 
         var lines = std.mem.splitScalar(u8, text.written(), '\n');
         while (lines.next()) |line| {
             if (line.len == 0 and lines.peek() == null) break;
             const plain = base.terminal_text.stripAnsiInPlace(try page.arena.dupe(u8, line));
             const target = disasmTarget(plain);
-            const action: RowAction = if (target == .none and disasmOffset(chunk, plain) != null) .instruction else target;
-            try page.lineAt(line, action, self.disasmLocation(id, chunk, plain));
+            const action: RowAction = if (target == .none and disasmOffset(&inspected_chunk, plain) != null) .instruction else target;
+            try page.lineAt(line, action, self.disasmLocation(id, &inspected_chunk, plain));
         }
     }
 

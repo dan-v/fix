@@ -457,6 +457,24 @@ pub const BreakpointTable = struct {
         return @enumFromInt(raw);
     }
 
+    /// Restore debugger-patched opcode bytes in a caller-owned copy of a
+    /// chunk's code. Inspectors should describe the program, not the trap bytes
+    /// temporarily installed to implement breakpoints and granular stepping.
+    pub fn restoreOriginalCode(
+        self: *const BreakpointTable,
+        chunk_id: ChunkId,
+        destination: []u8,
+    ) void {
+        for (self.placements.items) |placement| {
+            if (placement.chunk_id == chunk_id and placement.offset < destination.len)
+                destination[placement.offset] = placement.original;
+        }
+        for (self.step_temps.items) |placement| {
+            if (placement.chunk_id == chunk_id and placement.offset < destination.len)
+                destination[placement.offset] = placement.original;
+        }
+    }
+
     fn instructionEnd(self: *const BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk, start: usize) ?usize {
         const raw = self.originalOpcodeByte(chunk_id, start, chunk);
         if (raw >= opcode.count) return null;
@@ -732,6 +750,10 @@ test "step sites advance suspended operand ips to instruction boundaries" {
     try table.placeStepSite(9, 1, &chunk);
     try std.testing.expectEqual(@as(u8, 7), code[1]);
     try table.placeStepSite(9, 2, &chunk);
+    try std.testing.expectEqual(breakpoint_byte, code[2]);
+    var inspected = code;
+    table.restoreOriginalCode(9, &inspected);
+    try std.testing.expectEqual(@intFromEnum(opcode.OpCode.push_const), inspected[2]);
     try std.testing.expectEqual(breakpoint_byte, code[2]);
     try std.testing.expectEqual(@as(?u32, 5), table.instructionBoundaryAtOrAfter(9, &chunk, 3));
     try std.testing.expectEqual(@as(?u32, 0), table.instructionForSavedIp(9, &chunk, 1));

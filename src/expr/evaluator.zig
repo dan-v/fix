@@ -1288,6 +1288,20 @@ pub const Evaluator = struct {
         return false;
     }
 
+    /// A presentation-safe copy of chunk code with debugger trap patches
+    /// replaced by their original opcodes.
+    pub fn unpatchedChunkCode(
+        self: *const Evaluator,
+        allocator: std.mem.Allocator,
+        chunk_id: ChunkId,
+        chunk: *const bytecode.Chunk,
+    ) ![]u8 {
+        const code = try allocator.dupe(u8, chunk.code);
+        if (self.debugger.breakpoints) |*breakpoints|
+            breakpoints.restoreOriginalCode(chunk_id, code);
+        return code;
+    }
+
     pub fn listBreakpoints(self: *const Evaluator) []const bytecode.BreakpointTable.Request {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.list();
         return &.{};
