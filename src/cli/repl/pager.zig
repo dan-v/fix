@@ -1319,7 +1319,7 @@ const Tui = struct {
         }
         try page.line("", .none);
 
-        if (session.reason == .return_step or session.reason == .break_builtin or session.reason == .eval_error) {
+        if (session.reason == .break_builtin or session.reason == .eval_error) {
             try page.line(returnValueHeading(session.reason), .{ .heading = .code });
             try self.appendValueLine(&page, "  => ", session.value);
             try page.line("  (Enter on the tree's ↳ row opens it as a full subject)", .none);
@@ -1366,7 +1366,14 @@ const Tui = struct {
 
         if (self.ev.getChunk(chunk_id)) |chunk| {
             try page.line(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{chunk_id}), .none);
-            try self.appendDisassemblyAt(&page, chunk_id, chunk, .code, info.instruction);
+            try self.appendDisassemblyAt(
+                &page,
+                chunk_id,
+                chunk,
+                .code,
+                info.instruction,
+                if (session.reason == .return_step) session.value else null,
+            );
         }
 
         return .{
@@ -1448,10 +1455,18 @@ const Tui = struct {
     }
 
     fn appendDisassembly(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk, panel: Panel) !void {
-        return self.appendDisassemblyAt(page, id, chunk, panel, null);
+        return self.appendDisassemblyAt(page, id, chunk, panel, null, null);
     }
 
-    fn appendDisassemblyAt(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk, panel: Panel, current_offset: ?u32) !void {
+    fn appendDisassemblyAt(
+        self: *Tui,
+        page: *PageBuilder,
+        id: ChunkId,
+        chunk: *const bytecode.Chunk,
+        panel: Panel,
+        current_offset: ?u32,
+        returned_value: ?runtime.value.Value,
+    ) !void {
         var text: std.Io.Writer.Allocating = .init(page.arena);
         const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
         var inspected_chunk = chunk.*;
@@ -1470,8 +1485,47 @@ const Tui = struct {
             const plain = base.terminal_text.stripAnsiInPlace(try page.arena.dupe(u8, line));
             const target = disasmTarget(plain);
             const action: RowAction = if (target == .none and disasmOffset(&inspected_chunk, plain) != null) .instruction else target;
-            try page.lineAt(line, action, self.disasmLocation(id, &inspected_chunk, plain));
+            const location = self.disasmLocation(id, &inspected_chunk, plain);
+            if (returned_value) |value| {
+                if (location != null and current_offset != null and location.?.offset == current_offset.?) {
+                    const available = self.layout().main_width -| 2;
+                    var annotation: std.Io.Writer.Allocating = .init(page.arena);
+                    try annotation.writer.writeAll("  ↳ return ");
+                    try disasm.writeValueDigest(
+                        &annotation.writer,
+                        value,
+                        symbols,
+                        @max(available -| 12, 8),
+                        self.color_depth,
+                    );
+                    if (tui.displayWidth(line, width_mod.cpWidth) +
+                        tui.displayWidth(annotation.written(), width_mod.cpWidth) <= available)
+                    {
+                        try page.lineAt(
+                            try std.fmt.allocPrint(page.arena, "{s}{s}", .{ line, annotation.written() }),
+                            action,
+                            location,
+                        );
+                    } else {
+                        try page.lineAt(line, action, location);
+                        try page.line(
+                            try std.fmt.allocPrint(page.arena, "          {s}", .{annotation.written()[2..]}),
+                            self.valueRowAction(value),
+                        );
+                    }
+                    continue;
+                }
+            }
+            try page.lineAt(line, action, location);
         }
+    }
+
+    fn valueRowAction(self: *const Tui, value: runtime.value.Value) RowAction {
+        return switch (self.ev.valueRef(value).target) {
+            .object => |id| .{ .object = id },
+            .chunk => |id| .{ .chunk = id },
+            else => .none,
+        };
     }
 
     fn chunkEquivalence(self: *const Tui, id: ChunkId) ?ChunkEquivalence {
@@ -1969,7 +2023,7 @@ const Tui = struct {
                 i -= 1;
                 try self.tree.rows.append(self.allocator, .{ .debug_frame = .{ .index = @intCast(i), .depth = 1 } });
             }
-            if (session.reason == .break_builtin or session.reason == .eval_error or session.reason == .return_step) {
+            if (session.reason == .break_builtin or session.reason == .eval_error) {
                 try self.tree.rows.append(self.allocator, .{ .debug_value = .{ .depth = 1 } });
             }
         }
