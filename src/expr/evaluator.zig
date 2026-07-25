@@ -1922,6 +1922,37 @@ pub const Evaluator = struct {
         return self.store.realization.ensureClosure(drv_path);
     }
 
+    /// Hash-modulo resolver over the recorded input derivations — for computing
+    /// the paths of a derivation constructed on the fly (e.g. a get-env drv).
+    pub fn storeResolver(self: *Evaluator) derivation.HashModuloResolver {
+        return self.store.realization.resolver();
+    }
+
+    /// Write a constructed `.drv` (ATerm) to the store. Its references (input
+    /// `.drv`s / srcs) must already be valid.
+    pub fn instantiateDrv(self: *Evaluator, drv_path: []const u8, aterm: []const u8, references: []const []const u8) !void {
+        return self.store.realization.instantiateDrv(drv_path, aterm, references);
+    }
+
+    /// Read a store path's file contents: straight off local disk when the store
+    /// is local, else via the daemon (`NarFromPath`) for a remote store. Used to
+    /// read a get-env derivation's `$out` back regardless of store location.
+    pub fn readStorePathFile(self: *Evaluator, io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 << 20))) |data| {
+            return data;
+        } else |err| switch (err) {
+            error.FileNotFound => {}, // not on this machine — a remote store
+            else => return err,
+        }
+        return self.store.realization.readFileViaDaemon(allocator, path);
+    }
+
+    /// Read a store path's contents via the daemon (`NarFromPath`), bypassing the
+    /// local disk. For a remote store, and a test hook for the read path.
+    pub fn readFileViaDaemon(self: *Evaluator, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        return self.store.realization.readFileViaDaemon(allocator, path);
+    }
+
     pub const AsyncBuildRequest = StoreState.AsyncBuildRequest;
 
     /// Submit a fully materialized derivation to the daemon pool without

@@ -423,6 +423,35 @@ pub const RealizationStore = struct {
         }
     };
 
+    /// Read a store path's file contents via the daemon (`NarFromPath`), for a
+    /// remote store where the path isn't on local disk. Single-regular-file only.
+    pub fn readFileViaDaemon(self: *RealizationStore, allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
+        if (!self.daemon.writes_enabled) return error.StoreUnavailable;
+        var cell: NarCell = .{ .allocator = allocator, .store_path = store_path };
+        try self.runOnDaemon(NarCell.run, &cell);
+        if (cell.err) |e| return e;
+        return cell.data orelse error.StoreUnavailable;
+    }
+
+    const NarCell = struct {
+        allocator: std.mem.Allocator,
+        store_path: []const u8,
+        data: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(conn: ?*anyopaque, p: *anyopaque) void {
+            const c: *NarCell = @ptrCast(@alignCast(p));
+            const daemon = daemonConn(conn) catch |e| {
+                c.err = e;
+                return;
+            };
+            c.data = daemon.narFromPath(c.allocator, c.store_path) catch |e| {
+                c.err = e;
+                return;
+            };
+        }
+    };
+
     /// `isValidPath` against the supplied connection, consulting +
     /// populating the `instantiated` cache. The daemon round-trip runs without
     /// `daemon_mu` held (it guards only the brief cache touches), so concurrent

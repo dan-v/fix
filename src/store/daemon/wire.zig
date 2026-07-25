@@ -35,6 +35,7 @@ pub const Op = enum(u64) {
     set_options = 19,
     query_path_info = 26,
     build_derivation = 36,
+    nar_from_path = 38,
     add_to_store_nar = 39,
     query_missing = 40,
     add_multiple_to_store = 44,

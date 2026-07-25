@@ -32,10 +32,12 @@ then `direnv allow`.
 
 ## How it works
 
-1. `fix print-dev-env <src>` evaluates the derivation, recovers its build
-   environment, **realizes only its input derivations** (stdenv + buildInputs —
-   not the derivation), then runs the derivation's own bash to
-   `source $stdenv/setup` and dump the resulting environment.
+1. `fix print-dev-env <src>` evaluates the derivation, then builds a **get-env
+   derivation** — a variant of the target whose builder sources `$stdenv/setup`,
+   runs the `shellHook`, and dumps the resulting environment to `$out` (matching
+   `nix develop`). Because the env is computed *inside the build*, this is pure
+   and works against a remote store; `$out` is read back off local disk, or via
+   the daemon (`NarFromPath`) for a remote store.
 2. The `use fix` function caches that script under `.direnv/`, re-running
    `fix print-dev-env` only when the fix binary or the input files change
    (`watch_file`).
@@ -56,5 +58,6 @@ eval "$(fix print-dev-env ./shell.nix)"   # enter the dev shell in-place
 - **`__structuredAttrs` derivations are not yet supported** (the env is emitted
   as a single `__json` blob rather than individual variables). `fix
   print-dev-env` reports this and exits non-zero.
-- The dev environment is impure (host bash runs `$stdenv/setup`), matching
-  classic `nix-shell` semantics.
+- The env is computed by building a get-env derivation (pure), so the first run
+  pays a small build; it's content-addressed, so the daemon caches it, and
+  direnv caches the emitted script.

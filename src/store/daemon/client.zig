@@ -60,6 +60,38 @@ fn socketPathOf(store: []const u8) []const u8 {
     return store;
 }
 
+/// Parse a `nix-archive-1` NAR containing a single regular file, returning its
+/// contents (owned). NAR tokens are length-prefixed 8-padded strings — the same
+/// framing as `wire.readString`. Errors on a directory/symlink NAR.
+fn readSingleFileNar(allocator: std.mem.Allocator, r: *std.Io.Reader) ![]u8 {
+    try expectNarToken(allocator, r, "nix-archive-1");
+    try expectNarToken(allocator, r, "(");
+    try expectNarToken(allocator, r, "type");
+    try expectNarToken(allocator, r, "regular");
+
+    var tok = try wire.readString(allocator, r);
+    if (std.mem.eql(u8, tok, "executable")) {
+        allocator.free(tok);
+        const empty = try wire.readString(allocator, r);
+        allocator.free(empty);
+        tok = try wire.readString(allocator, r);
+    }
+    defer allocator.free(tok);
+    if (!std.mem.eql(u8, tok, "contents")) return error.UnexpectedNar;
+
+    const contents = try wire.readString(allocator, r);
+    errdefer allocator.free(contents);
+    const close = try wire.readString(allocator, r);
+    allocator.free(close);
+    return contents;
+}
+
+fn expectNarToken(allocator: std.mem.Allocator, r: *std.Io.Reader, want: []const u8) !void {
+    const tok = try wire.readString(allocator, r);
+    defer allocator.free(tok);
+    if (!std.mem.eql(u8, tok, want)) return error.UnexpectedNar;
+}
+
 test "store uri parsing selects transport" {
     try std.testing.expect(sshHost("ssh-ng://build.example.com") != null);
     try std.testing.expectEqualStrings("user@host", sshHost("ssh-ng://user@host?compress=true").?);
@@ -325,6 +357,17 @@ pub const DaemonStore = struct {
         try wire.writeString(self.w(), path);
         try self.flushAndDrain();
         return try wire.readBool(self.r());
+    }
+
+    /// Read a store path's contents via `NarFromPath` (op 24) — for a remote
+    /// store, where the path isn't on local disk. The daemon streams a NAR after
+    /// the stderr sideband; we parse the single-regular-file case (what a get-env
+    /// `$out` is) and return its bytes.
+    pub fn narFromPath(self: *DaemonStore, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        try self.beginOp(.nar_from_path);
+        try wire.writeString(self.w(), path);
+        try self.flushAndDrain();
+        return try readSingleFileNar(allocator, self.r());
     }
 
     /// Add `text` to the store as a text-addressed object named `name`
