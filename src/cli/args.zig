@@ -355,6 +355,7 @@ const Opt = enum {
     keep_going,
     max_silent_time,
     timeout,
+    store,
     verbose,
     // Diagnostics.
     show_trace,
@@ -518,6 +519,7 @@ const specs = [_]Spec{
     .{ .id = .keep_going, .short = "-k", .long = "--keep-going", .help = "keep building other derivations if one fails", .show_in = daemon_setting_cmds },
     .{ .id = .max_silent_time, .long = "--max-silent-time", .arg = .req, .metavar = "SECS", .help = "abort a build silent for SECS seconds (0 = no limit)", .show_in = daemon_setting_cmds },
     .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = daemon_setting_cmds },
+    .{ .id = .store, .long = "--store", .arg = .req, .metavar = "STORE-URI", .help = "store: `auto` (local daemon), `ssh-ng://[user@]host`, or `tcp://host:port`", .show_in = daemon_setting_cmds },
     .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase progress detail and daemon build verbosity (repeatable)", .completion_help = "increase progress and build verbosity", .repeatable = true, .show_in = verbose_cmds },
     .{ .id = .no_build_output, .short = "-Q", .long = "--no-build-output", .help = "suppress builder output", .show_in = daemon_setting_cmds },
 
@@ -936,6 +938,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         },
         .max_silent_time => try options.option_overrides.append(allocator, .{ .name = "max-silent-time", .value = v0.? }),
         .timeout => try options.option_overrides.append(allocator, .{ .name = "timeout", .value = v0.? }),
+        .store => try options.option_overrides.append(allocator, .{ .name = "store", .value = v0.? }),
         .fallback => try options.option_overrides.append(allocator, .{ .name = "fallback", .value = "true" }),
         .keep_failed => try options.option_overrides.append(allocator, .{ .name = "keep-failed", .value = "true" }),
         .keep_going => try options.option_overrides.append(allocator, .{ .name = "keep-going", .value = "true" }),

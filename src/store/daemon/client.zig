@@ -16,6 +16,67 @@ const settings = @import("settings.zig");
 
 pub const default_socket_path = "/nix/var/nix/daemon-socket/socket";
 
+/// The ssh host of an `ssh-ng://[user@]host[?params]` store, else null.
+fn sshHost(store: []const u8) ?[]const u8 {
+    const prefix = "ssh-ng://";
+    if (!std.mem.startsWith(u8, store, prefix)) return null;
+    var rest = store[prefix.len..];
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| rest = rest[0..q];
+    if (std.mem.indexOfScalar(u8, rest, '/')) |s| rest = rest[0..s];
+    return if (rest.len == 0) null else rest;
+}
+
+const TcpTarget = struct { host: []const u8, port: u16 };
+
+/// The host/port of a `tcp://host:port` store (bracketed IPv6 accepted), else null.
+fn tcpTarget(store: []const u8) ?TcpTarget {
+    const prefix = "tcp://";
+    if (!std.mem.startsWith(u8, store, prefix)) return null;
+    var rest = store[prefix.len..];
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| rest = rest[0..q];
+    if (std.mem.indexOfScalar(u8, rest, '/')) |s| rest = rest[0..s];
+    if (rest.len != 0 and rest[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return null;
+        const host = rest[1..close];
+        const after = rest[close + 1 ..];
+        if (after.len < 2 or after[0] != ':') return null;
+        const port = std.fmt.parseInt(u16, after[1..], 10) catch return null;
+        return if (host.len == 0) null else .{ .host = host, .port = port };
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return null;
+    const host = rest[0..colon];
+    const port = std.fmt.parseInt(u16, rest[colon + 1 ..], 10) catch return null;
+    return if (host.len == 0) null else .{ .host = host, .port = port };
+}
+
+/// The unix daemon socket path for a local store URI (default / `auto` /
+/// `daemon` / `unix://PATH` / a bare socket path).
+fn socketPathOf(store: []const u8) []const u8 {
+    if (store.len == 0 or std.mem.eql(u8, store, "auto") or std.mem.eql(u8, store, "daemon")) return default_socket_path;
+    if (std.mem.startsWith(u8, store, "unix://")) {
+        const path = store["unix://".len..];
+        return if (path.len == 0) default_socket_path else path;
+    }
+    return store;
+}
+
+test "store uri parsing selects transport" {
+    try std.testing.expect(sshHost("ssh-ng://build.example.com") != null);
+    try std.testing.expectEqualStrings("user@host", sshHost("ssh-ng://user@host?compress=true").?);
+    try std.testing.expect(sshHost("unix:///tmp/sock") == null);
+    try std.testing.expectEqualStrings(default_socket_path, socketPathOf(""));
+    try std.testing.expectEqualStrings(default_socket_path, socketPathOf("auto"));
+    try std.testing.expectEqualStrings("/tmp/sock", socketPathOf("unix:///tmp/sock"));
+    try std.testing.expectEqualStrings("/run/sock", socketPathOf("/run/sock"));
+    try std.testing.expect(tcpTarget("unix:///s") == null);
+    const t = tcpTarget("tcp://build.example.com:1234").?;
+    try std.testing.expectEqualStrings("build.example.com", t.host);
+    try std.testing.expectEqual(@as(u16, 1234), t.port);
+    const t6 = tcpTarget("tcp://[::1]:9999").?;
+    try std.testing.expectEqualStrings("::1", t6.host);
+    try std.testing.expectEqual(@as(u16, 9999), t6.port);
+}
+
 const ActivityType = enum(u64) {
     build = 105,
     substitute = 108,
@@ -69,12 +130,60 @@ pub const MissingPlan = struct {
     }
 };
 
+/// How we're connected to the daemon. The worker protocol is identical over any
+/// of these — only the framed reader/writer differ, so every op is transport
+/// agnostic (it goes through `w()`/`r()`).
+///
+///   * `socket`  — a local unix (or tcp) daemon socket (the default).
+///   * `command` — a subprocess whose stdio speaks the worker protocol. This is
+///     `ssh-ng://host`: we spawn the user's `ssh host nix-daemon --stdio`, so we
+///     inherit their whole OpenSSH setup (config, keys, agent, ProxyJump) and
+///     implement no crypto — exactly how Nix's ssh-ng store works.
+const Transport = union(enum) {
+    socket: Socket,
+    command: Command,
+
+    const Socket = struct {
+        stream: std.Io.net.Stream,
+        reader: std.Io.net.Stream.Reader,
+        writer: std.Io.net.Stream.Writer,
+    };
+    const Command = struct {
+        child: std.process.Child,
+        reader: std.Io.File.Reader,
+        writer: std.Io.File.Writer,
+    };
+
+    fn r(self: *Transport) *std.Io.Reader {
+        return switch (self.*) {
+            .socket => |*s| &s.reader.interface,
+            .command => |*c| &c.reader.interface,
+        };
+    }
+    fn w(self: *Transport) *std.Io.Writer {
+        return switch (self.*) {
+            .socket => |*s| &s.writer.interface,
+            .command => |*c| &c.writer.interface,
+        };
+    }
+    fn close(self: *Transport, io: std.Io) void {
+        switch (self.*) {
+            .socket => |*s| s.stream.close(io),
+            .command => |*c| {
+                if (c.child.stdin) |f| {
+                    f.close(io);
+                    c.child.stdin = null;
+                }
+                _ = c.child.wait(io) catch {};
+            },
+        }
+    }
+};
+
 pub const DaemonStore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    stream: std.Io.net.Stream,
-    reader: std.Io.net.Stream.Reader,
-    writer: std.Io.net.Stream.Writer,
+    transport: Transport,
     rbuf: []u8,
     wbuf: []u8,
     /// The daemon's advertised protocol version (its own, not the negotiated
@@ -91,15 +200,14 @@ pub const DaemonStore = struct {
     /// When set, logs go to the sink instead of directly to stderr.
     build_sink: ?BuildSink = null,
 
-    /// Connect to the daemon socket and complete the handshake. Heap-allocated
-    /// so the framed reader/writer (which hold interior pointers) stay put.
-    pub fn connect(allocator: std.mem.Allocator, io: std.Io, socket_path: []const u8) !*DaemonStore {
+    /// Connect to the daemon and complete the handshake. `store` is a store URI:
+    /// `""`/`auto`/`daemon`/`unix://PATH`/a bare socket path → a local socket;
+    /// `ssh-ng://[user@]host` → the user's `ssh` running `nix-daemon --stdio`.
+    /// Heap-allocated so the framed reader/writer (which hold interior pointers
+    /// via `@fieldParentPtr`) stay put.
+    pub fn connect(allocator: std.mem.Allocator, io: std.Io, store: []const u8) !*DaemonStore {
         const self = try allocator.create(DaemonStore);
         errdefer allocator.destroy(self);
-
-        const addr = try std.Io.net.UnixAddress.init(socket_path);
-        const stream = try addr.connect(io);
-        errdefer stream.close(io);
 
         const rbuf = try allocator.alloc(u8, 64 * 1024);
         errdefer allocator.free(rbuf);
@@ -109,30 +217,77 @@ pub const DaemonStore = struct {
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .stream = stream,
-            .reader = std.Io.net.Stream.Reader.init(stream, io, rbuf),
-            .writer = std.Io.net.Stream.Writer.init(stream, io, wbuf),
+            .transport = undefined,
             .rbuf = rbuf,
             .wbuf = wbuf,
         };
+        try self.openTransport(store);
+        errdefer self.transport.close(io);
 
         try self.handshake();
         return self;
     }
 
+    fn openTransport(self: *DaemonStore, store: []const u8) !void {
+        const io = self.io;
+        if (sshHost(store)) |host| {
+            // `ssh <opts> host nix-daemon --stdio` — the worker protocol over the
+            // ssh subprocess's stdio. We rely entirely on the user's ssh client.
+            const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", host, "nix-daemon", "--stdio" };
+            var child = try std.process.spawn(io, .{
+                .argv = &argv,
+                .stdin = .pipe,
+                .stdout = .pipe,
+            });
+            errdefer {
+                if (child.stdin) |f| f.close(io);
+                _ = child.wait(io) catch {};
+            }
+            const out = child.stdout orelse return error.SshPipeUnavailable;
+            const in = child.stdin orelse return error.SshPipeUnavailable;
+            self.transport = .{ .command = .{
+                .child = child,
+                .reader = out.readerStreaming(io, self.rbuf),
+                .writer = in.writerStreaming(io, self.wbuf),
+            } };
+            return;
+        }
+        if (tcpTarget(store)) |target| {
+            // `tcp://host:port` — the worker protocol over a TCP daemon socket
+            // (e.g. a `socat`/`nc` bridge to a unix socket, or a TCP-listening
+            // daemon). Same framed transport as the unix socket.
+            const addr = try std.Io.net.IpAddress.resolve(io, target.host, target.port);
+            const stream = try addr.connect(io, .{ .mode = .stream });
+            self.transport = .{ .socket = .{
+                .stream = stream,
+                .reader = std.Io.net.Stream.Reader.init(stream, io, self.rbuf),
+                .writer = std.Io.net.Stream.Writer.init(stream, io, self.wbuf),
+            } };
+            return;
+        }
+        const path = socketPathOf(store);
+        const addr = try std.Io.net.UnixAddress.init(path);
+        const stream = try addr.connect(io);
+        self.transport = .{ .socket = .{
+            .stream = stream,
+            .reader = std.Io.net.Stream.Reader.init(stream, io, self.rbuf),
+            .writer = std.Io.net.Stream.Writer.init(stream, io, self.wbuf),
+        } };
+    }
+
     pub fn deinit(self: *DaemonStore) void {
         if (self.last_error) |msg| self.allocator.free(msg);
-        self.stream.close(self.io);
+        self.transport.close(self.io);
         self.allocator.free(self.rbuf);
         self.allocator.free(self.wbuf);
         self.allocator.destroy(self);
     }
 
     fn w(self: *DaemonStore) *std.Io.Writer {
-        return &self.writer.interface;
+        return self.transport.w();
     }
     fn r(self: *DaemonStore) *std.Io.Reader {
-        return &self.reader.interface;
+        return self.transport.r();
     }
 
     fn handshake(self: *DaemonStore) !void {

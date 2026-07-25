@@ -123,6 +123,11 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // = unset, as in Nix). Useful for pointing at an alternate/proxied daemon.
     if (init.environ_map.get("NIX_DAEMON_SOCKET_PATH")) |sock|
         if (sock.len != 0) try ev.setDaemonSocket(sock);
+    // The store URI (`store` from nix.conf / `--store`, or legacy `NIX_REMOTE`)
+    // selects the daemon transport and wins over NIX_DAEMON_SOCKET_PATH. E.g.
+    // `ssh-ng://host` speaks the worker protocol over `ssh host nix-daemon --stdio`.
+    if (settings.get("store") orelse init.environ_map.get("NIX_REMOTE")) |uri|
+        if (uri.len != 0) try ev.setDaemonSocket(uri);
     try applyDaemonSettings(ev, options, &settings);
     try ev.setBasePathFromCurrentPath(init.io);
     try applyNixPath(ev, init, options);
