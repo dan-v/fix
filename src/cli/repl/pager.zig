@@ -1769,9 +1769,14 @@ const Tui = struct {
                 if (selected_start >= selected_end) break :blk null;
                 break :blk .{ .start = selected_start - cursor, .end = selected_end - cursor };
             } else null;
+            const breakpoints = if (location) |target|
+                try self.sourceBreakpointRanges(document.arena, target.chunk_id, cursor, shown_end)
+            else
+                &.{};
             try source_render.writeLine(&rendered.writer, source[cursor..shown_end], .{
                 .color_depth = self.color_depth,
                 .focus = selected,
+                .breakpoints = breakpoints,
             });
             if (line_end > cursor +| 4096) try rendered.writer.writeAll(" …");
             if (active and location != null) {
@@ -1783,6 +1788,28 @@ const Tui = struct {
             if (newline >= end or newline == source.len) break;
             cursor = newline + 1;
         }
+    }
+
+    fn sourceBreakpointRanges(
+        self: *const Tui,
+        arena: std.mem.Allocator,
+        chunk_id: ChunkId,
+        line_start: usize,
+        line_end: usize,
+    ) ![]const source_render.Range {
+        var ranges: std.ArrayListUnmanaged(source_render.Range) = .empty;
+        for (self.ev.listBreakpoints()) |request| {
+            if (request.span_chunk != chunk_id) continue;
+            const span = request.span orelse continue;
+            const start = @max(line_start, @as(usize, span.offset));
+            const end = @min(line_end, @as(usize, span.offset) +| @as(usize, span.len));
+            if (start >= end) continue;
+            try ranges.append(arena, .{
+                .start = start - line_start,
+                .end = end - line_start,
+            });
+        }
+        return ranges.items;
     }
 
     /// Resolve the source text a chunk was compiled from (its file, or the

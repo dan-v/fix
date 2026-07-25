@@ -12,7 +12,9 @@ const col_keyword: terminal_color.Rgb = .{ 210, 143, 240 };
 const col_string: terminal_color.Rgb = .{ 111, 201, 145 };
 const col_number: terminal_color.Rgb = .{ 229, 192, 123 };
 const col_focus = terminal_color.hueColor(3);
+const col_breakpoint = terminal_color.hueColor(0);
 const focus_underline = "\x1b[4m";
+const breakpoint_emphasis = "\x1b[1;4m";
 const reset = "\x1b[0m";
 
 pub const Range = struct {
@@ -25,6 +27,9 @@ pub const Options = struct {
     /// Byte range relative to `line`. Empty and out-of-bounds ranges are
     /// ignored. Focus falls back to an underline when color is disabled.
     focus: ?Range = null,
+    /// Exact breakpoint ranges relative to `line`. These remain emphasized
+    /// while focus moves to another sub-expression.
+    breakpoints: []const Range = &.{},
 };
 
 pub fn writeLine(w: *std.Io.Writer, line: []const u8, options: Options) !void {
@@ -41,11 +46,11 @@ pub fn writeLine(w: *std.Io.Writer, line: []const u8, options: Options) !void {
         const start = @min(token.offset, line.len);
         const end = @min(token.offset +| token.len, line.len);
         if (end <= last) break;
-        if (start > last) try writeSpan(w, line, last, start, null, selected, options.color_depth);
-        try writeSpan(w, line, start, end, tokenColor(token.type), selected, options.color_depth);
+        if (start > last) try writeSpan(w, line, last, start, null, selected, options.breakpoints, options.color_depth);
+        try writeSpan(w, line, start, end, tokenColor(token.type), selected, options.breakpoints, options.color_depth);
         last = end;
     }
-    if (last < line.len) try writeSpan(w, line, last, line.len, null, selected, options.color_depth);
+    if (last < line.len) try writeSpan(w, line, last, line.len, null, selected, options.breakpoints, options.color_depth);
 }
 
 fn writeSpan(
@@ -55,20 +60,32 @@ fn writeSpan(
     end: usize,
     color: ?terminal_color.Rgb,
     selected: ?Range,
+    breakpoints: []const Range,
     color_depth: terminal_color.Depth,
 ) !void {
     if (start >= end) return;
-    if (selected) |range| {
-        const selected_start = @max(start, range.start);
-        const selected_end = @min(end, range.end);
-        if (selected_start < selected_end) {
-            if (start < selected_start) try styled(w, line[start..selected_start], color, false, color_depth);
-            try styled(w, line[selected_start..selected_end], color, true, color_depth);
-            if (selected_end < end) try styled(w, line[selected_end..end], color, false, color_depth);
-            return;
+    var cursor = start;
+    while (cursor < end) {
+        var next = end;
+        if (selected) |range| {
+            if (range.start > cursor) next = @min(next, range.start);
+            if (range.end > cursor) next = @min(next, range.end);
         }
+        for (breakpoints) |range| {
+            if (range.start > cursor) next = @min(next, range.start);
+            if (range.end > cursor) next = @min(next, range.end);
+        }
+        const focused = if (selected) |range| cursor >= range.start and cursor < range.end else false;
+        var breakpoint = false;
+        for (breakpoints) |range| {
+            if (cursor >= range.start and cursor < range.end) {
+                breakpoint = true;
+                break;
+            }
+        }
+        try styled(w, line[cursor..next], color, focused, breakpoint, color_depth);
+        cursor = next;
     }
-    try styled(w, line[start..end], color, false, color_depth);
 }
 
 fn styled(
@@ -76,16 +93,20 @@ fn styled(
     text: []const u8,
     color: ?terminal_color.Rgb,
     selected: bool,
+    breakpoint: bool,
     color_depth: terminal_color.Depth,
 ) !void {
-    if (selected) {
+    if (breakpoint) {
+        try terminal_color.foreground(w, color_depth, col_breakpoint, false);
+        try w.writeAll(breakpoint_emphasis);
+    } else if (selected) {
         try terminal_color.foreground(w, color_depth, col_focus, false);
         try w.writeAll(focus_underline);
     } else if (color) |rgb| {
         try terminal_color.foreground(w, color_depth, rgb, false);
     }
     try writeSafe(w, text);
-    if (selected or (color != null and color_depth.enabled())) try w.writeAll(reset);
+    if (selected or breakpoint or (color != null and color_depth.enabled())) try w.writeAll(reset);
 }
 
 fn writeSafe(w: *std.Io.Writer, text: []const u8) !void {
@@ -129,4 +150,18 @@ test "source focus outside a token does not duplicate its text" {
     });
     const plain = @import("base").terminal_text.stripAnsiInPlace(output.written());
     try std.testing.expectEqualStrings("if true", plain);
+}
+
+test "source breakpoints mark exact ranges independently of focus" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeLine(&output.writer, "one + two", .{
+        .color_depth = .truecolor,
+        .focus = .{ .start = 6, .end = 9 },
+        .breakpoints = &.{.{ .start = 0, .end = 3 }},
+    });
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[1;4mone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[4mtwo") != null);
+    const plain = @import("base").terminal_text.stripAnsiInPlace(output.written());
+    try std.testing.expectEqualStrings("one + two", plain);
 }
