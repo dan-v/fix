@@ -2587,11 +2587,14 @@ const Tui = struct {
             .help => {},
         }
         self.navigation.x_scroll = 0;
-        switch (kind) {
+        // Replacing the subject is tree browsing: keep the cursor in the tree.
+        // Pushed visits originate outside it (detail links, debugger entry,
+        // commands) and may choose the inspector as their natural destination.
+        if (mode == .push) switch (kind) {
             .help => self.navigation.focus = .disassembly,
             .heap, .object, .store_record, .debug_frame, .debug_value => self.navigation.focus = .disassembly,
             .chunk => {},
-        }
+        };
         self.status_msg = "";
     }
 
@@ -3248,11 +3251,20 @@ const Tui = struct {
         const outer_height = visible + 2;
 
         const anchor_row = if (self.navigation.focus == .chunks)
-            3 + @min(self.navigation.tree_selection, rows -| 4)
+            self.treeSelectionSlot(if (layout_now.split) layout_now.sidebar_width else cols, rows) orelse 0
         else
             self.navigation.detail_selection -| self.navigation.scroll;
-        const top = first_row + @min(anchor_row, rows - outer_height);
-        const left = cols - outer_width + 1;
+        // Put the first content row level with the selected row whenever there
+        // is room: the popup reads as attached to the cursor instead of as a
+        // remote panel.
+        const top = first_row + @min(anchor_row -| 1, rows - outer_height);
+        const left = if (self.navigation.focus == .chunks)
+            if (layout_now.split)
+                layout_now.main_col
+            else
+                @min(cols / 3 + 1, cols - outer_width + 1)
+        else
+            cols - outer_width + 1;
         const role = self.previewRole();
         const fill = try arena.alloc(u8, content_width);
         @memset(fill, ' ');
@@ -3892,6 +3904,15 @@ const Tui = struct {
                 .wrapped = height > 1,
             };
             physical += height;
+        }
+        return null;
+    }
+
+    fn treeSelectionSlot(self: *const Tui, width: usize, slots: usize) ?usize {
+        for (0..slots) |slot| {
+            const cell = self.treeCell(slot, width, slots) orelse continue;
+            if (cell.index == self.navigation.tree_selection and cell.segment == 0)
+                return slot;
         }
         return null;
     }
