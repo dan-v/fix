@@ -1962,6 +1962,16 @@ pub const Evaluator = struct {
         return self.store.realization.setDaemonSocket(path);
     }
 
+    /// Override the store directory (`store-dir` / `NIX_STORE_DIR`). Threads
+    /// into path computation, store-path detection, and `builtins.storeDir`.
+    pub fn setStoreDir(self: *Evaluator, dir: []const u8) !void {
+        return self.store.realization.setStoreDir(dir);
+    }
+
+    pub fn storeDir(self: *const Evaluator) []const u8 {
+        return self.store.realization.store_dir;
+    }
+
     /// Navigate a dotted attr path (e.g. `python3Packages.requests`) from `value`,
     /// forcing each step. Returns null if any component is missing or non-attrs.
     pub fn attrPathValue(self: *Evaluator, value: Value, path: []const u8) !?Value {
@@ -2483,7 +2493,7 @@ pub const Evaluator = struct {
         try self.heap.ensureEmptySingletons();
         const nix_path = try self.sources.search_paths.toNixPath(self.allocator);
         defer self.allocator.free(nix_path);
-        const value = try builtins.buildAttrSet(&self.intern, &self.heap, nix_path);
+        const value = try builtins.buildAttrSet(&self.intern, &self.heap, nix_path, self.store.realization.store_dir);
         self.builtins_value = value;
         return value;
     }

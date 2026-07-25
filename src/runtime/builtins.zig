@@ -438,7 +438,7 @@ pub fn arity(id: BuiltinId) u8 {
     };
 }
 
-pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const NixPathEntry) !Value {
+pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const NixPathEntry, store_dir: []const u8) !Value {
     var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
     defer entries.deinit(heap.allocator);
     try entries.ensureTotalCapacity(heap.allocator, builtin_bindings.len + constant_bindings.len + 1);
@@ -453,7 +453,7 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
     entries.appendAssumeCapacity(.{ .name = try intern.intern("langVersion"), .value = Value.int(6) });
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("storeDir"),
-        .value = Value.string(try intern.intern("/nix/store")),
+        .value = Value.string(try intern.intern(store_dir)),
     });
     // `currentSystem` / `currentTime` are impure: wrapped in a force-time guard
     // that raises `RestrictedInPureEval` under pure eval (a flake must take

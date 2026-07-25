@@ -327,9 +327,11 @@ pub fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.
 
 pub fn hasStorePathContext(self: *VM, value: Value) !bool {
     if (!value.isContextString()) return false;
+    const store_dir = self.realization.store_dir;
     const string = try self.heap.getContextString(value.asObjectId());
     for (string.context) |entry| {
-        if (std.mem.startsWith(u8, self.intern.get(entry.name), "/nix/store/")) return true;
+        const name = self.intern.get(entry.name);
+        if (std.mem.startsWith(u8, name, store_dir) and name.len > store_dir.len and name[store_dir.len] == '/') return true;
     }
     return false;
 }

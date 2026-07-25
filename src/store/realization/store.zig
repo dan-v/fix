@@ -87,7 +87,10 @@ test "progress labels retain complete store paths" {
 
 pub const RealizationStore = struct {
     allocator: std.mem.Allocator,
+    /// The store directory (`store-dir`, default `/nix/store`). Borrowed static
+    /// literal until `setStoreDir` replaces it with an owned copy from config.
     store_dir: []const u8 = "/nix/store",
+    store_dir_owned: ?[]u8 = null,
     registry: derivation.Registry,
     memo: eval_memo.EvalMemo,
     graph: recipe_graph.Graph,
@@ -245,6 +248,17 @@ pub const RealizationStore = struct {
         self.graph.deinit();
         self.registry.deinit();
         self.memo.deinit();
+        if (self.store_dir_owned) |owned| self.allocator.free(owned);
+    }
+
+    /// Override the store directory (`store-dir` / `NIX_STORE_DIR`). Dupes `dir`
+    /// into owned storage (freed in `deinit`); a no-op if empty.
+    pub fn setStoreDir(self: *RealizationStore, dir: []const u8) !void {
+        if (dir.len == 0) return;
+        const owned = try self.allocator.dupe(u8, dir);
+        if (self.store_dir_owned) |old| self.allocator.free(old);
+        self.store_dir_owned = owned;
+        self.store_dir = owned;
     }
 
     /// Set the per-connection daemon settings to apply on connect. Dupes the

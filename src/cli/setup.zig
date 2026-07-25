@@ -115,6 +115,10 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // authenticate fetches to private GitHub/GitLab/… hosts.
     if (settings.get("access-tokens")) |tokens| try ev.setAccessTokens(tokens);
     try applyNetrc(ev, init, &settings);
+    // The store directory follows `store-dir` from nix.conf, with `NIX_STORE_DIR`
+    // taking precedence (as Nix does for this setting). Defaults to `/nix/store`.
+    if (init.environ_map.get("NIX_STORE_DIR") orelse settings.get("store-dir")) |dir|
+        try ev.setStoreDir(dir);
     // Nix's `NIX_DAEMON_SOCKET_PATH` overrides the daemon socket location (empty
     // = unset, as in Nix). Useful for pointing at an alternate/proxied daemon.
     if (init.environ_map.get("NIX_DAEMON_SOCKET_PATH")) |sock|
