@@ -7,75 +7,13 @@
 //! terminals render, not the full Unicode segmentation spec.
 
 const std = @import("std");
-
-const Range = struct { lo: u21, hi: u21 };
-
-/// Zero-width: combining marks and format characters that terminals overlay
-/// onto the previous cell (or drop entirely).
-const zero_width = [_]Range{
-    .{ .lo = 0x0300, .hi = 0x036F }, // combining diacritical marks
-    .{ .lo = 0x0483, .hi = 0x0489 },
-    .{ .lo = 0x0591, .hi = 0x05BD },
-    .{ .lo = 0x05BF, .hi = 0x05BF },
-    .{ .lo = 0x0610, .hi = 0x061A },
-    .{ .lo = 0x064B, .hi = 0x065F },
-    .{ .lo = 0x0670, .hi = 0x0670 },
-    .{ .lo = 0x06D6, .hi = 0x06DC },
-    .{ .lo = 0x0711, .hi = 0x0711 },
-    .{ .lo = 0x0730, .hi = 0x074A },
-    .{ .lo = 0x0E31, .hi = 0x0E31 },
-    .{ .lo = 0x0E34, .hi = 0x0E3A },
-    .{ .lo = 0x0E47, .hi = 0x0E4E },
-    .{ .lo = 0x135D, .hi = 0x135F },
-    .{ .lo = 0x1AB0, .hi = 0x1AFF }, // combining, extended
-    .{ .lo = 0x1DC0, .hi = 0x1DFF }, // combining, supplement
-    .{ .lo = 0x200B, .hi = 0x200F }, // zero-width space/joiners, marks
-    .{ .lo = 0x202A, .hi = 0x202E }, // bidi embedding
-    .{ .lo = 0x20D0, .hi = 0x20FF }, // combining, symbols
-    .{ .lo = 0xFE00, .hi = 0xFE0F }, // variation selectors
-    .{ .lo = 0xFE20, .hi = 0xFE2F }, // combining half marks
-    .{ .lo = 0xFEFF, .hi = 0xFEFF }, // BOM / zero-width no-break
-};
-
-/// Double-width: East Asian Wide + Fullwidth, Hangul, and emoji blocks.
-const double_width = [_]Range{
-    .{ .lo = 0x1100, .hi = 0x115F }, // Hangul jamo
-    .{ .lo = 0x2329, .hi = 0x232A },
-    .{ .lo = 0x2E80, .hi = 0x303E }, // CJK radicals .. CJK symbols
-    .{ .lo = 0x3041, .hi = 0x33FF }, // Hiragana .. CJK compatibility
-    .{ .lo = 0x3400, .hi = 0x4DBF }, // CJK extension A
-    .{ .lo = 0x4E00, .hi = 0x9FFF }, // CJK unified
-    .{ .lo = 0xA000, .hi = 0xA4CF }, // Yi
-    .{ .lo = 0xAC00, .hi = 0xD7A3 }, // Hangul syllables
-    .{ .lo = 0xF900, .hi = 0xFAFF }, // CJK compatibility ideographs
-    .{ .lo = 0xFE30, .hi = 0xFE4F }, // CJK compatibility forms
-    .{ .lo = 0xFF00, .hi = 0xFF60 }, // fullwidth forms
-    .{ .lo = 0xFFE0, .hi = 0xFFE6 },
-    .{ .lo = 0x1F300, .hi = 0x1F64F }, // emoji: misc symbols & emoticons
-    .{ .lo = 0x1F680, .hi = 0x1F6FF }, // emoji: transport
-    .{ .lo = 0x1F900, .hi = 0x1F9FF }, // emoji: supplemental
-    .{ .lo = 0x1FA70, .hi = 0x1FAFF }, // emoji: extended-A
-    .{ .lo = 0x20000, .hi = 0x2FFFD }, // CJK extension B..
-    .{ .lo = 0x30000, .hi = 0x3FFFD },
-};
-
-fn inRanges(cp: u21, ranges: []const Range) bool {
-    // Tables are tiny; linear scan beats a binary search's branch misses.
-    for (ranges) |r| {
-        if (cp >= r.lo and cp <= r.hi) return true;
-    }
-    return false;
-}
+const terminal_text = @import("base").terminal_text;
 
 /// Display width of one codepoint: 0, 1, or 2 columns. Control characters
 /// report 0 — the editor never lets them into the buffer (except '\n' and
 /// '\t', which the renderer expands itself).
 pub fn cpWidth(cp: u21) u2 {
-    if (cp < 0x20 or cp == 0x7F) return 0;
-    if (cp < 0x0300) return 1; // fast path: ASCII + Latin-1
-    if (inRanges(cp, &zero_width)) return 0;
-    if (inRanges(cp, &double_width)) return 2;
-    return 1;
+    return terminal_text.cellWidth(cp);
 }
 
 /// Display width of a UTF-8 string. Invalid bytes count as width 1
@@ -100,6 +38,17 @@ pub fn middleEllipsis(allocator: std.mem.Allocator, text: []const u8, max_cells:
     const left_end = prefixEnd(text, left_cells);
     const right_start = suffixStart(text, right_cells);
     return std.fmt.allocPrint(allocator, "{s}…{s}", .{ text[0..left_end], text[right_start..] });
+}
+
+/// Preserve the beginning of a value and replace the omitted tail with one
+/// display-cell ellipsis. This is preferable to byte slicing for values such
+/// as strings: it never splits UTF-8 and accounts for wide glyphs.
+pub fn endEllipsis(allocator: std.mem.Allocator, text: []const u8, max_cells: usize) ![]const u8 {
+    if (strWidth(text) <= max_cells) return text;
+    if (max_cells == 0) return "";
+    if (max_cells == 1) return "…";
+    const end = prefixEnd(text, max_cells - 1);
+    return std.fmt.allocPrint(allocator, "{s}…", .{text[0..end]});
 }
 
 fn prefixEnd(text: []const u8, cells: usize) usize {
@@ -200,6 +149,13 @@ test "middle ellipsis preserves both ends at display width" {
     defer std.testing.allocator.free(shortened);
     try std.testing.expectEqualStrings("abc…hij", shortened);
     try std.testing.expectEqual(@as(usize, 7), strWidth(shortened));
+}
+
+test "end ellipsis is display-width aware and preserves utf8" {
+    const shortened = try endEllipsis(std.testing.allocator, "ab中def", 5);
+    defer std.testing.allocator.free(shortened);
+    try std.testing.expectEqualStrings("ab中…", shortened);
+    try std.testing.expectEqual(@as(usize, 5), strWidth(shortened));
 }
 
 test "boundaries walk codepoints, not bytes" {

@@ -1,4 +1,5 @@
-//! Source-line breakpoints by bytecode patching.
+//! Source-line, exact-source-span, and instruction breakpoints by bytecode
+//! patching.
 //!
 //! A breakpoint replaces the single opcode byte at a line's first instruction
 //! with the `breakpoint` opcode, saving the original byte. Execution then hits
@@ -69,6 +70,10 @@ pub const BreakpointTable = struct {
         /// rather than a FILE:LINE. Not re-placeable by line, so lazy chunk
         /// registration and pending-file resolution skip it.
         site_only: bool = false,
+        /// An exact source-span request. The chunk id keeps equal source
+        /// coordinates in separately compiled bodies independent.
+        span_chunk: ?ChunkId = null,
+        span: ?Chunk.SourceSpan = null,
     };
 
     /// A patched site realizing a request in a specific chunk.
@@ -197,8 +202,8 @@ pub const BreakpointTable = struct {
 
     /// Set a per-instruction breakpoint at an exact `(chunk_id, offset)` site.
     /// Unlike `set`, this does not resolve or track a source line: it patches
-    /// the one instruction the caller selected (asm view = an instruction row,
-    /// source view = a source-map span's entry offset).
+    /// the one instruction the caller selected. Source rows use `setSpan`
+    /// because several nested spans may share an entry offset.
     pub fn setAt(self: *BreakpointTable, registry: *ChunkRegistry, chunk_id: ChunkId, offset: u32) !SetResult {
         const id = self.next_id;
         self.next_id += 1;
@@ -220,6 +225,58 @@ pub const BreakpointTable = struct {
         };
     }
 
+    /// Set a breakpoint on one exact source-map span. Nested spans commonly
+    /// share their first bytecode offset, so using the map entry's raw `start`
+    /// would collapse them into a line-like breakpoint. Instead, resolve to the
+    /// first instruction whose *tightest* source mapping is this exact span.
+    /// If compiler lowering gave the span no distinct execution site, return
+    /// zero sites rather than silently broadening it.
+    pub fn setSpan(
+        self: *BreakpointTable,
+        registry: *ChunkRegistry,
+        chunk_id: ChunkId,
+        span: Chunk.SourceSpan,
+    ) !SetResult {
+        const chunk = registry.get(chunk_id) orelse return .{
+            .id = 0,
+            .line = span.line,
+            .sites = 0,
+            .pending = false,
+        };
+        const offset = self.firstExactSpanSite(chunk_id, chunk, span) orelse return .{
+            .id = 0,
+            .line = span.line,
+            .sites = 0,
+            .pending = false,
+        };
+
+        const id = self.next_id;
+        self.next_id += 1;
+        try self.requests.append(self.gpa, .{
+            .id = id,
+            .file = try self.gpa.dupe(u8, ""),
+            .requested_line = span.line,
+            .line = span.line,
+            .pending = false,
+            .site_only = true,
+            .span_chunk = chunk_id,
+            .span = span,
+        });
+        const before = self.placements.items.len;
+        try self.placeSite(id, chunk_id, offset, chunk);
+        const sites = self.placements.items.len - before;
+        if (sites == 0) {
+            const request = self.requests.pop().?;
+            self.gpa.free(request.file);
+        }
+        return .{
+            .id = if (sites == 0) 0 else id,
+            .line = span.line,
+            .sites = sites,
+            .pending = false,
+        };
+    }
+
     /// Remove whatever breakpoint owns the placement at `(chunk_id, offset)`,
     /// restoring the patched byte. Returns true if a placement existed there.
     pub fn removeAt(self: *BreakpointTable, registry: *ChunkRegistry, chunk_id: ChunkId, offset: u32) bool {
@@ -229,9 +286,31 @@ pub const BreakpointTable = struct {
         return false;
     }
 
+    pub fn removeSpan(
+        self: *BreakpointTable,
+        registry: *ChunkRegistry,
+        chunk_id: ChunkId,
+        span: Chunk.SourceSpan,
+    ) bool {
+        for (self.requests.items) |request| {
+            const requested = request.span orelse continue;
+            if (request.span_chunk == chunk_id and sameSpan(requested, span))
+                return self.remove(registry, request.id);
+        }
+        return false;
+    }
+
     /// Whether a permanent breakpoint is currently placed at this exact site.
     pub fn hasSite(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) bool {
         return self.placedAt(chunk_id, offset);
+    }
+
+    pub fn hasSpan(self: *const BreakpointTable, chunk_id: ChunkId, span: Chunk.SourceSpan) bool {
+        for (self.requests.items) |request| {
+            const requested = request.span orelse continue;
+            if (request.span_chunk == chunk_id and sameSpan(requested, span)) return true;
+        }
+        return false;
     }
 
     /// Decide what the `breakpoint` handler does at `(chunk_id, offset)`: the
@@ -388,6 +467,28 @@ pub const BreakpointTable = struct {
         return operands_start + operands_len;
     }
 
+    fn firstExactSpanSite(
+        self: *const BreakpointTable,
+        chunk_id: ChunkId,
+        chunk: *const Chunk,
+        wanted: Chunk.SourceSpan,
+    ) ?u32 {
+        var start: usize = 0;
+        while (start < chunk.code.len) {
+            var best: ?Chunk.SourceMapEntry = null;
+            for (chunk.source_map) |entry| {
+                if (start < entry.start or start >= entry.end) continue;
+                if (best == null or entry.end - entry.start <= best.?.end - best.?.start)
+                    best = entry;
+            }
+            if (best) |entry| if (sameSpan(entry.span, wanted)) return @intCast(start);
+            const next = self.instructionEnd(chunk_id, chunk, start) orelse return null;
+            if (next <= start) return null;
+            start = next;
+        }
+        return null;
+    }
+
     fn placedAt(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) bool {
         for (self.placements.items) |p| {
             if (p.chunk_id == chunk_id and p.offset == offset) return true;
@@ -515,6 +616,14 @@ fn textFileMatches(a: []const u8, b: []const u8) bool {
     if (std.mem.eql(u8, a, b)) return true;
     if (std.mem.endsWith(u8, a, b) or std.mem.endsWith(u8, b, a)) return true;
     return std.mem.eql(u8, std.fs.path.basename(a), std.fs.path.basename(b));
+}
+
+fn sameSpan(a: Chunk.SourceSpan, b: Chunk.SourceSpan) bool {
+    return a.file == b.file and
+        a.offset == b.offset and
+        a.len == b.len and
+        a.line == b.line and
+        a.column == b.column;
 }
 
 fn firstMappedOffset(chunk: *const Chunk) ?u32 {
@@ -652,4 +761,50 @@ test "evaluation step sites include forces and calls but skip stack plumbing" {
 
     try table.appendEvaluationStepSites(std.testing.allocator, 3, &chunk, 1, &sites);
     try std.testing.expectEqualSlices(BreakpointTable.Site, &.{.{ .chunk_id = 3, .offset = 4 }}, sites.items);
+}
+
+test "source-span breakpoints distinguish nested expressions on one line" {
+    const allocator = std.testing.allocator;
+    var intern = try InternTable.init(allocator);
+    defer intern.deinit();
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+    var table = BreakpointTable.init(allocator, &intern);
+    defer table.deinit();
+
+    var builder = try chunk_mod.ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+    try builder.emitConstant(allocator, Value.int(1)); // 0..3
+    try builder.emitConstant(allocator, Value.int(2)); // 3..6
+    try builder.writeOp(allocator, .int_add); // 6..7
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+
+    const outer: Chunk.SourceSpan = .{ .file = null, .offset = 0, .len = 5, .line = 1, .column = 1 };
+    const left: Chunk.SourceSpan = .{ .file = null, .offset = 0, .len = 1, .line = 1, .column = 1 };
+    const right: Chunk.SourceSpan = .{ .file = null, .offset = 4, .len = 1, .line = 1, .column = 5 };
+    try builder.addSourceMapEntry(allocator, 0, 3, left);
+    try builder.addSourceMapEntry(allocator, 3, 6, right);
+    try builder.addSourceMapEntry(allocator, 0, 7, outer);
+
+    const chunk_id = try registry.register(try builder.finish(allocator, 0));
+    const chunk = registry.get(chunk_id).?;
+
+    try std.testing.expectEqual(@as(usize, 1), (try table.setSpan(&registry, chunk_id, left)).sites);
+    try std.testing.expectEqual(@as(usize, 1), (try table.setSpan(&registry, chunk_id, right)).sites);
+    try std.testing.expectEqual(@as(usize, 1), (try table.setSpan(&registry, chunk_id, outer)).sites);
+    try std.testing.expect(table.hasSpan(chunk_id, left));
+    try std.testing.expect(table.hasSpan(chunk_id, right));
+    try std.testing.expect(table.hasSpan(chunk_id, outer));
+    try std.testing.expect(table.hasSite(chunk_id, 0));
+    try std.testing.expect(table.hasSite(chunk_id, 3));
+    try std.testing.expect(table.hasSite(chunk_id, 6));
+
+    try std.testing.expect(table.removeSpan(&registry, chunk_id, outer));
+    try std.testing.expect(!table.hasSpan(chunk_id, outer));
+    try std.testing.expectEqual(@as(u8, @intFromEnum(opcode.OpCode.int_add)), chunk.code[6]);
+    try std.testing.expect(table.hasSpan(chunk_id, left));
+    try std.testing.expect(table.hasSpan(chunk_id, right));
+    try std.testing.expect(table.removeSpan(&registry, chunk_id, left));
+    try std.testing.expect(table.removeSpan(&registry, chunk_id, right));
 }

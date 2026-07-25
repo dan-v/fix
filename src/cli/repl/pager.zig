@@ -52,13 +52,13 @@ fn writeChunk(
     options: disasm.Options,
 ) !void {
     const chunk = ev.getChunk(chunk_id) orelse {
-        try w.print("chunk #{d} not found\n", .{chunk_id});
+        try w.print("chunk[0x{x}] not found\n", .{chunk_id});
         return;
     };
     try disasm.writeChunk(allocator, w, chunk_id, chunk, symbols, options);
 }
 
-const Panel = enum(u2) { code, tables, source, references };
+const Panel = enum(u1) { code, tables };
 const Category = enum(u1) { bytecode, heap };
 const HeapView = enum { overview, objects, values, attrs, attr_positions };
 
@@ -70,15 +70,17 @@ const RowAction = union(enum) {
     object: runtime.types.ObjectId,
 };
 
-/// A breakpoint target attached to a rendered row. Breakpoints are keyed on the
-/// exact `(chunk_id, offset)` site: the asm view targets an instruction row, the
-/// source view targets a source-map span's entry offset. `file`/`line` are kept
-/// only for display/status.
+/// A breakpoint target attached to a rendered row. Instruction rows use the
+/// exact `(chunk_id, offset)` site; source rows retain the full span so nested
+/// expressions that share an entry offset remain independent.
 const BreakpointLocation = struct {
     chunk_id: ChunkId,
     offset: u32,
     file: []const u8 = "",
     line: u32 = 0,
+    /// Present on source-span rows so the document's source excerpt can follow
+    /// the highlighted sub-expression rather than remaining on the chunk body.
+    span: ?bytecode.Chunk.SourceSpan = null,
 };
 
 /// One rendered inspector document (or the help screen). Actions are parallel
@@ -89,7 +91,6 @@ const Page = struct {
     lines: [][]u8,
     actions: []RowAction,
     locations: []const ?BreakpointLocation = &.{},
-    source_lines: []const []const u8 = &.{},
 };
 
 const PageBuilder = struct {
@@ -549,6 +550,10 @@ const Range = struct {
     parent: u32,
     start: u32,
     len: u32,
+    /// Number of live records in this half-open range. This is deliberately
+    /// separate from `len`: sparse stores must not advertise backing capacity
+    /// as if every reserved slot were an object.
+    live: u32,
     depth: u16,
 
     fn key(self: Range) u128 {
@@ -583,7 +588,6 @@ const NavigationState = struct {
     detail_selection: usize = 0,
     scroll: usize = 0,
     x_scroll: usize = 0,
-    panel: Panel = .code,
 };
 
 const TreeState = struct {
@@ -690,6 +694,12 @@ const Tui = struct {
     transcript_lines: std.ArrayListUnmanaged(LineRange) = .empty,
     status_msg: []const u8 = "",
     status_buf: [256]u8 = undefined,
+    /// The source-map span currently selected in an inspector. Chunk and frame
+    /// documents use it when rebuilding their embedded source excerpt.
+    source_focus: ?struct {
+        chunk_id: ChunkId,
+        span: bytecode.Chunk.SourceSpan,
+    } = null,
 
     /// Set for the duration of a debug pause driven by `debugRun`. While non-null
     /// the tree grows a Debug subtree and the debug-control keys are live.
@@ -698,7 +708,7 @@ const Tui = struct {
     /// borrowed pause leaves the outer explorer's history exactly as it found it.
     debug_nav_mark: usize = 0,
 
-    const range_leaf = 128;
+    const range_leaf = 256;
     const range_branch = 4096;
 
     fn deinit(self: *Tui) void {
@@ -746,6 +756,7 @@ const Tui = struct {
             };
         }
         try self.refreshPage(initial);
+        try self.selectedSourceChanged();
     }
 
     fn pollSessionJobs(self: *Tui, host: SessionHost, jobs: *SessionJobs) !void {
@@ -792,10 +803,8 @@ const Tui = struct {
             };
         }
 
-        // References are part of every chunk's code view now (not a separate
-        // panel), so they are wanted whenever a chunk is open outside the
-        // source panel.
-        const shows_references = self.currentChunk() != null and self.navigation.panel != .source;
+        // References are part of every chunk's unified inspector document.
+        const shows_references = self.currentChunk() != null;
         if (jobs.references.poll(&self.references.graph)) {
             self.references.indexing = false;
             if (shows_references) try self.refreshPage(self.currentKind());
@@ -998,39 +1007,27 @@ const Tui = struct {
                 };
                 var page: PageBuilder = .{ .arena = arena };
                 try self.appendChunkEquivalence(&page, id);
-                const source_lines = if (self.navigation.panel == .source)
-                    try self.sourceDocument(id, chunk)
-                else
-                    &.{};
-                switch (self.navigation.panel) {
-                    // The source panel's main content is the navigable span list
-                    // (sub-expression breakpoints); the read-only excerpt goes to
-                    // the side pane when the terminal is wide enough to split.
-                    .source => {
-                        if (!self.layout().source_split) {
-                            for (source_lines) |source_line| try page.line(source_line, .none);
-                            try page.line("", .none);
-                        }
-                        try self.appendSourceSpans(&page, id, chunk);
-                    },
-                    // Code, constants, and references are one document for the
-                    // selected chunk rather than separate panels.
-                    .code, .tables, .references => {
-                        try self.appendDisassembly(&page, id, chunk, .code);
-                        if (chunk.constants.len > 0) {
-                            try page.line("", .none);
-                            try self.appendDisassembly(&page, id, chunk, .tables);
-                        }
-                        try page.line("", .none);
-                        try self.appendRefs(&page, id);
-                    },
+                const source_lines = try self.sourceDocument(arena, id, chunk, self.focusedSourceSpan(id));
+                try page.line("SOURCE", .none);
+                // `sourceDocument` includes its file:line:column label followed
+                // by the focused excerpt, matching the debugger frame layout.
+                for (source_lines) |source_line| try page.line(source_line, .none);
+                try page.line("", .none);
+                try self.appendSourceSpans(&page, id, chunk);
+                try page.line("", .none);
+                try page.line(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{id}), .none);
+                try self.appendDisassembly(&page, id, chunk, .code);
+                if (chunk.constants.len > 0) {
+                    try page.line("", .none);
+                    try self.appendDisassembly(&page, id, chunk, .tables);
                 }
+                try page.line("", .none);
+                try self.appendRefs(&page, id);
                 return .{
                     .title = try std.fmt.allocPrint(arena, "chunk[0x{x}]", .{id}),
                     .lines = page.lines.items,
                     .actions = page.actions.items,
                     .locations = page.locations.items,
-                    .source_lines = if (self.layout().source_split) source_lines else &.{},
                 };
             },
             .heap => |view| return self.buildHeapPage(view),
@@ -1046,8 +1043,6 @@ const Tui = struct {
                     \\  j/k, arrows     move between interactive rows
                     \\  Enter, →        expand a tree/group or open a reference
                     \\  ←               collapse a tree/group
-                    \\  c               code view (disassembly, constants, references)
-                    \\  s               source view (navigable sub-expression spans)
                     \\  p               toggle a breakpoint on the selected row
                     \\  F               filter the tree by name (Esc clears)
                     \\  d/u, PgDn/PgUp  scroll the detail document
@@ -1129,7 +1124,7 @@ const Tui = struct {
         const snapshot = self.heap_index.objects orelse {
             try page.line(if (self.heap_index.objects_failed) "live-object index unavailable" else "building the live-object index asynchronously…", .none);
             return .{
-                .title = try std.fmt.allocPrint(arena, "object[#{d}]", .{id}),
+                .title = try std.fmt.allocPrint(arena, "objects[0x{x}]", .{id}),
                 .lines = page.lines.items,
                 .actions = page.actions.items,
             };
@@ -1137,12 +1132,12 @@ const Tui = struct {
         const info = self.ev.inspectHeapObject(&snapshot, id) catch {
             try page.line("this object is no longer live", .none);
             return .{
-                .title = try std.fmt.allocPrint(arena, "object[#{d}]", .{id}),
+                .title = try std.fmt.allocPrint(arena, "objects[0x{x}]", .{id}),
                 .lines = page.lines.items,
                 .actions = page.actions.items,
             };
         };
-        try page.line(try std.fmt.allocPrint(arena, "OBJECT #{d} · {s}", .{ id, @tagName(info) }), .none);
+        try page.line(try std.fmt.allocPrint(arena, "objects[0x{x}] → {s}", .{ id, @tagName(info) }), .none);
         try page.line("", .none);
         switch (info) {
             .list => {
@@ -1162,11 +1157,11 @@ const Tui = struct {
                 if (merge.flattened) |flat| try self.appendObjectRef(&page, "flattened", flat) else try page.line("flattened   not materialized", .none);
             },
             .closure => |closure| {
-                try page.line(try std.fmt.allocPrint(arena, "chunk       #{d}", .{closure.chunk}), .{ .chunk = closure.chunk });
+                try page.line(try std.fmt.allocPrint(arena, "chunk       chunk[0x{x}]", .{closure.chunk}), .{ .chunk = closure.chunk });
                 try page.line(try std.fmt.allocPrint(arena, "upvalues    {d}", .{closure.upvalues}), .none);
             },
             .builtin_closure => |closure| {
-                try page.line(try std.fmt.allocPrint(arena, "builtin     #{d}", .{closure.builtin}), .none);
+                try page.line(try std.fmt.allocPrint(arena, "builtin     {s}", .{try builtinText(arena, closure.builtin)}), .none);
                 try page.line(try std.fmt.allocPrint(arena, "arguments   {d}", .{closure.args}), .none);
             },
             .thunk => |thunk| {
@@ -1178,23 +1173,23 @@ const Tui = struct {
                     .target => |target| switch (target) {
                         .closure => |value| try self.appendValueRef(&page, "closure", value),
                         .bytecode => |body| {
-                            try page.line(try std.fmt.allocPrint(arena, "chunk       #{d}", .{body.chunk}), .{ .chunk = body.chunk });
+                            try page.line(try std.fmt.allocPrint(arena, "chunk       chunk[0x{x}]", .{body.chunk}), .{ .chunk = body.chunk });
                             try page.line(try std.fmt.allocPrint(arena, "captures    {d}", .{body.captures}), .none);
                         },
                         .pass_through => |value| try self.appendValueRef(&page, "value", value),
                         .attr_access => |access| {
                             try self.appendValueRef(&page, "base", access.base);
-                            try page.line(try std.fmt.allocPrint(arena, "attribute   intern #{d}", .{access.name}), .none);
+                            try page.line(try std.fmt.allocPrint(arena, "attribute   intern[0x{x}]", .{access.name}), .none);
                         },
                         .deferred => |body| {
-                            try page.line(try std.fmt.allocPrint(arena, "deferred    #{d}", .{body.id}), .none);
+                            try page.line(try std.fmt.allocPrint(arena, "deferred[0x{x}]", .{body.id}), .none);
                             try page.line(try std.fmt.allocPrint(arena, "captures    {d}", .{body.captures}), .none);
                         },
                     },
                 }
             },
             .context_string => |string| {
-                try page.line(try std.fmt.allocPrint(arena, "text        intern #{d}", .{string.text}), .none);
+                try page.line(try std.fmt.allocPrint(arena, "text        intern[0x{x}]", .{string.text}), .none);
                 try page.line(try std.fmt.allocPrint(arena, "context     {d} entries", .{string.context}), .none);
             },
             .boxed_int => |value| try page.line(try std.fmt.allocPrint(arena, "value       {d}", .{value}), .none),
@@ -1204,7 +1199,7 @@ const Tui = struct {
             },
         }
         return .{
-            .title = try std.fmt.allocPrint(arena, "object[#{d}]", .{id}),
+            .title = try std.fmt.allocPrint(arena, "objects[0x{x}]", .{id}),
             .lines = page.lines.items,
             .actions = page.actions.items,
         };
@@ -1214,7 +1209,7 @@ const Tui = struct {
     fn buildStoreRecordPage(self: *Tui, view: HeapView, id: u32) !Page {
         const arena = self.arena.allocator();
         var page: PageBuilder = .{ .arena = arena };
-        try page.line(try std.fmt.allocPrint(arena, "{s} #{d}", .{ @tagName(view), id }), .none);
+        try page.line(try self.canonicalStoreRef(arena, view, id, null, true), .none);
         try page.line("", .none);
         switch (view) {
             .values => {
@@ -1238,7 +1233,7 @@ const Tui = struct {
             .overview, .objects => try page.line("(not a store record)", .none),
         }
         return .{
-            .title = try std.fmt.allocPrint(arena, "{s}[#{d}]", .{ @tagName(view), id }),
+            .title = try std.fmt.allocPrint(arena, "{s}[0x{x}]", .{ @tagName(view), id }),
             .lines = page.lines.items,
             .actions = page.actions.items,
             .locations = page.locations.items,
@@ -1337,7 +1332,7 @@ const Tui = struct {
             try page.line("", .none);
         }
 
-        if (info.span) |span| if (session.frameSourceText(index)) |source| {
+        if (self.focusedSourceSpan(chunk_id) orelse info.span) |span| if (session.frameSourceText(index)) |source| {
             try page.line("SOURCE", .none);
             try self.appendSourceExcerpt(&page, source, span);
             try page.line("", .none);
@@ -1376,7 +1371,7 @@ const Tui = struct {
         }
 
         if (self.ev.getChunk(chunk_id)) |chunk| {
-            try page.line(try std.fmt.allocPrint(arena, "CODE · chunk #{d}", .{chunk_id}), .none);
+            try page.line(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{chunk_id}), .none);
             try self.appendDisassemblyAt(&page, chunk_id, chunk, .code, info.instruction);
         }
 
@@ -1389,8 +1384,10 @@ const Tui = struct {
     }
 
     fn appendObjectRef(self: *Tui, page: *PageBuilder, label: []const u8, id: runtime.types.ObjectId) !void {
-        _ = self;
-        try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} object #{d}", .{ label, id }), .{ .object = id });
+        try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{
+            label,
+            try self.canonicalStoreRef(page.arena, .objects, id, null, true),
+        }), .{ .object = id });
     }
 
     /// Render a heap `Value`: the actual scalar for inline kinds (int, float,
@@ -1401,39 +1398,58 @@ const Tui = struct {
         const arena = page.arena;
         try page.line(try std.fmt.allocPrint(arena, "kind   {s}", .{@tagName(value.kind())}), .none);
         switch (value.kind()) {
-            .null => try page.line(try std.fmt.allocPrint(arena, "{s:<12} null", .{label}), .none),
-            .bool_false => try page.line(try std.fmt.allocPrint(arena, "{s:<12} false", .{label}), .none),
-            .bool_true => try page.line(try std.fmt.allocPrint(arena, "{s:<12} true", .{label}), .none),
-            .int => try page.line(try std.fmt.allocPrint(arena, "{s:<12} {d}", .{ label, value.asInt() }), .none),
-            .float => try page.line(try std.fmt.allocPrint(arena, "{s:<12} {d}", .{ label, value.asFloat() }), .none),
-            .string, .path => try page.line(try std.fmt.allocPrint(arena, "{s:<12} {s}", .{ label, self.ev.internTable().get(value.asInternId()) }), .none),
+            .null, .bool_false, .bool_true, .int, .float, .string, .path => try page.line(
+                try std.fmt.allocPrint(arena, "{s:<12} {s}", .{ label, try self.valueSummary(arena, value, 64) }),
+                .none,
+            ),
             else => try self.appendValueRef(page, label, self.ev.valueRef(value)),
         }
     }
 
-    /// One navigable line for a `Value`: `<prefix><scalar-or-kind>[ → object #N]`.
+    /// One navigable line for a `Value`: `<prefix><digest>[ → store[0xN]]`.
     /// Object/chunk-backed values carry a `.object`/`.chunk` action so Enter
     /// (or the right-hand preview) drills into them; scalars render inline.
     fn appendValueLine(self: *Tui, page: *PageBuilder, prefix: []const u8, value: runtime.value.Value) !void {
         const arena = page.arena;
         const ref = self.ev.valueRef(value);
-        const detail = if (try self.scalarText(arena, value)) |s| s else @tagName(value.kind());
+        const detail = try self.valueSummary(arena, value, 52);
         const action: RowAction, const suffix: []const u8 = switch (ref.target) {
-            .object => |id| .{ .{ .object = id }, try std.fmt.allocPrint(arena, "  → object #{d}", .{id}) },
-            .chunk => |id| .{ .{ .chunk = id }, try std.fmt.allocPrint(arena, "  → chunk #{d}", .{id}) },
+            .object => |id| .{
+                .{ .object = id },
+                try std.fmt.allocPrint(arena, "  → {s}", .{try self.canonicalStoreRef(arena, .objects, id, null, true)}),
+            },
+            .chunk => |id| blk: {
+                var rendered: std.Io.Writer.Allocating = .init(arena);
+                try disasm.writeStoreRef(&rendered.writer, "chunk", id, .chunk, null, self.color_depth);
+                break :blk .{ .{ .chunk = id }, try std.fmt.allocPrint(arena, "  → {s}", .{rendered.written()}) };
+            },
             else => .{ .none, "" },
         };
         try page.line(try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ prefix, detail, suffix }), action);
     }
 
     fn appendValueRef(self: *Tui, page: *PageBuilder, label: []const u8, value: runtime.heap.ValueRef) !void {
-        _ = self;
         switch (value.target) {
             .none => try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{ label, @tagName(value.kind) }), .none),
-            .object => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} object #{d}", .{ label, @tagName(value.kind), id }), .{ .object = id }),
-            .chunk => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} chunk #{d}", .{ label, @tagName(value.kind), id }), .{ .chunk = id }),
-            .intern => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} intern #{d}", .{ label, @tagName(value.kind), id }), .none),
-            .builtin => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} #{d}", .{ label, @tagName(value.kind), id }), .none),
+            .object => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} → {s}", .{
+                label,
+                @tagName(value.kind),
+                try self.canonicalStoreRef(page.arena, .objects, id, null, true),
+            }), .{ .object = id }),
+            .chunk => |id| {
+                var rendered: std.Io.Writer.Allocating = .init(page.arena);
+                try disasm.writeStoreRef(&rendered.writer, "chunk", id, .chunk, null, self.color_depth);
+                try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} → {s}", .{ label, @tagName(value.kind), rendered.written() }), .{ .chunk = id });
+            },
+            .intern => |id| {
+                var rendered: std.Io.Writer.Allocating = .init(page.arena);
+                try disasm.writeStoreRef(&rendered.writer, "intern", id, .intern, null, self.color_depth);
+                try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} → {s}", .{ label, @tagName(value.kind), rendered.written() }), .none);
+            },
+            .builtin => |id| try page.line(
+                try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{ label, try builtinText(page.arena, id) }),
+                .none,
+            ),
         }
     }
 
@@ -1472,8 +1488,8 @@ const Tui = struct {
     fn chunkEquivalenceSuffix(self: *const Tui, buffer: []u8, id: ChunkId) []const u8 {
         const relation = self.chunkEquivalence(id) orelse return "";
         return switch (relation) {
-            .structural => |peer| std.fmt.bufPrint(buffer, " · identical #{d}", .{peer}) catch "",
-            .code => |peer| std.fmt.bufPrint(buffer, " · same code #{d}", .{peer}) catch "",
+            .structural => |peer| std.fmt.bufPrint(buffer, " · identical chunk[0x{x}]", .{peer}) catch "",
+            .code => |peer| std.fmt.bufPrint(buffer, " · same code chunk[0x{x}]", .{peer}) catch "",
         };
     }
 
@@ -1481,11 +1497,11 @@ const Tui = struct {
         const relation = self.chunkEquivalence(id) orelse return;
         switch (relation) {
             .structural => |peer| try page.line(
-                try std.fmt.allocPrint(page.arena, "structurally identical to chunk #{d}", .{peer}),
+                try std.fmt.allocPrint(page.arena, "structurally identical to chunk[0x{x}]", .{peer}),
                 .{ .chunk = peer },
             ),
             .code => |peer| try page.line(
-                try std.fmt.allocPrint(page.arena, "same bytecode as chunk #{d}; constants, source data, or metadata differ", .{peer}),
+                try std.fmt.allocPrint(page.arena, "same bytecode as chunk[0x{x}]; constants, source data, or metadata differ", .{peer}),
                 .{ .chunk = peer },
             ),
         }
@@ -1528,7 +1544,7 @@ const Tui = struct {
 
     fn appendChunkLabel(self: *Tui, page: *PageBuilder, marker: []const u8, id: ChunkId) !void {
         var text: std.Io.Writer.Allocating = .init(page.arena);
-        try text.writer.print("{s} #{d}", .{ marker, id });
+        try text.writer.print("{s} chunk[0x{x}]", .{ marker, id });
         if (self.ev.chunkRegistry().hasQualifiedName(id)) {
             try text.writer.writeByte(' ');
             try self.ev.chunkRegistry().writeQualifiedName(&text.writer, id, self.ev.internTable());
@@ -1574,9 +1590,14 @@ const Tui = struct {
         std.mem.reverse(LineRange, self.transcript_lines.items);
     }
 
-    fn sourceDocument(self: *Tui, id: ChunkId, chunk: *const bytecode.Chunk) ![][]u8 {
-        const arena = self.arena.allocator();
-        const span = chunk.body_span orelse if (chunk.source_map.len > 0) chunk.source_map[0].span else {
+    fn sourceDocument(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        id: ChunkId,
+        chunk: *const bytecode.Chunk,
+        focused_span: ?bytecode.Chunk.SourceSpan,
+    ) ![][]u8 {
+        const span = focused_span orelse chunk.body_span orelse if (chunk.source_map.len > 0) chunk.source_map[0].span else {
             var missing: PageBuilder = .{ .arena = arena };
             try missing.line("(no source information)", .none);
             return missing.lines.items;
@@ -1598,6 +1619,47 @@ const Tui = struct {
         };
         try self.appendSourceExcerpt(&document, bytes, span);
         return document.lines.items;
+    }
+
+    fn focusedSourceSpan(self: *const Tui, chunk_id: ChunkId) ?bytecode.Chunk.SourceSpan {
+        const focus = self.source_focus orelse return null;
+        return if (focus.chunk_id == chunk_id) focus.span else null;
+    }
+
+    /// Apply a newly selected source span by rebuilding the unified document.
+    /// Afterwards, find the same source row by location so the cursor does not
+    /// jump when the excerpt's line count changes.
+    fn selectedSourceChanged(self: *Tui) !void {
+        const selected = self.selectedSourceLocation() orelse return;
+        self.source_focus = .{ .chunk_id = selected.chunk_id, .span = selected.span.? };
+
+        const source_document = switch (self.currentKind()) {
+            .debug_frame, .chunk => true,
+            else => false,
+        };
+        if (!source_document) return;
+
+        const kind = self.currentKind();
+        try self.refreshPage(kind);
+        for (self.page.locations, 0..) |candidate, i| {
+            const location = candidate orelse continue;
+            const span = location.span orelse continue;
+            if (location.chunk_id == selected.chunk_id and
+                location.offset == selected.offset and
+                span.offset == selected.span.?.offset and
+                span.len == selected.span.?.len)
+            {
+                self.navigation.detail_selection = i;
+                self.ensureDetailVisible();
+                break;
+            }
+        }
+    }
+
+    fn selectedSourceLocation(self: *const Tui) ?BreakpointLocation {
+        if (self.navigation.detail_selection >= self.page.locations.len) return null;
+        const location = self.page.locations[self.navigation.detail_selection] orelse return null;
+        return if (location.span != null) location else null;
     }
 
     fn appendSourceExcerpt(self: *Tui, document: *PageBuilder, source: []const u8, span: bytecode.Chunk.SourceSpan) !void {
@@ -1661,12 +1723,19 @@ const Tui = struct {
     /// A source-map span (sub-expression) breakpoint target: distinct spans in
     /// source order, deduped, each keyed on the first instruction of its
     /// bytecode range.
-    const SpanTarget = struct { offset: u32, len: u32, line: u32, column: u32, start: u32 };
+    const SpanTarget = struct {
+        file: ?runtime.types.InternId,
+        offset: u32,
+        len: u32,
+        line: u32,
+        column: u32,
+        start: u32,
+    };
 
-    /// The breakpoint targets a chunk exposes in its source (code) view. Unlike
-    /// the asm view's per-instruction rows, these are per source-map span — finer
-    /// than a line, coarser than an instruction — but both toggle the same
-    /// `(chunk_id, offset)` breakpoint so a mark set in one view shows in the other.
+    /// The breakpoint targets a chunk exposes in its source view. Unlike the
+    /// disassembly's per-instruction rows, these retain exact source-span
+    /// identity; the breakpoint table resolves each to the first instruction
+    /// owned by that span's tightest source mapping.
     fn appendSourceSpans(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk) !void {
         const arena = page.arena;
         try page.line(" SOURCE SPANS · p toggles a breakpoint on the selected sub-expression", .none);
@@ -1679,6 +1748,7 @@ const Tui = struct {
         var n: usize = 0;
         for (chunk.source_map) |entry| {
             targets[n] = .{
+                .file = entry.span.file,
                 .offset = entry.span.offset,
                 .len = entry.span.len,
                 .line = entry.span.line,
@@ -1703,10 +1773,29 @@ const Tui = struct {
             if (last_offset != null and t.offset == last_offset.? and t.len == last_len.?) continue;
             last_offset = t.offset;
             last_len = t.len;
-            const snippet = spanSnippet(arena, source, t) catch "";
+            const snippet = self.highlightedSpanSnippet(arena, source, t) catch "";
             const text = try std.fmt.allocPrint(arena, "  L{d}:{d}  {s}", .{ t.line, t.column, snippet });
-            try page.lineAt(text, .instruction, .{ .chunk_id = id, .offset = t.start, .line = t.line });
+            try page.lineAt(text, .instruction, .{
+                .chunk_id = id,
+                .offset = t.start,
+                .line = t.line,
+                .span = .{
+                    .file = t.file,
+                    .offset = t.offset,
+                    .len = t.len,
+                    .line = t.line,
+                    .column = t.column,
+                },
+            });
         }
+    }
+
+    fn highlightedSpanSnippet(self: *Tui, arena: std.mem.Allocator, source: ?[]const u8, target: anytype) ![]const u8 {
+        const snippet = try spanSnippet(arena, source, target);
+        if (snippet.len == 0) return snippet;
+        var rendered: std.Io.Writer.Allocating = .init(arena);
+        try source_render.writeLine(&rendered.writer, snippet, .{ .color_depth = self.color_depth });
+        return rendered.written();
     }
 
     // -- navigation ------------------------------------------------------------
@@ -1719,15 +1808,6 @@ const Tui = struct {
         sidebar_width: usize,
         main_col: usize,
         main_width: usize,
-        source_split: bool,
-        source_col: usize,
-        source_width: usize,
-        preview_split: bool,
-        preview_col: usize,
-        preview_width: usize,
-        detail_preview_split: bool,
-        detail_preview_col: usize,
-        detail_preview_width: usize,
     };
 
     fn layout(self: *const Tui) Layout {
@@ -1735,30 +1815,8 @@ const Tui = struct {
         const body_rows = self.viewport.rows;
         const split = cols >= 96;
         const sidebar_width = if (split) @max(cols * 3 / 10, 28) else 0;
-        const source_split = split and cols >= 140 and self.currentChunk() != null and self.navigation.panel == .source;
-        // While browsing the tree on a wide terminal, a preview of the
-        // highlighted row sits BETWEEN the tree and the inspector (so it reads
-        // as "what the cursor is on" next to the tree, not marooned far right).
-        const preview_split = split and !source_split and cols >= 128 and self.navigation.focus == .chunks;
-        // While inspecting a value subject, the selected reference row is
-        // previewed to the RIGHT of the subject (peek into a member/target
-        // without navigating). Mutually exclusive with the left preview (focus).
-        const detail_preview_split = split and !source_split and !preview_split and cols >= 128 and self.detailPreviewAction() != null;
         const inspector_width = if (split) cols - sidebar_width - 1 else cols;
-        const source_width = if (source_split) @max(cols * 3 / 10, 42) else 0;
-        const preview_width = if (preview_split) @max(cols / 5, 28) else 0;
-        const detail_preview_width = if (detail_preview_split) @max(cols / 4, 32) else 0;
-        const main_width = inspector_width -| source_width -| preview_width -| detail_preview_width -|
-            @intFromBool(source_split) -| @intFromBool(preview_split) -| @intFromBool(detail_preview_split);
-        // Left preview comes first (right after the tree divider); the main
-        // inspector follows; source/detail previews sit to the right of main.
-        const preview_col = sidebar_width + 2;
-        const main_col = if (!split)
-            1
-        else if (preview_split)
-            preview_col + preview_width + 1
-        else
-            sidebar_width + 2;
+        const main_col = if (split) sidebar_width + 2 else 1;
         return .{
             .cols = cols,
             .rows = body_rows + 2,
@@ -1766,16 +1824,7 @@ const Tui = struct {
             .split = split,
             .sidebar_width = sidebar_width,
             .main_col = main_col,
-            .main_width = main_width,
-            .source_split = source_split,
-            .source_col = main_col + main_width + @intFromBool(source_split),
-            .source_width = source_width,
-            .preview_split = preview_split,
-            .preview_col = preview_col,
-            .preview_width = preview_width,
-            .detail_preview_split = detail_preview_split,
-            .detail_preview_col = main_col + main_width + @intFromBool(detail_preview_split),
-            .detail_preview_width = detail_preview_width,
+            .main_width = inspector_width,
         };
     }
 
@@ -2112,11 +2161,18 @@ const Tui = struct {
             if (projected_only and !contains_focus) continue;
             const first_live = snapshot.nextLive(child_start) orelse continue;
             if (first_live >= child_end) continue;
+            var live: u32 = 0;
+            var next: ?u32 = first_live;
+            while (next) |id| : (next = snapshot.nextLive(id + 1)) {
+                if (id >= child_end) break;
+                live += 1;
+            }
             const range: Range = .{
                 .kind = storeRangeKind(view),
                 .parent = 0,
                 .start = child_start,
                 .len = child_len,
+                .live = live,
                 .depth = depth,
             };
             try self.tree.rows.append(self.allocator, .{ .range = range });
@@ -2177,6 +2233,7 @@ const Tui = struct {
                 .parent = parent,
                 .start = start + offset,
                 .len = @min(span, len - offset),
+                .live = @min(span, len - offset),
                 .depth = depth,
             };
             try self.tree.rows.append(self.allocator, .{ .range = range });
@@ -2218,6 +2275,7 @@ const Tui = struct {
                 .parent = parent,
                 .start = start + offset,
                 .len = @min(span, len - offset),
+                .live = @min(span, len - offset),
                 .depth = depth,
             };
             try self.tree.rows.append(self.allocator, .{ .range = range });
@@ -2450,9 +2508,11 @@ const Tui = struct {
             try self.navigation.back.append(self.allocator, .{ .kind = kind });
         }
         self.navigation.forward.clearRetainingCapacity();
+        self.source_focus = null;
         try self.refreshPage(kind);
         self.navigation.scroll = 0;
         self.navigation.detail_selection = self.firstActionableRow() orelse 0;
+        try self.selectedSourceChanged();
         switch (kind) {
             .chunk => |id| {
                 try self.expandFocusedPath(id);
@@ -2485,6 +2545,7 @@ const Tui = struct {
         }
         try self.navigation.forward.append(self.allocator, self.navigation.back.pop().?);
         const visit = self.navigation.back.items[self.navigation.back.items.len - 1];
+        self.source_focus = null;
         try self.refreshPage(visit.kind);
         switch (visit.kind) {
             .chunk => |id| try self.expandFocusedPath(id),
@@ -2495,6 +2556,7 @@ const Tui = struct {
         self.navigation.tree_selection = visit.tree_selection;
         self.navigation.detail_selection = visit.detail_selection;
         self.navigation.x_scroll = visit.x_scroll;
+        try self.selectedSourceChanged();
         self.status_msg = "";
     }
 
@@ -2511,6 +2573,7 @@ const Tui = struct {
             top.x_scroll = self.navigation.x_scroll;
         }
         try self.navigation.back.append(self.allocator, visit);
+        self.source_focus = null;
         try self.refreshPage(visit.kind);
         switch (visit.kind) {
             .chunk => |id| try self.expandFocusedPath(id),
@@ -2521,6 +2584,7 @@ const Tui = struct {
         self.navigation.tree_selection = visit.tree_selection;
         self.navigation.detail_selection = visit.detail_selection;
         self.navigation.x_scroll = visit.x_scroll;
+        try self.selectedSourceChanged();
         self.status_msg = "";
     }
 
@@ -2573,26 +2637,49 @@ const Tui = struct {
             self.status_msg = "(selected row has no instruction)";
             return;
         };
-        if (self.ev.breakpointAt(location.chunk_id, location.offset)) {
-            _ = self.ev.deleteBreakpointAt(location.chunk_id, location.offset);
-            self.status_msg = std.fmt.bufPrint(&self.status_buf, "cleared breakpoint · #{d} @0x{x}", .{
-                location.chunk_id,
-                location.offset,
-            }) catch "cleared breakpoint";
+        if (self.hasBreakpoint(location)) {
+            if (location.span) |span|
+                _ = self.ev.deleteBreakpointSpan(location.chunk_id, span)
+            else
+                _ = self.ev.deleteBreakpointAt(location.chunk_id, location.offset);
+            self.status_msg = if (location.span) |span|
+                std.fmt.bufPrint(&self.status_buf, "cleared breakpoint · chunk[0x{x}] L{d}:{d}", .{
+                    location.chunk_id,
+                    span.line,
+                    span.column,
+                }) catch "cleared breakpoint"
+            else
+                std.fmt.bufPrint(&self.status_buf, "cleared breakpoint · chunk[0x{x}] @0x{x}", .{
+                    location.chunk_id,
+                    location.offset,
+                }) catch "cleared breakpoint";
             return;
         }
-        const result = self.ev.setBreakpointAt(location.chunk_id, location.offset) catch |err| {
+        const result = (if (location.span) |span|
+            self.ev.setBreakpointSpan(location.chunk_id, span)
+        else
+            self.ev.setBreakpointAt(location.chunk_id, location.offset)) catch |err| {
             self.status_msg = std.fmt.bufPrint(&self.status_buf, "breakpoint failed: {s}", .{@errorName(err)}) catch "breakpoint failed";
             return;
         };
         if (result.sites == 0) {
-            self.status_msg = "(not an instruction boundary)";
+            self.status_msg = if (location.span != null)
+                "(span has no distinct execution site)"
+            else
+                "(not an instruction boundary)";
             return;
         }
-        self.status_msg = std.fmt.bufPrint(&self.status_buf, "breakpoint · #{d} @0x{x}", .{
-            location.chunk_id,
-            location.offset,
-        }) catch "breakpoint set";
+        self.status_msg = if (location.span) |span|
+            std.fmt.bufPrint(&self.status_buf, "breakpoint · chunk[0x{x}] L{d}:{d}", .{
+                location.chunk_id,
+                span.line,
+                span.column,
+            }) catch "breakpoint set"
+        else
+            std.fmt.bufPrint(&self.status_buf, "breakpoint · chunk[0x{x}] @0x{x}", .{
+                location.chunk_id,
+                location.offset,
+            }) catch "breakpoint set";
     }
 
     fn moveDetail(self: *Tui, forward: bool) void {
@@ -2609,6 +2696,9 @@ const Tui = struct {
             if (self.rowActionable(cursor)) {
                 self.navigation.detail_selection = cursor;
                 self.ensureDetailVisible();
+                self.selectedSourceChanged() catch {
+                    self.status_msg = "(source preview unavailable)";
+                };
                 return;
             }
         }
@@ -2620,13 +2710,6 @@ const Tui = struct {
         if (self.navigation.detail_selection < self.navigation.scroll) self.navigation.scroll = self.navigation.detail_selection;
         if (self.navigation.detail_selection >= self.navigation.scroll + rows) self.navigation.scroll = self.navigation.detail_selection - rows + 1;
         self.clampScroll();
-    }
-
-    fn selectPanel(self: *Tui, panel: Panel) !void {
-        if (self.currentChunk() == null) return;
-        self.navigation.panel = panel;
-        try self.refreshPage(self.currentKind());
-        self.navigation.focus = .disassembly;
     }
 
     fn activateDetailRow(self: *Tui) !void {
@@ -2678,6 +2761,7 @@ const Tui = struct {
                     } else {
                         self.navigation.detail_selection = self.firstActionableRow() orelse 0;
                         self.ensureDetailVisible();
+                        try self.selectedSourceChanged();
                     }
                 },
                 'G' => {
@@ -2693,6 +2777,7 @@ const Tui = struct {
                             }
                         }
                         self.ensureDetailVisible();
+                        try self.selectedSourceChanged();
                     }
                 },
                 'h' => {
@@ -2703,8 +2788,6 @@ const Tui = struct {
                 },
                 'b' => try self.back(),
                 'f' => try self.goForward(),
-                'c' => try self.selectPanel(.code),
-                's' => try self.selectPanel(.source),
                 'p' => try self.toggleSelectedBreakpoint(),
                 'F' => try self.filterPrompt(),
                 '?' => try self.toggleHelp(),
@@ -2749,6 +2832,7 @@ const Tui = struct {
                 if (self.navigation.focus == .chunks) self.navigation.tree_selection = 0 else {
                     self.navigation.detail_selection = self.firstActionableRow() orelse 0;
                     self.ensureDetailVisible();
+                    try self.selectedSourceChanged();
                 }
             },
             .end => {
@@ -2951,7 +3035,7 @@ const Tui = struct {
                 mode,
             }) catch " fix vm  ·  paused "
         else if (self.currentChunk()) |id|
-            std.fmt.bufPrint(&header_buf, " fix vm  ·  chunk #0x{x}  ·  {s} ", .{
+            std.fmt.bufPrint(&header_buf, " fix vm  ·  chunk[0x{x}]  ·  {s} ", .{
                 id,
                 if (prompt_active) "repl" else if (self.navigation.focus == .chunks) "tree" else "inspector",
             }) catch " fix repl "
@@ -2961,7 +3045,7 @@ const Tui = struct {
                 if (prompt_active) "repl" else if (self.navigation.focus == .chunks) "tree" else "inspector",
             }) catch " fix vm "
         else if (self.currentObject()) |id|
-            std.fmt.bufPrint(&header_buf, " fix vm  ·  object #{d}  ·  {s} ", .{
+            std.fmt.bufPrint(&header_buf, " fix vm  ·  objects[0x{x}]  ·  {s} ", .{
                 id,
                 if (prompt_active) "repl" else if (self.navigation.focus == .chunks) "tree" else "inspector",
             }) catch " fix vm "
@@ -2996,7 +3080,7 @@ const Tui = struct {
         else if (self.filterActive())
             std.fmt.bufPrint(&footer_buf, " filter '{s}' · F edit · Esc-in-F clears · q/Esc exit · Tab pane · ↵ inspect ", .{self.tree.filter_query.items}) catch " filtered "
         else
-            std.fmt.bufPrint(&footer_buf, " q/Esc exit · i expr · : cmd · Tab pane · c code · s source · p break · F filter · ↵ inspect{s} ", .{
+            std.fmt.bufPrint(&footer_buf, " q/Esc exit · i expr · : cmd · Tab pane · p break · F filter · ↵ inspect{s} ", .{
                 if (self.tree.indexing) " · indexing" else "",
             }) catch " q exit ";
         try frame.bar(screen_rows, footer, cols, .footer);
@@ -3015,43 +3099,16 @@ const Tui = struct {
         const layout_now = self.layout();
         self.clampScroll();
         self.navigation.tree_selection = @min(self.navigation.tree_selection, self.tree.rows.items.len -| 1);
-        const preview = if (layout_now.preview_split) try self.previewLines(arena) else &.{};
-        const detail_preview = if (layout_now.detail_preview_split) try self.detailPreviewLines(arena) else &.{};
         for (0..rows) |row| {
             const screen_row = first_row + row;
             try frame.clearRow(screen_row);
             if (layout_now.split) {
                 try frame.at(screen_row, 1);
                 try self.drawChunkRow(arena, frame, row, layout_now.sidebar_width, rows);
-                // The divider immediately left of the focused inspector is
-                // accented (tree focus is already shown by its selection bar).
-                // With a preview between, that's the preview→inspector divider;
-                // otherwise it's the tree→inspector one.
                 const inspector_focused = self.navigation.focus == .disassembly;
-                try self.drawFocusDivider(frame, screen_row, layout_now.sidebar_width + 1, inspector_focused and !layout_now.preview_split);
-                // Preview sits between the tree and the inspector.
-                if (layout_now.preview_split) {
-                    try frame.at(screen_row, layout_now.preview_col);
-                    if (row < preview.len) {
-                        const role: tui.Role = if (row == 0) .section else .plain;
-                        try frame.text(preview[row], 0, layout_now.preview_width, role);
-                    }
-                    try self.drawFocusDivider(frame, screen_row, layout_now.main_col - 1, inspector_focused);
-                }
+                try self.drawFocusDivider(frame, screen_row, layout_now.sidebar_width + 1, inspector_focused);
                 try frame.at(screen_row, layout_now.main_col);
                 try self.drawDisasmRow(frame, row, layout_now.main_width);
-                if (layout_now.source_split) {
-                    try frame.divider(screen_row, layout_now.source_col - 1);
-                    try frame.at(screen_row, layout_now.source_col);
-                    try self.drawSourceRow(frame, row, layout_now.source_width);
-                } else if (layout_now.detail_preview_split) {
-                    try frame.divider(screen_row, layout_now.detail_preview_col - 1);
-                    try frame.at(screen_row, layout_now.detail_preview_col);
-                    if (row < detail_preview.len) {
-                        const role: tui.Role = if (row == 0) .section else .plain;
-                        try frame.text(detail_preview[row], 0, layout_now.detail_preview_width, role);
-                    }
-                }
             } else if (self.navigation.focus == .chunks) {
                 try frame.at(screen_row, 1);
                 try self.drawChunkRow(arena, frame, row, cols, rows);
@@ -3060,6 +3117,98 @@ const Tui = struct {
                 try self.drawDisasmRow(frame, row, layout_now.main_width);
             }
         }
+
+        // Peeks are overlays, not columns: moving the selection no longer
+        // changes either pane's width or reflows the inspector.
+        const popup = if (self.navigation.focus == .chunks)
+            try self.previewLines(arena)
+        else if (self.detailPreviewAction() != null)
+            try self.detailPreviewLines(arena)
+        else
+            &.{};
+        if (popup.len > 1 and cols >= 40 and rows >= 6)
+            try self.drawHoverPopup(arena, frame, first_row, rows, cols, layout_now, popup);
+    }
+
+    fn previewRole(self: *const Tui) tui.Role {
+        if (self.navigation.focus == .disassembly) return switch (self.detailPreviewAction() orelse return .section) {
+            .chunk => .chunk,
+            .object => .object,
+            else => .section,
+        };
+        if (self.navigation.tree_selection >= self.tree.rows.items.len) return .section;
+        return switch (self.tree.rows.items[self.navigation.tree_selection]) {
+            .chunk => .chunk,
+            .object, .store_record, .heap => .object,
+            .range => .range,
+            .name => .name,
+            else => .section,
+        };
+    }
+
+    fn drawHoverPopup(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        frame: *tui.Frame,
+        first_row: usize,
+        rows: usize,
+        cols: usize,
+        layout_now: Layout,
+        lines: []const []const u8,
+    ) !void {
+        const available_outer = if (self.navigation.focus == .chunks)
+            (if (layout_now.split) cols -| layout_now.sidebar_width -| 2 else cols * 2 / 3)
+        else
+            cols * 2 / 3;
+        const max_outer = @min(@as(usize, 76), @max(@as(usize, 28), available_outer));
+        var desired: usize = 28;
+        for (lines) |line| desired = @max(desired, tui.displayWidth(line, width_mod.cpWidth) + 2);
+        const outer_width = @min(max_outer, desired);
+        const content_width = outer_width - 2;
+        const visible = @min(lines.len, rows - 2);
+        const outer_height = visible + 2;
+
+        const anchor_row = if (self.navigation.focus == .chunks)
+            3 + @min(self.navigation.tree_selection, rows -| 4)
+        else
+            self.navigation.detail_selection -| self.navigation.scroll;
+        const top = first_row + @min(anchor_row, rows - outer_height);
+        const left = cols - outer_width + 1;
+        const role = self.previewRole();
+        const fill = try arena.alloc(u8, content_width);
+        @memset(fill, ' ');
+        var horizontal: std.Io.Writer.Allocating = .init(arena);
+        for (0..content_width) |_| try horizontal.writer.writeAll("─");
+
+        try frame.at(top, left);
+        try frame.text("╭", 0, 1, role);
+        try frame.text(horizontal.written(), 0, content_width, role);
+        try frame.text("╮", 0, 1, role);
+
+        for (0..visible) |i| {
+            const screen_row = top + 1 + i;
+            try frame.at(screen_row, left);
+            try frame.text("│", 0, 1, role);
+            try frame.at(screen_row, left + 1);
+            try frame.text(fill, 0, content_width, .plain);
+            try frame.at(screen_row, left + 1);
+            const line_width = tui.displayWidth(lines[i], width_mod.cpWidth);
+            if (line_width > content_width and content_width > 0) {
+                try frame.text(lines[i], 0, content_width -| 1, if (i == 0) role else .plain);
+                try frame.at(screen_row, left + outer_width - 2);
+                try frame.text("…", 0, 1, if (i == 0) role else .plain);
+            } else {
+                try frame.text(lines[i], 0, content_width, if (i == 0) role else .plain);
+            }
+            try frame.at(screen_row, left + outer_width - 1);
+            try frame.text("│", 0, 1, role);
+        }
+
+        const bottom = top + outer_height - 1;
+        try frame.at(bottom, left);
+        try frame.text("╰", 0, 1, role);
+        try frame.text(horizontal.written(), 0, content_width, role);
+        try frame.text("╯", 0, 1, role);
     }
 
     /// A compact preview of the highlighted tree row for the right-hand pane.
@@ -3071,7 +3220,7 @@ const Tui = struct {
         if (self.navigation.tree_selection >= self.tree.rows.items.len) return lines.items;
         switch (self.tree.rows.items[self.navigation.tree_selection]) {
             .chunk => |entry| {
-                try lines.append(arena, try std.fmt.allocPrint(arena, " chunk #{d}", .{entry.id}));
+                try lines.append(arena, try std.fmt.allocPrint(arena, " chunk[0x{x}]", .{entry.id}));
                 if (self.ev.chunkRegistry().hasQualifiedName(entry.id)) {
                     var name: std.Io.Writer.Allocating = .init(arena);
                     self.ev.chunkRegistry().writeQualifiedName(&name.writer, entry.id, self.ev.internTable()) catch {};
@@ -3089,6 +3238,7 @@ const Tui = struct {
                             if (snip.len > 0) try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{snip}));
                         }
                     }
+                    try self.appendChunkCodePreview(&lines, arena, entry.id, chunk, 12);
                 }
             },
             .name => |entry| {
@@ -3097,12 +3247,11 @@ const Tui = struct {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {d} chunks in subtree", .{self.tree_index.statsOf(entry.id).chunks}));
             },
             .object => |entry| {
-                const kind = if (self.heap_index.objects) |*snapshot|
-                    if (self.ev.inspectHeapObject(snapshot, entry.id)) |info| @tagName(info) else |_| "?"
-                else
-                    "?";
-                try lines.append(arena, try std.fmt.allocPrint(arena, " object #{d}", .{entry.id}));
-                try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{kind}));
+                const summary = try self.objectSummary(arena, entry.id, 56);
+                try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
+                    try self.canonicalStoreRef(arena, .objects, entry.id, summary, true),
+                }));
+                try self.appendObjectPreview(&lines, arena, entry.id);
             },
             .heap => |entry| {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " heap/{s}", .{@tagName(entry.view)}));
@@ -3114,19 +3263,33 @@ const Tui = struct {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {s}:{d}", .{ if (info.file) |f| std.fs.path.basename(f) else "<repl>", info.line }));
             },
             .store_record => |entry| {
-                try lines.append(arena, try std.fmt.allocPrint(arena, " {s} #{d}", .{ @tagName(entry.view), entry.id }));
                 switch (entry.view) {
                     .values => if (self.ev.heapValueAt(entry.id)) |v| {
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{@tagName(v.kind())}));
-                        if (try self.scalarText(arena, v.*)) |s| try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{s}));
+                        const summary = try self.valueSummary(arena, v.*, 56);
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
+                            try self.canonicalStoreRef(arena, entry.view, entry.id, summary, true),
+                        }));
                     },
                     .attrs => if (self.ev.heapAttrAt(entry.id)) |a| {
-                        if (try self.scalarText(arena, a.value)) |s|
-                            try lines.append(arena, try std.fmt.allocPrint(arena, " {s} = {s}", .{ self.ev.internTable().get(a.name), s }))
-                        else
-                            try lines.append(arena, try std.fmt.allocPrint(arena, " {s} : {s}", .{ self.ev.internTable().get(a.name), @tagName(a.value.kind()) }));
+                        const summary = try std.fmt.allocPrint(arena, "{s} = {s}", .{
+                            self.ev.internTable().get(a.name),
+                            try self.valueSummary(arena, a.value, 42),
+                        });
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
+                            try self.canonicalStoreRef(arena, entry.view, entry.id, summary, true),
+                        }));
                     },
-                    .attr_positions => if (self.ev.heapAttrPosAt(entry.id)) |a| try lines.append(arena, try std.fmt.allocPrint(arena, " {s}:{d}", .{ self.ev.internTable().get(a.pos.file), a.pos.line })),
+                    .attr_positions => if (self.ev.heapAttrPosAt(entry.id)) |a| {
+                        const summary = try std.fmt.allocPrint(arena, "{s} @ {s}:{d}:{d}", .{
+                            self.ev.internTable().get(a.name),
+                            std.fs.path.basename(self.ev.internTable().get(a.pos.file)),
+                            a.pos.line,
+                            a.pos.column,
+                        });
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
+                            try self.canonicalStoreRef(arena, entry.view, entry.id, summary, true),
+                        }));
+                    },
                     else => {},
                 }
             },
@@ -3156,7 +3319,9 @@ const Tui = struct {
         const action = self.detailPreviewAction() orelse return lines.items;
         switch (action) {
             .object => |id| {
-                try lines.append(arena, try std.fmt.allocPrint(arena, " object #{d}", .{id}));
+                try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
+                    try self.canonicalStoreRef(arena, .objects, id, try self.objectSummary(arena, id, 56), true),
+                }));
                 if (self.ev.heapAttrsOf(id)) |attrs| {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " attrs · {d} members", .{attrs.len}));
                     for (attrs, 0..) |entry, i| {
@@ -3177,21 +3342,290 @@ const Tui = struct {
                             try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{@tagName(info)}));
                         } else |_| {}
                     }
+                    try self.appendObjectPreview(&lines, arena, id);
                 }
             },
             .chunk => |id| {
-                try lines.append(arena, try std.fmt.allocPrint(arena, " chunk #{d}", .{id}));
+                try lines.append(arena, try std.fmt.allocPrint(arena, " chunk[0x{x}]", .{id}));
                 if (self.ev.getChunk(id)) |chunk| {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {d} bytes · {d} consts", .{ chunk.code.len, chunk.constants.len }));
                     if (chunk.source_map.len > 0) {
                         const snip = spanSnippet(arena, self.chunkSourceText(id, chunk), chunk.source_map[0].span) catch "";
                         if (snip.len > 0) try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{snip}));
                     }
+                    try self.appendChunkCodePreview(&lines, arena, id, chunk, 14);
                 }
             },
             else => {},
         }
         return lines.items;
+    }
+
+    /// Add a bounded canonical disassembly to a preview. This deliberately uses
+    /// the same formatter as the full code view, including builtin resolution
+    /// and syntax/source annotations, but excludes cold tables.
+    fn appendChunkCodePreview(
+        self: *Tui,
+        lines: *std.ArrayListUnmanaged([]const u8),
+        arena: std.mem.Allocator,
+        id: ChunkId,
+        chunk: *const bytecode.Chunk,
+        limit: usize,
+    ) !void {
+        // A preview must stay cheap even when the highlighted chunk is huge.
+        // The formatter may hit the fixed writer's limit; the complete rows it
+        // produced before that point are still a useful bounded preview.
+        var text: std.Io.Writer = .fixed(try arena.alloc(u8, 16 * 1024));
+        const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
+        var options = disasm_options;
+        options.show_constants = false;
+        options.show_code = true;
+        options.show_bytes = false;
+        options.color_depth = self.color_depth;
+        options.line_width = 0;
+        disasm.writeChunk(arena, &text, id, chunk, symbols, options) catch {};
+
+        try lines.append(arena, "");
+        try lines.append(arena, " CODE");
+        var it = std.mem.splitScalar(u8, text.buffered(), '\n');
+        var shown: usize = 0;
+        while (it.next()) |line| {
+            if (line.len == 0 or std.mem.startsWith(u8, base.terminal_text.stripAnsiInPlace(try arena.dupe(u8, line)), "chunk[")) continue;
+            try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{line}));
+            shown += 1;
+            if (shown == limit) {
+                if (it.peek() != null) try lines.append(arena, " …");
+                break;
+            }
+        }
+    }
+
+    /// Enrich heap-object previews where metadata alone is least useful. In
+    /// particular, bytecode thunks show their body and its first instructions.
+    fn appendObjectPreview(
+        self: *Tui,
+        lines: *std.ArrayListUnmanaged([]const u8),
+        arena: std.mem.Allocator,
+        id: runtime.types.ObjectId,
+    ) !void {
+        // A standalone debugger pause does not run the asynchronous heap-index
+        // jobs. Build its live-object bitmap once, synchronously while the VM is
+        // paused, so stack thunks can still expose their bodies in previews.
+        if (self.heap_index.objects == null and self.debug_session != null)
+            self.heap_index.objects = self.ev.heapObjectSnapshot(self.allocator) catch null;
+        const snapshot = if (self.heap_index.objects) |*snap| snap else return;
+        const info = self.ev.inspectHeapObject(snapshot, id) catch return;
+        switch (info) {
+            .thunk => |thunk| {
+                try lines.append(arena, try std.fmt.allocPrint(arena, " state {s} · demanded {s}", .{
+                    @tagName(thunk.state),
+                    if (thunk.demanded) "yes" else "no",
+                }));
+                switch (thunk.body) {
+                    .target => |target| switch (target) {
+                        .bytecode => |body| {
+                            try lines.append(arena, try std.fmt.allocPrint(arena, " chunk[0x{x}] · {d} captures", .{ body.chunk, body.captures }));
+                            if (self.ev.getChunk(body.chunk)) |chunk|
+                                try self.appendChunkCodePreview(lines, arena, body.chunk, chunk, 10);
+                        },
+                        .closure => |value| try lines.append(arena, try std.fmt.allocPrint(arena, " closure {s}", .{@tagName(value.kind)})),
+                        .pass_through => |value| try lines.append(arena, try std.fmt.allocPrint(arena, " value {s}", .{@tagName(value.kind)})),
+                        .attr_access => |access| try lines.append(arena, try std.fmt.allocPrint(arena, " attribute intern[0x{x}]", .{access.name})),
+                        .deferred => |body| try lines.append(arena, try std.fmt.allocPrint(arena, " deferred[0x{x}] · {d} captures", .{ body.id, body.captures })),
+                    },
+                    .result => |value| try lines.append(arena, try std.fmt.allocPrint(arena, " result {s}", .{@tagName(value.kind)})),
+                    .error_name => |name| try lines.append(arena, try std.fmt.allocPrint(arena, " error {s}", .{name})),
+                }
+            },
+            .builtin_closure => |closure| {
+                try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{try builtinText(arena, closure.builtin)}));
+                try lines.append(arena, try std.fmt.allocPrint(arena, " {d} arguments", .{closure.args}));
+            },
+            .closure => |closure| if (self.ev.getChunk(closure.chunk)) |chunk|
+                try self.appendChunkCodePreview(lines, arena, closure.chunk, chunk, 10),
+            else => {},
+        }
+    }
+
+    fn identityForStore(view: HeapView) disasm.Identity {
+        return switch (view) {
+            .overview, .objects => .object,
+            .values => .value,
+            .attrs => .attr,
+            .attr_positions => .attr_position,
+        };
+    }
+
+    fn canonicalStoreRef(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        view: HeapView,
+        id: u32,
+        preview: ?[]const u8,
+        colored: bool,
+    ) ![]const u8 {
+        var rendered: std.Io.Writer.Allocating = .init(arena);
+        try disasm.writeStoreRef(
+            &rendered.writer,
+            @tagName(view),
+            id,
+            identityForStore(view),
+            preview,
+            if (colored) self.color_depth else .none,
+        );
+        return rendered.written();
+    }
+
+    fn canonicalStoreRange(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        view: HeapView,
+        start: u32,
+        end: u32,
+        live: u32,
+        colored: bool,
+    ) ![]const u8 {
+        var rendered: std.Io.Writer.Allocating = .init(arena);
+        try disasm.writeStoreRange(
+            &rendered.writer,
+            @tagName(view),
+            start,
+            end,
+            live,
+            identityForStore(view),
+            if (colored) self.color_depth else .none,
+        );
+        return rendered.written();
+    }
+
+    fn escapedQuoted(
+        arena: std.mem.Allocator,
+        prefix: []const u8,
+        text: []const u8,
+        max_cells: usize,
+    ) ![]const u8 {
+        var escaped: std.Io.Writer.Allocating = .init(arena);
+        for (text) |c| switch (c) {
+            '\\' => try escaped.writer.writeAll("\\\\"),
+            '"' => try escaped.writer.writeAll("\\\""),
+            '\n' => try escaped.writer.writeAll("\\n"),
+            '\r' => try escaped.writer.writeAll("\\r"),
+            '\t' => try escaped.writer.writeAll("\\t"),
+            else => try escaped.writer.writeByte(c),
+        };
+        const inner_width = max_cells -| width_mod.strWidth(prefix) -| 2;
+        const short = try width_mod.endEllipsis(arena, escaped.written(), inner_width);
+        return std.fmt.allocPrint(arena, "{s}\"{s}\"", .{ prefix, short });
+    }
+
+    fn floatSummary(arena: std.mem.Allocator, value: f64) ![]const u8 {
+        const short = try std.fmt.allocPrint(arena, "{d:.3}", .{value});
+        const parsed = std.fmt.parseFloat(f64, short) catch value;
+        return std.fmt.allocPrint(arena, "float {s}{s}", .{
+            if (parsed == value) "" else "~",
+            short,
+        });
+    }
+
+    /// A bounded, non-forcing digest. Container membership is already known by
+    /// the heap, so counts and a few inline members are safe to use; no thunk is
+    /// evaluated and no lazy attribute is demanded here.
+    fn valueSummary(self: *Tui, arena: std.mem.Allocator, value: runtime.value.Value, max_cells: usize) ![]const u8 {
+        const raw: []const u8 = switch (value.kind()) {
+            .null => "null",
+            .bool_false => "bool false",
+            .bool_true => "bool true",
+            .int => try std.fmt.allocPrint(arena, "int {d}", .{value.asInt()}),
+            .float => try floatSummary(arena, value.asFloat()),
+            .string => return escapedQuoted(arena, "string ", self.ev.internTable().get(value.asInternId()), max_cells),
+            .path => return escapedQuoted(arena, "path ", self.ev.internTable().get(value.asInternId()), max_cells),
+            .builtin => blk: {
+                const id = value.asBuiltinId();
+                break :blk if (disasm.builtinName(id)) |name|
+                    try std.fmt.allocPrint(arena, "builtin[0x{x}] → {s}", .{ id, name })
+                else
+                    try std.fmt.allocPrint(arena, "builtin[0x{x}]", .{id});
+            },
+            .list => blk: {
+                const id = value.asObjectId();
+                const items = self.ev.heapListOf(id) catch break :blk try std.fmt.allocPrint(arena, "list → objects[0x{x}]", .{id});
+                var out: std.Io.Writer.Allocating = .init(arena);
+                try out.writer.print("list ({d})", .{items.len});
+                if (items.len > 0) {
+                    try out.writer.writeAll(" [");
+                    for (items[0..@min(items.len, 3)], 0..) |item, i| {
+                        if (i != 0) try out.writer.writeAll(", ");
+                        if (try self.scalarText(arena, item)) |scalar|
+                            try out.writer.writeAll(scalar)
+                        else
+                            try out.writer.writeAll(@tagName(item.kind()));
+                    }
+                    if (items.len > 3) try out.writer.writeAll(", …");
+                    try out.writer.writeByte(']');
+                }
+                break :blk out.written();
+            },
+            .attrs => blk: {
+                const id = value.asObjectId();
+                const attrs = self.ev.heapAttrsOf(id) catch break :blk try std.fmt.allocPrint(arena, "attrs → objects[0x{x}]", .{id});
+                var out: std.Io.Writer.Allocating = .init(arena);
+                try out.writer.print("attrs ({d})", .{attrs.len});
+                if (attrs.len > 0) {
+                    try out.writer.writeAll(" {");
+                    for (attrs[0..@min(attrs.len, 2)], 0..) |attr, i| {
+                        if (i != 0) try out.writer.writeAll(", ");
+                        try out.writer.writeAll(self.ev.internTable().get(attr.name));
+                        if (try self.scalarText(arena, attr.value)) |scalar|
+                            try out.writer.print(" = {s}", .{scalar});
+                    }
+                    if (attrs.len > 2) try out.writer.writeAll(", …");
+                    try out.writer.writeByte('}');
+                }
+                break :blk out.written();
+            },
+            .closure => if (value.isFunction())
+                try std.fmt.allocPrint(arena, "function → chunk[0x{x}]", .{value.asFunctionChunkId()})
+            else
+                try std.fmt.allocPrint(arena, "closure → objects[0x{x}]", .{value.asObjectId()}),
+            .thunk, .builtin_closure, .string_context, .boxed_int, .partial_app => try std.fmt.allocPrint(
+                arena,
+                "{s} → objects[0x{x}]",
+                .{ @tagName(value.kind()), value.asObjectId() },
+            ),
+        };
+        return width_mod.endEllipsis(arena, raw, max_cells);
+    }
+
+    fn objectSummary(self: *Tui, arena: std.mem.Allocator, id: runtime.types.ObjectId, max_cells: usize) ![]const u8 {
+        if (self.heap_index.objects) |*snapshot| {
+            if (self.ev.inspectHeapObject(snapshot, id)) |info| {
+                const text: []const u8 = switch (info) {
+                    .list => if (self.ev.heapListOf(id)) |items|
+                        try std.fmt.allocPrint(arena, "list ({d})", .{items.len})
+                    else |_|
+                        "list",
+                    .attrs => if (self.ev.heapAttrsOf(id)) |attrs|
+                        try std.fmt.allocPrint(arena, "attrs ({d})", .{attrs.len})
+                    else |_|
+                        "attrs",
+                    .merge_attrs => |merge| try std.fmt.allocPrint(arena, "attrs merge · depth {d}", .{merge.depth}),
+                    .closure => |closure| try std.fmt.allocPrint(arena, "closure → chunk[0x{x}] · {d} upvalues", .{ closure.chunk, closure.upvalues }),
+                    .builtin_closure => |closure| if (disasm.builtinName(closure.builtin)) |name|
+                        try std.fmt.allocPrint(arena, "builtin closure → {s} · {d} args", .{ name, closure.args })
+                    else
+                        try std.fmt.allocPrint(arena, "builtin closure[0x{x}] · {d} args", .{ closure.builtin, closure.args }),
+                    .thunk => |thunk| try std.fmt.allocPrint(arena, "thunk · {s}{s}", .{
+                        @tagName(thunk.state),
+                        if (thunk.demanded) " · demanded" else "",
+                    }),
+                    .context_string => |string| try std.fmt.allocPrint(arena, "context string · {d} entries", .{string.context}),
+                    .boxed_int => |value| try std.fmt.allocPrint(arena, "int {d}", .{value}),
+                    .partial_app => |partial| try std.fmt.allocPrint(arena, "partial application · {d} args", .{partial.args}),
+                };
+                return width_mod.endEllipsis(arena, text, max_cells);
+            } else |_| {}
+        }
+        return "?";
     }
 
     /// The rendered scalar for an inline `Value` (null/bool/int/float/string/
@@ -3202,9 +3636,11 @@ const Tui = struct {
             .null => "null",
             .bool_false => "false",
             .bool_true => "true",
-            .int => try std.fmt.allocPrint(arena, "{d}", .{value.asInt()}),
-            .float => try std.fmt.allocPrint(arena, "{d}", .{value.asFloat()}),
-            .string, .path => self.ev.internTable().get(value.asInternId()),
+            .int => try std.fmt.allocPrint(arena, "int {d}", .{value.asInt()}),
+            .float => try floatSummary(arena, value.asFloat()),
+            .string => try escapedQuoted(arena, "string ", self.ev.internTable().get(value.asInternId()), 32),
+            .path => try escapedQuoted(arena, "path ", self.ev.internTable().get(value.asInternId()), 32),
+            .builtin => try builtinText(arena, value.asBuiltinId()),
             else => null,
         };
     }
@@ -3246,6 +3682,7 @@ const Tui = struct {
     }
 
     fn hasBreakpoint(self: *const Tui, location: BreakpointLocation) bool {
+        if (location.span) |span| return self.ev.breakpointSpan(location.chunk_id, span);
         return self.ev.breakpointAt(location.chunk_id, location.offset);
     }
 
@@ -3257,13 +3694,6 @@ const Tui = struct {
             .none, .instruction => {},
         };
         return if (std.mem.startsWith(u8, self.page.lines[index], "▶")) .source_focus else .plain;
-    }
-
-    fn drawSourceRow(self: *Tui, frame: *tui.Frame, row: usize, width: usize) !void {
-        if (row < self.page.source_lines.len) {
-            const role: tui.Role = if (std.mem.startsWith(u8, self.page.source_lines[row], "▶")) .source_focus else .plain;
-            try frame.text(self.page.source_lines[row], 0, width, role);
-        }
     }
 
     const TreeViewport = struct {
@@ -3414,7 +3844,7 @@ const Tui = struct {
                 const node = self.tree_index.node(node_id) orelse return null;
                 const chunk = self.ev.getChunk(entry.id) orelse return null;
                 const relation = self.chunkEquivalenceSuffix(&relation_buf, entry.id);
-                const suffix = std.fmt.bufPrint(&suffix_buf, "  #{d} · {Bi}{s}", .{ entry.id, chunk.code.len, relation }) catch "";
+                const suffix = std.fmt.bufPrint(&suffix_buf, "  chunk[0x{x}] · {Bi}{s}", .{ entry.id, chunk.code.len, relation }) catch "";
                 break :blk width_mod.strWidth(node.label) + width_mod.strWidth(suffix);
             } else null,
             else => null,
@@ -3438,7 +3868,7 @@ const Tui = struct {
             1 => {
                 const id = self.currentChunk() orelse {
                     if (self.currentObject()) |object_id| {
-                        const line = std.fmt.bufPrint(&line_buf, " ● object #{d}", .{object_id}) catch " object";
+                        const line = std.fmt.bufPrint(&line_buf, " ● objects[0x{x}]", .{object_id}) catch " object";
                         try frame.text(line, 0, width, .object);
                     } else if (self.currentHeap()) |view| {
                         const line = std.fmt.bufPrint(&line_buf, " ● heap/{s}", .{@tagName(view)}) catch " heap";
@@ -3454,9 +3884,9 @@ const Tui = struct {
                 var relation_buf: [96]u8 = undefined;
                 const relation = self.chunkEquivalenceSuffix(&relation_buf, id);
                 const line = if (self.ev.getChunk(id)) |chunk|
-                    std.fmt.bufPrint(&line_buf, " ● #0x{x}  {d}b · {d}c · a{d}{s}", .{ id, chunk.code.len, chunk.constants.len, chunk.arity, relation }) catch " current chunk"
+                    std.fmt.bufPrint(&line_buf, " ● chunk[0x{x}]  {d}b · {d}c · a{d}{s}", .{ id, chunk.code.len, chunk.constants.len, chunk.arity, relation }) catch " current chunk"
                 else
-                    std.fmt.bufPrint(&line_buf, " ● #0x{x}  missing", .{id}) catch " current chunk";
+                    std.fmt.bufPrint(&line_buf, " ● chunk[0x{x}]  missing", .{id}) catch " current chunk";
                 try frame.text(line, 0, width, .chunk_current);
             },
             2 => try frame.text(" ─ runtime state ─", 0, width, .muted),
@@ -3496,7 +3926,7 @@ const Tui = struct {
                     },
                     .heap => blk2: {
                         const counts = self.ev.heapCounts();
-                        break :blk2 std.fmt.bufPrint(&line_buf, " {s} HEAP  {d} object slots", .{ if (is_open) "▾" else if (projected) "›" else "▸", counts.objects }) catch " heap";
+                        break :blk2 std.fmt.bufPrint(&line_buf, " {s} HEAP - {d} slots", .{ if (is_open) "▾" else if (projected) "›" else "▸", counts.objects }) catch " heap";
                     },
                 };
             },
@@ -3528,7 +3958,7 @@ const Tui = struct {
                 const relation = self.chunkEquivalenceSuffix(&relation_buf, entry.id);
                 break :blk if (chunk) |ch|
                     if (label.len > 0)
-                        try std.fmt.allocPrint(arena, " {s}{s} {s}  #{d} · {Bi}{s}", .{
+                        try std.fmt.allocPrint(arena, " {s}{s} {s}  chunk[0x{x}] · {Bi}{s}", .{
                             indent[0..indent_len],
                             if (self.currentChunk() == entry.id) "●" else "·",
                             label,
@@ -3537,7 +3967,7 @@ const Tui = struct {
                             relation,
                         })
                     else
-                        std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {Bi}{s}", .{
+                        std.fmt.bufPrint(&line_buf, " {s}{s} chunk[0x{x}]  {Bi}{s}", .{
                             indent[0..indent_len],
                             if (self.currentChunk() == entry.id) "●" else "·",
                             entry.id,
@@ -3545,7 +3975,7 @@ const Tui = struct {
                             relation,
                         }) catch " chunk"
                 else
-                    std.fmt.bufPrint(&line_buf, " {s}! #{d} missing", .{ indent[0..indent_len], entry.id }) catch " missing";
+                    std.fmt.bufPrint(&line_buf, " {s}! chunk[0x{x}] missing", .{ indent[0..indent_len], entry.id }) catch " missing";
             },
             .range => |entry| blk: {
                 var indent: [64]u8 = undefined;
@@ -3563,26 +3993,50 @@ const Tui = struct {
                         const chunks = self.tree_index.chunksOf(entry.parent);
                         const first = chunks[entry.start];
                         const last = chunks[entry.start + entry.len - 1];
-                        break :blk2 std.fmt.bufPrint(&line_buf, " {s}{s} chunks #{d}–#{d}", .{
+                        break :blk2 std.fmt.bufPrint(&line_buf, " {s}{s} chunks[0x{x}:0x{x}] ({d})", .{
                             indent[0..indent_len],
                             if (is_open) "▾" else "▸",
                             first,
-                            last,
+                            last + 1,
+                            entry.live,
                         }) catch " chunk range";
                     },
-                    .objects => std.fmt.bufPrint(&line_buf, " {s}{s} objects #{d}–#{d}", .{
-                        indent[0..indent_len],
-                        if (is_open) "▾" else if (self.currentObject()) |id| (if (id >= entry.start and id < entry.start + entry.len) "›" else "▸") else "▸",
-                        entry.start,
-                        entry.start + entry.len - 1,
-                    }) catch " object range",
-                    .values, .attrs, .attr_positions => std.fmt.bufPrint(&line_buf, " {s}{s} {s} #{d}–#{d}", .{
-                        indent[0..indent_len],
-                        if (is_open) "▾" else "▸",
-                        @tagName(entry.kind),
-                        entry.start,
-                        entry.start + entry.len - 1,
-                    }) catch " store range",
+                    .objects => blk2: {
+                        const reference = try self.canonicalStoreRange(
+                            arena,
+                            .objects,
+                            entry.start,
+                            entry.start + entry.len,
+                            entry.live,
+                            !(selected and self.navigation.focus == .chunks),
+                        );
+                        break :blk2 try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
+                            indent[0..indent_len],
+                            if (is_open) "▾" else if (self.currentObject()) |id| (if (id >= entry.start and id < entry.start + entry.len) "›" else "▸") else "▸",
+                            reference,
+                        });
+                    },
+                    .values, .attrs, .attr_positions => blk2: {
+                        const view: HeapView = switch (entry.kind) {
+                            .values => .values,
+                            .attrs => .attrs,
+                            .attr_positions => .attr_positions,
+                            else => unreachable,
+                        };
+                        const reference = try self.canonicalStoreRange(
+                            arena,
+                            view,
+                            entry.start,
+                            entry.start + entry.len,
+                            entry.live,
+                            !(selected and self.navigation.focus == .chunks),
+                        );
+                        break :blk2 try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
+                            indent[0..indent_len],
+                            if (is_open) "▾" else "▸",
+                            reference,
+                        });
+                    },
                 };
             },
             .heap => |entry| blk: {
@@ -3599,23 +4053,43 @@ const Tui = struct {
                     "›"
                 else
                     "▸";
-                // Show the LIVE record count, not the reserved backing capacity.
-                break :blk std.fmt.bufPrint(&line_buf, " {s}{s} {s}  {d}", .{ indent[0..indent_len], marker, @tagName(entry.view), self.liveStoreCount(entry.view) }) catch " heap store";
+                const snapshot = if (entry.view == .objects)
+                    (if (self.heap_index.objects) |*s| s else null)
+                else
+                    self.ensureStoreSnapshot(entry.view);
+                const high_water = if (snapshot) |s| s.high_water else self.storeCount(entry.view);
+                const live = if (snapshot) |s| s.live_count else self.storeCount(entry.view);
+                const reference = try self.canonicalStoreRange(
+                    arena,
+                    entry.view,
+                    0,
+                    high_water,
+                    live,
+                    !(selected and self.navigation.focus == .chunks),
+                );
+                break :blk try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
+                    indent[0..indent_len],
+                    marker,
+                    reference,
+                });
             },
             .object => |entry| blk: {
                 var indent: [64]u8 = undefined;
                 const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                 @memset(indent[0..indent_len], ' ');
-                const kind = if (self.heap_index.objects) |*snapshot|
-                    if (self.ev.inspectHeapObject(snapshot, entry.id)) |info| @tagName(info) else |_| "?"
-                else
-                    "?";
-                break :blk std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {s}", .{
+                const preview = try self.objectSummary(arena, entry.id, @max(@as(usize, 16), width -| indent_len -| 18));
+                const reference = try self.canonicalStoreRef(
+                    arena,
+                    .objects,
+                    entry.id,
+                    preview,
+                    !(selected and self.navigation.focus == .chunks),
+                );
+                break :blk try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
                     indent[0..indent_len],
                     if (self.currentObject() == entry.id) "●" else "·",
-                    entry.id,
-                    kind,
-                }) catch " object";
+                    reference,
+                });
             },
             .store_record => |entry| blk: {
                 var indent: [64]u8 = undefined;
@@ -3623,17 +4097,30 @@ const Tui = struct {
                 @memset(indent[0..indent_len], ' ');
                 const current = if (self.currentStoreRecord()) |r| (r.view == entry.view and r.id == entry.id) else false;
                 const detail: []const u8 = switch (entry.view) {
-                    .attrs => if (self.ev.heapAttrAt(entry.id)) |a| self.ev.internTable().get(a.name) else "",
-                    .values => if (self.ev.heapValueAt(entry.id)) |v| @tagName(v.kind()) else "",
-                    .attr_positions => if (self.ev.heapAttrPosAt(entry.id)) |a| self.ev.internTable().get(a.name) else "",
+                    .attrs => if (self.ev.heapAttrAt(entry.id)) |a| blk2: {
+                        const value = try self.valueSummary(arena, a.value, 34);
+                        break :blk2 try std.fmt.allocPrint(arena, "{s} = {s}", .{ self.ev.internTable().get(a.name), value });
+                    } else "",
+                    .values => if (self.ev.heapValueAt(entry.id)) |v| try self.valueSummary(arena, v.*, 42) else "",
+                    .attr_positions => if (self.ev.heapAttrPosAt(entry.id)) |a| try std.fmt.allocPrint(
+                        arena,
+                        "{s} @ {s}:{d}:{d}",
+                        .{ self.ev.internTable().get(a.name), std.fs.path.basename(self.ev.internTable().get(a.pos.file)), a.pos.line, a.pos.column },
+                    ) else "",
                     else => "",
                 };
-                break :blk std.fmt.bufPrint(&line_buf, " {s}{s} #{d}  {s}", .{
-                    indent[0..indent_len],
-                    if (current) "●" else "·",
+                const reference = try self.canonicalStoreRef(
+                    arena,
+                    entry.view,
                     entry.id,
                     detail,
-                }) catch " record";
+                    !(selected and self.navigation.focus == .chunks),
+                );
+                break :blk try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
+                    indent[0..indent_len],
+                    if (current) "●" else "·",
+                    reference,
+                });
             },
             .debug_root => blk: {
                 const reason = if (self.debug_session) |s| reasonName(s.reason) else "paused";
@@ -3712,8 +4199,24 @@ const Tui = struct {
                 try frame.text(line, start, available, role);
             }
         } else {
-            const shown = try width_mod.middleEllipsis(arena, line, width);
-            try frame.text(shown, 0, width, role);
+            const ansi_identity = switch (self.tree.rows.items[index]) {
+                .object, .store_record, .heap => !(selected and self.navigation.focus == .chunks),
+                .range => |entry| switch (entry.kind) {
+                    .objects, .values, .attrs, .attr_positions => !(selected and self.navigation.focus == .chunks),
+                    else => false,
+                },
+                else => false,
+            };
+            if (ansi_identity) {
+                const line_width = tui.displayWidth(line, width_mod.cpWidth);
+                try frame.text(line, 0, width -| @intFromBool(line_width > width), role);
+                if (line_width > width and width > 0) {
+                    try frame.text("…", 0, 1, role);
+                }
+            } else {
+                const shown = try width_mod.middleEllipsis(arena, line, width);
+                try frame.text(shown, 0, width, role);
+            }
         }
     }
 
@@ -3739,7 +4242,9 @@ const Tui = struct {
         self.debug_nav_mark = self.navigation.back.items.len;
         defer self.exitDebugView();
         try self.open(.{ .debug_frame = session.frameCount() -| 1 });
-        self.navigation.focus = .chunks;
+        // `open` focuses frame details. Keep that focus across step pauses so
+        // the next/current frame is immediately usable instead of bouncing the
+        // user back to the stack tree after every instruction.
 
         var editor = editor_mod.Editor.init(self.allocator, history, .none(), .always());
         defer editor.deinit();
@@ -3961,7 +4466,14 @@ const Tui = struct {
             return;
         }
         for (items) |bp| {
-            if (bp.site_only) {
+            if (bp.span) |span| {
+                try capture.writer.print("{d}  chunk[0x{x}] L{d}:{d} (source span)\n", .{
+                    bp.id,
+                    bp.span_chunk.?,
+                    span.line,
+                    span.column,
+                });
+            } else if (bp.site_only) {
                 try capture.writer.print("{d}  (per-instruction site)\n", .{bp.id});
             } else {
                 try capture.writer.print("{d}  {s}:{d}{s}\n", .{ bp.id, bp.file, bp.line, if (bp.pending) " (pending)" else "" });
@@ -4003,7 +4515,7 @@ const debug_help_text =
     \\  s / n / f      step into / next / finish
     \\  c              continue (resume evaluation)
     \\  q / Ctrl-D     abort evaluation
-    \\  p              toggle a per-instruction breakpoint on the selected row
+    \\  p              toggle a breakpoint on the selected instruction/span
     \\  ↑/↓ j/k        select a tree row (frames, chunks, heap)
     \\  Enter          open the selected frame / follow a reference
     \\  i / :          evaluate an expression / run a command
@@ -4026,12 +4538,18 @@ fn spanSnippet(arena: std.mem.Allocator, source: ?[]const u8, target: anytype) !
     const end = @min(start +| @as(usize, target.len), text.len);
     if (start >= end) return "";
     const raw = text[start..end];
-    const cap = @min(raw.len, 64);
-    const out = try arena.dupe(u8, raw[0..cap]);
+    const out = try arena.dupe(u8, raw);
     for (out) |*b| if (b.* == '\n' or b.* == '\r' or b.* == '\t') {
         b.* = ' ';
     };
-    return out;
+    return width_mod.endEllipsis(arena, out, 64);
+}
+
+/// Match the canonical disassembly digest: `builtin[0x20] → import`.
+fn builtinText(arena: std.mem.Allocator, id: u64) ![]const u8 {
+    if (disasm.builtinName(id)) |name|
+        return std.fmt.allocPrint(arena, "builtin[0x{x}] → {s}", .{ id, name });
+    return std.fmt.allocPrint(arena, "builtin[0x{x}]", .{id});
 }
 
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -4126,4 +4644,14 @@ test "disassembly targets recognize chunk and heap links" {
     try std.testing.expectEqual(@as(ChunkId, 0x2a), disasmTarget("closure chunk[0x2a]").chunk);
     try std.testing.expectEqual(@as(runtime.types.ObjectId, 0x31), disasmTarget("push thunk[0x31]").object);
     try std.testing.expect(disasmTarget("push str[0x1]") == .none);
+}
+
+test "builtin values use the resolved disassembly form" {
+    const known = try builtinText(std.testing.allocator, 0x20);
+    defer std.testing.allocator.free(known);
+    try std.testing.expectEqualStrings("builtin[0x20] → import", known);
+
+    const unknown = try builtinText(std.testing.allocator, 0xffff);
+    defer std.testing.allocator.free(unknown);
+    try std.testing.expectEqualStrings("builtin[0xffff]", unknown);
 }

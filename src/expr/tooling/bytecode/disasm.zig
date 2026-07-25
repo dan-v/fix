@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const terminal_color = @import("base").terminal_color;
+const terminal_text = @import("base").terminal_text;
 const ColorDepth = terminal_color.Depth;
 const hueColor = terminal_color.hueColor;
 const bytecode = @import("../../bytecode.zig");
@@ -449,8 +450,36 @@ fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, bg: ?[3]u8, color_depth: Co
 /// Every chunk has an identity color derived from its id — the same hue is used
 /// for its header title and for every reference to it, so a `chunk[0xN]` operand
 /// visually points at the header it names.
+pub const Identity = enum {
+    chunk,
+    constant,
+    intern,
+    object,
+    value,
+    attr,
+    attr_position,
+    builtin,
+};
+
+/// The canonical identity color for a VM reference.  Explorer surfaces use
+/// this too, so `objects[0x8]`, `values[0x8]`, and `chunk[0x8]` each keep a
+/// stable (and intentionally distinct) hue wherever they appear.
+pub fn identityColor(kind: Identity, id: anytype) [3]u8 {
+    const seed: usize = switch (kind) {
+        .chunk => 0,
+        .constant => 1000,
+        .intern => 5000,
+        .object => 9000,
+        .value => 13000,
+        .attr => 17000,
+        .attr_position => 21000,
+        .builtin => 25000,
+    };
+    return hueColor(@as(usize, @intCast(id)) + seed);
+}
+
 fn objColor(id: anytype) [3]u8 {
-    return hueColor(@intCast(id));
+    return identityColor(.chunk, id);
 }
 
 /// Fixed color for compiler-attributed chunk names, wherever they appear
@@ -470,7 +499,7 @@ const current_row_bg: [3]u8 = .{ 0x32, 0x2b, 0x43 };
 /// row in the pool table. Offset well past typical chunk ids so a `#N` constant
 /// and a `chunk[0xN]` never share a hue in the same listing.
 fn constColor(i: usize) [3]u8 {
-    return hueColor(i + 1000);
+    return identityColor(.constant, i);
 }
 
 /// Identity color for an interned string/path id: the same hue everywhere the
@@ -478,13 +507,13 @@ fn constColor(i: usize) [3]u8 {
 /// constant-pool row — so occurrences of one id link up visually. Offset past
 /// the chunk-id and constant-slot seeds.
 fn internColor(id: anytype) [3]u8 {
-    return hueColor(@as(usize, @intCast(id)) + 5000);
+    return identityColor(.intern, id);
 }
 
 /// Identity color for a heap object id (closures/thunks/lists in constant
 /// digests). Own seed range, like chunks/constants/interns.
 fn heapColor(id: anytype) [3]u8 {
-    return hueColor(@as(usize, @intCast(id)) + 9000);
+    return identityColor(.object, id);
 }
 
 /// Identity color for an upvalue slot (chunk-local): the upvalues table row,
@@ -731,14 +760,13 @@ fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, bg: ?[3]u8, color_depth: Color
     }
 }
 
-/// One operand-hierarchy gutter cell: a vertical `│` that descends through the
-/// group's members, closing with an L-shaped `└` on the run's last row. A
-/// column wider than the thin chunk margin.
+/// One operand-hierarchy gutter cell. Tree columns stay vertical for their
+/// entire run; the last item does not change the column into a corner.
 const GuideKind = enum { vert, corner, blank };
 fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, bg: ?[3]u8, color_depth: ColorDepth) !void {
     const glyph: []const u8 = switch (kind) {
         .vert => "│  ",
-        .corner => "└  ",
+        .corner => "│  ",
         .blank => "   ",
     };
     if (color_depth.enabled() and kind != .blank) {
@@ -781,7 +809,7 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
         try writer.writeByte(' '); // gap column between the bytes and the gutter
         // Tree gutter: every ancestor level draws a vertical bar `│` down the
         // gutter; a level whose run ends at this line (`last_mask` bit i)
-        // closes with `└` on the line's final row.
+        // remains `│` on the line's final row.
         for (guides, 0..) |gc, gi| {
             const ends = (last_mask >> @intCast(gi)) & 1 == 1;
             const kind: GuideKind = if (ends and r == rows - 1) .corner else .vert;
@@ -825,7 +853,8 @@ fn chunkIdWide(op: OpCode) bool {
 }
 
 /// The builtin's Nix-visible name for a raw builtin id, if the id is valid.
-fn builtinName(id: u64) ?[]const u8 {
+/// Kept public so debugger/value views can use the same spelling as disassembly.
+pub fn builtinName(id: u64) ?[]const u8 {
     const BuiltinId = @import("runtime").builtins.BuiltinId;
     inline for (@typeInfo(BuiltinId).@"enum".fields) |f| {
         if (f.value == id) return f.name;
@@ -872,7 +901,7 @@ fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
         .thunk => l.storeRef("thunk", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
         .builtin => {
             const bid = value.asBuiltinId();
-            l.storeRef("builtin", heapColor(bid), "0x{x}", .{bid});
+            l.storeRef("builtin", identityColor(.builtin, bid), "0x{x}", .{bid});
             if (builtinName(bid)) |nm| {
                 l.glue(" → ", .{});
                 l.tint(heapColor(bid), "{s}", .{nm});
@@ -1540,7 +1569,7 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
 fn writeRefList(writer: *std.Io.Writer, label: []const u8, sub_color: [3]u8, ids: []const ChunkId, outer_last: bool, symbols: Symbols, cc: [3]u8, color_depth: ColorDepth) !void {
     if (ids.len == 0) return;
     // Sub-section header under the references gutter, then one row per chunk
-    // under the sub-section's own gutter; each vertical run closes with `└`.
+    // under the sub-section's own gutter; each vertical run stays `│`.
     try writeGuide(writer, cc, null, color_depth);
     try writer.writeAll("  ");
     try writeTreeGuide(writer, sec_references_color, .vert, null, color_depth);
@@ -1825,7 +1854,7 @@ fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, color
 /// current file (whose name is on its own hoisted line).
 /// A `store[accessor]` reference written directly (outside the `Line` token
 /// model): keyword in the store color, brackets comment-grey, accessor in `id_color`.
-fn writeStoreRefText(writer: *std.Io.Writer, kw: []const u8, id: u64, id_color: [3]u8, color_depth: ColorDepth) !void {
+pub fn writeStoreRefText(writer: *std.Io.Writer, kw: []const u8, id: u64, id_color: [3]u8, color_depth: ColorDepth) !void {
     try setFg(writer, store_kw_color, color_depth);
     try writer.writeAll(kw);
     if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
@@ -1840,11 +1869,58 @@ fn writeStoreRefText(writer: *std.Io.Writer, kw: []const u8, id: u64, id_color: 
     if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
 }
 
+/// Canonical `store[0xid] → preview` rendering shared by disassembly and the
+/// VM explorer. The store keyword has one fixed color; the accessor and its
+/// short preview share the referenced record's identity color.
+pub fn writeStoreRef(
+    writer: *std.Io.Writer,
+    store: []const u8,
+    id: u64,
+    identity: Identity,
+    preview: ?[]const u8,
+    color_depth: ColorDepth,
+) !void {
+    const id_color = identityColor(identity, id);
+    try writeStoreRefText(writer, store, id, id_color, color_depth);
+    if (preview) |text| {
+        try setCommentFg(writer, color_depth);
+        try writer.writeAll(" → ");
+        if (color_depth.enabled()) try setFg(writer, id_color, color_depth);
+        try writer.writeAll(text);
+        if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+    }
+}
+
+/// Canonical half-open store range with an explicit live-record count.
+pub fn writeStoreRange(
+    writer: *std.Io.Writer,
+    store: []const u8,
+    start: u64,
+    end: u64,
+    live: u64,
+    identity: Identity,
+    color_depth: ColorDepth,
+) !void {
+    const range_color = identityColor(identity, start);
+    try setFg(writer, store_kw_color, color_depth);
+    try writer.writeAll(store);
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+    try setCommentFg(writer, color_depth);
+    try writer.writeByte('[');
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+    try setFg(writer, range_color, color_depth);
+    try writer.print("0x{x}:0x{x}", .{ start, end });
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+    try setCommentFg(writer, color_depth);
+    try writer.print("] ({d})", .{live});
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+}
+
 /// `type[accessor] → value` digest of a constant. Interned strings/paths render
 /// the full lookup chain — `str[0xN] → "text"` — with the intern id in its
 /// identity color (matching every other occurrence of that id) when `color_depth`.
 /// `max` caps string length.
-fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max: usize, color_depth: ColorDepth) !void {
+pub fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max: usize, color_depth: ColorDepth) !void {
     switch (value.kind()) {
         .null => try writer.writeAll("null"),
         .bool_true => try writer.writeAll("true"),
@@ -1853,36 +1929,26 @@ fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max:
         .float => try writer.print("float {d}", .{value.asFloat()}),
         .string => try writeStringRef(writer, "str", value.asInternId(), symbols, max, color_depth),
         .path => try writeStringRef(writer, "path", value.asInternId(), symbols, max, color_depth),
-        .list => try writeStoreRefText(writer, "list", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
-        .attrs => try writeStoreRefText(writer, "attrs", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
+        .list => try writeStoreRef(writer, "list", value.asObjectId(), .object, null, color_depth),
+        .attrs => try writeStoreRef(writer, "attrs", value.asObjectId(), .object, null, color_depth),
         .closure => if (value.isFunction())
-            try writeStoreRefText(writer, "function", value.asFunctionChunkId(), objColor(value.asFunctionChunkId()), color_depth)
+            try writeStoreRef(writer, "function", value.asFunctionChunkId(), .chunk, null, color_depth)
         else
-            try writeStoreRefText(writer, "closure", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
-        .thunk => try writeStoreRefText(writer, "thunk", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
+            try writeStoreRef(writer, "closure", value.asObjectId(), .object, null, color_depth),
+        .thunk => try writeStoreRef(writer, "thunk", value.asObjectId(), .object, null, color_depth),
         .builtin => {
             const bid = value.asBuiltinId();
-            try writeStoreRefText(writer, "builtin", bid, heapColor(bid), color_depth);
-            if (builtinName(bid)) |nm| {
-                try setCommentFg(writer, color_depth);
-                try writer.writeAll(" → ");
-                if (color_depth.enabled()) {
-                    const c = heapColor(bid);
-                    try setFg(writer, c, color_depth);
-                }
-                try writer.writeAll(nm);
-                if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
-            }
+            try writeStoreRef(writer, "builtin", bid, .builtin, builtinName(bid), color_depth);
         },
-        .builtin_closure => try writeStoreRefText(writer, "builtin_closure", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
-        .string_context => try writeStoreRefText(writer, "string_ctx", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
-        .boxed_int => try writeStoreRefText(writer, "boxed_int", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
-        .partial_app => try writeStoreRefText(writer, "partial_app", value.asObjectId(), heapColor(value.asObjectId()), color_depth),
+        .builtin_closure => try writeStoreRef(writer, "builtin_closure", value.asObjectId(), .object, null, color_depth),
+        .string_context => try writeStoreRef(writer, "string_ctx", value.asObjectId(), .object, null, color_depth),
+        .boxed_int => try writeStoreRef(writer, "boxed_int", value.asObjectId(), .object, null, color_depth),
+        .partial_app => try writeStoreRef(writer, "partial_app", value.asObjectId(), .object, null, color_depth),
     }
 }
 
 fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols, max: usize, color_depth: ColorDepth) !void {
-    try writeStoreRefText(writer, kind, id, internColor(id), color_depth);
+    try writeStoreRef(writer, kind, id, .intern, null, color_depth);
     if (symbols.internName(id)) |text| {
         try setCommentFg(writer, color_depth);
         try writer.writeAll(" → \"");
@@ -1927,8 +1993,8 @@ fn writeAttrPosLocation(writer: *std.Io.Writer, rec: @import("runtime").heap.Att
     if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
 }
 
-/// The `│  └ #idx` prefix of one `name:` section-table row: chunk gutter, the
-/// section's tree guide (`└` on the last row, else `│`), then the row index in
+/// The `│  │ #idx` prefix of one `name:` section-table row: chunk gutter, the
+/// section's vertical tree guide, then the row index in
 /// its identity color padded to the value column. The shared row opener for the
 /// attr-name/position tables.
 fn writeTableRowHead(writer: *std.Io.Writer, cc: [3]u8, sec_color: [3]u8, idx: usize, last: bool, idx_color: [3]u8, color_depth: ColorDepth) !void {
@@ -1947,20 +2013,56 @@ fn writeTableRowHead(writer: *std.Io.Writer, cc: [3]u8, sec_color: [3]u8, idx: u
     try writer.splatByteAll(' ', 6 -| istr.len);
 }
 
-/// Escape a string for display, truncating in the MIDDLE (`head…tail`) when
-/// over `max_len` — a path or store key's ends are the informative parts, so
-/// keeping both beats a trailing `...`.
-fn writeEscapedSnippet(writer: *std.Io.Writer, text: []const u8, max_len: usize) !void {
-    if (text.len <= max_len) {
+/// Escape a string for display and truncate on terminal cell width. UTF-8 is
+/// never split, wide characters consume two cells, and escaped controls count
+/// as the two visible characters they become.
+fn writeEscapedSnippet(writer: *std.Io.Writer, text: []const u8, max_cells: usize) !void {
+    if (escapedCellWidth(text) <= max_cells) {
         try escapeRun(writer, text);
         return;
     }
-    const keep = if (max_len > 1) max_len - 1 else 1;
-    const head = (keep + 1) / 2;
-    const tail = keep - head;
-    try escapeRun(writer, text[0..head]);
+    if (max_cells == 0) return;
+    const keep = max_cells - 1;
+    var used: usize = 0;
+    var end: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const unit = escapedUnit(text, i);
+        if (used + unit.cells > keep) break;
+        used += unit.cells;
+        i += unit.len;
+        end = i;
+    }
+    try escapeRun(writer, text[0..end]);
     try writer.writeAll("…");
-    if (tail > 0) try escapeRun(writer, text[text.len - tail ..]);
+}
+
+const EscapedUnit = struct { len: usize, cells: usize };
+
+fn escapedUnit(text: []const u8, offset: usize) EscapedUnit {
+    const byte = text[offset];
+    if (byte < 0x80) return .{
+        .len = 1,
+        .cells = switch (byte) {
+            '\\', '"', '\n', '\r', '\t' => 2,
+            else => terminal_text.cellWidth(byte),
+        },
+    };
+    const len = std.unicode.utf8ByteSequenceLength(byte) catch return .{ .len = 1, .cells = 1 };
+    if (offset + len > text.len) return .{ .len = 1, .cells = 1 };
+    const cp = std.unicode.utf8Decode(text[offset .. offset + len]) catch return .{ .len = 1, .cells = 1 };
+    return .{ .len = len, .cells = terminal_text.cellWidth(cp) };
+}
+
+fn escapedCellWidth(text: []const u8) usize {
+    var cells: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const unit = escapedUnit(text, i);
+        cells += unit.cells;
+        i += unit.len;
+    }
+    return cells;
 }
 
 fn escapeRun(writer: *std.Io.Writer, text: []const u8) !void {
@@ -2137,4 +2239,19 @@ test "table-only disassembly omits instructions" {
     try std.testing.expect(std.mem.indexOf(u8, text, "int 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "push_const") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "halt") == null);
+}
+
+test "canonical store references and half-open ranges" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeStoreRef(&out.writer, "values", 2, .value, "int 7", .none);
+    try std.testing.expectEqualStrings("values[0x2] → int 7", out.written());
+
+    out.clearRetainingCapacity();
+    try writeStoreRange(&out.writer, "objects", 0x100, 0x105, 4, .object, .none);
+    try std.testing.expectEqualStrings("objects[0x100:0x105] (4)", out.written());
+
+    out.clearRetainingCapacity();
+    try writeEscapedSnippet(&out.writer, "ab中def", 5);
+    try std.testing.expectEqualStrings("ab中…", out.written());
 }

@@ -322,6 +322,22 @@ pub const DebugSession = struct {
         return self.ev.breakpointAt(chunk_id, offset);
     }
 
+    pub fn setBreakpointSpan(
+        self: *DebugSession,
+        chunk_id: types.ChunkId,
+        span: bytecode.Chunk.SourceSpan,
+    ) !bytecode.BreakpointTable.SetResult {
+        return self.ev.setBreakpointSpan(chunk_id, span);
+    }
+
+    pub fn deleteBreakpointSpan(self: *DebugSession, chunk_id: types.ChunkId, span: bytecode.Chunk.SourceSpan) bool {
+        return self.ev.deleteBreakpointSpan(chunk_id, span);
+    }
+
+    pub fn breakpointSpan(self: *const DebugSession, chunk_id: types.ChunkId, span: bytecode.Chunk.SourceSpan) bool {
+        return self.ev.breakpointSpan(chunk_id, span);
+    }
+
     pub const StepKind = debug_session.StepKind;
 
     /// Arm a single step. It takes effect once the console resumes; the next
@@ -1239,9 +1255,9 @@ pub const Evaluator = struct {
         return self.debugger.breakpoints.?.set(&self.registry, file, line);
     }
 
-    /// Per-instruction breakpoint at an exact `(chunk_id, offset)` site, for the
-    /// VM explorer's asm/source views. `line`-based `setBreakpoint` stays for
-    /// the console `break FILE:LINE` and pending/import resolution.
+    /// Per-instruction breakpoint at an exact `(chunk_id, offset)` site.
+    /// `setBreakpointSpan` handles source-span rows; line-based
+    /// `setBreakpoint` stays for console requests and pending/import resolution.
     pub fn setBreakpointAt(self: *Evaluator, chunk_id: ChunkId, offset: u32) !bytecode.BreakpointTable.SetResult {
         self.ensureBreakpointTable();
         return self.debugger.breakpoints.?.setAt(&self.registry, chunk_id, offset);
@@ -1254,6 +1270,21 @@ pub const Evaluator = struct {
 
     pub fn breakpointAt(self: *const Evaluator, chunk_id: ChunkId, offset: u32) bool {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.hasSite(chunk_id, offset);
+        return false;
+    }
+
+    pub fn setBreakpointSpan(self: *Evaluator, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) !bytecode.BreakpointTable.SetResult {
+        self.ensureBreakpointTable();
+        return self.debugger.breakpoints.?.setSpan(&self.registry, chunk_id, span);
+    }
+
+    pub fn deleteBreakpointSpan(self: *Evaluator, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) bool {
+        if (self.debugger.breakpoints) |*breakpoints| return breakpoints.removeSpan(&self.registry, chunk_id, span);
+        return false;
+    }
+
+    pub fn breakpointSpan(self: *const Evaluator, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) bool {
+        if (self.debugger.breakpoints) |*breakpoints| return breakpoints.hasSpan(chunk_id, span);
         return false;
     }
 

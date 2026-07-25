@@ -167,8 +167,9 @@ fi
 after_vm=${out##*$'\x1b[?1049l'}
 t "tty: vm transcript survives screen exit" "fix> 1 + 1" "$after_vm"
 
-# The code view for a chunk is one document (code + constants + references), and
-# the source view lists navigable sub-expression spans as breakpoint targets.
+# A chunk uses one debugger-style document: source + navigable spans followed by
+# code, constants, and references. Jumping to the bottom exercises both ends
+# without switching modes.
 out=$(
     (
         sleep 0.4
@@ -176,7 +177,7 @@ out=$(
         sleep 0.4
         printf ':vm\r'
         sleep 0.6
-        printf 's'
+        printf 'G'
         sleep 0.4
         printf 'q'
         sleep 0.3
@@ -185,7 +186,34 @@ out=$(
     ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty vm: source view lists breakpoint spans" "SOURCE SPANS" "$out"
+t "tty vm: unified inspector lists source spans" "SOURCE SPANS" "$out"
+t "tty vm: unified inspector includes code" "CODE · chunk" "$out"
+
+# Nested expressions on one line may share a bytecode-entry offset. A source
+# breakpoint must mark only the exact selected span, not every row with that
+# old shared offset.
+out=$(
+    (
+        sleep 0.4
+        printf 'x: (x + 1) * (x + 2)\r'
+        sleep 0.4
+        printf ':vm\r'
+        sleep 0.6
+        printf 'p'
+        sleep 0.4
+        printf 'q'
+        sleep 0.2
+        printf '\004'
+        sleep 0.2
+    ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+span_marks=$(printf '%s' "$out" | grep -o '◆' | wc -l)
+if [[ "$span_marks" -eq 1 ]]; then
+    pass "tty vm: source breakpoint marks only its exact span"
+else
+    fail "tty vm: source breakpoint marked $span_marks span rows"
+fi
 
 # The tree filter modal is entered with F and echoes the query in the header.
 out=$(
