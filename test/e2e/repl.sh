@@ -167,9 +167,8 @@ fi
 after_vm=${out##*$'\x1b[?1049l'}
 t "tty: vm transcript survives screen exit" "fix> 1 + 1" "$after_vm"
 
-# A chunk uses one debugger-style document: source + navigable spans followed by
-# code, constants, and references. Jumping to the bottom exercises both ends
-# without switching modes.
+# A chunk uses one debugger-style document. SOURCE is an in-place inspection
+# session followed by code, constants, and references.
 out=$(
     (
         sleep 0.4
@@ -186,7 +185,7 @@ out=$(
     ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty vm: unified inspector navigates source spans in place" "SOURCE · j/k selects sub-expressions" "$out"
+t "tty vm: unified inspector offers source span session" "SOURCE \\* [0-9][0-9]* subexpressions" "$out"
 t "tty vm: unified inspector includes code" "CODE · chunk" "$out"
 
 # Nested expressions on one line may share a bytecode-entry offset. A source
@@ -199,6 +198,8 @@ out=$(
         sleep 0.4
         printf ':vm\r'
         sleep 0.6
+        printf '\r'
+        sleep 0.3
         printf 'p'
         sleep 0.4
         printf 'q'

@@ -65,6 +65,7 @@ const HeapView = enum { overview, objects, values, attrs, attr_positions };
 const RowAction = union(enum) {
     none,
     heading: Panel,
+    source: ChunkId,
     instruction,
     chunk: ChunkId,
     object: runtime.types.ObjectId,
@@ -700,6 +701,9 @@ const Tui = struct {
         chunk_id: ChunkId,
         span: bytecode.Chunk.SourceSpan,
     } = null,
+    /// The source section currently owns j/k. Selecting a SOURCE heading and
+    /// pressing Enter sets this without opening another page.
+    source_session: ?ChunkId = null,
     /// Vertical offset within the current hover preview. Normal cursor motion
     /// resets it; Alt+j/k and Alt+Up/Down adjust it without moving the tree.
     preview_scroll: usize = 0,
@@ -1331,12 +1335,25 @@ const Tui = struct {
 
         if (self.ev.getChunk(chunk_id)) |chunk| {
             if (self.focusedSourceSpan(chunk_id) orelse info.span) |span| if (session.frameSourceText(index)) |source| {
-                try self.appendSourceDocumentWithText(&page, chunk_id, chunk, source, span);
+                try self.appendSourceDocumentWithText(
+                    &page,
+                    chunk_id,
+                    chunk,
+                    source,
+                    span,
+                    if (session.reason == .return_step and index + 1 == session.frameCount()) session.value else null,
+                );
                 try page.line("", .none);
             };
         } else if (info.span) |span| if (session.frameSourceText(index)) |source| {
             try page.line("SOURCE", .none);
-            try self.appendSourceExcerpt(&page, source, span, null);
+            try self.appendSourceExcerpt(
+                &page,
+                source,
+                span,
+                null,
+                if (session.reason == .return_step and index + 1 == session.frameCount()) session.value else null,
+            );
             try page.line("", .none);
         };
 
@@ -1369,14 +1386,7 @@ const Tui = struct {
 
         if (self.ev.getChunk(chunk_id)) |chunk| {
             try page.line(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{chunk_id}), .none);
-            try self.appendDisassemblyAt(
-                &page,
-                chunk_id,
-                chunk,
-                .code,
-                info.instruction,
-                if (session.reason == .return_step) session.value else null,
-            );
+            try self.appendDisassemblyAt(&page, chunk_id, chunk, .code, info.instruction);
         }
 
         return .{
@@ -1472,7 +1482,7 @@ const Tui = struct {
     }
 
     fn appendDisassembly(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk, panel: Panel) !void {
-        return self.appendDisassemblyAt(page, id, chunk, panel, null, null);
+        return self.appendDisassemblyAt(page, id, chunk, panel, null);
     }
 
     fn appendDisassemblyAt(
@@ -1482,7 +1492,6 @@ const Tui = struct {
         chunk: *const bytecode.Chunk,
         panel: Panel,
         current_offset: ?u32,
-        returned_value: ?runtime.value.Value,
     ) !void {
         var text: std.Io.Writer.Allocating = .init(page.arena);
         const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
@@ -1503,36 +1512,6 @@ const Tui = struct {
             const target = disasmTarget(plain);
             const action: RowAction = if (target == .none and disasmOffset(&inspected_chunk, plain) != null) .instruction else target;
             const location = self.disasmLocation(id, &inspected_chunk, plain);
-            if (returned_value) |value| {
-                if (location != null and current_offset != null and location.?.offset == current_offset.?) {
-                    const available = self.layout().main_width -| 2;
-                    var annotation: std.Io.Writer.Allocating = .init(page.arena);
-                    try annotation.writer.writeAll("  ↳ return ");
-                    try disasm.writeValueDigest(
-                        &annotation.writer,
-                        value,
-                        symbols,
-                        @max(available -| 12, 8),
-                        self.color_depth,
-                    );
-                    if (tui.displayWidth(line, width_mod.cpWidth) +
-                        tui.displayWidth(annotation.written(), width_mod.cpWidth) <= available)
-                    {
-                        try page.lineAt(
-                            try std.fmt.allocPrint(page.arena, "{s}{s}", .{ line, annotation.written() }),
-                            action,
-                            location,
-                        );
-                    } else {
-                        try page.lineAt(line, action, location);
-                        try page.line(
-                            try std.fmt.allocPrint(page.arena, "          {s}", .{annotation.written()[2..]}),
-                            self.valueRowAction(value),
-                        );
-                    }
-                    continue;
-                }
-            }
             try page.lineAt(line, action, location);
         }
     }
@@ -1678,13 +1657,13 @@ const Tui = struct {
             break :blk .{ "<repl expression>", direct };
         };
 
-        try document.line("SOURCE · j/k selects sub-expressions · p toggles breakpoint", .none);
+        try self.appendSourceHeading(document, id, chunk, span);
         try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{ label, span.line, span.column }), .none);
         const bytes = source orelse {
             try document.line("(source text is unavailable)", .none);
             return;
         };
-        try self.appendSourceExcerpt(document, bytes, span, sourceLocation(id, chunk, span));
+        try self.appendSourceExcerpt(document, bytes, span, sourceLocation(id, chunk, span), null);
     }
 
     fn appendSourceDocumentWithText(
@@ -1693,15 +1672,43 @@ const Tui = struct {
         id: ChunkId,
         chunk: *const bytecode.Chunk,
         source: []const u8,
-        span: bytecode.Chunk.SourceSpan,
+        suggested_span: bytecode.Chunk.SourceSpan,
+        returned_value: ?runtime.value.Value,
     ) !void {
-        try document.line("SOURCE · j/k selects sub-expressions · p toggles breakpoint", .none);
+        const span = if (sourceLocation(id, chunk, suggested_span) != null)
+            suggested_span
+        else
+            firstSourceSpan(chunk) orelse suggested_span;
+        try self.appendSourceHeading(document, id, chunk, span);
         try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{
             if (span.file) |file| self.ev.internTable().get(file) else "<repl expression>",
             span.line,
             span.column,
         }), .none);
-        try self.appendSourceExcerpt(document, source, span, sourceLocation(id, chunk, span));
+        try self.appendSourceExcerpt(document, source, span, sourceLocation(id, chunk, span), returned_value);
+    }
+
+    fn appendSourceHeading(
+        self: *const Tui,
+        document: *PageBuilder,
+        id: ChunkId,
+        chunk: *const bytecode.Chunk,
+        span: bytecode.Chunk.SourceSpan,
+    ) !void {
+        const stats = sourceSpanStats(chunk, span);
+        if (stats.total == 0) {
+            try document.line("SOURCE", .none);
+        } else if (self.source_session == id) {
+            try document.line(
+                try std.fmt.allocPrint(document.arena, "SOURCE * {d}/{d} subexpressions · Enter leaves", .{ stats.index, stats.total }),
+                .{ .source = id },
+            );
+        } else {
+            try document.line(
+                try std.fmt.allocPrint(document.arena, "SOURCE * {d} subexpressions", .{stats.total}),
+                .{ .source = id },
+            );
+        }
     }
 
     fn focusedSourceSpan(self: *const Tui, chunk_id: ChunkId) ?bytecode.Chunk.SourceSpan {
@@ -1751,6 +1758,7 @@ const Tui = struct {
         source: []const u8,
         span: bytecode.Chunk.SourceSpan,
         location: ?BreakpointLocation,
+        returned_value: ?runtime.value.Value,
     ) !void {
         const focus_start = @min(@as(usize, span.offset), source.len);
         const focus_end = @min(focus_start +| @as(usize, span.len), source.len);
@@ -1796,11 +1804,38 @@ const Tui = struct {
                 .breakpoints = breakpoints,
             });
             if (line_end > cursor +| 4096) try rendered.writer.writeAll(" …");
+            var wrapped_result: ?[]const u8 = null;
+            const result_here = active and returned_value != null and focus_end <= line_end;
+            if (result_here) {
+                const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
+                var annotation: std.Io.Writer.Allocating = .init(document.arena);
+                try annotation.writer.writeAll("  ⇒ ");
+                try disasm.writeValueDigest(
+                    &annotation.writer,
+                    returned_value.?,
+                    symbols,
+                    @max(self.layout().main_width -| 14, 8),
+                    self.color_depth,
+                );
+                if (tui.displayWidth(rendered.written(), width_mod.cpWidth) +
+                    tui.displayWidth(annotation.written(), width_mod.cpWidth) <= self.layout().main_width -| 2)
+                {
+                    try rendered.writer.writeAll(annotation.written());
+                } else {
+                    wrapped_result = try std.fmt.allocPrint(document.arena, "          {s}", .{annotation.written()[2..]});
+                }
+            }
             if (active and location != null) {
-                try document.lineAt(rendered.written(), .instruction, location.?);
+                try document.lineAt(
+                    rendered.written(),
+                    if (self.source_session == location.?.chunk_id) .instruction else .none,
+                    location.?,
+                );
             } else {
                 try document.line(rendered.written(), .none);
             }
+            if (wrapped_result) |result|
+                try document.line(result, self.valueRowAction(returned_value.?));
             line_number += 1;
             if (newline >= end or newline == source.len) break;
             cursor = newline + 1;
@@ -1857,6 +1892,26 @@ const Tui = struct {
             if (first == null or sourceSpanLess(entry.span, first.?)) first = entry.span;
         }
         return first;
+    }
+
+    const SourceSpanStats = struct { index: usize, total: usize };
+
+    fn sourceSpanStats(chunk: *const bytecode.Chunk, current: bytecode.Chunk.SourceSpan) SourceSpanStats {
+        var total: usize = 0;
+        var before: usize = 0;
+        for (chunk.source_map, 0..) |entry, i| {
+            var duplicate = false;
+            for (chunk.source_map[0..i]) |previous| {
+                if (sameSourceSpan(previous.span, entry.span)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            total += 1;
+            if (sourceSpanLess(entry.span, current)) before += 1;
+        }
+        return .{ .index = @min(before + 1, total), .total = total };
     }
 
     fn adjacentSourceSpan(
@@ -2611,6 +2666,7 @@ const Tui = struct {
         }
         self.navigation.forward.clearRetainingCapacity();
         self.source_focus = null;
+        self.source_session = null;
         self.preview_scroll = 0;
         try self.refreshPage(kind);
         self.navigation.scroll = 0;
@@ -2652,6 +2708,7 @@ const Tui = struct {
         try self.navigation.forward.append(self.allocator, self.navigation.back.pop().?);
         const visit = self.navigation.back.items[self.navigation.back.items.len - 1];
         self.source_focus = null;
+        self.source_session = null;
         try self.refreshPage(visit.kind);
         switch (visit.kind) {
             .chunk => |id| try self.expandFocusedPath(id),
@@ -2680,6 +2737,7 @@ const Tui = struct {
         }
         try self.navigation.back.append(self.allocator, visit);
         self.source_focus = null;
+        self.source_session = null;
         try self.refreshPage(visit.kind);
         switch (visit.kind) {
             .chunk => |id| try self.expandFocusedPath(id),
@@ -2715,17 +2773,16 @@ const Tui = struct {
 
     fn rowActionable(self: *const Tui, index: usize) bool {
         if (index >= self.page.actions.len) return false;
-        if (index < self.page.locations.len and self.page.locations[index] != null) return true;
         return switch (self.page.actions[index]) {
-            .chunk, .object, .instruction => true,
+            .chunk, .object, .source, .instruction => true,
             .none, .heading => false,
         };
     }
 
     fn firstActionableRow(self: *const Tui) ?usize {
         for (self.page.actions, 0..) |action, i| switch (action) {
-            .chunk, .object, .instruction => return i,
-            .none, .heading => if (i < self.page.locations.len and self.page.locations[i] != null) return i,
+            .chunk, .object, .source, .instruction => return i,
+            .none, .heading => {},
         };
         return null;
     }
@@ -2733,6 +2790,12 @@ const Tui = struct {
     fn toggleSelectedBreakpoint(self: *Tui) !void {
         if (self.navigation.focus != .disassembly) {
             self.status_msg = "(focus the code pane first)";
+            return;
+        }
+        if (self.navigation.detail_selection < self.page.actions.len and
+            self.page.actions[self.navigation.detail_selection] == .source)
+        {
+            self.status_msg = "(Enter SOURCE to select a subexpression)";
             return;
         }
         if (self.navigation.detail_selection >= self.page.locations.len) {
@@ -2792,7 +2855,7 @@ const Tui = struct {
         if (self.page.actions.len == 0) return;
         self.preview_scroll = 0;
         if (self.selectedSourceLocation()) |location| {
-            if (self.ev.getChunk(location.chunk_id)) |chunk| {
+            if (self.source_session == location.chunk_id) if (self.ev.getChunk(location.chunk_id)) |chunk| {
                 if (adjacentSourceSpan(chunk, location.span.?, forward)) |span| {
                     self.source_focus = .{ .chunk_id = location.chunk_id, .span = span };
                     const kind = self.currentKind();
@@ -2811,7 +2874,7 @@ const Tui = struct {
                     }
                     return;
                 }
-            }
+            };
         }
         var cursor = self.navigation.detail_selection;
         while (true) {
@@ -2846,8 +2909,53 @@ const Tui = struct {
         switch (self.page.actions[self.navigation.detail_selection]) {
             .chunk => |id| try self.open(.{ .chunk = id }),
             .object => |id| try self.open(.{ .object = id }),
-            .none, .heading, .instruction => {},
+            .source => |id| try self.enterSourceSession(id),
+            .instruction => {
+                if (self.selectedSourceLocation()) |location| {
+                    if (self.source_session == location.chunk_id)
+                        try self.leaveSourceSession(location.chunk_id);
+                }
+            },
+            .none, .heading => {},
         }
+    }
+
+    fn enterSourceSession(self: *Tui, chunk_id: ChunkId) !void {
+        const chunk = self.ev.getChunk(chunk_id) orelse return;
+        var span = self.focusedSourceSpan(chunk_id);
+        if (span == null) for (self.page.locations) |candidate| {
+            const location = candidate orelse continue;
+            if (location.chunk_id == chunk_id and location.span != null) {
+                span = location.span;
+                break;
+            }
+        };
+        const selected_span = span orelse firstSourceSpan(chunk) orelse return;
+        self.source_focus = .{ .chunk_id = chunk_id, .span = selected_span };
+        self.source_session = chunk_id;
+        try self.refreshPage(self.currentKind());
+        for (self.page.locations, 0..) |candidate, i| {
+            const location = candidate orelse continue;
+            const candidate_span = location.span orelse continue;
+            if (location.chunk_id == chunk_id and sameSourceSpan(candidate_span, selected_span)) {
+                self.navigation.detail_selection = i;
+                self.ensureDetailVisible();
+                return;
+            }
+        }
+    }
+
+    fn leaveSourceSession(self: *Tui, chunk_id: ChunkId) !void {
+        self.source_session = null;
+        try self.refreshPage(self.currentKind());
+        for (self.page.actions, 0..) |action, i| switch (action) {
+            .source => |id| if (id == chunk_id) {
+                self.navigation.detail_selection = i;
+                self.ensureDetailVisible();
+                return;
+            },
+            else => {},
+        };
     }
 
     fn toggleHelp(self: *Tui) !void {
@@ -3901,7 +4009,7 @@ const Tui = struct {
 
     fn detailRole(self: *const Tui, index: usize) tui.Role {
         if (index < self.page.actions.len) switch (self.page.actions[index]) {
-            .heading => return .section,
+            .heading, .source => return .section,
             .chunk => return .chunk,
             .object => return .object,
             .none, .instruction => {},
