@@ -197,8 +197,13 @@ out=$(
     ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty vm: unified inspector offers source span session" "SOURCE * 1 subexpressions" "$out"
+t "tty vm: unified inspector offers source span session" "SOURCE · 1 subexpressions" "$out"
 t "tty vm: unified inspector includes code" "CODE · chunk" "$out"
+if [[ "$out" == *"Enter leaves"* ]]; then
+    fail "tty vm: source heading still advertises Enter-to-leave"
+else
+    pass "tty vm: source heading has no Enter-to-leave behavior"
+fi
 if [[ "$out" == *"▶"* ]]; then
     fail "tty vm: ordinary source showed a subexpression cursor"
 else
@@ -257,6 +262,10 @@ out=$(
         sleep 0.6
         printf '\r'
         sleep 0.3
+        # Enter on the selected span is deliberately a no-op; Escape owns
+        # leaving the source interaction layer.
+        printf '\r'
+        sleep 0.2
         printf 'p'
         sleep 0.4
         printf 'q'
@@ -267,7 +276,7 @@ out=$(
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
 span_marks=$(printf '%s' "$out" | grep -o '◆' | wc -l)
-t "tty vm: source session shows span progress" "SOURCE * 1/" "$out"
+t "tty vm: source session shows span progress" "SOURCE · 1/" "$out"
 if [[ "$span_marks" -eq 1 ]]; then
     pass "tty vm: source breakpoint marks only its exact span"
 else
@@ -314,6 +323,9 @@ out=$(
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
 t "tty debug: opens integrated screen" "paused/entry" "$out"
+t "tty debug: frame heading uses section language" "FRAME · #" "$out"
+t "tty debug: locals heading uses section language" "LOCALS · values are not forced" "$out"
+t "tty debug: code heading uses section language" "CODE · chunk" "$out"
 # Two steps to cross into the import (pause 2 is still the <repl> `call`); the
 # paused frame subtree shows the imported file within the same screen.
 t "tty debug: import step stays in screen" "imported.nix" "$out"
@@ -367,6 +379,30 @@ if [[ "$out" == *$'\x1b[1;7m⇒ chunk[0x'*$' → function'* && "$out" == *$'\x1b
 else
     fail "tty debug: return value did not show flash and settled styles"
 fi
+
+# A heap-backed inline return result is selected as a normal value link. Enter
+# follows it in-place using the same object action as locals, stack slots, and
+# tree references.
+out=$(
+    (
+        sleep 0.4
+        printf ':d (x: x) { a = 1; }\r'
+        sleep 0.5
+        for _ in 1 2 3; do
+            printf 's'
+            sleep 0.25
+        done
+        sleep 0.3
+        printf '\r'
+        sleep 0.5
+        printf 'q'
+        sleep 0.3
+        printf '\004'
+        sleep 0.2
+    ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+t "tty debug: Enter follows an inline returned object" "MEMBERS · 1" "$out"
 
 # Inside :vm the debugger borrows the explorer's raw mode and alternate screen;
 # nested stepping must not emit another enter/leave pair.

@@ -58,13 +58,12 @@ fn writeChunk(
     try disasm.writeChunk(allocator, w, chunk_id, chunk, symbols, options);
 }
 
-const Panel = enum(u1) { code, tables };
 const Category = enum(u1) { bytecode, heap };
 const HeapView = enum { overview, objects, values, attrs, attr_positions };
 
 const RowAction = union(enum) {
     none,
-    heading: Panel,
+    section,
     source: ChunkId,
     instruction,
     chunk: ChunkId,
@@ -102,6 +101,10 @@ const PageBuilder = struct {
 
     fn line(self: *PageBuilder, line_text: []const u8, action: RowAction) !void {
         try self.lineAt(line_text, action, null);
+    }
+
+    fn heading(self: *PageBuilder, line_text: []const u8) !void {
+        try self.line(line_text, .section);
     }
 
     fn lineAt(self: *PageBuilder, line_text: []const u8, action: RowAction, location: ?BreakpointLocation) !void {
@@ -783,7 +786,7 @@ const Tui = struct {
                 try self.appendChunkEquivalence(&page, id);
                 try self.appendSourceDocument(&page, id, chunk, self.focusedSourceSpan(id));
                 try page.line("", .none);
-                try page.line(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{id}), .none);
+                try page.heading(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{id}));
                 try self.appendDisassemblyAt(&page, id, chunk, true, null);
                 try page.line("", .none);
                 try self.appendRefs(&page, id);
@@ -801,8 +804,6 @@ const Tui = struct {
             .debug_value => return self.buildReturnValuePage(),
             .help => {
                 const help_text =
-                    \\The VM explorer
-                    \\
                     \\  Tab             switch tree/detail focus
                     \\  j/k, arrows     move between interactive rows
                     \\  Enter, →        expand a tree/group or open a reference
@@ -821,6 +822,8 @@ const Tui = struct {
                     \\bounded range nodes instead of being truncated.
                 ;
                 var page: PageBuilder = .{ .arena = arena };
+                try page.heading("The VM explorer");
+                try page.line("", .none);
                 try page.text(help_text);
                 return .{
                     .title = try arena.dupe(u8, "help"),
@@ -835,7 +838,7 @@ const Tui = struct {
         const arena = self.arena.allocator();
         const counts = self.ev.heapCounts();
         var page: PageBuilder = .{ .arena = arena };
-        try page.line(try std.fmt.allocPrint(arena, "HEAP · {d} object slots", .{counts.objects}), .none);
+        try page.heading(try std.fmt.allocPrint(arena, "HEAP · {d} object slots", .{counts.objects}));
         try page.line(try std.fmt.allocPrint(arena, "objects        {d:>12}", .{counts.objects}), .none);
         try page.line(try std.fmt.allocPrint(arena, "values         {d:>12}", .{counts.values}), .none);
         try page.line(try std.fmt.allocPrint(arena, "attrs          {d:>12}", .{counts.attrs}), .none);
@@ -851,12 +854,12 @@ const Tui = struct {
         };
         switch (view) {
             .overview, .objects => {
-                try page.line("OBJECT VARIANTS", .none);
+                try page.heading("OBJECT VARIANTS");
                 for (stats.variant_counts, 0..) |count, i| {
                     try page.line(try std.fmt.allocPrint(arena, "{s:<20} {d:>12}", .{ runtime.ObjectHeap.Stats.variantName(i), count }), .none);
                 }
                 try page.line("", .none);
-                try page.line("THUNK STATES", .none);
+                try page.heading("THUNK STATES");
                 for (stats.thunk_states, 0..) |count, i| {
                     try page.line(try std.fmt.allocPrint(arena, "{s:<20} {d:>12}", .{ runtime.ObjectHeap.Stats.thunkStateName(i), count }), .none);
                 }
@@ -864,13 +867,14 @@ const Tui = struct {
                 try page.line(try std.fmt.allocPrint(arena, "resolved undemanded   {d:>12}", .{stats.resolved_undemanded}), .none);
             },
             .values, .attrs => {
-                try page.line("INLINE INTEGER MAGNITUDES · values + attrs", .none);
+                try page.heading("INLINE INTEGER MAGNITUDES · values + attrs");
                 for (stats.int_buckets, 0..) |count, i| {
                     try page.line(try std.fmt.allocPrint(arena, "{s:<20} {d:>12}", .{ runtime.ObjectHeap.Stats.intBucketLabel(i), count }), .none);
                 }
                 try page.line(try std.fmt.allocPrint(arena, "i48 overflows         {d:>12}", .{stats.intOverflowsI48()}), .none);
             },
             .attr_positions => {
+                try page.heading("ATTR POSITIONS");
                 try page.line("Source-position records attached to heap attrs.", .none);
                 try page.line("Open TABLES on a chunk to inspect its compile-time attr positions.", .none);
             },
@@ -900,10 +904,7 @@ const Tui = struct {
                 .actions = page.actions.items,
             };
         };
-        try page.line(
-            try self.canonicalStoreRef(arena, .objects, id, try self.objectSummary(arena, id, 64), true),
-            .none,
-        );
+        try page.heading(try self.canonicalStoreRef(arena, .objects, id, try self.objectSummary(arena, id, 64), true));
         try page.line("", .none);
         switch (info) {
             .list => {
@@ -995,7 +996,7 @@ const Tui = struct {
     fn buildStoreRecordPage(self: *Tui, view: HeapView, id: u32) !Page {
         const arena = self.arena.allocator();
         var page: PageBuilder = .{ .arena = arena };
-        try page.line(try self.canonicalStoreRef(arena, view, id, null, true), .none);
+        try page.heading(try self.canonicalStoreRef(arena, view, id, null, true));
         try page.line("", .none);
         switch (view) {
             .values => {
@@ -1036,7 +1037,7 @@ const Tui = struct {
             try page.line("(no active pause)", .none);
             return debugPageOf(arena, &page, "value");
         };
-        try page.line(returnValueHeading(session.reason), .{ .heading = .code });
+        try page.heading(returnValueHeading(session.reason));
         try page.line("", .none);
         try self.appendValueDetail(&page, "value", session.value);
         try page.line("", .none);
@@ -1058,7 +1059,7 @@ const Tui = struct {
         const arena = page.arena;
         const cap = 200;
         if (self.ev.heapAttrsOf(id)) |attrs| {
-            try page.line(try std.fmt.allocPrint(arena, "MEMBERS ({d})", .{attrs.len}), .none);
+            try page.heading(try std.fmt.allocPrint(arena, "MEMBERS · {d}", .{attrs.len}));
             for (attrs, 0..) |entry, i| {
                 if (i >= cap) {
                     try page.line(try std.fmt.allocPrint(arena, "  … {d} more", .{attrs.len - cap}), .none);
@@ -1067,7 +1068,7 @@ const Tui = struct {
                 try self.appendValueLine(page, try std.fmt.allocPrint(arena, "  {s} : ", .{self.ev.internTable().get(entry.name)}), entry.value);
             }
         } else |_| if (self.ev.heapListOf(id)) |items| {
-            try page.line(try std.fmt.allocPrint(arena, "ITEMS ({d})", .{items.len}), .none);
+            try page.heading(try std.fmt.allocPrint(arena, "ITEMS · {d}", .{items.len}));
             for (items, 0..) |item, i| {
                 if (i >= cap) {
                     try page.line(try std.fmt.allocPrint(arena, "  … {d} more", .{items.len - cap}), .none);
@@ -1097,13 +1098,13 @@ const Tui = struct {
         const info = session.frame(index);
         const chunk_id = session.frameChunkId(index);
 
-        try page.line(try std.fmt.allocPrint(arena, "FRAME #{d} · {s} · {s}:{d}:{d}", .{
+        try page.heading(try std.fmt.allocPrint(arena, "FRAME · #{d} · {s} · {s}:{d}:{d}", .{
             index,
             reasonName(session.reason),
             if (info.file) |f| std.fs.path.basename(f) else "<repl>",
             info.line,
             info.column,
-        }), .none);
+        }));
         if (session.hasFrameName(index)) {
             var name: std.Io.Writer.Allocating = .init(arena);
             session.writeFrameName(&name.writer, index) catch {};
@@ -1112,9 +1113,8 @@ const Tui = struct {
         try page.line("", .none);
 
         if (session.reason == .break_builtin or session.reason == .eval_error) {
-            try page.line(returnValueHeading(session.reason), .{ .heading = .code });
+            try page.heading(returnValueHeading(session.reason));
             try self.appendValueLine(&page, "  => ", session.value);
-            try page.line("  (Enter on the tree's ↳ row opens it as a full subject)", .none);
             try page.line("", .none);
         }
 
@@ -1131,7 +1131,7 @@ const Tui = struct {
                 try page.line("", .none);
             };
         } else if (info.span) |span| if (session.frameSourceText(index)) |source| {
-            try page.line("SOURCE", .none);
+            try page.heading("SOURCE");
             try self.appendSourceExcerpt(
                 &page,
                 source,
@@ -1145,7 +1145,7 @@ const Tui = struct {
             try page.line("", .none);
         };
 
-        try page.line("LOCALS (values are not forced)", .none);
+        try page.heading("LOCALS · values are not forced");
         var any = false;
         for (0..session.localCount(index)) |slot| {
             const nm = session.localName(index, slot) orelse continue;
@@ -1163,7 +1163,7 @@ const Tui = struct {
         // The raw VM operand stack for this frame (top of stack first).
         const stack_n = session.stackSlotCount(index);
         if (stack_n > 0) {
-            try page.line(try std.fmt.allocPrint(arena, "VM STACK ({d})", .{stack_n}), .none);
+            try page.heading(try std.fmt.allocPrint(arena, "VM STACK · {d}", .{stack_n}));
             var s: usize = 0;
             while (s < stack_n) : (s += 1) {
                 const slot = stack_n - 1 - s;
@@ -1173,7 +1173,7 @@ const Tui = struct {
         }
 
         if (self.ev.getChunk(chunk_id)) |chunk| {
-            try page.line(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{chunk_id}), .none);
+            try page.heading(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{chunk_id}));
             try self.appendDisassemblyAt(&page, chunk_id, chunk, false, info.instruction);
         }
 
@@ -1389,6 +1389,32 @@ const Tui = struct {
         };
     }
 
+    fn rowTargetsValue(self: *const Tui, action: RowAction, value: runtime.value.Value) bool {
+        return switch (self.ev.valueRef(value).target) {
+            .object => |id| switch (action) {
+                .object => |row_id| row_id == id,
+                else => false,
+            },
+            .chunk => |id| switch (action) {
+                .chunk => |row_id| row_id == id,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Put a navigable pause result under the inspector cursor. The inline
+    /// result remains part of the source document, and Enter follows it using
+    /// the same object/chunk action as any other rendered value.
+    fn focusValueRow(self: *Tui, value: runtime.value.Value) void {
+        for (self.page.actions, 0..) |action, i| {
+            if (!self.rowTargetsValue(action, value)) continue;
+            self.navigation.detail_selection = i;
+            self.ensureDetailVisible();
+            return;
+        }
+    }
+
     fn chunkEquivalence(self: *const Tui, id: ChunkId) ?ChunkEquivalence {
         const index = &self.tree_index.equivalence;
         if (index.structuralPeer(id)) |peer| return .{ .structural = peer };
@@ -1438,12 +1464,13 @@ const Tui = struct {
         var outgoing: std.ArrayListUnmanaged(ChunkId) = .empty;
         const chunk = self.ev.getChunk(id) orelse return;
         try bytecode.inspect.collectRefs(page.arena, chunk, &outgoing);
-        try page.line(try std.fmt.allocPrint(page.arena, "outgoing ({d})", .{outgoing.items.len}), .none);
+        try page.heading(try std.fmt.allocPrint(page.arena, "OUTGOING · {d}", .{outgoing.items.len}));
         for (outgoing.items) |target| try self.appendChunkLabel(page, "  →", target);
 
         const graph = self.references.graph orelse return;
+        try page.line("", .none);
         const incoming = graph.incoming(id);
-        try page.line(try std.fmt.allocPrint(page.arena, "incoming ({d})", .{incoming.len}), .none);
+        try page.heading(try std.fmt.allocPrint(page.arena, "INCOMING · {d}", .{incoming.len}));
         for (incoming) |source| try self.appendChunkLabel(page, "  ←", source);
     }
 
@@ -1508,7 +1535,7 @@ const Tui = struct {
         else
             chunk.body_span orelse firstSourceSpan(chunk);
         const shown_span = span orelse {
-            try document.line("SOURCE", .none);
+            try document.heading("SOURCE");
             try document.line("(no source information)", .none);
             return;
         };
@@ -1579,15 +1606,15 @@ const Tui = struct {
     ) !void {
         const stats = sourceSpanStats(chunk, span);
         if (stats.total == 0) {
-            try document.line("SOURCE", .none);
+            try document.heading("SOURCE");
         } else if (self.source_session == id) {
             try document.line(
-                try std.fmt.allocPrint(document.arena, "SOURCE * {d}/{d} subexpressions · Enter leaves", .{ stats.index, stats.total }),
+                try std.fmt.allocPrint(document.arena, "SOURCE · {d}/{d} subexpressions", .{ stats.index, stats.total }),
                 .{ .source = id },
             );
         } else {
             try document.line(
-                try std.fmt.allocPrint(document.arena, "SOURCE * {d} subexpressions", .{stats.total}),
+                try std.fmt.allocPrint(document.arena, "SOURCE · {d} subexpressions", .{stats.total}),
                 .{ .source = id },
             );
         }
@@ -1720,14 +1747,18 @@ const Tui = struct {
                     wrapped_result = try std.fmt.allocPrint(document.arena, "        │ {s}", .{annotation.written()[2..]});
                 }
             }
+            var row_action: RowAction = if (active and location != null and self.source_session == location.?.chunk_id)
+                .instruction
+            else
+                .none;
+            if (result_here and wrapped_result == null) {
+                const result_action = self.valueRowAction(returned_value.?);
+                if (result_action != .none) row_action = result_action;
+            }
             if (active and location != null) {
-                try document.lineAt(
-                    rendered.written(),
-                    if (self.source_session == location.?.chunk_id) .instruction else .none,
-                    location.?,
-                );
+                try document.lineAt(rendered.written(), row_action, location.?);
             } else {
-                try document.line(rendered.written(), .none);
+                try document.line(rendered.written(), row_action);
             }
             if (wrapped_result) |result|
                 try document.line(result, self.valueRowAction(returned_value.?));
@@ -2698,14 +2729,14 @@ const Tui = struct {
         if (index >= self.page.actions.len) return false;
         return switch (self.page.actions[index]) {
             .chunk, .object, .source, .instruction => true,
-            .none, .heading => false,
+            .none, .section => false,
         };
     }
 
     fn firstActionableRow(self: *const Tui) ?usize {
         for (self.page.actions, 0..) |action, i| switch (action) {
             .chunk, .object, .source, .instruction => return i,
-            .none, .heading => {},
+            .none, .section => {},
         };
         return null;
     }
@@ -2833,13 +2864,7 @@ const Tui = struct {
             .chunk => |id| try self.open(.{ .chunk = id }),
             .object => |id| try self.open(.{ .object = id }),
             .source => |id| try self.enterSourceSession(id),
-            .instruction => {
-                if (self.selectedSourceLocation()) |location| {
-                    if (self.source_session == location.chunk_id)
-                        try self.leaveSourceSession(location.chunk_id);
-                }
-            },
-            .none, .heading => {},
+            .instruction, .none, .section => {},
         }
     }
 
@@ -4001,7 +4026,7 @@ const Tui = struct {
 
     fn detailRole(self: *const Tui, index: usize) tui.Role {
         if (index < self.page.actions.len) switch (self.page.actions[index]) {
-            .heading, .source => return .section,
+            .section, .source => return .section,
             .chunk => return .chunk,
             .object => return .object,
             .none, .instruction => {},
@@ -4555,6 +4580,7 @@ const Tui = struct {
             self.exitDebugView();
         }
         try self.open(.{ .debug_frame = session.frameCount() -| 1 });
+        if (session.reason == .return_step) self.focusValueRow(session.value);
         // `open` focuses frame details. Keep that focus across step pauses so
         // the next/current frame is immediately usable instead of bouncing the
         // user back to the stack tree after every instruction.
