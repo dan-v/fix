@@ -223,6 +223,30 @@ test "repeated constants share one chunk-pool index" {
     try testing.expect(std.mem.indexOf(u8, d.text, "push_const #1") == null);
 }
 
+test "empty containers lower to shared singleton constants" {
+    var ev = try Evaluator.init(testing.allocator, 0);
+    defer ev.deinit();
+
+    var attrs = try disassemble(&ev, "{}");
+    defer attrs.deinit(testing.allocator);
+    try testing.expect(attrs.contains("push_const_ret"));
+    try testing.expect(!attrs.contains("attrs_new"));
+    try testing.expect(!attrs.contains("attrs_new_srt"));
+
+    var list = try disassemble(&ev, "[]");
+    defer list.deinit(testing.allocator);
+    try testing.expect(list.contains("push_const_ret"));
+    try testing.expect(!list.contains("list_new"));
+
+    // Repeated empties reuse the same two constant-pool entries; the outer
+    // populated list is the only runtime container construction.
+    var repeated = try disassemble(&ev, "[ {} {} [] [] ]");
+    defer repeated.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, repeated.text, "2 consts") != null);
+    try testing.expectEqual(@as(usize, 4), repeated.count("push_const"));
+    try testing.expectEqual(@as(usize, 1), repeated.count("list_new"));
+}
+
 test "right-associated list concatenation lowers to one n-ary opcode" {
     var ev = try Evaluator.init(testing.allocator, 0);
     defer ev.deinit();

@@ -9,6 +9,7 @@ const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const chunk = bytecode.chunk;
 const heap_mod = @import("runtime").heap;
+const Value = @import("runtime").value.Value;
 const types = @import("runtime").types;
 const OpCode = bytecode.OpCode;
 const operand = @import("operand.zig");
@@ -36,13 +37,28 @@ pub fn emitOpU32(self: *Compiler, op: OpCode, val: u32) !void {
     try self.builder.writeU32(self.allocator, val);
 }
 
+/// Empty containers are evaluator-wide pinned singletons. Put their canonical
+/// values directly in the chunk pool instead of executing a zero-count builder
+/// opcode every time the expression runs.
+pub fn emitEmptyAttrs(self: *Compiler) !void {
+    try self.heap.ensureEmptySingletons();
+    const id = try self.heap.addAttrs(&.{});
+    try self.builder.emitConstant(self.allocator, Value.attrs(id));
+}
+
+pub fn emitEmptyList(self: *Compiler) !void {
+    try self.heap.ensureEmptySingletons();
+    const id = try self.heap.addList(&.{});
+    try self.builder.emitConstant(self.allocator, Value.list(id));
+}
+
 /// Build-attrs emission for STATIC sorted+unique literals: the attr names go
 /// to the chunk's side table (`attrs_new_named*`) and the stack carries only
 /// the N values — no per-entry `push_const` of the name, no pool slot.
 /// Positions (when present) ride the side table too.
 pub fn emitBuildAttrsSorted(self: *Compiler, count: u16, names: []const types.InternId, positions: []const heap_mod.AttrPosEntry) !void {
     std.debug.assert(names.len == count);
-    if (count == 0) return emitOpU16(self, .attrs_new_srt, 0);
+    if (count == 0) return emitEmptyAttrs(self);
     const names_start: u32 = @intCast(self.builder.attr_names.items.len);
     try self.builder.attr_names.appendSlice(self.allocator, names);
     if (positions.len == 0) {

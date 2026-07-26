@@ -72,7 +72,7 @@ fn compileMixedAttrEntryViews(self: *Compiler, entries: []const AttrEntryView, r
 
         try compileAttrEntries(self, static_entries, false);
     } else {
-        try emit.emitOpU16(self, .attrs_new, 0);
+        try emit.emitEmptyAttrs(self);
     }
 
     for (entries) |entry| {

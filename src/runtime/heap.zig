@@ -1946,9 +1946,13 @@ pub const ObjectHeap = struct {
     /// `addAttrs` calls below observe `empty_*_id == null` and allocate real
     /// slots, which we then cache; every later empty returns these ids.
     pub fn ensureEmptySingletons(self: *ObjectHeap) !void {
-        if (self.empty_list_id != null) return;
-        self.empty_list_id = try self.addList(&.{});
-        self.empty_attrs_id = try self.addAttrs(&.{});
+        // Complete either half independently so an allocation failure between
+        // the two assignments cannot leave future calls believing bootstrap
+        // finished.
+        if (self.empty_list_id == null)
+            self.empty_list_id = try self.addList(&.{});
+        if (self.empty_attrs_id == null)
+            self.empty_attrs_id = try self.addAttrs(&.{});
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {

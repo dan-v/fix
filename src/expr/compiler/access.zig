@@ -270,6 +270,7 @@ fn literalSetHasSimpleStaticShape(self: *Compiler, set: Node.AttrSet) !bool {
 
 pub fn compileList(self: *Compiler, node: *const Node) !void {
     const list = node.data.list;
+    if (list.items.len == 0) return emit.emitEmptyList(self);
     for (list.items) |item| {
         try compileListElement(self, item);
     }
@@ -306,7 +307,7 @@ fn compileListElement(self: *Compiler, item: *const Node) !void {
             // Empty list is a shared constant value (`[ [] ]` prints
             // `[ [ ] ]`); a non-empty list literal is thunked (`[ <CODE> ]`).
             if (unwrapped.data.list.items.len == 0) {
-                try emit.emitOpU16(self, .list_new, 0);
+                try emit.emitEmptyList(self);
             } else {
                 try thunks.compileListElementThunk(self, item);
             }
@@ -315,7 +316,7 @@ fn compileListElement(self: *Compiler, item: *const Node) !void {
             // An empty non-recursive set is a shared constant value too
             // (`[ {} {} ]` prints `[ { } { } ]`); any populated set is thunked.
             if (unwrapped.data.attr_set.entries.len == 0 and !unwrapped.data.attr_set.recursive) {
-                try emit.emitOpU16(self, .attrs_new, 0);
+                try emit.emitEmptyAttrs(self);
             } else {
                 try thunks.compileListElementThunk(self, item);
             }
@@ -371,7 +372,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             // pending name so the element thunks don't claim the binding's name.
             self.name_hint = null;
             if (unwrapped.data.list.items.len == 0) {
-                try emit.emitOpU16(self, .list_new, 0);
+                try emit.emitEmptyList(self);
             } else if (try fold.tryFoldConstant(self, unwrapped)) |v| {
                 // Closed constant list: materialized once at compile time into
                 // the constant pool (a permanent GC root) — no chunk, no thunk,
@@ -396,7 +397,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             // thunk, no chunk. (15k chunks on a NixOS toplevel existed solely
             // to build `{}`.)
             if (unwrapped.data.attr_set.entries.len == 0 and !unwrapped.data.attr_set.recursive) {
-                try emit.emitOpU16(self, .attrs_new, 0);
+                try emit.emitEmptyAttrs(self);
                 return true;
             }
             // Closed constant attrset: same treatment as the constant list
