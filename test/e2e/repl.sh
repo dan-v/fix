@@ -185,7 +185,7 @@ out=$(
     ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty vm: unified inspector offers source span session" "SOURCE \\* [0-9][0-9]* subexpressions" "$out"
+t "tty vm: unified inspector offers source span session" "SOURCE * 1 subexpressions" "$out"
 t "tty vm: unified inspector includes code" "CODE · chunk" "$out"
 
 # Nested expressions on one line may share a bytecode-entry offset. A source
@@ -210,6 +210,7 @@ out=$(
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
 span_marks=$(printf '%s' "$out" | grep -o '◆' | wc -l)
+t "tty vm: source session shows span progress" "SOURCE * 1/" "$out"
 if [[ "$span_marks" -eq 1 ]]; then
     pass "tty vm: source breakpoint marks only its exact span"
 else
@@ -284,6 +285,26 @@ out=$(
 )
 after_debug=${out##*$'\x1b[?1049l'}
 t "tty debug: completed result survives screen exit" "42" "$after_debug"
+
+# A return pause annotates the caller's source pointer, CIDER/SLIME-style,
+# rather than adding a detached value section or decorating bytecode.
+out=$(
+    (
+        sleep 0.4
+        printf ':d (x: x + 1) 2\r'
+        sleep 0.5
+        for _ in 1 2 3 4 5 6; do
+            printf 's'
+            sleep 0.25
+        done
+        printf 'q'
+        sleep 0.3
+        printf '\004'
+        sleep 0.2
+    ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+t "tty debug: return value is inline with source" "⇒ int 3" "$out"
 
 # Inside :vm the debugger borrows the explorer's raw mode and alternate screen;
 # nested stepping must not emit another enter/leave pair.
