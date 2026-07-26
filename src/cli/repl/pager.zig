@@ -15,6 +15,7 @@ const editor_mod = @import("editor.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("transcript.zig");
 const vm_tree = @import("vm_tree.zig");
+const vm_navigation = @import("vm_navigation.zig");
 const history_mod = @import("history.zig");
 const source_render = @import("../source_render.zig");
 const command_mod = @import("../debugger_command.zig");
@@ -540,7 +541,6 @@ const RefJob = struct {
     }
 };
 
-const Focus = enum { chunks, disassembly };
 const RangeKind = enum(u3) { names, chunks, objects, values, attrs, attr_positions };
 const ChunkEquivalence = union(enum) {
     structural: ChunkId,
@@ -584,7 +584,7 @@ const NavigationState = struct {
     back: std.ArrayListUnmanaged(Visit) = .empty,
     forward: std.ArrayListUnmanaged(Visit) = .empty,
     search: std.ArrayListUnmanaged(u8) = .empty,
-    focus: Focus = .disassembly,
+    focus: vm_navigation.Focus = .subject,
     tree_selection: usize = 0,
     detail_selection: usize = 0,
     scroll: usize = 0,
@@ -603,6 +603,10 @@ const TreeState = struct {
     /// only name nodes on a path to a match (and their chunks) are shown.
     filter_query: std.ArrayListUnmanaged(u8) = .empty,
     filter_keep: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Subject whose path is projected through otherwise-collapsed name nodes.
+    /// Tree-origin inspection does not change this anchor: opening a visible
+    /// row must never reshape the tree around the newly opened subject.
+    projected_chunk: ?ChunkId = null,
 };
 
 const HeapIndexState = struct {
@@ -622,7 +626,6 @@ const HeapIndexState = struct {
 
 const ReferenceIndexState = struct {
     graph: ?bytecode.inspect.RefGraph = null,
-    indexing: bool = false,
     failed: bool = false,
 };
 
@@ -706,7 +709,7 @@ const Tui = struct {
     source_session: ?ChunkId = null,
     /// Vertical offset within the current hover preview. Normal cursor motion
     /// resets it; Alt+j/k and Alt+Up/Down adjust it without moving the tree.
-    preview_scroll: usize = 0,
+    preview: vm_navigation.PreviewScroll = .{},
     /// True only for the first rendered frame of a return pause. The inline
     /// result starts as a bright badge, then settles to its persistent style.
     return_flash: bool = false,
@@ -769,13 +772,10 @@ const Tui = struct {
         try self.selectedSourceChanged();
     }
 
-    fn pollSessionJobs(self: *Tui, host: SessionHost, jobs: *SessionJobs) !void {
+    fn pollSessionJobs(self: *Tui, jobs: *SessionJobs) !void {
         if (jobs.names.poll(self.tree_index)) {
             self.tree.indexing = false;
-            if (host.focusedChunk()) |id| {
-                try self.expandFocusedPath(id);
-                try self.rebuildTree(id);
-            }
+            try self.rebuildTreeForCurrent();
         }
         const registry = self.ev.chunkRegistry();
         const names_stale = self.tree_index.registry_count != registry.count() or self.tree_index.name_count != registry.nameCount();
@@ -790,7 +790,10 @@ const Tui = struct {
 
         if (jobs.heap.poll(&self.heap_index.stats) and self.currentHeap() != null)
             try self.refreshPage(self.currentKind());
-        if (self.currentHeap() != null and self.heap_index.stats == null and jobs.heap.thread == null) {
+        // The collapsed HEAP row owns the aggregate census preview, so populate
+        // it for every explorer session rather than waiting for a folder/page
+        // to be opened.
+        if (self.heap_index.stats == null and jobs.heap.thread == null) {
             jobs.heap.start() catch {
                 self.status_msg = "(heap census failed)";
             };
@@ -816,26 +819,14 @@ const Tui = struct {
         // References are part of every chunk's unified inspector document.
         const shows_references = self.currentChunk() != null;
         if (jobs.references.poll(&self.references.graph)) {
-            self.references.indexing = false;
             if (shows_references) try self.refreshPage(self.currentKind());
         }
         const references_failed = jobs.references.failed.load(.acquire);
-        if (references_failed != self.references.failed) {
-            self.references.failed = references_failed;
-            if (shows_references) try self.refreshPage(self.currentKind());
-        }
+        self.references.failed = references_failed;
         const wants_references = shows_references;
-        if (wants_references and references_failed) self.status_msg = "(reference index failed)";
         const references_stale = self.references.graph == null or self.references.graph.?.registry_count != registry.count();
         if (wants_references and references_stale and jobs.references.thread == null and !references_failed) {
-            jobs.references.start() catch {
-                self.status_msg = "(reference index failed)";
-            };
-        }
-        const indexing_references = wants_references and !references_failed and (references_stale or jobs.references.running.load(.acquire));
-        if (indexing_references != self.references.indexing) {
-            self.references.indexing = indexing_references;
-            try self.refreshPage(self.currentKind());
+            jobs.references.start() catch {};
         }
     }
 
@@ -898,7 +889,7 @@ const Tui = struct {
         var read_buf: [512]u8 = undefined;
 
         while (true) {
-            try self.pollSessionJobs(host, &jobs);
+            try self.pollSessionJobs(&jobs);
 
             _ = frame_arena.reset(.retain_capacity);
             var prompt_view = try self.sessionPromptView(editor, frame_arena.allocator());
@@ -961,14 +952,15 @@ const Tui = struct {
                     continue;
                 }
 
+                if (key.code == .escape) {
+                    if (try self.escapeLayer()) continue;
+                    return;
+                }
                 const leave_explorer = switch (key.code) {
-                    .escape => true,
                     .cp => |cp| cp == 'q',
                     else => false,
                 };
-                if (leave_explorer) {
-                    return;
-                }
+                if (leave_explorer) return;
                 const enter_command = switch (key.code) {
                     .cp => |cp| cp == ':',
                     else => false,
@@ -1020,11 +1012,7 @@ const Tui = struct {
                 try self.appendSourceDocument(&page, id, chunk, self.focusedSourceSpan(id));
                 try page.line("", .none);
                 try page.line(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{id}), .none);
-                try self.appendDisassembly(&page, id, chunk, .code);
-                if (chunk.constants.len > 0) {
-                    try page.line("", .none);
-                    try self.appendDisassembly(&page, id, chunk, .tables);
-                }
+                try self.appendDisassemblyAt(&page, id, chunk, true, null);
                 try page.line("", .none);
                 try self.appendRefs(&page, id);
                 return .{
@@ -1053,7 +1041,8 @@ const Tui = struct {
                     \\  b / f           back / forward through followed references
                     \\  /               search; n/N next/previous match
                     \\  i / :           enter an expression / command at the REPL prompt
-                    \\  q, Esc          return to the inline REPL
+                    \\  Esc             leave source/pane/tree layer; then return
+                    \\  q               return directly to the inline REPL
                     \\
                     \\The tree starts collapsed except for the focused chunk's
                     \\ancestor path. Large child/chunk sets are exposed through
@@ -1082,7 +1071,6 @@ const Tui = struct {
         try page.line("", .none);
 
         const stats = self.heap_index.stats orelse {
-            try page.line("scanning the detailed heap census asynchronously…", .none);
             return .{
                 .title = try std.fmt.allocPrint(arena, "heap · {s}", .{@tagName(view)}),
                 .lines = page.lines.items,
@@ -1125,13 +1113,12 @@ const Tui = struct {
     fn buildObjectPage(self: *Tui, id: runtime.types.ObjectId) !Page {
         const arena = self.arena.allocator();
         var page: PageBuilder = .{ .arena = arena };
-        const snapshot = self.heap_index.objects orelse {
-            try page.line(if (self.heap_index.objects_failed) "live-object index unavailable" else "building the live-object index asynchronously…", .none);
-            return .{
-                .title = try std.fmt.allocPrint(arena, "objects[0x{x}]", .{id}),
-                .lines = page.lines.items,
-                .actions = page.actions.items,
-            };
+        if (self.heap_index.objects == null)
+            self.heap_index.objects = self.ev.heapObjectSnapshot(self.allocator) catch null;
+        const snapshot = self.heap_index.objects orelse return .{
+            .title = try std.fmt.allocPrint(arena, "objects[0x{x}]", .{id}),
+            .lines = page.lines.items,
+            .actions = page.actions.items,
         };
         const info = self.ev.inspectHeapObject(&snapshot, id) catch {
             try page.line("this object is no longer live", .none);
@@ -1412,7 +1399,7 @@ const Tui = struct {
 
         if (self.ev.getChunk(chunk_id)) |chunk| {
             try page.line(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{chunk_id}), .none);
-            try self.appendDisassemblyAt(&page, chunk_id, chunk, .code, info.instruction);
+            try self.appendDisassemblyAt(&page, chunk_id, chunk, false, info.instruction);
         }
 
         return .{
@@ -1587,16 +1574,12 @@ const Tui = struct {
         };
     }
 
-    fn appendDisassembly(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk, panel: Panel) !void {
-        return self.appendDisassemblyAt(page, id, chunk, panel, null);
-    }
-
     fn appendDisassemblyAt(
         self: *Tui,
         page: *PageBuilder,
         id: ChunkId,
         chunk: *const bytecode.Chunk,
-        panel: Panel,
+        show_tables: bool,
         current_offset: ?u32,
     ) !void {
         var text: std.Io.Writer.Allocating = .init(page.arena);
@@ -1605,8 +1588,9 @@ const Tui = struct {
         inspected_chunk.code = try self.ev.unpatchedChunkCode(page.arena, id, chunk);
         var options = disasm_options;
         options.color_depth = self.color_depth;
-        options.show_constants = panel == .tables;
-        options.show_code = panel == .code;
+        options.show_header = false;
+        options.show_constants = show_tables;
+        options.show_code = true;
         options.current_offset = current_offset;
         options.line_width = @intCast(@min(self.layout().main_width, std.math.maxInt(u16)));
         try disasm.writeChunk(page.arena, &text.writer, id, &inspected_chunk, symbols, options);
@@ -1676,22 +1660,16 @@ const Tui = struct {
     }
 
     fn appendRefs(self: *Tui, page: *PageBuilder, id: ChunkId) !void {
-        const graph = self.references.graph orelse {
-            try page.line(if (self.references.failed) "chunk reference index unavailable" else "indexing the chunk reference graph asynchronously…", .none);
-            return;
-        };
-        const outgoing = graph.outgoing(id);
-        try page.line(try std.fmt.allocPrint(page.arena, "outgoing ({d})", .{outgoing.len}), .none);
-        for (outgoing) |target| try self.appendChunkLabel(page, "  →", target);
+        var outgoing: std.ArrayListUnmanaged(ChunkId) = .empty;
+        const chunk = self.ev.getChunk(id) orelse return;
+        try bytecode.inspect.collectRefs(page.arena, chunk, &outgoing);
+        try page.line(try std.fmt.allocPrint(page.arena, "outgoing ({d})", .{outgoing.items.len}), .none);
+        for (outgoing.items) |target| try self.appendChunkLabel(page, "  →", target);
 
+        const graph = self.references.graph orelse return;
         const incoming = graph.incoming(id);
         try page.line(try std.fmt.allocPrint(page.arena, "incoming ({d})", .{incoming.len}), .none);
         for (incoming) |source| try self.appendChunkLabel(page, "  ←", source);
-        if (self.references.failed) {
-            try page.line("reference update failed; showing the previous graph", .none);
-        } else if (self.references.indexing) {
-            try page.line("updating references for newly compiled chunks…", .none);
-        }
     }
 
     fn appendChunkLabel(self: *Tui, page: *PageBuilder, marker: []const u8, id: ChunkId) !void {
@@ -2118,7 +2096,7 @@ const Tui = struct {
     /// The chunk/object referenced by the selected detail row (for the
     /// right-hand preview), or null when there's nothing to peek into.
     fn detailPreviewAction(self: *const Tui) ?RowAction {
-        if (self.navigation.focus != .disassembly) return null;
+        if (self.navigation.focus != .subject) return null;
         const kind = self.currentKind();
         const is_value_subject = switch (kind) {
             .object, .store_record, .debug_value, .debug_frame => true,
@@ -2220,10 +2198,11 @@ const Tui = struct {
     }
 
     fn rebuildTreeForCurrent(self: *Tui) !void {
-        try self.rebuildTree(self.currentChunk() orelse std.math.maxInt(ChunkId));
+        try self.rebuildTree(self.tree.projected_chunk orelse std.math.maxInt(ChunkId));
     }
 
     fn expandFocusedPath(self: *Tui, chunk_id: ChunkId) !void {
+        self.tree.projected_chunk = chunk_id;
         self.tree.categories[@intFromEnum(Category.bytecode)] = true;
         self.tree.focus_path.clearRetainingCapacity();
         try self.tree.focus_path.put(self.allocator, vm_tree.root_node_id, {});
@@ -2576,7 +2555,7 @@ const Tui = struct {
     fn moveTree(self: *Tui, forward: bool) void {
         const count = self.tree.rows.items.len;
         if (count == 0) return;
-        self.preview_scroll = 0;
+        self.preview.reset();
         if (forward) {
             self.navigation.tree_selection = @min(self.navigation.tree_selection + 1, count - 1);
         } else {
@@ -2658,118 +2637,114 @@ const Tui = struct {
     fn collapseTreeRow(self: *Tui) !void {
         if (self.navigation.tree_selection >= self.tree.rows.items.len) return;
         const selected = self.tree.rows.items[self.navigation.tree_selection];
-        switch (selected) {
-            .category => |entry| {
+        const collapsed = switch (selected) {
+            .category => |entry| blk: {
                 const index = @intFromEnum(entry.kind);
-                if (self.tree.categories[index]) {
-                    self.tree.categories[index] = false;
-                    try self.rebuildTreeForCurrent();
-                    for (self.tree.rows.items, 0..) |row, i| switch (row) {
-                        .category => |candidate| if (candidate.kind == entry.kind) {
-                            self.navigation.tree_selection = i;
-                            return;
-                        },
-                        else => {},
-                    };
-                }
-                return;
+                if (!self.tree.categories[index]) break :blk false;
+                self.tree.categories[index] = false;
+                break :blk true;
             },
-            .heap => |entry| {
-                if (entry.view != .overview and self.tree.heap_views[@intFromEnum(entry.view)]) {
-                    self.tree.heap_views[@intFromEnum(entry.view)] = false;
-                    try self.rebuildTreeForCurrent();
-                    return;
-                }
-                for (self.tree.rows.items, 0..) |row, i| switch (row) {
-                    .category => |candidate| if (candidate.kind == .heap) {
-                        self.navigation.tree_selection = i;
-                        return;
-                    },
-                    else => {},
-                };
-                return;
+            .name => |entry| self.tree.expanded_names.remove(entry.id),
+            .range => |entry| self.tree.expanded_ranges.remove(entry.key()),
+            .heap => |entry| blk: {
+                if (entry.view == .overview or !self.tree.heap_views[@intFromEnum(entry.view)])
+                    break :blk false;
+                self.tree.heap_views[@intFromEnum(entry.view)] = false;
+                break :blk true;
             },
-            .debug_frame, .debug_value => {
-                // Collapse from a debug row snaps up to the pause header.
-                for (self.tree.rows.items, 0..) |row, i| if (row == .debug_root) {
-                    self.navigation.tree_selection = i;
-                    return;
-                };
-                return;
-            },
-            .debug_root => return,
-            else => {},
-        }
-        if (selected == .range) {
-            const range = selected.range;
-            if (self.tree.expanded_ranges.remove(range.key())) {
-                try self.rebuildTreeForCurrent();
-                for (self.tree.rows.items, 0..) |row, i| switch (row) {
-                    .range => |candidate| if (candidate.key() == range.key()) {
-                        self.navigation.tree_selection = i;
-                        return;
-                    },
-                    else => {},
-                };
-            }
-            if (range.kind == .objects) {
-                const selected_depth = range.depth;
-                var cursor = self.navigation.tree_selection;
-                while (cursor > 0) {
-                    cursor -= 1;
-                    const candidate = self.tree.rows.items[cursor];
-                    if (treeRowDepth(candidate) >= selected_depth) continue;
-                    self.navigation.tree_selection = cursor;
-                    return;
-                }
-                return;
-            }
-            for (self.tree.rows.items, 0..) |row, i| switch (row) {
-                .name => |entry| if (entry.id == range.parent) {
-                    self.navigation.tree_selection = i;
-                    return;
-                },
-                else => {},
-            };
-            return;
-        }
-        const name: u32 = switch (selected) {
-            .name => |entry| entry.id,
-            .chunk => |entry| self.tree_index.nodeForChunk(entry.id),
-            .object, .store_record => {
-                var cursor = self.navigation.tree_selection;
-                while (cursor > 0) {
-                    cursor -= 1;
-                    if (self.tree.rows.items[cursor] == .range) {
-                        self.navigation.tree_selection = cursor;
-                        return;
-                    }
-                }
-                return;
-            },
-            .range => unreachable,
-            .category, .heap, .debug_root, .debug_frame, .debug_value => unreachable,
+            else => false,
         };
-        if (self.tree.expanded_names.remove(name)) {
-            const focused = self.currentChunk() orelse 0;
-            try self.rebuildTree(focused);
-            for (self.tree.rows.items, 0..) |row, i| switch (row) {
-                .name => |entry| if (entry.id == name) {
-                    self.navigation.tree_selection = i;
-                    break;
-                },
-                else => {},
-            };
-            return;
-        }
-        const parent = (self.tree_index.node(name) orelse return).parent;
-        for (self.tree.rows.items, 0..) |row, i| switch (row) {
-            .name => |entry| if (entry.id == parent) {
+        if (collapsed) {
+            try self.rebuildTreeForCurrent();
+            for (self.tree.rows.items, 0..) |row, i| if (treeRowsEqual(row, selected)) {
                 self.navigation.tree_selection = i;
                 return;
-            },
-            else => {},
+            };
+            return;
+        }
+
+        // Rows are preorder-flattened. The nearest preceding shallower row is
+        // therefore the parent for every node kind: chunk, object, store value,
+        // synthetic range, heap folder, name, and paused frame alike.
+        const selected_depth = treeRowDepth(selected);
+        var cursor = self.navigation.tree_selection;
+        while (cursor > 0) {
+            cursor -= 1;
+            if (treeRowDepth(self.tree.rows.items[cursor]) < selected_depth) {
+                self.navigation.tree_selection = cursor;
+                return;
+            }
+        }
+    }
+
+    fn selectCurrentTreeSubject(self: *Tui) void {
+        for (self.tree.rows.items, 0..) |row, i| {
+            const matches = switch (row) {
+                .chunk => |entry| if (self.currentChunk()) |id| entry.id == id else false,
+                .object => |entry| if (self.currentObject()) |id| entry.id == id else false,
+                .store_record => |entry| if (self.currentStoreRecord()) |record|
+                    entry.view == record.view and entry.id == record.id
+                else
+                    false,
+                .heap => |entry| if (self.currentHeap()) |view| entry.view == view else false,
+                .debug_frame => |entry| if (self.currentDebugFrame()) |index| entry.index == index else false,
+                .debug_value => self.currentKind() == .debug_value,
+                else => false,
+            };
+            if (matches) {
+                self.navigation.tree_selection = i;
+                return;
+            }
+        }
+    }
+
+    fn treeSelectionCanMoveUp(self: *const Tui) bool {
+        if (self.navigation.tree_selection >= self.tree.rows.items.len) return false;
+        const row = self.tree.rows.items[self.navigation.tree_selection];
+        if (treeRowDepth(row) > 0) return true;
+        return switch (row) {
+            .category => |entry| self.tree.categories[@intFromEnum(entry.kind)],
+            .name => |entry| self.tree.expanded_names.contains(entry.id),
+            .range => |entry| self.tree.expanded_ranges.contains(entry.key()),
+            .heap => |entry| entry.view != .overview and self.tree.heap_views[@intFromEnum(entry.view)],
+            else => false,
         };
+    }
+
+    /// Escape unwinds one interaction layer. It leaves an in-place source
+    /// session first, then the inspector, then nested/expanded tree rows. Only
+    /// an Escape at the tree root asks the caller to leave the explorer.
+    fn escapeLayer(self: *Tui) !bool {
+        switch (vm_navigation.escapeAction(.{
+            .source_active = self.source_session != null,
+            .focus = self.navigation.focus,
+            .filter_active = self.filterActive(),
+            .tree_can_move_up = self.treeSelectionCanMoveUp(),
+        })) {
+            .leave_source => {
+                try self.leaveSourceSession(self.source_session.?);
+                self.status_msg = "";
+                return true;
+            },
+            .focus_tree => {
+                self.navigation.focus = .tree;
+                self.preview.reset();
+                self.selectCurrentTreeSubject();
+                return true;
+            },
+            .clear_filter => {
+                self.tree.filter_query.clearRetainingCapacity();
+                try self.rebuildTreeForCurrent();
+                self.status_msg = "(filter cleared)";
+                return true;
+            },
+            .tree_up => {
+                try self.collapseTreeRow();
+                self.preview.reset();
+                return true;
+            },
+            .exit => return false,
+        }
     }
 
     /// `.push` records a back/forward history entry (following a reference link,
@@ -2798,12 +2773,15 @@ const Tui = struct {
         self.navigation.forward.clearRetainingCapacity();
         self.source_focus = null;
         self.source_session = null;
-        self.preview_scroll = 0;
+        self.preview.reset();
         try self.refreshPage(kind);
         self.navigation.scroll = 0;
         self.navigation.detail_selection = self.firstActionableRow() orelse 0;
         try self.selectedSourceChanged();
-        switch (kind) {
+        // A tree row is already visible, so opening it must not rebuild or
+        // re-project the tree. Only subjects reached from outside the tree
+        // reveal their path/store.
+        if (mode == .push) switch (kind) {
             .chunk => |id| {
                 try self.expandFocusedPath(id);
                 try self.rebuildTree(id);
@@ -2818,14 +2796,14 @@ const Tui = struct {
             },
             .debug_frame, .debug_value => try self.rebuildTreeForCurrent(),
             .help => {},
-        }
+        };
         self.navigation.x_scroll = 0;
         // Replacing the subject is tree browsing: keep the cursor in the tree.
         // Pushed visits originate outside it (detail links, debugger entry,
         // commands) and may choose the inspector as their natural destination.
         if (mode == .push) switch (kind) {
-            .help => self.navigation.focus = .disassembly,
-            .heap, .object, .store_record, .debug_frame, .debug_value => self.navigation.focus = .disassembly,
+            .help => self.navigation.focus = .subject,
+            .heap, .object, .store_record, .debug_frame, .debug_value => self.navigation.focus = .subject,
             .chunk => {},
         };
         self.status_msg = "";
@@ -2919,7 +2897,7 @@ const Tui = struct {
     }
 
     fn toggleSelectedBreakpoint(self: *Tui) !void {
-        if (self.navigation.focus != .disassembly) {
+        if (self.navigation.focus != .subject) {
             self.status_msg = "(focus the code pane first)";
             return;
         }
@@ -2984,7 +2962,7 @@ const Tui = struct {
 
     fn moveDetail(self: *Tui, forward: bool) void {
         if (self.page.actions.len == 0) return;
-        self.preview_scroll = 0;
+        self.preview.reset();
         if (self.selectedSourceLocation()) |location| {
             if (self.source_session == location.chunk_id) if (self.ev.getChunk(location.chunk_id)) |chunk| {
                 if (adjacentSourceSpan(chunk, location.span.?, forward)) |span| {
@@ -3103,21 +3081,21 @@ const Tui = struct {
         if (key.alt) switch (key.code) {
             .cp => |cp| switch (cp) {
                 'j' => {
-                    self.preview_scroll +|= 1;
+                    self.preview.move(1);
                     return true;
                 },
                 'k' => {
-                    self.preview_scroll -|= 1;
+                    self.preview.move(-1);
                     return true;
                 },
                 else => {},
             },
             .down => {
-                self.preview_scroll +|= 1;
+                self.preview.move(1);
                 return true;
             },
             .up => {
-                self.preview_scroll -|= 1;
+                self.preview.move(-1);
                 return true;
             },
             else => {},
@@ -3126,27 +3104,27 @@ const Tui = struct {
             .cp => |cp| switch (cp) {
                 'q' => return false,
                 'j' => {
-                    if (self.navigation.focus == .chunks) {
+                    if (self.navigation.focus == .tree) {
                         self.moveTree(true);
                     } else {
                         self.moveDetail(true);
                     }
                 },
                 'k' => {
-                    if (self.navigation.focus == .chunks) {
+                    if (self.navigation.focus == .tree) {
                         self.moveTree(false);
                     } else {
                         self.moveDetail(false);
                     }
                 },
                 'd' => {
-                    if (self.navigation.focus == .disassembly) self.navigation.scroll = @min(self.navigation.scroll + self.contentRows() / 2, self.maxScroll());
+                    if (self.navigation.focus == .subject) self.navigation.scroll = @min(self.navigation.scroll + self.contentRows() / 2, self.maxScroll());
                 },
                 'u' => {
-                    if (self.navigation.focus == .disassembly) self.navigation.scroll -|= self.contentRows() / 2;
+                    if (self.navigation.focus == .subject) self.navigation.scroll -|= self.contentRows() / 2;
                 },
                 'g' => {
-                    if (self.navigation.focus == .chunks) {
+                    if (self.navigation.focus == .tree) {
                         self.navigation.tree_selection = 0;
                     } else {
                         self.navigation.detail_selection = self.firstActionableRow() orelse 0;
@@ -3155,7 +3133,7 @@ const Tui = struct {
                     }
                 },
                 'G' => {
-                    if (self.navigation.focus == .chunks) {
+                    if (self.navigation.focus == .tree) {
                         self.navigation.tree_selection = self.tree.rows.items.len -| 1;
                     } else {
                         var row = self.page.actions.len;
@@ -3171,10 +3149,10 @@ const Tui = struct {
                     }
                 },
                 'h' => {
-                    if (self.navigation.focus == .disassembly) self.navigation.x_scroll -|= 4;
+                    if (self.navigation.focus == .subject) self.navigation.x_scroll -|= 4;
                 },
                 'l' => {
-                    if (self.navigation.focus == .disassembly) self.navigation.x_scroll = @min(self.navigation.x_scroll + 4, self.maxXScroll());
+                    if (self.navigation.focus == .subject) self.navigation.x_scroll = @min(self.navigation.x_scroll + 4, self.maxXScroll());
                 },
                 'b' => try self.back(),
                 'f' => try self.goForward(),
@@ -3182,7 +3160,7 @@ const Tui = struct {
                 'F' => try self.filterPrompt(),
                 '?' => try self.toggleHelp(),
                 '/' => {
-                    if (self.navigation.focus == .disassembly) try self.searchPrompt();
+                    if (self.navigation.focus == .subject) try self.searchPrompt();
                 },
                 'n' => {
                     self.findNext(1);
@@ -3193,52 +3171,52 @@ const Tui = struct {
                 else => {},
             },
             .up => {
-                if (self.navigation.focus == .chunks) self.moveTree(false) else self.moveDetail(false);
+                if (self.navigation.focus == .tree) self.moveTree(false) else self.moveDetail(false);
             },
             .down => {
-                if (self.navigation.focus == .chunks) {
+                if (self.navigation.focus == .tree) {
                     self.moveTree(true);
                 } else {
                     self.moveDetail(true);
                 }
             },
             .left => {
-                if (self.navigation.focus == .chunks) try self.collapseTreeRow() else self.navigation.x_scroll -|= 4;
+                if (self.navigation.focus == .tree) try self.collapseTreeRow() else self.navigation.x_scroll -|= 4;
             },
             .right => {
-                if (self.navigation.focus == .chunks) {
+                if (self.navigation.focus == .tree) {
                     try self.activateTreeRow();
                 } else {
                     self.navigation.x_scroll = @min(self.navigation.x_scroll + 4, self.maxXScroll());
                 }
             },
             .page_up => {
-                if (self.navigation.focus == .disassembly) self.navigation.scroll -|= self.contentRows();
+                if (self.navigation.focus == .subject) self.navigation.scroll -|= self.contentRows();
             },
             .page_down => {
-                if (self.navigation.focus == .disassembly) self.navigation.scroll = @min(self.navigation.scroll + self.contentRows(), self.maxScroll());
+                if (self.navigation.focus == .subject) self.navigation.scroll = @min(self.navigation.scroll + self.contentRows(), self.maxScroll());
             },
             .home => {
-                if (self.navigation.focus == .chunks) self.navigation.tree_selection = 0 else {
+                if (self.navigation.focus == .tree) self.navigation.tree_selection = 0 else {
                     self.navigation.detail_selection = self.firstActionableRow() orelse 0;
                     self.ensureDetailVisible();
                     try self.selectedSourceChanged();
                 }
             },
             .end => {
-                if (self.navigation.focus == .chunks) self.navigation.tree_selection = self.tree.rows.items.len -| 1 else self.navigation.scroll = self.maxScroll();
+                if (self.navigation.focus == .tree) self.navigation.tree_selection = self.tree.rows.items.len -| 1 else self.navigation.scroll = self.maxScroll();
             },
             .tab, .backtab => {
-                if (self.navigation.focus == .chunks) {
-                    self.navigation.focus = .disassembly;
+                if (self.navigation.focus == .tree) {
+                    self.navigation.focus = .subject;
                 } else {
-                    self.navigation.focus = .chunks;
+                    self.navigation.focus = .tree;
                 }
             },
             .enter => {
-                if (self.navigation.focus == .chunks) try self.activateTreeRow() else try self.activateDetailRow();
+                if (self.navigation.focus == .tree) try self.activateTreeRow() else try self.activateDetailRow();
             },
-            .escape => return false,
+            .escape => return true,
             else => {},
         }
         return true;
@@ -3416,7 +3394,7 @@ const Tui = struct {
             try self.refreshPage(self.currentKind());
         }
 
-        const mode: []const u8 = if (prompt_active) "repl" else if (self.navigation.focus == .chunks) "tree" else "inspector";
+        const mode: []const u8 = if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector";
         var header_buf: [512]u8 = undefined;
         const header = if (self.debug_session) |session|
             std.fmt.bufPrint(&header_buf, " fix vm  ·  ◆ paused/{s}  ·  frame {?d}  ·  {s} ", .{
@@ -3427,21 +3405,21 @@ const Tui = struct {
         else if (self.currentChunk()) |id|
             std.fmt.bufPrint(&header_buf, " fix vm  ·  chunk[0x{x}]  ·  {s} ", .{
                 id,
-                if (prompt_active) "repl" else if (self.navigation.focus == .chunks) "tree" else "inspector",
+                if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
             }) catch " fix repl "
         else if (self.currentHeap()) |view|
             std.fmt.bufPrint(&header_buf, " fix vm  ·  heap/{s}  ·  {s} ", .{
                 @tagName(view),
-                if (prompt_active) "repl" else if (self.navigation.focus == .chunks) "tree" else "inspector",
+                if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
             }) catch " fix vm "
         else if (self.currentObject()) |id|
             std.fmt.bufPrint(&header_buf, " fix vm  ·  objects[0x{x}]  ·  {s} ", .{
                 id,
-                if (prompt_active) "repl" else if (self.navigation.focus == .chunks) "tree" else "inspector",
+                if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
             }) catch " fix vm "
         else
             std.fmt.bufPrint(&header_buf, " fix vm  ·  help  ·  {s} ", .{
-                if (prompt_active) "repl" else if (self.navigation.focus == .chunks) "tree" else "inspector",
+                if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
             }) catch " fix vm ";
         try frame.bar(1, header, cols, .header);
 
@@ -3449,10 +3427,7 @@ const Tui = struct {
             try self.drawExplorerBody(arena, &frame, 2, explorer_rows, cols);
             const separator_row = 2 + explorer_rows;
             try frame.clearRow(separator_row);
-            const separator = if (self.tree.indexing)
-                " ─ transcript · indexing VM names asynchronously "
-            else
-                " ─ transcript ";
+            const separator = " ─ transcript ";
             try frame.at(separator_row, 1);
             try frame.text(separator, 0, cols, .muted);
         }
@@ -3468,11 +3443,9 @@ const Tui = struct {
         else if (self.debug_session != null)
             " s step · n next · f finish · c continue · p break · ↵ inspect · i expr · q abort "
         else if (self.filterActive())
-            std.fmt.bufPrint(&footer_buf, " filter '{s}' · F edit · Esc-in-F clears · q/Esc exit · Tab pane · ↵ inspect ", .{self.tree.filter_query.items}) catch " filtered "
+            std.fmt.bufPrint(&footer_buf, " filter '{s}' · F edit · Esc up/clear · q exit · Tab pane · ↵ inspect ", .{self.tree.filter_query.items}) catch " filtered "
         else
-            std.fmt.bufPrint(&footer_buf, " q/Esc exit · i expr · : cmd · Tab pane · p break · F filter · ↵ inspect{s} ", .{
-                if (self.tree.indexing) " · indexing" else "",
-            }) catch " q exit ";
+            " Esc up · q exit · i expr · : cmd · Tab pane · p break · F filter · ↵ inspect ";
         try frame.bar(screen_rows, footer, cols, .footer);
 
         prompt_renderer.invalidate();
@@ -3495,11 +3468,11 @@ const Tui = struct {
             if (layout_now.split) {
                 try frame.at(screen_row, 1);
                 try self.drawChunkRow(arena, frame, row, layout_now.sidebar_width, rows);
-                const inspector_focused = self.navigation.focus == .disassembly;
+                const inspector_focused = self.navigation.focus == .subject;
                 try self.drawFocusDivider(frame, screen_row, layout_now.sidebar_width + 1, inspector_focused);
                 try frame.at(screen_row, layout_now.main_col);
                 try self.drawDisasmRow(frame, row, layout_now.main_width);
-            } else if (self.navigation.focus == .chunks) {
+            } else if (self.navigation.focus == .tree) {
                 try frame.at(screen_row, 1);
                 try self.drawChunkRow(arena, frame, row, cols, rows);
             } else {
@@ -3510,7 +3483,7 @@ const Tui = struct {
 
         // Peeks are overlays, not columns: moving the selection no longer
         // changes either pane's width or reflows the inspector.
-        const popup = if (self.navigation.focus == .chunks)
+        const popup = if (self.navigation.focus == .tree)
             try self.previewLines(arena)
         else if (self.detailPreviewAction() != null)
             try self.detailPreviewLines(arena)
@@ -3521,7 +3494,7 @@ const Tui = struct {
     }
 
     fn previewRole(self: *const Tui) tui.Role {
-        if (self.navigation.focus == .disassembly) return switch (self.detailPreviewAction() orelse return .section) {
+        if (self.navigation.focus == .subject) return switch (self.detailPreviewAction() orelse return .section) {
             .chunk => .chunk,
             .object => .object,
             else => .section,
@@ -3546,7 +3519,7 @@ const Tui = struct {
         layout_now: Layout,
         lines: []const []const u8,
     ) !void {
-        const available_outer = if (self.navigation.focus == .chunks)
+        const available_outer = if (self.navigation.focus == .tree)
             (if (layout_now.split) cols -| layout_now.sidebar_width -| 2 else cols * 2 / 3)
         else
             cols * 2 / 3;
@@ -3557,8 +3530,7 @@ const Tui = struct {
         const content_width = outer_width - 2;
         const body_total = lines.len - 1;
         const body_visible = @min(body_total, rows - 3);
-        const body_start = @min(self.preview_scroll, body_total -| body_visible);
-        self.preview_scroll = body_start;
+        const body_start = self.preview.window(body_total, body_visible);
         const visible = body_visible + 1;
         const outer_height = visible + 2;
         const preview_heading = if (body_total > body_visible)
@@ -3571,7 +3543,7 @@ const Tui = struct {
         else
             lines[0];
 
-        const anchor_row = if (self.navigation.focus == .chunks)
+        const anchor_row = if (self.navigation.focus == .tree)
             self.treeSelectionSlot(if (layout_now.split) layout_now.sidebar_width else cols, rows) orelse 0
         else
             self.navigation.detail_selection -| self.navigation.scroll;
@@ -3579,7 +3551,7 @@ const Tui = struct {
         // is room: the popup reads as attached to the cursor instead of as a
         // remote panel.
         const top = first_row + @min(anchor_row -| 1, rows - outer_height);
-        const left = if (self.navigation.focus == .chunks)
+        const left = if (self.navigation.focus == .tree)
             if (layout_now.split)
                 layout_now.main_col
             else
@@ -3717,6 +3689,16 @@ const Tui = struct {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " values   {d} live · {d} slots", .{ self.liveStoreCount(.values), c.values }));
                     try lines.append(arena, try std.fmt.allocPrint(arena, " attrs    {d} live · {d} slots", .{ self.liveStoreCount(.attrs), c.attrs }));
                     try lines.append(arena, try std.fmt.allocPrint(arena, " attrpos  {d} live · {d} slots", .{ self.liveStoreCount(.attr_positions), c.attr_positions }));
+                    if (self.heap_index.stats) |stats| {
+                        try lines.append(arena, "");
+                        try lines.append(arena, " object types");
+                        for (stats.variant_counts, 0..) |count, i| {
+                            try lines.append(arena, try std.fmt.allocPrint(arena, "  {s:<20} {d}", .{
+                                runtime.ObjectHeap.Stats.variantName(i),
+                                count,
+                            }));
+                        }
+                    }
                 }
             },
             .range, .debug_root, .debug_value => {},
@@ -3792,6 +3774,7 @@ const Tui = struct {
         var text: std.Io.Writer = .fixed(try arena.alloc(u8, 16 * 1024));
         const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
         var options = disasm_options;
+        options.show_header = false;
         options.show_constants = false;
         options.show_code = true;
         options.show_bytes = false;
@@ -4183,7 +4166,7 @@ const Tui = struct {
     fn drawDisasmRow(self: *Tui, frame: *tui.Frame, row: usize, width: usize) !void {
         const idx = self.navigation.scroll + row;
         if (idx < self.page.lines.len) {
-            const selected = idx == self.navigation.detail_selection and self.navigation.focus == .disassembly and self.rowActionable(idx);
+            const selected = idx == self.navigation.detail_selection and self.navigation.focus == .subject and self.rowActionable(idx);
             const breakpoint = idx < self.page.locations.len and if (self.page.locations[idx]) |location| self.hasBreakpoint(location) else false;
             if ((selected or breakpoint) and width >= 2) {
                 try frame.text(if (selected and breakpoint) "◆ " else if (selected) "› " else "● ", 0, 2, if (selected) .selection_marker else .current);
@@ -4343,7 +4326,7 @@ const Tui = struct {
 
     fn treeDisplayHeight(self: *const Tui, index: usize, width: usize, slots: usize, pinned: bool) usize {
         if (index >= self.tree.rows.items.len or width < 8) return 1;
-        const selected = index == self.navigation.tree_selection and self.navigation.focus == .chunks;
+        const selected = index == self.navigation.tree_selection and self.navigation.focus == .tree;
         if (!pinned and !selected) return 1;
         const content_width = self.longTreeContentWidth(self.tree.rows.items[index]) orelse return 1;
         const prefix = @min(1 + @as(usize, treeRowDepth(self.tree.rows.items[index])) * 2 + 2, width - 1);
@@ -4383,8 +4366,6 @@ const Tui = struct {
                 const heap_counts = self.ev.heapCounts();
                 const line = if (self.filterActive())
                     std.fmt.bufPrint(&line_buf, " VM STATE · filter '{s}' · F edit · Esc clear", .{self.tree.filter_query.items}) catch " VM STATE · filtered"
-                else if (self.tree.indexing)
-                    std.fmt.bufPrint(&line_buf, " VM STATE · {d} chunks · {d} object slots · indexing…", .{ root_stats.chunks, heap_counts.objects }) catch " VM STATE"
                 else
                     std.fmt.bufPrint(&line_buf, " VM STATE · {d} chunks · {d} object slots", .{ root_stats.chunks, heap_counts.objects }) catch " VM STATE";
                 try frame.text(line, 0, width, if (self.filterActive()) .source_focus else .section);
@@ -4532,7 +4513,7 @@ const Tui = struct {
                             entry.start,
                             entry.start + entry.len,
                             entry.live,
-                            !(selected and self.navigation.focus == .chunks),
+                            !(selected and self.navigation.focus == .tree),
                         );
                         break :blk2 try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
                             indent[0..indent_len],
@@ -4553,7 +4534,7 @@ const Tui = struct {
                             entry.start,
                             entry.start + entry.len,
                             entry.live,
-                            !(selected and self.navigation.focus == .chunks),
+                            !(selected and self.navigation.focus == .tree),
                         );
                         break :blk2 try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
                             indent[0..indent_len],
@@ -4589,7 +4570,7 @@ const Tui = struct {
                     0,
                     high_water,
                     live,
-                    !(selected and self.navigation.focus == .chunks),
+                    !(selected and self.navigation.focus == .tree),
                 );
                 break :blk try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
                     indent[0..indent_len],
@@ -4607,7 +4588,7 @@ const Tui = struct {
                     .objects,
                     entry.id,
                     preview,
-                    !(selected and self.navigation.focus == .chunks),
+                    !(selected and self.navigation.focus == .tree),
                 );
                 break :blk try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
                     indent[0..indent_len],
@@ -4638,7 +4619,7 @@ const Tui = struct {
                     entry.view,
                     entry.id,
                     detail,
-                    !(selected and self.navigation.focus == .chunks),
+                    !(selected and self.navigation.focus == .tree),
                 );
                 break :blk try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
                     indent[0..indent_len],
@@ -4676,7 +4657,7 @@ const Tui = struct {
                 break :blk try std.fmt.allocPrint(arena, " ↳ {s}: {s}", .{ label, detail });
             },
         };
-        const role: tui.Role = if (selected and self.navigation.focus == .chunks)
+        const role: tui.Role = if (selected and self.navigation.focus == .tree)
             .selection
         else if (pinned)
             .muted
@@ -4713,9 +4694,9 @@ const Tui = struct {
             }
         } else {
             const ansi_identity = switch (self.tree.rows.items[index]) {
-                .object, .store_record, .heap => !(selected and self.navigation.focus == .chunks),
+                .object, .store_record, .heap => !(selected and self.navigation.focus == .tree),
                 .range => |entry| switch (entry.kind) {
-                    .objects, .values, .attrs, .attr_positions => !(selected and self.navigation.focus == .chunks),
+                    .objects, .values, .attrs, .attr_positions => !(selected and self.navigation.focus == .tree),
                     else => false,
                 },
                 else => false,
@@ -4834,7 +4815,7 @@ const Tui = struct {
     fn debugKey(self: *Tui, session: *DebugSession, editor: *editor_mod.Editor, prompt_active: *bool, key: keys_mod.Key) !DebugOutcome {
         self.status_msg = "";
         switch (key.code) {
-            .escape => return .resume_close,
+            .escape => return if (try self.escapeLayer()) .running else .resume_close,
             .cp => |cp| {
                 if (key.ctrl) {
                     if (cp == 'd') return .abort;

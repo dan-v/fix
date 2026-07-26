@@ -38,11 +38,14 @@ pub const Symbols = struct {
 };
 
 pub const Options = struct {
+    /// Print the chunk identity/shape line. Embedders that already provide a
+    /// section heading can suppress only the outermost header; recursively
+    /// rendered child chunks keep theirs.
+    show_header: bool = true,
     /// Print the chunk's cold side tables before the code: constants, formal
     /// arguments, attribute metadata, captures, and upvalues.
     show_constants: bool = true,
-    /// Print the decoded instruction stream. Explorer table panes disable this
-    /// while reusing the canonical chunk/table formatting above it.
+    /// Print the decoded instruction stream.
     show_code: bool = true,
     /// Print source-map column on the right.
     show_source: bool = true,
@@ -132,7 +135,8 @@ fn writeChunkAt(
     };
     // The strict/deep flags fold into the upvalues table when it renders;
     // otherwise the header prints its fallback flag lines.
-    try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, up_names != null, options.color_depth);
+    if (options.show_header or depth > 0)
+        try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, up_names != null, options.color_depth);
 
     try writeChunkTables(writer, chunk_id, chunk, symbols, options, cc, up_names);
 
@@ -2252,6 +2256,24 @@ test "disassembling omits the constant pool section when show_constants is false
     const text = out.written();
 
     try std.testing.expect(std.mem.indexOf(u8, text, "  constants:\n") == null);
+}
+
+test "embedded disassembly can omit its redundant outer header" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+    try builder.emitConstant(allocator, Value.int(7));
+    try builder.writeOp(allocator, .ret);
+
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try writeChunk(allocator, &out.writer, 0x2a, &chunk, .{}, .{ .show_header = false });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "chunk[0x2a]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "  constants:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "push_const") != null);
 }
 
 test "disassembly marks the current instruction" {

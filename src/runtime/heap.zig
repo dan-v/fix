@@ -1144,12 +1144,12 @@ pub const ObjectHeap = struct {
                 0 => "list",
                 1 => "attrs",
                 2 => "closure",
-                3 => "builtin_closure",
+                3 => "builtin closure",
                 4 => "thunk",
-                5 => "context_string",
-                6 => "boxed_int",
-                7 => "merge_attrs",
-                8 => "partial_app",
+                5 => "context string",
+                6 => "boxed int",
+                7 => "attrs merge",
+                8 => "partial application",
                 else => "?",
             };
         }

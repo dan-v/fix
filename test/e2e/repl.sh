@@ -199,6 +199,46 @@ out=$(
 )
 t "tty vm: unified inspector offers source span session" "SOURCE * 1 subexpressions" "$out"
 t "tty vm: unified inspector includes code" "CODE · chunk" "$out"
+if [[ "$out" == *"asynchronously"* || "$out" == *"updating references"* ]]; then
+    fail "tty vm: inspector exposed background indexing state"
+else
+    pass "tty vm: background indexing stays out of documents"
+fi
+
+# Hover previews are stable overlays with their own scroll position. The heap
+# census populates the collapsed HEAP preview and includes every object variant,
+# including zero-count variants, so the explorer never silently omits a type.
+out=$(
+    (
+        sleep 0.4
+        printf 'x: (x + 1) * (x + 2)\r'
+        sleep 0.4
+        printf ':vm\r'
+        sleep 0.7
+        printf '\t'
+        sleep 0.3
+        printf '\033[1;3B'
+        sleep 0.3
+        printf 'g'
+        sleep 0.7
+        for _ in 1 2 3; do
+            printf '\033[1;3B'
+            sleep 0.25
+        done
+        printf 'q'
+        sleep 0.3
+        printf '\004'
+        sleep 0.2
+    ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+if grep -aoE '[2-9]-[0-9]+/[0-9]+' <<<"$out" >/dev/null; then
+    pass "tty vm: Alt-arrow scrolls hover previews"
+else
+    fail "tty vm: hover preview did not scroll"
+fi
+t "tty vm: collapsed heap preview includes object variants" "object types" "$out"
+t "tty vm: heap preview includes the last object variant" "partial application" "$out"
 
 # Nested expressions on one line may share a bytecode-entry offset. A source
 # breakpoint must mark only the exact selected span, not every row with that
