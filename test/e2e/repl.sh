@@ -305,6 +305,11 @@ out=$(
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
 t "tty debug: return value is inline with source" "⇒ int 3" "$out"
+if [[ "$out" == *$'\x1b[1;7m⇒ int 3'* && "$out" == *$'\x1b[1;4m⇒ int 3'* ]]; then
+    pass "tty debug: return value flashes once then remains emphasized"
+else
+    fail "tty debug: return value did not show flash and settled styles"
+fi
 
 # Inside :vm the debugger borrows the explorer's raw mode and alternate screen;
 # nested stepping must not emit another enter/leave pair.

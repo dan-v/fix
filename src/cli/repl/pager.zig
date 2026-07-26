@@ -707,6 +707,9 @@ const Tui = struct {
     /// Vertical offset within the current hover preview. Normal cursor motion
     /// resets it; Alt+j/k and Alt+Up/Down adjust it without moving the tree.
     preview_scroll: usize = 0,
+    /// True only for the first rendered frame of a return pause. The inline
+    /// result starts as a bright badge, then settles to its persistent style.
+    return_flash: bool = false,
 
     /// Set for the duration of a debug pause driven by `debugRun`. While non-null
     /// the tree grows a Debug subtree and the debug-control keys are live.
@@ -1809,20 +1812,18 @@ const Tui = struct {
             if (result_here) {
                 const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
                 var annotation: std.Io.Writer.Allocating = .init(document.arena);
-                try annotation.writer.writeAll("  ⇒ ");
-                try disasm.writeValueDigest(
+                try self.writeReturnAnnotation(
                     &annotation.writer,
                     returned_value.?,
                     symbols,
                     @max(self.layout().main_width -| 14, 8),
-                    self.color_depth,
                 );
                 if (tui.displayWidth(rendered.written(), width_mod.cpWidth) +
                     tui.displayWidth(annotation.written(), width_mod.cpWidth) <= self.layout().main_width -| 2)
                 {
                     try rendered.writer.writeAll(annotation.written());
                 } else {
-                    wrapped_result = try std.fmt.allocPrint(document.arena, "          {s}", .{annotation.written()[2..]});
+                    wrapped_result = try std.fmt.allocPrint(document.arena, "        │ {s}", .{annotation.written()[2..]});
                 }
             }
             if (active and location != null) {
@@ -1840,6 +1841,33 @@ const Tui = struct {
             if (newline >= end or newline == source.len) break;
             cursor = newline + 1;
         }
+    }
+
+    /// A return result is a single styled badge. Value digests deliberately
+    /// render without their own SGR resets here so the background remains
+    /// continuous across the whole result.
+    fn writeReturnAnnotation(
+        self: *const Tui,
+        writer: *std.Io.Writer,
+        value: runtime.value.Value,
+        symbols: disasm.Symbols,
+        max_cells: usize,
+    ) !void {
+        try writer.writeAll("  ");
+        if (self.color_depth.enabled()) {
+            if (self.return_flash) {
+                try base.terminal_color.background(writer, self.color_depth, base.terminal_color.hueColor(3));
+                try base.terminal_color.foreground(writer, self.color_depth, .{ 15, 23, 30 }, true);
+            } else {
+                try base.terminal_color.background(writer, self.color_depth, .{ 78, 62, 112 });
+                try base.terminal_color.foreground(writer, self.color_depth, .{ 246, 248, 250 }, true);
+            }
+        } else {
+            try writer.writeAll(if (self.return_flash) "\x1b[1;7m" else "\x1b[1;4m");
+        }
+        try writer.writeAll("⇒ ");
+        try disasm.writeValueDigest(writer, value, symbols, max_cells, .none);
+        try writer.writeAll("\x1b[0m");
     }
 
     fn sourceBreakpointRanges(
@@ -4568,9 +4596,13 @@ const Tui = struct {
         const w = &out.interface;
 
         self.debug_session = session;
+        self.return_flash = session.reason == .return_step;
         session.clearStep();
         self.debug_nav_mark = self.navigation.back.items.len;
-        defer self.exitDebugView();
+        defer {
+            self.return_flash = false;
+            self.exitDebugView();
+        }
         try self.open(.{ .debug_frame = session.frameCount() -| 1 });
         // `open` focuses frame details. Keep that focus across step pauses so
         // the next/current frame is immediately usable instead of bouncing the
@@ -4612,7 +4644,12 @@ const Tui = struct {
             try self.drawSession(frame_arena.allocator(), w, &prompt_renderer, prompt_view, prompt_rows, &capture, prompt_active);
             try w.flush();
 
-            const result = term_mod.readInput(&read_buf, if (decoder.wantsMore()) 40 else -1);
+            const flash_drawn = self.return_flash;
+            const result = term_mod.readInput(&read_buf, if (decoder.wantsMore()) 40 else if (flash_drawn) 180 else -1);
+            if (flash_drawn) {
+                self.return_flash = false;
+                try self.refreshPage(self.currentKind());
+            }
             events.clearRetainingCapacity();
             switch (result) {
                 .timeout => try decoder.idleFlush(self.allocator, &events),
