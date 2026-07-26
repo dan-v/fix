@@ -700,6 +700,9 @@ const Tui = struct {
         chunk_id: ChunkId,
         span: bytecode.Chunk.SourceSpan,
     } = null,
+    /// Vertical offset within the current hover preview. Normal cursor motion
+    /// resets it; Alt+j/k and Alt+Up/Down adjust it without moving the tree.
+    preview_scroll: usize = 0,
 
     /// Set for the duration of a debug pause driven by `debugRun`. While non-null
     /// the tree grows a Debug subtree and the debug-control keys are live.
@@ -1413,20 +1416,28 @@ const Tui = struct {
     fn appendValueLine(self: *Tui, page: *PageBuilder, prefix: []const u8, value: runtime.value.Value) !void {
         const arena = page.arena;
         const ref = self.ev.valueRef(value);
-        const detail = try self.valueSummary(arena, value, 52);
-        const action: RowAction, const suffix: []const u8 = switch (ref.target) {
-            .object => |id| .{
-                .{ .object = id },
-                try std.fmt.allocPrint(arena, "  → {s}", .{try self.canonicalStoreRef(arena, .objects, id, null, true)}),
+        const action: RowAction, const detail: []const u8 = switch (ref.target) {
+            .object => |id| blk: {
+                const preview = try self.objectTargetSummary(arena, value.kind(), id, 38);
+                break :blk .{
+                    .{ .object = id },
+                    try std.fmt.allocPrint(arena, "{s} → {s}", .{
+                        @tagName(value.kind()),
+                        try self.canonicalStoreRef(arena, .objects, id, preview, true),
+                    }),
+                };
             },
             .chunk => |id| blk: {
                 var rendered: std.Io.Writer.Allocating = .init(arena);
                 try disasm.writeStoreRef(&rendered.writer, "chunk", id, .chunk, null, self.color_depth);
-                break :blk .{ .{ .chunk = id }, try std.fmt.allocPrint(arena, "  → {s}", .{rendered.written()}) };
+                break :blk .{
+                    .{ .chunk = id },
+                    try std.fmt.allocPrint(arena, "{s} → {s}", .{ @tagName(value.kind()), rendered.written() }),
+                };
             },
-            else => .{ .none, "" },
+            else => .{ .none, try self.valueSummary(arena, value, 52) },
         };
-        try page.line(try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ prefix, detail, suffix }), action);
+        try page.line(try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, detail }), action);
     }
 
     fn appendValueRef(self: *Tui, page: *PageBuilder, label: []const u8, value: runtime.heap.ValueRef) !void {
@@ -1435,7 +1446,13 @@ const Tui = struct {
             .object => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} → {s}", .{
                 label,
                 @tagName(value.kind),
-                try self.canonicalStoreRef(page.arena, .objects, id, null, true),
+                try self.canonicalStoreRef(
+                    page.arena,
+                    .objects,
+                    id,
+                    try self.objectTargetSummary(page.arena, value.kind, id, 38),
+                    true,
+                ),
             }), .{ .object = id }),
             .chunk => |id| {
                 var rendered: std.Io.Writer.Allocating = .init(page.arena);
@@ -2373,6 +2390,7 @@ const Tui = struct {
     fn moveTree(self: *Tui, forward: bool) void {
         const count = self.tree.rows.items.len;
         if (count == 0) return;
+        self.preview_scroll = 0;
         if (forward) {
             self.navigation.tree_selection = @min(self.navigation.tree_selection + 1, count - 1);
         } else {
@@ -2593,6 +2611,7 @@ const Tui = struct {
         }
         self.navigation.forward.clearRetainingCapacity();
         self.source_focus = null;
+        self.preview_scroll = 0;
         try self.refreshPage(kind);
         self.navigation.scroll = 0;
         self.navigation.detail_selection = self.firstActionableRow() orelse 0;
@@ -2771,6 +2790,7 @@ const Tui = struct {
 
     fn moveDetail(self: *Tui, forward: bool) void {
         if (self.page.actions.len == 0) return;
+        self.preview_scroll = 0;
         if (self.selectedSourceLocation()) |location| {
             if (self.ev.getChunk(location.chunk_id)) |chunk| {
                 if (adjacentSourceSpan(chunk, location.span.?, forward)) |span| {
@@ -2841,6 +2861,28 @@ const Tui = struct {
     fn handleKey(self: *Tui, key: keys_mod.Key) !bool {
         self.status_msg = "";
         if (key.isCtrl('c') or key.isCtrl('d')) return false;
+        if (key.alt) switch (key.code) {
+            .cp => |cp| switch (cp) {
+                'j' => {
+                    self.preview_scroll +|= 1;
+                    return true;
+                },
+                'k' => {
+                    self.preview_scroll -|= 1;
+                    return true;
+                },
+                else => {},
+            },
+            .down => {
+                self.preview_scroll +|= 1;
+                return true;
+            },
+            .up => {
+                self.preview_scroll -|= 1;
+                return true;
+            },
+            else => {},
+        };
         switch (key.code) {
             .cp => |cp| switch (cp) {
                 'q' => return false,
@@ -3274,8 +3316,21 @@ const Tui = struct {
         for (lines) |line| desired = @max(desired, tui.displayWidth(line, width_mod.cpWidth) + 2);
         const outer_width = @min(max_outer, desired);
         const content_width = outer_width - 2;
-        const visible = @min(lines.len, rows - 2);
+        const body_total = lines.len - 1;
+        const body_visible = @min(body_total, rows - 3);
+        const body_start = @min(self.preview_scroll, body_total -| body_visible);
+        self.preview_scroll = body_start;
+        const visible = body_visible + 1;
         const outer_height = visible + 2;
+        const preview_heading = if (body_total > body_visible)
+            try std.fmt.allocPrint(arena, "{s} · Alt-j/k · {d}-{d}/{d}", .{
+                lines[0],
+                body_start + 1,
+                body_start + body_visible,
+                body_total,
+            })
+        else
+            lines[0];
 
         const anchor_row = if (self.navigation.focus == .chunks)
             self.treeSelectionSlot(if (layout_now.split) layout_now.sidebar_width else cols, rows) orelse 0
@@ -3304,19 +3359,21 @@ const Tui = struct {
         try frame.text("╮", 0, 1, role);
 
         for (0..visible) |i| {
+            const line_index = if (i == 0) 0 else 1 + body_start + i - 1;
+            const display_line = if (i == 0) preview_heading else lines[line_index];
             const screen_row = top + 1 + i;
             try frame.at(screen_row, left);
             try frame.text("│", 0, 1, role);
             try frame.at(screen_row, left + 1);
             try frame.text(fill, 0, content_width, .plain);
             try frame.at(screen_row, left + 1);
-            const line_width = tui.displayWidth(lines[i], width_mod.cpWidth);
+            const line_width = tui.displayWidth(display_line, width_mod.cpWidth);
             if (line_width > content_width and content_width > 0) {
-                try frame.text(lines[i], 0, content_width -| 1, if (i == 0) role else .plain);
+                try frame.text(display_line, 0, content_width -| 1, if (i == 0) role else .plain);
                 try frame.at(screen_row, left + outer_width - 2);
                 try frame.text("…", 0, 1, if (i == 0) role else .plain);
             } else {
-                try frame.text(lines[i], 0, content_width, if (i == 0) role else .plain);
+                try frame.text(display_line, 0, content_width, if (i == 0) role else .plain);
             }
             try frame.at(screen_row, left + outer_width - 1);
             try frame.text("│", 0, 1, role);
@@ -3744,6 +3801,44 @@ const Tui = struct {
             } else |_| {}
         }
         return "?";
+    }
+
+    /// What lies beyond an `objects[0xN]` reference. The value kind is already
+    /// printed before the store reference, so remove that repeated wrapper and
+    /// continue the chain with the useful payload (`chunk`, state, count, …).
+    fn objectTargetSummary(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        kind: runtime.value.ValueType,
+        id: runtime.types.ObjectId,
+        max_cells: usize,
+    ) !?[]const u8 {
+        switch (kind) {
+            .list => if (self.ev.heapListOf(id)) |items|
+                return try std.fmt.allocPrint(arena, "{d} items", .{items.len})
+            else |_| {},
+            .attrs => if (self.ev.heapAttrsOf(id)) |attrs|
+                return try std.fmt.allocPrint(arena, "{d} attrs", .{attrs.len})
+            else |_| {},
+            else => {},
+        }
+
+        const summary = try self.objectSummary(arena, id, max_cells);
+        if (std.mem.eql(u8, summary, "?")) return null;
+        const prefixes: []const []const u8 = switch (kind) {
+            .closure => &.{"closure → "},
+            .thunk => &.{"thunk · "},
+            .builtin_closure => &.{ "builtin closure → ", "builtin closure · " },
+            .string_context => &.{"context string · "},
+            .boxed_int => &.{"int "},
+            .partial_app => &.{"partial application · "},
+            else => &.{},
+        };
+        for (prefixes) |prefix| {
+            if (std.mem.startsWith(u8, summary, prefix))
+                return summary[prefix.len..];
+        }
+        return summary;
     }
 
     /// The rendered scalar for an inline `Value` (null/bool/int/float/string/
