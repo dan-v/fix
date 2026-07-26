@@ -1427,30 +1427,62 @@ const Tui = struct {
     /// Object/chunk-backed values carry a `.object`/`.chunk` action so Enter
     /// (or the right-hand preview) drills into them; scalars render inline.
     fn appendValueLine(self: *Tui, page: *PageBuilder, prefix: []const u8, value: runtime.value.Value) !void {
-        const arena = page.arena;
+        const rendered = try self.renderValue(page.arena, value, 52, true);
+        try page.line(
+            try std.fmt.allocPrint(page.arena, "{s}{s}", .{ prefix, rendered.text }),
+            rendered.action,
+        );
+    }
+
+    const RenderedValue = struct {
+        text: []const u8,
+        action: RowAction,
+    };
+
+    /// Canonical non-forcing `Value` presentation shared by locals, stack
+    /// slots, return badges, and other compact value rows.
+    fn renderValue(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        value: runtime.value.Value,
+        max_cells: usize,
+        colored: bool,
+    ) !RenderedValue {
         const ref = self.ev.valueRef(value);
-        const action: RowAction, const detail: []const u8 = switch (ref.target) {
+        return switch (ref.target) {
             .object => |id| blk: {
                 const preview = try self.objectTargetSummary(arena, value.kind(), id, 38);
                 break :blk .{
-                    .{ .object = id },
-                    try std.fmt.allocPrint(arena, "{s} → {s}", .{
+                    .action = .{ .object = id },
+                    .text = try std.fmt.allocPrint(arena, "{s} → {s}", .{
                         @tagName(value.kind()),
-                        try self.canonicalStoreRef(arena, .objects, id, preview, true),
+                        try self.canonicalStoreRef(arena, .objects, id, preview, colored),
                     }),
                 };
             },
             .chunk => |id| blk: {
                 var rendered: std.Io.Writer.Allocating = .init(arena);
-                try disasm.writeStoreRef(&rendered.writer, "chunk", id, .chunk, null, self.color_depth);
+                try disasm.writeStoreRef(
+                    &rendered.writer,
+                    "chunk",
+                    id,
+                    .chunk,
+                    null,
+                    if (colored) self.color_depth else .none,
+                );
                 break :blk .{
-                    .{ .chunk = id },
-                    try std.fmt.allocPrint(arena, "{s} → {s}", .{ @tagName(value.kind()), rendered.written() }),
+                    .action = .{ .chunk = id },
+                    .text = try std.fmt.allocPrint(arena, "{s} → {s}", .{
+                        if (value.kind() == .closure and value.isFunction()) "function" else @tagName(value.kind()),
+                        rendered.written(),
+                    }),
                 };
             },
-            else => .{ .none, try self.valueSummary(arena, value, 52) },
+            else => .{
+                .action = .none,
+                .text = try self.valueSummary(arena, value, max_cells),
+            },
         };
-        try page.line(try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, detail }), action);
     }
 
     fn appendValueRef(self: *Tui, page: *PageBuilder, label: []const u8, value: runtime.heap.ValueRef) !void {
@@ -1810,12 +1842,11 @@ const Tui = struct {
             var wrapped_result: ?[]const u8 = null;
             const result_here = active and returned_value != null and focus_end <= line_end;
             if (result_here) {
-                const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
                 var annotation: std.Io.Writer.Allocating = .init(document.arena);
                 try self.writeReturnAnnotation(
+                    document.arena,
                     &annotation.writer,
                     returned_value.?,
-                    symbols,
                     @max(self.layout().main_width -| 14, 8),
                 );
                 if (tui.displayWidth(rendered.written(), width_mod.cpWidth) +
@@ -1847,10 +1878,10 @@ const Tui = struct {
     /// render without their own SGR resets here so the background remains
     /// continuous across the whole result.
     fn writeReturnAnnotation(
-        self: *const Tui,
+        self: *Tui,
+        arena: std.mem.Allocator,
         writer: *std.Io.Writer,
         value: runtime.value.Value,
-        symbols: disasm.Symbols,
         max_cells: usize,
     ) !void {
         try writer.writeAll("  ");
@@ -1866,7 +1897,8 @@ const Tui = struct {
             try writer.writeAll(if (self.return_flash) "\x1b[1;7m" else "\x1b[1;4m");
         }
         try writer.writeAll("⇒ ");
-        try disasm.writeValueDigest(writer, value, symbols, max_cells, .none);
+        const rendered = try self.renderValue(arena, value, max_cells, false);
+        try writer.writeAll(rendered.text);
         try writer.writeAll("\x1b[0m");
     }
 

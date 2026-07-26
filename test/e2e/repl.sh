@@ -291,9 +291,9 @@ t "tty debug: completed result survives screen exit" "42" "$after_debug"
 out=$(
     (
         sleep 0.4
-        printf ':d (x: x + 1) 2\r'
+        printf ':d (x: x) (y: y)\r'
         sleep 0.5
-        for _ in 1 2 3 4 5 6; do
+        for _ in 1 2 3 4; do
             printf 's'
             sleep 0.25
         done
@@ -304,8 +304,8 @@ out=$(
     ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty debug: return value is inline with source" "⇒ int 3" "$out"
-if [[ "$out" == *$'\x1b[1;7m⇒ int 3'* && "$out" == *$'\x1b[1;4m⇒ int 3'* ]]; then
+t "tty debug: return uses canonical value rendering" "⇒ function → chunk[0x" "$out"
+if [[ "$out" == *$'\x1b[1;7m⇒ function → chunk[0x'* && "$out" == *$'\x1b[1;4m⇒ function → chunk[0x'* ]]; then
     pass "tty debug: return value flashes once then remains emphasized"
 else
     fail "tty debug: return value did not show flash and settled styles"
