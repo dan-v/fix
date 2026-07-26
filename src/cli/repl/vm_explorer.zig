@@ -236,6 +236,11 @@ pub const VmDebugger = struct {
     /// straight-through step finishes (`endEvaluation`).
     owned_raw: term_mod.RawMode = .{},
     owned_active: bool = false,
+    /// The owned screen and explorer have the same lifetime. Keeping the Tui
+    /// here (rather than reconstructing it in every debug callback) preserves
+    /// tree expansion, selection, and navigation across consecutive steps.
+    owned_tree_index: ?vm_tree.Index = null,
+    owned_tui: ?Tui = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -278,6 +283,7 @@ pub const VmDebugger = struct {
     }
 
     fn leaveOwnedScreen(self: *VmDebugger) void {
+        self.releaseOwnedExplorer();
         if (!self.owned_active) return;
         var buf: [64]u8 = undefined;
         var out = std.Io.File.stdout().writerStreaming(self.io, &buf);
@@ -288,6 +294,53 @@ pub const VmDebugger = struct {
         self.owned_active = false;
     }
 
+    fn releaseOwnedExplorer(self: *VmDebugger) void {
+        if (self.owned_tui) |*explorer| explorer.deinit();
+        self.owned_tui = null;
+        if (self.owned_tree_index) |*index| index.deinit();
+        self.owned_tree_index = null;
+    }
+
+    fn ownedExplorer(self: *VmDebugger) !*Tui {
+        if (self.owned_tui == null) {
+            self.owned_tree_index = try vm_tree.Index.build(
+                self.allocator,
+                self.ev.chunkRegistry(),
+                self.ev.internTable(),
+                self.ev.basePath(),
+            );
+            errdefer {
+                self.owned_tree_index.?.deinit();
+                self.owned_tree_index = null;
+            }
+            self.owned_tui = .{
+                .allocator = self.allocator,
+                .io = self.io,
+                .ev = self.ev,
+                .color_depth = self.color_depth,
+                .tree_index = &self.owned_tree_index.?,
+                .session_host = null,
+                .arena = std.heap.ArenaAllocator.init(self.allocator),
+            };
+        }
+
+        const explorer = &self.owned_tui.?;
+        const index = &self.owned_tree_index.?;
+        const registry = self.ev.chunkRegistry();
+        if (index.registry_count != registry.count() or index.name_count != registry.nameCount()) {
+            const next = try vm_tree.Index.build(
+                self.allocator,
+                registry,
+                self.ev.internTable(),
+                self.ev.basePath(),
+            );
+            index.deinit();
+            index.* = next;
+            if (explorer.tree.projected_chunk) |id| try explorer.projectFocusedPath(id);
+        }
+        return explorer;
+    }
+
     fn runCallback(ctx: *anyopaque, session: *DebugSession) anyerror!void {
         const self: *VmDebugger = @ptrCast(@alignCast(ctx));
         // Borrowed: a live `:vm` explorer already owns the screen; just drive it.
@@ -296,21 +349,12 @@ pub const VmDebugger = struct {
             return;
         }
 
-        // Owned: ensure our own screen (kept across steps) and drive a throwaway
-        // explorer focused on the paused stack.
+        // Owned: keep both the screen and explorer across consecutive steps.
         try self.ensureOwnedScreen();
-        var tree_index = try vm_tree.Index.build(self.allocator, self.ev.chunkRegistry(), self.ev.internTable(), self.ev.basePath());
-        defer tree_index.deinit();
-        var explorer = Tui{
-            .allocator = self.allocator,
-            .io = self.io,
-            .ev = self.ev,
-            .color_depth = self.color_depth,
-            .tree_index = &tree_index,
-            .session_host = null,
-            .arena = std.heap.ArenaAllocator.init(self.allocator),
+        const explorer = self.ownedExplorer() catch |err| {
+            self.leaveOwnedScreen();
+            return err;
         };
-        defer explorer.deinit();
         const intent = explorer.debugRun(session, self.history) catch |err| {
             self.leaveOwnedScreen();
             return err;
@@ -677,6 +721,22 @@ const Tui = struct {
     fn clearReferenceGraph(self: *Tui) void {
         if (self.references.graph) |*graph| graph.deinit();
         self.references.graph = null;
+    }
+
+    /// A paused VM is a safe read boundary but has no background job loop.
+    /// Rebuild snapshots needed by already-open tree branches synchronously so
+    /// stepping refreshes their contents instead of temporarily erasing them.
+    fn refreshPausedTreeSnapshots(self: *Tui) void {
+        const projects_objects = if (self.tree.projected_heap) |projection|
+            projection.view == .objects
+        else
+            false;
+        if (!self.tree.heap_views[@intFromEnum(HeapView.objects)] and !projects_objects) return;
+        self.heap_index.objects = self.ev.heapObjectSnapshot(self.allocator) catch {
+            self.heap_index.objects_failed = true;
+            return;
+        };
+        self.heap_index.objects_failed = false;
     }
 
     fn runSession(self: *Tui, editor: *editor_mod.Editor, capture: *transcript_mod.Capture, host: SessionHost) !void {
@@ -4978,6 +5038,7 @@ const Tui = struct {
         // Every new pause is a new immutable inspection boundary.
         self.clearHeapSnapshots();
         self.clearReferenceGraph();
+        self.refreshPausedTreeSnapshots();
         session.clearStep();
         self.debug_nav_mark = self.navigation.back.items.len;
         defer {
@@ -5164,6 +5225,8 @@ const Tui = struct {
                 // leaving the pause, so discard its old read-only indexes.
                 self.clearHeapSnapshots();
                 self.clearReferenceGraph();
+                self.refreshPausedTreeSnapshots();
+                try self.rebuildTreeForCurrent();
                 try self.debugRenderValue(session, capture, value);
                 try self.refreshPage(self.currentKind());
             },

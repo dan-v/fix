@@ -392,6 +392,36 @@ else
     fail "tty debug: screen lifecycle ($debug_enters enters, $debug_leaves leaves)"
 fi
 
+# The owned debugger keeps the explorer model as well as its terminal screen.
+# Expand HEAP/objects, step once, then return to the tree: the same range must
+# still be expanded with a freshly-snapshotted object list.
+out=$(
+    (
+        sleep 0.4
+        printf ':d (x: x) { a = [1]; }\r'
+        sleep 0.6
+        printf '\tgjj\r'
+        sleep 0.4
+        printf 'j\r'
+        sleep 0.5
+        printf 's'
+        sleep 0.6
+        printf '\t'
+        sleep 0.5
+        printf 'q'
+        sleep 0.3
+        printf '\004'
+        sleep 0.2
+    ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+expanded_object_frames=$(grep -aoE 'objects\[0x0:0x[0-9a-f]+\] \([0-9]+\)' <<<"$out" | wc -l)
+if ((expanded_object_frames >= 2)); then
+    pass "tty debug: stepping preserves expanded tree branches"
+else
+    fail "tty debug: stepping collapsed the expanded object branch"
+fi
+
 # Finishing the outermost frame can complete without another debugger pause.
 # Its value must be printed after the alternate screen is restored, where it
 # remains in the ordinary REPL transcript.
