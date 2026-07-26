@@ -1,4 +1,4 @@
-//! The VM explorer TUI: a qualified-name tree beside the selected chunk view.
+//! The integrated VM explorer: tree navigation, inspection, and debugger UI.
 //!
 //! Interactive use is deliberately a TUI rather than a pager: the name tree is
 //! persistent navigation, the chunk detail is a separately scrollable pane,
@@ -14,6 +14,7 @@ const width_mod = @import("width.zig");
 const editor_mod = @import("editor.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("transcript.zig");
+const vm_jobs = @import("vm_jobs.zig");
 const vm_tree = @import("vm_tree.zig");
 const vm_navigation = @import("vm_navigation.zig");
 const history_mod = @import("history.zig");
@@ -23,8 +24,6 @@ const debugger = @import("../debugger.zig");
 const base = @import("base");
 const tui = base.tui;
 const ColorDepth = base.terminal_color.Depth;
-const sync = @import("base").sync;
-
 const Evaluator = engine.Evaluator;
 const DebugSession = engine.DebugSession;
 const ChunkId = runtime.types.ChunkId;
@@ -315,232 +314,6 @@ pub const VmDebugger = struct {
     }
 };
 
-const IndexJob = struct {
-    registry: *const bytecode.ChunkRegistry,
-    intern: *const runtime.InternTable,
-    base_path: ?[]const u8,
-    thread: ?std.Thread = null,
-    mutex: sync.BlockingMutex = .{},
-    ready: ?vm_tree.Index = null,
-    running: std.atomic.Value(bool) = .init(false),
-    failed: std.atomic.Value(bool) = .init(false),
-
-    fn start(self: *IndexJob) !void {
-        if (self.thread != null) return;
-        self.running.store(true, .release);
-        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
-            self.failed.store(true, .release);
-            self.running.store(false, .release);
-            return err;
-        };
-    }
-
-    fn build(self: *IndexJob) void {
-        const result = vm_tree.Index.build(std.heap.smp_allocator, self.registry, self.intern, self.base_path) catch {
-            self.failed.store(true, .release);
-            self.running.store(false, .release);
-            return;
-        };
-        self.mutex.lock();
-        self.ready = result;
-        self.mutex.unlock();
-        self.running.store(false, .release);
-    }
-
-    fn poll(self: *IndexJob, current: *vm_tree.Index) bool {
-        if (self.thread == null or self.running.load(.acquire)) return false;
-        return self.finish(current);
-    }
-
-    fn finish(self: *IndexJob, current: *vm_tree.Index) bool {
-        const thread = self.thread orelse return false;
-        thread.join();
-        self.thread = null;
-        self.mutex.lock();
-        const next = self.ready;
-        self.ready = null;
-        self.mutex.unlock();
-        if (next) |index| {
-            current.deinit();
-            current.* = index;
-            return true;
-        }
-        return false;
-    }
-
-    fn deinit(self: *IndexJob) void {
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
-        self.mutex.lock();
-        if (self.ready) |*index| index.deinit();
-        self.ready = null;
-        self.mutex.unlock();
-    }
-};
-
-const HeapJob = struct {
-    ev: *Evaluator,
-    thread: ?std.Thread = null,
-    mutex: sync.BlockingMutex = .{},
-    ready: ?runtime.ObjectHeap.Stats = null,
-    running: std.atomic.Value(bool) = .init(false),
-
-    fn start(self: *HeapJob) !void {
-        if (self.thread != null) return;
-        self.running.store(true, .release);
-        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
-            self.running.store(false, .release);
-            return err;
-        };
-    }
-
-    fn build(self: *HeapJob) void {
-        const result = self.ev.heapStats();
-        self.mutex.lock();
-        self.ready = result;
-        self.mutex.unlock();
-        self.running.store(false, .release);
-    }
-
-    fn poll(self: *HeapJob, target: *?runtime.ObjectHeap.Stats) bool {
-        if (self.thread == null or self.running.load(.acquire)) return false;
-        self.finish(target);
-        return true;
-    }
-
-    fn finish(self: *HeapJob, target: *?runtime.ObjectHeap.Stats) void {
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
-        self.mutex.lock();
-        if (self.ready) |stats| target.* = stats;
-        self.ready = null;
-        self.mutex.unlock();
-        self.running.store(false, .release);
-    }
-
-    fn deinit(self: *HeapJob) void {
-        var discard: ?runtime.ObjectHeap.Stats = null;
-        self.finish(&discard);
-    }
-};
-
-const ObjectJob = struct {
-    ev: *Evaluator,
-    thread: ?std.Thread = null,
-    mutex: sync.BlockingMutex = .{},
-    ready: ?runtime.ObjectHeap.ObjectSnapshot = null,
-    running: std.atomic.Value(bool) = .init(false),
-    failed: std.atomic.Value(bool) = .init(false),
-
-    fn start(self: *ObjectJob) !void {
-        if (self.thread != null) return;
-        self.running.store(true, .release);
-        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
-            self.failed.store(true, .release);
-            self.running.store(false, .release);
-            return err;
-        };
-    }
-
-    fn build(self: *ObjectJob) void {
-        const result = self.ev.heapObjectSnapshot(std.heap.smp_allocator) catch {
-            self.failed.store(true, .release);
-            self.running.store(false, .release);
-            return;
-        };
-        self.mutex.lock();
-        self.ready = result;
-        self.mutex.unlock();
-        self.running.store(false, .release);
-    }
-
-    fn poll(self: *ObjectJob, target: *?runtime.ObjectHeap.ObjectSnapshot) bool {
-        if (self.thread == null or self.running.load(.acquire)) return false;
-        self.finish(target);
-        return true;
-    }
-
-    fn finish(self: *ObjectJob, target: *?runtime.ObjectHeap.ObjectSnapshot) void {
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
-        self.mutex.lock();
-        if (self.ready) |snapshot| {
-            if (target.*) |*old| old.deinit();
-            target.* = snapshot;
-        }
-        self.ready = null;
-        self.mutex.unlock();
-        self.running.store(false, .release);
-    }
-
-    fn deinit(self: *ObjectJob) void {
-        var discard: ?runtime.ObjectHeap.ObjectSnapshot = null;
-        self.finish(&discard);
-        if (discard) |*snapshot| snapshot.deinit();
-    }
-};
-
-const RefJob = struct {
-    registry: *const bytecode.ChunkRegistry,
-    thread: ?std.Thread = null,
-    mutex: sync.BlockingMutex = .{},
-    ready: ?bytecode.inspect.RefGraph = null,
-    running: std.atomic.Value(bool) = .init(false),
-    failed: std.atomic.Value(bool) = .init(false),
-
-    fn start(self: *RefJob) !void {
-        if (self.thread != null) return;
-        self.running.store(true, .release);
-        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
-            self.failed.store(true, .release);
-            self.running.store(false, .release);
-            return err;
-        };
-    }
-
-    fn build(self: *RefJob) void {
-        const result = bytecode.inspect.RefGraph.build(std.heap.smp_allocator, self.registry) catch {
-            self.failed.store(true, .release);
-            self.running.store(false, .release);
-            return;
-        };
-        self.mutex.lock();
-        self.ready = result;
-        self.mutex.unlock();
-        self.running.store(false, .release);
-    }
-
-    fn poll(self: *RefJob, target: *?bytecode.inspect.RefGraph) bool {
-        if (self.thread == null or self.running.load(.acquire)) return false;
-        return self.finish(target);
-    }
-
-    fn finish(self: *RefJob, target: *?bytecode.inspect.RefGraph) bool {
-        const thread = self.thread orelse return false;
-        thread.join();
-        self.thread = null;
-        self.mutex.lock();
-        const next = self.ready;
-        self.ready = null;
-        self.mutex.unlock();
-        if (next) |graph| {
-            if (target.*) |*old| old.deinit();
-            target.* = graph;
-            return true;
-        }
-        return false;
-    }
-
-    fn deinit(self: *RefJob) void {
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
-        self.mutex.lock();
-        if (self.ready) |*graph| graph.deinit();
-        self.ready = null;
-        self.mutex.unlock();
-    }
-};
-
 const RangeKind = enum(u3) { names, chunks, objects, values, attrs, attr_positions };
 const ChunkEquivalence = union(enum) {
     structural: ChunkId,
@@ -635,10 +408,10 @@ const Viewport = struct {
 };
 
 const SessionJobs = struct {
-    names: IndexJob,
-    heap: HeapJob,
-    objects: ObjectJob,
-    references: RefJob,
+    names: vm_jobs.NameIndex,
+    heap: vm_jobs.HeapCensus,
+    objects: vm_jobs.ObjectSnapshot,
+    references: vm_jobs.References,
 
     fn init(ev: *Evaluator) SessionJobs {
         return .{
@@ -823,9 +596,8 @@ const Tui = struct {
         }
         const references_failed = jobs.references.failed.load(.acquire);
         self.references.failed = references_failed;
-        const wants_references = shows_references;
         const references_stale = self.references.graph == null or self.references.graph.?.registry_count != registry.count();
-        if (wants_references and references_stale and jobs.references.thread == null and !references_failed) {
+        if (shows_references and references_stale and jobs.references.thread == null and !references_failed) {
             jobs.references.start() catch {};
         }
     }

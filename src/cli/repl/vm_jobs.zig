@@ -1,0 +1,241 @@
+//! Background snapshots used by the interactive VM explorer.
+//!
+//! Workers never mutate display state. They build an owned result with the
+//! SMP allocator, publish it behind a mutex, and let the terminal thread adopt
+//! it between frames. Keeping that lifecycle here leaves the explorer focused
+//! on navigation and rendering.
+
+const std = @import("std");
+const sync = @import("base").sync;
+const engine = @import("expr");
+const runtime = @import("runtime");
+const vm_tree = @import("vm_tree.zig");
+
+const Evaluator = engine.Evaluator;
+const bytecode = engine.bytecode;
+
+pub const NameIndex = struct {
+    registry: *const bytecode.ChunkRegistry,
+    intern: *const runtime.InternTable,
+    base_path: ?[]const u8,
+    thread: ?std.Thread = null,
+    mutex: sync.BlockingMutex = .{},
+    ready: ?vm_tree.Index = null,
+    running: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    pub fn start(self: *NameIndex) !void {
+        if (self.thread != null) return;
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.failed.store(true, .release);
+            self.running.store(false, .release);
+            return err;
+        };
+    }
+
+    fn build(self: *NameIndex) void {
+        const result = vm_tree.Index.build(std.heap.smp_allocator, self.registry, self.intern, self.base_path) catch {
+            self.failed.store(true, .release);
+            self.running.store(false, .release);
+            return;
+        };
+        self.mutex.lock();
+        self.ready = result;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    pub fn poll(self: *NameIndex, current: *vm_tree.Index) bool {
+        if (self.thread == null or self.running.load(.acquire)) return false;
+        return self.finish(current);
+    }
+
+    pub fn finish(self: *NameIndex, current: *vm_tree.Index) bool {
+        const thread = self.thread orelse return false;
+        thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        const next = self.ready;
+        self.ready = null;
+        self.mutex.unlock();
+        if (next) |index| {
+            current.deinit();
+            current.* = index;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *NameIndex) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        if (self.ready) |*index| index.deinit();
+        self.ready = null;
+        self.mutex.unlock();
+    }
+};
+
+pub const HeapCensus = struct {
+    ev: *Evaluator,
+    thread: ?std.Thread = null,
+    mutex: sync.BlockingMutex = .{},
+    ready: ?runtime.ObjectHeap.Stats = null,
+    running: std.atomic.Value(bool) = .init(false),
+
+    pub fn start(self: *HeapCensus) !void {
+        if (self.thread != null) return;
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.running.store(false, .release);
+            return err;
+        };
+    }
+
+    fn build(self: *HeapCensus) void {
+        const result = self.ev.heapStats();
+        self.mutex.lock();
+        self.ready = result;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    pub fn poll(self: *HeapCensus, target: *?runtime.ObjectHeap.Stats) bool {
+        if (self.thread == null or self.running.load(.acquire)) return false;
+        self.finish(target);
+        return true;
+    }
+
+    pub fn finish(self: *HeapCensus, target: *?runtime.ObjectHeap.Stats) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        if (self.ready) |stats| target.* = stats;
+        self.ready = null;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    pub fn deinit(self: *HeapCensus) void {
+        var discard: ?runtime.ObjectHeap.Stats = null;
+        self.finish(&discard);
+    }
+};
+
+pub const ObjectSnapshot = struct {
+    ev: *Evaluator,
+    thread: ?std.Thread = null,
+    mutex: sync.BlockingMutex = .{},
+    ready: ?runtime.ObjectHeap.ObjectSnapshot = null,
+    running: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    pub fn start(self: *ObjectSnapshot) !void {
+        if (self.thread != null) return;
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.failed.store(true, .release);
+            self.running.store(false, .release);
+            return err;
+        };
+    }
+
+    fn build(self: *ObjectSnapshot) void {
+        const result = self.ev.heapObjectSnapshot(std.heap.smp_allocator) catch {
+            self.failed.store(true, .release);
+            self.running.store(false, .release);
+            return;
+        };
+        self.mutex.lock();
+        self.ready = result;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    pub fn poll(self: *ObjectSnapshot, target: *?runtime.ObjectHeap.ObjectSnapshot) bool {
+        if (self.thread == null or self.running.load(.acquire)) return false;
+        self.finish(target);
+        return true;
+    }
+
+    pub fn finish(self: *ObjectSnapshot, target: *?runtime.ObjectHeap.ObjectSnapshot) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        if (self.ready) |snapshot| {
+            if (target.*) |*old| old.deinit();
+            target.* = snapshot;
+        }
+        self.ready = null;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    pub fn deinit(self: *ObjectSnapshot) void {
+        var discard: ?runtime.ObjectHeap.ObjectSnapshot = null;
+        self.finish(&discard);
+        if (discard) |*snapshot| snapshot.deinit();
+    }
+};
+
+pub const References = struct {
+    registry: *const bytecode.ChunkRegistry,
+    thread: ?std.Thread = null,
+    mutex: sync.BlockingMutex = .{},
+    ready: ?bytecode.inspect.RefGraph = null,
+    running: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    pub fn start(self: *References) !void {
+        if (self.thread != null) return;
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, build, .{self}) catch |err| {
+            self.failed.store(true, .release);
+            self.running.store(false, .release);
+            return err;
+        };
+    }
+
+    fn build(self: *References) void {
+        const result = bytecode.inspect.RefGraph.build(std.heap.smp_allocator, self.registry) catch {
+            self.failed.store(true, .release);
+            self.running.store(false, .release);
+            return;
+        };
+        self.mutex.lock();
+        self.ready = result;
+        self.mutex.unlock();
+        self.running.store(false, .release);
+    }
+
+    pub fn poll(self: *References, target: *?bytecode.inspect.RefGraph) bool {
+        if (self.thread == null or self.running.load(.acquire)) return false;
+        return self.finish(target);
+    }
+
+    pub fn finish(self: *References, target: *?bytecode.inspect.RefGraph) bool {
+        const thread = self.thread orelse return false;
+        thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        const next = self.ready;
+        self.ready = null;
+        self.mutex.unlock();
+        if (next) |graph| {
+            if (target.*) |*old| old.deinit();
+            target.* = graph;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *References) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.mutex.lock();
+        if (self.ready) |*graph| graph.deinit();
+        self.ready = null;
+        self.mutex.unlock();
+    }
+};
