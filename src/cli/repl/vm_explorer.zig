@@ -320,6 +320,12 @@ pub const VmDebugger = struct {
 };
 
 const RangeKind = enum(u4) { names, chunks, objects, values, attrs, attr_positions, intern, builtin };
+const RangeKey = struct {
+    kind: RangeKind,
+    parent: u64,
+    start: u32,
+    span: u32,
+};
 const ChunkEquivalence = union(enum) {
     structural: ChunkId,
     code: ChunkId,
@@ -334,17 +340,25 @@ const Range = struct {
     /// as if every reserved slot were an object.
     live: u32,
     depth: u16,
+    /// Stable semantic identity of a bytecode name parent. Heap-store ranges
+    /// leave this at zero because their store kind + numeric span is stable.
+    stable_parent: u64 = 0,
+    /// Nominal range width rather than the current tail length. A growing store
+    /// or chunk group must not forget that its final partial range was open.
+    key_span: u32,
 
-    fn key(self: Range) u128 {
-        return (@as(u128, @intFromEnum(self.kind)) << 96) |
-            (@as(u128, self.parent) << 64) |
-            (@as(u128, self.start) << 32) |
-            @as(u128, self.len);
+    fn key(self: Range) RangeKey {
+        return .{
+            .kind = self.kind,
+            .parent = self.stable_parent,
+            .start = self.start,
+            .span = self.key_span,
+        };
     }
 };
 const TreeRow = union(enum) {
     category: struct { kind: Category, depth: u16 },
-    name: struct { id: u32, depth: u16 },
+    name: struct { id: u32, key: u64, depth: u16 },
     chunk: struct { id: ChunkId, depth: u16, label: ?u32 = null },
     range: Range,
     heap: struct { view: HeapView, depth: u16 },
@@ -369,9 +383,14 @@ const NavigationState = struct {
     x_scroll: usize = 0,
 };
 
+const HeapProjection = struct {
+    view: HeapView,
+    id: u32,
+};
+
 const TreeState = struct {
-    expanded_names: std.AutoHashMapUnmanaged(u32, void) = .empty,
-    expanded_ranges: std.AutoHashMapUnmanaged(u128, void) = .empty,
+    expanded_names: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    expanded_ranges: std.AutoHashMapUnmanaged(RangeKey, void) = .empty,
     focus_path: std.AutoHashMapUnmanaged(u32, void) = .empty,
     rows: std.ArrayListUnmanaged(TreeRow) = .empty,
     indexing: bool = false,
@@ -385,6 +404,10 @@ const TreeState = struct {
     /// Tree-origin inspection does not change this anchor: opening a visible
     /// row must never reshape the tree around the newly opened subject.
     projected_chunk: ?ChunkId = null,
+    /// Equivalent anchor for a heap record projected through a collapsed store
+    /// or synthetic range. It changes only when navigation originates outside
+    /// the tree, never merely because a visible record becomes the subject.
+    projected_heap: ?HeapProjection = null,
 };
 
 const HeapIndexState = struct {
@@ -551,6 +574,10 @@ const Tui = struct {
     fn pollSessionJobs(self: *Tui, jobs: *SessionJobs) !void {
         if (jobs.names.poll(self.tree_index)) {
             self.tree.indexing = false;
+            // Display-node ids belong to one index generation. Re-project the
+            // stable chunk anchor through the newly adopted index before
+            // rebuilding; explicit expansions use semantic keys and survive.
+            if (self.tree.projected_chunk) |id| try self.projectFocusedPath(id);
             try self.rebuildTreeForCurrent();
         }
         const registry = self.ev.chunkRegistry();
@@ -2195,8 +2222,12 @@ const Tui = struct {
     }
 
     fn expandFocusedPath(self: *Tui, chunk_id: ChunkId) !void {
-        self.tree.projected_chunk = chunk_id;
         self.tree.categories[@intFromEnum(Category.bytecode)] = true;
+        try self.projectFocusedPath(chunk_id);
+    }
+
+    fn projectFocusedPath(self: *Tui, chunk_id: ChunkId) !void {
+        self.tree.projected_chunk = chunk_id;
         self.tree.focus_path.clearRetainingCapacity();
         try self.tree.focus_path.put(self.allocator, vm_tree.root_node_id, {});
         var name = self.tree_index.nodeForChunk(chunk_id);
@@ -2231,8 +2262,8 @@ const Tui = struct {
         }
         try self.tree.rows.append(self.allocator, .{ .category = .{ .kind = .heap, .depth = 0 } });
         const heap_open = self.tree.categories[@intFromEnum(Category.heap)];
-        const record_view = self.currentStoreRecord();
-        if (heap_open or self.currentObject() != null or record_view != null) {
+        const heap_projection = self.tree.projected_heap;
+        if (heap_open or heap_projection != null) {
             for (std.meta.tags(HeapView)) |view| {
                 // The aggregate census is not a browsable folder (it hijacked the
                 // inspector with a cursorless page). It lives in the HEAP-row
@@ -2240,8 +2271,10 @@ const Tui = struct {
                 if (view == .overview) continue;
                 // Keep a collapsed category showing just the store that owns the
                 // currently-open record/object, projected in.
-                const projected_view = (self.currentObject() != null and view == .objects) or
-                    (record_view != null and record_view.?.view == view);
+                const projected_view = if (heap_projection) |projection|
+                    projection.view == view
+                else
+                    false;
                 if (!heap_open and !projected_view) continue;
                 try self.tree.rows.append(self.allocator, .{ .heap = .{ .view = view, .depth = 1 } });
                 const expanded = self.tree.heap_views[@intFromEnum(view)] or projected_view;
@@ -2336,7 +2369,11 @@ const Tui = struct {
             try self.tree.rows.append(self.allocator, .{ .chunk = .{ .id = chunks[0], .depth = depth, .label = name } });
             return;
         }
-        try self.tree.rows.append(self.allocator, .{ .name = .{ .id = name, .depth = depth } });
+        try self.tree.rows.append(self.allocator, .{ .name = .{
+            .id = name,
+            .key = self.tree_index.stableKey(name),
+            .depth = depth,
+        } });
         const next_depth = depth +| 1;
         for (children) |child| {
             if (self.tree.filter_keep.contains(child)) try self.appendFilteredNameRows(child, next_depth);
@@ -2353,7 +2390,11 @@ const Tui = struct {
             try self.tree.rows.append(self.allocator, .{ .chunk = .{ .id = chunks[0], .depth = depth, .label = name } });
             return;
         }
-        try self.tree.rows.append(self.allocator, .{ .name = .{ .id = name, .depth = depth } });
+        try self.tree.rows.append(self.allocator, .{ .name = .{
+            .id = name,
+            .key = self.tree_index.stableKey(name),
+            .depth = depth,
+        } });
         const next_depth = depth +| 1;
         for (children) |child| {
             if (self.tree.focus_path.contains(child)) try self.appendFocusedNameRows(child, next_depth, focused_chunk);
@@ -2393,7 +2434,10 @@ const Tui = struct {
         projected_only: bool,
     ) std.mem.Allocator.Error!void {
         if (len == 0) return;
-        const focused = if (self.currentStoreRecord()) |r| (if (r.view == view) r.id else null) else null;
+        const focused = if (self.tree.projected_heap) |projection|
+            if (projection.view == view) projection.id else null
+        else
+            null;
         const end = start + len;
         if (len <= range_leaf) {
             if (projected_only) {
@@ -2423,6 +2467,7 @@ const Tui = struct {
                 .len = child_len,
                 .live = child_len,
                 .depth = depth,
+                .key_span = span,
             };
             try self.tree.rows.append(self.allocator, .{ .range = range });
             if (self.tree.expanded_ranges.contains(range.key())) {
@@ -2449,9 +2494,10 @@ const Tui = struct {
     ) std.mem.Allocator.Error!void {
         if (len == 0) return;
         const end = start + len;
-        const focused: ?u32 = if (view == .objects)
-            self.currentObject()
-        else if (self.currentStoreRecord()) |r| (if (r.view == view) r.id else null) else null;
+        const focused: ?u32 = if (self.tree.projected_heap) |projection|
+            if (projection.view == view) projection.id else null
+        else
+            null;
         if (len <= range_leaf) {
             if (projected_only) {
                 if (focused) |id| if (id >= start and id < end and snapshot.isLive(id)) {
@@ -2491,6 +2537,7 @@ const Tui = struct {
                 .len = child_len,
                 .live = live,
                 .depth = depth,
+                .key_span = span,
             };
             try self.tree.rows.append(self.allocator, .{ .range = range });
             if (self.tree.expanded_ranges.contains(range.key())) {
@@ -2508,9 +2555,14 @@ const Tui = struct {
             try self.tree.rows.append(self.allocator, .{ .chunk = .{ .id = chunks[0], .depth = depth, .label = name } });
             return;
         }
-        try self.tree.rows.append(self.allocator, .{ .name = .{ .id = name, .depth = depth } });
+        const name_key = self.tree_index.stableKey(name);
+        try self.tree.rows.append(self.allocator, .{ .name = .{
+            .id = name,
+            .key = name_key,
+            .depth = depth,
+        } });
         const next_depth = depth +| 1;
-        if (!self.tree.expanded_names.contains(name)) {
+        if (!self.tree.expanded_names.contains(name_key)) {
             if (!self.tree.focus_path.contains(name)) return;
             for (children) |child| {
                 if (self.tree.focus_path.contains(child)) try self.appendNameRows(child, next_depth, focused_chunk);
@@ -2552,6 +2604,8 @@ const Tui = struct {
                 .len = @min(span, len - offset),
                 .live = @min(span, len - offset),
                 .depth = depth,
+                .stable_parent = self.tree_index.stableKey(parent),
+                .key_span = span,
             };
             try self.tree.rows.append(self.allocator, .{ .range = range });
             var contains_focus = false;
@@ -2594,6 +2648,8 @@ const Tui = struct {
                 .len = @min(span, len - offset),
                 .live = @min(span, len - offset),
                 .depth = depth,
+                .stable_parent = self.tree_index.stableKey(parent),
+                .key_span = span,
             };
             try self.tree.rows.append(self.allocator, .{ .range = range });
             const slice = chunks[range.start .. range.start + range.len];
@@ -2630,14 +2686,14 @@ const Tui = struct {
                 };
             },
             .name => |entry| {
-                if (self.tree.expanded_names.remove(entry.id)) {
+                if (self.tree.expanded_names.remove(entry.key)) {
                     // collapsed
                 } else {
-                    try self.tree.expanded_names.put(self.allocator, entry.id, {});
+                    try self.tree.expanded_names.put(self.allocator, entry.key, {});
                 }
                 try self.rebuildTreeForCurrent();
                 for (self.tree.rows.items, 0..) |row, i| switch (row) {
-                    .name => |candidate| if (candidate.id == entry.id) {
+                    .name => |candidate| if (candidate.key == entry.key) {
                         self.navigation.tree_selection = i;
                         break;
                     },
@@ -2677,7 +2733,7 @@ const Tui = struct {
                 if (!self.tree.expanded_ranges.remove(range.key())) try self.tree.expanded_ranges.put(self.allocator, range.key(), {});
                 try self.rebuildTreeForCurrent();
                 for (self.tree.rows.items, 0..) |row, i| switch (row) {
-                    .range => |candidate| if (candidate.key() == range.key()) {
+                    .range => |candidate| if (std.meta.eql(candidate.key(), range.key())) {
                         self.navigation.tree_selection = i;
                         break;
                     },
@@ -2700,7 +2756,7 @@ const Tui = struct {
                 self.tree.categories[index] = false;
                 break :blk true;
             },
-            .name => |entry| self.tree.expanded_names.remove(entry.id),
+            .name => |entry| self.tree.expanded_names.remove(entry.key),
             .range => |entry| self.tree.expanded_ranges.remove(entry.key()),
             .heap => |entry| blk: {
                 if (entry.view == .overview or !self.tree.heap_views[@intFromEnum(entry.view)])
@@ -2776,7 +2832,7 @@ const Tui = struct {
         if (treeRowDepth(row) > 0) return true;
         return switch (row) {
             .category => |entry| self.tree.categories[@intFromEnum(entry.kind)],
-            .name => |entry| self.tree.expanded_names.contains(entry.id),
+            .name => |entry| self.tree.expanded_names.contains(entry.key),
             .range => |entry| self.tree.expanded_ranges.contains(entry.key()),
             .heap => |entry| entry.view != .overview and self.tree.heap_views[@intFromEnum(entry.view)],
             else => false,
@@ -2858,11 +2914,17 @@ const Tui = struct {
                 try self.expandFocusedPath(id);
                 try self.rebuildTree(id);
             },
-            .object => {
+            .object => |id| {
+                self.tree.projected_heap = .{ .view = .objects, .id = id };
                 self.tree.categories[@intFromEnum(Category.heap)] = true;
                 try self.rebuildTreeForCurrent();
             },
-            .heap, .store_record => {
+            .store_record => |record| {
+                self.tree.projected_heap = .{ .view = record.view, .id = record.id };
+                self.tree.categories[@intFromEnum(Category.heap)] = true;
+                try self.rebuildTreeForCurrent();
+            },
+            .heap => {
                 self.tree.categories[@intFromEnum(Category.heap)] = true;
                 try self.rebuildTreeForCurrent();
             },
@@ -4613,7 +4675,7 @@ const Tui = struct {
                     "?";
                 break :blk try std.fmt.allocPrint(arena, " {s}{s} {s}  {d}", .{
                     indent[0..indent_len],
-                    if (self.tree.expanded_names.contains(entry.id)) "▾" else if (self.tree.focus_path.contains(entry.id)) "›" else "▸",
+                    if (self.tree.expanded_names.contains(entry.key)) "▾" else if (self.tree.focus_path.contains(entry.id)) "›" else "▸",
                     label,
                     stats.chunks,
                 });
@@ -5256,9 +5318,9 @@ fn treeRowsEqual(a: TreeRow, b: TreeRow) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .category => |x| b.category.kind == x.kind,
-        .name => |x| b.name.id == x.id,
+        .name => |x| b.name.key == x.key,
         .chunk => |x| b.chunk.id == x.id,
-        .range => |x| b.range.key() == x.key(),
+        .range => |x| std.meta.eql(b.range.key(), x.key()),
         .heap => |x| b.heap.view == x.view,
         .object => |x| b.object.id == x.id,
         .store_record => |x| b.store_record.view == x.view and b.store_record.id == x.id,
@@ -5329,6 +5391,34 @@ test "disassembly targets recognize chunk and heap links" {
     const builtin = disasmTarget("builtin[0x20] → import").store_record;
     try std.testing.expectEqual(HeapView.builtin, builtin.view);
     try std.testing.expectEqual(@as(u32, 0x20), builtin.id);
+}
+
+test "tree row identities ignore transient display ids" {
+    const old_name: TreeRow = .{ .name = .{ .id = 3, .key = 0xabc, .depth = 2 } };
+    const rebuilt_name: TreeRow = .{ .name = .{ .id = 19, .key = 0xabc, .depth = 5 } };
+    try std.testing.expect(treeRowsEqual(old_name, rebuilt_name));
+
+    const old_range: TreeRow = .{ .range = .{
+        .kind = .chunks,
+        .parent = 3,
+        .stable_parent = 0xabc,
+        .start = 256,
+        .len = 17,
+        .live = 17,
+        .key_span = 256,
+        .depth = 3,
+    } };
+    const rebuilt_range: TreeRow = .{ .range = .{
+        .kind = .chunks,
+        .parent = 19,
+        .stable_parent = 0xabc,
+        .start = 256,
+        .len = 93,
+        .live = 93,
+        .key_span = 256,
+        .depth = 6,
+    } };
+    try std.testing.expect(treeRowsEqual(old_range, rebuilt_range));
 }
 
 test "source snippets honor their container width" {

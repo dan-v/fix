@@ -26,6 +26,9 @@ pub const Node = struct {
     kind: Kind,
     synthetic: bool,
     file_leaf: bool,
+    /// Stable across rebuilt indexes: the semantic parent path, node kind, and
+    /// label determine this identity rather than the builder's temporary id.
+    stable_key: u64,
 };
 
 pub const Stats = struct {
@@ -100,6 +103,10 @@ pub const Index = struct {
         if (id >= self.chunk_nodes.len) return root_node_id;
         return self.chunk_nodes[id];
     }
+
+    pub fn stableKey(self: *const Index, id: NodeId) u64 {
+        return if (id < self.nodes.len) self.nodes[id].stable_key else 0;
+    }
 };
 
 const NodeKey = struct {
@@ -115,6 +122,7 @@ const TempNode = struct {
     kind: Kind,
     synthetic: bool,
     file_leaf: bool = false,
+    stable_key: u64,
 };
 
 const Builder = struct {
@@ -146,6 +154,7 @@ const Builder = struct {
             .label = root_label,
             .kind = .path,
             .synthetic = false,
+            .stable_key = stableNodeKey(0, "<root>", .path, false),
         });
 
         const name_files = try self.allocator.alloc(?InternId, name_len);
@@ -215,6 +224,7 @@ const Builder = struct {
             .kind = node.kind,
             .synthetic = node.synthetic,
             .file_leaf = node.file_leaf,
+            .stable_key = node.stable_key,
         };
 
         const child_offsets = try self.allocator.alloc(u32, nodes.len + 1);
@@ -311,6 +321,7 @@ const Builder = struct {
             .label = label,
             .kind = kind,
             .synthetic = synthetic,
+            .stable_key = stableNodeKey(self.nodes.items[parent].stable_key, text, kind, synthetic),
         });
         result.value_ptr.* = id;
         return id;
@@ -335,6 +346,14 @@ const Builder = struct {
         return parent;
     }
 };
+
+fn stableNodeKey(parent: u64, label: []const u8, kind: Kind, synthetic: bool) u64 {
+    var hash = std.hash.Wyhash.init(parent ^ 0x6e_61_6d_65_74_72_65_65);
+    const discriminants = [_]u8{ @intFromEnum(kind), @intFromBool(synthetic) };
+    hash.update(&discriminants);
+    hash.update(label);
+    return hash.final();
+}
 
 const SortContext = struct {
     nodes: []const Node,
@@ -391,6 +410,37 @@ test "display tree consolidates duplicate name siblings" {
     try testing.expectEqual(@as(usize, 1), children.len);
     try testing.expectEqualStrings("lib", index.node(children[0]).?.label);
     try testing.expectEqual(@as(u64, 2), index.statsOf(children[0]).chunks);
+}
+
+test "display node keys survive index rebuilds" {
+    const testing = std.testing;
+    var intern = try runtime.InternTable.init(testing.allocator);
+    defer intern.deinit();
+    var registry = try bytecode.ChunkRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const pkgs_text = try intern.intern("pkgs");
+    const lib_text = try intern.intern("lib");
+    const pkgs = try registry.childName(bytecode.root_name_id, pkgs_text, false);
+    const lib = try registry.childName(pkgs, lib_text, false);
+    _ = try registry.registerNamed(try testChunk(testing.allocator, 1), lib);
+
+    var before = try Index.build(testing.allocator, &registry, &intern, null);
+    defer before.deinit();
+    const before_pkgs = findChild(&before, root_node_id, "pkgs").?;
+    const before_lib = findChild(&before, before_pkgs, "lib").?;
+
+    const tools_text = try intern.intern("tools");
+    const tools = try registry.childName(pkgs, tools_text, false);
+    _ = try registry.registerNamed(try testChunk(testing.allocator, 2), tools);
+
+    var after = try Index.build(testing.allocator, &registry, &intern, null);
+    defer after.deinit();
+    const after_pkgs = findChild(&after, root_node_id, "pkgs").?;
+    const after_lib = findChild(&after, after_pkgs, "lib").?;
+
+    try testing.expectEqual(before.stableKey(before_pkgs), after.stableKey(after_pkgs));
+    try testing.expectEqual(before.stableKey(before_lib), after.stableKey(after_lib));
 }
 
 test "display tree groups files by relative path components" {
