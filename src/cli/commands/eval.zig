@@ -51,7 +51,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var console: debugger.Console = undefined;
     if (options.debugger) {
         ev.setParallelismToggles(true, true);
-        // Named chunks make the backtrace read like `pkgs.hello (chunk #42)`.
+        // Named chunks make the backtrace read like `pkgs.hello (chunk[0x2a])`.
         ev.setCaptureChunkNames(true);
         console = .{ .allocator = allocator, .io = init.io, .use_color = term.use_color };
         console.install(&ev);

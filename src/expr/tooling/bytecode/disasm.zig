@@ -20,6 +20,7 @@ const encoding = bytecode.encoding;
 const inspect = bytecode.inspect;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
+const ValueType = @import("runtime").value.ValueType;
 const intern_mod = @import("runtime").intern;
 const InternTable = intern_mod.InternTable;
 
@@ -288,7 +289,7 @@ fn writeChunkTables(
         try writer.writeAll("  function arguments:\n");
         for (chunk.function_args, 0..) |arg, i| {
             try writeTableRowHead(writer, cc, sec_function_args_color, i, i == chunk.function_args.len - 1, attrNameColor(i), options.color_depth);
-            try writeStringRef(writer, "str", arg.name, symbols, table_snippet_max, options.color_depth);
+            try writeInternNameRef(writer, arg.name, symbols, table_snippet_max, options.color_depth);
             try setCommentFg(writer, options.color_depth);
             try writer.writeAll(" = ");
             if (options.color_depth.enabled()) try writer.writeAll("\x1b[0m");
@@ -308,7 +309,7 @@ fn writeChunkTables(
         try writer.writeAll("  attr names:\n");
         for (chunk.attr_names, 0..) |name, i| {
             try writeTableRowHead(writer, cc, sec_attr_names_color, i, i == chunk.attr_names.len - 1, attrNameColor(i), options.color_depth);
-            try writeStringRef(writer, "str", name, symbols, table_snippet_max, options.color_depth);
+            try writeInternNameRef(writer, name, symbols, table_snippet_max, options.color_depth);
             try writer.writeByte('\n');
         }
     }
@@ -503,7 +504,7 @@ fn constColor(i: usize) [3]u8 {
 }
 
 /// Identity color for an interned string/path id: the same hue everywhere the
-/// id appears — as a raw operand, inside a `str[0xN]` comment, and on its
+/// id appears — as a raw operand, inside an `intern[0xN]` comment, and on its
 /// constant-pool row — so occurrences of one id link up visually. Offset past
 /// the chunk-id and constant-slot seeds.
 fn internColor(id: anytype) [3]u8 {
@@ -712,7 +713,7 @@ const Line = struct {
     }
     /// A `store[accessor]` reference: keyword in the fixed store color, brackets
     /// dim, accessor in the object's identity color. The uniform shape for every
-    /// cross-reference (`chunk[0xN]`, `str[0xN]`, …).
+    /// cross-reference (`chunk[0xN]`, `intern[0xN]`, …).
     fn storeRef(self: *Line, kw: []const u8, id_color: [3]u8, comptime id_fmt: []const u8, id_args: anytype) void {
         self.tint(store_kw_color, "{s}", .{kw});
         self.glue("[", .{});
@@ -862,6 +863,18 @@ pub fn builtinName(id: u64) ?[]const u8 {
     return null;
 }
 
+/// Human-facing type spelling shared by disassembly and VM value views.
+pub fn valueKindLabel(kind: ValueType) []const u8 {
+    return switch (kind) {
+        .bool_false, .bool_true => "bool",
+        .builtin_closure => "builtin closure",
+        .string_context => "context string",
+        .boxed_int => "boxed int",
+        .partial_app => "partial application",
+        else => @tagName(kind),
+    };
+}
+
 /// Escape `text` (middle-truncated at `max`) into `buf`, returning the slice.
 fn escSnippet(buf: []u8, text: []const u8, max: usize) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -869,48 +882,72 @@ fn escSnippet(buf: []u8, text: []const u8, max: usize) []const u8 {
     return w.buffered();
 }
 
-/// Token form of `writeStringRef`: `str[0xN] → "text"`, the id and the
-/// resolved text in the intern id's identity color.
-fn lineStringRef(l: *Line, kind: []const u8, id: InternId, symbols: Symbols, max: usize) void {
+/// Token form of an intern-backed value: `intern[0xN] → type "text"`.
+/// The address leads, while the type and resolved text describe its value.
+fn lineInternValue(l: *Line, kind: []const u8, id: InternId, symbols: Symbols, max: usize) void {
     const c = internColor(id);
-    l.storeRef(kind, c, "0x{x}", .{id});
+    l.storeRef("intern", c, "0x{x}", .{id});
+    l.glue(" → ", .{});
     if (symbols.internName(id)) |text| {
         var buf: [128]u8 = undefined;
-        l.glue(" → ", .{});
-        l.tint(c, "\"{s}\"", .{escSnippet(&buf, text, max)});
+        l.tint(c, "{s} \"{s}\"", .{ kind, escSnippet(&buf, text, max) });
+    } else {
+        l.tint(c, "{s}", .{kind});
     }
 }
 
-/// Token form of `writeValueDigest`: `type[accessor] → value` with identity
-/// colors, for mnemonic-line comments.
+fn lineLocatedValue(l: *Line, store: []const u8, id: u64, identity: Identity, description: []const u8) void {
+    const c = identityColor(identity, id);
+    l.storeRef(store, c, "0x{x}", .{id});
+    l.glue(" → ", .{});
+    l.tint(c, "{s}", .{description});
+}
+
+fn shortFloat(buf: []u8, value: f64) []const u8 {
+    const number = std.fmt.bufPrint(buf, "{d:.3}", .{value}) catch return "?";
+    if (!std.math.isFinite(value)) return number;
+    const rounded = std.fmt.parseFloat(f64, number) catch value;
+    if (rounded == value) return number;
+    if (number.len == buf.len) return number;
+    std.mem.copyBackwards(u8, buf[1 .. number.len + 1], number);
+    buf[0] = '~';
+    return buf[0 .. number.len + 1];
+}
+
+/// Token form of `writeValueDigest`: `location → type → description` with
+/// identity colors, for mnemonic-line comments. Inline scalars have no
+/// location and begin with their type.
 fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
     switch (value.kind()) {
         .null => l.glue("null", .{}),
-        .bool_true => l.glue("true", .{}),
-        .bool_false => l.glue("false", .{}),
+        .bool_true => l.glue("bool true", .{}),
+        .bool_false => l.glue("bool false", .{}),
         .int => l.glue("int {d}", .{value.asInt()}),
-        .float => l.glue("float {d}", .{value.asFloat()}),
-        .string => lineStringRef(l, "str", value.asInternId(), symbols, max),
-        .path => lineStringRef(l, "path", value.asInternId(), symbols, max),
-        .list => l.storeRef("list", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
-        .attrs => l.storeRef("attrs", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .float => {
+            var buf: [64]u8 = undefined;
+            l.glue("float {s}", .{shortFloat(&buf, value.asFloat())});
+        },
+        .string => lineInternValue(l, "string", value.asInternId(), symbols, max),
+        .path => lineInternValue(l, "path", value.asInternId(), symbols, max),
+        .list => lineLocatedValue(l, "objects", value.asObjectId(), .object, "list"),
+        .attrs => lineLocatedValue(l, "objects", value.asObjectId(), .object, "attrs"),
         .closure => if (value.isFunction())
-            l.storeRef("function", objColor(value.asFunctionChunkId()), "0x{x}", .{value.asFunctionChunkId()})
+            lineLocatedValue(l, "chunk", value.asFunctionChunkId(), .chunk, "function")
         else
-            l.storeRef("closure", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
-        .thunk => l.storeRef("thunk", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+            lineLocatedValue(l, "objects", value.asObjectId(), .object, "closure"),
+        .thunk => lineLocatedValue(l, "objects", value.asObjectId(), .object, "thunk"),
         .builtin => {
             const bid = value.asBuiltinId();
             l.storeRef("builtin", identityColor(.builtin, bid), "0x{x}", .{bid});
             if (builtinName(bid)) |nm| {
                 l.glue(" → ", .{});
-                l.tint(heapColor(bid), "{s}", .{nm});
+                l.tint(identityColor(.builtin, bid), "{s}", .{nm});
             }
         },
-        .builtin_closure => l.storeRef("builtin_closure", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
-        .string_context => l.storeRef("string_ctx", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
-        .boxed_int => l.storeRef("boxed_int", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
-        .partial_app => l.storeRef("partial_app", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .builtin_closure => lineLocatedValue(l, "objects", value.asObjectId(), .object, "builtin closure"),
+        .string_context => lineLocatedValue(l, "objects", value.asObjectId(), .object, "context string"),
+        .boxed_int => lineLocatedValue(l, "objects", value.asObjectId(), .object, "boxed int"),
+        .partial_app => lineLocatedValue(l, "objects", value.asObjectId(), .object, "partial application"),
     }
 }
 
@@ -1177,7 +1214,7 @@ fn headInterp(l: *Line, f: Operand, chunk: *const Chunk, code: []const u8, off: 
         },
         .intern => |w| {
             const id: InternId = readWidth(w, code, off);
-            lineStringRef(l, "str", id, symbols, snippet_max);
+            lineInternValue(l, "string", id, symbols, snippet_max);
         },
         .count => |c| {
             l.tint(color, "{d}", .{readWidth(c.w, code, off)});
@@ -1435,7 +1472,7 @@ fn writeOperandTail(
                 l.glue(" ", .{});
                 l.group(id_len, 2, "#{d}", .{slot});
                 l.comment();
-                l.storeRef("str", c, "0x{x}", .{id});
+                l.storeRef("intern", c, "0x{x}", .{id});
                 if (ew.end > 0) {
                     l.glue(" → ", .{});
                     l.tint(c, "\"{s}\"", .{esc[0..ew.end]});
@@ -1824,15 +1861,15 @@ fn writeSlotAttr(writer: *std.Io.Writer, role: []const u8, slot: u16, id: Intern
 }
 
 /// An interned-name operand: the raw id as the value, then the full lookup
-/// chain — `str[0xN] → "text"` — as the interpretation, so the intern id is
+/// chain — `intern[0xN] → "text"` — as the interpretation, so the intern id is
 /// explicit in the comment and matches the constant-pool rendering.
 fn writeInternRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols) !void {
     if (symbols.internName(id)) |name| {
-        try writer.print("0x{x} ; str[0x{x}] → \"", .{ id, id });
+        try writer.print("0x{x} ; intern[0x{x}] → \"", .{ id, id });
         try writeEscapedSnippet(writer, name, snippet_max);
         try writer.writeByte('"');
     } else {
-        try writer.print("0x{x} ; str[0x{x}]", .{ id, id });
+        try writer.print("0x{x} ; intern[0x{x}]", .{ id, id });
     }
 }
 
@@ -1916,42 +1953,61 @@ pub fn writeStoreRange(
     if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
 }
 
-/// `type[accessor] → value` digest of a constant. Interned strings/paths render
-/// the full lookup chain — `str[0xN] → "text"` — with the intern id in its
-/// identity color (matching every other occurrence of that id) when `color_depth`.
-/// `max` caps string length.
+/// A compact `location → type → description` value. Store-backed values lead
+/// with their canonical address (`objects`, `chunk`, `intern`, or `builtin`);
+/// inline scalars begin with their type. `max` caps resolved string contents.
 pub fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max: usize, color_depth: ColorDepth) !void {
     switch (value.kind()) {
         .null => try writer.writeAll("null"),
-        .bool_true => try writer.writeAll("true"),
-        .bool_false => try writer.writeAll("false"),
+        .bool_true => try writer.writeAll("bool true"),
+        .bool_false => try writer.writeAll("bool false"),
         .int => try writer.print("int {d}", .{value.asInt()}),
-        .float => try writer.print("float {d}", .{value.asFloat()}),
-        .string => try writeStringRef(writer, "str", value.asInternId(), symbols, max, color_depth),
-        .path => try writeStringRef(writer, "path", value.asInternId(), symbols, max, color_depth),
-        .list => try writeStoreRef(writer, "list", value.asObjectId(), .object, null, color_depth),
-        .attrs => try writeStoreRef(writer, "attrs", value.asObjectId(), .object, null, color_depth),
+        .float => {
+            var buf: [64]u8 = undefined;
+            try writer.print("float {s}", .{shortFloat(&buf, value.asFloat())});
+        },
+        .string => try writeInternValue(writer, "string", value.asInternId(), symbols, max, color_depth),
+        .path => try writeInternValue(writer, "path", value.asInternId(), symbols, max, color_depth),
+        .list => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "list", color_depth),
+        .attrs => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "attrs", color_depth),
         .closure => if (value.isFunction())
-            try writeStoreRef(writer, "function", value.asFunctionChunkId(), .chunk, null, color_depth)
+            try writeStoreRef(writer, "chunk", value.asFunctionChunkId(), .chunk, "function", color_depth)
         else
-            try writeStoreRef(writer, "closure", value.asObjectId(), .object, null, color_depth),
-        .thunk => try writeStoreRef(writer, "thunk", value.asObjectId(), .object, null, color_depth),
+            try writeStoreRef(writer, "objects", value.asObjectId(), .object, "closure", color_depth),
+        .thunk => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "thunk", color_depth),
         .builtin => {
             const bid = value.asBuiltinId();
             try writeStoreRef(writer, "builtin", bid, .builtin, builtinName(bid), color_depth);
         },
-        .builtin_closure => try writeStoreRef(writer, "builtin_closure", value.asObjectId(), .object, null, color_depth),
-        .string_context => try writeStoreRef(writer, "string_ctx", value.asObjectId(), .object, null, color_depth),
-        .boxed_int => try writeStoreRef(writer, "boxed_int", value.asObjectId(), .object, null, color_depth),
-        .partial_app => try writeStoreRef(writer, "partial_app", value.asObjectId(), .object, null, color_depth),
+        .builtin_closure => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "builtin closure", color_depth),
+        .string_context => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "context string", color_depth),
+        .boxed_int => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "boxed int", color_depth),
+        .partial_app => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "partial application", color_depth),
     }
 }
 
-fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols, max: usize, color_depth: ColorDepth) !void {
-    try writeStoreRef(writer, kind, id, .intern, null, color_depth);
+fn writeInternValue(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols, max: usize, color_depth: ColorDepth) !void {
+    try writeStoreRef(writer, "intern", id, .intern, null, color_depth);
+    try setCommentFg(writer, color_depth);
+    try writer.writeAll(" → ");
+    if (color_depth.enabled()) try setFg(writer, internColor(id), color_depth);
+    try writer.writeAll(kind);
+    if (symbols.internName(id)) |text| {
+        try writer.writeAll(" \"");
+        try writeEscapedSnippet(writer, text, max);
+        try writer.writeByte('"');
+    }
+    if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
+}
+
+/// A canonical intern-table reference used for names rather than values.
+fn writeInternNameRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols, max: usize, color_depth: ColorDepth) !void {
+    try writeStoreRef(writer, "intern", id, .intern, null, color_depth);
     if (symbols.internName(id)) |text| {
         try setCommentFg(writer, color_depth);
-        try writer.writeAll(" → \"");
+        try writer.writeAll(" → ");
+        if (color_depth.enabled()) try setFg(writer, internColor(id), color_depth);
+        try writer.writeByte('"');
         try writeEscapedSnippet(writer, text, max);
         try writer.writeByte('"');
         if (color_depth.enabled()) try writer.writeAll("\x1b[0m");
@@ -2254,4 +2310,66 @@ test "canonical store references and half-open ranges" {
     out.clearRetainingCapacity();
     try writeEscapedSnippet(&out.writer, "ab中def", 5);
     try std.testing.expectEqualStrings("ab中…", out.written());
+}
+
+test "value digests use canonical location-first references" {
+    var intern = try InternTable.init(std.testing.allocator);
+    defer intern.deinit();
+    const text_id = try intern.intern("hello");
+    const symbols: Symbols = .{ .intern = &intern };
+
+    const Case = struct {
+        value: Value,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .value = Value.boolVal(true), .expected = "bool true" },
+        .{ .value = Value.int(7), .expected = "int 7" },
+        .{ .value = Value.float(1.0 / 3.0), .expected = "float ~0.333" },
+        .{ .value = Value.list(0x12), .expected = "objects[0x12] → list" },
+        .{ .value = Value.attrs(0x13), .expected = "objects[0x13] → attrs" },
+        .{ .value = Value.function(0xa), .expected = "chunk[0xa] → function" },
+        .{ .value = Value.closure(0x14), .expected = "objects[0x14] → closure" },
+        .{ .value = Value.thunk(0x15), .expected = "objects[0x15] → thunk" },
+        .{ .value = Value.builtin(0x20), .expected = "builtin[0x20] → import" },
+        .{ .value = Value.builtinClosure(0x16), .expected = "objects[0x16] → builtin closure" },
+        .{ .value = Value.contextString(0x17), .expected = "objects[0x17] → context string" },
+        .{ .value = Value.boxedInt(0x18), .expected = "objects[0x18] → boxed int" },
+        .{ .value = Value.partialApp(0x19), .expected = "objects[0x19] → partial application" },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    for (cases) |case| {
+        out.clearRetainingCapacity();
+        try writeValueDigest(&out.writer, case.value, symbols, 40, .none);
+        try std.testing.expectEqualStrings(case.expected, out.written());
+    }
+
+    out.clearRetainingCapacity();
+    try writeValueDigest(&out.writer, Value.string(text_id), symbols, 40, .none);
+    var expected: [128]u8 = undefined;
+    const expected_text = try std.fmt.bufPrint(&expected, "intern[0x{x}] → string \"hello\"", .{text_id});
+    try std.testing.expectEqualStrings(expected_text, out.written());
+}
+
+test "constant comments use the same location-first value grammar" {
+    var builder = try ChunkBuilder.init(std.testing.allocator);
+    defer builder.deinit(std.testing.allocator);
+
+    try builder.emitConstant(std.testing.allocator, Value.list(0x12));
+    try builder.emitConstant(std.testing.allocator, Value.function(0xa));
+    try builder.writeOp(std.testing.allocator, .ret);
+    try builder.writeOp(std.testing.allocator, .halt);
+
+    var chunk = try builder.finish(std.testing.allocator, 0);
+    defer chunk.deinit(std.testing.allocator);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeChunk(std.testing.allocator, &out.writer, null, &chunk, .{}, .{});
+
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "objects[0x12] → list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "chunk[0xa] → function") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "list[0x12]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "function[0xa]") == null);
 }

@@ -67,7 +67,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     if (options.disasm_eval) ev.setParallelismToggles(true, true);
     // Best-effort chunk naming: attribute each lambda/thunk chunk to the attr
     // or let binding it was compiled for, so the disassembly headers read like
-    // `chunk #42 fetchGit`. Safe here — disasm compiles single-threaded.
+    // `chunk[0x2a] fetchGit`. Safe here — disasm compiles single-threaded.
     ev.setCaptureChunkNames(true);
 
     if (runner.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
@@ -101,7 +101,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         if (options.disasm_chunk) |id| {
             target_id = id;
             target_chunk = ev.getChunk(id) orelse {
-                std.debug.print("error: chunk #{d} not found\n", .{id});
+                std.debug.print("error: chunk[0x{x}] not found\n", .{id});
                 return 1;
             };
         }
@@ -112,7 +112,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         };
         target_id = options.disasm_chunk orelse top_id;
         target_chunk = ev.getChunk(target_id) orelse {
-            std.debug.print("error: chunk #{d} not found\n", .{target_id});
+            std.debug.print("error: chunk[0x{x}] not found\n", .{target_id});
             return 1;
         };
     }

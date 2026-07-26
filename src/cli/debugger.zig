@@ -306,7 +306,7 @@ pub const Console = struct {
             try w.print("  {s} @ 0x{x}", .{ name, f.instruction.? });
             try presentation.reset(w, self.use_color);
         }
-        try w.print("  (chunk #{d})\n", .{f.chunk_id});
+        try w.print("  (chunk[0x{x}])\n", .{f.chunk_id});
     }
 
     fn locals(self: *Console, s: *DebugSession) !void {

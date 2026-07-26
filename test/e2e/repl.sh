@@ -45,6 +45,10 @@ t "bare: :vm prints a chunk" "chunk[0x" "$out"
 out=$(printf ':vm x: x + 1\n' | "$FIX" repl 2>/dev/null)
 t "bare: :vm shows opcodes" "int_add" "$out"
 
+out=$(printf ':vm "hello"\n' | "$FIX" repl --color=never 2>/dev/null)
+t "bare: :vm values lead with intern location" "intern[0x" "$out"
+t "bare: :vm intern value includes type and text" '→ string "hello"' "$out"
+
 out=$(printf ':vm x: x + 1\n:vm\n' | "$FIX" repl 2>/dev/null)
 chunks=$(grep -c 'chunk\[0x' <<<"$out")
 if ((chunks >= 2)); then
@@ -72,6 +76,14 @@ else
     fail "bare: :vm heap emitted $heap_lines lines"
 fi
 
+out=$(printf '1\n:vm objects 0 3\n' | "$FIX" repl --bare --color=never 2>/dev/null)
+t "bare: :vm object rows lead with location" "objects[0x0] →" "$out"
+if [[ "$out" == *"list[0x"* || "$out" == *"attrs[0x"* || "$out" == *"thunk[0x"* ]]; then
+    fail "bare: :vm object rows used a type as a store"
+else
+    pass "bare: :vm object rows use canonical stores"
+fi
+
 # The automation frontend remains line-oriented while exercising the same
 # entry stop, deferred import stepping, pending breakpoints, and logical stack.
 # Crossing the import boundary takes two steps: push_const -> the import `call`,
@@ -89,10 +101,10 @@ else
 fi
 
 out=$(printf ':i builtins.map\n' | "$FIX" repl 2>/dev/null)
-t "bare: :i function" "a function" "$out"
+t "bare: :i function" "→ map" "$out"
 
 out=$(printf 'f = x: x * 2\n:i f\n' | "$FIX" repl 2>/dev/null)
-t "bare: :i closure shows chunk" "closure: chunk #" "$out"
+t "bare: :i closure shows chunk" "chunk[0x" "$out"
 
 out=$(printf ':q\n1 + 1\n' | "$FIX" repl 2>/dev/null)
 if [[ "$out" == *"2"* ]]; then
@@ -304,8 +316,8 @@ out=$(
     ) |
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
-t "tty debug: return uses canonical value rendering" "⇒ function → chunk[0x" "$out"
-if [[ "$out" == *$'\x1b[1;7m⇒ function → chunk[0x'* && "$out" == *$'\x1b[1;4m⇒ function → chunk[0x'* ]]; then
+t "tty debug: return uses canonical value rendering" "⇒ chunk[0x" "$out"
+if [[ "$out" == *$'\x1b[1;7m⇒ chunk[0x'*$' → function'* && "$out" == *$'\x1b[1;4m⇒ chunk[0x'*$' → function'* ]]; then
     pass "tty debug: return value flashes once then remains emphasized"
 else
     fail "tty debug: return value did not show flash and settled styles"

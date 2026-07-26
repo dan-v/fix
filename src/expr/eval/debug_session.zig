@@ -6,6 +6,7 @@ const runtime = @import("runtime");
 const types = runtime.types;
 const Value = runtime.value.Value;
 const bytecode = @import("../bytecode.zig");
+const disasm = @import("../tooling/bytecode/disasm.zig");
 const compiler = @import("../compiler.zig");
 const VM = @import("../vm.zig").VM;
 const vm_force = @import("../vm.zig").force;
@@ -95,48 +96,19 @@ pub fn frameSourceText(ctx: Context, i: usize) ?[]const u8 {
 /// results useful as stable targets for deeper heap inspection while scalars
 /// retain their actual value.
 pub fn writeValueSummary(ctx: Context, writer: *std.Io.Writer, value: Value) !void {
-    switch (value.kind()) {
-        .null => try writer.writeAll("null"),
-        .bool_false => try writer.writeAll("false"),
-        .bool_true => try writer.writeAll("true"),
-        .int => try writer.print("{d}", .{value.asInt()}),
-        .boxed_int => try writer.print("{d}", .{ctx.heap.getBoxedInt(value.asObjectId()) catch return error.InvalidObjectType}),
-        .float => try writer.print("{d}", .{value.asFloat()}),
-        .string => try writeQuotedSummary(writer, ctx.intern.get(value.asInternId())),
-        .path => {
-            try writer.writeAll("path ");
-            try writeQuotedSummary(writer, ctx.intern.get(value.asInternId()));
-        },
-        .list => try writer.print("list #{d}", .{value.asObjectId()}),
-        .attrs => try writer.print("attrs #{d}", .{value.asObjectId()}),
-        .closure => if (value.isFunction())
-            try writer.print("function chunk #{d}", .{value.asFunctionChunkId()})
-        else
-            try writer.print("closure #{d}", .{value.asObjectId()}),
-        .thunk => try writer.print("thunk #{d}", .{value.asObjectId()}),
-        .builtin => try writer.print("builtin #{d}", .{value.asBuiltinId()}),
-        .builtin_closure => try writer.print("builtin closure #{d}", .{value.asObjectId()}),
-        .string_context => try writer.print("context string #{d}", .{value.asObjectId()}),
-        .partial_app => try writer.print("partial application #{d}", .{value.asObjectId()}),
+    if (value.kind() == .boxed_int) {
+        const number = ctx.heap.getBoxedInt(value.asObjectId()) catch return error.InvalidObjectType;
+        var preview_buf: [64]u8 = undefined;
+        const preview = std.fmt.bufPrint(&preview_buf, "int {d}", .{number}) catch "boxed int";
+        return disasm.writeStoreRef(writer, "objects", value.asObjectId(), .object, preview, .none);
     }
-}
-
-fn writeQuotedSummary(writer: *std.Io.Writer, text: []const u8) !void {
-    const max_bytes = 96;
-    var shown = text[0..@min(text.len, max_bytes)];
-    while (!std.unicode.utf8ValidateSlice(shown)) shown = shown[0 .. shown.len - 1];
-
-    try writer.writeByte('"');
-    for (shown) |byte| switch (byte) {
-        '\\' => try writer.writeAll("\\\\"),
-        '"' => try writer.writeAll("\\\""),
-        '\n' => try writer.writeAll("\\n"),
-        '\r' => try writer.writeAll("\\r"),
-        '\t' => try writer.writeAll("\\t"),
-        else => try writer.writeByte(byte),
-    };
-    if (shown.len < text.len) try writer.writeAll("…");
-    try writer.writeByte('"');
+    try disasm.writeValueDigest(
+        writer,
+        value,
+        .{ .intern = ctx.intern, .registry = ctx.registry },
+        96,
+        .none,
+    );
 }
 
 pub fn step(ctx: Context, kind: StepKind) !void {

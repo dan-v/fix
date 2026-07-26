@@ -1141,7 +1141,10 @@ const Tui = struct {
                 .actions = page.actions.items,
             };
         };
-        try page.line(try std.fmt.allocPrint(arena, "objects[0x{x}] → {s}", .{ id, @tagName(info) }), .none);
+        try page.line(
+            try self.canonicalStoreRef(arena, .objects, id, try self.objectSummary(arena, id, 64), true),
+            .none,
+        );
         try page.line("", .none);
         switch (info) {
             .list => {
@@ -1161,11 +1164,18 @@ const Tui = struct {
                 if (merge.flattened) |flat| try self.appendObjectRef(&page, "flattened", flat) else try page.line("flattened   not materialized", .none);
             },
             .closure => |closure| {
-                try page.line(try std.fmt.allocPrint(arena, "chunk       chunk[0x{x}]", .{closure.chunk}), .{ .chunk = closure.chunk });
+                try page.line(
+                    try std.fmt.allocPrint(arena, "chunk       {s}", .{
+                        try self.locatedValue(arena, "chunk", closure.chunk, .chunk, null, 64, true),
+                    }),
+                    .{ .chunk = closure.chunk },
+                );
                 try page.line(try std.fmt.allocPrint(arena, "upvalues    {d}", .{closure.upvalues}), .none);
             },
             .builtin_closure => |closure| {
-                try page.line(try std.fmt.allocPrint(arena, "builtin     {s}", .{try builtinText(arena, closure.builtin)}), .none);
+                try page.line(try std.fmt.allocPrint(arena, "builtin     {s}", .{
+                    try self.locatedValue(arena, "builtin", closure.builtin, .builtin, disasm.builtinName(closure.builtin), 64, true),
+                }), .none);
                 try page.line(try std.fmt.allocPrint(arena, "arguments   {d}", .{closure.args}), .none);
             },
             .thunk => |thunk| {
@@ -1177,13 +1187,22 @@ const Tui = struct {
                     .target => |target| switch (target) {
                         .closure => |value| try self.appendValueRef(&page, "closure", value),
                         .bytecode => |body| {
-                            try page.line(try std.fmt.allocPrint(arena, "chunk       chunk[0x{x}]", .{body.chunk}), .{ .chunk = body.chunk });
+                            try page.line(
+                                try std.fmt.allocPrint(arena, "chunk       {s}", .{
+                                    try self.locatedValue(arena, "chunk", body.chunk, .chunk, null, 64, true),
+                                }),
+                                .{ .chunk = body.chunk },
+                            );
                             try page.line(try std.fmt.allocPrint(arena, "captures    {d}", .{body.captures}), .none);
                         },
                         .pass_through => |value| try self.appendValueRef(&page, "value", value),
                         .attr_access => |access| {
                             try self.appendValueRef(&page, "base", access.base);
-                            try page.line(try std.fmt.allocPrint(arena, "attribute   intern[0x{x}]", .{access.name}), .none);
+                            const attribute = try self.renderValueRef(arena, .{
+                                .kind = .string,
+                                .target = .{ .intern = access.name },
+                            }, 64, true);
+                            try page.line(try std.fmt.allocPrint(arena, "attribute   {s}", .{attribute.text}), .none);
                         },
                         .deferred => |body| {
                             try page.line(try std.fmt.allocPrint(arena, "deferred[0x{x}]", .{body.id}), .none);
@@ -1193,7 +1212,11 @@ const Tui = struct {
                 }
             },
             .context_string => |string| {
-                try page.line(try std.fmt.allocPrint(arena, "text        intern[0x{x}]", .{string.text}), .none);
+                const text = try self.renderValueRef(arena, .{
+                    .kind = .string,
+                    .target = .{ .intern = string.text },
+                }, 64, true);
+                try page.line(try std.fmt.allocPrint(arena, "text        {s}", .{text.text}), .none);
                 try page.line(try std.fmt.allocPrint(arena, "context     {d} entries", .{string.context}), .none);
             },
             .boxed_int => |value| try page.line(try std.fmt.allocPrint(arena, "value       {d}", .{value}), .none),
@@ -1403,7 +1426,7 @@ const Tui = struct {
     fn appendObjectRef(self: *Tui, page: *PageBuilder, label: []const u8, id: runtime.types.ObjectId) !void {
         try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{
             label,
-            try self.canonicalStoreRef(page.arena, .objects, id, null, true),
+            try self.canonicalStoreRef(page.arena, .objects, id, try self.objectSummary(page.arena, id, 48), true),
         }), .{ .object = id });
     }
 
@@ -1412,15 +1435,7 @@ const Tui = struct {
     /// kinds. Inline scalars carry their data in the `Value` itself, so this is
     /// safe on a raw store slot without any heap deref or forcing.
     fn appendValueDetail(self: *Tui, page: *PageBuilder, label: []const u8, value: runtime.value.Value) !void {
-        const arena = page.arena;
-        try page.line(try std.fmt.allocPrint(arena, "kind   {s}", .{@tagName(value.kind())}), .none);
-        switch (value.kind()) {
-            .null, .bool_false, .bool_true, .int, .float, .string, .path => try page.line(
-                try std.fmt.allocPrint(arena, "{s:<12} {s}", .{ label, try self.valueSummary(arena, value, 64) }),
-                .none,
-            ),
-            else => try self.appendValueRef(page, label, self.ev.valueRef(value)),
-        }
+        try self.appendValueLine(page, try std.fmt.allocPrint(page.arena, "{s:<12} ", .{label}), value);
     }
 
     /// One navigable line for a `Value`: `<prefix><digest>[ → store[0xN]]`.
@@ -1451,69 +1466,125 @@ const Tui = struct {
         const ref = self.ev.valueRef(value);
         return switch (ref.target) {
             .object => |id| blk: {
-                const preview = try self.objectTargetSummary(arena, value.kind(), id, 38);
+                const preview = try self.objectTargetSummary(arena, value.kind(), id, max_cells);
                 break :blk .{
                     .action = .{ .object = id },
-                    .text = try std.fmt.allocPrint(arena, "{s} → {s}", .{
-                        @tagName(value.kind()),
-                        try self.canonicalStoreRef(arena, .objects, id, preview, colored),
-                    }),
+                    .text = try self.locatedValue(
+                        arena,
+                        "objects",
+                        id,
+                        .object,
+                        preview,
+                        max_cells,
+                        colored,
+                    ),
                 };
             },
             .chunk => |id| blk: {
-                var rendered: std.Io.Writer.Allocating = .init(arena);
-                try disasm.writeStoreRef(
-                    &rendered.writer,
-                    "chunk",
-                    id,
-                    .chunk,
-                    null,
-                    if (colored) self.color_depth else .none,
-                );
                 break :blk .{
                     .action = .{ .chunk = id },
-                    .text = try std.fmt.allocPrint(arena, "{s} → {s}", .{
-                        if (value.kind() == .closure and value.isFunction()) "function" else @tagName(value.kind()),
-                        rendered.written(),
-                    }),
+                    .text = try self.locatedValue(
+                        arena,
+                        "chunk",
+                        id,
+                        .chunk,
+                        if (value.kind() == .closure and value.isFunction()) "function" else disasm.valueKindLabel(value.kind()),
+                        max_cells,
+                        colored,
+                    ),
                 };
+            },
+            .intern => |id| blk: {
+                const preview = try escapedQuoted(
+                    arena,
+                    try std.fmt.allocPrint(arena, "{s} ", .{disasm.valueKindLabel(value.kind())}),
+                    self.ev.internTable().get(id),
+                    self.storePreviewBudget("intern", id, max_cells),
+                );
+                break :blk .{
+                    .action = .none,
+                    .text = try self.locatedValue(arena, "intern", id, .intern, preview, max_cells, colored),
+                };
+            },
+            .builtin => |id| .{
+                .action = .none,
+                .text = try self.locatedValue(
+                    arena,
+                    "builtin",
+                    id,
+                    .builtin,
+                    disasm.builtinName(id),
+                    max_cells,
+                    colored,
+                ),
             },
             else => .{
                 .action = .none,
-                .text = try self.valueSummary(arena, value, max_cells),
+                .text = try self.scalarValueSummary(arena, value, max_cells),
             },
         };
     }
 
     fn appendValueRef(self: *Tui, page: *PageBuilder, label: []const u8, value: runtime.heap.ValueRef) !void {
-        switch (value.target) {
-            .none => try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{ label, @tagName(value.kind) }), .none),
-            .object => |id| try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} → {s}", .{
-                label,
-                @tagName(value.kind),
-                try self.canonicalStoreRef(
-                    page.arena,
-                    .objects,
+        const rendered = try self.renderValueRef(page.arena, value, 64, true);
+        try page.line(
+            try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{ label, rendered.text }),
+            rendered.action,
+        );
+    }
+
+    fn renderValueRef(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        value: runtime.heap.ValueRef,
+        max_cells: usize,
+        colored: bool,
+    ) !RenderedValue {
+        return switch (value.target) {
+            .none => .{ .text = disasm.valueKindLabel(value.kind), .action = .none },
+            .object => |id| .{
+                .text = try self.locatedValue(
+                    arena,
+                    "objects",
                     id,
-                    try self.objectTargetSummary(page.arena, value.kind, id, 38),
-                    true,
+                    .object,
+                    try self.objectTargetSummary(arena, value.kind, id, max_cells),
+                    max_cells,
+                    colored,
                 ),
-            }), .{ .object = id }),
-            .chunk => |id| {
-                var rendered: std.Io.Writer.Allocating = .init(page.arena);
-                try disasm.writeStoreRef(&rendered.writer, "chunk", id, .chunk, null, self.color_depth);
-                try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} → {s}", .{ label, @tagName(value.kind), rendered.written() }), .{ .chunk = id });
+                .action = .{ .object = id },
             },
-            .intern => |id| {
-                var rendered: std.Io.Writer.Allocating = .init(page.arena);
-                try disasm.writeStoreRef(&rendered.writer, "intern", id, .intern, null, self.color_depth);
-                try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s} → {s}", .{ label, @tagName(value.kind), rendered.written() }), .none);
+            .chunk => |id| blk: {
+                break :blk .{
+                    .text = try self.locatedValue(
+                        arena,
+                        "chunk",
+                        id,
+                        .chunk,
+                        if (value.kind == .closure) "function" else disasm.valueKindLabel(value.kind),
+                        max_cells,
+                        colored,
+                    ),
+                    .action = .{ .chunk = id },
+                };
             },
-            .builtin => |id| try page.line(
-                try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{ label, try builtinText(page.arena, id) }),
-                .none,
-            ),
-        }
+            .intern => |id| blk: {
+                const preview = try escapedQuoted(
+                    arena,
+                    try std.fmt.allocPrint(arena, "{s} ", .{disasm.valueKindLabel(value.kind)}),
+                    self.ev.internTable().get(id),
+                    self.storePreviewBudget("intern", id, max_cells),
+                );
+                break :blk .{
+                    .text = try self.locatedValue(arena, "intern", id, .intern, preview, max_cells, colored),
+                    .action = .none,
+                };
+            },
+            .builtin => |id| .{
+                .text = try self.locatedValue(arena, "builtin", id, .builtin, disasm.builtinName(id), max_cells, colored),
+                .action = .none,
+            },
+        };
     }
 
     fn appendDisassembly(self: *Tui, page: *PageBuilder, id: ChunkId, chunk: *const bytecode.Chunk, panel: Panel) !void {
@@ -3669,14 +3740,14 @@ const Tui = struct {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " attrs · {d} members", .{attrs.len}));
                     for (attrs, 0..) |entry, i| {
                         if (i >= 12) break;
-                        const detail = if (try self.scalarText(arena, entry.value)) |s| s else @tagName(entry.value.kind());
+                        const detail = try self.shallowValueSummary(arena, entry.value, 44);
                         try lines.append(arena, try std.fmt.allocPrint(arena, "  {s} = {s}", .{ self.ev.internTable().get(entry.name), detail }));
                     }
                 } else |_| if (self.ev.heapListOf(id)) |items| {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " list · {d} items", .{items.len}));
                     for (items, 0..) |item, i| {
                         if (i >= 12) break;
-                        const detail = if (try self.scalarText(arena, item)) |s| s else @tagName(item.kind());
+                        const detail = try self.shallowValueSummary(arena, item, 48);
                         try lines.append(arena, try std.fmt.allocPrint(arena, "  [{d}] {s}", .{ i, detail }));
                     }
                 } else |_| {
@@ -3771,17 +3842,28 @@ const Tui = struct {
                             if (self.ev.getChunk(body.chunk)) |chunk|
                                 try self.appendChunkCodePreview(lines, arena, body.chunk, chunk, 10);
                         },
-                        .closure => |value| try lines.append(arena, try std.fmt.allocPrint(arena, " closure {s}", .{@tagName(value.kind)})),
-                        .pass_through => |value| try lines.append(arena, try std.fmt.allocPrint(arena, " value {s}", .{@tagName(value.kind)})),
+                        .closure => |value| {
+                            const rendered = try self.renderValueRef(arena, value, 52, true);
+                            try lines.append(arena, try std.fmt.allocPrint(arena, " closure {s}", .{rendered.text}));
+                        },
+                        .pass_through => |value| {
+                            const rendered = try self.renderValueRef(arena, value, 52, true);
+                            try lines.append(arena, try std.fmt.allocPrint(arena, " value {s}", .{rendered.text}));
+                        },
                         .attr_access => |access| try lines.append(arena, try std.fmt.allocPrint(arena, " attribute intern[0x{x}]", .{access.name})),
                         .deferred => |body| try lines.append(arena, try std.fmt.allocPrint(arena, " deferred[0x{x}] · {d} captures", .{ body.id, body.captures })),
                     },
-                    .result => |value| try lines.append(arena, try std.fmt.allocPrint(arena, " result {s}", .{@tagName(value.kind)})),
+                    .result => |value| {
+                        const rendered = try self.renderValueRef(arena, value, 52, true);
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " result {s}", .{rendered.text}));
+                    },
                     .error_name => |name| try lines.append(arena, try std.fmt.allocPrint(arena, " error {s}", .{name})),
                 }
             },
             .builtin_closure => |closure| {
-                try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{try builtinText(arena, closure.builtin)}));
+                try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
+                    try self.locatedValue(arena, "builtin", closure.builtin, .builtin, disasm.builtinName(closure.builtin), 56, true),
+                }));
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {d} arguments", .{closure.args}));
             },
             .closure => |closure| if (self.ev.getChunk(closure.chunk)) |chunk|
@@ -3814,6 +3896,42 @@ const Tui = struct {
             id,
             identityForStore(view),
             preview,
+            if (colored) self.color_depth else .none,
+        );
+        return rendered.written();
+    }
+
+    fn storePreviewBudget(self: *Tui, store: []const u8, id: u64, max_cells: usize) usize {
+        _ = self;
+        var location_buf: [64]u8 = undefined;
+        const location = std.fmt.bufPrint(&location_buf, "{s}[0x{x}] → ", .{ store, id }) catch return max_cells;
+        return max_cells -| width_mod.strWidth(location);
+    }
+
+    /// Render a store-backed value in canonical address-first order. The
+    /// preview is bounded before color escapes are introduced, so truncation
+    /// remains terminal-cell-aware.
+    fn locatedValue(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        store: []const u8,
+        id: u64,
+        identity: disasm.Identity,
+        preview: ?[]const u8,
+        max_cells: usize,
+        colored: bool,
+    ) ![]const u8 {
+        const bounded = if (preview) |text|
+            try width_mod.endEllipsis(arena, text, self.storePreviewBudget(store, id, max_cells))
+        else
+            null;
+        var rendered: std.Io.Writer.Allocating = .init(arena);
+        try disasm.writeStoreRef(
+            &rendered.writer,
+            store,
+            id,
+            identity,
+            bounded,
             if (colored) self.color_depth else .none,
         );
         return rendered.written();
@@ -3863,6 +3981,7 @@ const Tui = struct {
 
     fn floatSummary(arena: std.mem.Allocator, value: f64) ![]const u8 {
         const short = try std.fmt.allocPrint(arena, "{d:.3}", .{value});
+        if (!std.math.isFinite(value)) return std.fmt.allocPrint(arena, "float {s}", .{short});
         const parsed = std.fmt.parseFloat(f64, short) catch value;
         return std.fmt.allocPrint(arena, "float {s}{s}", .{
             if (parsed == value) "" else "~",
@@ -3870,71 +3989,32 @@ const Tui = struct {
         });
     }
 
-    /// A bounded, non-forcing digest. Container membership is already known by
-    /// the heap, so counts and a few inline members are safe to use; no thunk is
-    /// evaluated and no lazy attribute is demanded here.
+    /// A bounded, non-forcing digest using the same address-first grammar as
+    /// locals, stack slots, return values, and disassembly.
     fn valueSummary(self: *Tui, arena: std.mem.Allocator, value: runtime.value.Value, max_cells: usize) ![]const u8 {
+        return (try self.renderValue(arena, value, max_cells, false)).text;
+    }
+
+    fn scalarValueSummary(self: *Tui, arena: std.mem.Allocator, value: runtime.value.Value, max_cells: usize) ![]const u8 {
+        _ = self;
         const raw: []const u8 = switch (value.kind()) {
             .null => "null",
             .bool_false => "bool false",
             .bool_true => "bool true",
             .int => try std.fmt.allocPrint(arena, "int {d}", .{value.asInt()}),
             .float => try floatSummary(arena, value.asFloat()),
-            .string => return escapedQuoted(arena, "string ", self.ev.internTable().get(value.asInternId()), max_cells),
-            .path => return escapedQuoted(arena, "path ", self.ev.internTable().get(value.asInternId()), max_cells),
-            .builtin => blk: {
-                const id = value.asBuiltinId();
-                break :blk if (disasm.builtinName(id)) |name|
-                    try std.fmt.allocPrint(arena, "builtin[0x{x}] → {s}", .{ id, name })
-                else
-                    try std.fmt.allocPrint(arena, "builtin[0x{x}]", .{id});
-            },
-            .list => blk: {
-                const id = value.asObjectId();
-                const items = self.ev.heapListOf(id) catch break :blk try std.fmt.allocPrint(arena, "list → objects[0x{x}]", .{id});
-                var out: std.Io.Writer.Allocating = .init(arena);
-                try out.writer.print("list ({d})", .{items.len});
-                if (items.len > 0) {
-                    try out.writer.writeAll(" [");
-                    for (items[0..@min(items.len, 3)], 0..) |item, i| {
-                        if (i != 0) try out.writer.writeAll(", ");
-                        if (try self.scalarText(arena, item)) |scalar|
-                            try out.writer.writeAll(scalar)
-                        else
-                            try out.writer.writeAll(@tagName(item.kind()));
-                    }
-                    if (items.len > 3) try out.writer.writeAll(", …");
-                    try out.writer.writeByte(']');
-                }
-                break :blk out.written();
-            },
-            .attrs => blk: {
-                const id = value.asObjectId();
-                const attrs = self.ev.heapAttrsOf(id) catch break :blk try std.fmt.allocPrint(arena, "attrs → objects[0x{x}]", .{id});
-                var out: std.Io.Writer.Allocating = .init(arena);
-                try out.writer.print("attrs ({d})", .{attrs.len});
-                if (attrs.len > 0) {
-                    try out.writer.writeAll(" {");
-                    for (attrs[0..@min(attrs.len, 2)], 0..) |attr, i| {
-                        if (i != 0) try out.writer.writeAll(", ");
-                        try out.writer.writeAll(self.ev.internTable().get(attr.name));
-                        if (try self.scalarText(arena, attr.value)) |scalar|
-                            try out.writer.print(" = {s}", .{scalar});
-                    }
-                    if (attrs.len > 2) try out.writer.writeAll(", …");
-                    try out.writer.writeByte('}');
-                }
-                break :blk out.written();
-            },
-            .closure => if (value.isFunction())
-                try std.fmt.allocPrint(arena, "function → chunk[0x{x}]", .{value.asFunctionChunkId()})
-            else
-                try std.fmt.allocPrint(arena, "closure → objects[0x{x}]", .{value.asObjectId()}),
-            .thunk, .builtin_closure, .string_context, .boxed_int, .partial_app => try std.fmt.allocPrint(
-                arena,
-                "{s} → objects[0x{x}]",
-                .{ @tagName(value.kind()), value.asObjectId() },
-            ),
+            .string,
+            .path,
+            .builtin,
+            .list,
+            .attrs,
+            .closure,
+            .thunk,
+            .builtin_closure,
+            .string_context,
+            .boxed_int,
+            .partial_app,
+            => unreachable,
         };
         return width_mod.endEllipsis(arena, raw, max_cells);
     }
@@ -3953,10 +4033,18 @@ const Tui = struct {
                         "attrs",
                     .merge_attrs => |merge| try std.fmt.allocPrint(arena, "attrs merge · depth {d}", .{merge.depth}),
                     .closure => |closure| try std.fmt.allocPrint(arena, "closure → chunk[0x{x}] · {d} upvalues", .{ closure.chunk, closure.upvalues }),
-                    .builtin_closure => |closure| if (disasm.builtinName(closure.builtin)) |name|
-                        try std.fmt.allocPrint(arena, "builtin closure → {s} · {d} args", .{ name, closure.args })
-                    else
-                        try std.fmt.allocPrint(arena, "builtin closure[0x{x}] · {d} args", .{ closure.builtin, closure.args }),
+                    .builtin_closure => |closure| try std.fmt.allocPrint(arena, "builtin closure → {s} · {d} args", .{
+                        try self.locatedValue(
+                            arena,
+                            "builtin",
+                            closure.builtin,
+                            .builtin,
+                            disasm.builtinName(closure.builtin),
+                            max_cells -| 20,
+                            false,
+                        ),
+                        closure.args,
+                    }),
                     .thunk => |thunk| try std.fmt.allocPrint(arena, "thunk · {s}{s}", .{
                         @tagName(thunk.state),
                         if (thunk.demanded) " · demanded" else "",
@@ -3971,9 +4059,9 @@ const Tui = struct {
         return "?";
     }
 
-    /// What lies beyond an `objects[0xN]` reference. The value kind is already
-    /// printed before the store reference, so remove that repeated wrapper and
-    /// continue the chain with the useful payload (`chunk`, state, count, …).
+    /// A useful, non-forcing description for an `objects[0xN]` value. Known
+    /// list/attribute membership can be summarized safely; thunks are never
+    /// forced and lazy attributes are never demanded.
     fn objectTargetSummary(
         self: *Tui,
         arena: std.mem.Allocator,
@@ -3982,31 +4070,41 @@ const Tui = struct {
         max_cells: usize,
     ) !?[]const u8 {
         switch (kind) {
-            .list => if (self.ev.heapListOf(id)) |items|
-                return try std.fmt.allocPrint(arena, "{d} items", .{items.len})
-            else |_| {},
-            .attrs => if (self.ev.heapAttrsOf(id)) |attrs|
-                return try std.fmt.allocPrint(arena, "{d} attrs", .{attrs.len})
-            else |_| {},
+            .list => if (self.ev.heapListOf(id)) |items| {
+                var out: std.Io.Writer.Allocating = .init(arena);
+                try out.writer.print("list ({d})", .{items.len});
+                if (items.len > 0) {
+                    try out.writer.writeAll(" [");
+                    for (items[0..@min(items.len, 3)], 0..) |item, i| {
+                        if (i != 0) try out.writer.writeAll(", ");
+                        try out.writer.writeAll(try self.shallowValueSummary(arena, item, 20));
+                    }
+                    if (items.len > 3) try out.writer.writeAll(", …");
+                    try out.writer.writeByte(']');
+                }
+                return try width_mod.endEllipsis(arena, out.written(), max_cells);
+            } else |_| {},
+            .attrs => if (self.ev.heapAttrsOf(id)) |attrs| {
+                var out: std.Io.Writer.Allocating = .init(arena);
+                try out.writer.print("attrs ({d})", .{attrs.len});
+                if (attrs.len > 0) {
+                    try out.writer.writeAll(" {");
+                    for (attrs[0..@min(attrs.len, 2)], 0..) |attr, i| {
+                        if (i != 0) try out.writer.writeAll(", ");
+                        try out.writer.writeAll(self.ev.internTable().get(attr.name));
+                        if (try self.scalarText(arena, attr.value)) |scalar|
+                            try out.writer.print(" = {s}", .{scalar});
+                    }
+                    if (attrs.len > 2) try out.writer.writeAll(", …");
+                    try out.writer.writeByte('}');
+                }
+                return try width_mod.endEllipsis(arena, out.written(), max_cells);
+            } else |_| {},
             else => {},
         }
 
         const summary = try self.objectSummary(arena, id, max_cells);
-        if (std.mem.eql(u8, summary, "?")) return null;
-        const prefixes: []const []const u8 = switch (kind) {
-            .closure => &.{"closure → "},
-            .thunk => &.{"thunk · "},
-            .builtin_closure => &.{ "builtin closure → ", "builtin closure · " },
-            .string_context => &.{"context string · "},
-            .boxed_int => &.{"int "},
-            .partial_app => &.{"partial application · "},
-            else => &.{},
-        };
-        for (prefixes) |prefix| {
-            if (std.mem.startsWith(u8, summary, prefix))
-                return summary[prefix.len..];
-        }
-        return summary;
+        return if (std.mem.eql(u8, summary, "?")) disasm.valueKindLabel(kind) else summary;
     }
 
     /// The rendered scalar for an inline `Value` (null/bool/int/float/string/
@@ -4014,16 +4112,52 @@ const Tui = struct {
     /// scalars carry their data in the `Value` bits with no heap deref.
     fn scalarText(self: *Tui, arena: std.mem.Allocator, value: runtime.value.Value) !?[]const u8 {
         return switch (value.kind()) {
-            .null => "null",
-            .bool_false => "false",
-            .bool_true => "true",
-            .int => try std.fmt.allocPrint(arena, "int {d}", .{value.asInt()}),
-            .float => try floatSummary(arena, value.asFloat()),
-            .string => try escapedQuoted(arena, "string ", self.ev.internTable().get(value.asInternId()), 32),
-            .path => try escapedQuoted(arena, "path ", self.ev.internTable().get(value.asInternId()), 32),
-            .builtin => try builtinText(arena, value.asBuiltinId()),
+            .null,
+            .bool_false,
+            .bool_true,
+            .int,
+            .float,
+            => try self.scalarValueSummary(arena, value, 32),
+            .string, .path => blk: {
+                const id = value.asInternId();
+                const preview = try escapedQuoted(
+                    arena,
+                    try std.fmt.allocPrint(arena, "{s} ", .{disasm.valueKindLabel(value.kind())}),
+                    self.ev.internTable().get(id),
+                    self.storePreviewBudget("intern", id, 32),
+                );
+                break :blk try self.locatedValue(arena, "intern", id, .intern, preview, 32, false);
+            },
+            .builtin => blk: {
+                const id = value.asBuiltinId();
+                break :blk try self.locatedValue(arena, "builtin", id, .builtin, disasm.builtinName(id), 32, false);
+            },
             else => null,
         };
+    }
+
+    /// Render a nested member without following it into another container.
+    /// This preserves its identity and type while keeping list/attrs previews
+    /// bounded and cycle-safe.
+    fn shallowValueSummary(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        value: runtime.value.Value,
+        max_cells: usize,
+    ) ![]const u8 {
+        if (try self.scalarText(arena, value)) |scalar|
+            return width_mod.endEllipsis(arena, scalar, max_cells);
+        if (value.kind() == .closure and value.isFunction())
+            return self.locatedValue(arena, "chunk", value.asFunctionChunkId(), .chunk, "function", max_cells, false);
+        return self.locatedValue(
+            arena,
+            "objects",
+            value.asObjectId(),
+            .object,
+            disasm.valueKindLabel(value.kind()),
+            max_cells,
+            false,
+        );
     }
 
     fn drawFocusDivider(self: *Tui, frame: *tui.Frame, row: usize, col: usize, focused: bool) !void {
@@ -4538,18 +4672,7 @@ const Tui = struct {
                 const session = self.debug_session orelse break :blk " value";
                 const v = session.value;
                 const label = returnValueHeading(session.reason);
-                // Prefer a real scalar / member count over an opaque object id.
-                if (self.scalarText(arena, v) catch null) |s|
-                    break :blk try std.fmt.allocPrint(arena, " ↳ {s}: {s}", .{ label, s });
-                const detail: []const u8 = switch (self.ev.valueRef(v).target) {
-                    .object => |id| if (self.ev.heapAttrsOf(id)) |a|
-                        try std.fmt.allocPrint(arena, "attrs · {d} members", .{a.len})
-                    else |_| if (self.ev.heapListOf(id)) |l|
-                        try std.fmt.allocPrint(arena, "list · {d} items", .{l.len})
-                    else |_|
-                        @tagName(v.kind()),
-                    else => @tagName(v.kind()),
-                };
+                const detail = try self.valueSummary(arena, v, @max(@as(usize, 20), width -| 24));
                 break :blk try std.fmt.allocPrint(arena, " ↳ {s}: {s}", .{ label, detail });
             },
         };
@@ -4944,13 +5067,6 @@ fn spanSnippet(arena: std.mem.Allocator, source: ?[]const u8, target: anytype) !
     return width_mod.endEllipsis(arena, out, 64);
 }
 
-/// Match the canonical disassembly digest: `builtin[0x20] → import`.
-fn builtinText(arena: std.mem.Allocator, id: u64) ![]const u8 {
-    if (disasm.builtinName(id)) |name|
-        return std.fmt.allocPrint(arena, "builtin[0x{x}] → {s}", .{ id, name });
-    return std.fmt.allocPrint(arena, "builtin[0x{x}]", .{id});
-}
-
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (needle.len > haystack.len) return false;
@@ -5002,23 +5118,12 @@ fn reasonName(reason: engine.BreakReason) []const u8 {
 }
 
 fn disasmTarget(line: []const u8) RowAction {
-    const chunk_prefixes = [_][]const u8{ "chunk[0x", "function[0x" };
-    for (chunk_prefixes) |prefix| if (storeRefId(line, prefix)) |id| {
+    if (storeRefId(line, "chunk[0x")) |id| {
         return .{ .chunk = @intCast(id) };
-    };
-    const object_prefixes = [_][]const u8{
-        "list[0x",
-        "attrs[0x",
-        "closure[0x",
-        "thunk[0x",
-        "builtin_closure[0x",
-        "string_ctx[0x",
-        "boxed_int[0x",
-        "partial_app[0x",
-    };
-    for (object_prefixes) |prefix| if (storeRefId(line, prefix)) |id| {
+    }
+    if (storeRefId(line, "objects[0x")) |id| {
         return .{ .object = @intCast(id) };
-    };
+    }
     return .none;
 }
 
@@ -5040,17 +5145,7 @@ fn sourceFileMatches(a: []const u8, b: []const u8) bool {
 }
 
 test "disassembly targets recognize chunk and heap links" {
-    try std.testing.expectEqual(@as(ChunkId, 0x2a), disasmTarget("closure chunk[0x2a]").chunk);
-    try std.testing.expectEqual(@as(runtime.types.ObjectId, 0x31), disasmTarget("push thunk[0x31]").object);
-    try std.testing.expect(disasmTarget("push str[0x1]") == .none);
-}
-
-test "builtin values use the resolved disassembly form" {
-    const known = try builtinText(std.testing.allocator, 0x20);
-    defer std.testing.allocator.free(known);
-    try std.testing.expectEqualStrings("builtin[0x20] → import", known);
-
-    const unknown = try builtinText(std.testing.allocator, 0xffff);
-    defer std.testing.allocator.free(unknown);
-    try std.testing.expectEqualStrings("builtin[0xffff]", unknown);
+    try std.testing.expectEqual(@as(ChunkId, 0x2a), disasmTarget("chunk[0x2a] → function").chunk);
+    try std.testing.expectEqual(@as(runtime.types.ObjectId, 0x31), disasmTarget("objects[0x31] → thunk").object);
+    try std.testing.expect(disasmTarget("intern[0x1] → string \"x\"") == .none);
 }

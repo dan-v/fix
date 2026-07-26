@@ -41,6 +41,7 @@ const transcript_mod = @import("../repl/transcript.zig");
 const Options = args.Options;
 const Evaluator = engine.Evaluator;
 const Value = runtime.Value;
+const disasm = engine.bytecode.disasm;
 
 pub const synopsis =
     \\usage: fix repl [options]
@@ -734,25 +735,35 @@ const Repl = struct {
     /// `:i` — one value, inspected without forcing: kind, thunk state and
     /// backing chunk, closure chunk/arity, container sizes.
     fn inspectValue(self: *Repl, w: *std.Io.Writer, value: Value) !void {
+        const symbols: disasm.Symbols = .{
+            .intern = self.ev.internTable(),
+            .registry = self.ev.chunkRegistry(),
+        };
         switch (value.kind()) {
             .thunk => {
                 const id = value.asObjectId();
                 const thunk = self.ev.tooling().thunk(value) catch {
-                    try w.writeAll("thunk (unreadable)\n");
+                    try disasm.writeStoreRef(w, "objects", id, .object, "thunk · unreadable", self.color_depth);
+                    try w.writeByte('\n');
                     return;
                 };
                 const state: future_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
-                try w.print("thunk #{d}: {s}", .{ id, @tagName(state) });
+                try disasm.writeStoreRef(w, "objects", id, .object, "thunk", self.color_depth);
+                try w.print(" · {s}", .{@tagName(state)});
                 switch (state) {
                     .resolved => {
-                        try w.writeAll(" -> ");
-                        try self.describeType(w, thunk.payload.result);
+                        try w.writeAll(" → ");
+                        try disasm.writeValueDigest(w, thunk.payload.result, symbols, 48, self.color_depth);
                         try w.writeByte('\n');
                     },
                     .errored => try w.writeAll(" (cached failure)\n"),
                     else => {
                         switch (thunk.targetKind()) {
-                            .bytecode => try w.print(" (bytecode, chunk #{d} — :vm it)\n", .{thunk.payload.target.bytecode.chunk_id}),
+                            .bytecode => {
+                                try w.writeAll(" · ");
+                                try disasm.writeStoreRef(w, "chunk", thunk.payload.target.bytecode.chunk_id, .chunk, "body", self.color_depth);
+                                try w.writeAll(" — :vm it\n");
+                            },
                             .closure => try w.writeAll(" (closure application)\n"),
                             .pass_through => try w.writeAll(" (pass-through cell)\n"),
                             .attr_access => try w.writeAll(" (attribute access)\n"),
@@ -762,21 +773,41 @@ const Repl = struct {
                 }
             },
             .closure => {
+                if (value.isFunction()) {
+                    const chunk_id = value.asFunctionChunkId();
+                    try disasm.writeValueDigest(w, value, symbols, 48, self.color_depth);
+                    if (self.ev.getChunk(chunk_id)) |chunk| try w.print(" · arity {d}", .{chunk.arity});
+                    try w.writeAll(" — :vm it\n");
+                    return;
+                }
                 const closure = self.ev.tooling().closure(value) catch {
-                    try w.writeAll("closure (unreadable)\n");
+                    try disasm.writeValueDigest(w, value, symbols, 48, self.color_depth);
+                    try w.writeAll(" · unreadable\n");
                     return;
                 };
                 var arity: usize = 1;
                 if (self.ev.getChunk(closure.chunk_id)) |chunk| arity = chunk.arity;
-                try w.print("closure: chunk #{d}, arity {d}, {d} upvalue{s} — :vm it\n", .{
-                    closure.chunk_id,
+                try disasm.writeValueDigest(w, value, symbols, 48, self.color_depth);
+                try w.writeAll(" → ");
+                try disasm.writeStoreRef(w, "chunk", closure.chunk_id, .chunk, null, self.color_depth);
+                try w.print(" · arity {d} · {d} upvalue{s} — :vm it\n", .{
                     arity,
                     closure.upvalues.len,
                     if (closure.upvalues.len == 1) "" else "s",
                 });
             },
+            .list => {
+                try disasm.writeValueDigest(w, value, symbols, 48, self.color_depth);
+                const n = self.ev.tooling().listLen(value) catch 0;
+                try w.print(" ({d} item{s})\n", .{ n, if (n == 1) "" else "s" });
+            },
+            .attrs => {
+                try disasm.writeValueDigest(w, value, symbols, 48, self.color_depth);
+                const entries = self.ev.tooling().attrs(value) catch &.{};
+                try w.print(" ({d} attr{s})\n", .{ entries.len, if (entries.len == 1) "" else "s" });
+            },
             else => {
-                try self.describeType(w, value);
+                try disasm.writeValueDigest(w, value, symbols, 48, self.color_depth);
                 try w.writeByte('\n');
             },
         }
@@ -840,7 +871,7 @@ const Repl = struct {
             return;
         };
         if (self.ev.getChunk(chunk_id) == null) {
-            try self.printError("chunk #{d} not found", .{chunk_id});
+            try self.printError("chunk[0x{x}] not found", .{chunk_id});
             return;
         }
         if (self.tui_active) return;
@@ -910,7 +941,7 @@ const Repl = struct {
         var out = self.output();
         defer out.flush() catch {};
         const w = out.writer();
-        try w.print("live objects: {d} across slots #0–#{d}\n", .{ snapshot.live_count, snapshot.high_water -| 1 });
+        try w.print("objects[0x0:0x{x}] ({d})\n", .{ snapshot.high_water, snapshot.live_count });
         var next = snapshot.nextLive(start);
         var shown: usize = 0;
         var continuation: ?runtime.types.ObjectId = null;
@@ -923,7 +954,9 @@ const Repl = struct {
                 next = snapshot.nextLive(id + 1);
                 continue;
             };
-            try w.print("  #{d:<11} {s}\n", .{ id, @tagName(info) });
+            try w.writeAll("  ");
+            try disasm.writeStoreRef(w, "objects", id, .object, objectInfoLabel(info), self.color_depth);
+            try w.writeByte('\n');
             shown += 1;
             next = snapshot.nextLive(id + 1);
         }
@@ -939,56 +972,96 @@ const Repl = struct {
         };
         const snapshot = try self.ensureVmObjects();
         const info = self.ev.inspectHeapObject(snapshot, id) catch {
-            try self.printError("object #{d} is not live", .{id});
+            try self.printError("objects[0x{x}] is not live", .{id});
             return;
         };
         var out = self.output();
         defer out.flush() catch {};
         const w = out.writer();
-        try w.print("object #{d}: {s}\n", .{ id, @tagName(info) });
+        try disasm.writeStoreRef(w, "objects", id, .object, objectInfoLabel(info), self.color_depth);
+        try w.writeByte('\n');
         switch (info) {
             .list => |list| try w.print("  items: {d}\n", .{list.len}),
             .attrs => |attrs| try w.print("  attrs: {d}, positions: {d}, sibling swept: {s}\n", .{ attrs.len, attrs.positions, if (attrs.sibling_swept) "yes" else "no" }),
             .merge_attrs => |merge| {
-                try w.print("  base: object #{d}\n  overlay: object #{d}\n  depth: {d}\n", .{ merge.base, merge.overlay, merge.depth });
-                if (merge.flattened) |flat| try w.print("  flattened: object #{d}\n", .{flat});
+                try self.writeVmObjectField(w, "base", merge.base);
+                try self.writeVmObjectField(w, "overlay", merge.overlay);
+                try w.print("  depth: {d}\n", .{merge.depth});
+                if (merge.flattened) |flat| try self.writeVmObjectField(w, "flattened", flat);
             },
-            .closure => |closure| try w.print("  chunk: #{d}\n  upvalues: {d}\n", .{ closure.chunk, closure.upvalues }),
-            .builtin_closure => |closure| try w.print("  builtin: #{d}\n  arguments: {d}\n", .{ closure.builtin, closure.args }),
+            .closure => |closure| {
+                try w.writeAll("  chunk: ");
+                try disasm.writeStoreRef(w, "chunk", closure.chunk, .chunk, null, self.color_depth);
+                try w.print("\n  upvalues: {d}\n", .{closure.upvalues});
+            },
+            .builtin_closure => |closure| {
+                try w.writeAll("  builtin: ");
+                try disasm.writeStoreRef(w, "builtin", closure.builtin, .builtin, disasm.builtinName(closure.builtin), self.color_depth);
+                try w.print("\n  arguments: {d}\n", .{closure.args});
+            },
             .thunk => |thunk| {
                 try w.print("  state: {s}\n  demanded: {s}\n", .{ @tagName(thunk.state), if (thunk.demanded) "yes" else "no" });
                 switch (thunk.body) {
-                    .result => |value| try writeVmValueRef(w, "result", value),
+                    .result => |value| try self.writeVmValueRef(w, "result", value),
                     .error_name => |name| try w.print("  error: {s}\n", .{name}),
                     .target => |target| switch (target) {
-                        .closure => |value| try writeVmValueRef(w, "closure", value),
-                        .bytecode => |body| try w.print("  chunk: #{d}\n  captures: {d}\n", .{ body.chunk, body.captures }),
-                        .pass_through => |value| try writeVmValueRef(w, "value", value),
-                        .attr_access => |access| {
-                            try writeVmValueRef(w, "base", access.base);
-                            try w.print("  attribute: intern #{d}\n", .{access.name});
+                        .closure => |value| try self.writeVmValueRef(w, "closure", value),
+                        .bytecode => |body| {
+                            try w.writeAll("  chunk: ");
+                            try disasm.writeStoreRef(w, "chunk", body.chunk, .chunk, null, self.color_depth);
+                            try w.print("\n  captures: {d}\n", .{body.captures});
                         },
-                        .deferred => |body| try w.print("  deferred: #{d}\n  captures: {d}\n", .{ body.id, body.captures }),
+                        .pass_through => |value| try self.writeVmValueRef(w, "value", value),
+                        .attr_access => |access| {
+                            try self.writeVmValueRef(w, "base", access.base);
+                            try w.writeAll("  attribute: ");
+                            try disasm.writeStoreRef(w, "intern", access.name, .intern, null, self.color_depth);
+                            try w.writeByte('\n');
+                        },
+                        .deferred => |body| try w.print("  deferred: 0x{x}\n  captures: {d}\n", .{ body.id, body.captures }),
                     },
                 }
             },
-            .context_string => |string| try w.print("  text: intern #{d}\n  context entries: {d}\n", .{ string.text, string.context }),
+            .context_string => |string| {
+                try w.writeAll("  text: ");
+                try disasm.writeStoreRef(w, "intern", string.text, .intern, "string", self.color_depth);
+                try w.print("\n  context entries: {d}\n", .{string.context});
+            },
             .boxed_int => |value| try w.print("  value: {d}\n", .{value}),
             .partial_app => |partial| {
-                try writeVmValueRef(w, "function", partial.function);
+                try self.writeVmValueRef(w, "function", partial.function);
                 try w.print("  arguments: {d}\n", .{partial.args});
             },
         }
     }
 
-    fn writeVmValueRef(w: *std.Io.Writer, label: []const u8, value: runtime.heap.ValueRef) !void {
-        try w.print("  {s}: {s}", .{ label, @tagName(value.kind) });
+    fn writeVmObjectField(self: *Repl, w: *std.Io.Writer, label: []const u8, id: runtime.types.ObjectId) !void {
+        var preview: ?[]const u8 = null;
+        if (self.vm_objects) |*snapshot| {
+            if (self.ev.inspectHeapObject(snapshot, id)) |info| {
+                preview = objectInfoLabel(info);
+            } else |_| {}
+        }
+        try w.print("  {s}: ", .{label});
+        try disasm.writeStoreRef(w, "objects", id, .object, preview, self.color_depth);
+        try w.writeByte('\n');
+    }
+
+    fn writeVmValueRef(self: *Repl, w: *std.Io.Writer, label: []const u8, value: runtime.heap.ValueRef) !void {
+        try w.print("  {s}: ", .{label});
         switch (value.target) {
-            .none => {},
-            .object => |id| try w.print(" object #{d}", .{id}),
-            .chunk => |id| try w.print(" chunk #{d}", .{id}),
-            .intern => |id| try w.print(" intern #{d}", .{id}),
-            .builtin => |id| try w.print(" #{d}", .{id}),
+            .none => try w.writeAll(disasm.valueKindLabel(value.kind)),
+            .object => |id| try disasm.writeStoreRef(w, "objects", id, .object, disasm.valueKindLabel(value.kind), self.color_depth),
+            .chunk => |id| try disasm.writeStoreRef(
+                w,
+                "chunk",
+                id,
+                .chunk,
+                if (value.kind == .closure) "function" else disasm.valueKindLabel(value.kind),
+                self.color_depth,
+            ),
+            .intern => |id| try disasm.writeStoreRef(w, "intern", id, .intern, disasm.valueKindLabel(value.kind), self.color_depth),
+            .builtin => |id| try disasm.writeStoreRef(w, "builtin", id, .builtin, disasm.builtinName(id), self.color_depth),
         }
         try w.writeByte('\n');
     }
@@ -1079,7 +1152,7 @@ const Repl = struct {
         const shown = @min(chunks.len, query.limit);
         for (chunks[0..shown]) |id| {
             const chunk = self.ev.getChunk(id) orelse continue;
-            try w.print("  #{d:<9} {Bi:>9} code  {d:>7} constants  arity {d}\n", .{
+            try w.print("  chunk[0x{x}]  {Bi:>9} code  {d:>7} constants  arity {d}\n", .{
                 id,
                 chunk.code.len,
                 chunk.constants.len,
@@ -1222,6 +1295,20 @@ const Binding = struct { name: []const u8, expr: []const u8 };
 const nix_keywords = [_][]const u8{
     "let", "in", "if", "then", "else", "with", "rec", "inherit", "assert", "or",
 };
+
+fn objectInfoLabel(info: runtime.heap.ObjectInfo) []const u8 {
+    return switch (info) {
+        .list => "list",
+        .attrs => "attrs",
+        .merge_attrs => "attrs merge",
+        .closure => "closure",
+        .builtin_closure => "builtin closure",
+        .thunk => "thunk",
+        .context_string => "context string",
+        .boxed_int => "boxed int",
+        .partial_app => "partial application",
+    };
+}
 
 fn parseChunkId(input: []const u8) ?types.ChunkId {
     var text = std.mem.trim(u8, input, " \t");

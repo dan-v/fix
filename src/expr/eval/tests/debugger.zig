@@ -567,7 +567,7 @@ test "finish pauses in the caller with the returned value" {
                     var text: [32]u8 = undefined;
                     var writer: std.Io.Writer = .fixed(&text);
                     try s.writeValueSummary(&writer, s.value);
-                    try std.testing.expectEqualStrings("42", text[0..writer.end]);
+                    try std.testing.expectEqualStrings("int 42", text[0..writer.end]);
                     self.saw_return = true;
                 },
             }
