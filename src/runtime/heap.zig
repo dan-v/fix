@@ -908,6 +908,25 @@ pub const ObjectHeap = struct {
                 word = self.live_bits[word_index];
             }
         }
+
+        /// One past the greatest live id, excluding a reserved or reclaimed
+        /// tail. Tree ranges use this instead of `high_water`, which is the
+        /// backing-store reservation frontier rather than a meaningful record
+        /// boundary.
+        pub fn liveExtent(self: *const ObjectSnapshot) ObjectId {
+            var word_index = self.live_bits.len;
+            while (word_index > 0) {
+                word_index -= 1;
+                const word = self.live_bits[word_index];
+                if (word == 0) continue;
+                const top_bit: usize = @bitSizeOf(u64) - 1 - @clz(word);
+                return @min(
+                    self.high_water,
+                    @as(ObjectId, @intCast(word_index * 64 + top_bit + 1)),
+                );
+            }
+            return 0;
+        }
     };
 
     pub fn objectSnapshot(self: *const ObjectHeap, allocator: std.mem.Allocator) !ObjectSnapshot {

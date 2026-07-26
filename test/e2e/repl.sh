@@ -188,6 +188,10 @@ out=$(
         sleep 0.4
         printf ':vm\r'
         sleep 0.6
+        printf '\t'
+        sleep 0.3
+        printf '\t'
+        sleep 0.2
         printf 'G'
         sleep 0.4
         printf 'q'
@@ -199,6 +203,11 @@ out=$(
 )
 t "tty vm: unified inspector offers source span session" "SOURCE · 1 subexpressions" "$out"
 t "tty vm: unified inspector includes code" "CODE · chunk" "$out"
+if [[ "$out" == *"PREVIEW"* ]]; then
+    fail "tty vm: current tree subject covered itself with a preview"
+else
+    pass "tty vm: current tree subject has no redundant preview"
+fi
 if [[ "$out" == *"Enter leaves"* ]]; then
     fail "tty vm: source heading still advertises Enter-to-leave"
 else
@@ -227,13 +236,13 @@ out=$(
         sleep 0.7
         printf '\t'
         sleep 0.3
-        printf '\033[1;3B'
-        sleep 0.3
         printf 'g'
         sleep 0.7
-        for _ in 1 2 3; do
+        printf '\033j'
+        sleep 0.25
+        for _ in 1 2 3 4 5 6 7; do
             printf '\033[1;3B'
-            sleep 0.25
+            sleep 0.12
         done
         printf 'q'
         sleep 0.3
@@ -243,12 +252,58 @@ out=$(
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
 if grep -aoE '[2-9]-[0-9]+/[0-9]+' <<<"$out" >/dev/null; then
-    pass "tty vm: Alt-arrow scrolls hover previews"
+    pass "tty vm: Alt-j and Alt-arrow scroll hover previews"
 else
     fail "tty vm: hover preview did not scroll"
 fi
 t "tty vm: collapsed heap preview includes object variants" "object types" "$out"
 t "tty vm: heap preview includes the last object variant" "partial application" "$out"
+
+# Store folders distinguish live records from reserved TLAB tails. Opening the
+# object store synchronously materializes its live rows, while dense stores use
+# the same canonical range language.
+out=$(
+    (
+        sleep 0.4
+        printf '{ a = 1; b = 2; c = 3; d = 4; }\r'
+        sleep 0.4
+        printf ':vm\r'
+        sleep 0.7
+        printf '\t'
+        sleep 0.2
+        printf 'g'
+        sleep 0.2
+        printf '\r'
+        sleep 0.3
+        printf 'j'
+        sleep 0.2
+        printf '\r'
+        sleep 0.6
+        printf 'q'
+        sleep 0.2
+        printf '\004'
+        sleep 0.2
+    ) |
+        script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
+)
+if grep -aoE 'objects · [0-9]+ live' <<<"$out" >/dev/null; then
+    pass "tty vm: object folder starts with a live count"
+else
+    fail "tty vm: object folder did not report live records"
+fi
+if grep -aoE 'objects\[0x0:0x[0-9a-f]+\] \([0-9]+\)' <<<"$out" >/dev/null; then
+    pass "tty vm: object range uses a live extent and count"
+else
+    fail "tty vm: object range did not materialize"
+fi
+t "tty vm: expanded object store contains records" "objects[0x0] →" "$out"
+t "tty vm: intern store appears in the tree" "intern[0x0:" "$out"
+t "tty vm: builtin store appears in the tree" "builtin[0x0:" "$out"
+if [[ "$out" == *"objects[0x0:0x100] (256)"* ]]; then
+    fail "tty vm: object range exposed its reserved TLAB tail"
+else
+    pass "tty vm: object range excludes its reserved TLAB tail"
+fi
 
 # Nested expressions on one line may share a bytecode-entry offset. A source
 # breakpoint must mark only the exact selected span, not every row with that

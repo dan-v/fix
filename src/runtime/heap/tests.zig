@@ -76,6 +76,7 @@ test "object snapshot indexes only filled slots and exposes semantic details" {
     var snapshot = try heap.objectSnapshot(std.testing.allocator);
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(u32, 2), snapshot.live_count);
+    try std.testing.expectEqual(closure_id + 1, snapshot.liveExtent());
     try std.testing.expectEqual(list_id, snapshot.nextLive(0).?);
     try std.testing.expectEqual(closure_id, snapshot.nextLive(list_id + 1).?);
     try std.testing.expect(snapshot.nextLive(closure_id + 1) == null);
@@ -102,6 +103,7 @@ test "range-store snapshots index only live records, not reserved capacity" {
     try std.testing.expectEqual(value_count, values.high_water);
     // The 3 filled slots are live; the reserved TLAB tail is excluded.
     try std.testing.expectEqual(@as(u32, 3), values.live_count);
+    try std.testing.expectEqual(@as(u32, 3), values.liveExtent());
     try std.testing.expect(values.live_count <= values.high_water);
     try std.testing.expect(values.nextLive(0) != null);
 

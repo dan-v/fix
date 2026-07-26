@@ -59,7 +59,7 @@ fn writeChunk(
 }
 
 const Category = enum(u1) { bytecode, heap };
-const HeapView = enum { overview, objects, values, attrs, attr_positions };
+const HeapView = enum { overview, objects, values, attrs, attr_positions, intern, builtin };
 
 const RowAction = union(enum) {
     none,
@@ -68,6 +68,7 @@ const RowAction = union(enum) {
     instruction,
     chunk: ChunkId,
     object: runtime.types.ObjectId,
+    store_record: struct { view: HeapView, id: u32 },
 };
 
 /// A breakpoint target attached to a rendered row. Instruction rows use the
@@ -317,7 +318,7 @@ pub const VmDebugger = struct {
     }
 };
 
-const RangeKind = enum(u3) { names, chunks, objects, values, attrs, attr_positions };
+const RangeKind = enum(u4) { names, chunks, objects, values, attrs, attr_positions, intern, builtin };
 const ChunkEquivalence = union(enum) {
     structural: ChunkId,
     code: ChunkId,
@@ -374,7 +375,7 @@ const TreeState = struct {
     rows: std.ArrayListUnmanaged(TreeRow) = .empty,
     indexing: bool = false,
     categories: [2]bool = .{ false, false },
-    heap_views: [5]bool = @splat(false),
+    heap_views: [std.meta.fields(HeapView).len]bool = @splat(false),
     /// Case-insensitive substring filter on the bytecode name tree. When set,
     /// only name nodes on a path to a match (and their chunks) are shown.
     filter_query: std.ArrayListUnmanaged(u8) = .empty,
@@ -499,6 +500,7 @@ const Tui = struct {
 
     const range_leaf = 256;
     const range_branch = 4096;
+    const preview_line_cap = 200;
 
     fn deinit(self: *Tui) void {
         self.navigation.back.deinit(self.allocator);
@@ -512,10 +514,7 @@ const Tui = struct {
         self.tree.rows.deinit(self.allocator);
         self.transcript_lines.deinit(self.allocator);
         if (self.references.graph) |*graph| graph.deinit();
-        if (self.heap_index.objects) |*snapshot| snapshot.deinit();
-        if (self.heap_index.values) |*snapshot| snapshot.deinit();
-        if (self.heap_index.attrs) |*snapshot| snapshot.deinit();
-        if (self.heap_index.attr_positions) |*snapshot| snapshot.deinit();
+        self.clearHeapSnapshots();
         self.arena.deinit();
     }
 
@@ -612,8 +611,7 @@ const Tui = struct {
         self.heap_index.objects_failed = false;
         self.references.failed = false;
         self.heap_index.stats = null;
-        if (self.heap_index.objects) |*snapshot| snapshot.deinit();
-        self.heap_index.objects = null;
+        self.clearHeapSnapshots();
         if (capture.written().len > 0 and capture.written()[capture.written().len - 1] != '\n')
             try capture.writer.writeByte('\n');
         try self.rebuildTranscriptLines(capture.written());
@@ -626,6 +624,23 @@ const Tui = struct {
                 try self.refreshPage(.{ .chunk = id });
         }
         return host.quitting();
+    }
+
+    /// An evaluation can fill a previously reserved slot without advancing a
+    /// store's high-water count, so count-keyed snapshots are not sufficient
+    /// invalidation. Drop every liveness bitmap at the command boundary.
+    fn clearHeapSnapshots(self: *Tui) void {
+        if (self.heap_index.objects) |*snapshot| snapshot.deinit();
+        if (self.heap_index.values) |*snapshot| snapshot.deinit();
+        if (self.heap_index.attrs) |*snapshot| snapshot.deinit();
+        if (self.heap_index.attr_positions) |*snapshot| snapshot.deinit();
+        self.heap_index.objects = null;
+        self.heap_index.values = null;
+        self.heap_index.attrs = null;
+        self.heap_index.attr_positions = null;
+        self.heap_index.values_count = 0;
+        self.heap_index.attrs_count = 0;
+        self.heap_index.attr_positions_count = 0;
     }
 
     fn runSession(self: *Tui, editor: *editor_mod.Editor, capture: *transcript_mod.Capture, host: SessionHost) !void {
@@ -843,6 +858,8 @@ const Tui = struct {
         try page.line(try std.fmt.allocPrint(arena, "values         {d:>12}", .{counts.values}), .none);
         try page.line(try std.fmt.allocPrint(arena, "attrs          {d:>12}", .{counts.attrs}), .none);
         try page.line(try std.fmt.allocPrint(arena, "attr positions {d:>12}", .{counts.attr_positions}), .none);
+        try page.line(try std.fmt.allocPrint(arena, "intern          {d:>12}", .{self.storeCount(.intern)}), .none);
+        try page.line(try std.fmt.allocPrint(arena, "builtin         {d:>12}", .{self.storeCount(.builtin)}), .none);
         try page.line("", .none);
 
         const stats = self.heap_index.stats orelse {
@@ -878,6 +895,14 @@ const Tui = struct {
                 try page.line("Source-position records attached to heap attrs.", .none);
                 try page.line("Open TABLES on a chunk to inspect its compile-time attr positions.", .none);
             },
+            .intern => {
+                try page.heading("INTERNED TEXT");
+                try page.line("Dense, process-local text identities used by strings, paths, names, and source files.", .none);
+            },
+            .builtin => {
+                try page.heading("BUILTINS");
+                try page.line("Dense evaluator builtin identities, including compiler-internal entries.", .none);
+            },
         }
         return .{
             .title = try std.fmt.allocPrint(arena, "heap · {s}", .{@tagName(view)}),
@@ -904,7 +929,14 @@ const Tui = struct {
                 .actions = page.actions.items,
             };
         };
-        try page.heading(try self.canonicalStoreRef(arena, .objects, id, try self.objectSummary(arena, id, 64), true));
+        const heading_width = self.layout().main_width;
+        try page.heading(try self.canonicalStoreRef(
+            arena,
+            .objects,
+            id,
+            try self.objectSummary(arena, id, self.storePreviewBudget("objects", id, heading_width)),
+            true,
+        ));
         try page.line("", .none);
         switch (info) {
             .list => {
@@ -924,17 +956,29 @@ const Tui = struct {
                 if (merge.flattened) |flat| try self.appendObjectRef(&page, "flattened", flat) else try page.line("flattened   not materialized", .none);
             },
             .closure => |closure| {
+                const prefix = "chunk       ";
                 try page.line(
-                    try std.fmt.allocPrint(arena, "chunk       {s}", .{
-                        try self.locatedValue(arena, "chunk", closure.chunk, .chunk, null, 64, true),
+                    try std.fmt.allocPrint(arena, "{s}{s}", .{
+                        prefix,
+                        try self.locatedValue(arena, "chunk", closure.chunk, .chunk, null, self.lineRemainderWidth(prefix), true),
                     }),
                     .{ .chunk = closure.chunk },
                 );
                 try page.line(try std.fmt.allocPrint(arena, "upvalues    {d}", .{closure.upvalues}), .none);
             },
             .builtin_closure => |closure| {
-                try page.line(try std.fmt.allocPrint(arena, "builtin     {s}", .{
-                    try self.locatedValue(arena, "builtin", closure.builtin, .builtin, disasm.builtinName(closure.builtin), 64, true),
+                const prefix = "builtin     ";
+                try page.line(try std.fmt.allocPrint(arena, "{s}{s}", .{
+                    prefix,
+                    try self.locatedValue(
+                        arena,
+                        "builtin",
+                        closure.builtin,
+                        .builtin,
+                        disasm.builtinName(closure.builtin),
+                        self.lineRemainderWidth(prefix),
+                        true,
+                    ),
                 }), .none);
                 try page.line(try std.fmt.allocPrint(arena, "arguments   {d}", .{closure.args}), .none);
             },
@@ -947,9 +991,11 @@ const Tui = struct {
                     .target => |target| switch (target) {
                         .closure => |value| try self.appendValueRef(&page, "closure", value),
                         .bytecode => |body| {
+                            const prefix = "chunk       ";
                             try page.line(
-                                try std.fmt.allocPrint(arena, "chunk       {s}", .{
-                                    try self.locatedValue(arena, "chunk", body.chunk, .chunk, null, 64, true),
+                                try std.fmt.allocPrint(arena, "{s}{s}", .{
+                                    prefix,
+                                    try self.locatedValue(arena, "chunk", body.chunk, .chunk, null, self.lineRemainderWidth(prefix), true),
                                 }),
                                 .{ .chunk = body.chunk },
                             );
@@ -958,11 +1004,12 @@ const Tui = struct {
                         .pass_through => |value| try self.appendValueRef(&page, "value", value),
                         .attr_access => |access| {
                             try self.appendValueRef(&page, "base", access.base);
+                            const prefix = "attribute   ";
                             const attribute = try self.renderValueRef(arena, .{
                                 .kind = .string,
                                 .target = .{ .intern = access.name },
-                            }, 64, true);
-                            try page.line(try std.fmt.allocPrint(arena, "attribute   {s}", .{attribute.text}), .none);
+                            }, self.lineRemainderWidth(prefix), true);
+                            try page.line(try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, attribute.text }), .none);
                         },
                         .deferred => |body| {
                             try page.line(try std.fmt.allocPrint(arena, "deferred[0x{x}]", .{body.id}), .none);
@@ -972,11 +1019,12 @@ const Tui = struct {
                 }
             },
             .context_string => |string| {
+                const prefix = "text        ";
                 const text = try self.renderValueRef(arena, .{
                     .kind = .string,
                     .target = .{ .intern = string.text },
-                }, 64, true);
-                try page.line(try std.fmt.allocPrint(arena, "text        {s}", .{text.text}), .none);
+                }, self.lineRemainderWidth(prefix), true);
+                try page.line(try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, text.text }), .none);
                 try page.line(try std.fmt.allocPrint(arena, "context     {d} entries", .{string.context}), .none);
             },
             .boxed_int => |value| try page.line(try std.fmt.allocPrint(arena, "value       {d}", .{value}), .none),
@@ -996,7 +1044,14 @@ const Tui = struct {
     fn buildStoreRecordPage(self: *Tui, view: HeapView, id: u32) !Page {
         const arena = self.arena.allocator();
         var page: PageBuilder = .{ .arena = arena };
-        try page.heading(try self.canonicalStoreRef(arena, view, id, null, true));
+        const heading_width = self.layout().main_width;
+        const heading_summary = try self.storeRecordSummary(
+            arena,
+            view,
+            id,
+            self.storePreviewBudget(@tagName(view), id, heading_width),
+        );
+        try page.heading(try self.canonicalStoreRef(arena, view, id, heading_summary, true));
         try page.line("", .none);
         switch (view) {
             .values => {
@@ -1017,6 +1072,12 @@ const Tui = struct {
                     try page.line(try std.fmt.allocPrint(arena, "at     {d}:{d}", .{ ap.pos.line, ap.pos.column }), .none);
                 } else try page.line("(slot is out of range)", .none);
             },
+            .intern => if (id < self.storeCount(.intern)) {
+                try page.line(try escapedQuoted(arena, "text ", self.ev.internTable().get(id), self.layout().main_width), .none);
+            } else try page.line("(slot is out of range)", .none),
+            .builtin => if (disasm.builtinName(id)) |name| {
+                try page.line(try std.fmt.allocPrint(arena, "name   {s}", .{name}), .none);
+            } else try page.line("(slot is out of range)", .none),
             .overview, .objects => try page.line("(not a store record)", .none),
         }
         return .{
@@ -1186,10 +1247,23 @@ const Tui = struct {
     }
 
     fn appendObjectRef(self: *Tui, page: *PageBuilder, label: []const u8, id: runtime.types.ObjectId) !void {
-        try page.line(try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{
-            label,
-            try self.canonicalStoreRef(page.arena, .objects, id, try self.objectSummary(page.arena, id, 48), true),
+        const prefix = try std.fmt.allocPrint(page.arena, "{s:<12} ", .{label});
+        const ref_width = self.lineRemainderWidth(prefix);
+        const preview_width = self.storePreviewBudget("objects", id, ref_width);
+        try page.line(try std.fmt.allocPrint(page.arena, "{s}{s}", .{
+            prefix,
+            try self.canonicalStoreRef(
+                page.arena,
+                .objects,
+                id,
+                try self.objectSummary(page.arena, id, preview_width),
+                true,
+            ),
         }), .{ .object = id });
+    }
+
+    fn lineRemainderWidth(self: *const Tui, prefix: []const u8) usize {
+        return self.layout().main_width -| tui.displayWidth(prefix, width_mod.cpWidth);
     }
 
     /// Render a heap `Value`: the actual scalar for inline kinds (int, float,
@@ -1204,7 +1278,7 @@ const Tui = struct {
     /// Object/chunk-backed values carry a `.object`/`.chunk` action so Enter
     /// (or the right-hand preview) drills into them; scalars render inline.
     fn appendValueLine(self: *Tui, page: *PageBuilder, prefix: []const u8, value: runtime.value.Value) !void {
-        const rendered = try self.renderValue(page.arena, value, 52, true);
+        const rendered = try self.renderValue(page.arena, value, self.lineRemainderWidth(prefix), true);
         try page.line(
             try std.fmt.allocPrint(page.arena, "{s}{s}", .{ prefix, rendered.text }),
             rendered.action,
@@ -1264,12 +1338,12 @@ const Tui = struct {
                     self.storePreviewBudget("intern", id, max_cells),
                 );
                 break :blk .{
-                    .action = .none,
+                    .action = .{ .store_record = .{ .view = .intern, .id = id } },
                     .text = try self.locatedValue(arena, "intern", id, .intern, preview, max_cells, colored),
                 };
             },
             .builtin => |id| .{
-                .action = .none,
+                .action = .{ .store_record = .{ .view = .builtin, .id = id } },
                 .text = try self.locatedValue(
                     arena,
                     "builtin",
@@ -1288,9 +1362,10 @@ const Tui = struct {
     }
 
     fn appendValueRef(self: *Tui, page: *PageBuilder, label: []const u8, value: runtime.heap.ValueRef) !void {
-        const rendered = try self.renderValueRef(page.arena, value, 64, true);
+        const prefix = try std.fmt.allocPrint(page.arena, "{s:<12} ", .{label});
+        const rendered = try self.renderValueRef(page.arena, value, self.lineRemainderWidth(prefix), true);
         try page.line(
-            try std.fmt.allocPrint(page.arena, "{s:<12} {s}", .{ label, rendered.text }),
+            try std.fmt.allocPrint(page.arena, "{s}{s}", .{ prefix, rendered.text }),
             rendered.action,
         );
     }
@@ -1339,12 +1414,12 @@ const Tui = struct {
                 );
                 break :blk .{
                     .text = try self.locatedValue(arena, "intern", id, .intern, preview, max_cells, colored),
-                    .action = .none,
+                    .action = .{ .store_record = .{ .view = .intern, .id = id } },
                 };
             },
             .builtin => |id| .{
                 .text = try self.locatedValue(arena, "builtin", id, .builtin, disasm.builtinName(id), max_cells, colored),
-                .action = .none,
+                .action = .{ .store_record = .{ .view = .builtin, .id = id } },
             },
         };
     }
@@ -1385,6 +1460,8 @@ const Tui = struct {
         return switch (self.ev.valueRef(value).target) {
             .object => |id| .{ .object = id },
             .chunk => |id| .{ .chunk = id },
+            .intern => |id| .{ .store_record = .{ .view = .intern, .id = id } },
+            .builtin => |id| .{ .store_record = .{ .view = .builtin, .id = id } },
             else => .none,
         };
     }
@@ -1397,6 +1474,14 @@ const Tui = struct {
             },
             .chunk => |id| switch (action) {
                 .chunk => |row_id| row_id == id,
+                else => false,
+            },
+            .intern => |id| switch (action) {
+                .store_record => |record| record.view == .intern and record.id == id,
+                else => false,
+            },
+            .builtin => |id| switch (action) {
+                .store_record => |record| record.view == .builtin and record.id == id,
                 else => false,
             },
             else => false,
@@ -1737,7 +1822,7 @@ const Tui = struct {
                     document.arena,
                     &annotation.writer,
                     returned_value.?,
-                    @max(self.layout().main_width -| 14, 8),
+                    self.layout().main_width -| 14,
                 );
                 if (tui.displayWidth(rendered.written(), width_mod.cpWidth) +
                     tui.displayWidth(annotation.written(), width_mod.cpWidth) <= self.layout().main_width -| 2)
@@ -1951,7 +2036,7 @@ const Tui = struct {
         const idx = self.navigation.detail_selection;
         if (idx >= self.page.actions.len) return null;
         return switch (self.page.actions[idx]) {
-            .object, .chunk => self.page.actions[idx],
+            .object, .chunk, .store_record => self.page.actions[idx],
             else => null,
         };
     }
@@ -1998,6 +2083,12 @@ const Tui = struct {
         };
     }
 
+    fn liveObjectCount(stats: runtime.ObjectHeap.Stats) u32 {
+        var total: u32 = 0;
+        for (stats.variant_counts) |count| total += count;
+        return total;
+    }
+
     fn storeCount(self: *const Tui, view: HeapView) u32 {
         const c = self.ev.heapCounts();
         return switch (view) {
@@ -2005,14 +2096,17 @@ const Tui = struct {
             .values => c.values,
             .attrs => c.attrs,
             .attr_positions => c.attr_positions,
+            .intern => self.ev.internTable().stats().entries,
+            .builtin => @intCast(@typeInfo(runtime.builtins.BuiltinId).@"enum".fields.len),
         };
     }
 
     /// The number of LIVE records in a store (via its snapshot), falling back to
     /// the raw reserved count if the snapshot can't be built.
     fn liveStoreCount(self: *Tui, view: HeapView) u32 {
+        if (view == .intern or view == .builtin) return self.storeCount(view);
         if (view == .objects or view == .overview)
-            return if (self.heap_index.objects) |*s| s.live_count else self.storeCount(view);
+            return if (self.heap_index.objects) |*s| s.live_count else if (self.heap_index.stats) |stats| liveObjectCount(stats) else 0;
         return if (self.ensureStoreSnapshot(view)) |s| s.live_count else self.storeCount(view);
     }
 
@@ -2023,7 +2117,7 @@ const Tui = struct {
             .values => .{ &self.heap_index.values, &self.heap_index.values_count },
             .attrs => .{ &self.heap_index.attrs, &self.heap_index.attrs_count },
             .attr_positions => .{ &self.heap_index.attr_positions, &self.heap_index.attr_positions_count },
-            .overview, .objects => return null,
+            .overview, .objects, .intern, .builtin => return null,
         };
         const current = self.storeCount(view);
         if (slot.* == null or cnt.* != current) {
@@ -2099,12 +2193,16 @@ const Tui = struct {
                 const expanded = self.tree.heap_views[@intFromEnum(view)] or projected_view;
                 if (!expanded) continue;
                 const projected_only = !heap_open or !self.tree.heap_views[@intFromEnum(view)];
-                const snapshot = if (view == .objects)
-                    (if (self.heap_index.objects) |*s| s else null)
-                else
-                    self.ensureStoreSnapshot(view);
-                if (snapshot) |snap| {
-                    try self.appendLiveRange(view, snap, 0, snap.high_water, 2, projected_only);
+                if (view == .intern or view == .builtin) {
+                    try self.appendDenseStoreRange(view, 0, self.storeCount(view), 2, projected_only);
+                } else {
+                    const snapshot = if (view == .objects)
+                        (if (self.heap_index.objects) |*s| s else null)
+                    else
+                        self.ensureStoreSnapshot(view);
+                    if (snapshot) |snap| {
+                        try self.appendLiveRange(view, snap, 0, snap.liveExtent(), 2, projected_only);
+                    }
                 }
             }
         }
@@ -2216,6 +2314,8 @@ const Tui = struct {
             .values => .values,
             .attrs => .attrs,
             .attr_positions => .attr_positions,
+            .intern => .intern,
+            .builtin => .builtin,
             .overview, .objects => .objects,
         };
     }
@@ -2225,6 +2325,58 @@ const Tui = struct {
             .{ .object = .{ .id = id, .depth = depth } }
         else
             .{ .store_record = .{ .view = view, .id = id, .depth = depth } };
+    }
+
+    /// Dense stores have no reservation holes: every id below `count` is a
+    /// real record. They still use the same bounded range fan-out and canonical
+    /// store rows as sparse heap stores.
+    fn appendDenseStoreRange(
+        self: *Tui,
+        view: HeapView,
+        start: u32,
+        len: u32,
+        depth: u16,
+        projected_only: bool,
+    ) std.mem.Allocator.Error!void {
+        if (len == 0) return;
+        const focused = if (self.currentStoreRecord()) |r| (if (r.view == view) r.id else null) else null;
+        const end = start + len;
+        if (len <= range_leaf) {
+            if (projected_only) {
+                if (focused) |id| if (id >= start and id < end)
+                    try self.tree.rows.append(self.allocator, liveRow(view, id, depth));
+                return;
+            }
+            var id = start;
+            while (id < end) : (id += 1)
+                try self.tree.rows.append(self.allocator, liveRow(view, id, depth));
+            return;
+        }
+
+        var span: u32 = range_leaf;
+        while ((len + span - 1) / span > 64) span *= 64;
+        var offset: u32 = 0;
+        while (offset < len) : (offset += span) {
+            const child_start = start + offset;
+            const child_len = @min(span, len - offset);
+            const child_end = child_start + child_len;
+            const contains_focus = if (focused) |id| id >= child_start and id < child_end else false;
+            if (projected_only and !contains_focus) continue;
+            const range: Range = .{
+                .kind = storeRangeKind(view),
+                .parent = 0,
+                .start = child_start,
+                .len = child_len,
+                .live = child_len,
+                .depth = depth,
+            };
+            try self.tree.rows.append(self.allocator, .{ .range = range });
+            if (self.tree.expanded_ranges.contains(range.key())) {
+                try self.appendDenseStoreRange(view, child_start, child_len, depth +| 1, false);
+            } else if (contains_focus) {
+                try self.appendDenseStoreRange(view, child_start, child_len, depth +| 1, true);
+            }
+        }
     }
 
     /// Bounded, liveness-filtered fan-out over any heap store (objects or the
@@ -2450,7 +2602,12 @@ const Tui = struct {
                     try self.openMode(.{ .heap = entry.view }, .replace);
                     return;
                 }
-                self.tree.heap_views[@intFromEnum(entry.view)] = !self.tree.heap_views[@intFromEnum(entry.view)];
+                const opening = !self.tree.heap_views[@intFromEnum(entry.view)];
+                if (opening and entry.view == .objects and self.heap_index.objects == null) {
+                    self.heap_index.objects = self.ev.heapObjectSnapshot(self.allocator) catch null;
+                    if (self.heap_index.objects == null) self.status_msg = "(object index failed)";
+                }
+                self.tree.heap_views[@intFromEnum(entry.view)] = opening;
                 try self.rebuildTreeForCurrent();
                 for (self.tree.rows.items, 0..) |row, i| switch (row) {
                     .heap => |candidate| if (candidate.view == entry.view) {
@@ -2541,6 +2698,22 @@ const Tui = struct {
                 return;
             }
         }
+    }
+
+    fn selectedTreeRowIsCurrentSubject(self: *const Tui) bool {
+        if (self.navigation.tree_selection >= self.tree.rows.items.len) return false;
+        return switch (self.tree.rows.items[self.navigation.tree_selection]) {
+            .chunk => |entry| self.currentChunk() == entry.id,
+            .object => |entry| self.currentObject() == entry.id,
+            .store_record => |entry| if (self.currentStoreRecord()) |record|
+                record.view == entry.view and record.id == entry.id
+            else
+                false,
+            .heap => |entry| self.currentHeap() == entry.view,
+            .debug_frame => |entry| self.currentDebugFrame() == entry.index,
+            .debug_value => self.currentKind() == .debug_value,
+            else => false,
+        };
     }
 
     fn treeSelectionCanMoveUp(self: *const Tui) bool {
@@ -2728,14 +2901,14 @@ const Tui = struct {
     fn rowActionable(self: *const Tui, index: usize) bool {
         if (index >= self.page.actions.len) return false;
         return switch (self.page.actions[index]) {
-            .chunk, .object, .source, .instruction => true,
+            .chunk, .object, .store_record, .source, .instruction => true,
             .none, .section => false,
         };
     }
 
     fn firstActionableRow(self: *const Tui) ?usize {
         for (self.page.actions, 0..) |action, i| switch (action) {
-            .chunk, .object, .source, .instruction => return i,
+            .chunk, .object, .store_record, .source, .instruction => return i,
             .none, .section => {},
         };
         return null;
@@ -2863,6 +3036,7 @@ const Tui = struct {
         switch (self.page.actions[self.navigation.detail_selection]) {
             .chunk => |id| try self.open(.{ .chunk = id }),
             .object => |id| try self.open(.{ .object = id }),
+            .store_record => |record| try self.open(.{ .store_record = .{ .view = record.view, .id = record.id } }),
             .source => |id| try self.enterSourceSession(id),
             .instruction, .none, .section => {},
         }
@@ -3257,6 +3431,12 @@ const Tui = struct {
                 id,
                 if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
             }) catch " fix vm "
+        else if (self.currentStoreRecord()) |record|
+            std.fmt.bufPrint(&header_buf, " fix vm  ·  {s}[0x{x}]  ·  {s} ", .{
+                @tagName(record.view),
+                record.id,
+                if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
+            }) catch " fix vm "
         else
             std.fmt.bufPrint(&header_buf, " fix vm  ·  help  ·  {s} ", .{
                 if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
@@ -3323,10 +3503,11 @@ const Tui = struct {
 
         // Peeks are overlays, not columns: moving the selection no longer
         // changes either pane's width or reflows the inspector.
-        const popup = if (self.navigation.focus == .tree)
-            try self.previewLines(arena)
+        const popup_width = self.hoverMaxOuterWidth(cols, layout_now) -| 2;
+        const popup = if (self.navigation.focus == .tree and !self.selectedTreeRowIsCurrentSubject())
+            try self.previewLines(arena, popup_width)
         else if (self.detailPreviewAction() != null)
-            try self.detailPreviewLines(arena)
+            try self.detailPreviewLines(arena, popup_width)
         else
             &.{};
         if (popup.len > 1 and cols >= 40 and rows >= 6)
@@ -3336,7 +3517,7 @@ const Tui = struct {
     fn previewRole(self: *const Tui) tui.Role {
         if (self.navigation.focus == .subject) return switch (self.detailPreviewAction() orelse return .section) {
             .chunk => .chunk,
-            .object => .object,
+            .object, .store_record => .object,
             else => .section,
         };
         if (self.navigation.tree_selection >= self.tree.rows.items.len) return .section;
@@ -3349,6 +3530,14 @@ const Tui = struct {
         };
     }
 
+    fn hoverMaxOuterWidth(self: *const Tui, cols: usize, layout_now: Layout) usize {
+        const available = if (self.navigation.focus == .tree)
+            (if (layout_now.split) cols -| layout_now.sidebar_width -| 2 else cols * 2 / 3)
+        else
+            cols * 2 / 3;
+        return @min(@as(usize, 76), available);
+    }
+
     fn drawHoverPopup(
         self: *Tui,
         arena: std.mem.Allocator,
@@ -3359,12 +3548,9 @@ const Tui = struct {
         layout_now: Layout,
         lines: []const []const u8,
     ) !void {
-        const available_outer = if (self.navigation.focus == .tree)
-            (if (layout_now.split) cols -| layout_now.sidebar_width -| 2 else cols * 2 / 3)
-        else
-            cols * 2 / 3;
-        const max_outer = @min(@as(usize, 76), @max(@as(usize, 28), available_outer));
-        var desired: usize = 28;
+        const max_outer = self.hoverMaxOuterWidth(cols, layout_now);
+        if (max_outer < 4) return;
+        var desired: usize = @min(@as(usize, 28), max_outer);
         for (lines) |line| desired = @max(desired, tui.displayWidth(line, width_mod.cpWidth) + 2);
         const outer_width = @min(max_outer, desired);
         const content_width = outer_width - 2;
@@ -3440,7 +3626,7 @@ const Tui = struct {
     /// A compact preview of the highlighted tree row for the right-hand pane.
     /// This reflects the cursor, not the open inspector, so you can look ahead
     /// while browsing without leaving the current subject.
-    fn previewLines(self: *Tui, arena: std.mem.Allocator) ![]const []const u8 {
+    fn previewLines(self: *Tui, arena: std.mem.Allocator, content_width: usize) ![]const []const u8 {
         var lines: std.ArrayListUnmanaged([]const u8) = .empty;
         try lines.append(arena, " PREVIEW");
         if (self.navigation.tree_selection >= self.tree.rows.items.len) return lines.items;
@@ -3460,11 +3646,11 @@ const Tui = struct {
                         const src = self.chunkSourceText(entry.id, chunk);
                         for (chunk.source_map, 0..) |sm, i| {
                             if (i >= 6) break;
-                            const snip = spanSnippet(arena, src, sm.span) catch "";
+                            const snip = spanSnippet(arena, src, sm.span, content_width -| 1) catch "";
                             if (snip.len > 0) try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{snip}));
                         }
                     }
-                    try self.appendChunkCodePreview(&lines, arena, entry.id, chunk, 12);
+                    try self.appendChunkCodePreview(&lines, arena, entry.id, chunk, preview_line_cap);
                 }
             },
             .name => |entry| {
@@ -3473,11 +3659,16 @@ const Tui = struct {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {d} chunks in subtree", .{self.tree_index.statsOf(entry.id).chunks}));
             },
             .object => |entry| {
-                const summary = try self.objectSummary(arena, entry.id, 56);
+                const ref_width = content_width -| 1;
+                const summary = try self.objectSummary(
+                    arena,
+                    entry.id,
+                    self.storePreviewBudget("objects", entry.id, ref_width),
+                );
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
                     try self.canonicalStoreRef(arena, .objects, entry.id, summary, true),
                 }));
-                try self.appendObjectPreview(&lines, arena, entry.id);
+                try self.appendObjectPreview(&lines, arena, entry.id, content_width);
             },
             .heap => |entry| {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " heap/{s}", .{@tagName(entry.view)}));
@@ -3489,35 +3680,15 @@ const Tui = struct {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {s}:{d}", .{ if (info.file) |f| std.fs.path.basename(f) else "<repl>", info.line }));
             },
             .store_record => |entry| {
-                switch (entry.view) {
-                    .values => if (self.ev.heapValueAt(entry.id)) |v| {
-                        const summary = try self.valueSummary(arena, v.*, 56);
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                            try self.canonicalStoreRef(arena, entry.view, entry.id, summary, true),
-                        }));
-                    },
-                    .attrs => if (self.ev.heapAttrAt(entry.id)) |a| {
-                        const summary = try std.fmt.allocPrint(arena, "{s} = {s}", .{
-                            self.ev.internTable().get(a.name),
-                            try self.valueSummary(arena, a.value, 42),
-                        });
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                            try self.canonicalStoreRef(arena, entry.view, entry.id, summary, true),
-                        }));
-                    },
-                    .attr_positions => if (self.ev.heapAttrPosAt(entry.id)) |a| {
-                        const summary = try std.fmt.allocPrint(arena, "{s} @ {s}:{d}:{d}", .{
-                            self.ev.internTable().get(a.name),
-                            std.fs.path.basename(self.ev.internTable().get(a.pos.file)),
-                            a.pos.line,
-                            a.pos.column,
-                        });
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                            try self.canonicalStoreRef(arena, entry.view, entry.id, summary, true),
-                        }));
-                    },
-                    else => {},
-                }
+                const summary = try self.storeRecordSummary(
+                    arena,
+                    entry.view,
+                    entry.id,
+                    self.storePreviewBudget(@tagName(entry.view), entry.id, content_width -| 1),
+                );
+                try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
+                    try self.canonicalStoreRef(arena, entry.view, entry.id, summary, true),
+                }));
             },
             .category => |entry| {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {s} section", .{@tagName(entry.kind)}));
@@ -3529,6 +3700,8 @@ const Tui = struct {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " values   {d} live · {d} slots", .{ self.liveStoreCount(.values), c.values }));
                     try lines.append(arena, try std.fmt.allocPrint(arena, " attrs    {d} live · {d} slots", .{ self.liveStoreCount(.attrs), c.attrs }));
                     try lines.append(arena, try std.fmt.allocPrint(arena, " attrpos  {d} live · {d} slots", .{ self.liveStoreCount(.attr_positions), c.attr_positions }));
+                    try lines.append(arena, try std.fmt.allocPrint(arena, " intern   {d}", .{self.liveStoreCount(.intern)}));
+                    try lines.append(arena, try std.fmt.allocPrint(arena, " builtin  {d}", .{self.liveStoreCount(.builtin)}));
                     if (self.heap_index.stats) |stats| {
                         try lines.append(arena, "");
                         try lines.append(arena, " object types");
@@ -3549,48 +3722,50 @@ const Tui = struct {
     /// The right-hand preview when inspecting a value subject: a peek at the
     /// object/chunk that the selected reference row points to, so you can see a
     /// member's contents without leaving the current subject.
-    fn detailPreviewLines(self: *Tui, arena: std.mem.Allocator) ![]const []const u8 {
+    fn detailPreviewLines(self: *Tui, arena: std.mem.Allocator, content_width: usize) ![]const []const u8 {
         var lines: std.ArrayListUnmanaged([]const u8) = .empty;
         try lines.append(arena, " PREVIEW");
         const action = self.detailPreviewAction() orelse return lines.items;
         switch (action) {
             .object => |id| {
+                const ref_width = content_width -| 1;
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                    try self.canonicalStoreRef(arena, .objects, id, try self.objectSummary(arena, id, 56), true),
+                    try self.canonicalStoreRef(
+                        arena,
+                        .objects,
+                        id,
+                        try self.objectSummary(arena, id, self.storePreviewBudget("objects", id, ref_width)),
+                        true,
+                    ),
                 }));
-                if (self.ev.heapAttrsOf(id)) |attrs| {
-                    try lines.append(arena, try std.fmt.allocPrint(arena, " attrs · {d} members", .{attrs.len}));
-                    for (attrs, 0..) |entry, i| {
-                        if (i >= 12) break;
-                        const detail = try self.shallowValueSummary(arena, entry.value, 44);
-                        try lines.append(arena, try std.fmt.allocPrint(arena, "  {s} = {s}", .{ self.ev.internTable().get(entry.name), detail }));
-                    }
-                } else |_| if (self.ev.heapListOf(id)) |items| {
-                    try lines.append(arena, try std.fmt.allocPrint(arena, " list · {d} items", .{items.len}));
-                    for (items, 0..) |item, i| {
-                        if (i >= 12) break;
-                        const detail = try self.shallowValueSummary(arena, item, 48);
-                        try lines.append(arena, try std.fmt.allocPrint(arena, "  [{d}] {s}", .{ i, detail }));
-                    }
-                } else |_| {
-                    if (self.heap_index.objects) |*snap| {
-                        if (self.ev.inspectHeapObject(snap, id)) |info| {
-                            try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{@tagName(info)}));
-                        } else |_| {}
-                    }
-                    try self.appendObjectPreview(&lines, arena, id);
-                }
+                try self.appendObjectPreview(&lines, arena, id, content_width);
             },
             .chunk => |id| {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " chunk[0x{x}]", .{id}));
                 if (self.ev.getChunk(id)) |chunk| {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {d} bytes · {d} consts", .{ chunk.code.len, chunk.constants.len }));
                     if (chunk.source_map.len > 0) {
-                        const snip = spanSnippet(arena, self.chunkSourceText(id, chunk), chunk.source_map[0].span) catch "";
+                        const snip = spanSnippet(
+                            arena,
+                            self.chunkSourceText(id, chunk),
+                            chunk.source_map[0].span,
+                            content_width -| 1,
+                        ) catch "";
                         if (snip.len > 0) try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{snip}));
                     }
-                    try self.appendChunkCodePreview(&lines, arena, id, chunk, 14);
+                    try self.appendChunkCodePreview(&lines, arena, id, chunk, preview_line_cap);
                 }
+            },
+            .store_record => |record| {
+                const summary = try self.storeRecordSummary(
+                    arena,
+                    record.view,
+                    record.id,
+                    self.storePreviewBudget(@tagName(record.view), record.id, content_width -| 1),
+                );
+                try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
+                    try self.canonicalStoreRef(arena, record.view, record.id, summary, true),
+                }));
             },
             else => {},
         }
@@ -3644,6 +3819,7 @@ const Tui = struct {
         lines: *std.ArrayListUnmanaged([]const u8),
         arena: std.mem.Allocator,
         id: runtime.types.ObjectId,
+        content_width: usize,
     ) !void {
         // A standalone debugger pause does not run the asynchronous heap-index
         // jobs. Build its live-object bitmap once, synchronously while the VM is
@@ -3653,6 +3829,38 @@ const Tui = struct {
         const snapshot = if (self.heap_index.objects) |*snap| snap else return;
         const info = self.ev.inspectHeapObject(snapshot, id) catch return;
         switch (info) {
+            .attrs => if (self.ev.heapAttrsOf(id)) |attrs| {
+                try lines.append(arena, try std.fmt.allocPrint(arena, " attrs · {d} members", .{attrs.len}));
+                for (attrs[0..@min(attrs.len, preview_line_cap)]) |entry| {
+                    const name = self.ev.internTable().get(entry.name);
+                    const value_width = content_width -| width_mod.strWidth(name) -| 4;
+                    const detail = try self.shallowValueSummary(arena, entry.value, value_width);
+                    try lines.append(arena, try std.fmt.allocPrint(arena, "  {s} = {s}", .{ name, detail }));
+                }
+                if (attrs.len > preview_line_cap) try lines.append(arena, try std.fmt.allocPrint(
+                    arena,
+                    "  … {d} more",
+                    .{attrs.len - preview_line_cap},
+                ));
+            } else |_| {},
+            .list => if (self.ev.heapListOf(id)) |items| {
+                try lines.append(arena, try std.fmt.allocPrint(arena, " list · {d} items", .{items.len}));
+                for (items[0..@min(items.len, preview_line_cap)], 0..) |item, i| {
+                    var prefix_buf: [32]u8 = undefined;
+                    const prefix = std.fmt.bufPrint(&prefix_buf, "  [{d}] ", .{i}) catch "  ";
+                    const detail = try self.shallowValueSummary(
+                        arena,
+                        item,
+                        content_width -| width_mod.strWidth(prefix),
+                    );
+                    try lines.append(arena, try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, detail }));
+                }
+                if (items.len > preview_line_cap) try lines.append(arena, try std.fmt.allocPrint(
+                    arena,
+                    "  … {d} more",
+                    .{items.len - preview_line_cap},
+                ));
+            } else |_| {},
             .thunk => |thunk| {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " state {s} · demanded {s}", .{
                     @tagName(thunk.state),
@@ -3663,21 +3871,21 @@ const Tui = struct {
                         .bytecode => |body| {
                             try lines.append(arena, try std.fmt.allocPrint(arena, " chunk[0x{x}] · {d} captures", .{ body.chunk, body.captures }));
                             if (self.ev.getChunk(body.chunk)) |chunk|
-                                try self.appendChunkCodePreview(lines, arena, body.chunk, chunk, 10);
+                                try self.appendChunkCodePreview(lines, arena, body.chunk, chunk, preview_line_cap);
                         },
                         .closure => |value| {
-                            const rendered = try self.renderValueRef(arena, value, 52, true);
+                            const rendered = try self.renderValueRef(arena, value, content_width -| 9, true);
                             try lines.append(arena, try std.fmt.allocPrint(arena, " closure {s}", .{rendered.text}));
                         },
                         .pass_through => |value| {
-                            const rendered = try self.renderValueRef(arena, value, 52, true);
+                            const rendered = try self.renderValueRef(arena, value, content_width -| 7, true);
                             try lines.append(arena, try std.fmt.allocPrint(arena, " value {s}", .{rendered.text}));
                         },
                         .attr_access => |access| try lines.append(arena, try std.fmt.allocPrint(arena, " attribute intern[0x{x}]", .{access.name})),
                         .deferred => |body| try lines.append(arena, try std.fmt.allocPrint(arena, " deferred[0x{x}] · {d} captures", .{ body.id, body.captures })),
                     },
                     .result => |value| {
-                        const rendered = try self.renderValueRef(arena, value, 52, true);
+                        const rendered = try self.renderValueRef(arena, value, content_width -| 8, true);
                         try lines.append(arena, try std.fmt.allocPrint(arena, " result {s}", .{rendered.text}));
                     },
                     .error_name => |name| try lines.append(arena, try std.fmt.allocPrint(arena, " error {s}", .{name})),
@@ -3685,12 +3893,20 @@ const Tui = struct {
             },
             .builtin_closure => |closure| {
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                    try self.locatedValue(arena, "builtin", closure.builtin, .builtin, disasm.builtinName(closure.builtin), 56, true),
+                    try self.locatedValue(
+                        arena,
+                        "builtin",
+                        closure.builtin,
+                        .builtin,
+                        disasm.builtinName(closure.builtin),
+                        content_width -| 1,
+                        true,
+                    ),
                 }));
                 try lines.append(arena, try std.fmt.allocPrint(arena, " {d} arguments", .{closure.args}));
             },
             .closure => |closure| if (self.ev.getChunk(closure.chunk)) |chunk|
-                try self.appendChunkCodePreview(lines, arena, closure.chunk, chunk, 10),
+                try self.appendChunkCodePreview(lines, arena, closure.chunk, chunk, preview_line_cap),
             else => {},
         }
     }
@@ -3701,6 +3917,8 @@ const Tui = struct {
             .values => .value,
             .attrs => .attr,
             .attr_positions => .attr_position,
+            .intern => .intern,
+            .builtin => .builtin,
         };
     }
 
@@ -3722,6 +3940,44 @@ const Tui = struct {
             if (colored) self.color_depth else .none,
         );
         return rendered.written();
+    }
+
+    fn storeRecordSummary(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        view: HeapView,
+        id: u32,
+        max_cells: usize,
+    ) ![]const u8 {
+        const raw: []const u8 = switch (view) {
+            .values => if (self.ev.heapValueAt(id)) |value|
+                try self.valueSummary(arena, value.*, max_cells)
+            else
+                "",
+            .attrs => if (self.ev.heapAttrAt(id)) |attr|
+                try std.fmt.allocPrint(arena, "{s} = {s}", .{
+                    self.ev.internTable().get(attr.name),
+                    try self.valueSummary(arena, attr.value, max_cells),
+                })
+            else
+                "",
+            .attr_positions => if (self.ev.heapAttrPosAt(id)) |position|
+                try std.fmt.allocPrint(arena, "{s} @ {s}:{d}:{d}", .{
+                    self.ev.internTable().get(position.name),
+                    std.fs.path.basename(self.ev.internTable().get(position.pos.file)),
+                    position.pos.line,
+                    position.pos.column,
+                })
+            else
+                "",
+            .intern => if (id < self.storeCount(.intern))
+                try escapedQuoted(arena, "text ", self.ev.internTable().get(id), max_cells)
+            else
+                "",
+            .builtin => disasm.builtinName(id) orelse "",
+            .overview, .objects => "",
+        };
+        return width_mod.endEllipsis(arena, raw, max_cells);
     }
 
     fn storePreviewBudget(self: *Tui, store: []const u8, id: u64, max_cells: usize) usize {
@@ -3900,7 +4156,11 @@ const Tui = struct {
                     try out.writer.writeAll(" [");
                     for (items[0..@min(items.len, 3)], 0..) |item, i| {
                         if (i != 0) try out.writer.writeAll(", ");
-                        try out.writer.writeAll(try self.shallowValueSummary(arena, item, 20));
+                        try out.writer.writeAll(try self.shallowValueSummary(
+                            arena,
+                            item,
+                            @max(@as(usize, 8), max_cells / 3),
+                        ));
                     }
                     if (items.len > 3) try out.writer.writeAll(", …");
                     try out.writer.writeByte(']');
@@ -3915,7 +4175,7 @@ const Tui = struct {
                     for (attrs[0..@min(attrs.len, 2)], 0..) |attr, i| {
                         if (i != 0) try out.writer.writeAll(", ");
                         try out.writer.writeAll(self.ev.internTable().get(attr.name));
-                        if (try self.scalarText(arena, attr.value)) |scalar|
+                        if (try self.scalarText(arena, attr.value, @max(@as(usize, 8), max_cells / 2))) |scalar|
                             try out.writer.print(" = {s}", .{scalar});
                     }
                     if (attrs.len > 2) try out.writer.writeAll(", …");
@@ -3933,27 +4193,32 @@ const Tui = struct {
     /// The rendered scalar for an inline `Value` (null/bool/int/float/string/
     /// path), or null for heap-backed kinds. Safe on a raw store slot — inline
     /// scalars carry their data in the `Value` bits with no heap deref.
-    fn scalarText(self: *Tui, arena: std.mem.Allocator, value: runtime.value.Value) !?[]const u8 {
+    fn scalarText(
+        self: *Tui,
+        arena: std.mem.Allocator,
+        value: runtime.value.Value,
+        max_cells: usize,
+    ) !?[]const u8 {
         return switch (value.kind()) {
             .null,
             .bool_false,
             .bool_true,
             .int,
             .float,
-            => try self.scalarValueSummary(arena, value, 32),
+            => try self.scalarValueSummary(arena, value, max_cells),
             .string, .path => blk: {
                 const id = value.asInternId();
                 const preview = try escapedQuoted(
                     arena,
                     try std.fmt.allocPrint(arena, "{s} ", .{disasm.valueKindLabel(value.kind())}),
                     self.ev.internTable().get(id),
-                    self.storePreviewBudget("intern", id, 32),
+                    self.storePreviewBudget("intern", id, max_cells),
                 );
-                break :blk try self.locatedValue(arena, "intern", id, .intern, preview, 32, false);
+                break :blk try self.locatedValue(arena, "intern", id, .intern, preview, max_cells, false);
             },
             .builtin => blk: {
                 const id = value.asBuiltinId();
-                break :blk try self.locatedValue(arena, "builtin", id, .builtin, disasm.builtinName(id), 32, false);
+                break :blk try self.locatedValue(arena, "builtin", id, .builtin, disasm.builtinName(id), max_cells, false);
             },
             else => null,
         };
@@ -3968,7 +4233,7 @@ const Tui = struct {
         value: runtime.value.Value,
         max_cells: usize,
     ) ![]const u8 {
-        if (try self.scalarText(arena, value)) |scalar|
+        if (try self.scalarText(arena, value, max_cells)) |scalar|
             return width_mod.endEllipsis(arena, scalar, max_cells);
         if (value.kind() == .closure and value.isFunction())
             return self.locatedValue(arena, "chunk", value.asFunctionChunkId(), .chunk, "function", max_cells, false);
@@ -4028,7 +4293,7 @@ const Tui = struct {
         if (index < self.page.actions.len) switch (self.page.actions[index]) {
             .section, .source => return .section,
             .chunk => return .chunk,
-            .object => return .object,
+            .object, .store_record => return .object,
             .none, .instruction => {},
         };
         return .plain;
@@ -4218,6 +4483,12 @@ const Tui = struct {
                     } else if (self.currentHeap()) |view| {
                         const line = std.fmt.bufPrint(&line_buf, " ● heap/{s}", .{@tagName(view)}) catch " heap";
                         try frame.text(line, 0, width, .section);
+                    } else if (self.currentStoreRecord()) |record| {
+                        const line = std.fmt.bufPrint(&line_buf, " ● {s}[0x{x}]", .{
+                            @tagName(record.view),
+                            record.id,
+                        }) catch " store record";
+                        try frame.text(line, 0, width, .object);
                     } else if (self.debug_session) |session| {
                         const line = std.fmt.bufPrint(&line_buf, " ◆ paused/{s}", .{reasonName(session.reason)}) catch " paused";
                         try frame.text(line, 0, width, .current);
@@ -4361,11 +4632,13 @@ const Tui = struct {
                             reference,
                         });
                     },
-                    .values, .attrs, .attr_positions => blk2: {
+                    .values, .attrs, .attr_positions, .intern, .builtin => blk2: {
                         const view: HeapView = switch (entry.kind) {
                             .values => .values,
                             .attrs => .attrs,
                             .attr_positions => .attr_positions,
+                            .intern => .intern,
+                            .builtin => .builtin,
                             else => unreachable,
                         };
                         const reference = try self.canonicalStoreRange(
@@ -4402,13 +4675,26 @@ const Tui = struct {
                     (if (self.heap_index.objects) |*s| s else null)
                 else
                     self.ensureStoreSnapshot(entry.view);
-                const high_water = if (snapshot) |s| s.high_water else self.storeCount(entry.view);
+                if (entry.view == .objects and snapshot == null) {
+                    break :blk if (self.heap_index.stats) |stats|
+                        try std.fmt.allocPrint(arena, " {s}{s} objects · {d} live", .{
+                            indent[0..indent_len],
+                            marker,
+                            liveObjectCount(stats),
+                        })
+                    else
+                        try std.fmt.allocPrint(arena, " {s}{s} objects", .{
+                            indent[0..indent_len],
+                            marker,
+                        });
+                }
+                const extent = if (snapshot) |s| s.liveExtent() else self.storeCount(entry.view);
                 const live = if (snapshot) |s| s.live_count else self.storeCount(entry.view);
                 const reference = try self.canonicalStoreRange(
                     arena,
                     entry.view,
                     0,
-                    high_water,
+                    extent,
                     live,
                     !(selected and self.navigation.focus == .tree),
                 );
@@ -4422,7 +4708,12 @@ const Tui = struct {
                 var indent: [64]u8 = undefined;
                 const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                 @memset(indent[0..indent_len], ' ');
-                const preview = try self.objectSummary(arena, entry.id, @max(@as(usize, 16), width -| indent_len -| 18));
+                const ref_width = width -| indent_len -| 4;
+                const preview = try self.objectSummary(
+                    arena,
+                    entry.id,
+                    self.storePreviewBudget("objects", entry.id, ref_width),
+                );
                 const reference = try self.canonicalStoreRef(
                     arena,
                     .objects,
@@ -4441,19 +4732,13 @@ const Tui = struct {
                 const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                 @memset(indent[0..indent_len], ' ');
                 const current = if (self.currentStoreRecord()) |r| (r.view == entry.view and r.id == entry.id) else false;
-                const detail: []const u8 = switch (entry.view) {
-                    .attrs => if (self.ev.heapAttrAt(entry.id)) |a| blk2: {
-                        const value = try self.valueSummary(arena, a.value, 34);
-                        break :blk2 try std.fmt.allocPrint(arena, "{s} = {s}", .{ self.ev.internTable().get(a.name), value });
-                    } else "",
-                    .values => if (self.ev.heapValueAt(entry.id)) |v| try self.valueSummary(arena, v.*, 42) else "",
-                    .attr_positions => if (self.ev.heapAttrPosAt(entry.id)) |a| try std.fmt.allocPrint(
-                        arena,
-                        "{s} @ {s}:{d}:{d}",
-                        .{ self.ev.internTable().get(a.name), std.fs.path.basename(self.ev.internTable().get(a.pos.file)), a.pos.line, a.pos.column },
-                    ) else "",
-                    else => "",
-                };
+                const ref_width = width -| indent_len -| 4;
+                const detail = try self.storeRecordSummary(
+                    arena,
+                    entry.view,
+                    entry.id,
+                    self.storePreviewBudget(@tagName(entry.view), entry.id, ref_width),
+                );
                 const reference = try self.canonicalStoreRef(
                     arena,
                     entry.view,
@@ -4493,7 +4778,7 @@ const Tui = struct {
                 const session = self.debug_session orelse break :blk " value";
                 const v = session.value;
                 const label = returnValueHeading(session.reason);
-                const detail = try self.valueSummary(arena, v, @max(@as(usize, 20), width -| 24));
+                const detail = try self.valueSummary(arena, v, width -| 24);
                 break :blk try std.fmt.allocPrint(arena, " ↳ {s}: {s}", .{ label, detail });
             },
         };
@@ -4536,7 +4821,7 @@ const Tui = struct {
             const ansi_identity = switch (self.tree.rows.items[index]) {
                 .object, .store_record, .heap => !(selected and self.navigation.focus == .tree),
                 .range => |entry| switch (entry.kind) {
-                    .objects, .values, .attrs, .attr_positions => !(selected and self.navigation.focus == .tree),
+                    .objects, .values, .attrs, .attr_positions, .intern, .builtin => !(selected and self.navigation.focus == .tree),
                     else => false,
                 },
                 else => false,
@@ -4876,7 +5161,7 @@ fn debugPageOf(arena: std.mem.Allocator, page: *PageBuilder, title: []const u8) 
 }
 
 /// A one-line, length-capped snippet of a source span for the span list.
-fn spanSnippet(arena: std.mem.Allocator, source: ?[]const u8, target: anytype) ![]const u8 {
+fn spanSnippet(arena: std.mem.Allocator, source: ?[]const u8, target: anytype, max_cells: usize) ![]const u8 {
     const text = source orelse return "";
     const start = @min(@as(usize, target.offset), text.len);
     const end = @min(start +| @as(usize, target.len), text.len);
@@ -4886,7 +5171,7 @@ fn spanSnippet(arena: std.mem.Allocator, source: ?[]const u8, target: anytype) !
     for (out) |*b| if (b.* == '\n' or b.* == '\r' or b.* == '\t') {
         b.* = ' ';
     };
-    return width_mod.endEllipsis(arena, out, 64);
+    return width_mod.endEllipsis(arena, out, max_cells);
 }
 
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -4946,6 +5231,12 @@ fn disasmTarget(line: []const u8) RowAction {
     if (storeRefId(line, "objects[0x")) |id| {
         return .{ .object = @intCast(id) };
     }
+    if (storeRefId(line, "intern[0x")) |id| {
+        return .{ .store_record = .{ .view = .intern, .id = @intCast(id) } };
+    }
+    if (storeRefId(line, "builtin[0x")) |id| {
+        return .{ .store_record = .{ .view = .builtin, .id = @intCast(id) } };
+    }
     return .none;
 }
 
@@ -4969,5 +5260,22 @@ fn sourceFileMatches(a: []const u8, b: []const u8) bool {
 test "disassembly targets recognize chunk and heap links" {
     try std.testing.expectEqual(@as(ChunkId, 0x2a), disasmTarget("chunk[0x2a] → function").chunk);
     try std.testing.expectEqual(@as(runtime.types.ObjectId, 0x31), disasmTarget("objects[0x31] → thunk").object);
-    try std.testing.expect(disasmTarget("intern[0x1] → string \"x\"") == .none);
+    const intern = disasmTarget("intern[0x1] → string \"x\"").store_record;
+    try std.testing.expectEqual(HeapView.intern, intern.view);
+    try std.testing.expectEqual(@as(u32, 1), intern.id);
+    const builtin = disasmTarget("builtin[0x20] → import").store_record;
+    try std.testing.expectEqual(HeapView.builtin, builtin.view);
+    try std.testing.expectEqual(@as(u32, 0x20), builtin.id);
+}
+
+test "source snippets honor their container width" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = "alpha βeta gamma delta";
+    const snippet = try spanSnippet(arena.allocator(), source, .{
+        .offset = 0,
+        .len = source.len,
+    }, 9);
+    try std.testing.expect(width_mod.strWidth(snippet) <= 9);
+    try std.testing.expect(std.mem.endsWith(u8, snippet, "…"));
 }
