@@ -89,6 +89,41 @@ test "object snapshot indexes only filled slots and exposes semantic details" {
     try std.testing.expectError(error.InvalidObjectId, heap.inspectObject(&snapshot, snapshot.high_water - 1));
 }
 
+test "object reference inspection follows objects and chunks without recursion" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const child_id = try heap.addList(&.{Value.int(7)});
+    const parent_id = try heap.addAttrs(&.{
+        .{ .name = 10, .value = Value.list(child_id) },
+        .{ .name = 20, .value = Value.function(0x2a) },
+        .{ .name = 30, .value = Value.string(99) },
+    });
+    const closure_id = try heap.addClosure(0x31, &.{
+        Value.attrs(parent_id),
+        Value.function(0x32),
+    });
+
+    var snapshot = try heap.objectSnapshot(std.testing.allocator);
+    defer snapshot.deinit();
+
+    var refs: std.ArrayListUnmanaged(heap_mod.HeapReference) = .empty;
+    defer refs.deinit(std.testing.allocator);
+    try heap.collectObjectReferences(&snapshot, parent_id, std.testing.allocator, &refs);
+    try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
+        .{ .object = child_id },
+        .{ .chunk = 0x2a },
+    }, refs.items);
+
+    refs.clearRetainingCapacity();
+    try heap.collectObjectReferences(&snapshot, closure_id, std.testing.allocator, &refs);
+    try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
+        .{ .chunk = 0x31 },
+        .{ .object = parent_id },
+        .{ .chunk = 0x32 },
+    }, refs.items);
+}
+
 test "range-store snapshots index only live records, not reserved capacity" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();

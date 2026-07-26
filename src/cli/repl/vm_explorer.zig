@@ -15,6 +15,7 @@ const editor_mod = @import("editor.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("transcript.zig");
 const vm_jobs = @import("vm_jobs.zig");
+const vm_refs = @import("vm_refs.zig");
 const vm_tree = @import("vm_tree.zig");
 const vm_navigation = @import("vm_navigation.zig");
 const history_mod = @import("history.zig");
@@ -402,7 +403,7 @@ const HeapIndexState = struct {
 };
 
 const ReferenceIndexState = struct {
-    graph: ?bytecode.inspect.RefGraph = null,
+    graph: ?vm_refs.Graph = null,
     failed: bool = false,
 };
 
@@ -426,7 +427,7 @@ const SessionJobs = struct {
             },
             .heap = .{ .ev = ev },
             .objects = .{ .ev = ev },
-            .references = .{ .registry = ev.chunkRegistry() },
+            .references = .{ .ev = ev },
         };
     }
 
@@ -591,14 +592,16 @@ const Tui = struct {
             };
         }
 
-        // References are part of every chunk's unified inspector document.
-        const shows_references = self.currentChunk() != null;
+        // References are part of chunk and heap-object inspector documents.
+        const shows_references = self.currentChunk() != null or self.currentObject() != null;
         if (jobs.references.poll(&self.references.graph)) {
             if (shows_references) try self.refreshPage(self.currentKind());
         }
         const references_failed = jobs.references.failed.load(.acquire);
         self.references.failed = references_failed;
-        const references_stale = self.references.graph == null or self.references.graph.?.registry_count != registry.count();
+        const references_stale = self.references.graph == null or
+            self.references.graph.?.registry_count != registry.count() or
+            self.references.graph.?.object_high_water != self.ev.heapCounts().objects;
         if (shows_references and references_stale and jobs.references.thread == null and !references_failed) {
             jobs.references.start() catch {};
         }
@@ -612,6 +615,7 @@ const Tui = struct {
         self.references.failed = false;
         self.heap_index.stats = null;
         self.clearHeapSnapshots();
+        self.clearReferenceGraph();
         if (capture.written().len > 0 and capture.written()[capture.written().len - 1] != '\n')
             try capture.writer.writeByte('\n');
         try self.rebuildTranscriptLines(capture.written());
@@ -641,6 +645,11 @@ const Tui = struct {
         self.heap_index.values_count = 0;
         self.heap_index.attrs_count = 0;
         self.heap_index.attr_positions_count = 0;
+    }
+
+    fn clearReferenceGraph(self: *Tui) void {
+        if (self.references.graph) |*graph| graph.deinit();
+        self.references.graph = null;
     }
 
     fn runSession(self: *Tui, editor: *editor_mod.Editor, capture: *transcript_mod.Capture, host: SessionHost) !void {
@@ -804,7 +813,7 @@ const Tui = struct {
                 try page.heading(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{id}));
                 try self.appendDisassemblyAt(&page, id, chunk, true, null);
                 try page.line("", .none);
-                try self.appendRefs(&page, id);
+                try self.appendReferences(&page, .{ .chunk = id });
                 return .{
                     .title = try std.fmt.allocPrint(arena, "chunk[0x{x}]", .{id}),
                     .lines = page.lines.items,
@@ -1033,6 +1042,8 @@ const Tui = struct {
                 try page.line(try std.fmt.allocPrint(arena, "arguments   {d}", .{partial.args}), .none);
             },
         }
+        try page.line("", .none);
+        try self.appendReferences(&page, .{ .object = id });
         return .{
             .title = try std.fmt.allocPrint(arena, "objects[0x{x}]", .{id}),
             .lines = page.lines.items,
@@ -1545,18 +1556,61 @@ const Tui = struct {
         };
     }
 
-    fn appendRefs(self: *Tui, page: *PageBuilder, id: ChunkId) !void {
-        var outgoing: std.ArrayListUnmanaged(ChunkId) = .empty;
-        const chunk = self.ev.getChunk(id) orelse return;
-        try bytecode.inspect.collectRefs(page.arena, chunk, &outgoing);
-        try page.heading(try std.fmt.allocPrint(page.arena, "OUTGOING · {d}", .{outgoing.items.len}));
-        for (outgoing.items) |target| try self.appendChunkLabel(page, "  →", target);
+    fn appendReferences(self: *Tui, page: *PageBuilder, subject: vm_refs.Node) !void {
+        // A standalone debugger pause has no background job loop. Build the
+        // cold index only when a reference-bearing page is actually opened.
+        if (self.references.graph == null and self.debug_session != null and !self.references.failed) {
+            const graph = vm_refs.Graph.build(self.allocator, self.ev) catch {
+                self.references.failed = true;
+                return;
+            };
+            self.references.graph = graph;
+        }
 
-        const graph = self.references.graph orelse return;
+        const graph = self.references.graph orelse {
+            // Preserve the immediately-useful chunk-to-chunk projection while
+            // a full heap/chunk graph is being built in a normal :vm session.
+            switch (subject) {
+                .object => return,
+                .chunk => |id| {
+                    var outgoing: std.ArrayListUnmanaged(ChunkId) = .empty;
+                    const chunk = self.ev.getChunk(id) orelse return;
+                    try bytecode.inspect.collectRefs(page.arena, chunk, &outgoing);
+                    try page.heading(try std.fmt.allocPrint(page.arena, "OUTGOING · {d}", .{outgoing.items.len}));
+                    for (outgoing.items) |target| try self.appendChunkLabel(page, "  →", target);
+                    return;
+                },
+            }
+        };
+
+        const outgoing = graph.outgoing(subject);
+        try page.heading(try std.fmt.allocPrint(page.arena, "OUTGOING · {d}", .{outgoing.len}));
+        for (outgoing) |edge| try self.appendReferenceLabel(page, "  →", vm_refs.node(edge.target));
         try page.line("", .none);
-        const incoming = graph.incoming(id);
+        const incoming = graph.incoming(subject);
         try page.heading(try std.fmt.allocPrint(page.arena, "INCOMING · {d}", .{incoming.len}));
-        for (incoming) |source| try self.appendChunkLabel(page, "  ←", source);
+        for (incoming) |edge| try self.appendReferenceLabel(page, "  ←", vm_refs.node(edge.target));
+    }
+
+    fn appendReferenceLabel(self: *Tui, page: *PageBuilder, marker: []const u8, reference: vm_refs.Node) !void {
+        switch (reference) {
+            .chunk => |id| try self.appendChunkLabel(page, marker, id),
+            .object => |id| {
+                if (self.heap_index.objects == null)
+                    self.heap_index.objects = self.ev.heapObjectSnapshot(self.allocator) catch null;
+                const prefix = try std.fmt.allocPrint(page.arena, "{s} ", .{marker});
+                const width = self.lineRemainderWidth(prefix);
+                const summary = try self.objectSummary(
+                    page.arena,
+                    id,
+                    self.storePreviewBudget("objects", id, width),
+                );
+                try page.line(try std.fmt.allocPrint(page.arena, "{s}{s}", .{
+                    prefix,
+                    try self.canonicalStoreRef(page.arena, .objects, id, summary, true),
+                }), .{ .object = id });
+            },
+        }
     }
 
     fn appendChunkLabel(self: *Tui, page: *PageBuilder, marker: []const u8, id: ChunkId) !void {
@@ -4858,6 +4912,10 @@ const Tui = struct {
 
         self.debug_session = session;
         self.return_flash = session.reason == .return_step;
+        // A previous pause may have indexed the heap before the VM resumed.
+        // Every new pause is a new immutable inspection boundary.
+        self.clearHeapSnapshots();
+        self.clearReferenceGraph();
         session.clearStep();
         self.debug_nav_mark = self.navigation.back.items.len;
         defer {
@@ -5040,7 +5098,12 @@ const Tui = struct {
                     try self.debugSetCaptureFmt(capture, "error: {s}", .{@errorName(err)});
                     return .running;
                 };
+                // Debugger evaluation may allocate or resolve objects without
+                // leaving the pause, so discard its old read-only indexes.
+                self.clearHeapSnapshots();
+                self.clearReferenceGraph();
                 try self.debugRenderValue(session, capture, value);
+                try self.refreshPage(self.currentKind());
             },
             .breakpoint => |arg| try self.debugAddBreakpoint(session, capture, arg),
             .breakpoints => try self.debugListBreakpoints(session, capture),

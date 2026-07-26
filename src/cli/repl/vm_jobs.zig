@@ -10,6 +10,7 @@ const sync = @import("base").sync;
 const engine = @import("expr");
 const runtime = @import("runtime");
 const vm_tree = @import("vm_tree.zig");
+const vm_refs = @import("vm_refs.zig");
 
 const Evaluator = engine.Evaluator;
 const bytecode = engine.bytecode;
@@ -180,10 +181,10 @@ pub const ObjectSnapshot = struct {
 };
 
 pub const References = struct {
-    registry: *const bytecode.ChunkRegistry,
+    ev: *Evaluator,
     thread: ?std.Thread = null,
     mutex: sync.BlockingMutex = .{},
-    ready: ?bytecode.inspect.RefGraph = null,
+    ready: ?vm_refs.Graph = null,
     running: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
 
@@ -198,7 +199,7 @@ pub const References = struct {
     }
 
     fn build(self: *References) void {
-        const result = bytecode.inspect.RefGraph.build(std.heap.smp_allocator, self.registry) catch {
+        const result = vm_refs.Graph.build(std.heap.smp_allocator, self.ev) catch {
             self.failed.store(true, .release);
             self.running.store(false, .release);
             return;
@@ -209,12 +210,12 @@ pub const References = struct {
         self.running.store(false, .release);
     }
 
-    pub fn poll(self: *References, target: *?bytecode.inspect.RefGraph) bool {
+    pub fn poll(self: *References, target: *?vm_refs.Graph) bool {
         if (self.thread == null or self.running.load(.acquire)) return false;
         return self.finish(target);
     }
 
-    pub fn finish(self: *References, target: *?bytecode.inspect.RefGraph) bool {
+    pub fn finish(self: *References, target: *?vm_refs.Graph) bool {
         const thread = self.thread orelse return false;
         thread.join();
         self.thread = null;

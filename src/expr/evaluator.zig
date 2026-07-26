@@ -1386,6 +1386,16 @@ pub const Evaluator = struct {
         return self.heap.inspectObject(snapshot, id);
     }
 
+    pub fn collectHeapObjectReferences(
+        self: *const Evaluator,
+        snapshot: *const ObjectHeap.ObjectSnapshot,
+        id: runtime.types.ObjectId,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(runtime.heap.HeapReference),
+    ) !void {
+        return self.heap.collectObjectReferences(snapshot, id, allocator, out);
+    }
+
     /// Per-record access to the value/attr/attr-position stores, for the VM
     /// explorer's heap-store browsing.
     pub fn heapValueAt(self: *const Evaluator, id: u32) ?*const runtime.value.Value {

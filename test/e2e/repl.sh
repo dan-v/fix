@@ -441,7 +441,7 @@ fi
 out=$(
     (
         sleep 0.4
-        printf ':d (x: x) { a = 1; }\r'
+        printf ':d (x: x) { a = [1]; }\r'
         sleep 0.5
         for _ in 1 2 3; do
             printf 's'
@@ -458,6 +458,10 @@ out=$(
         script -qec "$FIX repl --color=never" /dev/null 2>/dev/null
 )
 t "tty debug: Enter follows an inline returned object" "MEMBERS · 1" "$out"
+t "tty debug: heap objects have an outgoing reference section" "OUTGOING · 1" "$out"
+t "tty debug: heap objects list outgoing object references" "→ objects[0x" "$out"
+t "tty debug: heap objects have an incoming reference section" "INCOMING · 1" "$out"
+t "tty debug: heap objects list incoming chunk references" "← chunk[0x" "$out"
 
 # Inside :vm the debugger borrows the explorer's raw mode and alternate screen;
 # nested stepping must not emit another enter/leave pair.

@@ -231,6 +231,15 @@ pub const ValueRef = struct {
     };
 };
 
+/// A direct graph edge exposed to read-only runtime tooling. Interned strings
+/// and builtins have their own stores; this projection is deliberately limited
+/// to the two executable/reference-bearing identities shared by heap and
+/// bytecode inspectors.
+pub const HeapReference = union(enum) {
+    object: ObjectId,
+    chunk: ChunkId,
+};
+
 pub const ThunkState = enum(u8) { unresolved, evaluating, resolved, blackhole, errored };
 
 pub const ThunkTargetInfo = union(enum) {
@@ -1047,6 +1056,106 @@ pub const ObjectHeap = struct {
             .boxed_int => |value| .{ .boxed_int = value },
             .partial_app => |partial| .{ .partial_app = .{ .function = inspectValue(partial.func), .args = partial.args.len } },
         };
+    }
+
+    /// Collect the direct object/chunk references held by one live object.
+    ///
+    /// This is a tooling-only, non-forcing walk over already-published payloads.
+    /// It intentionally does not flatten merge attrs, force thunks, compile
+    /// deferred bodies, or recursively traverse children.
+    pub fn collectObjectReferences(
+        self: *const ObjectHeap,
+        snapshot: *const ObjectSnapshot,
+        id: ObjectId,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(HeapReference),
+    ) !void {
+        if (!snapshot.isLive(id)) return error.InvalidObjectId;
+        const object = self.objects.get(id);
+        switch (object.*) {
+            .list => |range| try self.collectValueRangeReferences(range, allocator, out),
+            .attrs => |attrs| try self.collectAttrRangeReferences(attrs.range, allocator, out),
+            .merge_attrs => |merge| {
+                try out.append(allocator, .{ .object = merge.base });
+                try out.append(allocator, .{ .object = merge.overlay });
+                const flattened = merge.flattened.load(.acquire);
+                if (flattened != no_flattened_attrs)
+                    try out.append(allocator, .{ .object = flattened });
+            },
+            .closure => |closure| {
+                try out.append(allocator, .{ .chunk = closure.chunk_id });
+                try self.collectValueRangeReferences(closure.upvalues, allocator, out);
+            },
+            .builtin_closure => |closure| try self.collectValueRangeReferences(closure.args, allocator, out),
+            .context_string => |string| try self.collectAttrRangeReferences(string.context, allocator, out),
+            .partial_app => |partial| {
+                try collectValueReference(partial.func, allocator, out);
+                try self.collectValueRangeReferences(partial.args, allocator, out);
+            },
+            .boxed_int => {},
+            .thunk => |*thunk| try collectThunkReferences(thunk, allocator, out),
+        }
+    }
+
+    fn collectValueReference(
+        value: Value,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(HeapReference),
+    ) !void {
+        switch (inspectValue(value).target) {
+            .object => |target| try out.append(allocator, .{ .object = target }),
+            .chunk => |target| try out.append(allocator, .{ .chunk = target }),
+            .none, .intern, .builtin => {},
+        }
+    }
+
+    fn collectValueRangeReferences(
+        self: *const ObjectHeap,
+        range: ValueRange,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(HeapReference),
+    ) !void {
+        for (self.values.slice(range)) |value|
+            try collectValueReference(value, allocator, out);
+    }
+
+    fn collectAttrRangeReferences(
+        self: *const ObjectHeap,
+        range: AttrRange,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(HeapReference),
+    ) !void {
+        for (self.attrs.slice(range)) |entry|
+            try collectValueReference(entry.value, allocator, out);
+    }
+
+    fn collectThunkReferences(
+        thunk: *const Thunk,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(HeapReference),
+    ) !void {
+        const raw_state = thunk.future.state.load(.acquire);
+        const state: ThunkState = @enumFromInt(@min(raw_state, @intFromEnum(ThunkState.errored)));
+        switch (state) {
+            .resolved => try collectValueReference(thunk.payload.result, allocator, out),
+            // These states do not contain a readable Value payload.
+            .errored, .blackhole => {},
+            .unresolved, .evaluating => switch (thunk.targetKind()) {
+                .closure => try collectValueReference(thunk.payload.target.closure, allocator, out),
+                .pass_through => try collectValueReference(thunk.payload.target.pass_through, allocator, out),
+                .attr_access => try collectValueReference(thunk.payload.target.attr_access.base, allocator, out),
+                .bytecode => {
+                    const target = &thunk.payload.target.bytecode;
+                    try out.append(allocator, .{ .chunk = target.chunk_id });
+                    for (target.upvalues()) |value|
+                        try collectValueReference(value, allocator, out);
+                },
+                .deferred => {
+                    for (thunk.payload.target.deferred.env()) |value|
+                        try collectValueReference(value, allocator, out);
+                },
+            },
+        }
     }
 
     fn inspectThunk(thunk: *const Thunk) ThunkInfo {
