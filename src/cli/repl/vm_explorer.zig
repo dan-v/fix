@@ -269,6 +269,9 @@ pub const VmDebugger = struct {
     /// Close an owned screen left up by a final step that ran to completion
     /// without another pause. A borrowed or already-closed screen is a no-op.
     pub fn endEvaluation(self: *VmDebugger) void {
+        // A requested step can finish the evaluation without producing another
+        // pause. Do not let its saved focus leak into a later debug session.
+        if (self.active_tui) |explorer| explorer.pending_step_focus = null;
         self.leaveOwnedScreen();
     }
 
@@ -565,6 +568,10 @@ const Tui = struct {
     /// `navigation.back` length captured on pause entry, restored on resume so a
     /// borrowed pause leaves the outer explorer's history exactly as it found it.
     debug_nav_mark: usize = 0,
+    /// Pane focus at the instant a step resumes evaluation. The next pause opens
+    /// its new/current frame as the subject, then restores this interaction focus
+    /// so stepping from the tree does not pull the cursor into the subject pane.
+    pending_step_focus: ?vm_navigation.Focus = null,
 
     const range_leaf = 256;
     const range_branch = 4096;
@@ -5032,6 +5039,8 @@ const Tui = struct {
         var out = std.Io.File.stdout().writerStreaming(self.io, &out_buf);
         const w = &out.interface;
 
+        const step_focus = self.pending_step_focus;
+        self.pending_step_focus = null;
         self.debug_session = session;
         self.return_flash = session.reason == .return_step;
         // A previous pause may have indexed the heap before the VM resumed.
@@ -5047,9 +5056,10 @@ const Tui = struct {
         }
         try self.open(.{ .debug_frame = session.frameCount() -| 1 });
         if (session.reason == .return_step) self.focusValueRow(session.value);
-        // `open` focuses frame details. Keep that focus across step pauses so
-        // the next/current frame is immediately usable instead of bouncing the
-        // user back to the stack tree after every instruction.
+        // `open` updates the subject and normally focuses it. Across a requested
+        // step, keep whichever pane owned interaction focus while still showing
+        // the newly-current frame in the subject.
+        if (step_focus) |focus| self.navigation.focus = focus;
 
         var editor = editor_mod.Editor.init(self.allocator, history, .none(), .always());
         defer editor.deinit();
@@ -5162,6 +5172,7 @@ const Tui = struct {
             self.status_msg = std.fmt.bufPrint(&self.status_buf, "step failed: {s}", .{@errorName(err)}) catch "step failed";
             return .running;
         };
+        self.pending_step_focus = self.navigation.focus;
         return .resume_keep;
     }
 

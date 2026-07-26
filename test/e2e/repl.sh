@@ -392,9 +392,9 @@ else
     fail "tty debug: screen lifecycle ($debug_enters enters, $debug_leaves leaves)"
 fi
 
-# The owned debugger keeps the explorer model as well as its terminal screen.
-# Expand HEAP/objects, step once, then return to the tree: the same range must
-# still be expanded with a freshly-snapshotted object list.
+# The owned debugger keeps the explorer model, terminal screen, and interaction
+# focus. Expand HEAP/objects and step once: the new frame becomes the subject,
+# while the tree stays focused and its freshly-snapshotted range stays expanded.
 out=$(
     (
         sleep 0.4
@@ -405,9 +405,7 @@ out=$(
         printf 'j\r'
         sleep 0.5
         printf 's'
-        sleep 0.6
-        printf '\t'
-        sleep 0.5
+        sleep 0.8
         printf 'q'
         sleep 0.3
         printf '\004'
@@ -417,9 +415,9 @@ out=$(
 )
 expanded_object_frames=$(grep -aoE 'objects\[0x0:0x[0-9a-f]+\] \([0-9]+\)' <<<"$out" | wc -l)
 if ((expanded_object_frames >= 2)); then
-    pass "tty debug: stepping preserves expanded tree branches"
+    pass "tty debug: stepping preserves tree focus and expansion"
 else
-    fail "tty debug: stepping collapsed the expanded object branch"
+    fail "tty debug: stepping left or collapsed the expanded object tree"
 fi
 
 # Finishing the outermost frame can complete without another debugger pause.
