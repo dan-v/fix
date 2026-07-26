@@ -1,6 +1,7 @@
 //! Shared, allocation-free Nix source-line rendering for terminal frontends.
-//! Token color and an exact byte-range focus are composed in one pass so a
-//! debugger can emphasize an expression without painting its whole line.
+//! Token color, an exact byte-range cursor, and breakpoint backgrounds are
+//! composed in one pass. A cursor keeps its normal syntax colors while the
+//! surrounding source dims, so selection never masquerades as token meaning.
 
 const std = @import("std");
 const terminal_color = @import("base").terminal_color;
@@ -11,10 +12,10 @@ const TokenType = syntax.token.TokenType;
 const col_keyword: terminal_color.Rgb = .{ 210, 143, 240 };
 const col_string: terminal_color.Rgb = .{ 111, 201, 145 };
 const col_number: terminal_color.Rgb = .{ 229, 192, 123 };
-const col_focus = terminal_color.hueColor(3);
-const col_breakpoint = terminal_color.hueColor(0);
-const focus_underline = "\x1b[4m";
-const breakpoint_emphasis = "\x1b[1;4m";
+const col_breakpoint_bg: terminal_color.Rgb = .{ 92, 40, 52 };
+const col_breakpoint_plain: terminal_color.Rgb = .{ 246, 248, 250 };
+const dim = "\x1b[2m";
+const breakpoint_fallback = "\x1b[7m";
 const reset = "\x1b[0m";
 
 pub const Range = struct {
@@ -25,10 +26,11 @@ pub const Range = struct {
 pub const Options = struct {
     color_depth: terminal_color.Depth,
     /// Byte range relative to `line`. Empty and out-of-bounds ranges are
-    /// ignored. Focus falls back to an underline when color is disabled.
+    /// ignored. Text outside the range is dimmed; text inside retains ordinary
+    /// syntax highlighting. The UI renders the cursor marker separately.
     focus: ?Range = null,
-    /// Exact breakpoint ranges relative to `line`. These remain emphasized
-    /// while focus moves to another sub-expression.
+    /// Exact breakpoint ranges relative to `line`. Breakpoint backgrounds
+    /// remain visible while the cursor moves to another sub-expression.
     breakpoints: []const Range = &.{},
 };
 
@@ -83,7 +85,7 @@ fn writeSpan(
                 break;
             }
         }
-        try styled(w, line[cursor..next], color, focused, breakpoint, color_depth);
+        try styled(w, line[cursor..next], color, selected != null and !focused, breakpoint, color_depth);
         cursor = next;
     }
 }
@@ -92,21 +94,23 @@ fn styled(
     w: *std.Io.Writer,
     text: []const u8,
     color: ?terminal_color.Rgb,
-    selected: bool,
+    dimmed: bool,
     breakpoint: bool,
     color_depth: terminal_color.Depth,
 ) !void {
     if (breakpoint) {
-        try terminal_color.foreground(w, color_depth, col_breakpoint, false);
-        try w.writeAll(breakpoint_emphasis);
-    } else if (selected) {
-        try terminal_color.foreground(w, color_depth, col_focus, false);
-        try w.writeAll(focus_underline);
-    } else if (color) |rgb| {
-        try terminal_color.foreground(w, color_depth, rgb, false);
+        if (color_depth.enabled()) {
+            try terminal_color.background(w, color_depth, col_breakpoint_bg);
+            try terminal_color.foreground(w, color_depth, color orelse col_breakpoint_plain, color == null);
+        } else {
+            try w.writeAll(breakpoint_fallback);
+        }
+    } else {
+        if (color) |rgb| try terminal_color.foreground(w, color_depth, rgb, false);
+        if (dimmed) try w.writeAll(dim);
     }
     try writeSafe(w, text);
-    if (selected or breakpoint or (color != null and color_depth.enabled())) try w.writeAll(reset);
+    if (dimmed or breakpoint or (color != null and color_depth.enabled())) try w.writeAll(reset);
 }
 
 fn writeSafe(w: *std.Io.Writer, text: []const u8) !void {
@@ -128,17 +132,18 @@ fn tokenColor(token: TokenType) ?terminal_color.Rgb {
     };
 }
 
-test "source rendering composes token color with an exact focus" {
+test "source cursor preserves token color and dims its surroundings" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try writeLine(&output.writer, "if true then 42", .{
         .color_depth = .truecolor,
         .focus = .{ .start = 3, .end = 7 },
     });
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[38;2;210;143;240mif") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[4mtrue") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[38;2;229;192;123m42") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[7m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[38;2;210;143;240m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[2mif") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[38;2;210;143;240mtrue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[2m42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[4m") == null);
 }
 
 test "source focus outside a token does not duplicate its text" {
@@ -160,8 +165,8 @@ test "source breakpoints mark exact ranges independently of focus" {
         .focus = .{ .start = 6, .end = 9 },
         .breakpoints = &.{.{ .start = 0, .end = 3 }},
     });
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[1;4mone") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[4mtwo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[48;2;92;40;52m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[4m") == null);
     const plain = @import("base").terminal_text.stripAnsiInPlace(output.written());
     try std.testing.expectEqualStrings("one + two", plain);
 }

@@ -199,6 +199,11 @@ out=$(
 )
 t "tty vm: unified inspector offers source span session" "SOURCE * 1 subexpressions" "$out"
 t "tty vm: unified inspector includes code" "CODE · chunk" "$out"
+if [[ "$out" == *"▶"* ]]; then
+    fail "tty vm: ordinary source showed a subexpression cursor"
+else
+    pass "tty vm: ordinary source has no subexpression cursor"
+fi
 if [[ "$out" == *"asynchronously"* || "$out" == *"updating references"* ]]; then
     fail "tty vm: inspector exposed background indexing state"
 else

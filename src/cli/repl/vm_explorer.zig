@@ -1137,6 +1137,9 @@ const Tui = struct {
                 source,
                 span,
                 null,
+                null,
+                true,
+                true,
                 if (session.reason == .return_step and index + 1 == session.frameCount()) session.value else null,
             );
             try page.line("", .none);
@@ -1499,13 +1502,18 @@ const Tui = struct {
         chunk: *const bytecode.Chunk,
         focused_span: ?bytecode.Chunk.SourceSpan,
     ) !void {
-        const span = focused_span orelse firstSourceSpan(chunk) orelse chunk.body_span orelse {
+        const selecting_span = self.source_session == id;
+        const span = if (selecting_span)
+            focused_span orelse firstSourceSpan(chunk) orelse chunk.body_span
+        else
+            chunk.body_span orelse firstSourceSpan(chunk);
+        const shown_span = span orelse {
             try document.line("SOURCE", .none);
             try document.line("(no source information)", .none);
             return;
         };
 
-        const label, const source = if (span.file) |file| blk: {
+        const label, const source = if (shown_span.file) |file| blk: {
             const path = self.ev.internTable().get(file);
             break :blk .{ path, self.ev.readSourceFile(path) catch null };
         } else blk: {
@@ -1513,13 +1521,22 @@ const Tui = struct {
             break :blk .{ "<repl expression>", direct };
         };
 
-        try self.appendSourceHeading(document, id, chunk, span);
-        try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{ label, span.line, span.column }), .none);
+        try self.appendSourceHeading(document, id, chunk, shown_span);
+        try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{ label, shown_span.line, shown_span.column }), .none);
         const bytes = source orelse {
             try document.line("(source text is unavailable)", .none);
             return;
         };
-        try self.appendSourceExcerpt(document, bytes, span, sourceLocation(id, chunk, span), null);
+        try self.appendSourceExcerpt(
+            document,
+            bytes,
+            shown_span,
+            id,
+            sourceLocation(id, chunk, shown_span),
+            selecting_span,
+            false,
+            null,
+        );
     }
 
     fn appendSourceDocumentWithText(
@@ -1541,7 +1558,16 @@ const Tui = struct {
             span.line,
             span.column,
         }), .none);
-        try self.appendSourceExcerpt(document, source, span, sourceLocation(id, chunk, span), returned_value);
+        try self.appendSourceExcerpt(
+            document,
+            source,
+            span,
+            id,
+            sourceLocation(id, chunk, span),
+            true,
+            self.source_session != id,
+            returned_value,
+        );
     }
 
     fn appendSourceHeading(
@@ -1576,7 +1602,9 @@ const Tui = struct {
     /// Afterwards, find the same source row by location so the cursor does not
     /// jump when the excerpt's line count changes.
     fn selectedSourceChanged(self: *Tui) !void {
+        const source_session = self.source_session orelse return;
         const selected = self.selectedSourceLocation() orelse return;
+        if (selected.chunk_id != source_session) return;
         self.source_focus = .{ .chunk_id = selected.chunk_id, .span = selected.span.? };
 
         const source_document = switch (self.currentKind()) {
@@ -1613,7 +1641,10 @@ const Tui = struct {
         document: *PageBuilder,
         source: []const u8,
         span: bytecode.Chunk.SourceSpan,
+        chunk_id: ?ChunkId,
         location: ?BreakpointLocation,
+        focus_active: bool,
+        show_instruction_pointer: bool,
         returned_value: ?runtime.value.Value,
     ) !void {
         const focus_start = @min(@as(usize, span.offset), source.len);
@@ -1642,16 +1673,27 @@ const Tui = struct {
             const line_end = @min(newline, end);
             const active = cursor < focus_end and line_end >= focus_start;
             var rendered: std.Io.Writer.Allocating = .init(document.arena);
-            try rendered.writer.print("{s} {d:>5} │ ", .{ if (active) "▶" else " ", line_number });
+            if (active and show_instruction_pointer) {
+                if (self.color_depth.enabled()) {
+                    try base.terminal_color.foreground(&rendered.writer, self.color_depth, base.terminal_color.hueColor(3), true);
+                } else {
+                    try rendered.writer.writeAll("\x1b[1m");
+                }
+                try rendered.writer.writeAll("▶");
+                try rendered.writer.writeAll("\x1b[0m");
+            } else {
+                try rendered.writer.writeByte(' ');
+            }
+            try rendered.writer.print(" {d:>5} │ ", .{line_number});
             const shown_end = @min(line_end, cursor +| 4096);
-            const selected: ?source_render.Range = if (active) blk: {
+            const selected: ?source_render.Range = if (focus_active and active) blk: {
                 const selected_start = @max(cursor, focus_start);
                 const selected_end = @min(shown_end, @max(focus_end, focus_start +| 1));
                 if (selected_start >= selected_end) break :blk null;
                 break :blk .{ .start = selected_start - cursor, .end = selected_end - cursor };
             } else null;
-            const breakpoints = if (location) |target|
-                try self.sourceBreakpointRanges(document.arena, target.chunk_id, cursor, shown_end)
+            const breakpoints = if (chunk_id) |target|
+                try self.sourceBreakpointRanges(document.arena, target, cursor, shown_end)
             else
                 &.{};
             try source_render.writeLine(&rendered.writer, source[cursor..shown_end], .{
@@ -2804,6 +2846,7 @@ const Tui = struct {
     fn enterSourceSession(self: *Tui, chunk_id: ChunkId) !void {
         const chunk = self.ev.getChunk(chunk_id) orelse return;
         var span = self.focusedSourceSpan(chunk_id);
+        if (span == null) span = firstSourceSpan(chunk);
         if (span == null) for (self.page.locations) |candidate| {
             const location = candidate orelse continue;
             if (location.chunk_id == chunk_id and location.span != null) {
@@ -2811,7 +2854,7 @@ const Tui = struct {
                 break;
             }
         };
-        const selected_span = span orelse firstSourceSpan(chunk) orelse return;
+        const selected_span = span orelse return;
         self.source_focus = .{ .chunk_id = chunk_id, .span = selected_span };
         self.source_session = chunk_id;
         try self.refreshPage(self.currentKind());
@@ -3963,7 +4006,7 @@ const Tui = struct {
             .object => return .object,
             .none, .instruction => {},
         };
-        return if (std.mem.startsWith(u8, self.page.lines[index], "▶")) .source_focus else .plain;
+        return .plain;
     }
 
     const TreeViewport = struct {
