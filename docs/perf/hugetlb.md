@@ -102,7 +102,7 @@ diagnostic consumers fold them in:
 - the `--timeline` `rss_mb` counter carries a separate `hugetlb` series.
 - the **GC budget needs no fix**: it gates on internal
   `totalReservedBytes()` slot counting, not RSS. The default budget is half
-  `MemTotal`, with default bounds of 256 MiB–8 GiB, so it is stable and independent of
+  `MemTotal`, with default bounds of 256 MiB–32 GiB, so it is stable and independent of
   hugetlb RSS accounting.
 
 External monitoring that watches `fix`'s RSS will under-read by the hugetlb

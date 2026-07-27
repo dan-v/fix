@@ -16,6 +16,7 @@ const containers = @import("base");
 const clock = @import("base").clock;
 const heap_mod = @import("heap.zig");
 const heap_collector = @import("heap/collector.zig");
+const RangeFreeList = @import("heap/reuse.zig").RangeFreeList;
 const value_mod = @import("value.zig");
 const thunk_mod = @import("thunk.zig");
 const types = @import("types.zig");
@@ -24,6 +25,45 @@ const ObjectHeap = heap_mod.ObjectHeap;
 const Value = value_mod.Value;
 const ObjectId = types.ObjectId;
 const FutureState = @import("future.zig").FutureState;
+
+/// The mark bitmap's natural locality unit: one word describes 64 adjacent
+/// fixed-size object slots. Marking records object discovery in `mark_bits`
+/// ("seen"), while the page worklist drains the corresponding word in address
+/// order and records completion in `scanned_bits`. Queueing words instead of
+/// individual graph edges lets discoveries accumulate and turns the graph
+/// flood into mostly-linear object-store reads (the Green Tea GC shape).
+const MarkPage = u32;
+const objects_per_mark_page = 64;
+
+/// Deferred scans of the two side stores that actually hold most graph edges.
+/// They are exclusive ranges owned by one object, so unlike object pages they
+/// need no seen/scanned bitmap: queueing the owning object's range exactly
+/// once is sufficient.
+const RangeWork = union(enum) {
+    values: heap_mod.ValueRange,
+    attrs: heap_mod.AttrRange,
+};
+/// 256 sixteen-byte descriptors make a 4 KiB sorting window: large enough to
+/// expose physical locality without turning mark into a whole-live-set sort.
+const range_batch_size = 256;
+
+fn rangeWorkLessThan(_: void, a: RangeWork, b: RangeWork) bool {
+    const a_tag = @intFromEnum(std.meta.activeTag(a));
+    const b_tag = @intFromEnum(std.meta.activeTag(b));
+    if (a_tag != b_tag) return a_tag < b_tag;
+    return switch (a) {
+        .values => |ar| blk: {
+            const br = b.values;
+            break :blk ar.segment < br.segment or
+                (ar.segment == br.segment and ar.offset < br.offset);
+        },
+        .attrs => |ar| blk: {
+            const br = b.attrs;
+            break :blk ar.segment < br.segment or
+                (ar.segment == br.segment and ar.offset < br.offset);
+        },
+    };
+}
 
 /// A `attrs_merge` whose `flattened` memo equals this has no flattened
 /// object to follow. Single source of truth in `heap.zig`.
@@ -63,21 +103,39 @@ fn atomicTestAndSet(mark_bits: []u64, id: ObjectId) bool {
     return prev & mask == 0;
 }
 
-/// One parallel marker: a private never-drop worklist (`GrowableDeque` — a
-/// dropped element is a swept live object) plus a private `LiveStats` tally
+fn atomicClaimPage(pending_pages: []u64, page: MarkPage) bool {
+    const word = page >> 6;
+    if (word >= pending_pages.len) return false;
+    const mask = @as(u64, 1) << @intCast(page & 63);
+    const prev = @atomicRmw(u64, &pending_pages[word], .Or, mask, .acq_rel);
+    return prev & mask == 0;
+}
+
+fn atomicReleasePage(pending_pages: []u64, page: MarkPage) void {
+    const word = page >> 6;
+    const mask = @as(u64, 1) << @intCast(page & 63);
+    _ = @atomicRmw(u64, &pending_pages[word], .And, ~mask, .acq_rel);
+}
+
+/// One parallel marker: a private never-drop page worklist
+/// (`GrowableDeque` — a dropped page can strand reachable descendants) plus a
+/// private `LiveStats` tally
 /// (summed after termination; a shared atomic per object would cache-line
 /// bounce and erase the parallel win). All markers share the one atomic
-/// mark-bitmap (`mark_bits`, aliased from the owning `Tracer`).
+/// seen bitmap (`mark_bits`), scanned bitmap, and queued/in-flight page bitmap.
 ///
 /// `Marker` doubles as a `scanObject` **sink**: it exposes the same
 /// `markValue`/`markObject`/`count*` methods the serial `SerialSink` does, so
 /// the single generic edge-walk (`scanObject`) is the ONE place the heap trace
 /// map lives — serial and parallel marking can never drift.
 pub const Marker = struct {
-    deque: containers.GrowableDeque(ObjectId),
+    deque: containers.GrowableDeque(MarkPage),
+    ranges: containers.GrowableDeque(RangeWork),
     stats: LiveStats = .{},
     /// Shared with every other marker and the Tracer; set in `resetParallel`.
     mark_bits: []u64 = &.{},
+    scanned_bits: []u64 = &.{},
+    pending_pages: []u64 = &.{},
     allocator: std.mem.Allocator,
     /// Minor-collection young-gate (set by `resetParallelMinor`): stop the
     /// trace at old objects. Matches `Tracer.minor_gate` for the serial path.
@@ -91,12 +149,43 @@ pub const Marker = struct {
         // referents arrive via the remembered set). Same gate as the serial
         // `Tracer.markObject`, so parallel and serial minors agree.
         if (self.minor_gate and !heap.gcIsYoung(id)) return;
-        // The worklist is correctness metadata: once the mark bit is published,
-        // this object must be scanned. Continuing after a failed push would let
-        // sweep reclaim reachable descendants, so allocation exhaustion is
-        // deliberately fail-closed.
-        if (atomicTestAndSet(self.mark_bits, id))
-            self.deque.push(self.allocator, id) catch @panic("gc parallel mark worklist exhausted");
+        if (!atomicTestAndSet(self.mark_bits, id)) return;
+        self.enqueuePage(@intCast(id >> 6));
+    }
+    inline fn enqueuePage(self: *Marker, page: MarkPage) void {
+        // The worklist is correctness metadata. Only the thread whose Marker
+        // this is pushes its deque; peers consume through `steal`.
+        if (atomicClaimPage(self.pending_pages, page))
+            self.deque.push(self.allocator, page) catch @panic("gc parallel mark worklist exhausted");
+    }
+    inline fn scanValues(self: *Marker, _: *const ObjectHeap, range: heap_mod.ValueRange) void {
+        self.ranges.push(self.allocator, .{ .values = range }) catch @panic("gc parallel range worklist exhausted");
+    }
+    inline fn scanAttrs(self: *Marker, _: *const ObjectHeap, range: heap_mod.AttrRange) void {
+        self.ranges.push(self.allocator, .{ .attrs = range }) catch @panic("gc parallel range worklist exhausted");
+    }
+    fn scanRange(self: *Marker, heap: *const ObjectHeap, work: RangeWork) void {
+        scanRangeWork(Marker, self, heap, work);
+    }
+    fn scanPage(self: *Marker, heap: *const ObjectHeap, page: MarkPage) void {
+        const wi: usize = @intCast(page);
+        const seen = @atomicLoad(u64, &self.mark_bits[wi], .acquire);
+        const scanned = @atomicLoad(u64, &self.scanned_bits[wi], .monotonic);
+        const active = seen & ~scanned;
+        if (active != 0) {
+            @atomicStore(u64, &self.scanned_bits[wi], scanned | active, .release);
+            scanMarkedWord(Marker, self, heap, page, active);
+        }
+
+        // Close the page only after every object in our snapshot was scanned.
+        // A marker that discovered another object while the page was pending
+        // deliberately did not enqueue it. The post-release check catches that
+        // case; a discovery after the check observes pending=false and queues
+        // the page itself. Thus no seen object can be stranded between states.
+        atomicReleasePage(self.pending_pages, page);
+        const seen_after = @atomicLoad(u64, &self.mark_bits[wi], .acquire);
+        const scanned_after = @atomicLoad(u64, &self.scanned_bits[wi], .acquire);
+        if (seen_after & ~scanned_after != 0) self.enqueuePage(page);
     }
     inline fn countObject(self: *Marker) void {
         self.stats.objects += 1;
@@ -116,18 +205,23 @@ pub const Marker = struct {
     }
 };
 
-/// Precise marker over the heap object graph. Holds a mark-bitmap indexed
-/// by ObjectId and an explicit work stack (no recursion — the module
-/// fixpoint builds graphs far too deep for the native stack). Reused
-/// across collections; `reset` grows the bitmap to the current object
-/// count and clears it.
+/// Precise marker over the heap object graph. Both serial and parallel paths
+/// use the same two-phase batching model: adjacent objects in ObjectId order
+/// within each mark page, then bounded value/attribute batches in physical
+/// store order. No native recursion is involved.
 pub const Tracer = struct {
     allocator: std.mem.Allocator,
     /// One bit per ObjectId; bit set == marked. Shared (aliased) by every
     /// `Marker` in the parallel path; set with `atomicTestAndSet` there.
     mark_bits: []u64 = &.{},
-    /// Serial (`--workers=1`) worklist of marked-but-not-yet-scanned objects.
-    stack: std.ArrayListUnmanaged(ObjectId) = .empty,
+    /// One bit per ObjectId; bit set == its outgoing edges were scanned.
+    scanned_bits: []u64 = &.{},
+    /// One bit per mark page; bit set == queued or currently being scanned.
+    pending_pages: []u64 = &.{},
+    /// Serial (`--workers=1`) FIFO worklists. Parallel marking uses the same
+    /// payloads in each Marker's stealable deques.
+    pages: std.ArrayListUnmanaged(MarkPage) = .empty,
+    ranges: std.ArrayListUnmanaged(RangeWork) = .empty,
     stats: LiveStats = .{},
 
     // --- parallel mark (`--workers>1`; see resetParallel/drainParallel) ---
@@ -149,7 +243,7 @@ pub const Tracer = struct {
     /// would let a peer observe a spurious all-idle and abandon pushed children.
     active_idle: std.atomic.Value(u32) = .init(0),
     /// When non-null, `markObject`/`markValue` seed into this marker's deque
-    /// (atomic bitmap) instead of the serial `stack`. Set only by the lone
+    /// (atomic bitmap) instead of the serial page FIFO. Set only by the lone
     /// collector during the single-threaded root-scan (`beginSeeding`), so a
     /// plain field — no concurrency — is safe.
     parallel_seed: ?*Marker = null,
@@ -165,20 +259,33 @@ pub const Tracer = struct {
 
     pub fn deinit(self: *Tracer) void {
         self.allocator.free(self.mark_bits);
-        self.stack.deinit(self.allocator);
-        for (self.markers) |*m| m.deque.deinit(self.allocator);
+        self.allocator.free(self.scanned_bits);
+        self.allocator.free(self.pending_pages);
+        self.pages.deinit(self.allocator);
+        self.ranges.deinit(self.allocator);
+        for (self.markers) |*m| {
+            m.deque.deinit(self.allocator);
+            m.ranges.deinit(self.allocator);
+        }
         self.allocator.free(self.markers);
     }
 
-    /// Prepare for a fresh mark over `[0, object_count)`: grow + clear the
-    /// bitmap, empty the work stack, zero the stats.
+    /// Prepare for a fresh mark over `[0, object_count)`: grow + clear all
+    /// seen/scanned/page-state bitmaps and empty the serial FIFOs.
     pub fn reset(self: *Tracer, object_count: u32) !void {
         const words = (@as(usize, object_count) + 63) >> 6;
-        if (words > self.mark_bits.len) {
+        if (words > self.mark_bits.len)
             self.mark_bits = try self.allocator.realloc(self.mark_bits, words);
-        }
+        if (words > self.scanned_bits.len)
+            self.scanned_bits = try self.allocator.realloc(self.scanned_bits, words);
+        const page_words = (words + 63) >> 6;
+        if (page_words > self.pending_pages.len)
+            self.pending_pages = try self.allocator.realloc(self.pending_pages, page_words);
         @memset(self.mark_bits[0..words], 0);
-        self.stack.clearRetainingCapacity();
+        @memset(self.scanned_bits[0..words], 0);
+        @memset(self.pending_pages[0..page_words], 0);
+        self.pages.clearRetainingCapacity();
+        self.ranges.clearRetainingCapacity();
         self.stats = .{};
     }
 
@@ -191,6 +298,27 @@ pub const Tracer = struct {
         if (self.mark_bits[word] & mask != 0) return false;
         self.mark_bits[word] |= mask;
         return true;
+    }
+
+    fn queuePage(self: *Tracer, page: MarkPage) void {
+        const word: usize = @intCast(page >> 6);
+        const mask = @as(u64, 1) << @intCast(page & 63);
+        if (self.pending_pages[word] & mask != 0) return;
+        self.pending_pages[word] |= mask;
+        self.pages.append(self.allocator, page) catch @panic("gc serial mark worklist exhausted");
+    }
+
+    fn scanPage(self: *Tracer, sink: *SerialSink, heap: *const ObjectHeap, page: MarkPage) void {
+        const wi: usize = @intCast(page);
+        const active = self.mark_bits[wi] & ~self.scanned_bits[wi];
+        self.scanned_bits[wi] |= active;
+        scanMarkedWord(SerialSink, sink, heap, page, active);
+
+        const pending_word: usize = @intCast(page >> 6);
+        const pending_mask = @as(u64, 1) << @intCast(page & 63);
+        self.pending_pages[pending_word] &= ~pending_mask;
+        if (self.mark_bits[wi] & ~self.scanned_bits[wi] != 0)
+            self.queuePage(page);
     }
 
     /// Is `id` already marked? (Oracle: detect what precise roots missed.)
@@ -222,19 +350,25 @@ pub const Tracer = struct {
             return;
         }
         if (!self.testAndSet(id)) return;
-        // A marked object that is not queued leaves its children untraced.
-        // Collection cannot recover from that locally, so fail closed rather
-        // than allowing an incomplete mark to reach sweep.
-        self.stack.append(self.allocator, id) catch @panic("gc serial mark worklist exhausted");
+        self.queuePage(@intCast(id >> 6));
     }
 
-    /// Serial drain (`--workers=1`): process the work stack until empty via the
-    /// shared generic edge-walk. `SerialSink` pushes children to `self.stack`
-    /// and accumulates into `self.stats`. The trace map itself lives ONCE, in
-    /// `scanObject` — serial and parallel marking can never disagree.
+    /// Serial drain (`--workers=1`): alternate complete FIFO batches of object
+    /// pages and owned side-store ranges. Range scans discover pages; page
+    /// scans discover ranges. Keeping the phases distinct lets marks for the
+    /// same page accumulate before it is revisited.
     pub fn drain(self: *Tracer, heap: *const ObjectHeap) void {
         var sink = SerialSink{ .tr = self };
-        while (self.stack.pop()) |id| scanObject(SerialSink, &sink, heap, id);
+        var page_head: usize = 0;
+        var range_head: usize = 0;
+        while (page_head < self.pages.items.len or range_head < self.ranges.items.len) {
+            while (page_head < self.pages.items.len) : (page_head += 1)
+                self.scanPage(&sink, heap, self.pages.items[page_head]);
+            const range_end = @min(range_head + range_batch_size, self.ranges.items.len);
+            std.mem.sort(RangeWork, self.ranges.items[range_head..range_end], {}, rangeWorkLessThan);
+            while (range_head < range_end) : (range_head += 1)
+                sink.scanRange(heap, self.ranges.items[range_head]);
+        }
     }
 
     // --- minor collection (young-gated) ---
@@ -251,6 +385,10 @@ pub const Tracer = struct {
     /// source itself is never added to the live set. Call for each remembered
     /// source before `drainMinor`.
     pub fn markRemsetSource(self: *Tracer, heap: *const ObjectHeap, source: ObjectId) void {
+        if (self.parallel_seed) |marker| {
+            scanObject(Marker, marker, heap, source);
+            return;
+        }
         var sink = SerialSink{ .tr = self };
         scanObject(SerialSink, &sink, heap, source);
     }
@@ -285,7 +423,14 @@ pub const Tracer = struct {
         const words = (@as(usize, object_count) + 63) >> 6;
         if (words > self.mark_bits.len)
             self.mark_bits = try self.allocator.realloc(self.mark_bits, words);
+        if (words > self.scanned_bits.len)
+            self.scanned_bits = try self.allocator.realloc(self.scanned_bits, words);
+        const page_words = (words + 63) >> 6;
+        if (page_words > self.pending_pages.len)
+            self.pending_pages = try self.allocator.realloc(self.pending_pages, page_words);
         @memset(self.mark_bits[0..words], 0);
+        @memset(self.scanned_bits[0..words], 0);
+        @memset(self.pending_pages[0..page_words], 0);
         self.stats = .{};
         // Grow the roster once (worker count is fixed within a run); reuse
         // the deques (with their grown capacity) on later collections.
@@ -293,14 +438,18 @@ pub const Tracer = struct {
             const old = self.markers.len;
             self.markers = try self.allocator.realloc(self.markers, marker_count);
             for (self.markers[old..]) |*m| m.* = .{
-                .deque = try containers.GrowableDeque(ObjectId).init(self.allocator, 1024),
+                .deque = try containers.GrowableDeque(MarkPage).init(self.allocator, 1024),
+                .ranges = try containers.GrowableDeque(RangeWork).init(self.allocator, 1024),
                 .allocator = self.allocator,
             };
         }
         for (self.markers[0..marker_count]) |*m| {
             m.deque.clear();
+            m.ranges.clear();
             m.stats = .{};
             m.mark_bits = self.mark_bits;
+            m.scanned_bits = self.scanned_bits;
+            m.pending_pages = self.pending_pages;
             // Default to a FULL (non-gated) mark; `resetParallelMinor` re-arms
             // the gate. Without this a parallel major inherits a leftover
             // young-gate from the previous minor and misses old objects.
@@ -331,7 +480,7 @@ pub const Tracer = struct {
         self.parallel_seed = null;
     }
 
-    /// Parallel marker `id`: drain own deque (LIFO), steal from peers when
+    /// Parallel marker `id`: drain own deque FIFO, steal from peers when
     /// empty, and cooperatively detect termination. Returns only when the
     /// whole mark is complete (`active_idle == marker_count`). Safe to run on
     /// every worker concurrently. See the `active_idle` field for the
@@ -339,8 +488,22 @@ pub const Tracer = struct {
     pub fn drainParallel(self: *Tracer, heap: *const ObjectHeap, id: usize) void {
         const me = &self.markers[id];
         while (true) {
-            // Phase A: drain everything in our own deque first (LIFO).
-            while (me.deque.pop()) |oid| scanObject(Marker, me, heap, oid);
+            // Phase A: consume complete FIFO batches of object pages, then
+            // side-store ranges. Each phase produces the other kind of work,
+            // allowing both page marks and adjacent range scans to accumulate.
+            var did_work = false;
+            while (me.deque.steal()) |page| me.scanPage(heap, page);
+            var range_batch: [range_batch_size]RangeWork = undefined;
+            var range_count: usize = 0;
+            while (range_count < range_batch.len) : (range_count += 1) {
+                range_batch[range_count] = me.ranges.steal() orelse break;
+            }
+            if (range_count != 0) {
+                did_work = true;
+                std.mem.sort(RangeWork, range_batch[0..range_count], {}, rangeWorkLessThan);
+                for (range_batch[0..range_count]) |work| me.scanRange(heap, work);
+            }
+            if (did_work or me.deque.approxLen() > 0) continue;
             // Phase B: our deque is empty. Try to steal one item and scan it;
             // if that fails, offer termination. We are still ACTIVE here (not
             // yet counted idle), so scanning the stolen item — which pushes
@@ -374,7 +537,7 @@ pub const Tracer = struct {
         }
     }
 
-    /// Steal one object from some peer's deque and scan it into marker `id`'s
+    /// Steal one page from some peer's deque and scan it into marker `id`'s
     /// own deque. Returns true iff an item was stolen (and scanned). Visits
     /// peers in a rotated order to spread steal contention. Caller must be
     /// counted ACTIVE (not offering termination) — the scan produces work.
@@ -383,8 +546,12 @@ pub const Tracer = struct {
         var k: usize = 1;
         while (k < n) : (k += 1) {
             const j = (id + k) % n;
-            if (self.markers[j].deque.steal()) |oid| {
-                scanObject(Marker, &self.markers[id], heap, oid);
+            if (self.markers[j].deque.steal()) |page| {
+                self.markers[id].scanPage(heap, page);
+                return true;
+            }
+            if (self.markers[j].ranges.steal()) |work| {
+                self.markers[id].scanRange(heap, work);
                 return true;
             }
         }
@@ -403,7 +570,8 @@ pub const Tracer = struct {
         var k: usize = 1;
         while (k < n) : (k += 1) {
             const j = (id + k) % n;
-            if (self.markers[j].deque.approxLen() > 0) return true;
+            if (self.markers[j].deque.approxLen() > 0 or
+                self.markers[j].ranges.approxLen() > 0) return true;
         }
         return false;
     }
@@ -445,6 +613,15 @@ const SerialSink = struct {
     inline fn markObject(self: *SerialSink, heap: *const ObjectHeap, id: ObjectId) void {
         self.tr.markObject(heap, id);
     }
+    inline fn scanValues(self: *SerialSink, _: *const ObjectHeap, range: heap_mod.ValueRange) void {
+        self.tr.ranges.append(self.tr.allocator, .{ .values = range }) catch @panic("gc serial range worklist exhausted");
+    }
+    inline fn scanAttrs(self: *SerialSink, _: *const ObjectHeap, range: heap_mod.AttrRange) void {
+        self.tr.ranges.append(self.tr.allocator, .{ .attrs = range }) catch @panic("gc serial range worklist exhausted");
+    }
+    fn scanRange(self: *SerialSink, heap: *const ObjectHeap, work: RangeWork) void {
+        scanRangeWork(SerialSink, self, heap, work);
+    }
     inline fn countObject(self: *SerialSink) void {
         self.tr.stats.objects += 1;
         self.tr.stats.bytes += @sizeOf(heap_mod.Object);
@@ -470,6 +647,46 @@ const SerialSink = struct {
 // GC correctness invariant — has a single source of truth. A missed edge here
 // is a swept live object (use-after-free) at BOTH --workers=1 and --workers>1,
 // so both mark paths always agree by construction. See docs/gc.md.
+
+/// Scan the newly-seen objects in one mark page in ascending ObjectId order.
+/// `bits` is a stable snapshot: discoveries made by these scans accumulate in
+/// `mark_bits` and are picked up by this page's close/requeue handshake.
+fn scanMarkedWord(
+    comptime Sink: type,
+    sink: *Sink,
+    heap: *const ObjectHeap,
+    page: MarkPage,
+    bits_in: u64,
+) void {
+    var bits = bits_in;
+    while (bits != 0) {
+        const bit: u6 = @intCast(@ctz(bits));
+        const id: ObjectId = page * objects_per_mark_page + @as(ObjectId, bit);
+        scanObject(Sink, sink, heap, id);
+        bits &= bits - 1;
+    }
+}
+
+/// Account and trace one physically-ordered side-store range. Like
+/// `scanObject`, this is generic so serial and parallel tracing share the
+/// exact same edge map.
+fn scanRangeWork(
+    comptime Sink: type,
+    sink: *Sink,
+    heap: *const ObjectHeap,
+    work: RangeWork,
+) void {
+    switch (work) {
+        .values => |range| {
+            sink.countValues(range.len);
+            for (heap.values.slice(range)) |v| sink.markValue(heap, v);
+        },
+        .attrs => |range| {
+            sink.countAttrs(range.len);
+            for (heap.attrs.slice(range)) |entry| sink.markValue(heap, entry.value);
+        },
+    }
+}
 
 /// Account object `id`'s slot and follow its outgoing edges via `sink`.
 fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: ObjectId) void {
@@ -500,13 +717,11 @@ fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: Obj
 }
 
 fn scanValues(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, range: heap_mod.ValueRange) void {
-    sink.countValues(range.len);
-    for (heap.values.slice(range)) |v| sink.markValue(heap, v);
+    sink.scanValues(heap, range);
 }
 
 fn scanAttrs(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, range: heap_mod.AttrRange) void {
-    sink.countAttrs(range.len);
-    for (heap.attrs.slice(range)) |entry| sink.markValue(heap, entry.value);
+    sink.scanAttrs(heap, range);
 }
 
 fn scanThunk(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, t: *const thunk_mod.Thunk) void {
@@ -881,6 +1096,30 @@ test "gc range reuse splits a larger range and preserves the remainder" {
     try std.testing.expectEqual(dead_range.segment, remainder_range.segment);
     try std.testing.expectEqual(dead_range.offset + 3, remainder_range.offset);
     try std.testing.expectEqual(@as(u32, 4), remainder_range.len);
+}
+
+test "range batch claim returns a hit without consuming another worker's fair share" {
+    const allocator = std.testing.allocator;
+    var shared: RangeFreeList = .{};
+    defer shared.deinit(allocator);
+    var worker_0: RangeFreeList = .{};
+    defer worker_0.deinit(allocator);
+    var worker_1: RangeFreeList = .{};
+    defer worker_1.deinit(allocator);
+
+    shared.push(allocator, 0, 10, 3);
+    shared.push(allocator, 0, 20, 3);
+
+    const first = shared.moveBestFitBatchAndClaim(&worker_0, allocator, 3, 256, 2).?;
+    try std.testing.expect(!first.split);
+    try std.testing.expectEqual(@as(u64, 1), shared.stats().ranges);
+    try std.testing.expectEqual(@as(u64, 0), worker_0.stats().ranges);
+
+    const second = shared.moveBestFitBatchAndClaim(&worker_1, allocator, 3, 256, 2).?;
+    try std.testing.expect(!second.split);
+    try std.testing.expectEqual(@as(u64, 0), shared.stats().ranges);
+    try std.testing.expectEqual(@as(u64, 0), worker_1.stats().ranges);
+    try std.testing.expect(first.loc.offset != second.loc.offset);
 }
 
 test "gc range best-fit preserves a larger class for a later request" {

@@ -1430,19 +1430,23 @@ pub const ObjectHeap = struct {
             return null;
         }
         self.gc_shared_free_range_mu.lock();
-        const refilled = @field(self, shared_field).moveBestFitBatchTo(
+        const shared = &@field(self, shared_field);
+        // Claim this request and transfer its surplus fair-share batch as one
+        // locked operation. The old refill returned only a boolean, unlocked,
+        // then asserted that a second worker-list pop succeeded; repeated
+        // parallel collection exposed that handoff as an invalid invariant.
+        const hit = shared.moveBestFitBatchAndClaim(
             &@field(local, field),
             self.allocator,
             n,
             gc_range_refill_batch,
             self.worker_locals.len,
         );
-        self.gc_shared_free_range_max[store_index].store(@field(self, shared_field).maxLen(), .release);
+        self.gc_shared_free_range_max[store_index].store(shared.maxLen(), .release);
         self.gc_shared_free_range_mu.unlock();
-        if (refilled) {
-            const hit = @field(local, field).pop(self.allocator, n).?;
-            if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
-            return hit.loc;
+        if (hit) |claimed| {
+            if (claimed.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
+            return claimed.loc;
         }
         if (n > 0) {
             local.range_reuse_miss[store_index] += 1;

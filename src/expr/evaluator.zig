@@ -2352,7 +2352,7 @@ pub const Engine = struct {
             }
         }
         // Collection line: no collection runs until heap-reserved bytes
-        // cross it (automatic `clamp(½·MemTotal, 256MB, 8GB)`, overridable
+        // cross it (automatic `clamp(½·MemTotal, 256MB, 32GB)`, overridable
         // via `--gc-budget`; see `gc_controller.memoryBudget`).
         // On a roomy machine that line dwarfs the eval → never fires: zero
         // pauses AND zero tracking (lazy arming at line/2, see
