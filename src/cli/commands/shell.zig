@@ -52,9 +52,11 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     const worker_count = try setup.workerCount(options);
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options);
+    const term = try setup.configure(&ev, init, options, &settings);
     ev.enableStoreWrites();
 
     var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);

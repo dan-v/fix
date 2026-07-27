@@ -50,9 +50,14 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     }
 
     const memory_backing = setup.applyMemoryBacking(process, null);
+    var settings = setup.loadSettingsAndFlakeConfig(allocator, init, options) catch |err| {
+        if (err != error.ConfigError) return err;
+        return 1;
+    };
+    defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, memory_backing));
     defer ev.deinit();
-    _ = setup.configure(&ev, init, options) catch |err| {
+    _ = setup.configure(&ev, init, options, &settings) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});
         return 1;
     };

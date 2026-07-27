@@ -68,10 +68,31 @@ pub fn applyMemoryBacking(
     return policy;
 }
 
-/// Apply the shared `Options → Engine` configuration (feature toggles,
-/// parallelism, environment, base path, NIX_PATH) and resolve the terminal
-/// color/progress policy. Enables ANSI on stderr when coloring.
-pub fn configure(ev: *Engine, init: std.process.Init, options: args.Options) !Terminal {
+/// Load nix.conf, apply CLI overrides, then explicitly fetch and fold each
+/// flake input's `nixConfig`. This is the pre-engine phase because flake config
+/// may perform network I/O and construct a short-lived evaluator.
+pub fn loadSettingsAndFlakeConfig(
+    allocator: std.mem.Allocator,
+    init: std.process.Init,
+    options: args.Options,
+) !nix_conf.Settings {
+    var settings = try nix_conf.load(allocator, init.environ_map, init.io);
+    errdefer settings.deinit();
+    for (options.option_overrides.items) |override|
+        try settings.setOrAppend(override.name, override.value);
+    applyFlakeNixConfig(allocator, init, options, &settings);
+    return settings;
+}
+
+/// Apply already-resolved settings and CLI policy to an Engine, then derive
+/// terminal presentation. This phase performs no configuration discovery and
+/// does not construct a hidden evaluator.
+pub fn configure(
+    ev: *Engine,
+    init: std.process.Init,
+    options: args.Options,
+    settings: *nix_conf.Settings,
+) !Terminal {
     // Language effects are durable stderr records, independent of progress
     // verbosity. The evaluator sink synchronizes and flushes each one.
     // Interactive terminals additionally get ANSI sync-wrapped records so a
@@ -91,20 +112,7 @@ pub fn configure(ev: *Engine, init: std.process.Init, options: args.Options) !Te
     // that `fix` doesn't recognize are silently skipped, as in Nix.
     var features = options.experimental_features;
     var http_conn: u64 = 25; // Nix default; 0 = unlimited.
-    // Start from the loaded config (empty if unreadable), then layer `--option`
-    // overrides on top at highest precedence, before reading the settings fix
-    // acts on.
-    // A fatal config problem (e.g. a missing required `include`) aborts with a
-    // printed message, like Nix; a missing top-level nix.conf is not an error.
-    const allocator = ev.hostAllocator();
-    var settings = try nix_conf.load(allocator, init.environ_map, init.io);
-    defer settings.deinit();
-    // `--option NAME VALUE` overrides; `--option extra-NAME VALUE` appends (Nix).
-    for (options.option_overrides.items) |o| try settings.setOrAppend(o.name, o.value);
-    // A flake's own `nixConfig` layers on top, exactly like `--option` (read up
-    // front so it applies before daemon settings are sent — see below).
-    applyFlakeNixConfig(allocator, init, options, &settings);
-    ev.setTraceVerbose(boolSetting(&settings, "trace-verbose", false));
+    ev.setTraceVerbose(boolSetting(settings, "trace-verbose", false));
     if (!options.experimental_features_reset) {
         if (settings.get("experimental-features")) |list|
             args.mergeConfigFeatures(&features, list);
@@ -134,7 +142,7 @@ pub fn configure(ev: *Engine, init: std.process.Init, options: args.Options) !Te
     // `access-tokens` from nix.conf (incl. `--option access-tokens ...`):
     // authenticate fetches to private GitHub/GitLab/… hosts.
     if (settings.get("access-tokens")) |tokens| try ev.setAccessTokens(tokens);
-    try applyNetrc(ev, init, &settings);
+    try applyNetrc(ev, init, settings);
     // The store directory follows `store-dir` from nix.conf, with `NIX_STORE_DIR`
     // taking precedence (as Nix does for this setting). Defaults to `/nix/store`.
     if (init.environ_map.get("NIX_STORE_DIR") orelse settings.get("store-dir")) |dir|
@@ -148,7 +156,7 @@ pub fn configure(ev: *Engine, init: std.process.Init, options: args.Options) !Te
     // `ssh-ng://host` speaks the worker protocol over `ssh host nix-daemon --stdio`.
     if (settings.get("store") orelse init.environ_map.get("NIX_REMOTE")) |uri|
         if (uri.len != 0) try ev.setDaemonSocket(uri);
-    try applyDaemonSettings(ev, options, &settings);
+    try applyDaemonSettings(ev, options, settings);
     try ev.setBasePathFromCurrentPath(init.io);
     try applyNixPath(ev, init, options);
 

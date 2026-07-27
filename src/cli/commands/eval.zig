@@ -38,9 +38,11 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // speculative forcing racing ahead of the break.
     const worker_count = if (options.debugger) 1 else try setup.workerCount(options);
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options);
+    const term = try setup.configure(&ev, init, options, &settings);
     if (options.read_write_mode) {
         // Store writes are observable. Keep them on the demand path so helper
         // speculation cannot instantiate derivations the user never demanded.

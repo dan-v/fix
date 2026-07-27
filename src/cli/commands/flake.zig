@@ -59,12 +59,14 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer options.deinit(allocator);
 
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    defer settings.deinit();
     var ev = try Engine.init(
         allocator,
         setup.engineConfig(init, try setup.workerCount(options), memory_backing),
     );
     defer ev.deinit();
-    _ = try setup.configure(&ev, init, options);
+    _ = try setup.configure(&ev, init, options, &settings);
     if (!ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;

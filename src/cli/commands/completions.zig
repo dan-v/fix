@@ -685,10 +685,12 @@ fn completeSourceAttrs(
     const source_arg = options.source orelse options.defaultSource();
     if (source_arg == .flake) options.experimental_features.insert(.flakes);
 
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    _ = try setup.configure(&ev, init, options);
+    _ = try setup.configure(&ev, init, options, &settings);
     var source = try eval_support.getCompletionSource(&ev, init.io, source_arg, options);
     defer source.deinit(ev.hostAllocator());
     const value = try ev.evaluatePathAt(source.slice(), source.base_path, source.abs_path);
@@ -707,10 +709,12 @@ fn completePackageAttrs(
 ) !void {
     var options = try parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    _ = try setup.configure(&ev, init, options);
+    _ = try setup.configure(&ev, init, options, &settings);
     const value = try ev.evaluate("import <nixpkgs> { }");
     try writeAttrCandidates(allocator, w, &ev, value, prefix, replacement);
 }
@@ -733,10 +737,12 @@ fn completeFlakeAttrs(
     var options = try parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
     options.experimental_features.insert(.flakes);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    _ = try setup.configure(&ev, init, options);
+    _ = try setup.configure(&ev, init, options, &settings);
 
     const source = try eval_support.lowerFlakeCompletion(&ev, flake_ref, parts.parent);
     defer ev.hostAllocator().free(source);
