@@ -16,36 +16,42 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch, Rectangle
 
 
-BACKGROUND = "#F6F8FB"
-TEXT = "#182230"
-MUTED = "#667085"
-GRID = "#E4E9F0"
+BACKGROUND = "#FBF9FD"
+PANEL = "#FFFFFF"
+TEXT = "#241B2F"
+VALUE_TEXT = "#4B4054"
+MUTED = "#716779"
+GRID = "#E9E2ED"
+BORDER = "#D7CFDC"
+MISSING_BACKGROUND = "#F3F0F5"
+MISSING_TEXT = "#9A909F"
+FASTEST_DETAIL = "#DDF2EA"
 COLORS = {
-    "nix": "#3976D3",
-    "lix": "#7557C5",
-    "snix": "#D85B53",
-    "detsys-1core": "#ECA239",
-    "detsys-2core": "#DE8928",
-    "detsys-8core": "#CE711E",
-    "detsys-16core": "#B85B19",
-    "detsys-autocore": "#9F4915",
-    "fix-1core": "#42B8B1",
-    "fix-2core": "#2BA59D",
-    "fix-8core": "#168C84",
-    "fix-16core": "#0B6D66",
-    "fix-autocore": "#064943",
+    "nix": "#4E7FBF",
+    "lix": "#D23C9B",
+    "snix": "#258F83",
+    "detsys-1core": "#F4B45F",
+    "detsys-2core": "#EA9A3A",
+    "detsys-8core": "#D97B22",
+    "detsys-16core": "#BE5D16",
+    "detsys-autocore": "#963F12",
+    "fix-1core": "#AA87DE",
+    "fix-2core": "#9164D0",
+    "fix-8core": "#7745BC",
+    "fix-16core": "#5A2CA0",
+    "fix-autocore": "#442178",
 }
 SUITE_COLORS = {
-    "torture": "#3976D3",
-    "realworld": "#7557C5",
-    "json": "#138E83",
+    "torture": "#4E7FBF",
+    "realworld": "#7A4CBD",
+    "json": "#258F83",
 }
 PARAMETER_GROUPS = (
     {
         "prefix": "detsys-",
         "label": "DETERMINATE",
         "parameter": "EVAL CORES",
-        "color": "#C66A1A",
+        "color": "#C96A1E",
         "order": 3,
         "values": ("1core", "2core", "8core", "16core", "autocore"),
     },
@@ -53,18 +59,18 @@ PARAMETER_GROUPS = (
         "prefix": "fix-",
         "label": "FIX",
         "parameter": "WORKERS",
-        "color": "#08766B",
+        "color": "#5A2CA0",
         "order": 0,
         "values": ("1core", "2core", "8core", "16core", "autocore"),
     },
 )
 TOOL_ORDER = {"nix": 1, "lix": 2, "snix": 4}
 RATIO_STYLES = (
-    (1.0, "#147D74", "#FFFFFF", "fastest"),
-    (1.25, "#D9F0EC", TEXT, "≤ 1.25×"),
-    (2.0, "#E8EDF4", TEXT, "≤ 2×"),
-    (4.0, "#F4E8CF", TEXT, "≤ 4×"),
-    (math.inf, "#EFD8D5", TEXT, "> 4×"),
+    (1.0, "#237A66", "#FFFFFF", "fastest"),
+    (1.25, "#DCEFE8", TEXT, "≤ 1.25×"),
+    (2.0, "#E3EAF4", TEXT, "≤ 2×"),
+    (4.0, "#F4E7CF", TEXT, "≤ 4×"),
+    (math.inf, "#F1DADC", TEXT, "> 4×"),
 )
 
 
@@ -111,7 +117,7 @@ def time_stddev_label(mean: float, stddev: float) -> str:
 
 
 def color_for(name: str) -> str:
-    return COLORS.get(name, "#667085")
+    return COLORS.get(name, MUTED)
 
 
 def label_color_for(name: str) -> str:
@@ -188,12 +194,12 @@ def mark_parameter_groups(ax: plt.Axes, groups: list[dict], *, labels: bool) -> 
 
 
 def style_axis(ax: plt.Axes) -> None:
-    ax.set_facecolor("#FFFFFF")
+    ax.set_facecolor(PANEL)
     ax.grid(axis="x", color=GRID, linewidth=0.75)
     ax.set_axisbelow(True)
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
-    ax.spines["bottom"].set_color("#CBD3DF")
+    ax.spines["bottom"].set_color(BORDER)
     ax.tick_params(axis="x", colors=MUTED, labelsize=8)
     ax.tick_params(axis="y", colors=TEXT, labelsize=8.5, length=0, pad=7)
     ax.set_xlabel("mean wall time · lower is better", fontsize=8, color=MUTED)
@@ -215,10 +221,10 @@ def bars_on(ax: plt.Axes, rows: list[dict], positions: list[float]) -> list:
         [row["mean"] for row in rows],
         xerr=[row["stddev"] for row in rows],
         color=[color_for(row["name"]) for row in rows],
-        edgecolor="#FFFFFF",
+        edgecolor=PANEL,
         linewidth=0.35,
         height=0.64,
-        error_kw={"ecolor": "#344054", "elinewidth": 1.0, "capsize": 2.5, "capthick": 1.0},
+        error_kw={"ecolor": VALUE_TEXT, "elinewidth": 1.0, "capsize": 2.5, "capthick": 1.0},
     )
 
 
@@ -236,7 +242,7 @@ def label_rows(ax: plt.Axes, bars: list, rows: list[dict], fastest: float, selec
             va="center",
             ha="left",
             fontsize=8.2,
-            color="#344054",
+            color=VALUE_TEXT,
             fontweight="bold" if math.isclose(ratio, 1.0) else "normal",
         )
 
@@ -401,14 +407,14 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
     row_extent = row_positions[-1] + 1 if row_positions else 0
     height = max(7.0, 2.8 + 0.39 * row_extent)
     fig, ax = plt.subplots(figsize=(width, height), facecolor=BACKGROUND)
-    ax.set_facecolor("#FFFFFF")
+    ax.set_facecolor(PANEL)
     fig.subplots_adjust(left=max(0.12, 2.15 / width), right=0.985, bottom=0.07, top=0.70)
 
     for column, (rows_by_name, best) in enumerate(zip(row_maps, fastest)):
         for tool_name, row_position in zip(tool_names, row_positions):
             row = rows_by_name.get(tool_name)
             if row is None:
-                background, foreground = "#F3F5F8", "#98A2B3"
+                background, foreground = MISSING_BACKGROUND, MISSING_TEXT
             else:
                 ratio = row["mean"] / best
                 background, foreground = ratio_style(ratio)
@@ -418,7 +424,7 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
                     0.94,
                     0.86,
                     facecolor=background,
-                    edgecolor="#FFFFFF",
+                    edgecolor=PANEL,
                     linewidth=1.0,
                 )
             )
@@ -451,7 +457,7 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
                     ha="center",
                     va="center",
                     fontsize=5.6,
-                    color="#DDF2EF" if is_fastest else MUTED,
+                    color=FASTEST_DETAIL if is_fastest else MUTED,
                 )
 
     ax.set_xlim(-0.5, len(workloads) - 0.5)
@@ -461,7 +467,7 @@ def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) 
     ax.tick_params(axis="x", top=True, labeltop=True, bottom=False, labelbottom=False, length=0, pad=11, labelsize=8)
     ax.tick_params(axis="y", length=0, pad=10, labelsize=8.5, colors=TEXT)
     for label in ax.get_xticklabels():
-        label.set_color("#344054")
+        label.set_color(VALUE_TEXT)
         label.set_linespacing(1.3)
     for label, tool_name in zip(ax.get_yticklabels(), tool_names):
         label.set_color(label_color_for(tool_name))

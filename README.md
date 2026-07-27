@@ -223,7 +223,7 @@ with `fix repl --no-tui` when an alternate-screen interface is undesirable.
 The chart below compares wall-clock evaluation time across synthetic stress
 tests, real NixOS and Home Manager configurations, and JSON-producing
 workloads. Each cell is relative to the fastest evaluator for that workload;
-`1.00×` is fastest. The harness defaults to ten recorded runs.
+`1.00×` is fastest. The harness defaults to five recorded runs.
 
 ![fix evaluator benchmark](demo/benchmark.png)
 

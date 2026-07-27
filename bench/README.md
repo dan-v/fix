@@ -2,12 +2,13 @@
 
 The benchmark harness has three independent suites:
 
-- `torture`: synthetic evaluator hot paths, with explicit 1/2/automatic-core
-  rows where the evaluator supports them.
-- `realworld`: NixOS and Home Manager scalar evaluations, including evaluator
-  scaling rows where available.
-- `json`: wide result trees evaluated and serialized as JSON, including
-  Determinate Nix and fix scaling rows.
+- `torture`: synthetic evaluator hot paths;
+- `realworld`: NixOS and Home Manager scalar evaluations; and
+- `json`: wide result trees evaluated and serialized as JSON.
+
+By default, each suite compares 1-core and automatic profiles for Fix and
+Determinate alongside the other applicable evaluators. Full core-count sweeps
+remain available through explicit `TOOLS` selectors.
 
 These fixtures are also reused for a *correctness* check, separate from the
 timing harness: `zig build test-bench-fixtures` evaluates every workload under
@@ -26,16 +27,18 @@ $ RUNS=3 ./result/bin/fix-bench realworld json
 With no suite, all suites run. `bench.sh` is a convenience wrapper that builds
 the harness without creating a `result` link. Useful environment variables are:
 
-- `RUNS` and `WARMUP` control Hyperfine sampling.
+- `RUNS` and `WARMUP` control Hyperfine sampling. They default to 5 measured
+  runs and 1 warmup.
 - `RECLAIM_MEMORY=0` disables the default per-run `sudo` preparation, which
   drops reclaimable caches and compacts normal memory before every measured
   run. The harness obtains credentials once with `sudo -v`; explicit hugetlb
   pages remain in the configured pool and are reused after each evaluator exits.
-- `TOOLS=nix,lix,fix-1core` selects evaluator rows. `fix` and `detsys` select
-  their complete parameterized groups; individual rows can still be excluded,
-  as in `TOOLS=fix,-fix-16core`. Fix profiles use 1, 2, 8, 16, and automatic
-  workers. Determinate uses 1 and automatic evaluator cores in scalar suites,
-  adding 2, 8, and 16 cores for JSON.
+- With no `TOOLS` selector, the harness runs 1-core and automatic profiles for
+  Fix and Determinate, plus the available Nix, Lix, and snix rows.
+  `TOOLS=nix,lix,fix-1core` selects exact evaluator rows. `fix` and `detsys`
+  select their complete 1, 2, 8, 16, and automatic parameterized groups for a
+  deliberate scaling sweep; individual rows can still be excluded, as in
+  `TOOLS=fix,-fix-16core`.
 - During focused development, always set `TOOLS` explicitly (normally
   `TOOLS=fix-1core`, optionally plus one relevant parallel Fix row). The `fix`
   group expands to every worker profile and is intended for a deliberate full

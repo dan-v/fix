@@ -83,13 +83,13 @@
         ++ ["detsys-autocore|detsys|${base} --eval-cores 0${suffix}"]
     );
 
-  # Scalar suites retain only Determinate's efficiency baseline and automatic
-  # mode. JSON adds its wider deep-forcing scaling sweep.
+  # Keep the full parameterized families available to explicit TOOLS selectors.
+  # The shell defaults to 1-core and automatic rows for both families.
   scalarTools =
     fixTools false
     ++ optional (nix != null) "nix|nix|${nix}/bin/nix-instantiate --eval --strict"
     ++ optional (lix != null) "lix|lix|${lix}/bin/nix-instantiate --eval --strict"
-    ++ detsysTools {}
+    ++ detsysTools {scaling = true;}
     ++ optional (snix != null) "snix|snix|${snix}/bin/snix-eval -qqqq --no-warnings --strict";
 
   tortureTools = scalarTools;
@@ -148,13 +148,14 @@ in
       usage: fix-bench [all|torture|realworld|json ...]
 
       environment:
-        RUNS=N              measured runs per command (default: 10)
+        RUNS=N              measured runs per command (default: 5)
         WARMUP=N            warmup runs per command (default: 1)
         RECLAIM_MEMORY=0    skip per-run cache reclaim and memory compaction
         OUT=DIR             output directory (default: /tmp/fix-bench.XXXXXX)
         TOOLS=RULE,...      select evaluator rows: group, exact name, or /Bash ERE/;
                             prefix a rule with - to exclude it. If every rule
                             is negative, all tools start included.
+                            Default: fix/detsys 1-core + auto, plus other tools.
                             Groups: fix, detsys (for parameterized profiles)
                             Examples: TOOLS=fix,lix
                                       TOOLS=fix,-fix-16core
@@ -170,7 +171,7 @@ in
         exit 0
       fi
 
-      runs="''${RUNS:-10}"
+      runs="''${RUNS:-5}"
       warmup="''${WARMUP:-1}"
       reclaim_memory="''${RECLAIM_MEMORY:-1}"
       prepare_args=()
@@ -287,6 +288,13 @@ in
         local name="$1"
         local group="$2"
         local rule selector
+        if [[ "''${#tool_rules[@]}" -eq 0 ]]; then
+          case "$name" in
+            fix-2core|fix-8core|fix-16core|detsys-2core|detsys-8core|detsys-16core)
+              return 1
+              ;;
+          esac
+        fi
         local included=1
         if [[ "$tool_has_include" -eq 1 ]]; then
           included=0
