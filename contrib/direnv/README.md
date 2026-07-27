@@ -8,13 +8,36 @@ side-effect-free bash script. That's exactly what direnv needs to replace
 
 ## Install
 
+### With the Nix modules (recommended)
+
+`default.nix` exposes `nixosModules.fix`, `homeManagerModules.fix`, and
+`darwinModules.fix`. Import the one for your setup, enable fix, and the direnv
+integration turns on automatically wherever `programs.direnv` is enabled:
+
+```nix
+{
+  imports = [ (import fixSrc {}).homeManagerModules.fix ];   # or nixosModules / darwinModules
+  programs.direnv.enable = true;   # `programs.direnv.fix.enable` follows this
+}
+```
+
+The `use fix` integration lives at `programs.direnv.fix.enable`, alongside
+`programs.direnv.{nix-direnv,mise}`. It auto-enables with direnv and installs
+`fix` for you (so `use fix` resolves the CLI), sourcing `fix.sh` from the
+direnvrc each module system manages — `programs.direnv.stdlib` on home-manager,
+`programs.direnv.direnvrcExtra` on NixOS/nix-darwin. Set it to `false` to opt
+out. To install the CLI standalone (no direnv), use `programs.fix.enable`.
+
+### Manually
+
 ```sh
 mkdir -p ~/.config/direnv/lib
 cp contrib/direnv/fix.sh ~/.config/direnv/lib/fix.sh
 ```
 
 (direnv auto-loads every `*.sh` under `~/.config/direnv/lib/`. Alternatively
-`source` it from `~/.config/direnv/direnvrc`.)
+`source` it from `~/.config/direnv/direnvrc`. The packaged copy lives at
+`$out/share/fix/direnv/fix.sh`.)
 
 ## Use
 

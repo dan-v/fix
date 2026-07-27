@@ -33,7 +33,12 @@ in
     nativeBuildInputs = [zig.hook pkg-config installShellFiles makeWrapper];
     buildInputs = [curl libgit2];
 
-    postInstall = lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
+    # The direnv library (`use fix` / `use fix_flake`) is a plain shell file, so
+    # it installs on every platform. Completions need to run the freshly-built
+    # binary, so they are gated on the host being executable by the builder.
+    postInstall = ''
+      install -Dm444 ${../contrib/direnv/fix.sh} $out/share/fix/direnv/fix.sh
+    '' + lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
       installShellCompletion --cmd fix \
         --bash <($out/bin/fix completions bash) \
         --fish <($out/bin/fix completions fish) \
