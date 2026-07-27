@@ -10,7 +10,7 @@ const debugger = @import("../debugger.zig");
 const trace_setup = @import("../trace_setup.zig");
 const stats = @import("../stats.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 
 pub const synopsis =
     \\usage: fix eval [options] [paths... | -E <expression>... | --flake <installable>...]
@@ -38,7 +38,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // speculative forcing racing ahead of the break.
     const worker_count = if (options.debugger) 1 else try setup.workerCount(options);
     setup.applyMemoryBacking(options.hugetlb);
-    var ev = try Evaluator.init(allocator, worker_count);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count));
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
     if (options.read_write_mode) {

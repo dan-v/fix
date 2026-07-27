@@ -1,7 +1,7 @@
 const std = @import("std");
 const std_testing = std.testing;
 const effects = @import("../../effects.zig");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 const renderForTest = @import("../test_helpers.zig").renderForTest;
 
 const EffectCapture = struct {
@@ -62,7 +62,7 @@ test "trace forces the message and returns the value unchanged" {
 
 test "trace, traceVerbose, and warn emit sanitized effects" {
     var capture: EffectCapture = .{};
-    var ev = try Evaluator.init(std_testing.allocator, 0);
+    var ev = try Engine.init(std_testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setEffectSink(.{ .context = &capture, .emit_fn = EffectCapture.emit });
 
@@ -99,7 +99,7 @@ test "trace, traceVerbose, and warn emit sanitized effects" {
 
 test "effectful thunk bodies do not enter the pure result memo" {
     var capture: EffectCapture = .{};
-    var ev = try Evaluator.init(std_testing.allocator, 0);
+    var ev = try Engine.init(std_testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setEffectSink(.{ .context = &capture, .emit_fn = EffectCapture.emit });
 

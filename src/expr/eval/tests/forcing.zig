@@ -5,13 +5,13 @@ const std = @import("std");
 // force.zig has no lighter-weight VM-only constructor — every entry point
 // (`forceThunk`, `forceThunkFallible`, `forceValueSpeculative`, `forceDeep`)
 // only runs meaningfully behind a full bytecode-compiled evaluation, so
-// these tests drive it through `Evaluator.evaluate`/`forceDeep`, matching
+// these tests drive it through `Engine.evaluate`/`forceDeep`, matching
 // the rest of the eval-level test suite (see src/expr/eval/tests/core.zig).
 
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "forceThunk resolves an unresolved thunk and reuses the resolved fast path" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // `y` is a thunk that isn't forced until referenced; `y + y` forces the
@@ -23,13 +23,13 @@ test "forceThunk resolves an unresolved thunk and reuses the resolved fast path"
 }
 
 test "a self-referential thunk raises RecursiveThunk without corrupting the VM" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.RecursiveThunk, ev.evaluate("let x = x; in x"));
     // Blackhole detection (`recordBlackhole`) must not leave any VM-global
     // state (claim identity, operand stack depth, ...) broken — the same
-    // Evaluator has to keep serving unrelated evaluations afterward.
+    // Engine has to keep serving unrelated evaluations afterward.
     const recovered = try ev.evaluate("1 + 1");
     try std.testing.expectEqual(@as(i64, 2), recovered.asInt());
 
@@ -41,7 +41,7 @@ test "a self-referential thunk raises RecursiveThunk without corrupting the VM" 
 }
 
 test "forceDeep terminates and is correct over a DAG with a shared sub-list and sub-attrset" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // `a` is a single thunk/list object reachable twice from `s` (once
@@ -70,7 +70,7 @@ test "forceDeep terminates and is correct over a DAG with a shared sub-list and 
 }
 
 test "forceDeep still raises RecursiveThunk through a genuinely cyclic attrset" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // Distinguishes the DAG case above (shared, but acyclic — must
@@ -95,11 +95,11 @@ test "forceValueSpeculative agrees with demand-driven forceThunk (serial vs para
         \\in builtins.foldl' (a: b: a + b) 0 (builtins.genList heavy 40)
     ;
 
-    var serial = try Evaluator.init(std.testing.allocator, 0);
+    var serial = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer serial.deinit();
     const serial_result = try serial.evaluate(source);
 
-    var parallel = try Evaluator.init(std.testing.allocator, 8);
+    var parallel = try Engine.init(std.testing.allocator, .{ .worker_count = 8 });
     defer parallel.deinit();
     const parallel_result = try parallel.evaluate(source);
 

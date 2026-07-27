@@ -155,11 +155,11 @@ pub const ImportHost = struct {
 /// with `--debugger`.
 pub const BreakReason = enum { entry, break_builtin, line_breakpoint, step, return_step, eval_error };
 
-/// A debugger attachment. Installed on every VM by `Evaluator.initVm` when a
+/// A debugger attachment. Installed on every VM by `Engine.initVm` when a
 /// debugger is active; null (the default) means "no debugger" and ordinary
 /// return paths pay only one unlikely null check.
 ///
-/// `fire` is an upcall into the owning layer (the `fix` Evaluator, then the
+/// `fire` is an upcall into the owning layer (the `fix` Engine, then the
 /// `cli` debug console): it runs the interactive session synchronously on the
 /// *current* demand fiber, then returns so evaluation continues. `ctx` is the
 /// owner's opaque self-pointer. The callback may re-enter the evaluator to
@@ -213,14 +213,14 @@ pub const VM = struct {
     /// runtime (`register` is internally thread-safe).
     registry: *ChunkRegistry,
     /// Lazy per-attr compilation: deferred bodies + their compile cache.
-    /// Set post-init by `Evaluator.initVm`; null in standalone test VMs
+    /// Set post-init by `Engine.initVm`; null in standalone test VMs
     /// (which never create `.deferred` thunks). See
     /// `compiler/deferred_table.zig`.
     deferred_table: ?*DeferredTable = null,
     registration_sink: ?ChunkRegistrationSink = null,
-    /// Evaluator-owned compiled-regex cache for `builtins.match`/`split`
+    /// Engine-owned compiled-regex cache for `builtins.match`/`split`
     /// (see `support/regex.zig`). Set post-init by
-    /// `Evaluator.initVm`; null in standalone test VMs, which fall back
+    /// `Engine.initVm`; null in standalone test VMs, which fall back
     /// to compiling per call.
     regexes: ?*PatternCache = null,
     /// Debugger attachment, breakpoint state, and synchronous import ancestry.
@@ -229,15 +229,15 @@ pub const VM = struct {
     intern: *InternTable,
     /// Runtime object heap.
     heap: *ObjectHeap,
-    /// Evaluator-owned filesystem cache.
+    /// Engine-owned filesystem cache.
     files: *FileCache,
-    /// Evaluator-owned network/source fetch cache.
+    /// Engine-owned network/source fetch cache.
     fetchers: *FetchService,
-    /// Evaluator-owned realization service for recipes, store I/O, and builds.
+    /// Engine-owned realization service for recipes, store I/O, and builds.
     realization: *RealizationStore,
     /// Global scheduler (for spawning work).
     scheduler: *Scheduler,
-    /// Evaluator-owned error trace collector.
+    /// Engine-owned error trace collector.
     trace: ?*eval_trace.Trace,
     /// Sparse demand-committed language-effect store. Null only in isolated
     /// VM unit harnesses that do not exercise effecting builtins.
@@ -248,7 +248,7 @@ pub const VM = struct {
     /// Monotonic per-VM marker used to keep effectful bodies out of the pure
     /// bytecode-result memo. Wrapping is harmless; only equality is tested.
     effect_epoch: u64 = 0,
-    /// Evaluator-scoped structured observation capability. Disabled handles
+    /// Engine-scoped structured observation capability. Disabled handles
     /// are cheap values and all workers may use an enabled handle safely.
     observer: observ.Observer,
     /// Fiber-aware blocking capability supplied by the evaluator. Standalone
@@ -256,7 +256,7 @@ pub const VM = struct {
     executor: ?FiberExecutor,
     /// Fiber-scoped execution identity: claim id and demand role.
     /// Points at the owning `WorkerFiber`'s context; nested VMs created on
-    /// that fiber share the pointer (see `Evaluator.initVm`), so they cannot
+    /// that fiber share the pointer (see `Engine.initVm`), so they cannot
     /// diverge from their fiber's identity. Standalone test VMs (no fiber)
     /// point at the static neutral default. Read-only from the VM's side —
     /// only the fiber's driving worker dresses/resets it, between resumes.
@@ -278,7 +278,7 @@ pub const VM = struct {
     /// safepoint where no builtin holds un-rooted Zig locals. On the VM (not a
     /// threadlocal) so it's fiber-local — a yielded fiber resuming on another
     /// thread keeps its own count. A nested import's fresh VM inherits the
-    /// caller's depth (see `Evaluator.evaluateSource`).
+    /// caller's depth (see `Engine.evaluateSource`).
     native_depth: u32 = 0,
 
     /// Where `stack`/`frames` came from and where `deinit` returns them:
@@ -315,7 +315,7 @@ pub const VM = struct {
     /// (`<unevaluated />`) until demanded. The compiler emits
     /// `thunk_shell` to wrap such values; when this is false (the
     /// common default/JSON/`.drv`/strict path) the op pushes the value
-    /// directly. Set per-eval from `Evaluator.lazy_shells_visible`.
+    /// directly. Set per-eval from `Engine.lazy_shells_visible`.
     lazy_shells_visible: bool,
 
     /// Compatibility policy applied while parsing and compiling this code.
@@ -393,7 +393,7 @@ pub const VM = struct {
             // `ctx` keeps its neutral default here; Worker.allocateFiber
             // repoints it at the fiber's own context (with the fiber's
             // claim id baked in) before the VM runs anything, and
-            // Evaluator.initVm repoints nested VMs at the surrounding
+            // Engine.initVm repoints nested VMs at the surrounding
             // fiber's context.
             .buffer_pool = options.buffer_pool,
             .stack = value_stack,

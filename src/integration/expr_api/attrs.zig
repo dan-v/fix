@@ -1,13 +1,13 @@
 const std = @import("std");
 const expr = @import("expr");
-const Evaluator = expr.Evaluator;
+const Engine = expr.Engine;
 const value = @import("runtime").value;
 const ValueType = value.ValueType;
 
 test "end-to-end: attribute set" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("{ a = 1; b = 2; }");
@@ -17,7 +17,7 @@ test "end-to-end: attribute set" {
 test "end-to-end: simple inherit in attrsets" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const inherited = try ev.evaluate("let x = 1; y = 2; in ({ inherit x y; }).y");
@@ -38,7 +38,7 @@ test "end-to-end: simple inherit in attrsets" {
 test "end-to-end: dynamic attribute selection" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let digits = { \"10\" = \"A\"; }; d = 10; in digits.${builtins.toString d}");
@@ -81,7 +81,7 @@ test "end-to-end: dynamic attribute selection" {
 test "end-to-end: or is contextual in attr names" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const direct = try ev.evaluate("({ or = 2; }).or");
@@ -103,7 +103,7 @@ test "end-to-end: or is contextual in attr names" {
 test "end-to-end: attribute access" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("({ a = 42; }).a");
@@ -113,7 +113,7 @@ test "end-to-end: attribute access" {
 test "end-to-end: unused attribute values are lazy" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("({ a = 42; b = 1 / 0; }).a");
@@ -125,7 +125,7 @@ test "end-to-end: unused attribute values are lazy" {
 test "end-to-end: recursive attribute sets" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const forward = try ev.evaluate("(rec { a = b + 1; b = 3; }).a");
@@ -140,7 +140,7 @@ test "end-to-end: recursive attribute sets" {
 test "end-to-end: nested attribute declarations" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const nested = try ev.evaluate("({ a.b = 1; a.c = 2; }).a.c");
@@ -192,7 +192,7 @@ test "end-to-end: nested attribute declarations" {
 test "end-to-end: attrset update operator" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const added = try ev.evaluate("({ a = 1; } // { b = 2; }).b");
@@ -210,7 +210,7 @@ test "end-to-end: attrset update operator" {
 test "end-to-end: attr path or defaults" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const present = try ev.evaluate("({ a.b = 1; }).a.b or 2");
@@ -258,7 +258,7 @@ test "end-to-end: attr path or defaults" {
 test "end-to-end: dynamic null attributes are omitted" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const present = try ev.evaluate("({ ${\"x\"} = 1; }).x");
@@ -273,7 +273,7 @@ test "end-to-end: dynamic null attributes are omitted" {
 test "end-to-end: duplicate attributes are rejected" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.ParseError, ev.evaluate("{ a = 1; a = 2; }"));
@@ -283,7 +283,7 @@ test "end-to-end: duplicate attributes are rejected" {
 test "end-to-end: quoted attribute access" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("({ foo = 42; }).\"foo\"");
@@ -293,7 +293,7 @@ test "end-to-end: quoted attribute access" {
 test "end-to-end: has-attr binds tighter than boolean not" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expect(!(try ev.evaluate("!{ a = 1; } ? a")).asBool());

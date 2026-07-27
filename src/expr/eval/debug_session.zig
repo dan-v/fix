@@ -1,5 +1,5 @@
 //! Debug-session algorithms over an explicit paused-evaluation view. This file
-//! does not know the Evaluator type and does not use duck-typed private access.
+//! does not know the Engine type and does not use duck-typed private access.
 
 const std = @import("std");
 const runtime = @import("runtime");

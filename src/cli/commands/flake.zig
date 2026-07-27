@@ -10,7 +10,7 @@ const engine = @import("expr");
 const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const Value = @import("runtime").Value;
 
 pub const synopsis =
@@ -58,7 +58,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
     defer options.deinit(allocator);
 
-    var ev = try Evaluator.init(allocator, try setup.workerCount(options));
+    var ev = try Engine.init(allocator, setup.engineConfig(init, try setup.workerCount(options)));
     defer ev.deinit();
     _ = try setup.configure(&ev, init, options);
     if (!ev.languagePolicy().flakes_enabled) {
@@ -103,7 +103,7 @@ fn getFlakeExpr(allocator: std.mem.Allocator, flakeref: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn evalFlake(ev: *Evaluator, allocator: std.mem.Allocator, flakeref: []const u8) !Value {
+fn evalFlake(ev: *Engine, allocator: std.mem.Allocator, flakeref: []const u8) !Value {
     const expr = try getFlakeExpr(allocator, flakeref);
     defer allocator.free(expr);
     return ev.evaluate(expr);
@@ -120,7 +120,7 @@ fn printEvalError(err: anyerror) u8 {
 
 // ---- metadata -------------------------------------------------------------
 
-fn metadata(ev: *Evaluator, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
+fn metadata(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
     const flake = evalFlake(ev, allocator, flakeref) catch |err| return printEvalError(err);
 
     var buf: [4096]u8 = undefined;
@@ -163,7 +163,7 @@ fn metadata(ev: *Evaluator, io: std.Io, allocator: std.mem.Allocator, flakeref: 
 }
 
 /// The flake's `description`, read from its `flake.nix` (not on the result).
-fn flakeDescription(ev: *Evaluator, allocator: std.mem.Allocator, flake: Value) !?[]u8 {
+fn flakeDescription(ev: *Engine, allocator: std.mem.Allocator, flake: Value) !?[]u8 {
     const out_path = (try ev.stringAttr(flake, "outPath")) orelse return null;
     const expr = try std.fmt.allocPrint(allocator, "(import \"{s}/flake.nix\").description or \"\"", .{out_path});
     defer allocator.free(expr);
@@ -203,7 +203,7 @@ const Node = struct {
     children: std.ArrayListUnmanaged(*Node) = .empty,
 };
 
-fn show(ev: *Evaluator, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
+fn show(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
     const flake = evalFlake(ev, allocator, flakeref) catch |err| return printEvalError(err);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -241,7 +241,7 @@ fn show(ev: *Evaluator, io: std.Io, allocator: std.mem.Allocator, flakeref: []co
     return 0;
 }
 
-fn appendLeaves(ev: *Evaluator, arena: std.mem.Allocator, parent: *Node, value: Value, desc: []const u8) !void {
+fn appendLeaves(ev: *Engine, arena: std.mem.Allocator, parent: *Node, value: Value, desc: []const u8) !void {
     const names = (ev.attrNames(arena, value) catch return) orelse return;
     for (names) |name| {
         const node = try arena.create(Node);
@@ -261,7 +261,7 @@ fn printChildren(out: *std.Io.Writer, arena: std.mem.Allocator, node: *Node, pre
 
 // ---- check ----------------------------------------------------------------
 
-fn check(ev: *Evaluator, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
+fn check(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
     const flake = evalFlake(ev, allocator, flakeref) catch |err| return printEvalError(err);
 
     var buf: [4096]u8 = undefined;
@@ -294,7 +294,7 @@ fn check(ev: *Evaluator, io: std.Io, allocator: std.mem.Allocator, flakeref: []c
     return if (failures == 0) 0 else 1;
 }
 
-fn checkLeaves(ev: *Evaluator, out: *std.Io.Writer, allocator: std.mem.Allocator, category: []const u8, system: ?[]const u8, value: Value, checked: *usize, failures: *usize) !void {
+fn checkLeaves(ev: *Engine, out: *std.Io.Writer, allocator: std.mem.Allocator, category: []const u8, system: ?[]const u8, value: Value, checked: *usize, failures: *usize) !void {
     const names = (ev.attrNames(allocator, value) catch return) orelse return;
     defer allocator.free(names);
     for (names) |name| {
@@ -324,11 +324,11 @@ fn reportCheckFailure(out: *std.Io.Writer, category: []const u8, system: ?[]cons
 // ---- update / lock --------------------------------------------------------
 
 /// `flake update [inputs…]` / `flake lock` — compute and write the lock of the
-/// cwd flake as a first-class operation (`Evaluator.updateFlakeLock`), NOT a
+/// cwd flake as a first-class operation (`Engine.updateFlakeLock`), NOT a
 /// side effect of evaluating outputs. `update` with no inputs re-pins
 /// everything; `update x y` re-pins only x and y; `lock` just completes a
 /// missing lock, keeping existing pins.
-fn lockCmd(ev: *Evaluator, io: std.Io, allocator: std.mem.Allocator, options: args.Options, is_update: bool) !u8 {
+fn lockCmd(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, options: args.Options, is_update: bool) !u8 {
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer names.deinit(allocator);
     for (options.sources.items) |src| switch (src) {

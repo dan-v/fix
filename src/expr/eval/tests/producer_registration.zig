@@ -1,6 +1,6 @@
 const std = @import("std");
 const eval_mod = @import("../../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 const RealizationStore = @import("store").RealizationStore;
 const Value = @import("runtime").value.Value;
 const ObjectId = @import("runtime").types.ObjectId;
@@ -24,7 +24,7 @@ const Fixture = struct {
     tmp: std.testing.TmpDir,
     store_dir: []u8,
     fake: *FakeDaemon,
-    ev: Evaluator,
+    ev: Engine,
 
     fn init(allocator: std.mem.Allocator, enable_store_writes: bool) !Fixture {
         var tmp = std.testing.tmpDir(.{});
@@ -39,7 +39,7 @@ const Fixture = struct {
         const fake = try FakeDaemon.start(allocator, std.testing.io);
         errdefer fake.deinit();
 
-        var ev = try Evaluator.init(allocator, 0);
+        var ev = try Engine.init(allocator, .{ .worker_count = 0 });
         errdefer ev.deinit();
         ev.setFileIo(std.testing.io);
         ev.store.realization.store_dir = store_dir;

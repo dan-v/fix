@@ -6,7 +6,7 @@
 
 A **fiber** is a computation running on its own stack. Its owner (a [worker](workers.md) thread) calls `resume_` to switch onto the fiber's stack; the fiber calls `yield` to switch back, suspending itself for later resumption. The key property: **once a fiber yields, its entire live state is captured in its `Context` + stack** — immutable until the next resume. Nothing lives in thread-local or register state that the resumer must reconstruct. That is what makes a suspended fiber a *value* the scheduler can hand to any thread.
 
-Each fiber carries **its own VM**. The VM's shared pointers reference the [`Evaluator`](workers.md) tables (chunk registry, [intern](../runtime/interning.md) table, [heap](../runtime/heap.md), scheduler, file/import caches); the per-fiber part is the interpreter value stack, the frame chain, and a private scratch arena backing the VM's run-path allocations. So resuming a fiber on a different thread is sound: the shared state is shared, the private state travels in the stack.
+Each fiber carries **its own VM**. The VM's shared pointers reference the [`Engine`](workers.md) tables (chunk registry, [intern](../runtime/interning.md) table, [heap](../runtime/heap.md), scheduler, file/import caches); the per-fiber part is the interpreter value stack, the frame chain, and a private scratch arena backing the VM's run-path allocations. So resuming a fiber on a different thread is sound: the shared state is shared, the private state travels in the stack.
 
 ### Why fibers, not OS threads or "steal-while-waiting"
 

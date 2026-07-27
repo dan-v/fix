@@ -1,8 +1,8 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "getContext and hasContext expose a derivation's context on its string coercion" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const has_context = try ev.evaluate(
@@ -16,7 +16,7 @@ test "getContext and hasContext expose a derivation's context on its string coer
 }
 
 test "unsafeDiscardStringContext strips context so hasContext reports false" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate(
@@ -27,7 +27,7 @@ test "unsafeDiscardStringContext strips context so hasContext reports false" {
 }
 
 test "appendContext adds a context entry that getContext can then observe" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate(
@@ -39,7 +39,7 @@ test "appendContext adds a context entry that getContext can then observe" {
 }
 
 test "addDrvOutputDependencies rewrites a drv path's context entry to depend on all outputs" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate(
@@ -53,13 +53,13 @@ test "addDrvOutputDependencies rewrites a drv path's context entry to depend on 
 }
 
 test "addDrvOutputDependencies rejects a non-string-like argument" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.addDrvOutputDependencies 1"));
 }
 
 test "appendContext rejects a non-attrs context argument" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.appendContext \"x\" 1"));
 }

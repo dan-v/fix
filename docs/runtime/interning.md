@@ -2,7 +2,7 @@
 
 *String and symbol interning: the sharded global table behind every `InternId`.*
 
-Strings and attr names are interned to dense `u32` `InternId`s so that comparison is an integer compare and [`Value`](values.md) can carry a `string`/`path` as a 48-bit payload. An `InternTable` is owned by the `Evaluator` (one per evaluation) and is thread-safe: interning is sharded for concurrency, and `get(id)` is lock-free once an id exists.
+Strings and attr names are interned to dense `u32` `InternId`s so that comparison is an integer compare and [`Value`](values.md) can carry a `string`/`path` as a 48-bit payload. An `InternTable` is owned by the `Engine` (one per evaluation) and is thread-safe: interning is sharded for concurrency, and `get(id)` is lock-free once an id exists.
 
 ## Mental model
 
@@ -33,7 +33,7 @@ Two `StableSegments` hold the data globally (so ids stay dense and `get` needn't
 
 A `threadlocal` **direct-mapped cache** (`cache_size = 512` slots, indexed by `h % 512`) short-circuits the shard lock + HashMap probe + segment slice for hot short identifiers (attr names, builtin args, path components). Each slot stores `hash`, `table_token`, `id`, `len`, and an **inlined copy of the bytes** (`len ≤ cache_max_len = 24`) so the comparison stays branch-local to one cache line — no `data` indirection. Strings longer than 24 bytes skip the cache. Hits require all of `hash`, `table_token`, `len`, and bytes to match; the slot is also populated on a shard-lock miss (both the found-existing and freshly-interned paths write it back).
 
-**Token invalidation.** Each `InternTable` init takes a unique monotonic `token`. Because the thread-local cache outlives an `Evaluator` and the allocator may reuse the same heap address for a fresh table, a stale slot could match by pointer identity alone; the `table_token` check defeats that. A new table (`init`/reinit after `deinit`) bumps the token, invalidating every stale slot lazily.
+**Token invalidation.** Each `InternTable` init takes a unique monotonic `token`. Because the thread-local cache outlives an `Engine` and the allocator may reuse the same heap address for a fresh table, a stale slot could match by pointer identity alone; the `table_token` check defeats that. A new table (`init`/reinit after `deinit`) bumps the token, invalidating every stale slot lazily.
 
 ## Concurrency summary
 

@@ -1,4 +1,4 @@
-//! Evaluator-owned builtin values.
+//! Engine-owned builtin values.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -477,7 +477,7 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
     // Self-reference: `builtins.builtins` points back at the attrset we're
     // about to add. Reserve an object slot up front, embed its id in the
     // entries, then fill the slot once we have the AttrRange. This is
-    // single-threaded — `Evaluator.evaluate` calls `ensureBuiltins` before
+    // single-threaded — `Engine.evaluate` calls `ensureBuiltins` before
     // `scheduler.start` — so no other thread can observe the in-flight slot.
     const self_id = try heap.reserveObjectSlot();
     entries.appendAssumeCapacity(.{

@@ -1,6 +1,6 @@
 const std = @import("std");
 const eval_mod = @import("../../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 const Diagnostic = eval_mod.Diagnostic;
 const Value = @import("runtime").value.Value;
 const path_ops = @import("runtime").paths;
@@ -202,7 +202,7 @@ test "evaluate hash builtins" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.hashFile \"sha1\" {s}", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -360,7 +360,7 @@ test "evaluate regex builtins" {
 }
 
 test "evaluate control and error builtins" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.NixThrow, ev.evaluate("builtins.throw \"nope\""));
@@ -524,7 +524,7 @@ test "evaluate path construction builtins" {
         \\}
     ;
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     try ev.setBasePathFromCurrentPath(std.testing.io);

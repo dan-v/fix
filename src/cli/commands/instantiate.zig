@@ -11,7 +11,7 @@ const eval_support = @import("../eval_support.zig");
 const stats = @import("../stats.zig");
 const build = @import("build.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 
 pub const synopsis =
     \\usage: fix instantiate [options] [paths... | -E <expr>... | --flake <installable>...]
@@ -37,7 +37,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     const worker_count = try setup.workerCount(options);
     setup.applyMemoryBacking(options.hugetlb);
-    var ev = try Evaluator.init(allocator, worker_count);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count));
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
 
@@ -92,7 +92,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     return if (ok) 0 else 1;
 }
 
-fn findFiles(io: std.Io, ev: *Evaluator, sources: []const args.SourceArg) !u8 {
+fn findFiles(io: std.Io, ev: *Engine, sources: []const args.SourceArg) !u8 {
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     for (sources) |source| {
@@ -121,7 +121,7 @@ fn instantiateOne(
     init: std.process.Init,
     term: setup.Terminal,
     options: args.Options,
-    ev: *Evaluator,
+    ev: *Engine,
     input: eval_support.LoadedInput,
     index: usize,
 ) !bool {

@@ -1,11 +1,11 @@
 const std = @import("std");
 const std_testing = std.testing;
 const renderForTest = @import("../test_helpers.zig").renderForTest;
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 /// Evaluate `source` as if it lived at `file_path` (relative path literals
 /// resolve against the file's dir, like Nix), deep-force, render.
-fn renderResolvedForTest(ev: *Evaluator, source: []const u8) ![]u8 {
+fn renderResolvedForTest(ev: *Engine, source: []const u8) ![]u8 {
     const result = try ev.evaluatePath(source, "/test/fold.nix");
     try ev.forceDeep(result);
     var out: std.Io.Writer.Allocating = .init(std_testing.allocator);
@@ -19,7 +19,7 @@ test "non-interpolated path literals fold inside closed attrset and list literal
     // path-bearing attrset/list literals are closed constants and fold
     // whole. The folded values must match what runtime construction would
     // produce.
-    var ev = try Evaluator.init(std_testing.allocator, 0);
+    var ev = try Engine.init(std_testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try ev.setBasePathToFileDir("/test/fold.nix");
 

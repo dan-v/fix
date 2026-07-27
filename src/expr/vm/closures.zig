@@ -358,7 +358,7 @@ inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const
 /// at every `call`/`call_tail` site keyed by the caller's
 /// (chunk_id, ip). On hit the registry hashtable lookup is skipped.
 ///
-/// Heap-token gated: chunk_ids aren't unique across Evaluator
+/// Heap-token gated: chunk_ids aren't unique across Engine
 /// instances (each registry starts at 0), and the IC outlives individual VMs,
 /// so a stale `ch_ptr` from a prior eval would point at a freed
 /// chunk. Matching `heap_token` invalidates the cache when the

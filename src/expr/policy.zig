@@ -73,7 +73,7 @@ pub const LanguagePolicy = struct {
     /// content-locked. See `vm/builtins/purity.zig`.
     pure_eval: bool = false,
     /// Extra filesystem roots readable under `pure_eval` (besides the store):
-    /// the flake's own source tree(s). Borrowed; owned by the Evaluator.
+    /// the flake's own source tree(s). Borrowed; owned by the Engine.
     allowed_path_roots: []const []const u8 = &.{},
 
     pub fn applyFeatureSets(

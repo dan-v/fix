@@ -1,8 +1,8 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "compiles an integer literal to its constant value" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("42");
@@ -10,7 +10,7 @@ test "compiles an integer literal to its constant value" {
 }
 
 test "compiles a float literal to its constant value" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("3.5");
@@ -18,7 +18,7 @@ test "compiles a float literal to its constant value" {
 }
 
 test "compiles a string literal to an interned constant" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("\"hello\"");
@@ -26,7 +26,7 @@ test "compiles a string literal to an interned constant" {
 }
 
 test "compiles a path literal to an interned absolute path" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("/nix/store/example");
@@ -35,7 +35,7 @@ test "compiles a path literal to an interned absolute path" {
 }
 
 test "invalid integer literal is a compile error" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // A literal with digits overflowing i64 fails to parse.

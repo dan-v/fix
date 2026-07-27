@@ -12,7 +12,7 @@ const runtime = @import("runtime");
 const vm_tree = @import("tree.zig");
 const vm_refs = @import("refs.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const bytecode = engine.bytecode;
 
 /// All background work owned by one explorer session. The aggregate keeps
@@ -23,7 +23,7 @@ pub const Session = struct {
     objects: ObjectSnapshot,
     references: References,
 
-    pub fn init(ev: *Evaluator) Session {
+    pub fn init(ev: *Engine) Session {
         return .{
             .names = .{
                 .registry = ev.chunkRegistry(),
@@ -134,7 +134,7 @@ pub const NameIndex = struct {
 };
 
 pub const HeapCensus = struct {
-    ev: *Evaluator,
+    ev: *Engine,
     thread: ?std.Thread = null,
     mutex: sync.BlockingMutex = .{},
     ready: ?runtime.ObjectHeap.Stats = null,
@@ -180,7 +180,7 @@ pub const HeapCensus = struct {
 };
 
 pub const ObjectSnapshot = struct {
-    ev: *Evaluator,
+    ev: *Engine,
     thread: ?std.Thread = null,
     mutex: sync.BlockingMutex = .{},
     ready: ?runtime.ObjectHeap.ObjectSnapshot = null,
@@ -236,7 +236,7 @@ pub const ObjectSnapshot = struct {
 };
 
 pub const References = struct {
-    ev: *Evaluator,
+    ev: *Engine,
     thread: ?std.Thread = null,
     mutex: sync.BlockingMutex = .{},
     ready: ?vm_refs.Graph = null,

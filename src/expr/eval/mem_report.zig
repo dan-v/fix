@@ -3,7 +3,7 @@
 //! Decomposes the process's memory across every subsystem (object stores,
 //! interned strings, bytecode, retained AST arenas) alongside a kernel-truth
 //! mincore/smaps breakdown, so it's visible where memory actually goes — the
-//! tracked object stores are only part of it. Printed at `Evaluator.deinit`,
+//! tracked object stores are only part of it. Printed at `Engine.deinit`,
 //! before any teardown frees state. Diagnostics only; off the hot path.
 
 const std = @import("std");
@@ -23,7 +23,7 @@ const ast = @import("syntax").ast;
 /// where the memory actually goes (the tracked object stores are only part
 /// of it — interned strings, bytecode, and AST arenas are large and the GC
 /// never sees them). Printed at deinit, before any teardown frees state.
-/// Takes the lower-layer state it reads, not the whole Evaluator.
+/// Takes the lower-layer state it reads, not the whole Engine.
 pub fn report(
     heap: *heap_mod.ObjectHeap,
     intern: *intern_mod.InternTable,

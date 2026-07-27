@@ -117,7 +117,7 @@ The memo is a bounded **per-worker, zero-contention** table (`memo_size = 1 << 1
   per-VM effect epoch detects `trace`/`warn`, debugger callbacks, and effects
   returned through nested imports; such executions are not inserted into the
   memo.
-- Keyed by `heap_token`, which **bumps on every GC collection**, auto-invalidating stale entries across heap generations / `Evaluator` instances (same trick as the attr inline cache).
+- Keyed by `heap_token`, which **bumps on every GC collection**, auto-invalidating stale entries across heap generations / `Engine` instances (same trick as the attr inline cache).
 - **Does not cross workers** (thread-local). Each worker publishes its memo's address into a registry so the STW collector can mark current-token entries (a memo slot can be the momentary sole reference to a shared result). The heap token is bumped after collection, invalidating those old slots before ObjectIds can be reused.
 
 Checked on the freshly-claimed path before running the body; a hit resolves the thunk to the cached value and skips execution.

@@ -31,7 +31,7 @@ const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
 const build = @import("build.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const Target = args.SwitchTarget;
 
 /// What to do with the built configuration. The first positional (default
@@ -157,7 +157,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
 
     const worker_count = try setup.workerCount(options.*);
     setup.applyMemoryBacking(options.hugetlb);
-    var ev = try Evaluator.init(allocator, worker_count);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count));
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options.*);
 

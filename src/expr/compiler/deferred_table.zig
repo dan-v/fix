@@ -58,7 +58,7 @@ pub const max_scope_size: usize = 32;
 /// except for `compiled`, the publish-once compile cache.
 pub const Entry = struct {
     /// The value body's AST node (lives in an arena retained by the
-    /// Evaluator for its lifetime — see `evaluator.zig` arena retention).
+    /// Engine for its lifetime — see `evaluator.zig` arena retention).
     node: *const ast.Node,
     /// Snapshot of the enclosing lexical scope, in declaration order:
     /// each `Capture` says how to fetch one visible binding's value from

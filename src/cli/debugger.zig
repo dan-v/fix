@@ -8,7 +8,7 @@
 //! abort. All I/O goes to the terminal via stdin/stderr so a redirected stdout
 //! still receives only the final value.
 //!
-//! The engine upcalls through `engine.Evaluator.setDebugUi`; this file is the
+//! The engine upcalls through `engine.Engine.setDebugUi`; this file is the
 //! `cli`-side implementation, so no VM internals leak below the facade.
 
 const std = @import("std");
@@ -39,11 +39,11 @@ pub const Console = struct {
     hits: usize = 0,
 
     /// Attach this console to `ev`; `builtins.break`/errors now route here.
-    pub fn install(self: *Console, ev: *engine.Evaluator) void {
+    pub fn install(self: *Console, ev: *engine.Engine) void {
         ev.setDebugUi(self, runCallback);
     }
 
-    pub fn uninstall(_: *Console, ev: *engine.Evaluator) void {
+    pub fn uninstall(_: *Console, ev: *engine.Engine) void {
         ev.clearDebugUi();
     }
 

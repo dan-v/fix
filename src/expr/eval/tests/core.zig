@@ -1,6 +1,6 @@
 const std = @import("std");
 const eval_mod = @import("../../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 const Diagnostic = eval_mod.Diagnostic;
 const Value = @import("runtime").value.Value;
 const path_ops = @import("runtime").paths;
@@ -11,14 +11,14 @@ const renderForTestFromCurrentPath = helpers.renderForTestFromCurrentPath;
 const renderXmlForTest = helpers.renderXmlForTest;
 
 test "language release is evaluator-owned and idempotent" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     ev.releaseEvalState();
     ev.releaseEvalState();
     ev.deinit();
 }
 
 test "inspection evaluation retains its entry chunk" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluateWithScopeResult("1 + 2", null);
@@ -36,7 +36,7 @@ test "build transition runs its explicit post-release action once" {
         }
     };
     var counter: Counter = .{};
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     var session = try ev.beginBuildPhase(&.{}, .{ .context = &counter, .run = Counter.run });
     session.deinit();
     ev.deinit();
@@ -49,7 +49,7 @@ test "parallel top-level evaluation uses one demand fiber per ordered input" {
         fibers: [3]usize = .{ 0, 0, 0 },
         errors: [3]?anyerror = .{ null, null, null },
 
-        fn complete(raw: *anyopaque, index: usize, value: ?Value, failure: ?Evaluator.ParallelFailure) void {
+        fn complete(raw: *anyopaque, index: usize, value: ?Value, failure: ?Engine.ParallelFailure) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.values[index] = value;
             self.errors[index] = if (failure) |failed| failed.err else null;
@@ -57,7 +57,7 @@ test "parallel top-level evaluation uses one demand fiber per ordered input" {
         }
     };
 
-    var ev = try Evaluator.init(std.testing.allocator, 4);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 4 });
     defer ev.deinit();
     var capture: Capture = .{};
     ev.evaluatePathsParallel(&.{
@@ -80,7 +80,7 @@ test "parallel top-level failures retain isolated Nix error traces" {
         messages: [2][32]u8 = .{ undefined, undefined },
         lengths: [2]usize = .{ 0, 0 },
 
-        fn complete(raw: *anyopaque, index: usize, _: ?Value, failure: ?Evaluator.ParallelFailure) void {
+        fn complete(raw: *anyopaque, index: usize, _: ?Value, failure: ?Engine.ParallelFailure) void {
             const failed = failure orelse return;
             const self: *@This() = @ptrCast(@alignCast(raw));
             const message = failed.trace.message orelse return;
@@ -89,7 +89,7 @@ test "parallel top-level failures retain isolated Nix error traces" {
         }
     };
 
-    var ev = try Evaluator.init(std.testing.allocator, 4);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 4 });
     defer ev.deinit();
     var capture: Capture = .{};
     ev.evaluatePathsParallel(&.{
@@ -102,7 +102,7 @@ test "parallel top-level failures retain isolated Nix error traces" {
 }
 
 test "external scope construction and rooting is evaluator-owned" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const scope = try ev.replaceExternalScope(&.{
@@ -113,7 +113,7 @@ test "external scope construction and rooting is evaluator-owned" {
 }
 
 test "unused external scopes do not make duplicate entry chunks" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const first_scope = try ev.replaceExternalScope(&.{
@@ -130,7 +130,7 @@ test "unused external scopes do not make duplicate entry chunks" {
 }
 
 test "referenced external scopes remain distinct chunk constants" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const first_scope = try ev.replaceExternalScope(&.{
@@ -148,7 +148,7 @@ test "referenced external scopes remain distinct chunk constants" {
 }
 
 test "writeValue colorizes strings, numbers, keywords, and attr names when value_color is set" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setValueColor(true);
     const result = try ev.evaluate("{ n = 1; s = \"x\"; b = true; }");
@@ -357,7 +357,7 @@ test "evaluate attrset function defaults ellipsis and binding" {
     defer std.testing.allocator.free(trailing_comma);
     try std.testing.expectEqualStrings("3", trailing_comma);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(error.MissingAttribute, ev.evaluate("({ x }: 1) { }"));
     try std.testing.expectError(error.UnexpectedAttribute, ev.evaluate("({ x }: x) { x = 1; y = 2; }"));
@@ -691,7 +691,7 @@ test "evaluate deepSeq builtin" {
     defer std.testing.allocator.free(unused);
     try std.testing.expectEqualStrings("3", unused);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("builtins.deepSeq [ (1 / 0) ] 2"));
 }
@@ -717,7 +717,7 @@ test "unsafeGetAttrPos reports file positions for file-attributed sources" {
     try std.testing.expect(std.mem.indexOf(u8, built, "file = \"/test/pos.nix\"") != null);
 
     // No source path (bare expression): null, matching Nix's `-E` behavior.
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     const v = try ev.evaluate("builtins.unsafeGetAttrPos \"email\" { email = \"e\"; }");
     try std.testing.expect(v.kind() == .null);

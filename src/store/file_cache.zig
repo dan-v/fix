@@ -1,4 +1,4 @@
-//! Evaluator-owned filesystem cache.
+//! Engine-owned filesystem cache.
 //!
 //! The VM talks to this cache, not directly to the host filesystem. Cold
 //! reads are isolated behind `readFile`/`pathExists` so workers can use

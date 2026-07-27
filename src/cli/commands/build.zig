@@ -10,7 +10,7 @@ const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 
 pub const synopsis =
     \\usage: fix build [options] [paths... | -E <expr>... | --flake <installable>...]
@@ -35,7 +35,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     const worker_count = try setup.workerCount(options);
     setup.applyMemoryBacking(options.hugetlb);
-    var ev = try Evaluator.init(allocator, worker_count);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count));
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
 

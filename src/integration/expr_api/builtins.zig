@@ -1,13 +1,13 @@
 const std = @import("std");
 const expr = @import("expr");
-const Evaluator = expr.Evaluator;
+const Engine = expr.Engine;
 const value = @import("runtime").value;
 const ValueType = value.ValueType;
 
 test "end-to-end: ambient builtins" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const first = try ev.evaluate("builtins.elemAt (map (x: x + 1) [ 1 2 ]) 0");
@@ -43,7 +43,7 @@ test "end-to-end: ambient builtins" {
 test "end-to-end: builtins.toFile returns store-like string" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const file_value = try ev.evaluate("builtins.toFile \"x\" \"hello\"");
@@ -59,7 +59,7 @@ test "end-to-end: builtins.toFile returns store-like string" {
 test "end-to-end: derivation preserves original attrs" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const drv = try ev.evaluate(
@@ -74,7 +74,7 @@ test "end-to-end: derivation preserves original attrs" {
 test "end-to-end: core fetchurl import" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const fetched = try ev.evaluate(
@@ -86,7 +86,7 @@ test "end-to-end: core fetchurl import" {
 test "end-to-end: builtins.toString" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const int_string = try ev.evaluate("builtins.toString 42");
@@ -119,7 +119,7 @@ test "end-to-end: builtins.toString" {
 test "end-to-end: builtin type predicates" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expect((try ev.evaluate("builtins.isAttrs {}")).asBool());

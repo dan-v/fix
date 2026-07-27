@@ -45,9 +45,9 @@ Priority within `drainStep` mirrors the scheduler's discipline: **ready fibers â
 
 **`gcSafepoint`** is a per-loop-iteration poll: if a [GC](../gc.md) stop is requested the worker parks at the safepoint until released. This is how the collector reaches a stop-the-world barrier without preempting mid-op.
 
-## The Evaluator
+## The Engine
 
-The **`Evaluator`** (defined in `evaluator.zig`) holds the state shared across all workers and fibers:
+The **`Engine`** (defined in `evaluator.zig`) holds the state shared across all workers and fibers:
 
 - **chunk registry** (compiled [bytecode](../compiler/pipeline.md)), **[intern](../runtime/interning.md) table**, **[heap](../runtime/heap.md)**, **scheduler**, **file/[import](imports.md) caches**, [derivation](../derivation/model.md) caches.
 - Cross-worker sharing goes through the heap and interned tables, which *are* concurrency-safe; the hot per-fiber allocation path takes no lock because it lands in the fiber's private scratch arena.

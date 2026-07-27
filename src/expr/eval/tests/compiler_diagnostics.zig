@@ -1,8 +1,8 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "has-attr path within the segment-count limit compiles and evaluates" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("{ a = { b = 1; }; } ? a.b");
@@ -10,7 +10,7 @@ test "has-attr path within the segment-count limit compiles and evaluates" {
 }
 
 test "has-attr path exceeding the u8 segment limit is a compile error" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // `requireU8At` guards the has-attr-path segment count operand

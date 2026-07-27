@@ -1,7 +1,7 @@
 //! Shared evaluation-to-build workflow for realizing CLI commands.
 
 const std = @import("std");
-const Evaluator = @import("expr").Evaluator;
+const Engine = @import("expr").Engine;
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const eval_support = @import("eval_support.zig");
@@ -58,7 +58,7 @@ pub const BuildInput = eval_support.LoadedInput;
 const FailureStage = enum { none, evaluation, derivation, closure };
 
 const BuildSlot = struct {
-    request: Evaluator.AsyncBuildRequest = undefined,
+    request: Engine.AsyncBuildRequest = undefined,
     progress_operation: build_progress.Operation = undefined,
     request_paths: [1][]const u8 = undefined,
     drv_path: ?[]u8 = null,
@@ -78,13 +78,13 @@ const BuildSlot = struct {
 
 const Pipeline = struct {
     allocator: std.mem.Allocator,
-    ev: *Evaluator,
+    ev: *Engine,
     slots: []BuildSlot,
     inputs: []const BuildInput,
     use_color: bool,
     show_trace: bool,
 
-    fn complete(raw: *anyopaque, index: usize, value: ?@import("runtime").Value, failure: ?Evaluator.ParallelFailure) void {
+    fn complete(raw: *anyopaque, index: usize, value: ?@import("runtime").Value, failure: ?Engine.ParallelFailure) void {
         const self: *Pipeline = @ptrCast(@alignCast(raw));
         const slot = &self.slots[index];
         if (failure) |failed| {
@@ -121,7 +121,7 @@ const Pipeline = struct {
 const OrderedPrinter = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    ev: *Evaluator,
+    ev: *Engine,
     options: args.Options,
     slots: []BuildSlot,
     use_color: bool,
@@ -224,7 +224,7 @@ pub fn makeLink(io: std.Io, name: []const u8, target: []const u8) !void {
     try cwd.symLink(io, target, name, .{});
 }
 
-pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Evaluator, name: []const u8, target: []const u8, indirect: bool) void {
+pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Engine, name: []const u8, target: []const u8, indirect: bool) void {
     makeLink(io, name, target) catch |err| {
         std.debug.print("warning: could not create {s}: {s}\n", .{ name, @errorName(err) });
         return;
@@ -257,7 +257,7 @@ fn absolutePath(io: std.Io, allocator: std.mem.Allocator, name: []const u8) ![]u
 pub fn realizeMany(
     allocator: std.mem.Allocator,
     io: std.Io,
-    ev: *Evaluator,
+    ev: *Engine,
     release_action: ?@import("expr").ReleaseAction,
     terminal: setup.Terminal,
     options: args.Options,
@@ -275,11 +275,11 @@ pub fn realizeMany(
     for (slots) |*slot| {
         slot.* = .{};
         slot.progress_operation = build_progress_state.operation();
-        slot.request = Evaluator.AsyncBuildRequest.init(slot.request_paths[0..], slot.progress_operation.sink(), eval_support.buildMode(options));
+        slot.request = Engine.AsyncBuildRequest.init(slot.request_paths[0..], slot.progress_operation.sink(), eval_support.buildMode(options));
     }
     defer for (slots) |*slot| slot.deinit(allocator);
 
-    const parallel_inputs = try allocator.alloc(Evaluator.ParallelInput, inputs.len);
+    const parallel_inputs = try allocator.alloc(Engine.ParallelInput, inputs.len);
     defer allocator.free(parallel_inputs);
     for (inputs, parallel_inputs) |input, *parallel| parallel.* = .{
         .source = input.source.slice(),
@@ -323,7 +323,7 @@ pub fn realizeMany(
 pub fn dryRunMany(
     allocator: std.mem.Allocator,
     io: std.Io,
-    ev: *Evaluator,
+    ev: *Engine,
     release_action: ?@import("expr").ReleaseAction,
     terminal: setup.Terminal,
     options: args.Options,
@@ -427,7 +427,7 @@ fn proveBuildStartsBeforeOtherEvaluationFinishes(slow_index: usize) !void {
 
     const fake = try FakeDaemon.start(testing.allocator, testing.io);
     defer fake.deinit();
-    var ev = try Evaluator.init(testing.allocator, 2);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 2 });
     defer ev.deinit();
     ev.setFileIo(testing.io);
     ev.store.realization.store_dir = store_dir;
@@ -495,10 +495,10 @@ fn proveBuildStartsBeforeOtherEvaluationFinishes(slow_index: usize) !void {
 
     var slots: [2]BuildSlot = .{ .{}, .{} };
     for (&slots) |*slot| {
-        slot.request = Evaluator.AsyncBuildRequest.init(slot.request_paths[0..], null, .normal);
+        slot.request = Engine.AsyncBuildRequest.init(slot.request_paths[0..], null, .normal);
     }
     defer for (&slots) |*slot| slot.deinit(testing.allocator);
-    const parallel_inputs = [_]Evaluator.ParallelInput{
+    const parallel_inputs = [_]Engine.ParallelInput{
         .{ .source = inputs[0].source.slice() },
         .{ .source = inputs[1].source.slice() },
     };
@@ -531,7 +531,7 @@ test "build 2 starts before slow evaluation 1 finishes" {
 pub fn realize(
     allocator: std.mem.Allocator,
     io: std.Io,
-    ev: *Evaluator,
+    ev: *Engine,
     release_action: ?@import("expr").ReleaseAction,
     terminal: setup.Terminal,
     options: args.Options,

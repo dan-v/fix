@@ -3,7 +3,7 @@
 const std = @import("std");
 const observ = @import("base").observ;
 const engine = @import("expr");
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const Timeline = engine.probe.timeline.Recorder;
 const terminal_text = @import("base").terminal_text;
 const args = @import("args.zig");
@@ -218,7 +218,7 @@ pub const EvalProgress = struct {
 /// single local operation and lets build keep recording daemon spans after the
 /// language evaluator has released its memory.
 pub const Session = struct {
-    ev: *Evaluator,
+    ev: *Engine,
     io: std.Io,
     progress: EvalProgress,
     timeline: ?Timeline = null,
@@ -227,7 +227,7 @@ pub const Session = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
-        ev: *Evaluator,
+        ev: *Engine,
         terminal: setup.Terminal,
         options: args.Options,
         source: []const u8,

@@ -4,7 +4,7 @@
 //! directories, lookup paths, tarballs, channels, and flake source trees.
 
 const std = @import("std");
-const Evaluator = @import("expr").Evaluator;
+const Engine = @import("expr").Engine;
 const TextRef = @import("base").TextRef;
 
 pub const Kind = enum { stdin, path, lookup, tarball, channel, flake };
@@ -43,7 +43,7 @@ pub const Source = struct {
 /// Resolve and load one fileish argument. Returned file bytes are borrowed
 /// from the evaluator's file cache; stdin is owned. Paths and base paths are
 /// owned so source positions and relative imports remain tied to this input.
-pub fn load(ev: *Evaluator, io: std.Io, input: []const u8) !Source {
+pub fn load(ev: *Engine, io: std.Io, input: []const u8) !Source {
     const allocator = ev.hostAllocator();
     if (classify(input) == .stdin) {
         var stdin_buffer: [64 * 1024]u8 = undefined;
@@ -105,7 +105,7 @@ test "classify legacy fileish syntax and path disambiguation" {
 }
 
 test "load resolves directories and lookup paths to default.nix" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     try ev.setBasePathFromCurrentPath(std.testing.io);
 

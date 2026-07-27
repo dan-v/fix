@@ -11,7 +11,8 @@ pub const workers = @import("eval/workers.zig");
 pub const vm = @import("vm.zig");
 pub const probe = @import("probe.zig");
 
-pub const Evaluator = evaluator.Evaluator;
+pub const Engine = evaluator.Engine;
+pub const EngineConfig = evaluator.Config;
 pub const BuildSession = evaluator.BuildSession;
 pub const Diagnostic = evaluator.Diagnostic;
 pub const EvalTrace = evaluator.EvalTrace;

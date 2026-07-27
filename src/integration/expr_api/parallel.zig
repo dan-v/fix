@@ -1,15 +1,15 @@
 //! End-to-end tests that exercise the scheduler with multiple helpers.
 //! These re-run the same evaluations as the single-threaded suite but
-//! configure the Evaluator with helper threads so the speculative
+//! configure the Engine with helper threads so the speculative
 //! force_thunk path is actually traversed.
 
 const std = @import("std");
 const expr = @import("expr");
-const Evaluator = expr.Evaluator;
+const Engine = expr.Engine;
 
 test "parallel: arithmetic with 4 workers" {
     const alloc = std.testing.allocator;
-    var ev = try Evaluator.init(alloc, 4);
+    var ev = try Engine.init(alloc, .{ .worker_count = 4 });
     defer ev.deinit();
 
     const result = try ev.evaluate("10 + 32");
@@ -18,7 +18,7 @@ test "parallel: arithmetic with 4 workers" {
 
 test "parallel: recursive let with 4 workers" {
     const alloc = std.testing.allocator;
-    var ev = try Evaluator.init(alloc, 4);
+    var ev = try Engine.init(alloc, .{ .worker_count = 4 });
     defer ev.deinit();
 
     const result = try ev.evaluate(
@@ -31,7 +31,7 @@ test "parallel: recursive let with 4 workers" {
 
 test "parallel: large attrset with 8 workers" {
     const alloc = std.testing.allocator;
-    var ev = try Evaluator.init(alloc, 8);
+    var ev = try Engine.init(alloc, .{ .worker_count = 8 });
     defer ev.deinit();
 
     const result = try ev.evaluate(
@@ -46,7 +46,7 @@ test "parallel: large attrset with 8 workers" {
 
 test "parallel: list operations with 4 workers" {
     const alloc = std.testing.allocator;
-    var ev = try Evaluator.init(alloc, 4);
+    var ev = try Engine.init(alloc, .{ .worker_count = 4 });
     defer ev.deinit();
 
     const result = try ev.evaluate(
@@ -61,7 +61,7 @@ test "parallel: list operations with 4 workers" {
 
 test "parallel: automatic collector dispatches a major with 4 workers" {
     const alloc = std.testing.allocator;
-    var ev = try Evaluator.init(alloc, 4);
+    var ev = try Engine.init(alloc, .{ .worker_count = 4 });
     defer ev.deinit();
     ev.configureMemory(64 << 20, null, false);
 
@@ -98,7 +98,7 @@ test "parallel: forceDeep fans wide attrset out to helpers" {
     // child to helpers urgently — `forceDeep` should complete without
     // hangs or errors regardless of how the work is distributed.
     const alloc = std.testing.allocator;
-    var ev = try Evaluator.init(alloc, 4);
+    var ev = try Engine.init(alloc, .{ .worker_count = 4 });
     defer ev.deinit();
 
     const value = try ev.evaluate(

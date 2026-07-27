@@ -233,7 +233,7 @@ pub const Thunk = struct {
     demanded: std.atomic.Value(u8),
     /// Active arm of `payload.target` while the future is non-terminal.
     target_kind: TargetKind,
-    /// Evaluator-owned demand-effect group (0 = none). Written by the claiming
+    /// Engine-owned demand-effect group (0 = none). Written by the claiming
     /// fiber before it release-publishes a resolved/errored state and therefore
     /// safely read after the corresponding acquire-load. A raw u32 keeps the
     /// runtime module independent of the expression engine's effect store and

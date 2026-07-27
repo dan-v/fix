@@ -17,7 +17,7 @@ const args = @import("../args.zig");
 const fileish = @import("../fileish.zig");
 const setup = @import("../setup.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const Parser = syntax.parser.Parser;
 const AstArena = syntax.ast.AstArena;
 const Diagnostic = syntax.diagnostic.Diagnostic;
@@ -50,7 +50,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     }
 
     setup.applyMemoryBacking(null);
-    var ev = try Evaluator.init(allocator, 1);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1));
     defer ev.deinit();
     _ = setup.configure(&ev, init, options) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});
@@ -129,7 +129,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
 const DeprecationWarning = syntax.parser.DeprecationWarning;
 
-fn loadSource(ev: *Evaluator, io: std.Io, source: args.SourceArg) !fileish.Source {
+fn loadSource(ev: *Engine, io: std.Io, source: args.SourceArg) !fileish.Source {
     return switch (source) {
         .expr => |text| .{ .text = .{ .borrowed = text } },
         .file => |path| try fileish.load(ev, io, path),

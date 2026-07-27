@@ -1,6 +1,6 @@
 const std = @import("std");
 const eval_mod = @import("../../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 const Value = @import("runtime").value.Value;
 const heap_mod = @import("runtime").heap;
 const vm = @import("../../vm.zig");
@@ -35,7 +35,7 @@ const DemandFixture = struct {
     tmp: std.testing.TmpDir,
     store_dir: []u8,
     fake: *FakeDaemon,
-    ev: Evaluator,
+    ev: Engine,
 
     fn init(allocator: std.mem.Allocator, workers: u8) !DemandFixture {
         var tmp = std.testing.tmpDir(.{});
@@ -49,7 +49,7 @@ const DemandFixture = struct {
 
         const fake = try FakeDaemon.start(allocator, std.testing.io);
         errdefer fake.deinit();
-        var ev = try Evaluator.init(allocator, workers);
+        var ev = try Engine.init(allocator, .{ .worker_count = workers });
         errdefer ev.deinit();
         ev.setFileIo(std.testing.io);
         ev.store.realization.store_dir = store_dir;

@@ -1,6 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 const disasm = @import("../../tooling/bytecode.zig").disasm;
 
 /// One decoded disassembler line: the opcode name and its 0-based position
@@ -10,7 +10,7 @@ const disasm = @import("../../tooling/bytecode.zig").disasm;
 /// bytecode stream or pinning byte offsets.
 const OpLine = struct { name: []const u8, index: usize };
 
-/// Compile `source` with a fresh single-threaded `Evaluator`, recursively
+/// Compile `source` with a fresh single-threaded `Engine`, recursively
 /// disassemble every reachable chunk via the real disassembler, and split
 /// the result into per-line opcode names in program order. The caller owns
 /// the returned text buffer (`text`) and must free it; `lines` borrows from
@@ -45,7 +45,7 @@ const Disassembly = struct {
     }
 };
 
-fn disassemble(ev: *Evaluator, source: []const u8) !Disassembly {
+fn disassemble(ev: *Engine, source: []const u8) !Disassembly {
     const chunk_id = try ev.compileSource(source, null);
     const target = ev.getChunk(chunk_id).?;
     const symbols = disasm.Symbols{ .intern = ev.internTable(), .registry = ev.chunkRegistry() };
@@ -82,7 +82,7 @@ fn disassemble(ev: *Evaluator, source: []const u8) !Disassembly {
 }
 
 test "compileBinary emits the runtime add opcode for non-literal operands" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     // Locals (lambda params), not literals, so the `+` can't constant-fold
     // — the runtime `int_add` opcode must actually be emitted.
@@ -92,7 +92,7 @@ test "compileBinary emits the runtime add opcode for non-literal operands" {
 }
 
 test "compileBinary emits the runtime sub/mul/div opcodes for non-literal operands" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var sub_d = try disassemble(&ev, "a: b: a - b");
@@ -109,7 +109,7 @@ test "compileBinary emits the runtime sub/mul/div opcodes for non-literal operan
 }
 
 test "compileBinary emits comparison opcodes for non-literal operands" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var lt_d = try disassemble(&ev, "a: b: a < b");
@@ -122,7 +122,7 @@ test "compileBinary emits comparison opcodes for non-literal operands" {
 }
 
 test "fully applied operator-equivalent builtins lower to VM opcodes" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const cases = [_]struct { source: []const u8, opcode: []const u8 }{
@@ -144,7 +144,7 @@ test "fully applied operator-equivalent builtins lower to VM opcodes" {
 }
 
 test "builtin opcode lowering requires saturation and the global builtins set" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var partial = try disassemble(&ev, "builtins.sub 1");
@@ -159,7 +159,7 @@ test "builtin opcode lowering requires saturation and the global builtins set" {
 }
 
 test "inherit-from group compiles one shared source thunk" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var d = try disassemble(&ev, "let inherit (builtins.trace \"once\" { a = 1; b = 2; }) a b; in a + b");
@@ -171,7 +171,7 @@ test "inherit-from group compiles one shared source thunk" {
 }
 
 test "static literal selection skips attrset construction" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var selected = try disassemble(&ev, "({ a = 1; b = builtins.throw \"unused\"; }).a");
@@ -197,7 +197,7 @@ test "static literal selection skips attrset construction" {
 }
 
 test "static literal membership emits a boolean without member code" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var present = try disassemble(&ev, "({ a = builtins.throw \"unused\"; } ? a)");
@@ -213,7 +213,7 @@ test "static literal membership emits a boolean without member code" {
 }
 
 test "repeated constants share one chunk-pool index" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var d = try disassemble(&ev, "x: x + 7 + 7");
@@ -224,7 +224,7 @@ test "repeated constants share one chunk-pool index" {
 }
 
 test "empty containers lower to shared singleton constants" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var attrs = try disassemble(&ev, "{}");
@@ -248,7 +248,7 @@ test "empty containers lower to shared singleton constants" {
 }
 
 test "right-associated list concatenation lowers to one n-ary opcode" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var chain = try disassemble(&ev, "a: b: c: a ++ b ++ c");
@@ -265,7 +265,7 @@ test "right-associated list concatenation lowers to one n-ary opcode" {
 }
 
 test "compileBinary folds literal-on-literal arithmetic to a constant instead of emitting an opcode" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     var d = try disassemble(&ev, "1 + 2");
     defer d.deinit(testing.allocator);
@@ -274,7 +274,7 @@ test "compileBinary folds literal-on-literal arithmetic to a constant instead of
 }
 
 test "compileAnd emits a jump strictly between the two operand pushes" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     // Uncurried two-param lambda: both `a` and `b` compile to `loc_get`
     // reads in one chunk, so the two occurrences bracket the jump.
@@ -297,7 +297,7 @@ test "compileAnd emits a jump strictly between the two operand pushes" {
 }
 
 test "compileOr emits a jump strictly between the two operand pushes" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     var d = try disassemble(&ev, "a: b: a || b");
     defer d.deinit(testing.allocator);
@@ -322,7 +322,7 @@ test "compileOr emits a jump strictly between the two operand pushes" {
 }
 
 test "&& never evaluates its right-hand side when the left side is false" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     // If `1/0` were evaluated, this would raise DivisionByZero.
     const v = try ev.evaluate("false && (1 / 0 == 0)");
@@ -331,7 +331,7 @@ test "&& never evaluates its right-hand side when the left side is false" {
 }
 
 test "|| never evaluates its right-hand side when the left side is true" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     const v = try ev.evaluate("true || (1 / 0 == 0)");
     try testing.expect(v.isBool());
@@ -339,19 +339,19 @@ test "|| never evaluates its right-hand side when the left side is true" {
 }
 
 test "&& does evaluate its right-hand side when the left side is true" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try testing.expectError(error.DivisionByZero, ev.evaluate("true && (1 / 0 == 0)"));
 }
 
 test "|| does evaluate its right-hand side when the left side is false" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try testing.expectError(error.DivisionByZero, ev.evaluate("false || (1 / 0 == 0)"));
 }
 
 test "compileLambda and compileLambdaAttrs produce different chunk shapes" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var value_lambda = try disassemble(&ev, "x: x");
@@ -369,13 +369,13 @@ test "compileLambda and compileLambdaAttrs produce different chunk shapes" {
 }
 
 test "applying a non-callable value raises NotCallable instead of panicking" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try testing.expectError(error.NotCallable, ev.evaluate("(1) 2"));
 }
 
 test "duplicate let bindings raise a parse error instead of panicking" {
-    var ev = try Evaluator.init(testing.allocator, 0);
+    var ev = try Engine.init(testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try testing.expectError(error.ParseError, ev.evaluate("let x = 1; x = 2; in x"));
 }

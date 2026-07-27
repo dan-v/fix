@@ -1,10 +1,10 @@
 const std = @import("std");
 const eval_mod = @import("../../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 const Diagnostic = eval_mod.Diagnostic;
 
 test "evaluate exposes parse diagnostics without printing" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.ParseError, ev.evaluate("$ $ 1"));
@@ -19,7 +19,7 @@ test "evaluate exposes parse diagnostics without printing" {
 }
 
 test "evaluate exposes duplicate binding diagnostics" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.ParseError, ev.evaluate("let x = 1; x = 2; in x"));
@@ -35,7 +35,7 @@ test "evaluate exposes duplicate binding diagnostics" {
 }
 
 test "evaluate exposes duplicate attribute diagnostics" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.ParseError, ev.evaluate("{ a = 1; a = 2; }"));
@@ -51,7 +51,7 @@ test "evaluate exposes duplicate attribute diagnostics" {
 }
 
 test "evaluate exposes undefined variable diagnostics" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.UndefinedVariable, ev.evaluate("let y = x; in y"));
@@ -65,7 +65,7 @@ test "evaluate exposes undefined variable diagnostics" {
 }
 
 test "evaluate exposes invalid numeric literal diagnostics" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.InvalidNumber, ev.evaluate("9223372036854775808"));
@@ -77,7 +77,7 @@ test "evaluate exposes invalid numeric literal diagnostics" {
 }
 
 test "evaluate exposes interpolation parse diagnostics" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.ParseError, ev.evaluate("\"${$}\""));
@@ -90,7 +90,7 @@ test "evaluate exposes interpolation parse diagnostics" {
 }
 
 test "evaluate records runtime error message and expression trace" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.TypeError, ev.evaluate("let y = 1 + \"x\"; in y"));
@@ -131,7 +131,7 @@ test "evaluate records imported file source trace" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "import {s}", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 

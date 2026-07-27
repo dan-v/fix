@@ -1,18 +1,18 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 // Test vectors independently verified via `printf 'abc' | md5sum` /
 // `printf 'abc' | sha512sum` rather than trusting self-consistency.
 
 test "hashString md5 matches the independently-computed digest of \"abc\"" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     const result = try ev.evaluate("builtins.hashString \"md5\" \"abc\"");
     try std.testing.expectEqualStrings("900150983cd24fb0d6963f7d28e17f72", ev.intern.get(result.asInternId()));
 }
 
 test "hashString sha512 matches the independently-computed digest of \"abc\"" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     const result = try ev.evaluate("builtins.hashString \"sha512\" \"abc\"");
     try std.testing.expectEqualStrings(
@@ -22,7 +22,7 @@ test "hashString sha512 matches the independently-computed digest of \"abc\"" {
 }
 
 test "hashString rejects an unsupported algorithm name" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(
         error.UnsupportedHashAlgorithm,
@@ -31,7 +31,7 @@ test "hashString rejects an unsupported algorithm name" {
 }
 
 test "hashString rejects a non-string argument" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.hashString \"sha256\" 1"));
 }

@@ -1,9 +1,9 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "a lambda body returning a bare local evaluates correctly" {
     // Exercises the loc_get/loc_get_ret fusion in emitRet.
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("(x: x) 42");
@@ -12,7 +12,7 @@ test "a lambda body returning a bare local evaluates correctly" {
 
 test "a lambda body returning a captured upvalue evaluates correctly" {
     // Exercises the up_get/up_get_ret fusion in emitRet.
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let y = 7; in (x: y) 0");
@@ -21,7 +21,7 @@ test "a lambda body returning a captured upvalue evaluates correctly" {
 
 test "chained attribute access through an upvalue evaluates correctly" {
     // Exercises the up_get/up_get_attr fusion in emitGetAttr.
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let pkg = { name = \"foo\"; }; in (x: pkg.name) 0");
@@ -31,7 +31,7 @@ test "chained attribute access through an upvalue evaluates correctly" {
 test "an if-else whose branches join at the tail evaluates both arms correctly" {
     // Exercises patchJump's tail-join detection (dropping the fusion hint
     // when a jump target lands at the current write position).
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const then_arm = try ev.evaluate("if true then 1 else 2");

@@ -25,7 +25,7 @@ pub const ResolvedPath = TextRef;
 /// Parsed NIX_PATH entries. `set` rebuilds from a `:`-separated string;
 /// resolution against base_path is the caller's responsibility (we
 /// don't carry base_path so this struct stays decoupled from the
-/// Evaluator's lifecycle).
+/// Engine's lifecycle).
 pub const Paths = struct {
     entries: []Entry = &.{},
 
@@ -121,7 +121,7 @@ pub const Paths = struct {
     }
 
     /// Copy entries into a borrowed `NixPathEntry` slice the caller
-    /// owns. Used to populate `builtins.nixPath` at Evaluator init.
+    /// owns. Used to populate `builtins.nixPath` at Engine init.
     pub fn toNixPath(self: *const Paths, allocator: std.mem.Allocator) ![]builtins.NixPathEntry {
         const out = try allocator.alloc(builtins.NixPathEntry, self.entries.len);
         for (self.entries, out) |entry, *slot| {

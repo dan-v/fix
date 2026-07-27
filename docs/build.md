@@ -27,7 +27,7 @@ The LALR parser tables are expensive to construct at comptime, so a standalone c
 
 ## Build options
 
-Evaluator-specific `-D` flags are folded into one shared `build_options` module and injected only where they are used. Generic `base` does not see that application-wide option surface. It receives a separate, narrow `base_options` module containing only the profiler-backed fiber census.
+Engine-specific `-D` flags are folded into one shared `build_options` module and injected only where they are used. Generic `base` does not see that application-wide option surface. It receives a separate, narrow `base_options` module containing only the profiler-backed fiber census.
 
 ### `-D` flag surface
 

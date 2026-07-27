@@ -68,7 +68,7 @@ pub fn builtinAddErrorContext(self: *VM, message_arg: Value, value_arg: Value) !
 /// is a plain forced identity, so it costs nothing off the debug path.
 pub fn builtinBreak(self: *VM, arg: Value) !Value {
     if (self.debug.break_sink) |sink| {
-        // Debugger installation disables speculation at the Evaluator seam;
+        // Debugger installation disables speculation at the Engine seam;
         // marking this body effectful also keeps repeated calls out of the
         // bytecode-result memo.
         self.effect_epoch +%= 1;

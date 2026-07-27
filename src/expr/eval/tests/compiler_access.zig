@@ -1,8 +1,8 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "compiles a nested attribute path access" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("{ a.b.c = 42; }.a.b.c");
@@ -10,14 +10,14 @@ test "compiles a nested attribute path access" {
 }
 
 test "attribute path access reports missing key" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.MissingAttribute, ev.evaluate("{ a.b = 1; }.a.c"));
 }
 
 test "attribute or-default returns the default when the path is missing" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const missing = try ev.evaluate("{ a.b = 1; }.a.c or 42");
@@ -28,7 +28,7 @@ test "attribute or-default returns the default when the path is missing" {
 }
 
 test "attribute or-default works with a dynamic attribute name" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let x = \"missing\"; in { a = 1; }.${x} or 99");
@@ -39,7 +39,7 @@ test "or-default covers a miss anywhere in a path with a dynamic segment" {
     // Regression: the `or` default must catch a missing attr at ANY position,
     // even when a dynamic `${...}` sits earlier in the select path (the whole
     // path is compiled as one fallback, not just the outer static tail).
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // Missing attr with the dynamic segment in the middle / first / last.

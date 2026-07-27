@@ -39,7 +39,7 @@ const vm_ui = @import("../repl/vm/root.zig");
 const transcript_mod = @import("../repl/transcript.zig");
 
 const Options = args.Options;
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const Value = runtime.Value;
 const disasm = engine.bytecode.disasm;
 
@@ -84,7 +84,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // speculation. Same posture as `fix eval --debugger`.
     const worker_count = if (options.debugger) 1 else try setup.workerCount(options);
     setup.applyMemoryBacking(options.hugetlb);
-    var ev = try Evaluator.init(allocator, worker_count);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count));
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
     // The explorer is a first-class REPL surface: retain binding and synthetic
@@ -135,7 +135,7 @@ const Repl = struct {
     proc_init: std.process.Init,
     io: std.Io,
     options: Options,
-    ev: *Evaluator,
+    ev: *Engine,
     use_color: bool,
     color_depth: presentation.ColorDepth,
     interactive: bool,
@@ -183,7 +183,7 @@ const Repl = struct {
         allocator: std.mem.Allocator,
         proc_init: std.process.Init,
         options: Options,
-        ev: *Evaluator,
+        ev: *Engine,
         color_depth: presentation.ColorDepth,
         interactive: bool,
     ) Repl {
@@ -690,7 +690,7 @@ const Repl = struct {
     /// Ask the evaluator to rebuild the scope attrset and replace its GC roots
     /// as one operation.
     fn rebuildScope(self: *Repl) !void {
-        var bindings: std.ArrayListUnmanaged(Evaluator.ScopeBinding) = .empty;
+        var bindings: std.ArrayListUnmanaged(Engine.ScopeBinding) = .empty;
         defer bindings.deinit(self.allocator);
 
         var it = self.bindings.iterator();

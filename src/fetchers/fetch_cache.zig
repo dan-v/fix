@@ -1,4 +1,4 @@
-//! Evaluator-owned network/source fetch cache.
+//! Engine-owned network/source fetch cache.
 //!
 //! Fetching is isolated here for the same reason filesystem I/O is isolated in
 //! FileCache: builtin implementations should describe Nix semantics, while this

@@ -4,9 +4,9 @@ const runtime = @import("runtime");
 const types = runtime.types;
 const Value = runtime.value.Value;
 
-pub fn Adapter(comptime Evaluator: type) type {
+pub fn Adapter(comptime Engine: type) type {
     return struct {
-        ev: *Evaluator,
+        ev: *Engine,
 
         const Self = @This();
 

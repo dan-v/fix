@@ -35,6 +35,11 @@ if rg -n '(^|[[:space:]])owned:[[:space:]]*bool([,;[:space:]]|$)' "$src"; then
   failed=1
 fi
 
+if rg -n '\bEvaluator\b' "$src"; then
+  echo "structure-check: use the responsibility-oriented Engine API; no legacy Evaluator alias" >&2
+  failed=1
+fi
+
 if rg -n '@import\("(\.\./)+(base|syntax|runtime|store|fetchers|expr|cli)(/|\.zig")' "$src"; then
   echo "structure-check: import durable modules by name instead of crossing roots relatively" >&2
   failed=1

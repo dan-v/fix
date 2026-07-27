@@ -1,4 +1,4 @@
-//! Evaluator — the top-level orchestration layer.
+//! Engine — the top-level orchestration layer.
 //!
 //! Manages the shared state (chunk registry, intern table, scheduler) and runs
 //! the worker threads that execute bytecode.
@@ -64,6 +64,7 @@ const VmTrace = @import("vm.zig").trace_log.VmTrace;
 const ThunkTrace = @import("probe.zig").thunk_trace.ThunkTrace;
 const SpinMutex = @import("base").sync.SpinMutex;
 const owned_strings = @import("base").owned_strings;
+const capability = @import("engine/capabilities.zig");
 
 const parse_observation: observ.SpanSpec = .{
     .category = "eval",
@@ -160,7 +161,7 @@ pub const DebugFrame = debug_session.DebugFrame;
 /// run on the paused demand fiber; `eval` re-enters the evaluator, which is
 /// safe because forcing already nests VM frames (`runIsolatedFrame`).
 pub const DebugSession = struct {
-    ev: *Evaluator,
+    ev: *Engine,
     vm: *VM,
     /// The value passed to `builtins.break`, returned by a stepped frame, or
     /// under evaluation at an error. It may be an unforced thunk.
@@ -443,7 +444,18 @@ fn debugContext(session: *const DebugSession) debug_session.Context {
     };
 }
 
-pub const Evaluator = struct {
+/// Borrowed construction policy for the expression engine.
+///
+/// Keeping initialization inputs in one value makes setup transactional and
+/// lets composition layers resolve policy before allocating long-lived state.
+pub const Config = struct {
+    worker_count: u8 = 1,
+    io: ?std.Io = null,
+    environment: ?*const std.process.Environ.Map = null,
+    fetch: FetchService.Config = .{},
+};
+
+pub const Engine = struct {
     allocator: std.mem.Allocator,
     intern: InternTable,
     registry: ChunkRegistry,
@@ -487,10 +499,18 @@ pub const Evaluator = struct {
     /// release). Makes the release idempotent so `deinit` can share it.
     eval_released: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
+    pub const Evaluation = capability.Evaluation(Engine);
+    pub const Values = capability.Values(Engine);
+    pub const Sources = capability.Sources(Engine);
+    pub const Debugger = capability.Debugger(Engine);
+    pub const Inspection = capability.Inspection(Engine);
+    pub const Builds = capability.Builds(Engine);
+    pub const Instrumentation = capability.Instrumentation(Engine);
+
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Engine {
         // Always run at least one worker — the main evaluator thread itself
         // owns worker id 0 even when no scheduler helpers are requested.
-        const worker_count: u8 = @max(requested_worker_count, 1);
+        const worker_count: u8 = @max(config.worker_count, 1);
 
         var scheduler = try Scheduler.init(allocator, worker_count);
         errdefer scheduler.deinit();
@@ -521,10 +541,13 @@ pub const Evaluator = struct {
         var heap = try ObjectHeap.init(allocator, worker_count);
         errdefer heap.deinit();
 
-        var fetch_service = try FetchService.init(allocator, .{});
+        var fetch_config = config.fetch;
+        if (fetch_config.io == null) fetch_config.io = config.io;
+        if (fetch_config.environment == null) fetch_config.environment = config.environment;
+        var fetch_service = try FetchService.init(allocator, fetch_config);
         errdefer fetch_service.deinit();
 
-        const ev: Evaluator = .{
+        var ev: Engine = .{
             .allocator = allocator,
             .intern = intern,
             .registry = registry,
@@ -554,10 +577,40 @@ pub const Evaluator = struct {
                 .workers = gc_workers,
             },
         };
+        if (config.io) |io| ev.setFileIo(io);
+        if (config.environment) |env_map| ev.setEnvironment(env_map);
         return ev;
     }
 
-    pub fn deinit(self: *Evaluator) void {
+    pub fn evaluation(self: *Engine) Evaluation {
+        return .{ .engine = self };
+    }
+
+    pub fn values(self: *Engine) Values {
+        return .{ .engine = self };
+    }
+
+    pub fn sourceAccess(self: *Engine) Sources {
+        return .{ .engine = self };
+    }
+
+    pub fn debugging(self: *Engine) Debugger {
+        return .{ .engine = self };
+    }
+
+    pub fn inspection(self: *const Engine) Inspection {
+        return .{ .engine = self };
+    }
+
+    pub fn builds(self: *Engine) Builds {
+        return .{ .engine = self };
+    }
+
+    pub fn instrumentation(self: *Engine) Instrumentation {
+        return .{ .engine = self };
+    }
+
+    pub fn deinit(self: *Engine) void {
         self.debugger.deinit();
         self.releaseEvalState();
         owned_strings.free(self.allocator, self.pure_eval_roots);
@@ -578,7 +631,7 @@ pub const Evaluator = struct {
     /// points are valid (`StoreState`/`BuildSession` and the progress-session
     /// calls) — no evaluation, value
     /// access, or diagnostics rendering.
-    pub fn releaseEvalState(self: *Evaluator) void {
+    pub fn releaseEvalState(self: *Engine) void {
         if (self.eval_released) return;
         self.eval_released = true;
         mem_report.report(&self.heap, &self.intern, &self.registry, self.compilation.retained_arenas.items, self.collection.mem_report_mode);
@@ -631,30 +684,30 @@ pub const Evaluator = struct {
 
     /// Allocator for app-layer values whose ownership is explicitly returned
     /// to the evaluator (source descriptors, diagnostics, debug records).
-    pub fn hostAllocator(self: *const Evaluator) std.mem.Allocator {
+    pub fn hostAllocator(self: *const Engine) std.mem.Allocator {
         return self.allocator;
     }
 
-    pub fn basePath(self: *const Evaluator) ?[]const u8 {
+    pub fn basePath(self: *const Engine) ?[]const u8 {
         return self.sources.base_path;
     }
 
     /// The value of `builtins.currentSystem` (e.g. "x86_64-linux"). The CLI
     /// bakes this into flake installable lowering so the lowered expression
     /// doesn't depend on `builtins.currentSystem` (which pure eval forbids).
-    pub fn systemName(self: *const Evaluator) []const u8 {
+    pub fn systemName(self: *const Engine) []const u8 {
         _ = self;
         return runtime.builtins.hostSystemName();
     }
 
-    pub fn configureLanguage(self: *Evaluator, policy: LanguagePolicy) void {
+    pub fn configureLanguage(self: *Engine, policy: LanguagePolicy) void {
         self.policy = policy;
     }
 
     /// Enable/disable pure evaluation (see `LanguagePolicy.pure_eval`). Each
     /// call replaces the allowed-path roots; `roots` (the flake source tree(s)
     /// readable besides the store) are copied into evaluator-owned storage.
-    pub fn setPureEval(self: *Evaluator, pure: bool, roots: []const []const u8) !void {
+    pub fn setPureEval(self: *Engine, pure: bool, roots: []const []const u8) !void {
         const replacement = try owned_strings.clone(self.allocator, roots);
         owned_strings.free(self.allocator, self.pure_eval_roots);
         self.pure_eval_roots = replacement;
@@ -662,35 +715,35 @@ pub const Evaluator = struct {
         self.policy.allowed_path_roots = self.pure_eval_roots;
     }
 
-    pub fn languagePolicy(self: *const Evaluator) LanguagePolicy {
+    pub fn languagePolicy(self: *const Engine) LanguagePolicy {
         return self.policy;
     }
 
-    pub fn configureMemory(self: *Evaluator, gc_budget: ?u64, report_mode: ?[]const u8, gc_report: bool) void {
+    pub fn configureMemory(self: *Engine, gc_budget: ?u64, report_mode: ?[]const u8, gc_report: bool) void {
         self.collection.budget_bytes = gc_budget;
         self.collection.mem_report_mode = report_mode;
         self.collection.report_on = gc_report;
     }
 
-    pub fn setLazyShellsVisible(self: *Evaluator, visible: bool) void {
+    pub fn setLazyShellsVisible(self: *Engine, visible: bool) void {
         self.lazy_shells_visible = visible;
     }
 
-    pub fn setTraceFlows(self: *Evaluator, enabled: bool) void {
+    pub fn setTraceFlows(self: *Engine, enabled: bool) void {
         self.execution.scheduler.setTraceFlows(enabled);
     }
 
-    pub fn addIndirectRoot(self: *Evaluator, link_path: []const u8, target: []const u8) !void {
+    pub fn addIndirectRoot(self: *Engine, link_path: []const u8, target: []const u8) !void {
         return self.store.addIndirectRoot(link_path, target);
     }
 
-    pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {
+    pub fn getDiagnostics(self: *const Engine) []const Diagnostic {
         return self.report.diagnosticsView();
     }
 
     /// Render recorded parser/compiler diagnostics without exposing the syntax
     /// subsystem through the application facade.
-    pub fn writeDiagnostics(self: *const Evaluator, writer: *std.Io.Writer, source: []const u8, use_color: bool) !void {
+    pub fn writeDiagnostics(self: *const Engine, writer: *std.Io.Writer, source: []const u8, use_color: bool) !void {
         try diagnostic.writeAllWithOptions(writer, source, self.getDiagnostics(), .{ .color = use_color });
     }
 
@@ -698,7 +751,7 @@ pub const Evaluator = struct {
     /// diagnostics keep their compact `near` excerpt; a trace already shows
     /// the source line and should not repeat it.
     pub fn writeTraceDiagnostic(
-        _: *const Evaluator,
+        _: *const Engine,
         writer: *std.Io.Writer,
         source: []const u8,
         item: Diagnostic,
@@ -710,65 +763,65 @@ pub const Evaluator = struct {
         });
     }
 
-    pub fn getTrace(self: *const Evaluator) *const EvalTrace {
+    pub fn getTrace(self: *const Engine) *const EvalTrace {
         return self.report.traceView();
     }
 
-    pub fn setDerivationDebug(self: *Evaluator, enabled: bool) void {
+    pub fn setDerivationDebug(self: *Engine, enabled: bool) void {
         self.store.realization.setDebugEnabled(enabled);
     }
 
     /// Cap concurrent fetches (`http-connections`; 0 = unlimited).
-    pub fn setFetchConnections(self: *Evaluator, n: u32) !void {
+    pub fn setFetchConnections(self: *Engine, n: u32) !void {
         try self.sources.fetchers.setMaxConnections(n);
     }
 
     /// `download-attempts`: total tries per download before failing.
-    pub fn setDownloadAttempts(self: *Evaluator, n: u32) void {
+    pub fn setDownloadAttempts(self: *Engine, n: u32) void {
         self.sources.fetchers.setDownloadAttempts(n);
     }
 
-    pub fn setTarballTtl(self: *Evaluator, seconds: u32) void {
+    pub fn setTarballTtl(self: *Engine, seconds: u32) void {
         self.sources.fetchers.setTarballTtl(seconds);
     }
 
-    pub fn setFetchConnectTimeout(self: *Evaluator, seconds: u32) void {
+    pub fn setFetchConnectTimeout(self: *Engine, seconds: u32) void {
         self.sources.fetchers.setConnectTimeout(seconds);
     }
 
-    pub fn setStalledDownloadTimeout(self: *Evaluator, seconds: u32) void {
+    pub fn setStalledDownloadTimeout(self: *Engine, seconds: u32) void {
         self.sources.fetchers.setStalledDownloadTimeout(seconds);
     }
 
-    pub fn setDownloadSpeed(self: *Evaluator, kib_per_second: u64) void {
+    pub fn setDownloadSpeed(self: *Engine, kib_per_second: u64) void {
         self.sources.fetchers.setDownloadSpeed(kib_per_second);
     }
 
-    pub fn setSslCertFile(self: *Evaluator, path: []const u8) !void {
+    pub fn setSslCertFile(self: *Engine, path: []const u8) !void {
         try self.sources.fetchers.setSslCertFile(path);
     }
 
-    pub fn setFlakeRegistryUrl(self: *Evaluator, url: ?[]const u8) !void {
+    pub fn setFlakeRegistryUrl(self: *Engine, url: ?[]const u8) !void {
         try self.sources.fetchers.setFlakeRegistryUrl(url);
     }
 
     /// Set the fetcher's `access-tokens` (a raw `nix.conf` value), used to
     /// authenticate downloads to matching hosts. See `setup.configure`.
-    pub fn setAccessTokens(self: *Evaluator, raw: []const u8) !void {
+    pub fn setAccessTokens(self: *Engine, raw: []const u8) !void {
         try self.sources.fetchers.setAccessTokens(raw);
     }
 
     /// Set the fetcher's `netrc` credentials (raw file content) for HTTP
     /// basic-auth on plain downloads. See `setup.configure`.
-    pub fn setNetrc(self: *Evaluator, content: []const u8) !void {
+    pub fn setNetrc(self: *Engine, content: []const u8) !void {
         try self.sources.fetchers.setNetrc(content);
     }
 
-    pub fn derivationDebugRecords(self: *const Evaluator) []const derivation.DebugRecord {
+    pub fn derivationDebugRecords(self: *const Engine) []const derivation.DebugRecord {
         return self.store.realization.debugRecords();
     }
 
-    pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
+    pub fn setBasePathFromCurrentPath(self: *Engine, io: std.Io) !void {
         self.sources.files.setIo(io);
         self.sources.fetchers.setIo(io);
         self.store.realization.setIo(io);
@@ -776,7 +829,7 @@ pub const Evaluator = struct {
         self.sources.base_path = try std.process.currentPathAlloc(io, self.allocator);
     }
 
-    pub fn setFileIo(self: *Evaluator, io: std.Io) void {
+    pub fn setFileIo(self: *Engine, io: std.Io) void {
         self.sources.files.setIo(io);
         self.sources.fetchers.setIo(io);
         self.store.realization.setIo(io);
@@ -786,7 +839,7 @@ pub const Evaluator = struct {
     /// at the directory containing `file_path`, resolved against the current
     /// base path. This makes a file's relative paths resolve relative to the
     /// file, as Nix does — not the process cwd.
-    pub fn setBasePathToFileDir(self: *Evaluator, file_path: []const u8) !void {
+    pub fn setBasePathToFileDir(self: *Engine, file_path: []const u8) !void {
         const base = self.sources.base_path orelse ".";
         const abs = try std.fs.path.resolve(self.allocator, &.{ base, file_path });
         defer self.allocator.free(abs);
@@ -796,7 +849,7 @@ pub const Evaluator = struct {
         self.sources.base_path = owned;
     }
 
-    pub fn setEnvironment(self: *Evaluator, env_map: *const std.process.Environ.Map) void {
+    pub fn setEnvironment(self: *Engine, env_map: *const std.process.Environ.Map) void {
         self.sources.env_map = env_map;
         self.sources.fetchers.setEnvironment(env_map);
         // Point the fetch download-cache at `$XDG_CACHE_HOME/fix` (default
@@ -805,11 +858,11 @@ pub const Evaluator = struct {
         self.setFetchCacheRoot() catch {};
     }
 
-    pub fn environment(self: *const Evaluator) ?*const std.process.Environ.Map {
+    pub fn environment(self: *const Engine) ?*const std.process.Environ.Map {
         return self.sources.env_map;
     }
 
-    fn setFetchCacheRoot(self: *Evaluator) !void {
+    fn setFetchCacheRoot(self: *Engine) !void {
         const env = self.sources.env_map orelse return;
         const base: []const u8, const sub: []const []const u8 = blk: {
             if (env.get("XDG_CACHE_HOME")) |xdg| {
@@ -829,11 +882,11 @@ pub const Evaluator = struct {
         try self.sources.fetchers.setCacheRoot(root);
     }
 
-    pub fn setVmTrace(self: *Evaluator, vm_trace: ?*VmTrace) void {
+    pub fn setVmTrace(self: *Engine, vm_trace: ?*VmTrace) void {
         self.vm_trace = vm_trace;
     }
 
-    pub fn setThunkTrace(self: *Evaluator, thunk_trace: ?*ThunkTrace) void {
+    pub fn setThunkTrace(self: *Engine, thunk_trace: ?*ThunkTrace) void {
         // No-op when the trace is compiled out; callers don't need to
         // comptime-gate. `--thunks-log` users get a heads-up at the CLI
         // layer.
@@ -843,11 +896,11 @@ pub const Evaluator = struct {
 
     /// Construct a thunk trace bound to this evaluator's runtime state without
     /// exporting mutable heap/registry pointers to the CLI composition layer.
-    pub fn initThunkTrace(self: *Evaluator, writer: *std.Io.Writer) ThunkTrace {
+    pub fn initThunkTrace(self: *Engine, writer: *std.Io.Writer) ThunkTrace {
         return ThunkTrace.init(writer, &self.intern, &self.heap, &self.registry);
     }
 
-    pub fn setObserver(self: *Evaluator, observer: observ.Observer) void {
+    pub fn setObserver(self: *Engine, observer: observ.Observer) void {
         self.observer = observer;
         self.store.realization.setObserver(observer);
     }
@@ -855,22 +908,22 @@ pub const Evaluator = struct {
     /// Install a language-effect sink. The callback can run concurrently from
     /// independent demanded fibers and is responsible for synchronizing its
     /// destination. Primarily useful to embedding applications and tests.
-    pub fn setEffectSink(self: *Evaluator, sink: effects_mod.Sink) void {
+    pub fn setEffectSink(self: *Engine, sink: effects_mod.Sink) void {
         self.effects.setSink(sink);
     }
 
     /// Stream language effects to synchronized stderr, flushing each record.
     /// `sync_updates` wraps records in ANSI synchronized-output markers; pass
     /// true only when stderr is an interactive terminal.
-    pub fn setEffectStderr(self: *Evaluator, io: std.Io, sync_updates: bool) void {
+    pub fn setEffectStderr(self: *Engine, io: std.Io, sync_updates: bool) void {
         self.effects.setStderr(io, sync_updates);
     }
 
-    pub fn setTraceVerbose(self: *Evaluator, enabled: bool) void {
+    pub fn setTraceVerbose(self: *Engine, enabled: bool) void {
         self.trace_verbose = enabled;
     }
 
-    pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
+    pub fn setNixPath(self: *Engine, nix_path: []const u8) !void {
         try self.sources.search_paths.set(self.allocator, nix_path, self, resolveHostPath);
         for (self.sources.search_paths.entries) |*entry| {
             if (!std.mem.startsWith(u8, entry.path, "http://") and !std.mem.startsWith(u8, entry.path, "https://") and !std.mem.startsWith(u8, entry.path, "file://")) continue;
@@ -881,25 +934,25 @@ pub const Evaluator = struct {
         }
     }
 
-    pub fn readSourceFile(self: *Evaluator, path: []const u8) ![]const u8 {
+    pub fn readSourceFile(self: *Engine, path: []const u8) ![]const u8 {
         var resolved = try self.resolveHostPath(path);
         defer resolved.deinit(self.allocator);
         return self.sources.files.readFile(resolved.slice());
     }
 
     /// Resolve `<name>` through the configured NIX_PATH to an owned host path.
-    pub fn resolveLookupPath(self: *Evaluator, name: []const u8) ![]u8 {
+    pub fn resolveLookupPath(self: *Engine, name: []const u8) ![]u8 {
         return self.sources.search_paths.resolveName(self.allocator, &self.sources.files, name);
     }
 
     /// Fetch and unpack a legacy fileish tarball, returning its owned cache path.
-    pub fn fetchTarballPath(self: *Evaluator, url: []const u8) ![]u8 {
+    pub fn fetchTarballPath(self: *Engine, url: []const u8) ![]u8 {
         const result = try self.fetchTarball(url);
         if (result.nar_payload) |payload| self.allocator.free(payload.bytes);
         return result.path;
     }
 
-    fn fetchTarball(self: *Evaluator, url: []const u8) !@import("fetchers").FetchService.TarballResult {
+    fn fetchTarball(self: *Engine, url: []const u8) !@import("fetchers").FetchService.TarballResult {
         var span = self.observer.begin(&fetch_observation, .{ .subject = .{ .url = url } });
         defer span.cancel();
         const result = try self.sources.fetchers.fetchTarball(&self.sources.files, .{ .url = url, .name = "source" }, null);
@@ -907,7 +960,7 @@ pub const Evaluator = struct {
         return result;
     }
 
-    pub fn isSourceDirectory(self: *Evaluator, path: []const u8) !bool {
+    pub fn isSourceDirectory(self: *Engine, path: []const u8) !bool {
         var resolved = try self.resolveHostPath(path);
         defer resolved.deinit(self.allocator);
         return self.sources.files.isDirectoryFollowing(resolved.slice());
@@ -916,7 +969,7 @@ pub const Evaluator = struct {
     /// Fetch a flake source without evaluating its outputs. `parseFlakeRef`
     /// performs registry resolution, `fetchTree` materializes the source, and
     /// `dir` selects a nested flake before legacy fileish default.nix loading.
-    pub fn fetchFlakeSourcePath(self: *Evaluator, ref: []const u8) ![]u8 {
+    pub fn fetchFlakeSourcePath(self: *Engine, ref: []const u8) ![]u8 {
         if (!self.policy.flakes_enabled) return error.FlakesFeatureRequired;
         var escaped: std.ArrayListUnmanaged(u8) = .empty;
         defer escaped.deinit(self.allocator);
@@ -935,32 +988,32 @@ pub const Evaluator = struct {
         return self.allocator.dupe(u8, self.intern.get(value.asInternId()));
     }
 
-    fn clearDiagnostics(self: *Evaluator) void {
+    fn clearDiagnostics(self: *Engine) void {
         self.report.clear();
     }
 
-    fn copyDiagnostics(self: *Evaluator, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
+    fn copyDiagnostics(self: *Engine, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
         try self.report.replaceDiagnostics(diagnostics, source, source_path);
     }
 
     /// Parse and compile source text into a registered chunk id. Used by
     /// debugging tools that want to inspect bytecode without running it.
     pub fn compileSource(
-        self: *Evaluator,
+        self: *Engine,
         source: []const u8,
         source_path: ?[]const u8,
     ) !ChunkId {
         return self.parseAndCompile(source, self.sources.base_path, source_path, null);
     }
 
-    pub fn compileSourceAt(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !ChunkId {
+    pub fn compileSourceAt(self: *Engine, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !ChunkId {
         return self.parseAndCompile(source, base_path, source_path, null);
     }
 
     /// `compileSource` with an ambient scope attrset (see
     /// `evaluateWithScope`). The repl's VM explorer compiles expressions that
     /// reference repl bindings through this.
-    pub fn compileSourceScoped(self: *Evaluator, source: []const u8, scope: ?Value) !ChunkId {
+    pub fn compileSourceScoped(self: *Engine, source: []const u8, scope: ?Value) !ChunkId {
         return self.parseAndCompile(source, self.sources.base_path, null, scope);
     }
 
@@ -968,7 +1021,7 @@ pub const Evaluator = struct {
     /// Shared by `compileSource` (public, no eval) and `evaluateSource`
     /// (the internal eval entrypoint that runs the chunk afterwards).
     fn parseAndCompile(
-        self: *Evaluator,
+        self: *Engine,
         source: []const u8,
         base_path: ?[]const u8,
         source_path: ?[]const u8,
@@ -1090,7 +1143,7 @@ pub const Evaluator = struct {
     }
 
     fn validateParserPolicy(
-        self: *Evaluator,
+        self: *Engine,
         parser: *const parser_mod.Parser,
         source: []const u8,
         source_path: ?[]const u8,
@@ -1144,7 +1197,7 @@ pub const Evaluator = struct {
     }
 
     fn registerTopLevelChunk(
-        self: *Evaluator,
+        self: *Engine,
         chunk: bytecode.Chunk,
         compiler: *compiler_mod.Compiler,
         source_path: ?[]const u8,
@@ -1171,7 +1224,7 @@ pub const Evaluator = struct {
         return registered.id;
     }
 
-    fn retainDeferredArena(self: *Evaluator, arena: ast_mod.AstArena) void {
+    fn retainDeferredArena(self: *Engine, arena: ast_mod.AstArena) void {
         self.compilation.retained_arenas_mu.lock();
         defer self.compilation.retained_arenas_mu.unlock();
         // A failed bookkeeping allocation must leak rather than leave deferred
@@ -1180,32 +1233,32 @@ pub const Evaluator = struct {
     }
 
     /// Read-only access to compiled chunks for tools.
-    pub fn getChunk(self: *const Evaluator, id: ChunkId) ?*const bytecode.Chunk {
+    pub fn getChunk(self: *const Engine, id: ChunkId) ?*const bytecode.Chunk {
         return self.registry.get(id);
     }
 
     /// Read-only access to the intern table for tools.
-    pub fn internTable(self: *const Evaluator) *const InternTable {
+    pub fn internTable(self: *const Engine) *const InternTable {
         return &self.intern;
     }
 
     /// The `builtins` attrset, built on first use. Single-threaded callers
     /// only (the repl's completer wants it before the first evaluation).
-    pub fn builtinsValue(self: *Evaluator) !Value {
+    pub fn builtinsValue(self: *Engine) !Value {
         return self.ensureBuiltins();
     }
 
     /// Read-only access to the chunk registry for tools.
-    pub fn chunkRegistry(self: *const Evaluator) *const ChunkRegistry {
+    pub fn chunkRegistry(self: *const Engine) *const ChunkRegistry {
         return &self.registry;
     }
 
     /// Explicit diagnostic surface for CLI tooling. Runtime representation is
     /// intentionally available here, but ordinary command workflows do not get
-    /// direct mutable access to the Evaluator's heap/intern/registry fields.
-    pub const Tooling = tooling_adapter.Adapter(Evaluator);
+    /// direct mutable access to the Engine's heap/intern/registry fields.
+    pub const Tooling = tooling_adapter.Adapter(Engine);
 
-    pub fn tooling(self: *Evaluator) Tooling {
+    pub fn tooling(self: *Engine) Tooling {
         return .{ .ev = self };
     }
 
@@ -1214,7 +1267,7 @@ pub const Evaluator = struct {
     /// Replace the REPL's ambient scope and its external GC roots as one
     /// evaluator-owned operation, so the CLI cannot accidentally construct a
     /// heap object without registering the values that keep it alive.
-    pub fn replaceExternalScope(self: *Evaluator, bindings: []const ScopeBinding) !Value {
+    pub fn replaceExternalScope(self: *Engine, bindings: []const ScopeBinding) !Value {
         const entries = try self.allocator.alloc(runtime.heap.AttrEntry, bindings.len);
         defer self.allocator.free(entries);
         const roots = try self.allocator.alloc(Value, bindings.len + 1);
@@ -1234,7 +1287,7 @@ pub const Evaluator = struct {
     /// `fix disasm` and the REPL explorer to display. Off by default (hot
     /// compiles pay nothing); sidecar writes are synchronized for the REPL's
     /// parallel import compilation. Set before compiling.
-    pub fn setCaptureChunkNames(self: *Evaluator, on: bool) void {
+    pub fn setCaptureChunkNames(self: *Engine, on: bool) void {
         self.registry.capture_names = on;
     }
 
@@ -1244,7 +1297,7 @@ pub const Evaluator = struct {
     /// returns to resume. `ctx` is the UI's opaque self-pointer. The CLI owns
     /// the UI implementation (terminal I/O lives in `cli`); the engine only
     /// upcalls through this seam, so the layering stays down-only.
-    pub fn setDebugUi(self: *Evaluator, ctx: *anyopaque, run: *const fn (*anyopaque, *DebugSession) anyerror!void) void {
+    pub fn setDebugUi(self: *Engine, ctx: *anyopaque, run: *const fn (*anyopaque, *DebugSession) anyerror!void) void {
         // Interactive pauses are observable and cannot run on helper fibers.
         // Keep every debugger entry on the deterministic demand path even for
         // embedding applications that do not use the CLI's --debugger setup.
@@ -1256,7 +1309,7 @@ pub const Evaluator = struct {
     /// Breakpoint tooling is also available to the VM explorer, before a
     /// debugger UI is attached. A later `:debug`/`--debugger` session reuses
     /// the same requests and patched sites.
-    pub fn setBreakpoint(self: *Evaluator, file: []const u8, line: u32) !bytecode.BreakpointTable.SetResult {
+    pub fn setBreakpoint(self: *Engine, file: []const u8, line: u32) !bytecode.BreakpointTable.SetResult {
         self.ensureBreakpointTable();
         return self.debugger.breakpoints.?.set(&self.registry, file, line);
     }
@@ -1264,32 +1317,32 @@ pub const Evaluator = struct {
     /// Per-instruction breakpoint at an exact `(chunk_id, offset)` site.
     /// `setBreakpointSpan` handles source-span rows; line-based
     /// `setBreakpoint` stays for console requests and pending/import resolution.
-    pub fn setBreakpointAt(self: *Evaluator, chunk_id: ChunkId, offset: u32) !bytecode.BreakpointTable.SetResult {
+    pub fn setBreakpointAt(self: *Engine, chunk_id: ChunkId, offset: u32) !bytecode.BreakpointTable.SetResult {
         self.ensureBreakpointTable();
         return self.debugger.breakpoints.?.setAt(&self.registry, chunk_id, offset);
     }
 
-    pub fn deleteBreakpointAt(self: *Evaluator, chunk_id: ChunkId, offset: u32) bool {
+    pub fn deleteBreakpointAt(self: *Engine, chunk_id: ChunkId, offset: u32) bool {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.removeAt(&self.registry, chunk_id, offset);
         return false;
     }
 
-    pub fn breakpointAt(self: *const Evaluator, chunk_id: ChunkId, offset: u32) bool {
+    pub fn breakpointAt(self: *const Engine, chunk_id: ChunkId, offset: u32) bool {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.hasSite(chunk_id, offset);
         return false;
     }
 
-    pub fn setBreakpointSpan(self: *Evaluator, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) !bytecode.BreakpointTable.SetResult {
+    pub fn setBreakpointSpan(self: *Engine, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) !bytecode.BreakpointTable.SetResult {
         self.ensureBreakpointTable();
         return self.debugger.breakpoints.?.setSpan(&self.registry, chunk_id, span);
     }
 
-    pub fn deleteBreakpointSpan(self: *Evaluator, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) bool {
+    pub fn deleteBreakpointSpan(self: *Engine, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) bool {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.removeSpan(&self.registry, chunk_id, span);
         return false;
     }
 
-    pub fn breakpointSpan(self: *const Evaluator, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) bool {
+    pub fn breakpointSpan(self: *const Engine, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) bool {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.hasSpan(chunk_id, span);
         return false;
     }
@@ -1297,7 +1350,7 @@ pub const Evaluator = struct {
     /// A presentation-safe copy of chunk code with debugger trap patches
     /// replaced by their original opcodes.
     pub fn unpatchedChunkCode(
-        self: *const Evaluator,
+        self: *const Engine,
         allocator: std.mem.Allocator,
         chunk_id: ChunkId,
         chunk: *const bytecode.Chunk,
@@ -1308,30 +1361,30 @@ pub const Evaluator = struct {
         return code;
     }
 
-    pub fn listBreakpoints(self: *const Evaluator) []const bytecode.BreakpointTable.Request {
+    pub fn listBreakpoints(self: *const Engine) []const bytecode.BreakpointTable.Request {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.list();
         return &.{};
     }
 
-    pub fn deleteBreakpoint(self: *Evaluator, id: u32) bool {
+    pub fn deleteBreakpoint(self: *Engine, id: u32) bool {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.remove(&self.registry, id);
         return false;
     }
 
-    fn ensureBreakpointTable(self: *Evaluator) void {
+    fn ensureBreakpointTable(self: *Engine) void {
         if (self.debugger.breakpoints == null)
             self.debugger.breakpoints = bytecode.BreakpointTable.init(self.allocator, &self.intern);
     }
 
-    pub fn clearDebugUi(self: *Evaluator) void {
+    pub fn clearDebugUi(self: *Engine) void {
         self.debugger.clearUi();
     }
 
-    pub fn setDebugSource(self: *Evaluator, source: ?[]const u8) void {
+    pub fn setDebugSource(self: *Engine, source: ?[]const u8) void {
         self.debugger.setSource(source);
     }
 
-    pub fn setValueColor(self: *Evaluator, enabled: bool) void {
+    pub fn setValueColor(self: *Engine, enabled: bool) void {
         self.value_color = enabled;
     }
 
@@ -1339,7 +1392,7 @@ pub const Evaluator = struct {
     /// paused VM and hand it to the installed UI. Runs synchronously on the
     /// current demand fiber, so the console can re-enter the evaluator.
     fn fireBreak(ctx: *anyopaque, vm: *VM, value: Value, reason: vm_mod.BreakReason) anyerror!void {
-        const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        const self: *Engine = @ptrCast(@alignCast(ctx));
         // A break/throw raised while the console is evaluating an expression
         // must not recurse into a nested debugger.
         const ui = self.debugger.beginSession() orelse return;
@@ -1352,7 +1405,7 @@ pub const Evaluator = struct {
     /// ambient `scope` and run it on a fresh nested VM (sharing the registry,
     /// heap, and intern table). The nested VM leaves the paused VM's stack and
     /// frames untouched, so inspecting a value can't corrupt the pause point.
-    fn debugEvalScoped(self: *Evaluator, paused_vm: *VM, source: []const u8, scope: ?Value) !Value {
+    fn debugEvalScoped(self: *Engine, paused_vm: *VM, source: []const u8, scope: ?Value) !Value {
         const chunk_id = try self.compileSourceScoped(source, scope);
         return self.runWithVm(debugRunBody, .{ chunk_id, paused_vm.debug.import_replay });
     }
@@ -1362,38 +1415,38 @@ pub const Evaluator = struct {
         return vm.eval(chunk_id);
     }
 
-    pub fn heapStats(self: *const Evaluator) ObjectHeap.Stats {
+    pub fn heapStats(self: *const Engine) ObjectHeap.Stats {
         return self.heap.stats();
     }
 
-    pub fn heapCounts(self: *const Evaluator) ObjectHeap.Counts {
+    pub fn heapCounts(self: *const Engine) ObjectHeap.Counts {
         return self.heap.counts();
     }
 
-    pub fn heapObjectSnapshot(self: *const Evaluator, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
+    pub fn heapObjectSnapshot(self: *const Engine, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
         return self.heap.objectSnapshot(allocator);
     }
 
     /// Live-slot snapshots for the value/attr/attr-position stores, so the VM
     /// explorer browses only real records, not reserved backing capacity.
-    pub fn heapValueSnapshot(self: *const Evaluator, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
+    pub fn heapValueSnapshot(self: *const Engine, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
         return self.heap.valueSnapshot(allocator);
     }
 
-    pub fn heapAttrSnapshot(self: *const Evaluator, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
+    pub fn heapAttrSnapshot(self: *const Engine, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
         return self.heap.attrSnapshot(allocator);
     }
 
-    pub fn heapAttrPosSnapshot(self: *const Evaluator, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
+    pub fn heapAttrPosSnapshot(self: *const Engine, allocator: std.mem.Allocator) !ObjectHeap.ObjectSnapshot {
         return self.heap.attrPosSnapshot(allocator);
     }
 
-    pub fn inspectHeapObject(self: *const Evaluator, snapshot: *const ObjectHeap.ObjectSnapshot, id: runtime.types.ObjectId) !runtime.heap.ObjectInfo {
+    pub fn inspectHeapObject(self: *const Engine, snapshot: *const ObjectHeap.ObjectSnapshot, id: runtime.types.ObjectId) !runtime.heap.ObjectInfo {
         return self.heap.inspectObject(snapshot, id);
     }
 
     pub fn collectHeapObjectReferences(
-        self: *const Evaluator,
+        self: *const Engine,
         snapshot: *const ObjectHeap.ObjectSnapshot,
         id: runtime.types.ObjectId,
         allocator: std.mem.Allocator,
@@ -1404,84 +1457,84 @@ pub const Evaluator = struct {
 
     /// Per-record access to the value/attr/attr-position stores, for the VM
     /// explorer's heap-store browsing.
-    pub fn heapValueAt(self: *const Evaluator, id: u32) ?*const runtime.value.Value {
+    pub fn heapValueAt(self: *const Engine, id: u32) ?*const runtime.value.Value {
         return self.heap.valueAt(id);
     }
 
-    pub fn heapAttrAt(self: *const Evaluator, id: u32) ?*const runtime.heap.AttrEntry {
+    pub fn heapAttrAt(self: *const Engine, id: u32) ?*const runtime.heap.AttrEntry {
         return self.heap.attrAt(id);
     }
 
-    pub fn heapAttrPosAt(self: *const Evaluator, id: u32) ?*const runtime.heap.AttrPosEntry {
+    pub fn heapAttrPosAt(self: *const Engine, id: u32) ?*const runtime.heap.AttrPosEntry {
         return self.heap.attrPosAt(id);
     }
 
-    pub fn valueRef(_: *const Evaluator, value: Value) runtime.heap.ValueRef {
+    pub fn valueRef(_: *const Engine, value: Value) runtime.heap.ValueRef {
         return ObjectHeap.inspectValue(value);
     }
 
     /// Enumerate an attrs / list object's members (non-forcing) for the VM
     /// explorer, so a container value inspects into its actual entries.
-    pub fn heapAttrsOf(self: *Evaluator, id: runtime.types.ObjectId) ![]const runtime.heap.AttrEntry {
+    pub fn heapAttrsOf(self: *Engine, id: runtime.types.ObjectId) ![]const runtime.heap.AttrEntry {
         return self.heap.getAttrs(id);
     }
 
-    pub fn heapListOf(self: *const Evaluator, id: runtime.types.ObjectId) ![]const Value {
+    pub fn heapListOf(self: *const Engine, id: runtime.types.ObjectId) ![]const Value {
         return self.heap.getList(id);
     }
 
-    pub fn heapBoxedInt(self: *const Evaluator, id: runtime.types.ObjectId) !i64 {
+    pub fn heapBoxedInt(self: *const Engine, id: runtime.types.ObjectId) !i64 {
         return self.heap.getBoxedInt(id);
     }
 
-    pub fn internStats(self: *const Evaluator) InternTable.Stats {
+    pub fn internStats(self: *const Engine) InternTable.Stats {
         return self.intern.stats();
     }
 
-    pub fn chunkStats(self: *const Evaluator) ChunkRegistry.Stats {
+    pub fn chunkStats(self: *const Engine) ChunkRegistry.Stats {
         return self.registry.stats();
     }
 
-    pub fn schedulerStats(self: *const Evaluator) Scheduler.Stats {
+    pub fn schedulerStats(self: *const Engine) Scheduler.Stats {
         return self.execution.scheduler.stats();
     }
 
-    pub fn deferredStats(self: *const Evaluator) deferred_mod.Table.Stats {
+    pub fn deferredStats(self: *const Engine) deferred_mod.Table.Stats {
         return self.compilation.deferred_table.stats();
     }
 
-    pub fn workerCount(self: *const Evaluator) u8 {
+    pub fn workerCount(self: *const Engine) u8 {
         return self.execution.scheduler.worker_count;
     }
 
-    pub fn setParallelismToggles(self: *Evaluator, disable_speculation: bool, disable_fanout: bool) void {
+    pub fn setParallelismToggles(self: *Engine, disable_speculation: bool, disable_fanout: bool) void {
         var config = self.execution.scheduler.configuration();
         config.disable_speculation = disable_speculation;
         config.disable_fanout = disable_fanout;
         self.execution.scheduler.configure(config);
     }
 
-    pub fn setDebugSerial(self: *Evaluator, enabled: bool) void {
+    pub fn setDebugSerial(self: *Engine, enabled: bool) void {
         self.execution.scheduler.setDebugSerial(enabled);
     }
 
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
-    pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
+    pub fn evaluate(self: *Engine, source: []const u8) !Value {
         return self.evaluateTop(source, self.sources.base_path, null, null);
     }
 
     /// `evaluate`, attributing the top-level source to `source_path` — source
     /// spans and the disasm file sidecar then carry the entry file's name, the
     /// same way imported files do. Used by `fix disasm --eval`.
-    pub fn evaluatePath(self: *Evaluator, source: []const u8, source_path: ?[]const u8) !Value {
+    pub fn evaluatePath(self: *Engine, source: []const u8, source_path: ?[]const u8) !Value {
         return self.evaluateTop(source, self.sources.base_path, source_path, null);
     }
 
     /// `evaluatePath` with an explicit relative-path base. Multi-input CLI
     /// builds use this so each file keeps its own directory while sharing one
     /// evaluator.
-    pub fn evaluatePathAt(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !Value {
+    pub fn evaluatePathAt(self: *Engine, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !Value {
         return self.evaluateTop(source, base_path, source_path, null);
     }
 
@@ -1491,30 +1544,30 @@ pub const Evaluator = struct {
     /// make its bindings visible. When a source may reference those bindings,
     /// `scope` is baked into the compiled chunk's constants, which are GC
     /// roots; builtin/literal-only sources omit the unused scope.
-    pub fn evaluateWithScope(self: *Evaluator, source: []const u8, scope: ?Value) !Value {
+    pub fn evaluateWithScope(self: *Engine, source: []const u8, scope: ?Value) !Value {
         return self.evaluateTop(source, self.sources.base_path, null, scope);
     }
 
     /// `evaluateWithScope`, retaining the compiled entry chunk for tooling.
-    pub fn evaluateWithScopeResult(self: *Evaluator, source: []const u8, scope: ?Value) !EvaluationResult {
+    pub fn evaluateWithScopeResult(self: *Engine, source: []const u8, scope: ?Value) !EvaluationResult {
         return self.evaluateTopResult(source, self.sources.base_path, null, scope, false);
     }
 
     /// Evaluate REPL source with a one-shot debugger pause at its first mapped
     /// instruction. The source is compiled unchanged; the UI must already be
     /// installed so the entry trap has somewhere to route.
-    pub fn debugWithScopeResult(self: *Evaluator, source: []const u8, scope: ?Value) !EvaluationResult {
+    pub fn debugWithScopeResult(self: *Engine, source: []const u8, scope: ?Value) !EvaluationResult {
         const was_debug_serial = self.execution.scheduler.swapDebugSerial(true);
         defer self.execution.scheduler.setDebugSerial(was_debug_serial);
         return self.evaluateTopResult(source, self.sources.base_path, null, scope, true);
     }
 
-    fn evaluateTop(self: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value) !Value {
+    fn evaluateTop(self: *Engine, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8, scope: ?Value) !Value {
         return (try self.evaluateTopResult(source, base_path, source_path, scope, false)).value;
     }
 
     fn evaluateTopResult(
-        self: *Evaluator,
+        self: *Engine,
         source: []const u8,
         base_path: ?[]const u8,
         source_path: ?[]const u8,
@@ -1550,7 +1603,7 @@ pub const Evaluator = struct {
         return .{ .value = value, .entry_chunk = chunk_id };
     }
 
-    fn prepareEvaluations(self: *Evaluator) !void {
+    fn prepareEvaluations(self: *Engine) !void {
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only
@@ -1593,7 +1646,7 @@ pub const Evaluator = struct {
     /// Compile several independent inputs, then evaluate each on its own demand
     /// fiber. `sink` is called exactly once per input, from that demand fiber
     /// for runtime outcomes and from the caller for compile/setup failures.
-    pub fn evaluatePathsParallel(self: *Evaluator, inputs: []const ParallelInput, sink: ParallelSink) void {
+    pub fn evaluatePathsParallel(self: *Engine, inputs: []const ParallelInput, sink: ParallelSink) void {
         if (inputs.len == 0) return;
         self.prepareEvaluations() catch |err| {
             for (inputs, 0..) |_, index| sink.complete(index, null, .{ .err = err, .trace = self.getTrace() });
@@ -1601,7 +1654,7 @@ pub const Evaluator = struct {
         };
 
         const Context = struct {
-            ev: *Evaluator,
+            ev: *Engine,
             sink: ParallelSink,
             index: usize,
             chunk_id: ChunkId,
@@ -1685,7 +1738,7 @@ pub const Evaluator = struct {
     }
 
     pub fn evaluateSource(
-        self: *Evaluator,
+        self: *Engine,
         source: []const u8,
         base_path: ?[]const u8,
         source_path: ?[]const u8,
@@ -1743,7 +1796,7 @@ pub const Evaluator = struct {
         return value;
     }
 
-    fn runChunkOnMainWorker(self: *Evaluator, chunk_id: ChunkId) !Value {
+    fn runChunkOnMainWorker(self: *Engine, chunk_id: ChunkId) !Value {
         return self.runWithVm(VM.eval, .{chunk_id});
     }
 
@@ -1751,7 +1804,7 @@ pub const Evaluator = struct {
     /// fiber is recycled) or per-import (freed when the import returns).
     /// It must be an arena: VM frees are best-effort, error and suspend paths
     /// may abandon allocations, and reset/deinit reclaims them wholesale.
-    fn initVm(self: *Evaluator, worker_id: u8, scratch: std.mem.Allocator) !VM {
+    fn initVm(self: *Engine, worker_id: u8, scratch: std.mem.Allocator) !VM {
         // RSS attribution: the VM's own allocations (gc lists; the
         // stack/frames go through the shared pool) get the worker bucket.
         const prev_tag = vma_mod.setAllocTag(.worker_arena);
@@ -1814,7 +1867,7 @@ pub const Evaluator = struct {
         return vm;
     }
 
-    pub fn writeJsonValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+    pub fn writeJsonValue(self: *Engine, writer: *std.Io.Writer, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
         self.report.trace.clear();
@@ -1825,7 +1878,7 @@ pub const Evaluator = struct {
     /// Legacy `nix-instantiate --eval --raw` rendering: coerce exactly as a
     /// Nix string interpolation would (strings, paths, `outPath`,
     /// `__toString`; never integers), then emit the bytes verbatim.
-    pub fn writeRawValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+    pub fn writeRawValue(self: *Engine, writer: *std.Io.Writer, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
         self.report.trace.clear();
@@ -1833,7 +1886,7 @@ pub const Evaluator = struct {
         observation.finish(.{});
     }
 
-    pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+    pub fn writeXmlValue(self: *Engine, writer: *std.Io.Writer, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
         self.report.trace.clear();
@@ -1841,31 +1894,31 @@ pub const Evaluator = struct {
         observation.finish(.{});
     }
 
-    pub fn forceValue(self: *Evaluator, value: Value) !Value {
+    pub fn forceValue(self: *Engine, value: Value) !Value {
         self.report.trace.clear();
         return self.forceValueUntraced(value);
     }
 
-    fn forceValueUntraced(self: *Evaluator, value: Value) !Value {
+    fn forceValueUntraced(self: *Engine, value: Value) !Value {
         return self.runWithVm(vm_force.forceValue, .{value});
     }
 
     /// Enable writing forced derivations + their sources to the store as they
     /// are forced (`fix instantiate`/`build`). The daemon connects lazily on
     /// first use; plain eval leaves this off and never touches the store.
-    pub fn enableStoreWrites(self: *Evaluator) void {
+    pub fn enableStoreWrites(self: *Engine) void {
         self.store.realization.enableStoreWrites();
     }
 
     /// Legacy `nix-instantiate --eval --read-write-mode`: materialize every
     /// derivation actually demanded by evaluation, while the CLI still renders
     /// the evaluated value rather than returning a `.drv` path.
-    pub fn enableReadWriteEvaluation(self: *Evaluator) void {
+    pub fn enableReadWriteEvaluation(self: *Engine) void {
         self.store.realization.enableEagerEvaluationWrites();
     }
 
     /// The last daemon error message, for surfacing `error.DaemonError`.
-    pub fn lastStoreError(self: *Evaluator) ?[]const u8 {
+    pub fn lastStoreError(self: *Engine) ?[]const u8 {
         return self.store.realization.lastStoreError();
     }
 
@@ -1873,19 +1926,19 @@ pub const Evaluator = struct {
     /// also instantiates its closure when a daemon is attached — and return the
     /// drv path (borrowed from the intern table). Returns null if `value` is not
     /// a derivation-shaped attrset.
-    pub fn derivationDrvPath(self: *Evaluator, value: Value) !?[]const u8 {
+    pub fn derivationDrvPath(self: *Engine, value: Value) !?[]const u8 {
         self.report.trace.clear();
         return self.derivationAttrPath(value, "drvPath");
     }
 
     /// The default output path (`outPath`) of a derivation `value`, or null if
     /// it is not a derivation-shaped attrset.
-    pub fn derivationOutPath(self: *Evaluator, value: Value) !?[]const u8 {
+    pub fn derivationOutPath(self: *Engine, value: Value) !?[]const u8 {
         self.report.trace.clear();
         return self.derivationAttrPath(value, "outPath");
     }
 
-    fn derivationAttrPath(self: *Evaluator, value: Value, attr_name: []const u8) !?[]const u8 {
+    fn derivationAttrPath(self: *Engine, value: Value, attr_name: []const u8) !?[]const u8 {
         const forced = try self.forceValueUntraced(value);
         if (!forced.isAttrs()) return null;
         return self.forcedStringAttr(forced.asObjectId(), attr_name);
@@ -1898,7 +1951,7 @@ pub const Evaluator = struct {
 
     /// Extract the paths needed by the parallel build pipeline without touching
     /// the evaluator's single-run diagnostic trace.
-    pub fn derivationBuildPaths(self: *Evaluator, value: Value) !?DerivationBuildPaths {
+    pub fn derivationBuildPaths(self: *Engine, value: Value) !?DerivationBuildPaths {
         const forced = try self.forceValueUntraced(value);
         if (!forced.isAttrs()) return null;
         const id = forced.asObjectId();
@@ -1911,7 +1964,7 @@ pub const Evaluator = struct {
 
     /// The name of the program `fix run` should exec from a derivation's output:
     /// `meta.mainProgram`, else `pname`, else `name`. Borrowed from intern.
-    pub fn derivationProgram(self: *Evaluator, value: Value) !?[]const u8 {
+    pub fn derivationProgram(self: *Engine, value: Value) !?[]const u8 {
         const forced = try self.forceValue(value);
         if (!forced.isAttrs()) return null;
         const id = forced.asObjectId();
@@ -1935,7 +1988,7 @@ pub const Evaluator = struct {
     /// If `value` is a flake app (`{ type = "app"; program = …; }`), return its
     /// program path and (from the program's string context) the derivation to
     /// build before running it. Null when `value` is not an app.
-    pub fn appProgram(self: *Evaluator, value: Value) !?AppProgram {
+    pub fn appProgram(self: *Engine, value: Value) !?AppProgram {
         const forced = try self.forceValueUntraced(value);
         if (!forced.isAttrs()) return null;
         const id = forced.asObjectId();
@@ -1963,7 +2016,7 @@ pub const Evaluator = struct {
 
     /// Force attribute `name` of `id` and return its text (string/path/context),
     /// or null if absent or non-string. Borrowed from the intern table.
-    fn forcedStringAttr(self: *Evaluator, id: types.ObjectId, name: []const u8) !?[]const u8 {
+    fn forcedStringAttr(self: *Engine, id: types.ObjectId, name: []const u8) !?[]const u8 {
         const name_id = try self.intern.intern(name);
         const attr = (try self.heap.getAttrValueOpt(id, name_id)) orelse return null;
         const forced = try self.forceValueUntraced(attr);
@@ -1979,26 +2032,26 @@ pub const Evaluator = struct {
     /// the recipe graph). Since forcing only records recipes, this is how a `.drv`
     /// is materialized — for `instantiate`, and before a build. Must run before
     /// eval state is released (it reads the recipe graph).
-    pub fn ensureDerivationClosure(self: *Evaluator, drv_path: []const u8) !void {
+    pub fn ensureDerivationClosure(self: *Engine, drv_path: []const u8) !void {
         return self.store.realization.ensureClosure(drv_path);
     }
 
     /// Hash-modulo resolver over the recorded input derivations — for computing
     /// the paths of a derivation constructed on the fly (e.g. a get-env drv).
-    pub fn storeResolver(self: *Evaluator) derivation.HashModuloResolver {
+    pub fn storeResolver(self: *Engine) derivation.HashModuloResolver {
         return self.store.realization.resolver();
     }
 
     /// Write a constructed `.drv` (ATerm) to the store. Its references (input
     /// `.drv`s / srcs) must already be valid.
-    pub fn instantiateDrv(self: *Evaluator, drv_path: []const u8, aterm: []const u8, references: []const []const u8) !void {
+    pub fn instantiateDrv(self: *Engine, drv_path: []const u8, aterm: []const u8, references: []const []const u8) !void {
         return self.store.realization.instantiateDrv(drv_path, aterm, references);
     }
 
     /// Read a store path's file contents: straight off local disk when the store
     /// is local, else via the daemon (`NarFromPath`) for a remote store. Used to
     /// read a get-env derivation's `$out` back regardless of store location.
-    pub fn readStorePathFile(self: *Evaluator, io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    pub fn readStorePathFile(self: *Engine, io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 << 20))) |data| {
             return data;
         } else |err| switch (err) {
@@ -2010,7 +2063,7 @@ pub const Evaluator = struct {
 
     /// Read a store path's contents via the daemon (`NarFromPath`), bypassing the
     /// local disk. For a remote store, and a test hook for the read path.
-    pub fn readFileViaDaemon(self: *Evaluator, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    pub fn readFileViaDaemon(self: *Engine, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         return self.store.realization.readFileViaDaemon(allocator, path);
     }
 
@@ -2018,14 +2071,14 @@ pub const Evaluator = struct {
 
     /// Submit a fully materialized derivation to the daemon pool without
     /// waiting for its build to finish.
-    pub fn submitBuild(self: *Evaluator, request: *AsyncBuildRequest) void {
+    pub fn submitBuild(self: *Engine, request: *AsyncBuildRequest) void {
         self.store.submitBuild(request);
     }
 
     /// Finish evaluation and return the only state needed by the build phase.
     /// Language teardown overlaps daemon work once the returned session starts
     /// a build; callers must keep the session alive until that work completes.
-    pub fn beginBuildPhase(self: *Evaluator, derived_paths: []const []const u8, after_release: ?ReleaseAction) !BuildSession {
+    pub fn beginBuildPhase(self: *Engine, derived_paths: []const []const u8, after_release: ?ReleaseAction) !BuildSession {
         // Writes are demand-driven: materialize each target's `.drv` closure now,
         // BEFORE releasing eval state — `ensureClosure` walks the recipe graph,
         // which `releaseEvalState` frees. (Cheap, and inherently sequential: the
@@ -2045,28 +2098,28 @@ pub const Evaluator = struct {
 
     /// Set the per-connection daemon settings (`--cores`/`--max-jobs`/… via
     /// `set_options`) applied when the store connects. See `setup.configure`.
-    pub fn setDaemonBuildSettings(self: *Evaluator, settings: store_domain.daemon.BuildSettings) !void {
+    pub fn setDaemonBuildSettings(self: *Engine, settings: store_domain.daemon.BuildSettings) !void {
         return self.store.realization.setBuildSettings(settings);
     }
 
     /// Override the nix-daemon socket path (`$NIX_DAEMON_SOCKET_PATH`).
-    pub fn setDaemonSocket(self: *Evaluator, path: []const u8) !void {
+    pub fn setDaemonSocket(self: *Engine, path: []const u8) !void {
         return self.store.realization.setDaemonSocket(path);
     }
 
     /// Override the store directory (`store-dir` / `NIX_STORE_DIR`). Threads
     /// into path computation, store-path detection, and `builtins.storeDir`.
-    pub fn setStoreDir(self: *Evaluator, dir: []const u8) !void {
+    pub fn setStoreDir(self: *Engine, dir: []const u8) !void {
         return self.store.realization.setStoreDir(dir);
     }
 
-    pub fn storeDir(self: *const Evaluator) []const u8 {
+    pub fn storeDir(self: *const Engine) []const u8 {
         return self.store.realization.store_dir;
     }
 
     /// Navigate a dotted attr path (e.g. `python3Packages.requests`) from `value`,
     /// forcing each step. Returns null if any component is missing or non-attrs.
-    pub fn attrPathValue(self: *Evaluator, value: Value, path: []const u8) !?Value {
+    pub fn attrPathValue(self: *Engine, value: Value, path: []const u8) !?Value {
         var current = try self.forceValue(value);
         var it = std.mem.splitScalar(u8, path, '.');
         while (it.next()) |component| {
@@ -2081,7 +2134,7 @@ pub const Evaluator = struct {
     /// The sorted attribute names of `value` (owned outer slice; the names are
     /// borrowed from the intern table). Null when `value` is not an attrset.
     /// Used by the `flake` subcommands to walk a flake's outputs/inputs.
-    pub fn attrNames(self: *Evaluator, allocator: std.mem.Allocator, value: Value) !?[][]const u8 {
+    pub fn attrNames(self: *Engine, allocator: std.mem.Allocator, value: Value) !?[][]const u8 {
         const forced = try self.forceValue(value);
         if (!forced.isAttrs()) return null;
         const attrs = try self.heap.getAttrs(forced.asObjectId());
@@ -2097,14 +2150,14 @@ pub const Evaluator = struct {
 
     /// Force `value` and return its attribute `name` (unforced), or null if
     /// `value` is not an attrset or has no such attribute.
-    pub fn getAttr(self: *Evaluator, value: Value, name: []const u8) !?Value {
+    pub fn getAttr(self: *Engine, value: Value, name: []const u8) !?Value {
         const forced = try self.forceValue(value);
         if (!forced.isAttrs()) return null;
         return self.heap.getAttrValueOpt(forced.asObjectId(), try self.intern.intern(name));
     }
 
     /// The text of string attribute `name` on `value`, or null. Borrowed.
-    pub fn stringAttr(self: *Evaluator, value: Value, name: []const u8) !?[]const u8 {
+    pub fn stringAttr(self: *Engine, value: Value, name: []const u8) !?[]const u8 {
         const forced = try self.forceValue(value);
         if (!forced.isAttrs()) return null;
         return self.forcedStringAttr(forced.asObjectId(), name);
@@ -2112,7 +2165,7 @@ pub const Evaluator = struct {
 
     /// The text of `value` if it is a string/path (following string context),
     /// or null otherwise. Borrowed from the intern table.
-    pub fn stringValue(self: *Evaluator, value: Value) !?[]const u8 {
+    pub fn stringValue(self: *Engine, value: Value) !?[]const u8 {
         const forced = try self.forceValue(value);
         return switch (forced.kind()) {
             .string, .path => self.intern.get(forced.asInternId()),
@@ -2122,7 +2175,7 @@ pub const Evaluator = struct {
     }
 
     /// The value of integer attribute `name` on `value`, or null.
-    pub fn intAttr(self: *Evaluator, value: Value, name: []const u8) !?i64 {
+    pub fn intAttr(self: *Engine, value: Value, name: []const u8) !?i64 {
         const attr = (try self.getAttr(value, name)) orelse return null;
         const forced = try self.forceValue(attr);
         return if (forced.isInt()) forced.asInt() else null;
@@ -2132,12 +2185,12 @@ pub const Evaluator = struct {
     /// (`fix flake update`/`lock`) — no `outputs` evaluation. `update_all`
     /// re-pins every input; otherwise only `update_names` (and newly-declared
     /// inputs) are re-fetched and the rest keep their current pins.
-    pub fn updateFlakeLock(self: *Evaluator, ref: []const u8, update_all: bool, update_names: []const []const u8) !void {
+    pub fn updateFlakeLock(self: *Engine, ref: []const u8, update_all: bool, update_names: []const []const u8) !void {
         if (!self.policy.flakes_enabled) return error.FlakesFeatureRequired;
         return self.runWithVm(vm_builtins.computeFlakeLock, .{ ref, update_all, update_names });
     }
 
-    pub fn forceDeep(self: *Evaluator, value: Value) !void {
+    pub fn forceDeep(self: *Engine, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "strict result" } });
         defer observation.cancel();
         self.report.trace.clear();
@@ -2145,14 +2198,14 @@ pub const Evaluator = struct {
         observation.finish(.{});
     }
 
-    /// Run `body(vm, args...)` on this Evaluator's main worker. If we're
+    /// Run `body(vm, args...)` on this Engine's main worker. If we're
     /// already inside a fiber (nested call from inside an evaluation),
     /// reuse the surrounding fiber's claim identity via a fresh VM. If
     /// we're on a bare OS thread, spin up a one-shot main Worker so the
     /// body's `.busy` thunks yield through the standard fiber machinery
     /// instead of blocking the thread. The body's payload type is
     /// inferred from its return signature; void payloads work too.
-    fn runWithVm(self: *Evaluator, comptime body: anytype, args: anytype) !ReturnPayload(@TypeOf(body)) {
+    fn runWithVm(self: *Engine, comptime body: anytype, args: anytype) !ReturnPayload(@TypeOf(body)) {
         if (fiber_mod.currentFiber() != null) {
             var scratch = @import("base").arena.ArenaAllocator.init(self.allocator);
             defer scratch.deinit();
@@ -2165,7 +2218,7 @@ pub const Evaluator = struct {
         const Args = @TypeOf(args);
         const Ret = ReturnPayload(@TypeOf(body));
         const Ctx = struct {
-            ev: *Evaluator,
+            ev: *Engine,
             body_args: Args,
             result: Ret = undefined,
             err: ?anyerror = null,
@@ -2195,7 +2248,7 @@ pub const Evaluator = struct {
         return ctx.result;
     }
 
-    fn ensureMainWorker(self: *Evaluator) !*worker_mod.Worker {
+    fn ensureMainWorker(self: *Engine) !*worker_mod.Worker {
         if (self.execution.main_worker) |w| return w;
         const w = try worker_mod.Worker.init(
             self.allocator,
@@ -2250,14 +2303,14 @@ pub const Evaluator = struct {
     }
 
     fn gcCollect(ctx: *anyopaque, collector_id: u8) void {
-        const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        const self: *Engine = @ptrCast(@alignCast(ctx));
         gc_controller.collect(gcContext(self), collector_id);
     }
 
     /// Replace the caller-held external root set (see
     /// `collection.extra_roots`). The repl passes its scope attrset + loose values
     /// here whenever they change; they stay rooted until replaced.
-    pub fn gcSetExternalRoots(self: *Evaluator, roots: []const Value) !void {
+    pub fn gcSetExternalRoots(self: *Engine, roots: []const Value) !void {
         self.collection.extra_roots.clearRetainingCapacity();
         try self.collection.extra_roots.appendSlice(self.allocator, roots);
     }
@@ -2276,7 +2329,7 @@ pub const Evaluator = struct {
         capacity_bytes: u64,
     };
 
-    fn collectNowResult(self: *Evaluator) CollectNowResult {
+    fn collectNowResult(self: *Engine) CollectNowResult {
         return .{
             .ran = false,
             .collections = 0,
@@ -2286,7 +2339,7 @@ pub const Evaluator = struct {
         };
     }
 
-    fn finishCollectNow(self: *Evaluator, result: *CollectNowResult, before: gc.LiveReport) void {
+    fn finishCollectNow(self: *Engine, result: *CollectNowResult, before: gc.LiveReport) void {
         const after = gc.liveReport(&self.heap.collection.report);
         result.ran = true;
         result.collections = after.collections -| before.collections;
@@ -2304,7 +2357,7 @@ pub const Evaluator = struct {
     ///
     /// Callable only between evaluations (no fiber may be mid-flight on the
     /// calling thread); helpers park at their safepoints as in any STW.
-    pub fn collectNow(self: *Evaluator) CollectNowResult {
+    pub fn collectNow(self: *Engine) CollectNowResult {
         var result = self.collectNowResult();
         // No hook yet (nothing evaluated) or reclaim disabled by policy
         // (threshold never armed): nothing to do.
@@ -2333,7 +2386,7 @@ pub const Evaluator = struct {
     /// minor only reclaims the young survivors, so under parallel workers, where
     /// more objects tenure, repl memory would otherwise ratchet up). Same STW
     /// dance + cache-invalidating token bump as `collectNow`.
-    pub fn collectMajorNow(self: *Evaluator) CollectNowResult {
+    pub fn collectMajorNow(self: *Engine) CollectNowResult {
         var result = self.collectNowResult();
         if (self.execution.main_worker == null) return result;
         if (self.heap.collection.threshold_bytes == std.math.maxInt(u64)) return result;
@@ -2348,28 +2401,28 @@ pub const Evaluator = struct {
     }
 
     fn gcHelpMark(ctx: *anyopaque, worker_id: u8) void {
-        const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        const self: *Engine = @ptrCast(@alignCast(ctx));
         gc_controller.helpMark(gcContext(self), worker_id);
     }
 
     fn importValue(context: *anyopaque, caller: *VM, path: []const u8, parent_depth: u32) anyerror!Value {
-        const self: *Evaluator = @ptrCast(@alignCast(context));
+        const self: *Engine = @ptrCast(@alignCast(context));
         return self.importPath(path, parent_depth, caller);
     }
 
-    fn importPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) !Value {
+    fn importPath(self: *Engine, path: []const u8, parent_depth: u32, debug_parent: *VM) !Value {
         var resolved = try self.resolveHostPath(path);
         defer resolved.deinit(self.allocator);
         return self.importResolvedPath(resolved.slice(), parent_depth, debug_parent);
     }
 
-    fn importResolvedPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
+    fn importResolvedPath(self: *Engine, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
         const entry = try self.sources.imports.lookupOrCreate(self.allocator, path, debug_parent.debug.import_replay);
         return self.forceImportEntry(path, entry, parent_depth, debug_parent);
     }
 
     fn forceImportEntry(
-        self: *Evaluator,
+        self: *Engine,
         path: []const u8,
         entry: *imports_mod.ImportEntry,
         parent_depth: u32,
@@ -2424,7 +2477,7 @@ pub const Evaluator = struct {
         }
     }
 
-    fn publishImportFailure(self: *Evaluator, entry: *imports_mod.ImportEntry, err: anyerror) void {
+    fn publishImportFailure(self: *Engine, entry: *imports_mod.ImportEntry, err: anyerror) void {
         switch (err) {
             error.OutOfMemory, error.StackOverflow, error.SpeculativeBail => {
                 entry.effect_group = 0;
@@ -2443,7 +2496,7 @@ pub const Evaluator = struct {
         entry.future.publishErrored();
     }
 
-    fn compileImportPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
+    fn compileImportPath(self: *Engine, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
 
@@ -2467,7 +2520,7 @@ pub const Evaluator = struct {
     /// chunk selected for a compiled body here, after registry mutation has
     /// completed. Import discovery and debugger patching are evaluator
     /// orchestration, not hidden side effects of `ChunkRegistry.register`.
-    fn chunkRegistered(self: *Evaluator, chunk_id: ChunkId) void {
+    fn chunkRegistered(self: *Engine, chunk_id: ChunkId) void {
         const chunk = self.registry.get(chunk_id) orelse return;
         for (chunk.constants) |value| {
             if (value.isPath()) prefetchPathConst(self, value.asInternId());
@@ -2484,7 +2537,7 @@ pub const Evaluator = struct {
     /// because directory constants are not necessarily imports, dedups per
     /// intern id, spends the submission
     /// budget, and hands the path to the spec lane.
-    fn prefetchPathConst(self: *Evaluator, path_id: types.InternId) void {
+    fn prefetchPathConst(self: *Engine, path_id: types.InternId) void {
         const text = self.intern.get(path_id);
         if (!std.mem.endsWith(u8, text, ".nix")) return;
         {
@@ -2499,18 +2552,18 @@ pub const Evaluator = struct {
     }
 
     fn scopedImportValue(context: *anyopaque, caller: *VM, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
-        const self: *Evaluator = @ptrCast(@alignCast(context));
+        const self: *Engine = @ptrCast(@alignCast(context));
         return self.scopedImportPath(scope, path, parent_depth, caller);
     }
 
-    fn scopedImportPath(self: *Evaluator, scope: Value, path: []const u8, parent_depth: u32, debug_parent: *VM) !Value {
+    fn scopedImportPath(self: *Engine, scope: Value, path: []const u8, parent_depth: u32, debug_parent: *VM) !Value {
         var resolved = try self.resolveHostPath(path);
         defer resolved.deinit(self.allocator);
         return self.scopedImportResolvedPath(scope, resolved.slice(), parent_depth, debug_parent);
     }
 
     fn scopedImportResolvedPath(
-        self: *Evaluator,
+        self: *Engine,
         scope: Value,
         path: []const u8,
         parent_depth: u32,
@@ -2544,14 +2597,14 @@ pub const Evaluator = struct {
         return value;
     }
 
-    fn importDirectory(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
+    fn importDirectory(self: *Engine, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
         const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
         defer self.allocator.free(default_path);
         return self.importResolvedPath(default_path, parent_depth, debug_parent);
     }
 
     fn scopedImportDirectory(
-        self: *Evaluator,
+        self: *Engine,
         scope: Value,
         path: []const u8,
         parent_depth: u32,
@@ -2563,21 +2616,21 @@ pub const Evaluator = struct {
     }
 
     fn findFile(context: *anyopaque, name: []const u8) anyerror!Value {
-        const self: *Evaluator = @ptrCast(@alignCast(context));
+        const self: *Engine = @ptrCast(@alignCast(context));
         return self.findFileInDefaultSearchPath(name);
     }
 
     fn getEnv(context: *anyopaque, name: []const u8) anyerror![]const u8 {
-        const self: *Evaluator = @ptrCast(@alignCast(context));
+        const self: *Engine = @ptrCast(@alignCast(context));
         const env_map = self.sources.env_map orelse return "";
         return env_map.get(name) orelse "";
     }
 
-    fn findFileInDefaultSearchPath(self: *Evaluator, name: []const u8) !Value {
+    fn findFileInDefaultSearchPath(self: *Engine, name: []const u8) !Value {
         return self.sources.search_paths.findFile(self.allocator, &self.sources.files, &self.intern, name);
     }
 
-    fn ensureBuiltins(self: *Evaluator) !Value {
+    fn ensureBuiltins(self: *Engine) !Value {
         if (self.builtins_value) |value| return value;
         // Create the shared `[]`/`{}` singletons as the heap's first objects,
         // before builtins allocate and before any worker arms the GC — so they
@@ -2590,7 +2643,7 @@ pub const Evaluator = struct {
         return value;
     }
 
-    pub fn resolveHostPath(self: *Evaluator, path: []const u8) !search_path_mod.ResolvedPath {
+    pub fn resolveHostPath(self: *Engine, path: []const u8) !search_path_mod.ResolvedPath {
         if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or std.mem.startsWith(u8, path, "file://"))
             return .{ .borrowed = path };
         if (std.fs.path.isAbsolute(path)) return .{ .borrowed = path };
@@ -2599,7 +2652,7 @@ pub const Evaluator = struct {
         return .{ .owned = try std.fs.path.resolve(self.allocator, &.{ base_path, path }) };
     }
 
-    pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+    pub fn writeValue(self: *Engine, writer: *std.Io.Writer, value: Value) !void {
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
         try self.runWithVm(writeValueBody, .{ self, writer, value });
@@ -2613,7 +2666,7 @@ pub const Evaluator = struct {
 /// `worker.zig`. Errors during speculation are swallowed inside the
 /// fiber's entry; the thunk's own `reset()` on failure surfaces the
 /// error to a future genuine caller.
-fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
+fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Engine) void {
     const worker = worker_mod.Worker.init(
         ev.allocator,
         sched,
@@ -2642,13 +2695,13 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
     worker.deinit();
 }
 
-fn releaseForBuild(ev: *Evaluator, after_release: ?ReleaseAction) void {
+fn releaseForBuild(ev: *Engine, after_release: ?ReleaseAction) void {
     ev.releaseEvalState();
     if (after_release) |action| action.run(action.context);
 }
 
 fn initVmForWorkerSlot(ctx: *anyopaque, worker_id: u8, _: u32, scratch: std.mem.Allocator) anyerror!VM {
-    const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+    const ev: *Engine = @ptrCast(@alignCast(ctx));
     return ev.initVm(worker_id, scratch);
 }
 
@@ -2660,12 +2713,12 @@ fn ReturnPayload(comptime F: type) type {
     };
 }
 
-/// Shim that lets `Evaluator.writeValue` reuse the same `runWithVm`
+/// Shim that lets `Engine.writeValue` reuse the same `runWithVm`
 /// machinery as the VM-bodied entries. The output formatter walks
-/// values via `Evaluator.forceValue` for nested thunks; the surrounding
+/// values via `Engine.forceValue` for nested thunks; the surrounding
 /// fiber's identity threads through via initVm, so we don't need a
 /// fresh VM here ourselves.
-fn writeValueBody(_: *VM, ev: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+fn writeValueBody(_: *VM, ev: *Engine, writer: *std.Io.Writer, value: Value) !void {
     return eval_print.writeValue(valuePrintHost(ev), writer, value);
 }
 
@@ -2675,7 +2728,7 @@ fn writeRawValueBody(vm: *VM, writer: *std.Io.Writer, value: Value) !void {
     try writer.writeAll(vm.intern.get(text_id));
 }
 
-fn valuePrintHost(ev: *Evaluator) eval_print.Host {
+fn valuePrintHost(ev: *Engine) eval_print.Host {
     return .{
         .allocator = ev.allocator,
         .heap = &ev.heap,
@@ -2686,17 +2739,17 @@ fn valuePrintHost(ev: *Evaluator) eval_print.Host {
     };
 }
 
-fn chunkRegistrationSink(ev: *Evaluator) compiler_mod.ChunkRegistrationSink {
+fn chunkRegistrationSink(ev: *Engine) compiler_mod.ChunkRegistrationSink {
     return .{ .context = ev, .registered = chunkRegisteredThunk };
 }
 
 fn chunkRegisteredThunk(context: *anyopaque, chunk_id: ChunkId) void {
-    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    const ev: *Engine = @ptrCast(@alignCast(context));
     ev.chunkRegistered(chunk_id);
 }
 
 fn printForceValue(context: *anyopaque, value: Value) anyerror!Value {
-    const ev: *Evaluator = @ptrCast(@alignCast(context));
+    const ev: *Engine = @ptrCast(@alignCast(context));
     return ev.forceValue(value);
 }
 
@@ -2730,7 +2783,7 @@ fn currentExecutionContext() *execution.ExecutionContext {
     return &wf.ctx;
 }
 
-fn gcContext(ev: *Evaluator) gc_controller.Context {
+fn gcContext(ev: *Engine) gc_controller.Context {
     return .{
         .allocator = ev.allocator,
         .heap = &ev.heap,
@@ -2774,7 +2827,7 @@ const TestEffectCapture = struct {
 
 test "speculative effects wait for demand and fire exactly once" {
     var capture: TestEffectCapture = .{};
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     var ev_live = true;
     defer if (ev_live) ev.deinit();
     ev.setEffectSink(.{ .context = &capture, .emit_fn = TestEffectCapture.emit });
@@ -2841,7 +2894,7 @@ test "speculative imported traces are committed by their demander" {
     defer std.testing.allocator.free(source);
 
     var capture: TestEffectCapture = .{};
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     ev.setEffectSink(.{ .context = &capture, .emit_fn = TestEffectCapture.emit });

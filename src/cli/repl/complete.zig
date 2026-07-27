@@ -18,13 +18,13 @@ const runtime = @import("runtime");
 const editor_mod = @import("editor.zig");
 const commands = @import("commands.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const Value = runtime.Value;
 const builtins_mod = runtime.builtins;
 const future_mod = runtime.future;
 
 pub const Ctx = struct {
-    ev: *Evaluator,
+    ev: *Engine,
     io: std.Io,
     bindings: *const std.StringArrayHashMapUnmanaged(Value),
 };

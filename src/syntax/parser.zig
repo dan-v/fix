@@ -161,7 +161,7 @@ pub const Parser = struct {
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
     /// Whether any `|>`/`<|` pipe operator was parsed. Enforcement that the
     /// `pipe-operators` feature is enabled happens at the compile chokepoint
-    /// (`Evaluator.parseAndCompile`), which reads this flag.
+    /// (`Engine.parseAndCompile`), which reads this flag.
     used_pipe_operators: bool,
     /// The earliest pipe operator token seen, for a precise "disabled"
     /// diagnostic.
@@ -186,7 +186,7 @@ pub const Parser = struct {
     /// `scanElidableBody`'s shape gate) is NOT parsed. Its tokens are
     /// skipped by a balanced span scan and a single `.elided` node holding
     /// the span is spliced onto the parse stack; the compiler sub-parses it
-    /// on demand. Default off — `Evaluator.parseAndCompile` enables it for
+    /// on demand. Default off — `Engine.parseAndCompile` enables it for
     /// file compiles, mirroring the lazy per-attr compilation gate
     /// (`compiler/attrs.zig shouldDeferSet`). Note this makes parse errors
     /// inside such bodies surface at first *force* instead of at parse time

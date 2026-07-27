@@ -1,8 +1,8 @@
-//! Evaluator-side GC coordination: root enumeration, stop-the-world marking,
+//! Engine-side GC coordination: root enumeration, stop-the-world marking,
 //! sweeping, and collection metrics.
 //!
 //! The explicit `Context` below contains only the evaluator state GC owns or
-//! scans, keeping this controller independent of the full `Evaluator` type.
+//! scans, keeping this controller independent of the full `Engine` type.
 //!
 
 const std = @import("std");

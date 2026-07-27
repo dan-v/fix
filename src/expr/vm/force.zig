@@ -83,7 +83,7 @@ const VM = vm_mod.VM;
 // computing a freshly-claimed bytecode thunk we check it; a hit resolves
 // the thunk to the cached value and skips re-running the body. Pure
 // functions, so reuse is sound; the `heap_token` guard invalidates stale
-// entries across Evaluator instances (same trick as the attr inline
+// entries across Engine instances (same trick as the attr inline
 // cache). The ≤2-upvalue limit keeps comparison exact and allocation-free.
 const memo_size = thread_caches.memo_size;
 
@@ -323,7 +323,7 @@ pub const SeenDeepObject = struct {
 
 /// Like `forceDeep`, but reports `[i/N]` over the TOP-LEVEL members (a list's
 /// elements / an attrset's entries) on the active render node. Used only by the
-/// strict top-level render (`Evaluator.forceDeep`) — plain `forceDeep` stays
+/// strict top-level render (`Engine.forceDeep`) — plain `forceDeep` stays
 /// count-free so builtin deep-forces (seq/deepSeq) don't hijack the counter.
 /// The count is on the outermost fan-out only; nested forces recurse via the
 /// uncounted `forceDeepInner`.
@@ -563,7 +563,7 @@ pub inline fn forceTop(self: *VM) anyerror!Value {
 // `defer -1` landing on different threads). The VM travels with the fiber, so
 // `self.native_depth` is fiber-local by construction. Imports evaluate on a
 // fresh nested VM that inherits the caller's depth (depth-transparency — see
-// `Evaluator.evaluateSource`), so a top-level import still collects (depth 0)
+// `Engine.evaluateSource`), so a top-level import still collects (depth 0)
 // while an import nested inside a builtin stays gated at that builtin's depth.
 
 /// Demand-sibling prefetch (`FIX_SIBLING`) member admission: skip

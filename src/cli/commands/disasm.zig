@@ -15,7 +15,7 @@ const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 const runner = @import("../eval_support.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const ChunkId = runtime.types.ChunkId;
 
 pub const synopsis =
@@ -58,7 +58,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // Resolve heap backing before the evaluator maps its stores
     // (`--hugetlb`, otherwise auto).
     setup.applyMemoryBacking(options.hugetlb);
-    var ev = try Evaluator.init(allocator, worker_count);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count));
     defer ev.deinit();
     // Configure features (pipe-operators/flakes), base path, and NIX_PATH so the
     // compile matches what `eval`/`build` would see. No progress: disasm prints
@@ -226,7 +226,7 @@ const Pager = struct {
 /// (and would FrameOverflow, or blow a speculative worker's stack). Best-effort:
 /// a failing eval still leaves its compiled chunks behind to inspect, so a
 /// failure is a warning, not an abort.
-fn compileByEval(ev: *Evaluator, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !void {
+fn compileByEval(ev: *Engine, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !void {
     _ = ev.evaluatePathAt(source, base_path, source_path) catch |err| {
         std.debug.print("warning: evaluation failed: {s} (dumping chunks compiled so far)\n", .{@errorName(err)});
     };
@@ -236,7 +236,7 @@ fn compileByEval(ev: *Evaluator, source: []const u8, base_path: ?[]const u8, sou
 /// registry walk already visits every chunk exactly once.
 fn dumpAll(
     writer: *std.Io.Writer,
-    ev: *Evaluator,
+    ev: *Engine,
     symbols: bytecode.disasm.Symbols,
     opts: bytecode.disasm.Options,
 ) !void {

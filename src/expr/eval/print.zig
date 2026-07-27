@@ -1,4 +1,4 @@
-//! Nix value rendering for Evaluator.writeValue.
+//! Nix value rendering for Engine.writeValue.
 
 const std = @import("std");
 const types = @import("runtime").types;

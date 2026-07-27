@@ -1,8 +1,8 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "if-else selects the matching branch" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const then_arm = try ev.evaluate("if 1 == 1 then \"yes\" else \"no\"");
@@ -13,7 +13,7 @@ test "if-else selects the matching branch" {
 }
 
 test "assert passes through the body when the condition holds" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("assert 1 + 1 == 2; 42");
@@ -21,14 +21,14 @@ test "assert passes through the body when the condition holds" {
 }
 
 test "assert raises an error when the condition fails" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.AssertionFailed, ev.evaluate("assert 1 == 2; 42"));
 }
 
 test "with brings an attribute set's names into scope" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("with { a = 1; b = 2; }; a + b");
@@ -36,7 +36,7 @@ test "with brings an attribute set's names into scope" {
 }
 
 test "an inner with shadows an outer with for the same name" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("with { a = 1; }; with { a = 2; }; a");

@@ -1,4 +1,4 @@
-# Evaluator benchmarks
+# Engine benchmarks
 
 The benchmark harness has three independent suites:
 

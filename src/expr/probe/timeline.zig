@@ -1,4 +1,4 @@
-//! Evaluator-scoped Perfetto recording for structured observations.
+//! Engine-scoped Perfetto recording for structured observations.
 //!
 //! Compute workers append through cache-local chunk cursors; daemon/client-I/O
 //! producers use bounded atomic fallback storage. Flow storage is separate so

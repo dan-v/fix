@@ -757,7 +757,7 @@ pub const ObjectHeap = struct {
     errored_infos: std.ArrayListUnmanaged(*ErrorInfo),
     errored_infos_mu: sync.SpinMutex,
     /// Unique-per-init id for cache invalidation. Same trick as the
-    /// intern table: thread-local caches outlive an Evaluator, and the
+    /// intern table: thread-local caches outlive an Engine, and the
     /// allocator can reuse heap addresses, so a stale slot would match
     /// pointer equality even though it refers to a freed heap.
     token: u64,
@@ -2068,7 +2068,7 @@ pub const ObjectHeap = struct {
     }
 
     /// Allocate the shared empty-`[]`/`{}` singletons if not already present.
-    /// Call once at bootstrap (see `Evaluator.ensureBuiltins`), on the main
+    /// Call once at bootstrap (see `Engine.ensureBuiltins`), on the main
     /// thread and before GC arming, so both ids fall below
     /// `collection.bootstrap_end` and stay pinned. Idempotent. The `addList`/
     /// `addAttrs` calls below observe `empty_*_id == null` and allocate real

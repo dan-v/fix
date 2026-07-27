@@ -1,16 +1,16 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 const renderForTest = @import("../test_helpers.zig").renderForTest;
 
 test "add evaluates simple integer arithmetic" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     const result = try ev.evaluate("1 + 2");
     try std.testing.expectEqual(@as(i64, 3), result.asInt());
 }
 
 test "add raises on integer overflow rather than wrapping" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(
         error.IntegerOverflow,
@@ -19,7 +19,7 @@ test "add raises on integer overflow rather than wrapping" {
 }
 
 test "mul raises on integer overflow" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(
         error.IntegerOverflow,
@@ -28,13 +28,13 @@ test "mul raises on integer overflow" {
 }
 
 test "float division by zero raises rather than producing inf or nan" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("1.0 / 0.0"));
 }
 
 test "integer division by zero raises" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("1 / 0"));
 }
@@ -53,7 +53,7 @@ test "floor and ceil saturate to i64 min near the boundary instead of wrapping" 
 }
 
 test "floor and ceil pass integers through unchanged" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const floored = try ev.evaluate("builtins.floor 42");
@@ -64,7 +64,7 @@ test "floor and ceil pass integers through unchanged" {
 }
 
 test "bitwise ops on ints" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const anded = try ev.evaluate("builtins.bitAnd 6 3");
@@ -78,13 +78,13 @@ test "bitwise ops on ints" {
 }
 
 test "bitwise ops reject non-integer operands" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.bitAnd 1.0 2"));
 }
 
 test "lessThan compares numbers and strings" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const numeric_lt = try ev.evaluate("builtins.lessThan 1 2");

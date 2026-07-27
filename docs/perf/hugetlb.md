@@ -57,7 +57,7 @@ part of the win.
 
 `--hugetlb MODE` accepts `auto`, `on`, or `off`; when omitted it defaults to
 `auto`. It is resolved in `cli/setup.zig:applyMemoryBacking` **before**
-`Evaluator.init` maps the heap
+`Engine.init` maps the heap
 — deliberately not a `nix.conf`/`--option` setting, since config loads after
 the flat store already picked its mapping.
 

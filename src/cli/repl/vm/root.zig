@@ -12,7 +12,7 @@ const width_mod = @import("../width.zig");
 const vm_model = @import("model.zig");
 const vm_helpers = @import("semantics.zig");
 const vm_tui = @import("tui.zig");
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const ChunkId = runtime.types.ChunkId;
 const disasm = engine.bytecode.disasm;
 
@@ -27,7 +27,7 @@ const disasm_options: disasm.Options = .{
 };
 
 /// Non-interactive `:vm`: the focused chunk without terminal chrome.
-pub fn writePlain(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Evaluator, chunk_id: ChunkId) !void {
+pub fn writePlain(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Engine, chunk_id: ChunkId) !void {
     const symbols: disasm.Symbols = .{ .intern = ev.internTable(), .registry = ev.chunkRegistry() };
     try writeChunk(allocator, w, ev, chunk_id, symbols, disasm_options);
 }
@@ -35,7 +35,7 @@ pub fn writePlain(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Evaluato
 fn writeChunk(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
-    ev: *Evaluator,
+    ev: *Engine,
     chunk_id: ChunkId,
     symbols: disasm.Symbols,
     options: disasm.Options,

@@ -2,7 +2,7 @@
 
 *The command surface and the introspection tools that read the machine's mind.*
 
-The command surface lives in the `cli` module (`src/cli/root.zig`). User-facing entry points are grouped under `src/cli/commands/`; the module exposes them as `cli.commands`, while shared CLI infrastructure stays at the module root. It consumes `expr`, `runtime`, `syntax`, and `store` directly according to each command's needs. Commands import focused helpers: `presentation.zig` owns terminal policy and styling, `progress.zig` renders evaluation progress, and `realize.zig` owns the shared evaluation-to-build workflow. `src/main.zig` is composition only; it imports `cli`, sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar, and `src/cli/setup.zig` folds common `Options → Evaluator` configuration through `expr` and `store` types. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
+The command surface lives in the `cli` module (`src/cli/root.zig`). User-facing entry points are grouped under `src/cli/commands/`; the module exposes them as `cli.commands`, while shared CLI infrastructure stays at the module root. It consumes `expr`, `runtime`, `syntax`, and `store` directly according to each command's needs. Commands import focused helpers: `presentation.zig` owns terminal policy and styling, `progress.zig` renders evaluation progress, and `realize.zig` owns the shared evaluation-to-build workflow. `src/main.zig` is composition only; it imports `cli`, sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar, and `src/cli/setup.zig` folds common `Options → Engine` configuration through `expr` and `store` types. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
 
 ## Invocation
 
@@ -45,7 +45,7 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` evaluate expressi
 
 **Scope.** `name = expr` binds; the last printed value is `it`; `:l PATH` merges a file's attrset into scope (auto-calling a top-level function with `{}`); `:r` reloads. Inputs compile inside an ambient scope attrset (the `scopedImport` mechanism), so bound values are *shared*, never re-evaluated.
 
-**GC.** A collection runs between inputs (`Evaluator.collectNow`: the standard STW barrier driven from outside an evaluation), so session memory tracks the live bindings rather than accreting. Repl-held values are precise GC roots (`Evaluator.gcSetExternalRoots` → `collection.extra_roots`). `:gc` collects on demand and reports reserved bytes.
+**GC.** A collection runs between inputs (`Engine.collectNow`: the standard STW barrier driven from outside an evaluation), so session memory tracks the live bindings rather than accreting. Repl-held values are precise GC roots (`Engine.gcSetExternalRoots` → `collection.extra_roots`). `:gc` collects on demand and reports reserved bytes.
 
 **Commands** (`:?` shows this table in-repl): `:?`/`:help`, `:q`/`:quit`/`:exit`, `:l`/`:load PATH`, `:r`/`:reload`, `:t`/`:type EXPR`, `:p`/`:print EXPR` (deep-force), `:i`/`:inspect EXPR` (kind, thunk state + backing chunk, closure chunk/arity), `:debug`/`:d EXPR` (pause before forcing an expression), `:vm [COMMAND | EXPR]`, `:env`, `:gc`.
 
@@ -108,7 +108,7 @@ One honest caveat: this is a **lazy** language, so stepping follows *demand* ord
 
 **Source locations.** A frame's `ip` is resolved with `disasm.frameSpan` — the narrowest covering source span, but with an *inclusive* end and a `body_span` fallback. The inclusive end matters for a caller frame, whose `ip` points *past* the call it's suspended on (exactly at the covering span's exclusive end); plain `bestSpan` (used by `fix disasm` for the instruction about to execute) would miss it and the frame would show no location. This is why a backtrace reads `f.nix:11:8 f ← 13:42 ← 13:3` rather than blank caller lines.
 
-**Architecture.** The engine exposes a neutral break seam so the layering stays down-only: `vm.BreakSink` on the VM (null in every normal run — `builtins.break` is then a plain identity, zero cost off the debug path), the `breakpoint` opcode + `bytecode.BreakpointTable` (patch/restore, with new chunks patched by the evaluator's `chunkRegistered` callback), an `expr.DebugSession` view over the paused VM (backtrace, scope, evaluate-in-place, value rendering, breakpoint set/list/delete, stepping), and `Evaluator.setDebugUi`. The `cli` layer supplies either the console (`src/cli/debugger.zig`) or interactive screen (`src/cli/debugger_tui.zig`) through that view; both share `debugger_command.zig`, and neither names a `vm` type.
+**Architecture.** The engine exposes a neutral break seam so the layering stays down-only: `vm.BreakSink` on the VM (null in every normal run — `builtins.break` is then a plain identity, zero cost off the debug path), the `breakpoint` opcode + `bytecode.BreakpointTable` (patch/restore, with new chunks patched by the evaluator's `chunkRegistered` callback), an `expr.DebugSession` view over the paused VM (backtrace, scope, evaluate-in-place, value rendering, breakpoint set/list/delete, stepping), and `Engine.setDebugUi`. The `cli` layer supplies either the console (`src/cli/debugger.zig`) or interactive screen (`src/cli/debugger_tui.zig`) through that view; both share `debugger_command.zig`, and neither names a `vm` type.
 
 ## Key flags
 
@@ -180,7 +180,7 @@ defaults to `.`. All subcommands require the `flakes` feature.
 | `lock` | complete `flake.lock` for the cwd flake — add missing inputs, keep every existing pin |
 | `update [inputs…]` | re-pin the cwd flake's lock: all inputs, or only the named ones (the rest keep their current pins) |
 
-`update`/`lock` are a first-class lock operation (`Evaluator.updateFlakeLock`):
+`update`/`lock` are a first-class lock operation (`Engine.updateFlakeLock`):
 they fetch the inputs and (re)write `flake.lock` directly, without evaluating
 `outputs`. Untouched inputs are copied forward from the existing lock, so
 `flake update nixpkgs` re-pins only `nixpkgs`. `getFlake`'s auto-lock-on-first-

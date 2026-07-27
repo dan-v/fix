@@ -16,7 +16,7 @@ const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
 const stats = @import("../stats.zig");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const EnvMap = std.process.Environ.Map;
 const BuildSink = store.daemon.BuildSink;
 
@@ -52,7 +52,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     const worker_count = try setup.workerCount(options);
     setup.applyMemoryBacking(options.hugetlb);
-    var ev = try Evaluator.init(allocator, worker_count);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count));
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
     ev.enableStoreWrites();
@@ -91,7 +91,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
 /// Build each `-p` package from `<nixpkgs>`, appending its outPath. Returns a
 /// non-null exit code on failure (already reported).
-fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, release_action: ?engine.ReleaseAction, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
+fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Engine, release_action: ?engine.ReleaseAction, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const nixpkgs = ev.evaluate("import <nixpkgs> { }") catch |err| {
         return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, "import <nixpkgs> {}", err);
     };
@@ -140,7 +140,7 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
 }
 
 /// Build the `-E`/`--file`/`--flake` derivation, appending its outPath.
-fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, release_action: ?engine.ReleaseAction, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
+fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Engine, release_action: ?engine.ReleaseAction, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const source_arg = options.source.?;
     if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});

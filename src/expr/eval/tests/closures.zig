@@ -6,12 +6,12 @@ const std = @import("std");
 // full compiled evaluation — `makeClosure`/`makeClosureFromCaptures` only
 // run from bytecode emitted for real lambda expressions, and `doCall`/
 // `doCallN` only make sense against a real callee value. These drive the
-// module through `Evaluator.evaluate`, observing Nix-visible results only.
+// module through `Engine.evaluate`, observing Nix-visible results only.
 
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "makeClosure with zero upvalues ignores the enclosing scope" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // `x: x + 1` captures nothing from `y` even though `y` is in scope;
@@ -21,7 +21,7 @@ test "makeClosure with zero upvalues ignores the enclosing scope" {
 }
 
 test "makeClosure with one upvalue captures the binding, not a slot to re-read later" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let y = 10; f = x: x + y; in f 5");
@@ -29,7 +29,7 @@ test "makeClosure with one upvalue captures the binding, not a slot to re-read l
 }
 
 test "makeClosureFromCaptures with multiple upvalues (mixed local and outer-upvalue descriptors)" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // The innermost lambda's captures mix a descriptor resolved against the
@@ -46,7 +46,7 @@ test "makeClosureFromCaptures with multiple upvalues (mixed local and outer-upva
 }
 
 test "a closure captures its upvalue's value at creation time, unaffected by a later shadow" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // `f` is created while `x = 1` is the visible binding for `x`; the
@@ -61,7 +61,7 @@ test "a closure captures its upvalue's value at creation time, unaffected by a l
 }
 
 test "capture-free lambdas are immediate functions while captured lambdas use heap closures" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const plain = try ev.evaluate("x: x");
@@ -80,7 +80,7 @@ test "capture-free lambdas are immediate functions while captured lambdas use he
 }
 
 test "doCall/doCallN: a curried multi-arg lambda is callable after a partial application" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // `f 1` under-applies a 3-arg uncurried chunk, producing a partial

@@ -13,7 +13,7 @@ pub const Driver = struct {
 pub const Coordinator = struct {
     driver: ?Driver = null,
 
-    /// Install once, after the owning Evaluator has reached its final address.
+    /// Install once, after the owning Engine has reached its final address.
     pub fn install(self: *Coordinator, heap: *ObjectHeap, scheduler: *Scheduler, driver: Driver) void {
         if (self.driver != null) return;
         self.driver = driver;

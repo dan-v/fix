@@ -7,11 +7,11 @@
 
 const std = @import("std");
 const engine = @import("expr");
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const prof = engine.probe.prof;
 const prof_path = engine.probe.prof_path;
 
-pub fn report(ev: *Evaluator) void {
+pub fn report(ev: *Engine) void {
     const h = ev.heapStats();
     std.debug.print(
         "heap: objects={d} values={d} attrs={d} attr_positions={d}\n",

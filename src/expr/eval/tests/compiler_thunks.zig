@@ -1,10 +1,10 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "an unforced let binding thunk never evaluates its erroring body" {
     // `compileThunk` defers the body; if `b` were compiled/run eagerly,
     // the division by zero would raise before `a` is even returned.
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let a = 1; b = 1 / 0; in a");
@@ -14,7 +14,7 @@ test "an unforced let binding thunk never evaluates its erroring body" {
 test "a strict let binding is still forced exactly to its value" {
     // Strictness analysis shows the binding is used unconditionally, while
     // the materialized thunk remains lazy until demand.
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let a = 1 + 1; in a + a");
@@ -27,7 +27,7 @@ test "fused thunk+store let bindings publish through their cells correctly" {
     // `emit.fuseStoreToSlot` rewrites into the fused `thunk(_eag)_st_cell`
     // forms (the trailing-slot-byte encoding). The values must round-trip
     // through the cells exactly as if unfused.
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let a = b + 1; b = c + 1; c = 40; in a");
@@ -37,7 +37,7 @@ test "fused thunk+store let bindings publish through their cells correctly" {
 test "a fused-store thunk that is never forced stays lazy" {
     // Fusion must not change laziness: the thunk is published into its
     // slot unevaluated, so an erroring unused binding never detonates.
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let used = 2; unused = (1 / 0) + used; in used");
@@ -47,7 +47,7 @@ test "a fused-store thunk that is never forced stays lazy" {
 test "function call arguments are compiled as adaptive apply-arg thunks" {
     // Exercises `compileApplyArgThunk`: the callee decides thunk-vs-eager
     // at runtime, but either way an unused argument must stay lazy...
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const unused = try ev.evaluate("(x: 1) (1 / 0)");

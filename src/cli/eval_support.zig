@@ -8,7 +8,7 @@ const fileish = @import("fileish.zig");
 const engine = @import("expr");
 const runtime = @import("runtime");
 const store = @import("store");
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const Value = runtime.Value;
 const EvaluationMode = args.EvaluationMode;
 const SourceArg = args.SourceArg;
@@ -29,7 +29,7 @@ pub fn evaluateAndWrite(
     mode: EvaluationMode,
     use_color: bool,
     show_trace: bool,
-    ev: *Evaluator,
+    ev: *Engine,
     source: Source,
     label: []const u8,
 ) !bool {
@@ -37,7 +37,7 @@ pub fn evaluateAndWrite(
     ev.setValueColor(use_color);
     _ = label;
 
-    const result = ev.evaluatePathAt(source.slice(), source.base_path, source.abs_path) catch |err| {
+    const result = ev.evaluation().evaluatePathAt(source.slice(), source.base_path, source.abs_path) catch |err| {
         try render.evalFailure(io, use_color, show_trace, ev, source.slice(), err);
         return false;
     };
@@ -49,16 +49,18 @@ pub fn evaluateAndWrite(
     return true;
 }
 
-fn writeResult(io: std.Io, mode: EvaluationMode, ev: *Evaluator, result: Value) !void {
-    if (mode.strict) try ev.forceDeep(result);
+fn writeResult(io: std.Io, mode: EvaluationMode, ev: *Engine, result: Value) !void {
+    const evaluation = ev.evaluation();
+    const values = ev.values();
+    if (mode.strict) try evaluation.forceDeep(result);
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     switch (mode.output) {
-        .nix => try ev.writeValue(&stdout.interface, result),
-        .raw => try ev.writeRawValue(&stdout.interface, result),
-        .json => try ev.writeJsonValue(&stdout.interface, result),
-        .xml => try ev.writeXmlValue(&stdout.interface, result),
+        .nix => try values.write(&stdout.interface, result),
+        .raw => try values.writeRaw(&stdout.interface, result),
+        .json => try values.writeJson(&stdout.interface, result),
+        .xml => try values.writeXml(&stdout.interface, result),
     }
     if (mode.output != .xml and mode.output != .raw) try stdout.interface.writeByte('\n');
     try stdout.interface.flush();
@@ -86,7 +88,7 @@ pub const LoadedInput = struct {
     source_arg: SourceArg,
     source: Source,
 
-    pub fn deinit(self: *LoadedInput, ev: *Evaluator) void {
+    pub fn deinit(self: *LoadedInput, ev: *Engine) void {
         self.source.deinit(ev.hostAllocator());
     }
 
@@ -129,7 +131,7 @@ pub const InputPlan = struct {
         return .{ .source_arg = source_arg, .options = input_options };
     }
 
-    pub fn validate(self: InputPlan, ev: *Evaluator) !void {
+    pub fn validate(self: InputPlan, ev: *Engine) !void {
         if (ev.languagePolicy().flakes_enabled) return;
         const input_count = try self.count();
         for (0..input_count) |index| {
@@ -137,7 +139,7 @@ pub const InputPlan = struct {
         }
     }
 
-    pub fn load(self: InputPlan, ev: *Evaluator, index: usize) !LoadedInput {
+    pub fn load(self: InputPlan, ev: *Engine, index: usize) !LoadedInput {
         const input = self.selected(index);
         return .{
             .source_arg = input.source_arg,
@@ -193,7 +195,7 @@ pub fn sourceLabel(source: SourceArg) []const u8 {
 /// Render a store-op failure (daemon down / daemon error) specially, else fall
 /// back to the normal eval-failure trace. Returns exit code 1. Shared by the
 /// store-writing subcommands (`instantiate`, `build`).
-pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !u8 {
+pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Engine, source: []const u8, err: anyerror) !u8 {
     switch (err) {
         error.DaemonError => render.messageError(io, use_color, "daemon: {s}", .{ev.lastStoreError() orelse "unknown"}),
         error.StoreUnavailable => render.messageError(io, use_color, "cannot reach the nix-daemon (is it running?)", .{}),
@@ -202,7 +204,7 @@ pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Ev
     return 1;
 }
 
-/// `storeOrEvalFailure` for after `Evaluator.releaseEvalState`: the language
+/// `storeOrEvalFailure` for after `Engine.releaseEvalState`: the language
 /// heap (diagnostics, trace, intern table) is gone, so a build failure can
 /// only render store-side state. Evaluation already succeeded by the time a
 /// build runs — there are no eval diagnostics to lose — and the daemon's own
@@ -216,18 +218,18 @@ pub fn buildFailure(io: std.Io, use_color: bool, last_store_error: ?[]const u8, 
     return 1;
 }
 
-pub fn getSource(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Options) !Source {
+pub fn getSource(ev: *Engine, io: std.Io, source: SourceArg, options: args.Options) !Source {
     return getSourceMode(ev, io, source, options, false);
 }
 
 /// Load a source for attribute discovery. Unlike ordinary evaluation without
 /// selectors, completion auto-calls a top-level attrset function with `{}` so
 /// files such as `default.nix` expose outputs whose formals all have defaults.
-pub fn getCompletionSource(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Options) !Source {
+pub fn getCompletionSource(ev: *Engine, io: std.Io, source: SourceArg, options: args.Options) !Source {
     return getSourceMode(ev, io, source, options, true);
 }
 
-fn getSourceMode(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Options, completion_auto_call: bool) !Source {
+fn getSourceMode(ev: *Engine, io: std.Io, source: SourceArg, options: args.Options, completion_auto_call: bool) !Source {
     const allocator = ev.hostAllocator();
     // Load the base source text (borrowed for expr/file, owned for flake).
     var base: Source = switch (source) {
@@ -259,7 +261,7 @@ fn getSourceMode(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Op
 /// with those args intersected against its formals; then select the `-A`
 /// attribute path. Returns owned wrapped text, or `base_text` borrowed when no
 /// selector applies.
-fn applySelectors(ev: *Evaluator, base_text: []const u8, options: args.Options, completion_auto_call: bool) !Source {
+fn applySelectors(ev: *Engine, base_text: []const u8, options: args.Options, completion_auto_call: bool) !Source {
     const alloc = ev.hostAllocator();
     const has_args = options.arg_defs.items.len > 0;
     // A `-A` with only empty components (`.`/``) selects nothing.
@@ -355,7 +357,7 @@ fn appendFlakeCandidate(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
     try out.appendSlice(alloc, suffix);
 }
 
-fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8, options: args.Options) ![]u8 {
+fn lowerFlakeInstallable(ev: *Engine, installable: []const u8, options: args.Options) ![]u8 {
     const alloc = ev.hostAllocator();
     const hash = std.mem.indexOfScalar(u8, installable, '#');
     const flake_ref = if (hash) |i| installable[0..i] else installable;
@@ -420,7 +422,7 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8, options: args.
 /// typed portion before the final dot. Non-attr branches are ignored so a
 /// similarly named leaf in one namespace cannot suppress useful candidates
 /// from another.
-pub fn lowerFlakeCompletion(ev: *Evaluator, flake_ref: []const u8, parent: []const u8) ![]const u8 {
+pub fn lowerFlakeCompletion(ev: *Engine, flake_ref: []const u8, parent: []const u8) ![]const u8 {
     const alloc = ev.hostAllocator();
     var resolved = try resolveFlakeRef(ev, flake_ref);
     defer resolved.deinit(alloc);
@@ -458,7 +460,7 @@ const ResolvedRef = TextRef;
 /// an absolute path against the base path (the cwd). Everything else — scheme
 /// refs (`github:…`, `git+…`) and bare indirect ids (`nixpkgs`) — passes through
 /// to getFlake, which resolves indirect ids via the flake registry itself.
-fn resolveFlakeRef(ev: *Evaluator, flake_ref: []const u8) !ResolvedRef {
+fn resolveFlakeRef(ev: *Engine, flake_ref: []const u8) !ResolvedRef {
     if (flake_ref.len > 0 and (flake_ref[0] == '/' or flake_ref[0] == '.')) {
         const base = ev.basePath() orelse return .{ .borrowed = flake_ref };
         const abs = try std.fs.path.resolve(ev.hostAllocator(), &.{ base, flake_ref });
@@ -497,7 +499,7 @@ fn appendNixEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
 }
 
 test "completion auto-calls a top-level function with defaulted formals" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
 
     var source = try applySelectors(
@@ -515,7 +517,7 @@ test "completion auto-calls a top-level function with defaulted formals" {
 }
 
 test "flake installable lowering: profiles, default attr, literal system" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     const alloc = ev.hostAllocator();
 

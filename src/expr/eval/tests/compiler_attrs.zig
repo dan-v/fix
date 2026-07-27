@@ -1,8 +1,8 @@
 const std = @import("std");
-const Evaluator = @import("../../evaluator.zig").Evaluator;
+const Engine = @import("../../evaluator.zig").Engine;
 
 test "compiles a plain attribute set with two entries" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("{ a = 1; b = 2; }.a + { a = 1; b = 2; }.b");
@@ -10,14 +10,14 @@ test "compiles a plain attribute set with two entries" {
 }
 
 test "reports duplicate attribute as a parse error" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.ParseError, ev.evaluate("{ a = 1; a = 2; }"));
 }
 
 test "compiles a recursive attribute set referencing a sibling" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("(rec { a = 1; b = a + 1; }).b");
@@ -25,7 +25,7 @@ test "compiles a recursive attribute set referencing a sibling" {
 }
 
 test "compiles a dynamic attribute name from string interpolation" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let x = \"foo\"; in ({ \"${x}\" = 1; }).foo");
@@ -33,14 +33,14 @@ test "compiles a dynamic attribute name from string interpolation" {
 }
 
 test "reports duplicate attribute inside a nested static path" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.ParseError, ev.evaluate("{ a.b = 1; a.b = 2; }"));
 }
 
 test "attr segments equal compares underlying source text" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // `foo` and `"foo"` denote the same attribute name; merging both into

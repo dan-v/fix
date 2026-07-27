@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const engine = @import("expr");
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const Options = @import("args.zig").Options;
 const vm_trace_mod = engine.vm.trace_log;
 const thunk_trace_mod = engine.probe.thunk_trace;
@@ -34,7 +34,7 @@ pub const ThunkTraceSetup = struct {
 pub fn setupThunkTrace(
     allocator: std.mem.Allocator,
     io: std.Io,
-    ev: *Evaluator,
+    ev: *Engine,
     options: Options,
 ) !ThunkTraceSetup {
     var setup: ThunkTraceSetup = .{};

@@ -1,13 +1,13 @@
 const std = @import("std");
 const expr = @import("expr");
-const Evaluator = expr.Evaluator;
+const Engine = expr.Engine;
 const value = @import("runtime").value;
 const ValueType = value.ValueType;
 
 test "end-to-end: function arguments are lazy" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const unused_arg = try ev.evaluate("let f = x: 1; a = f b; b = a + 1; in b");
@@ -28,7 +28,7 @@ test "end-to-end: function arguments are lazy" {
 test "end-to-end: single argument lambdas" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const direct = try ev.evaluate("(x: x + 1) 41");
@@ -59,7 +59,7 @@ test "end-to-end: single argument lambdas" {
 test "end-to-end: tail calls reuse lambda frames" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const countdown = try ev.evaluate("let f = n: if n == 0 then 42 else f (n - 1); in f 1500");

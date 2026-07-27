@@ -140,7 +140,7 @@ pub const Task = union(enum) {
     /// interned absolute path, populating the import registry ahead of
     /// the demand fiber. Discovered from `.path` constants of freshly
     /// compiled chunks (see `ChunkRegistry.register`); deduplicated
-    /// per path by the Evaluator before submission. Holds no heap
+    /// per path by the Engine before submission. Holds no heap
     /// ObjectId — nothing to GC-mark.
     import_prefetch: types.InternId,
     /// Speculative readDir-children prefetch (`FIX_READDIR_PREFETCH`):
@@ -1376,7 +1376,7 @@ pub const Scheduler = struct {
         self.gc_barrier.end(collector_id);
     }
 
-    /// Evaluator installs the parallel-mark hook (see `GcMarkHook`) once, at
+    /// Engine installs the parallel-mark hook (see `GcMarkHook`) once, at
     /// startup, so parked peers can help drain the mark.
     pub fn gcSetMarkHook(self: *Scheduler, hook: GcMarkHook) void {
         self.gc_barrier.setMarkHook(hook);

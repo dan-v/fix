@@ -12,7 +12,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const eval_mod = @import("../../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 const vm_mod = @import("../../vm.zig");
 const VM = vm_mod.VM;
 const types = @import("runtime").types;
@@ -25,27 +25,27 @@ const closures = @import("../../vm.zig").closures;
 const stack = @import("../../vm.zig").stack;
 const equality = @import("../../vm.zig").equality;
 
-/// A live Evaluator plus a bare VM sharing its registry/heap/intern
-/// state. `evaluate("null")` on the Evaluator first drives the normal
+/// A live Engine plus a bare VM sharing its registry/heap/intern
+/// state. `evaluate("null")` on the Engine first drives the normal
 /// public API once, which builds the builtins attrset and starts the
 /// scheduler — everything a hand-built chunk running through
 /// `runIsolatedFrame` needs already in place.
 ///
 /// `ev` is heap-allocated so its address is stable: `vm` holds pointers
 /// into it (`&ev.registry`, `&ev.heap`, ...), and returning an
-/// `Evaluator` by value out of a constructor would move it, dangling
+/// `Engine` by value out of a constructor would move it, dangling
 /// those pointers.
 const Harness = struct {
-    ev: *Evaluator,
+    ev: *Engine,
     /// VM scratch arena. Heap-allocated for the same address-stability
     /// reason as `ev`: the VM's allocator captures its address.
     scratch: *std.heap.ArenaAllocator,
     vm: VM,
 
     fn init() !Harness {
-        const ev = try testing.allocator.create(Evaluator);
+        const ev = try testing.allocator.create(Engine);
         errdefer testing.allocator.destroy(ev);
-        ev.* = try Evaluator.init(testing.allocator, 0);
+        ev.* = try Engine.init(testing.allocator, .{ .worker_count = 0 });
         errdefer ev.deinit();
         _ = try ev.evaluate("null");
 

@@ -23,7 +23,7 @@ const debugger = @import("../../debugger.zig");
 const base = @import("base");
 const tui = base.tui;
 const ColorDepth = base.terminal_color.Depth;
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const DebugSession = engine.DebugSession;
 const ChunkId = runtime.types.ChunkId;
 const bytecode = engine.bytecode;
@@ -88,7 +88,7 @@ pub const SessionHost = struct {
 pub fn runSession(
     allocator: std.mem.Allocator,
     io: std.Io,
-    ev: *Evaluator,
+    ev: *Engine,
     color_depth: ColorDepth,
     editor: *editor_mod.Editor,
     transcript: *transcript_mod.Capture,
@@ -123,7 +123,7 @@ pub fn runSession(
 pub const VmDebugger = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    ev: *Evaluator,
+    ev: *Engine,
     color_depth: ColorDepth,
     history: *history_mod.History,
     /// Set by `runSession` for the lifetime of an interactive `:vm` session.
@@ -143,7 +143,7 @@ pub const VmDebugger = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
-        ev: *Evaluator,
+        ev: *Engine,
         color_depth: ColorDepth,
         history: *history_mod.History,
     ) VmDebugger {
@@ -156,11 +156,11 @@ pub const VmDebugger = struct {
         };
     }
 
-    pub fn install(self: *VmDebugger, ev: *Evaluator) void {
+    pub fn install(self: *VmDebugger, ev: *Engine) void {
         ev.setDebugUi(self, runCallback);
     }
 
-    pub fn uninstall(_: *VmDebugger, ev: *Evaluator) void {
+    pub fn uninstall(_: *VmDebugger, ev: *Engine) void {
         ev.clearDebugUi();
     }
 
@@ -267,7 +267,7 @@ pub const VmDebugger = struct {
 const Tui = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    ev: *Evaluator,
+    ev: *Engine,
     color_depth: ColorDepth,
     tree_index: *vm_tree.Index,
     session_host: ?SessionHost = null,

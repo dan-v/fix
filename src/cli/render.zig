@@ -3,7 +3,7 @@
 const std = @import("std");
 const presentation = @import("presentation.zig");
 const engine = @import("expr");
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const EvalTrace = engine.EvalTrace;
 
 const default_trace_limit = 8;
@@ -34,7 +34,7 @@ pub fn evalFailure(
     io: std.Io,
     use_color: bool,
     show_trace: bool,
-    ev: *Evaluator,
+    ev: *Engine,
     source: []const u8,
     err: anyerror,
 ) !void {
@@ -45,7 +45,7 @@ pub fn evalFailure(
     try stderr.flush();
 }
 
-pub fn evaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !void {
+pub fn evaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Engine, source: []const u8, err: anyerror) !void {
     var stderr_buffer: [4096]u8 = undefined;
     var stderr = try presentation.lockStderr(io, &stderr_buffer);
     defer stderr.deinit();
@@ -56,11 +56,11 @@ pub fn evaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Evalu
 /// Writer-targeted variants used by terminal surfaces that own their output
 /// region (notably the REPL transcript). Keeping the rendering here prevents
 /// interactive and plain diagnostics from drifting apart.
-pub fn evalFailureTo(writer: *std.Io.Writer, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !void {
+pub fn evalFailureTo(writer: *std.Io.Writer, use_color: bool, show_trace: bool, ev: *Engine, source: []const u8, err: anyerror) !void {
     try writeEvalFailure(writer, use_color, show_trace, ev, source, err, ev.getTrace(), true);
 }
 
-pub fn evaluationErrorTo(writer: *std.Io.Writer, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !void {
+pub fn evaluationErrorTo(writer: *std.Io.Writer, use_color: bool, show_trace: bool, ev: *Engine, source: []const u8, err: anyerror) !void {
     try writeEvaluationError(writer, use_color, show_trace, ev, source, err, ev.getTrace());
 }
 
@@ -71,9 +71,9 @@ pub fn captureEvalFailure(
     allocator: std.mem.Allocator,
     use_color: bool,
     show_trace: bool,
-    ev: *Evaluator,
+    ev: *Engine,
     source: []const u8,
-    failure: Evaluator.ParallelFailure,
+    failure: Engine.ParallelFailure,
 ) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -94,7 +94,7 @@ fn writeEvalFailure(
     writer: *std.Io.Writer,
     use_color: bool,
     show_trace: bool,
-    ev: *Evaluator,
+    ev: *Engine,
     source: []const u8,
     err: anyerror,
     trace: *const EvalTrace,
@@ -110,7 +110,7 @@ fn writeEvaluationError(
     writer: *std.Io.Writer,
     use_color: bool,
     show_trace: bool,
-    ev: *Evaluator,
+    ev: *Engine,
     source: []const u8,
     err: anyerror,
     trace: *const EvalTrace,
@@ -135,7 +135,7 @@ fn writeTraceFrames(
     writer: *std.Io.Writer,
     use_color: bool,
     show_trace: bool,
-    ev: *Evaluator,
+    ev: *Engine,
     source: []const u8,
     frames: []const EvalTrace.Frame,
 ) !void {
@@ -161,7 +161,7 @@ fn writeTraceFrames(
     for (frames[frames.len - tail_count ..]) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
 }
 
-fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) !void {
+fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Engine, source: []const u8, frame: EvalTrace.Frame) !void {
     if (frame.kind == .evaluation) {
         const diag = frame.diagnostic orelse return;
         if (traceFrameSource(ev, source, frame)) |frame_source| {
@@ -187,7 +187,7 @@ fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Evaluator, sour
     try writer.print("  {s}\n", .{frame.message});
 }
 
-fn traceFrameSource(ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) ?[]const u8 {
+fn traceFrameSource(ev: *Engine, source: []const u8, frame: EvalTrace.Frame) ?[]const u8 {
     if (frame.source_path) |path| {
         return ev.readSourceFile(path) catch null;
     }
@@ -195,7 +195,7 @@ fn traceFrameSource(ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) 
 }
 
 test "trace contexts render their complete prose once" {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     var trace = EvalTrace.init(std.testing.allocator);
@@ -239,7 +239,7 @@ test "trace diagnostics include source paths and keep excerpts on one line" {
     });
     defer std.testing.allocator.free(source_path);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 

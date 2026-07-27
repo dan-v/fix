@@ -1,6 +1,6 @@
 const std = @import("std");
 const fix = @import("../../root.zig");
-const Evaluator = fix.Evaluator;
+const Engine = fix.Engine;
 
 test "an imported file large enough to defer per-attr compilation evaluates the forced attr correctly" {
     // Lazy per-attr compilation (attrs.zig `shouldDeferSet`) only
@@ -43,7 +43,7 @@ test "an imported file large enough to defer per-attr compilation evaluates the 
     const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).attr42", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -100,7 +100,7 @@ test "deferred bodies under enclosing with scopes resolve names like the eager c
     const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).attr42", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -148,7 +148,7 @@ test "an elided attr body is deferred and compiles correctly at first force" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).target", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -171,7 +171,7 @@ test "a syntax error inside an elided body surfaces at force time, not parse tim
     const file_path = try writeTmpNix(&tmp, std.testing.allocator, "badbody.nix", contents.items);
     defer std.testing.allocator.free(file_path);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -198,7 +198,7 @@ test "an elided leaf in an extended group materializes for the duplicate check" 
     try appendElisionPrefix(&contents, std.testing.allocator);
     try contents.print(std.testing.allocator, "  dup = f 1 {s};\n  dup.extra = 2;\n}}\n", .{elision_pad});
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(
@@ -230,7 +230,7 @@ test "elided bodies fall back to eager materialization when the set cannot defer
     const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).target", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -253,7 +253,7 @@ test "an elided body under a dynamic attribute name compiles via the thunk path"
     const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).dynX", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 

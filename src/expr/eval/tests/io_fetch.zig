@@ -1,6 +1,6 @@
 const std = @import("std");
 const eval_mod = @import("../../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 const Diagnostic = eval_mod.Diagnostic;
 const Value = @import("runtime").value.Value;
 const FileCache = @import("store").FileCache;
@@ -35,7 +35,7 @@ test "evaluate pathExists and readFile builtins through file cache" {
     const read_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.readFile \"{s}\"", .{file_path});
     defer std.testing.allocator.free(read_source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -57,7 +57,7 @@ test "read source files through evaluator file cache" {
     const relative_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/source.nix", .{tmp.sub_path});
     defer std.testing.allocator.free(relative_path);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try ev.setBasePathFromCurrentPath(std.testing.io);
 
@@ -89,7 +89,7 @@ test "evaluate readDir builtin through file cache" {
     const dir_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.readDir {s}).sub", .{dir_path});
     defer std.testing.allocator.free(dir_source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -126,7 +126,7 @@ test "evaluate readFileType builtin through file cache" {
     const dir_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.readFileType {s}", .{dir_path});
     defer std.testing.allocator.free(dir_source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -169,7 +169,7 @@ test "evaluate filterSource builtin through file cache" {
     );
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -271,7 +271,7 @@ test "evaluate fetchGit builtin for local repository" {
     const untracked_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.hasAttr \".zig-cache\" (builtins.readDir (builtins.fetchGit {{ url = \"{s}\"; }}).outPath)", .{cwd});
     defer std.testing.allocator.free(untracked_source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -305,7 +305,7 @@ test "evaluate fetchurl builtin through fetch cache" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.readFile (builtins.fetchurl {{ url = \"file://{s}\"; name = \"payload.txt\"; }})", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -339,7 +339,7 @@ test "evaluate fetchTarball builtin through fetch cache" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.readFile ((builtins.fetchTarball {{ url = \"file://{s}\"; name = \"src\"; }}) + \"/file.txt\")", .{archive_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -364,7 +364,7 @@ test "hashed fetchurl reads content with the specified sha256" {
     );
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -388,7 +388,7 @@ test "hashed fetchurl reports mismatched and malformed sha256" {
         .{file_path},
     );
     defer std.testing.allocator.free(malformed_source);
-    var malformed_ev = try Evaluator.init(std.testing.allocator, 0);
+    var malformed_ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer malformed_ev.deinit();
     malformed_ev.setFileIo(std.testing.io);
     try std.testing.expectError(error.InvalidHash, malformed_ev.evaluate(malformed_source));
@@ -400,7 +400,7 @@ test "hashed fetchurl reports mismatched and malformed sha256" {
         .{file_path},
     );
     defer std.testing.allocator.free(mismatch_source);
-    var mismatch_ev = try Evaluator.init(std.testing.allocator, 0);
+    var mismatch_ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer mismatch_ev.deinit();
     mismatch_ev.setFileIo(std.testing.io);
     try std.testing.expectError(error.HashMismatch, mismatch_ev.evaluate(mismatch_source));
@@ -437,7 +437,7 @@ test "hashed fetchTarball reads a subpath with the specified sha256" {
     );
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     const contents = try ev.evaluate(source);
@@ -470,7 +470,7 @@ test "hashed fetchTarball reports mismatched and malformed sha256" {
         .{archive_path},
     );
     defer std.testing.allocator.free(malformed_source);
-    var malformed_ev = try Evaluator.init(std.testing.allocator, 0);
+    var malformed_ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer malformed_ev.deinit();
     malformed_ev.setFileIo(std.testing.io);
     try std.testing.expectError(error.InvalidHash, malformed_ev.evaluate(malformed_source));
@@ -482,7 +482,7 @@ test "hashed fetchTarball reports mismatched and malformed sha256" {
         .{archive_path},
     );
     defer std.testing.allocator.free(mismatch_source);
-    var mismatch_ev = try Evaluator.init(std.testing.allocator, 0);
+    var mismatch_ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer mismatch_ev.deinit();
     mismatch_ev.setFileIo(std.testing.io);
     try std.testing.expectError(error.HashMismatch, mismatch_ev.evaluate(mismatch_source));
@@ -515,7 +515,7 @@ test "evaluate fetchTree builtin through fetch cache" {
     const git_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.stringLength (builtins.fetchTree {{ type = \"git\"; url = \"{s}\"; }}).shortRev", .{cwd});
     defer std.testing.allocator.free(git_source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     ev.policy.fetch_tree_enabled = true;
@@ -643,7 +643,7 @@ test "evaluate getFlake builtin for local path ref" {
     const self_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").source", .{flake_dir});
     defer std.testing.allocator.free(self_source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     ev.policy.flakes_enabled = true;
@@ -680,7 +680,7 @@ test "getFlake ties self into the outputs fixpoint" {
     const flake_dir = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(flake_dir);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     ev.policy.flakes_enabled = true;
@@ -739,7 +739,7 @@ test "getFlake resolves inputs from flake.lock (transitive + follows + diamond)"
     defer std.testing.allocator.free(lock);
     try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.lock", .data = lock });
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     ev.policy.flakes_enabled = true;
@@ -775,7 +775,7 @@ test "getFlake resolves inputs from flake.nix when there is no lock" {
     try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = root_flake });
     // deliberately no flake.lock
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     ev.policy.flakes_enabled = true;
@@ -796,7 +796,7 @@ test "getFlake rejects an unsupported flake.lock version" {
     try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = "{ outputs = i: { x = 1; }; }" });
     try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.lock", .data = "{ \"nodes\": {\"root\":{}}, \"root\": \"root\", \"version\": 99 }" });
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     ev.policy.flakes_enabled = true;
@@ -844,7 +844,7 @@ test "getFlake generates, writes, and uses a flake.lock when none exists" {
     defer std.testing.allocator.free(root_nix);
     try t_root.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = root_nix });
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     ev.policy.flakes_enabled = true;
@@ -875,7 +875,7 @@ test "pure evaluation sandboxes env, out-of-tree reads, search paths, and unlock
     const inside = try std.fs.path.join(std.testing.allocator, &.{ dir, "inside.txt" });
     defer std.testing.allocator.free(inside);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     ev.policy.flakes_enabled = true;
@@ -950,7 +950,7 @@ test "evaluate findFile builtin through explicit search path" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.findFile [ {{ prefix = \"pkg\"; path = {s}; }} ] \"pkg/target.nix\"", .{base_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -976,7 +976,7 @@ test "evaluate angle search path literals through cached nix path" {
     const nix_path = try std.fmt.allocPrint(std.testing.allocator, "pkg={s}", .{base_path});
     defer std.testing.allocator.free(nix_path);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
     try ev.setNixPath(nix_path);
@@ -1004,7 +1004,7 @@ test "evaluate import through evaluator file cache" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "let a = import {s}; b = import {s}; in a.value + b.value", .{ file_path, file_path });
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -1046,7 +1046,7 @@ test "evaluate path builtins coerce outPath attrsets" {
     , .{ imported_path, payload_path });
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -1074,7 +1074,7 @@ test "evaluate directory import through default nix" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).value", .{dir_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -1095,7 +1095,7 @@ test "evaluate scopedImport through ambient scope" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.scopedImport {{ x = 1; y = 2; }} {s}", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -1129,7 +1129,7 @@ test "detect recursive scoped imports with migratable workers" {
     );
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 4);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 4 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -1155,7 +1155,7 @@ test "detect recursive imports" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "import {s}", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -1217,7 +1217,7 @@ test "releaseEvalState releases retained flat recipe payload" {
     if (comptime @hasDecl(RealizationStore, "recordFlatRecipe") and @hasDecl(RealizationStore, "releaseRecipePayloads")) {
         var tracking = LifecycleTrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
-        var ev = try Evaluator.init(allocator, 0);
+        var ev = try Engine.init(allocator, .{ .worker_count = 0 });
         defer ev.deinit();
         const payload = try allocator.dupe(u8, "shared evaluator recipe payload");
         const payload_ptr = @intFromPtr(payload.ptr);

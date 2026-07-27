@@ -16,7 +16,7 @@ const setup = @import("../setup.zig");
 const engine = @import("expr");
 const runtime = @import("runtime");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const Value = runtime.Value;
 
 pub const synopsis =
@@ -441,10 +441,9 @@ fn completeFlake(
 /// List the declared input names of the flake in the current directory
 /// (`flake.nix`'s `inputs` attrset) — no fetch, no outputs.
 fn completeFlakeInputNames(allocator: std.mem.Allocator, init: std.process.Init, w: *std.Io.Writer, prefix: []const u8) !void {
-    var ev = try Evaluator.init(allocator, 1);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    ev.setFileIo(init.io);
     const cwd = try std.process.currentPathAlloc(init.io, allocator);
     defer allocator.free(cwd);
     const expr = try std.fmt.allocPrint(allocator, "(import \"{s}/flake.nix\").inputs or {{}}", .{cwd});
@@ -686,7 +685,7 @@ fn completeSourceAttrs(
     const source_arg = options.source orelse options.defaultSource();
     if (source_arg == .flake) options.experimental_features.insert(.flakes);
 
-    var ev = try Evaluator.init(allocator, 1);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     _ = try setup.configure(&ev, init, options);
@@ -708,7 +707,7 @@ fn completePackageAttrs(
 ) !void {
     var options = try parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
-    var ev = try Evaluator.init(allocator, 1);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     _ = try setup.configure(&ev, init, options);
@@ -734,7 +733,7 @@ fn completeFlakeAttrs(
     var options = try parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
     options.experimental_features.insert(.flakes);
-    var ev = try Evaluator.init(allocator, 1);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     _ = try setup.configure(&ev, init, options);
@@ -765,7 +764,7 @@ fn attrParts(prefix: []const u8) AttrParts {
 fn writeAttrCandidates(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
-    ev: *Evaluator,
+    ev: *Engine,
     root: Value,
     prefix: []const u8,
     replacement: []const u8,
@@ -781,7 +780,7 @@ fn writeAttrCandidates(
 fn writeAttrEntries(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
-    ev: *Evaluator,
+    ev: *Engine,
     value: Value,
     partial: []const u8,
     replacement: []const u8,

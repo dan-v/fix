@@ -1,4 +1,4 @@
-//! Evaluator worker runtime: work-stealing scheduler, fiber workers,
+//! Engine worker runtime: work-stealing scheduler, fiber workers,
 //! fiber-scoped execution context, and blocking-work parking adapter.
 
 pub const scheduler = @import("workers/scheduler.zig");

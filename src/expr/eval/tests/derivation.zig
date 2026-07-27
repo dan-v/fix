@@ -1,6 +1,6 @@
 const std = @import("std");
 const eval_mod = @import("../../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 const Diagnostic = eval_mod.Diagnostic;
 const Value = @import("runtime").value.Value;
 const path_ops = @import("runtime").paths;
@@ -282,7 +282,7 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(to_file_churns_intern_table);
     try std.testing.expect(std.mem.endsWith(u8, to_file_churns_intern_table, "-payload.txt\""));
 
-    var missing_hash_algo_ev = try Evaluator.init(std.testing.allocator, 0);
+    var missing_hash_algo_ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer missing_hash_algo_ev.deinit();
     try std.testing.expectError(
         error.InvalidHashAlgorithm,
@@ -346,7 +346,7 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(structured_explicit_outputs);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/5nkc970vb573fs2ppl4vflsymcrri8dn-pkg-structured.drv\\\",\\\"/nix/store/j9jfd9axp7wyhrx9mg088db3iw19dkyw-pkg-structured\\\",\\\"/nix/store/470amnhnd10jpqrh3im85xr0bicjb8rm-pkg-structured-debug\\\"]\"", structured_explicit_outputs);
 
-    var recursive_structured_ev = try Evaluator.init(std.testing.allocator, 0);
+    var recursive_structured_ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer recursive_structured_ev.deinit();
     try std.testing.expectError(
         error.RecursiveThunk,

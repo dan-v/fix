@@ -28,7 +28,7 @@ These span subsystems, so they're collected here. Violating one usually shows up
 
 - **The operand stack is a precise root; force in place.** Ops force with `forceAt`/`forceTop` and write back — never pop-then-force — so a value stays rooted across a possibly-collecting force. → [runtime/thunks](runtime/thunks.md), [vm/dispatch](vm/dispatch.md)
 - **In-flight thunks are rooted by the force chain.** An `.evaluating` thunk is off the stack; `vm.gc_roots.force_chain` roots its target/upvalues for the body's duration. Loop-based builtins use `vm.gc_roots.temporary`. → [gc](gc.md)
-- **`heap_token` invalidates caches.** It bumps on every collection (and per `Evaluator`); the attr inline cache and the [thunk-result memo](runtime/thunks.md) key on it so stale entries auto-miss. Any new cross-eval cache must key on it too. → [gc](gc.md)
+- **`heap_token` invalidates caches.** It bumps on every collection (and per `Engine`); the attr inline cache and the [thunk-result memo](runtime/thunks.md) key on it so stale entries auto-miss. Any new cross-eval cache must key on it too. → [gc](gc.md)
 - **Single-owner ranges.** Every `ValueRange`/`AttrRange` belongs to exactly one object; the GC marks objects, not ranges. Don't alias a range into two objects. → [gc](gc.md)
 - **Collection starts at a demand `forceThunk` boundary.** The coordinating fiber may collect at any native depth because builtin arguments and fresh intermediates are explicitly rooted; peer fibers park only at `native_depth == 0`. → [gc](gc.md)
 

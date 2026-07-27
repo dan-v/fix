@@ -58,7 +58,7 @@ pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
     // needed MUST `force.rootKeep` it first — else the collection sweeps it
     // (w>1 UAF). See concatMap/foldl'/mergeAttrLiteralObjects for the pattern.
     // `import`/`scopedImport` drop back to the caller's depth for the imported
-    // eval (see `Evaluator.evaluateSource`).
+    // eval (see `Engine.evaluateSource`).
     self.native_depth += 1;
     defer {
         self.native_depth -= 1;

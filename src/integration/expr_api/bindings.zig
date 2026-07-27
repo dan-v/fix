@@ -1,6 +1,6 @@
 const std = @import("std");
 const expr = @import("expr");
-const Evaluator = expr.Evaluator;
+const Engine = expr.Engine;
 const value = @import("runtime").value;
 const ValueType = value.ValueType;
 
@@ -11,7 +11,7 @@ test "end-to-end: eager let-elision preserves error order under tryEval (§G)" {
     // `div 1 0`). Only the first-demanded binding may be elided. Verified
     // against the Lix oracle. See strictness.firstForcedName / compileLetIn.
     const alloc = std.testing.allocator;
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     // Body forces `b` (uncaught div-by-zero) FIRST → the error propagates,
@@ -36,7 +36,7 @@ test "end-to-end: eager let-elision preserves error order under tryEval (§G)" {
 test "end-to-end: let binding" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let x = 10; y = 32; in x + y");
@@ -64,7 +64,7 @@ test "end-to-end: let binding" {
 test "end-to-end: duplicate let bindings are rejected" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.ParseError, ev.evaluate("let x = 1; x = 2; in x"));
@@ -78,7 +78,7 @@ test "end-to-end: duplicate let bindings are rejected" {
 test "end-to-end: undefined variables are rejected with source diagnostics" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.UndefinedVariable, ev.evaluate("x"));
@@ -95,7 +95,7 @@ test "end-to-end: undefined variables are rejected with source diagnostics" {
 test "end-to-end: let forward references" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let a = b + 1; b = 3; in a + b");
@@ -105,7 +105,7 @@ test "end-to-end: let forward references" {
 test "end-to-end: unused let binding is not evaluated" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let x = 1 / 0; in 42");
@@ -115,7 +115,7 @@ test "end-to-end: unused let binding is not evaluated" {
 test "end-to-end: recursive let binding errors" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.RecursiveThunk, ev.evaluate("let a = a; in a"));
@@ -125,7 +125,7 @@ test "end-to-end: recursive let binding errors" {
 test "end-to-end: guarded recursive let bindings can terminate" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const true_guard = try ev.evaluate("let a = if true then 1 else b; b = a + 1; in b");
@@ -138,7 +138,7 @@ test "end-to-end: guarded recursive let bindings can terminate" {
 test "end-to-end: inherit quoted attribute from source" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("let x = { \"or\" = 1; }; in { inherit (x) \"or\"; }.\"or\"");
@@ -148,7 +148,7 @@ test "end-to-end: inherit quoted attribute from source" {
 test "end-to-end: inherit from source expression" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const inherited = try ev.evaluate("let src = { x = 7; y = 8; }; in ({ inherit (src) x y; }).x");
@@ -164,7 +164,7 @@ test "end-to-end: inherit from source expression" {
 test "end-to-end: inherit in let bindings" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const outer = try ev.evaluate("let x = 1; in let inherit x; in x");
@@ -183,7 +183,7 @@ test "end-to-end: inherit in let bindings" {
 test "end-to-end: with expressions" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const simple = try ev.evaluate("with { x = 40; y = 2; }; x + y");

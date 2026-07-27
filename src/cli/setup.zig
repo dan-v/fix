@@ -1,6 +1,6 @@
 //! Shared evaluator setup for the eval-producing subcommands (`eval`, `repl`,
 //! `instantiate`, `build`, and `run`). Owns the worker-count formula and
-//! the `Options → Evaluator` configuration block that each subcommand would
+//! the `Options → Engine` configuration block that each subcommand would
 //! otherwise duplicate.
 
 const std = @import("std");
@@ -13,7 +13,7 @@ const nix_conf = @import("nix_conf.zig");
 const hugetlb = @import("base").hugetlb;
 const TextRef = @import("base").TextRef;
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 
 /// Resolve the worker-thread count: an explicit `--workers`, else
 /// `min(12, cpu_count)` (1 when single-threaded).
@@ -24,6 +24,17 @@ pub fn workerCount(options: args.Options) !u8 {
         1
     else
         @intCast(@min(@as(u32, 12), @as(u32, @intCast(try std.Thread.getCpuCount()))));
+}
+
+/// Resolve the process capabilities that must be present when the engine's
+/// long-lived services are constructed. Remaining language/store policy is
+/// applied by `configure` after nix.conf has been folded.
+pub fn engineConfig(init: std.process.Init, worker_count: u8) engine.EngineConfig {
+    return .{
+        .worker_count = worker_count,
+        .io = init.io,
+        .environment = init.environ_map,
+    };
 }
 
 pub const Terminal = struct {
@@ -37,20 +48,20 @@ pub const Terminal = struct {
 };
 
 /// Resolve process-level memory-backing policy that must be decided BEFORE
-/// `Evaluator.init` maps the heap (the flat object store picks its mapping
+/// `Engine.init` maps the heap (the flat object store picks its mapping
 /// at init): `--hugetlb` (`cli_mode`, null for subcommands without the shared
 /// parser), defaulting to `auto`.
 /// Deliberately NOT a nix.conf setting: config loads in `configure`, after
 /// the heap already exists, so a config-sourced value could only half-apply.
-/// Call before `Evaluator.init` in every eval-producing subcommand.
+/// Call before `Engine.init` in every eval-producing subcommand.
 pub fn applyMemoryBacking(cli_mode: ?hugetlb.Mode) void {
     hugetlb.setMode(cli_mode orelse .auto);
 }
 
-/// Apply the shared `Options → Evaluator` configuration (feature toggles,
+/// Apply the shared `Options → Engine` configuration (feature toggles,
 /// parallelism, environment, base path, NIX_PATH) and resolve the terminal
 /// color/progress policy. Enables ANSI on stderr when coloring.
-pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) !Terminal {
+pub fn configure(ev: *Engine, init: std.process.Init, options: args.Options) !Terminal {
     // Language effects are durable stderr records, independent of progress
     // verbosity. The evaluator sink synchronizes and flushes each one.
     // Interactive terminals additionally get ANSI sync-wrapped records so a
@@ -61,8 +72,6 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     ev.setLazyShellsVisible(options.output == .xml);
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.configureMemory(options.gc_budget, options.mem_report, options.gc_report);
-    ev.setEnvironment(init.environ_map);
-
     // Experimental features and the concurrent-fetch cap both come from
     // `nix.conf` (best-effort: unreadable config just uses defaults), so load it
     // once. The CLI-parsed feature set is the starting point; unless the CLI
@@ -179,10 +188,8 @@ fn resolveNixConfigRef(allocator: std.mem.Allocator, io: std.Io, ref: []const u8
 fn foldFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, ref: []const u8, settings: *nix_conf.Settings) void {
     // A ref with quotes/backslashes is invalid; skip rather than mis-escape it.
     if (std.mem.indexOfAny(u8, ref, "\"\\\n") != null) return;
-    var ev = Evaluator.init(allocator, 1) catch return;
+    var ev = Engine.init(allocator, engineConfig(init, 1)) catch return;
     defer ev.deinit();
-    ev.setFileIo(init.io);
-    ev.setEnvironment(init.environ_map);
     // fetchTree / parseFlakeRef need the flakes feature (which implies fetch-tree).
     var feats: args.ExperimentalFeatures = .{};
     feats.insert(.flakes);
@@ -224,7 +231,7 @@ fn foldFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, ref:
 /// `/etc/nix/nix.conf` the daemon does, so unchanged values are no-ops; only
 /// user/CLI overrides differ. `set_options` is only emitted when the store
 /// actually connects (build/instantiate/run/shell), never for plain `eval`.
-fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_conf.Settings) !void {
+fn applyDaemonSettings(ev: *Engine, options: args.Options, settings: *nix_conf.Settings) !void {
     const allocator = ev.hostAllocator();
     var overrides: std.ArrayListUnmanaged(store.daemon.Setting) = .empty;
     defer overrides.deinit(allocator);
@@ -269,7 +276,7 @@ fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_con
 /// Load the `netrc-file` (default `$NIX_CONF_DIR/netrc`, matching Nix) and hand
 /// its credentials to the fetcher for HTTP basic-auth on plain downloads.
 /// Best-effort: a missing/unreadable file just means no netrc auth.
-fn applyNetrc(ev: *Evaluator, init: std.process.Init, settings: *nix_conf.Settings) !void {
+fn applyNetrc(ev: *Engine, init: std.process.Init, settings: *nix_conf.Settings) !void {
     const allocator = ev.hostAllocator();
     const path: []u8 = if (settings.get("netrc-file")) |p|
         try allocator.dupe(u8, p)
@@ -302,7 +309,7 @@ fn jobsSetting(settings: *nix_conf.Settings, key: []const u8, default: u64) u64 
 /// Build the evaluator's search path from `-I`/`--include` entries followed by
 /// `$NIX_PATH`. Command-line entries come first so they take precedence, as in
 /// Nix. A no-op when neither is present.
-fn applyNixPath(ev: *Evaluator, init: std.process.Init, options: args.Options) !void {
+fn applyNixPath(ev: *Engine, init: std.process.Init, options: args.Options) !void {
     const allocator = ev.hostAllocator();
     const env_path = init.environ_map.get("NIX_PATH");
     if (options.include.items.len == 0) {

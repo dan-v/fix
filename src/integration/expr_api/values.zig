@@ -1,13 +1,13 @@
 const std = @import("std");
 const expr = @import("expr");
-const Evaluator = expr.Evaluator;
+const Engine = expr.Engine;
 const value = @import("runtime").value;
 const ValueType = value.ValueType;
 
 test "end-to-end: simple arithmetic" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("10 + 32");
@@ -25,7 +25,7 @@ test "end-to-end: simple arithmetic" {
 test "end-to-end: float arithmetic" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const add = try ev.evaluate("1.5 + 2.25");
@@ -59,7 +59,7 @@ test "end-to-end: float arithmetic" {
 test "end-to-end: string concatenation" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const literal = try ev.evaluate("\"ab\" + \"cd\"");
@@ -74,7 +74,7 @@ test "end-to-end: string concatenation" {
 test "end-to-end: string concatenation coerces string-like attrs" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const out_path = try ev.evaluate("{ outPath = \"/nix/store/source\"; } + \"/subdir\"");
@@ -87,7 +87,7 @@ test "end-to-end: string concatenation coerces string-like attrs" {
 test "end-to-end: path concatenation follows Nix left-path semantics" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const suffix = try ev.evaluate("./foo + \"x\"");
@@ -98,7 +98,7 @@ test "end-to-end: path concatenation follows Nix left-path semantics" {
     try std.testing.expectEqual(value.ValueType.path, paths.kind());
     try std.testing.expectEqualStrings("./foo./bar", ev.intern.get(paths.asInternId()));
 
-    var ev_with_base = try Evaluator.init(alloc, 0);
+    var ev_with_base = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev_with_base.deinit();
     try ev_with_base.setBasePathFromCurrentPath(std.testing.io);
     try std.testing.expectError(error.FileNotFound, ev_with_base.evaluate("\"x\" + ./missing-source-path"));
@@ -107,7 +107,7 @@ test "end-to-end: path concatenation follows Nix left-path semantics" {
 test "end-to-end: string interpolation" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const literal = try ev.evaluate("\"a${\"b\"}c\"");
@@ -128,7 +128,7 @@ test "end-to-end: string interpolation" {
 test "end-to-end: nested interpolation in strings" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const literal_brace = try ev.evaluate("\"a${{ x = \"}\"; }.x}b\"");
@@ -150,7 +150,7 @@ test "end-to-end: nested interpolation in strings" {
 test "end-to-end: indented strings" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const plain = try ev.evaluate(
@@ -186,7 +186,7 @@ test "end-to-end: indented strings" {
 test "end-to-end: list elements are lazy" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("[ 1 (1 / 0) ]");
@@ -196,7 +196,7 @@ test "end-to-end: list elements are lazy" {
 test "end-to-end: list concatenation" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const combined = try ev.evaluate("[ 1 ] ++ [ 2 3 ] == [ 1 2 3 ]");
@@ -211,7 +211,7 @@ test "end-to-end: list concatenation" {
 test "end-to-end: if else false branch" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate("if false then 1 else 2");
@@ -221,7 +221,7 @@ test "end-to-end: if else false branch" {
 test "end-to-end: boolean operators short-circuit" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const and_result = try ev.evaluate("true && false");
@@ -240,7 +240,7 @@ test "end-to-end: boolean operators short-circuit" {
 test "end-to-end: boolean contexts require booleans" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.TypeError, ev.evaluate("if 1 then 2 else 3"));
@@ -252,7 +252,7 @@ test "end-to-end: boolean contexts require booleans" {
 test "end-to-end: comparisons reject incompatible types" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     try std.testing.expectError(error.TypeError, ev.evaluate("1 < true"));
@@ -269,7 +269,7 @@ test "end-to-end: comparisons reject incompatible types" {
 test "end-to-end: lists and attrs compare structurally" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const lists_equal = try ev.evaluate("[ 1 2 ] == [ 1 2 ]");
@@ -340,7 +340,7 @@ test "end-to-end: lists and attrs compare structurally" {
 test "end-to-end: assert and implication" {
     const alloc = std.testing.allocator;
 
-    var ev = try Evaluator.init(alloc, 0);
+    var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const passed = try ev.evaluate("assert 1 < 2; 42");

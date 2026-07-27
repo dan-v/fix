@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const eval_mod = @import("../../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 const DebugSession = eval_mod.DebugSession;
 const Value = @import("runtime").value.Value;
 
@@ -29,7 +29,7 @@ const Probe = struct {
     /// Count of `.line_breakpoint` pauses.
     line_hits: usize = 0,
 
-    fn install(self: *Probe, ev: *Evaluator) void {
+    fn install(self: *Probe, ev: *Engine) void {
         ev.setDebugUi(self, run);
     }
 
@@ -68,7 +68,7 @@ const Probe = struct {
 };
 
 test "builtins.break drives the debug UI and is identity" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     var probe: Probe = .{};
     probe.install(&ev);
@@ -82,7 +82,7 @@ test "builtins.break drives the debug UI and is identity" {
 }
 
 test "native debug entry pauses on unchanged user source" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     var probe: Probe = .{};
     probe.install(&ev);
@@ -96,7 +96,7 @@ test "native debug entry pauses on unchanged user source" {
 }
 
 test "debug session evaluates expressions with the break value bound as it" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     var probe: Probe = .{ .eval_expr = "it.a + it.b" };
     probe.install(&ev);
@@ -107,7 +107,7 @@ test "debug session evaluates expressions with the break value bound as it" {
 }
 
 test "scopeAttrs resolves breakpoint-scope locals and upvalues by name" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     ev.setCaptureChunkNames(true); // --debugger enables this; needed for names
     var probe: Probe = .{ .eval_expr = "base * factor + n" };
@@ -129,7 +129,7 @@ test "scopeAttrs resolves breakpoint-scope locals and upvalues by name" {
 }
 
 test "scopeAttrs resolves with-scope bindings, inner with shadowing outer" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     ev.setCaptureChunkNames(true);
     var probe: Probe = .{ .eval_expr = "hello + toString world" };
@@ -148,7 +148,7 @@ test "scopeAttrs resolves with-scope bindings, inner with shadowing outer" {
 }
 
 test "qualified chunk names are populated always-on, without capture_names" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     // Deliberately do NOT setCaptureChunkNames — the name tree is always on.
     _ = try ev.evaluate("let myFunc = x: x + 1; in myFunc 5");
@@ -169,14 +169,14 @@ test "qualified chunk names are populated always-on, without capture_names" {
 }
 
 test "no debug UI installed leaves builtins.break as a plain identity" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     const result = try ev.evaluate("builtins.break 7");
     try std.testing.expectEqual(@as(i64, 7), (try ev.forceValue(result)).asInt());
 }
 
 test "debug UI can be detached between evaluations" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     var probe: Probe = .{};
     probe.install(&ev);
@@ -188,7 +188,7 @@ test "debug UI can be detached between evaluations" {
 }
 
 test "throw enters the debugger, then the error still propagates" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     var probe: Probe = .{};
     probe.install(&ev);
@@ -200,7 +200,7 @@ test "throw enters the debugger, then the error still propagates" {
 }
 
 test "tryEval suppresses debugger error-entry for caught errors" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     var probe: Probe = .{};
     probe.install(&ev);
@@ -210,7 +210,7 @@ test "tryEval suppresses debugger error-entry for caught errors" {
 }
 
 test "source-line breakpoint fires and preserves the result" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     var probe: Probe = .{ .set_bp = .{ .file = "bp.nix", .line = 3 } };
     probe.install(&ev);
@@ -232,7 +232,7 @@ test "source-line breakpoint fires and preserves the result" {
 }
 
 test "deleting a source-line breakpoint stops it firing" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
 
     // Set then immediately delete on the first pause; the line must not fire.
@@ -262,7 +262,7 @@ test "deleting a source-line breakpoint stops it firing" {
 }
 
 test "stepping pauses again and preserves the result" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
 
     // On the initial break, arm a step-into; count the resulting step pauses.
@@ -293,7 +293,7 @@ test "stepping pauses again and preserves the result" {
 }
 
 test "repeated step into preserves suspended caller operands" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
 
     // Forcing `seed`, `base`, and the function argument suspends parent
@@ -348,7 +348,7 @@ test "step into follows an import compiled after the step is armed" {
     );
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -403,7 +403,7 @@ test "repeated debug evaluations replay memoized imports for stepping" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).value", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -477,7 +477,7 @@ test "pending import breakpoint preserves the parent stack and finish returns to
     const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).value + 1", .{file_path});
     defer std.testing.allocator.free(source);
 
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
 
@@ -532,7 +532,7 @@ test "pending import breakpoint preserves the parent stack and finish returns to
 }
 
 test "finish pauses in the caller with the returned value" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
 
     const Ctl = struct {
@@ -583,7 +583,7 @@ test "finish pauses in the caller with the returned value" {
 }
 
 test "clearStep after a step leaves no patched bytecode behind" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
 
     // Arm a step-over on the break, immediately clear it, and continue: the
@@ -613,7 +613,7 @@ test "clearStep after a step leaves no patched bytecode behind" {
 }
 
 test "console abort error propagates out of evaluation" {
-    var ev = try Evaluator.init(std.testing.allocator, 1);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
     var probe: Probe = .{ .return_error = error.DebuggerAbort };
     probe.install(&ev);

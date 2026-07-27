@@ -1,13 +1,13 @@
-//! Test-only helpers that spin up an Evaluator, evaluate a source string, and
+//! Test-only helpers that spin up an Engine, evaluate a source string, and
 //! render the result to text (strict, XML, pipe-operator, and base-path
 //! variants) for eval unit tests.
 
 const std = @import("std");
 const eval_mod = @import("../evaluator.zig");
-const Evaluator = eval_mod.Evaluator;
+const Engine = eval_mod.Engine;
 
 pub fn renderForTest(source: []const u8) ![]u8 {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate(source);
@@ -23,7 +23,7 @@ pub fn renderForTest(source: []const u8) ![]u8 {
 /// tests that need file-attributed spans/attr positions (like Nix evaluating
 /// a real file).
 pub fn renderPathForTest(source: []const u8, source_path: []const u8) ![]u8 {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluatePath(source, source_path);
@@ -37,7 +37,7 @@ pub fn renderPathForTest(source: []const u8, source_path: []const u8) ![]u8 {
 }
 
 pub fn renderStrictForTest(source: []const u8) ![]u8 {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
 
     const result = try ev.evaluate(source);
@@ -51,7 +51,7 @@ pub fn renderStrictForTest(source: []const u8) ![]u8 {
 }
 
 pub fn renderWithPipeOperators(source: []const u8) ![]u8 {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.policy.pipe_operators_enabled = true;
 
@@ -65,7 +65,7 @@ pub fn renderWithPipeOperators(source: []const u8) ![]u8 {
 }
 
 pub fn renderWithFetchTree(source: []const u8) ![]u8 {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.policy.fetch_tree_enabled = true;
 
@@ -79,7 +79,7 @@ pub fn renderWithFetchTree(source: []const u8) ![]u8 {
 }
 
 pub fn renderWithFlakes(source: []const u8) ![]u8 {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     ev.policy.flakes_enabled = true;
 
@@ -93,7 +93,7 @@ pub fn renderWithFlakes(source: []const u8) ![]u8 {
 }
 
 pub fn renderForTestFromCurrentPath(source: []const u8) ![]u8 {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     try ev.setBasePathFromCurrentPath(std.testing.io);
 
@@ -107,7 +107,7 @@ pub fn renderForTestFromCurrentPath(source: []const u8) ![]u8 {
 }
 
 pub fn renderXmlForTest(source: []const u8) ![]u8 {
-    var ev = try Evaluator.init(std.testing.allocator, 0);
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
     // Lazy shells (eager shapes that render `<unevaluated />`) are only
     // built when the render observes them — mirror the CLI's `--xml`.

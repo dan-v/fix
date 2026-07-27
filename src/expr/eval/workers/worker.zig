@@ -396,7 +396,7 @@ pub const Worker = struct {
     }
 
     /// Drive a custom one-shot fiber to completion. Used by every
-    /// public entry on the Evaluator — top-level eval, render, force.
+    /// public entry on the Engine — top-level eval, render, force.
     /// While the entry's fiber is suspended (waiting on a `.busy`
     /// thunk), we still drain ready fibers + scheduler tasks, so the
     /// owning OS thread participates in work-stealing the same way a

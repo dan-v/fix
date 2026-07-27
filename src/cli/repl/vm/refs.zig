@@ -8,7 +8,7 @@ const std = @import("std");
 const engine = @import("expr");
 const runtime = @import("runtime");
 
-const Evaluator = engine.Evaluator;
+const Engine = engine.Engine;
 const ChunkId = runtime.types.ChunkId;
 const ObjectId = runtime.types.ObjectId;
 const object_tag: u64 = @as(u64, 1) << 63;
@@ -46,7 +46,7 @@ pub const Graph = struct {
     object_high_water: u32,
     allocator: std.mem.Allocator,
 
-    pub fn build(allocator: std.mem.Allocator, ev: *const Evaluator) !Graph {
+    pub fn build(allocator: std.mem.Allocator, ev: *const Engine) !Graph {
         var snapshot = try ev.heapObjectSnapshot(allocator);
         defer snapshot.deinit();
 
