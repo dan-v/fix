@@ -65,6 +65,19 @@ pub fn snapshotLocal(
 
 var init_mu: sync.BlockingMutex = .{};
 var initialized = false;
+var network_config_mu: sync.BlockingMutex = .{};
+var network_config: GlobalNetworkConfig = .{};
+
+/// libgit2 exposes certificate and timeout settings only as process globals.
+/// Configure them once, immutably, so concurrent requests never race and a
+/// request can never inherit another request's policy by accident.
+const GlobalNetworkConfig = struct {
+    configured: bool = false,
+    ca_len: ?usize = null,
+    ca: [std.fs.max_path_bytes]u8 = undefined,
+    connect_timeout_seconds: u32 = 0,
+    stalled_timeout_seconds: u32 = 0,
+};
 
 fn ensureInitialized() !void {
     init_mu.lock();
@@ -72,6 +85,54 @@ fn ensureInitialized() !void {
     if (initialized) return;
     if (c.git_libgit2_init() < 0) return error.GitInitializationFailed;
     initialized = true;
+}
+
+fn ensureNetworkConfig(options: Options, ca_z: ?[:0]u8) !void {
+    network_config_mu.lock();
+    defer network_config_mu.unlock();
+
+    if (network_config.configured) {
+        const ca_matches = if (options.ca_file) |path|
+            network_config.ca_len != null and
+                network_config.ca_len.? == path.len and
+                std.mem.eql(u8, network_config.ca[0..path.len], path)
+        else
+            network_config.ca_len == null;
+        if (!ca_matches or
+            network_config.connect_timeout_seconds != options.connect_timeout_seconds or
+            network_config.stalled_timeout_seconds != options.stalled_timeout_seconds)
+        {
+            return error.GitGlobalConfigurationConflict;
+        }
+        return;
+    }
+
+    if (options.ca_file) |path| {
+        if (path.len > network_config.ca.len) return error.NameTooLong;
+        const value = ca_z orelse unreachable;
+        try check(c.git_libgit2_opts(
+            c.GIT_OPT_SET_SSL_CERT_LOCATIONS,
+            value.ptr,
+            @as(?[*:0]const u8, null),
+        ));
+        @memcpy(network_config.ca[0..path.len], path);
+        network_config.ca_len = path.len;
+    }
+    try check(c.git_libgit2_opts(
+        c.GIT_OPT_SET_SERVER_CONNECT_TIMEOUT,
+        timeoutMilliseconds(options.connect_timeout_seconds),
+    ));
+    try check(c.git_libgit2_opts(
+        c.GIT_OPT_SET_SERVER_TIMEOUT,
+        timeoutMilliseconds(options.stalled_timeout_seconds),
+    ));
+    network_config.connect_timeout_seconds = options.connect_timeout_seconds;
+    network_config.stalled_timeout_seconds = options.stalled_timeout_seconds;
+    network_config.configured = true;
+}
+
+fn timeoutMilliseconds(seconds: u32) c_int {
+    return @intCast(@min(seconds *| 1000, std.math.maxInt(c_int)));
 }
 
 const CallbackContext = struct {
@@ -171,11 +232,7 @@ pub fn materialize(
     defer if (ca_z) |value| allocator.free(value);
     const proxy_z = if (options.proxy_url) |value| try allocator.dupeZ(u8, value) else null;
     defer if (proxy_z) |value| allocator.free(value);
-    if (ca_z) |value| try check(c.git_libgit2_opts(c.GIT_OPT_SET_SSL_CERT_LOCATIONS, value.ptr, @as(?[*:0]const u8, null)));
-    if (options.connect_timeout_seconds > 0)
-        try check(c.git_libgit2_opts(c.GIT_OPT_SET_SERVER_CONNECT_TIMEOUT, @as(c_int, @intCast(@min(options.connect_timeout_seconds *| 1000, std.math.maxInt(c_int))))));
-    if (options.stalled_timeout_seconds > 0)
-        try check(c.git_libgit2_opts(c.GIT_OPT_SET_SERVER_TIMEOUT, @as(c_int, @intCast(@min(options.stalled_timeout_seconds *| 1000, std.math.maxInt(c_int))))));
+    try ensureNetworkConfig(options, ca_z);
 
     var context = CallbackContext{
         .username = if (username_z) |value| value.ptr else null,
