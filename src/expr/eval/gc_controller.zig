@@ -331,7 +331,7 @@ pub const nowNs = clock.monotonicNs;
 pub const gc_limit_numerator: u64 = 1;
 pub const gc_limit_denominator: u64 = 2; // half of RAM
 pub const gc_limit_floor: u64 = 256 << 20; // 256 MB — below this, don't bother
-pub const gc_limit_ceiling: u64 = 8 << 30; // 8 GB — cap absolute garbage on big boxes
+pub const gc_limit_ceiling: u64 = 32 << 30; // 32 GB — cap absolute garbage on big boxes
 
 /// Resolve the collection line: `--gc-budget` if given, else the automatic
 /// `clamp(fraction × MemTotal, floor, ceiling)`. An explicit
@@ -373,8 +373,8 @@ test "constrained mode: explicit limit or sub-ceiling auto line" {
     try std.testing.expect(constrainedFor(c, true, c)); // explicit at the ceiling
     try std.testing.expect(constrainedFor(2 << 30, false, c)); // RAM-limited auto (< ceiling)
     try std.testing.expect(constrainedFor(800 << 20, false, c)); // small auto line
-    try std.testing.expect(!constrainedFor(16 << 30, false, c)); // auto above ceiling (defensive)
-    try std.testing.expect(constrainedFor(16 << 30, true, c)); // explicit big limit still opts in
+    try std.testing.expect(!constrainedFor(64 << 30, false, c)); // auto above ceiling (defensive)
+    try std.testing.expect(constrainedFor(64 << 30, true, c)); // explicit big limit still opts in
 }
 
 /// The automatic line: a fraction of physical RAM, clamped. MemTotal (not the
@@ -410,9 +410,10 @@ test "auto collection line: fraction of RAM, clamped to [floor, ceiling]" {
     try std.testing.expectEqual(@as(u64, 1 << 30), lineFor(2 << 30, f, c)); // 2GB → 1GB
     try std.testing.expectEqual(@as(u64, 2 << 30), lineFor(4 << 30, f, c)); // 4GB → 2GB
     try std.testing.expectEqual(@as(u64, 4 << 30), lineFor(8 << 30, f, c)); // 8GB → 4GB
+    try std.testing.expectEqual(@as(u64, 8 << 30), lineFor(16 << 30, f, c)); // 16GB → 8GB
     // Ceiling: huge boxes don't sit on absurd garbage.
-    try std.testing.expectEqual(c, lineFor(16 << 30, f, c)); // 16GB → 8GB (cap)
-    try std.testing.expectEqual(c, lineFor(128 << 30, f, c)); // 128GB → 8GB (cap)
+    try std.testing.expectEqual(c, lineFor(64 << 30, f, c)); // 64GB → 32GB (cap)
+    try std.testing.expectEqual(c, lineFor(128 << 30, f, c)); // 128GB → 32GB (cap)
     // Overridden bounds: a raised ceiling lets a big box hold more before GC.
     try std.testing.expectEqual(@as(u64, 32 << 30), lineFor(64 << 30, f, 64 << 30)); // ½·64=32GB, under raised 64GB cap
     try std.testing.expectEqual(@as(u64, 64 << 30), lineFor(256 << 30, f, 64 << 30)); // ½·256=128GB → capped at 64GB

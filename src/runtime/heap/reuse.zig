@@ -232,11 +232,36 @@ pub const RangeFreeList = struct {
         return true;
     }
 
-    pub fn moveBestFitBatchTo(self: *RangeFreeList, dst: *RangeFreeList, allocator: std.mem.Allocator, minimum: u32, limit: usize, divisor: usize) bool {
-        const class = self.smallestClassAtLeast(minimum) orelse return false;
+    /// Claim one range from the best-fit class and move the rest of the
+    /// caller's fair-share batch to `dst`. The returned `Hit`, not a boolean
+    /// transfer followed by a second pop, is the allocation claim.
+    ///
+    /// Caller synchronizes both lists. `dst` must be a worker-local list.
+    pub fn moveBestFitBatchAndClaim(
+        self: *RangeFreeList,
+        dst: *RangeFreeList,
+        allocator: std.mem.Allocator,
+        minimum: u32,
+        limit: usize,
+        divisor: usize,
+    ) ?Hit {
+        if (limit == 0 or self == dst) return null;
+        const class = self.smallestClassAtLeast(minimum) orelse return null;
         const available = class.ranges.items.len;
         const fair_share = (available + divisor - 1) / divisor;
-        return self.moveClassTo(dst, allocator, class.node.key, @min(limit, fair_share));
+        const take = @min(limit, fair_share);
+        if (take == 0) return null;
+
+        const bits = class.ranges.pop().?;
+        const len = class.node.key;
+        if (class.ranges.items.len == 0) self.deactivateClass(class);
+        if (take > 1)
+            _ = self.moveClassTo(dst, allocator, len, take - 1);
+
+        const loc = unpack(bits);
+        if (len > minimum)
+            dst.push(allocator, loc.segment, loc.offset + minimum, len - minimum);
+        return .{ .loc = loc, .split = len != minimum };
     }
 
     pub fn moveAllTo(self: *RangeFreeList, dst: *RangeFreeList, allocator: std.mem.Allocator) void {
