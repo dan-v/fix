@@ -90,14 +90,14 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     ok = true;
     for (0..input_count) |index| {
-        const input = input_plan.load(&ev, index) catch |err| {
+        var input = input_plan.load(&ev, index) catch |err| {
             eval_support.reportInputReadError(input_count, index, err);
             ok = false;
             continue;
         };
         defer input.deinit(&ev);
         // Let the debugger show snippets for synthesized expressions.
-        if (options.debugger) ev.setDebugSource(input.source.text);
+        if (options.debugger) ev.setDebugSource(input.source.slice());
         const input_ok = try eval_support.evaluateAndWrite(
             init.io,
             options.evaluationMode(),

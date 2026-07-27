@@ -66,7 +66,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const inputs = try allocator.alloc(realization_workflow.BuildInput, input_count);
     var loaded: usize = 0;
     defer {
-        for (inputs[0..loaded]) |input| input.deinit(&ev);
+        for (inputs[0..loaded]) |*input| input.deinit(&ev);
         allocator.free(inputs);
     }
 

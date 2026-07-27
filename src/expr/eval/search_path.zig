@@ -7,6 +7,7 @@ const path_ops = @import("runtime").paths;
 const FileCache = @import("store").FileCache;
 const InternTable = @import("runtime").intern.InternTable;
 const Value = @import("runtime").value.Value;
+const TextRef = @import("base").TextRef;
 
 pub const Entry = struct {
     prefix: []u8,
@@ -19,12 +20,7 @@ pub const Entry = struct {
 };
 
 /// Result of resolving a possibly-relative path against a base path.
-/// `owned` says whether `text` was freshly allocated and the caller
-/// owns it (true) or whether `text` is borrowed from the input (false).
-pub const ResolvedPath = struct {
-    text: []const u8,
-    owned: bool,
-};
+pub const ResolvedPath = TextRef;
 
 /// Parsed NIX_PATH entries. `set` rebuilds from a `:`-separated string;
 /// resolution against base_path is the caller's responsibility (we
@@ -68,11 +64,11 @@ pub const Paths = struct {
             const raw_path = if (eq) |i| part[i + 1 ..] else part;
             if (raw_path.len == 0) continue;
 
-            const resolved = resolve(ctx, raw_path) catch |err| switch (err) {
+            var resolved = resolve(ctx, raw_path) catch |err| switch (err) {
                 error.RelativePath => continue,
                 else => return err,
             };
-            defer if (resolved.owned) allocator.free(resolved.text);
+            defer resolved.deinit(allocator);
 
             // Reserve the list slot before cloning either field, then keep
             // each clone in a local until the complete Entry can be published.
@@ -81,7 +77,7 @@ pub const Paths = struct {
             try entries.ensureUnusedCapacity(allocator, 1);
             const owned_prefix = try allocator.dupe(u8, prefix);
             errdefer allocator.free(owned_prefix);
-            const owned_path = try allocator.dupe(u8, resolved.text);
+            const owned_path = try allocator.dupe(u8, resolved.slice());
             errdefer allocator.free(owned_path);
             entries.appendAssumeCapacity(.{
                 .prefix = owned_prefix,
@@ -179,7 +175,7 @@ fn candidate(
 }
 
 fn borrowedTestPath(_: u8, path: []const u8) anyerror!ResolvedPath {
-    return .{ .text = path, .owned = false };
+    return .{ .borrowed = path };
 }
 
 fn checkPathAllocationFailures(allocator: std.mem.Allocator) !void {

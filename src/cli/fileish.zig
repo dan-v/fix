@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Evaluator = @import("expr").Evaluator;
+const TextRef = @import("base").TextRef;
 
 pub const Kind = enum { stdin, path, lookup, tarball, channel, flake };
 
@@ -22,15 +23,20 @@ pub fn requiresFlakes(input: []const u8) bool {
 }
 
 pub const Source = struct {
-    text: []const u8,
-    owned: bool = false,
-    abs_path: ?[]const u8 = null,
-    base_path: ?[]const u8 = null,
+    text: TextRef,
+    abs_path: ?[]u8 = null,
+    base_path: ?[]u8 = null,
 
-    pub fn deinit(self: Source, allocator: std.mem.Allocator) void {
-        if (self.owned) allocator.free(self.text);
+    pub fn slice(self: Source) []const u8 {
+        return self.text.slice();
+    }
+
+    pub fn deinit(self: *Source, allocator: std.mem.Allocator) void {
+        self.text.deinit(allocator);
         if (self.abs_path) |p| allocator.free(p);
         if (self.base_path) |p| allocator.free(p);
+        self.abs_path = null;
+        self.base_path = null;
     }
 };
 
@@ -45,15 +51,15 @@ pub fn load(ev: *Evaluator, io: std.Io, input: []const u8) !Source {
         const text = try stdin.interface.allocRemaining(allocator, .limited(128 << 20));
         errdefer allocator.free(text);
         const base = if (ev.basePath()) |p| try allocator.dupe(u8, p) else null;
-        return .{ .text = text, .owned = true, .base_path = base };
+        return .{ .text = .{ .owned = text }, .base_path = base };
     }
 
     var path: []u8 = switch (classify(input)) {
         .stdin => unreachable,
         .path => blk: {
-            const resolved = try ev.resolveHostPath(input);
-            defer if (resolved.owned) allocator.free(resolved.text);
-            break :blk try allocator.dupe(u8, resolved.text);
+            var resolved = try ev.resolveHostPath(input);
+            defer resolved.deinit(allocator);
+            break :blk try allocator.dupe(u8, resolved.slice());
         },
         .lookup => try ev.resolveLookupPath(input[1 .. input.len - 1]),
         .tarball => try ev.fetchTarballPath(input),
@@ -76,7 +82,7 @@ pub fn load(ev: *Evaluator, io: std.Io, input: []const u8) !Source {
     const dir = std.fs.path.dirname(path) orelse "/";
     const base = try allocator.dupe(u8, dir);
     errdefer allocator.free(base);
-    return .{ .text = text, .abs_path = path, .base_path = base };
+    return .{ .text = .{ .borrowed = text }, .abs_path = path, .base_path = base };
 }
 
 fn channelUrl(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -103,16 +109,16 @@ test "load resolves directories and lookup paths to default.nix" {
     defer ev.deinit();
     try ev.setBasePathFromCurrentPath(std.testing.io);
 
-    const directory = try load(&ev, std.testing.io, "test/fileish");
+    var directory = try load(&ev, std.testing.io, "test/fileish");
     defer directory.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.endsWith(u8, directory.abs_path.?, "/test/fileish/default.nix"));
-    try std.testing.expect(std.mem.indexOf(u8, directory.text, "relative.nix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, directory.slice(), "relative.nix") != null);
 
     const nix_path = try std.fmt.allocPrint(std.testing.allocator, "fixture={s}/test/fileish", .{ev.basePath().?});
     defer std.testing.allocator.free(nix_path);
     try ev.setNixPath(nix_path);
-    const lookup = try load(&ev, std.testing.io, "<fixture>");
+    var lookup = try load(&ev, std.testing.io, "<fixture>");
     defer lookup.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(directory.abs_path.?, lookup.abs_path.?);
-    try std.testing.expectEqualStrings(directory.text, lookup.text);
+    try std.testing.expectEqualStrings(directory.slice(), lookup.slice());
 }

@@ -243,8 +243,15 @@ pub fn build(b: *std.Build) void {
         .check = true,
     });
 
+    const run_structure_check = b.addSystemCommand(&.{"bash"});
+    run_structure_check.addFileArg(b.path("tools/structure_check.sh"));
+    run_structure_check.addArg(b.pathFromRoot("."));
+    const structure_check_step = b.step("structure-check", "Check durable module and ownership boundaries");
+    structure_check_step.dependOn(&run_structure_check.step);
+
     const check_step = b.step("check", "Check formatting and run unit tests");
     check_step.dependOn(&format_check.step);
+    check_step.dependOn(structure_check_step);
     check_step.dependOn(test_step);
 
     // Quick syntax-only tests. The parser imports the build-generated

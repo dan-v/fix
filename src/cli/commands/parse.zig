@@ -58,12 +58,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
 
     const source_arg = options.source orelse options.defaultSource();
-    const loaded = loadSource(&ev, init.io, source_arg) catch |err| {
+    var loaded = loadSource(&ev, init.io, source_arg) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
     defer loaded.deinit(allocator);
-    const source = loaded.text;
+    const source = loaded.slice();
     const source_path = loaded.abs_path;
 
     // 1. Syntactic parse — the AST we print, and the syntax-error gate.
@@ -131,7 +131,7 @@ const DeprecationWarning = syntax.parser.DeprecationWarning;
 
 fn loadSource(ev: *Evaluator, io: std.Io, source: args.SourceArg) !fileish.Source {
     return switch (source) {
-        .expr => |text| .{ .text = text },
+        .expr => |text| .{ .text = .{ .borrowed = text } },
         .file => |path| try fileish.load(ev, io, path),
         .flake => error.FlakeParseUnsupported,
     };

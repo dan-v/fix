@@ -95,17 +95,17 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
-    const source = eval_support.getSource(&ev, init.io, source_arg, options) catch |err| {
+    var source = eval_support.getSource(&ev, init.io, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
     defer source.deinit(ev.hostAllocator());
 
-    const value = ev.evaluatePathAt(source.text, source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
-        return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
+    const value = ev.evaluatePathAt(source.slice(), source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
+        return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.slice(), err);
     };
     const paths = (ev.derivationBuildPaths(value) catch |err| {
-        return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
+        return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.slice(), err);
     }) orelse {
         std.debug.print("error: expression did not evaluate to a derivation\n", .{});
         return 1;

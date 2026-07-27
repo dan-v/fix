@@ -21,6 +21,7 @@ const diagnostics = @import("diagnostics.zig");
 const attrs = @import("attrs.zig");
 const int_ops = @import("runtime").int;
 const parser_mod = @import("syntax").parser;
+const TextRef = @import("base").TextRef;
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -35,10 +36,7 @@ const WithScope = compiler_mod.WithScope;
 const InternId = types.InternId;
 const offsetNode = ast.offsetNode;
 
-pub const ResolvedPath = struct {
-    text: []const u8,
-    owned: bool,
-};
+pub const ResolvedPath = TextRef;
 
 pub fn compileInt(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
@@ -96,7 +94,7 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
     for (parsed.parts) |part| {
         switch (part) {
             .text => |text| {
-                var bytes = text.bytes;
+                var bytes = text.slice();
                 // A NUL byte is a compile error unless the `nul-bytes`
                 // deprecated feature is on, in which case the string is
                 // truncated at the NUL (fix/Nix strings are NUL-terminated).
@@ -222,9 +220,9 @@ pub fn compilePath(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
     if (std.mem.indexOf(u8, span, "${") != null) return compileInterpolatedPath(self, span, node.data.atom.offset);
 
-    const path = try resolvePathLiteral(self, span);
-    defer if (path.owned) self.allocator.free(path.text);
-    const id = try self.intern.intern(path.text);
+    var path = try resolvePathLiteral(self, span);
+    defer path.deinit(self.allocator);
+    const id = try self.intern.intern(path.slice());
     const v = Value.path(id);
     try self.builder.emitConstant(self.allocator, v);
 }
@@ -263,9 +261,9 @@ pub fn compileInterpolatedPath(self: *Compiler, span: []const u8, source_offset:
 pub fn emitPathTextPart(self: *Compiler, part: []const u8, have_base: *bool) !bool {
     if (part.len == 0) return false;
     if (!have_base.*) {
-        const path = try resolvePathLiteralPreserveTrailingSlash(self, part);
-        defer if (path.owned) self.allocator.free(path.text);
-        const id = try self.intern.intern(path.text);
+        var path = try resolvePathLiteralPreserveTrailingSlash(self, part);
+        defer path.deinit(self.allocator);
+        const id = try self.intern.intern(path.slice());
         try self.builder.emitConstant(self.allocator, Value.path(id));
         have_base.* = true;
         return true;
@@ -315,32 +313,23 @@ pub fn resolvePathLiteral(self: *Compiler, span: []const u8) !ResolvedPath {
         const home = self.home_dir orelse return error.NoHomeDir;
         const joined = try std.fs.path.join(self.allocator, &.{ home, span[1..] });
         defer self.allocator.free(joined);
-        return .{
-            .text = try std.fs.path.resolve(self.allocator, &.{joined}),
-            .owned = true,
-        };
+        return .{ .owned = try std.fs.path.resolve(self.allocator, &.{joined}) };
     }
     if (std.fs.path.isAbsolute(span)) {
-        return .{
-            .text = try std.fs.path.resolve(self.allocator, &.{span}),
-            .owned = true,
-        };
+        return .{ .owned = try std.fs.path.resolve(self.allocator, &.{span}) };
     }
-    const cwd = self.base_path orelse return .{ .text = span, .owned = false };
+    const cwd = self.base_path orelse return .{ .borrowed = span };
 
-    return .{
-        .text = try std.fs.path.resolve(self.allocator, &.{ cwd, span }),
-        .owned = true,
-    };
+    return .{ .owned = try std.fs.path.resolve(self.allocator, &.{ cwd, span }) };
 }
 
 pub fn resolvePathLiteralPreserveTrailingSlash(self: *Compiler, span: []const u8) !ResolvedPath {
-    const resolved = try resolvePathLiteral(self, span);
-    if (!std.mem.endsWith(u8, span, "/") or std.mem.endsWith(u8, resolved.text, "/")) return resolved;
+    var resolved = try resolvePathLiteral(self, span);
+    if (!std.mem.endsWith(u8, span, "/") or std.mem.endsWith(u8, resolved.slice(), "/")) return resolved;
 
-    const text = try std.fmt.allocPrint(self.allocator, "{s}/", .{resolved.text});
-    if (resolved.owned) self.allocator.free(resolved.text);
-    return .{ .text = text, .owned = true };
+    const text = try std.fmt.allocPrint(self.allocator, "{s}/", .{resolved.slice()});
+    resolved.deinit(self.allocator);
+    return .{ .owned = text };
 }
 
 pub fn compileIdent(self: *Compiler, node: *const Node) !void {

@@ -985,7 +985,7 @@ pub fn attrSegmentNameAlloc(self: *Compiler, atom: Node.Atom) ![]u8 {
 
     for (parsed.parts) |part| {
         switch (part) {
-            .text => |text| try out.appendSlice(self.allocator, text.bytes),
+            .text => |text| try out.appendSlice(self.allocator, text.slice()),
             .interpolation => return error.InvalidAttributePath,
         }
     }

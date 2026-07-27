@@ -14,6 +14,7 @@ pub const fiber = @import("fiber.zig");
 pub const sync = @import("sync.zig");
 pub const clock = @import("clock.zig");
 pub const owned_strings = @import("owned_strings.zig");
+pub const text_ref = @import("text_ref.zig");
 pub const segments = @import("segments.zig");
 pub const vma = @import("vma.zig");
 pub const block_cache = @import("block_cache.zig");
@@ -32,6 +33,7 @@ pub const GrowableDeque = deque.GrowableDeque;
 pub const Isolated = cache_line.Isolated;
 pub const Fiber = fiber.Fiber;
 pub const BlockingPool = blocking_pool.BlockingPool;
+pub const TextRef = text_ref.TextRef;
 
 test {
     _ = deque;
@@ -40,6 +42,7 @@ test {
     _ = sync;
     _ = clock;
     _ = owned_strings;
+    _ = text_ref;
     _ = segments;
     _ = vma;
     _ = block_cache;

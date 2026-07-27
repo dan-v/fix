@@ -166,7 +166,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
         return 2;
     }
 
-    const source = eval_support.getSource(&ev, init.io, source_arg, options.*) catch |err| {
+    var source = eval_support.getSource(&ev, init.io, source_arg, options.*) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };

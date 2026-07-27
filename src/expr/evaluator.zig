@@ -876,9 +876,9 @@ pub const Evaluator = struct {
     }
 
     pub fn readSourceFile(self: *Evaluator, path: []const u8) ![]const u8 {
-        const resolved = try self.resolveHostPath(path);
-        defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.sources.files.readFile(resolved.text);
+        var resolved = try self.resolveHostPath(path);
+        defer resolved.deinit(self.allocator);
+        return self.sources.files.readFile(resolved.slice());
     }
 
     /// Resolve `<name>` through the configured NIX_PATH to an owned host path.
@@ -902,9 +902,9 @@ pub const Evaluator = struct {
     }
 
     pub fn isSourceDirectory(self: *Evaluator, path: []const u8) !bool {
-        const resolved = try self.resolveHostPath(path);
-        defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.sources.files.isDirectoryFollowing(resolved.text);
+        var resolved = try self.resolveHostPath(path);
+        defer resolved.deinit(self.allocator);
+        return self.sources.files.isDirectoryFollowing(resolved.slice());
     }
 
     /// Fetch a flake source without evaluating its outputs. `parseFlakeRef`
@@ -2352,9 +2352,9 @@ pub const Evaluator = struct {
     }
 
     fn importPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) !Value {
-        const resolved = try self.resolveHostPath(path);
-        defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.importResolvedPath(resolved.text, parent_depth, debug_parent);
+        var resolved = try self.resolveHostPath(path);
+        defer resolved.deinit(self.allocator);
+        return self.importResolvedPath(resolved.slice(), parent_depth, debug_parent);
     }
 
     fn importResolvedPath(self: *Evaluator, path: []const u8, parent_depth: u32, debug_parent: *VM) anyerror!Value {
@@ -2498,9 +2498,9 @@ pub const Evaluator = struct {
     }
 
     fn scopedImportPath(self: *Evaluator, scope: Value, path: []const u8, parent_depth: u32, debug_parent: *VM) !Value {
-        const resolved = try self.resolveHostPath(path);
-        defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.scopedImportResolvedPath(scope, resolved.text, parent_depth, debug_parent);
+        var resolved = try self.resolveHostPath(path);
+        defer resolved.deinit(self.allocator);
+        return self.scopedImportResolvedPath(scope, resolved.slice(), parent_depth, debug_parent);
     }
 
     fn scopedImportResolvedPath(
@@ -2586,14 +2586,11 @@ pub const Evaluator = struct {
 
     pub fn resolveHostPath(self: *Evaluator, path: []const u8) !search_path_mod.ResolvedPath {
         if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or std.mem.startsWith(u8, path, "file://"))
-            return .{ .text = path, .owned = false };
-        if (std.fs.path.isAbsolute(path)) return .{ .text = path, .owned = false };
+            return .{ .borrowed = path };
+        if (std.fs.path.isAbsolute(path)) return .{ .borrowed = path };
 
         const base_path = self.sources.base_path orelse return error.RelativePath;
-        return .{
-            .text = try std.fs.path.resolve(self.allocator, &.{ base_path, path }),
-            .owned = true,
-        };
+        return .{ .owned = try std.fs.path.resolve(self.allocator, &.{ base_path, path }) };
     }
 
     pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {

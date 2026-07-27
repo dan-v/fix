@@ -690,9 +690,9 @@ fn completeSourceAttrs(
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     _ = try setup.configure(&ev, init, options);
-    const source = try eval_support.getCompletionSource(&ev, init.io, source_arg, options);
+    var source = try eval_support.getCompletionSource(&ev, init.io, source_arg, options);
     defer source.deinit(ev.hostAllocator());
-    const value = try ev.evaluatePathAt(source.text, source.base_path, source.abs_path);
+    const value = try ev.evaluatePathAt(source.slice(), source.base_path, source.abs_path);
     try writeAttrCandidates(allocator, w, &ev, value, prefix, replacement);
 }
 

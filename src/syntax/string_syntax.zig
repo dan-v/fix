@@ -5,6 +5,7 @@
 //! prevents double-quoted and indented strings from drifting apart.
 
 const std = @import("std");
+const TextRef = @import("base").TextRef;
 
 // SIMD find-first-of for the literal scanners: string bodies are long runs
 // of plain bytes; jump straight to the next structurally interesting byte.
@@ -43,10 +44,7 @@ pub const Span = struct {
     end: u32,
 };
 
-pub const Text = struct {
-    bytes: []const u8,
-    owned: bool,
-};
+pub const Text = TextRef;
 
 pub const Part = union(enum) {
     text: Text,
@@ -58,9 +56,9 @@ pub const ParsedLiteral = struct {
     parts: []Part,
 
     pub fn deinit(self: ParsedLiteral) void {
-        for (self.parts) |part| {
-            switch (part) {
-                .text => |text| if (text.owned) self.allocator.free(text.bytes),
+        for (self.parts) |*part| {
+            switch (part.*) {
+                .text => |*text| text.deinit(self.allocator),
                 .interpolation => {},
             }
         }
@@ -94,9 +92,9 @@ pub fn parseLiteral(
 
     var parts: std.ArrayListUnmanaged(Part) = .empty;
     errdefer {
-        for (parts.items) |part| {
-            switch (part) {
-                .text => |text| if (text.owned) allocator.free(text.bytes),
+        for (parts.items) |*part| {
+            switch (part.*) {
+                .text => |*text| text.deinit(allocator),
                 .interpolation => {},
             }
         }
@@ -254,7 +252,7 @@ fn appendDoubleText(
     // A run with neither an escape nor a raw CR needs no decoding — keep the
     // zero-copy source slice.
     if (std.mem.indexOfScalar(u8, raw, '\\') == null and std.mem.indexOfScalar(u8, raw, '\r') == null) {
-        try parts.append(allocator, .{ .text = .{ .bytes = raw, .owned = false } });
+        try parts.append(allocator, .{ .text = .{ .borrowed = raw } });
         return;
     }
 
@@ -285,10 +283,7 @@ fn appendDoubleText(
     }
     const bytes = try out.toOwnedSlice(allocator);
     errdefer allocator.free(bytes);
-    try parts.append(allocator, .{ .text = .{
-        .bytes = bytes,
-        .owned = true,
-    } });
+    try parts.append(allocator, .{ .text = .{ .owned = bytes } });
 }
 
 fn parseIndented(
@@ -444,7 +439,7 @@ fn flushOwnedText(
     const bytes = try text.toOwnedSlice(allocator);
     text.* = .empty;
     errdefer allocator.free(bytes);
-    try parts.append(allocator, .{ .text = .{ .bytes = bytes, .owned = true } });
+    try parts.append(allocator, .{ .text = .{ .owned = bytes } });
 }
 
 fn minIndent(source: []const u8, body_start: usize, body_end: usize) usize {
@@ -584,8 +579,8 @@ test "parses double quoted text and interpolation" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), parsed.parts.len);
-    try std.testing.expectEqualStrings("a\n", parsed.parts[0].text.bytes);
-    try std.testing.expectEqualStrings("c", parsed.parts[2].text.bytes);
+    try std.testing.expectEqualStrings("a\n", parsed.parts[0].text.slice());
+    try std.testing.expectEqualStrings("c", parsed.parts[2].text.slice());
 }
 
 test "parses indented strings" {
@@ -599,7 +594,7 @@ test "parses indented strings" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), parsed.parts.len);
-    try std.testing.expectEqualStrings("a\nb\n", parsed.parts[0].text.bytes);
+    try std.testing.expectEqualStrings("a\nb\n", parsed.parts[0].text.slice());
 }
 
 test "parses indented string escapes after stripping source indentation" {
@@ -613,7 +608,7 @@ test "parses indented string escapes after stripping source indentation" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), parsed.parts.len);
-    try std.testing.expectEqualStrings("\t['name'] = {\n\t\tloader = 'file',\n", parsed.parts[0].text.bytes);
+    try std.testing.expectEqualStrings("\t['name'] = {\n\t\tloader = 'file',\n", parsed.parts[0].text.slice());
 }
 
 test "parses indented string escaped newlines after stripping source indentation" {
@@ -627,5 +622,5 @@ test "parses indented string escaped newlines after stripping source indentation
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), parsed.parts.len);
-    try std.testing.expectEqualStrings("alpha \nbeta\ngamma\n", parsed.parts[0].text.bytes);
+    try std.testing.expectEqualStrings("alpha \nbeta\ngamma\n", parsed.parts[0].text.slice());
 }

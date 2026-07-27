@@ -155,9 +155,9 @@ fn tryFoldNode(self: *Compiler, node: *const Node) anyerror!?Value {
             // (against base_path) — same Value the emit path would produce.
             const span = self.source[n.data.atom.offset .. n.data.atom.offset + n.data.atom.len];
             if (std.mem.indexOf(u8, span, "${") != null) return null;
-            const path = try literals_mod.resolvePathLiteral(self, span);
-            defer if (path.owned) self.allocator.free(path.text);
-            return Value.path(try self.intern.intern(path.text));
+            var path = try literals_mod.resolvePathLiteral(self, span);
+            defer path.deinit(self.allocator);
+            return Value.path(try self.intern.intern(path.slice()));
         },
         .attr_set => return tryFoldAttrSet(self, n),
         .list => return tryFoldList(self, n),
@@ -190,19 +190,19 @@ fn tryFoldString(self: *Compiler, n: *const Node) anyerror!?Value {
     defer parsed.deinit();
     var total: usize = 0;
     for (parsed.parts) |part| switch (part) {
-        .text => |t| total += t.bytes.len,
+        .text => |t| total += t.slice().len,
         .interpolation => return null,
     };
     // Common case: one text part interns directly; multi-part (escapes split
     // the literal) assembles into a scratch buffer first.
     if (parsed.parts.len == 1) {
-        return Value.string(try self.intern.intern(parsed.parts[0].text.bytes));
+        return Value.string(try self.intern.intern(parsed.parts[0].text.slice()));
     }
     const buf = try self.allocator.alloc(u8, total);
     defer self.allocator.free(buf);
     var off: usize = 0;
     for (parsed.parts) |part| {
-        const t = part.text.bytes;
+        const t = part.text.slice();
         @memcpy(buf[off .. off + t.len], t);
         off += t.len;
     }

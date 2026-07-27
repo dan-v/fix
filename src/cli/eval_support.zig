@@ -12,6 +12,7 @@ const Evaluator = engine.Evaluator;
 const Value = runtime.Value;
 const EvaluationMode = args.EvaluationMode;
 const SourceArg = args.SourceArg;
+const TextRef = @import("base").TextRef;
 
 /// The build realization mode selected by `--check`/`--repair` (`--check`
 /// takes precedence). `--repair`/`--check` require a trusted daemon user.
@@ -36,13 +37,13 @@ pub fn evaluateAndWrite(
     ev.setValueColor(use_color);
     _ = label;
 
-    const result = ev.evaluatePathAt(source.text, source.base_path, source.abs_path) catch |err| {
-        try render.evalFailure(io, use_color, show_trace, ev, source.text, err);
+    const result = ev.evaluatePathAt(source.slice(), source.base_path, source.abs_path) catch |err| {
+        try render.evalFailure(io, use_color, show_trace, ev, source.slice(), err);
         return false;
     };
 
     writeResult(io, mode, ev, result) catch |err| {
-        try render.evaluationError(io, use_color, show_trace, ev, source.text, err);
+        try render.evaluationError(io, use_color, show_trace, ev, source.slice(), err);
         return false;
     };
     return true;
@@ -85,7 +86,7 @@ pub const LoadedInput = struct {
     source_arg: SourceArg,
     source: Source,
 
-    pub fn deinit(self: LoadedInput, ev: *Evaluator) void {
+    pub fn deinit(self: *LoadedInput, ev: *Evaluator) void {
         self.source.deinit(ev.hostAllocator());
     }
 
@@ -230,9 +231,9 @@ fn getSourceMode(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Op
     const allocator = ev.hostAllocator();
     // Load the base source text (borrowed for expr/file, owned for flake).
     var base: Source = switch (source) {
-        .expr => |text| .{ .text = text, .owned = false },
+        .expr => |text| .{ .text = .{ .borrowed = text } },
         .file => |path| try fileish.load(ev, io, path),
-        .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable, options), .owned = true },
+        .flake => |installable| .{ .text = .{ .owned = try lowerFlakeInstallable(ev, installable, options) } },
     };
 
     // If selector wrapping fails, `base` (owned flake text and/or file
@@ -242,8 +243,8 @@ fn getSourceMode(ev: *Evaluator, io: std.Io, source: SourceArg, options: args.Op
 
     // Apply `-A`/`--arg`/`--argstr`. Wrapped text has offsets unrelated to the
     // source file, so drop the original source metadata.
-    const selected = try applySelectors(ev, base.text, options, completion_auto_call);
-    if (selected.owned) {
+    const selected = try applySelectors(ev, base.slice(), options, completion_auto_call);
+    if (selected.text.isOwned()) {
         var wrapped = selected;
         wrapped.base_path = base.base_path;
         base.base_path = null;
@@ -263,7 +264,7 @@ fn applySelectors(ev: *Evaluator, base_text: []const u8, options: args.Options, 
     const has_args = options.arg_defs.items.len > 0;
     // A `-A` with only empty components (`.`/``) selects nothing.
     const has_attr = if (options.attr) |a| std.mem.indexOfNone(u8, a, ".") != null else false;
-    if (!has_args and !has_attr and !completion_auto_call) return .{ .text = base_text, .owned = false };
+    if (!has_args and !has_attr and !completion_auto_call) return .{ .text = .{ .borrowed = base_text } };
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -298,7 +299,7 @@ fn applySelectors(ev: *Evaluator, base_text: []const u8, options: args.Options, 
 
     try out.appendSlice(alloc, "in __fix_v");
     if (options.attr) |attr| _ = try appendAttrPathSuffix(alloc, &out, attr);
-    return .{ .text = try out.toOwnedSlice(alloc), .owned = true };
+    return .{ .text = .{ .owned = try out.toOwnedSlice(alloc) } };
 }
 
 /// Lower a flake installable `<flakeref>[#<attrpath>]` into a Nix expression
@@ -354,21 +355,22 @@ fn appendFlakeCandidate(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
     try out.appendSlice(alloc, suffix);
 }
 
-fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8, options: args.Options) ![]const u8 {
+fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8, options: args.Options) ![]u8 {
     const alloc = ev.hostAllocator();
     const hash = std.mem.indexOfScalar(u8, installable, '#');
     const flake_ref = if (hash) |i| installable[0..i] else installable;
     const attr_path = if (hash) |i| installable[i + 1 ..] else "";
 
-    const resolved = try resolveFlakeRef(ev, flake_ref);
-    defer if (resolved.owned) alloc.free(resolved.ref);
+    var resolved = try resolveFlakeRef(ev, flake_ref);
+    defer resolved.deinit(alloc);
+    const resolved_ref = resolved.slice();
 
     // Flake installables evaluate in pure mode (Nix's default); `--impure` opts
     // out. A local-path flake's own source tree is readable besides the store.
-    const flake_dir: ?[]const u8 = if (std.mem.startsWith(u8, resolved.ref, "path:"))
-        resolved.ref["path:".len..]
-    else if (resolved.ref.len > 0 and resolved.ref[0] == '/')
-        resolved.ref
+    const flake_dir: ?[]const u8 = if (std.mem.startsWith(u8, resolved_ref, "path:"))
+        resolved_ref["path:".len..]
+    else if (resolved_ref.len > 0 and resolved_ref[0] == '/')
+        resolved_ref
     else
         null;
     try ev.setPureEval(!options.impure, if (flake_dir) |d| &.{d} else &.{});
@@ -390,7 +392,7 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8, options: args.
             _ = try appendAttrPathSuffix(alloc, &suffix, d);
         } else {
             try out.appendSlice(alloc, "(builtins.getFlake \"");
-            try appendNixEscaped(alloc, &out, resolved.ref);
+            try appendNixEscaped(alloc, &out, resolved_ref);
             try out.appendSlice(alloc, "\")");
             return out.toOwnedSlice(alloc);
         }
@@ -399,7 +401,7 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8, options: args.
     // The system is injected as a string literal (not `builtins.currentSystem`)
     // so the lowered expression is valid under pure evaluation.
     try out.appendSlice(alloc, "(let f = builtins.getFlake \"");
-    try appendNixEscaped(alloc, &out, resolved.ref);
+    try appendNixEscaped(alloc, &out, resolved_ref);
     try out.appendSlice(alloc, "\"; s = \"");
     try appendNixEscaped(alloc, &out, ev.systemName());
     try out.appendSlice(alloc, "\"; in ");
@@ -420,8 +422,9 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8, options: args.
 /// from another.
 pub fn lowerFlakeCompletion(ev: *Evaluator, flake_ref: []const u8, parent: []const u8) ![]const u8 {
     const alloc = ev.hostAllocator();
-    const resolved = try resolveFlakeRef(ev, flake_ref);
-    defer if (resolved.owned) alloc.free(resolved.ref);
+    var resolved = try resolveFlakeRef(ev, flake_ref);
+    defer resolved.deinit(alloc);
+    const resolved_ref = resolved.slice();
 
     var suffix: std.ArrayListUnmanaged(u8) = .empty;
     defer suffix.deinit(alloc);
@@ -430,7 +433,7 @@ pub fn lowerFlakeCompletion(ev: *Evaluator, flake_ref: []const u8, parent: []con
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, "(let f = builtins.getFlake \"");
-    try appendNixEscaped(alloc, &out, resolved.ref);
+    try appendNixEscaped(alloc, &out, resolved_ref);
     try out.appendSlice(alloc, "\"; s = \"");
     try appendNixEscaped(alloc, &out, ev.systemName());
     try out.appendSlice(alloc, "\"; add = a: b: if builtins.isAttrs b then a // b else a; in add (add (add {} (f.packages.${s}");
@@ -448,7 +451,7 @@ pub fn lowerFlakeCompletion(ev: *Evaluator, flake_ref: []const u8, parent: []con
     return out.toOwnedSlice(alloc);
 }
 
-const ResolvedRef = struct { ref: []const u8, owned: bool };
+const ResolvedRef = TextRef;
 
 /// Turn a CLI flakeref into one `builtins.getFlake` accepts. Only the
 /// CLI-specific bit lives here: `.` and paths (`/…`, `./…`, `../…`) resolve to
@@ -457,11 +460,11 @@ const ResolvedRef = struct { ref: []const u8, owned: bool };
 /// to getFlake, which resolves indirect ids via the flake registry itself.
 fn resolveFlakeRef(ev: *Evaluator, flake_ref: []const u8) !ResolvedRef {
     if (flake_ref.len > 0 and (flake_ref[0] == '/' or flake_ref[0] == '.')) {
-        const base = ev.basePath() orelse return .{ .ref = flake_ref, .owned = false };
+        const base = ev.basePath() orelse return .{ .borrowed = flake_ref };
         const abs = try std.fs.path.resolve(ev.hostAllocator(), &.{ base, flake_ref });
-        return .{ .ref = abs, .owned = true };
+        return .{ .owned = abs };
     }
-    return .{ .ref = flake_ref, .owned = false };
+    return .{ .borrowed = flake_ref };
 }
 
 /// Append `."a"."b"` selections for the dotted `attr_path` to `out`, each
@@ -497,16 +500,16 @@ test "completion auto-calls a top-level function with defaulted formals" {
     var ev = try Evaluator.init(std.testing.allocator, 1);
     defer ev.deinit();
 
-    const source = try applySelectors(
+    var source = try applySelectors(
         &ev,
         "{ pkgs ? 41 }: { answer = pkgs + 1; hello = true; }",
         .{},
         true,
     );
     defer source.deinit(ev.hostAllocator());
-    try std.testing.expect(source.owned);
+    try std.testing.expect(source.text.isOwned());
 
-    const value = try ev.evaluate(source.text);
+    const value = try ev.evaluate(source.slice());
     try std.testing.expect((try ev.attrPathValue(value, "answer")) != null);
     try std.testing.expect((try ev.attrPathValue(value, "hello")) != null);
 }

@@ -93,7 +93,7 @@ const Pipeline = struct {
                 self.use_color,
                 self.show_trace,
                 self.ev,
-                self.inputs[index].source.text,
+                self.inputs[index].source.slice(),
                 failed,
             ) catch null;
             return self.fail(slot, .evaluation, failed.err);
@@ -282,7 +282,7 @@ pub fn realizeMany(
     const parallel_inputs = try allocator.alloc(Evaluator.ParallelInput, inputs.len);
     defer allocator.free(parallel_inputs);
     for (inputs, parallel_inputs) |input, *parallel| parallel.* = .{
-        .source = input.source.text,
+        .source = input.source.slice(),
         .base_path = input.source.base_path,
         .source_path = input.source.abs_path,
     };
@@ -337,12 +337,12 @@ pub fn dryRunMany(
     }
 
     for (inputs, 0..) |input, index| {
-        const value = ev.evaluatePathAt(input.source.text, input.source.base_path, input.source.abs_path) catch |err| {
-            _ = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, input.source.text, err);
+        const value = ev.evaluatePathAt(input.source.slice(), input.source.base_path, input.source.abs_path) catch |err| {
+            _ = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, input.source.slice(), err);
             return 1;
         };
         const paths = (ev.derivationBuildPaths(value) catch |err| {
-            _ = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, input.source.text, err);
+            _ = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, input.source.slice(), err);
             return 1;
         }) orelse {
             std.debug.print("error: input {d} did not evaluate to a derivation\n", .{index + 1});
@@ -486,11 +486,11 @@ fn proveBuildStartsBeforeOtherEvaluationFinishes(slow_index: usize) !void {
     const quick_index = 1 - slow_index;
     inputs[slow_index] = .{
         .source_arg = .{ .expr = slow_source },
-        .source = .{ .text = slow_source },
+        .source = .{ .text = .{ .borrowed = slow_source } },
     };
     inputs[quick_index] = .{
         .source_arg = .{ .expr = quick_source },
-        .source = .{ .text = quick_source },
+        .source = .{ .text = .{ .borrowed = quick_source } },
     };
 
     var slots: [2]BuildSlot = .{ .{}, .{} };
@@ -499,8 +499,8 @@ fn proveBuildStartsBeforeOtherEvaluationFinishes(slow_index: usize) !void {
     }
     defer for (&slots) |*slot| slot.deinit(testing.allocator);
     const parallel_inputs = [_]Evaluator.ParallelInput{
-        .{ .source = inputs[0].source.text },
-        .{ .source = inputs[1].source.text },
+        .{ .source = inputs[0].source.slice() },
+        .{ .source = inputs[1].source.slice() },
     };
     var pipeline: Pipeline = .{
         .allocator = testing.allocator,
@@ -544,8 +544,8 @@ pub fn realize(
     defer if (!torn_down) progress.deinit(false);
     if (terminal.progressEnabled()) ev.setObserver(progress.observer());
 
-    const value = ev.evaluatePathAt(source.text, source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
-        return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.text, err) };
+    const value = ev.evaluatePathAt(source.slice(), source.base_path, eval_support.sourcePathOf(source_arg, source)) catch |err| {
+        return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.slice(), err) };
     };
 
     // A flake `app` (`{ type = "app"; program = …; }`): build the derivation in
@@ -586,7 +586,7 @@ pub fn realize(
     }
 
     const drv_path = (ev.derivationDrvPath(value) catch |err| {
-        return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.text, err) };
+        return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.slice(), err) };
     }) orelse {
         std.debug.print("error: that did not evaluate to a derivation\n", .{});
         return .{ .failed = 1 };

@@ -1,4 +1,4 @@
-//! Internal VM explorer component.
+//! VM explorer view semantics shared by tree, page, and preview projections.
 //!
 //! Methods are parameterized by the private explorer state type and wired as
 //! direct aliases by `operations.zig`; this module owns the behavior below.

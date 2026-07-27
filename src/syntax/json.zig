@@ -199,7 +199,7 @@ const Serializer = struct {
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             for (parsed.parts) |part| {
                 switch (part) {
-                    .text => |t| try buf.appendSlice(self.arena, t.bytes),
+                    .text => |t| try buf.appendSlice(self.arena, t.slice()),
                     .interpolation => {},
                 }
             }
@@ -228,8 +228,8 @@ const Serializer = struct {
         for (parsed.parts) |part| {
             switch (part) {
                 .text => |t| {
-                    if (t.bytes.len == 0) continue; // drop empty text chunks
-                    try es.append(self.arena, self.literal("String", try self.strOrBytes(try self.arena.dupe(u8, t.bytes))));
+                    if (t.slice().len == 0) continue; // drop empty text chunks
+                    try es.append(self.arena, self.literal("String", try self.strOrBytes(try self.arena.dupe(u8, t.slice()))));
                 },
                 .interpolation => |span| try es.append(self.arena, try self.interpolation(span)),
             }
@@ -246,7 +246,7 @@ const Serializer = struct {
     fn singleInterpolationSpan(parts: []const string_syntax.Part) ?string_syntax.Span {
         var span: ?string_syntax.Span = null;
         for (parts) |part| switch (part) {
-            .text => |t| if (t.bytes.len != 0) return null,
+            .text => |t| if (t.slice().len != 0) return null,
             .interpolation => |s| {
                 if (span != null) return null; // more than one interpolation
                 span = s;
@@ -272,7 +272,7 @@ const Serializer = struct {
         defer lit.deinit();
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         for (lit.parts) |p| switch (p) {
-            .text => |t| try buf.appendSlice(self.arena, t.bytes),
+            .text => |t| try buf.appendSlice(self.arena, t.slice()),
             .interpolation => return null, // not a constant string
         };
         return buf.items;
@@ -745,7 +745,7 @@ const Serializer = struct {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         for (parsed.parts) |part| {
             switch (part) {
-                .text => |t| buf.appendSlice(self.arena, t.bytes) catch return text,
+                .text => |t| buf.appendSlice(self.arena, t.slice()) catch return text,
                 .interpolation => {}, // constant names only; ignore any dynamics
             }
         }
@@ -766,7 +766,7 @@ const Serializer = struct {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         for (parsed.parts) |part| {
             switch (part) {
-                .text => |t| try buf.appendSlice(self.arena, t.bytes),
+                .text => |t| try buf.appendSlice(self.arena, t.slice()),
                 .interpolation => return null, // interpolating → stays dynamic
             }
         }

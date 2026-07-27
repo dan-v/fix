@@ -80,7 +80,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     ok = true;
     for (0..input_count) |index| {
-        const input = input_plan.load(&ev, index) catch |err| {
+        var input = input_plan.load(&ev, index) catch |err| {
             eval_support.reportInputReadError(input_count, index, err);
             ok = false;
             continue;
@@ -126,12 +126,12 @@ fn instantiateOne(
     index: usize,
 ) !bool {
     const source = input.source;
-    const result = ev.evaluatePathAt(source.text, source.base_path, source.abs_path) catch |err| {
-        _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
+    const result = ev.evaluatePathAt(source.slice(), source.base_path, source.abs_path) catch |err| {
+        _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.slice(), err);
         return false;
     };
     const drv_path = ev.derivationDrvPath(result) catch |err| {
-        _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
+        _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.slice(), err);
         return false;
     } orelse {
         std.debug.print("error: input {d} did not evaluate to a derivation\n", .{index + 1});
@@ -140,7 +140,7 @@ fn instantiateOne(
 
     // Materialize the `.drv` closure, but do not build its outputs.
     ev.ensureDerivationClosure(drv_path) catch |err| {
-        _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
+        _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.slice(), err);
         return false;
     };
 

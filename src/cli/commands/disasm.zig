@@ -80,7 +80,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
     const color_depth = presentation.colorDepthForTerminal(options.color, stdout_tty, init.environ_map);
 
-    const source = runner.getSource(&ev, init.io, source_arg, options) catch |err| {
+    var source = runner.getSource(&ev, init.io, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -97,7 +97,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // source path for span annotations; synthesized text has none.
     const source_path = runner.sourcePathOf(source_arg, source);
     if (options.disasm_eval) {
-        try compileByEval(&ev, source.text, source.base_path, source_path);
+        try compileByEval(&ev, source.slice(), source.base_path, source_path);
         if (options.disasm_chunk) |id| {
             target_id = id;
             target_chunk = ev.getChunk(id) orelse {
@@ -106,7 +106,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
             };
         }
     } else {
-        const top_id = ev.compileSourceAt(source.text, source.base_path, source_path) catch |err| {
+        const top_id = ev.compileSourceAt(source.slice(), source.base_path, source_path) catch |err| {
             std.debug.print("error: compilation failed: {s}\n", .{@errorName(err)});
             return 1;
         };

@@ -11,6 +11,7 @@ const presentation = @import("presentation.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
 const hugetlb = @import("base").hugetlb;
+const TextRef = @import("base").TextRef;
 
 const Evaluator = engine.Evaluator;
 
@@ -157,22 +158,22 @@ fn applyFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, opt
         const inst = src.flake;
         const ref = if (std.mem.indexOfScalar(u8, inst, '#')) |h| inst[0..h] else inst;
         // A local `.`/`./` ref becomes an absolute path parseFlakeRef accepts.
-        const resolved = resolveNixConfigRef(allocator, init.io, ref);
-        defer if (resolved.owned) allocator.free(resolved.ref);
-        foldFlakeNixConfig(allocator, init, resolved.ref, settings);
+        var resolved = resolveNixConfigRef(allocator, init.io, ref);
+        defer resolved.deinit(allocator);
+        foldFlakeNixConfig(allocator, init, resolved.slice(), settings);
     }
 }
 
-const ResolvedNixConfigRef = struct { ref: []const u8, owned: bool };
+const ResolvedNixConfigRef = TextRef;
 
 fn resolveNixConfigRef(allocator: std.mem.Allocator, io: std.Io, ref: []const u8) ResolvedNixConfigRef {
     if (std.mem.eql(u8, ref, ".") or std.mem.startsWith(u8, ref, "./") or std.mem.startsWith(u8, ref, "../")) {
-        const cwd = std.process.currentPathAlloc(io, allocator) catch return .{ .ref = ref, .owned = false };
+        const cwd = std.process.currentPathAlloc(io, allocator) catch return .{ .borrowed = ref };
         defer allocator.free(cwd);
-        const abs = std.fs.path.resolve(allocator, &.{ cwd, ref }) catch return .{ .ref = ref, .owned = false };
-        return .{ .ref = abs, .owned = true };
+        const abs = std.fs.path.resolve(allocator, &.{ cwd, ref }) catch return .{ .borrowed = ref };
+        return .{ .owned = abs };
     }
-    return .{ .ref = ref, .owned = false };
+    return .{ .borrowed = ref };
 }
 
 fn foldFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, ref: []const u8, settings: *nix_conf.Settings) void {
