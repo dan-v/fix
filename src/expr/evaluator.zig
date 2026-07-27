@@ -45,7 +45,6 @@ const path_ops = @import("runtime").paths;
 const eval_print = @import("eval/print.zig");
 const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
-const mem_report = @import("eval/mem_report.zig");
 const tuning = @import("eval/tuning.zig");
 const debugger_state = @import("eval/debugger_state.zig");
 const debug_session = @import("eval/debug_session.zig");
@@ -631,75 +630,17 @@ pub const Engine = struct {
     ///
     /// `deinit` performs the same cleanup when evaluation is still active.
     pub fn finishEvaluation(self: *Engine) void {
-        std.debug.assert(self.evaluation_phase == .active);
-        self.evaluation_phase = .releasing;
-        self.destroyEvaluationResources();
-        self.evaluation_phase = .finished;
+        lifecycle.finish(self);
     }
 
     fn requireActiveEvaluation(self: *const Engine) !void {
-        if (self.evaluation_phase != .active) return error.EvaluationFinished;
+        return lifecycle.requireActive(self);
     }
 
     /// Idempotent only so whole-Engine destruction can share the teardown
     /// path with the explicit terminal transition.
     fn releaseEvaluationResources(self: *Engine) void {
-        switch (self.evaluation_phase) {
-            .active => self.evaluation_phase = .releasing,
-            .finished => return,
-            .releasing => @panic("evaluation teardown is still running"),
-        }
-        self.destroyEvaluationResources();
-        self.evaluation_phase = .finished;
-    }
-
-    fn destroyEvaluationResources(self: *Engine) void {
-        mem_report.report(&self.heap, &self.intern, &self.registry, self.compilation.retained_arenas.items, self.collection.mem_report_mode);
-        gc.recordFinalTotal(&self.heap.collection.report, self.heap.totalReservedBytes());
-        if (self.collection.report_on) gc.report(&self.heap.collection.report, self.heap.collection.budget_bytes);
-        // Shut helpers down (which joins on `defer vm.deinit()` inside
-        // helperLoop) before tearing down state their VMs borrow.
-        self.execution.scheduler.deinit();
-        // Now that helpers are guaranteed quiescent, tear down the main
-        // worker. Doing this before scheduler shutdown could race with
-        // a helper still resuming a stolen main fiber.
-        if (self.execution.main_worker) |w| w.deinit();
-        self.execution.main_worker = null;
-        // Registration effects run directly from compiler workers now. Keep
-        // their dedup state alive until every worker that can publish a chunk
-        // has joined.
-        self.sources.prefetch.seen.deinit(self.allocator);
-        // Every VM (helper fibers, main worker, imports) is dead now —
-        // all pooled stack/frames buffers are back on the free list.
-        self.execution.vm_buffers.deinit();
-        // Imports can register transient VMs until every worker has joined, so
-        // collection bookkeeping must outlive the worker runtime.
-        self.collection.tracer.deinit();
-        self.collection.import_vms.deinit(self.allocator);
-        self.collection.extra_roots.deinit(self.allocator);
-        self.allocator.free(self.collection.workers);
-        self.report.deinit();
-        self.sources.imports.deinit(self.allocator);
-        self.sources.search_paths.deinit(self.allocator);
-        self.sources.fetchers.deinit();
-        self.regexes.deinit();
-        self.effects.deinit();
-        self.store.realization.releaseRecipePayloads();
-        self.sources.files.deinit();
-        self.heap.deinit();
-        // Free deferred-compile state after the heap (whose thunks
-        // referenced entries) and workers (no force-compile can be in
-        // flight) are gone. The retained arenas own the AST nodes the
-        // entries point at; the registered chunks are self-contained
-        // bytecode and don't reference them, so order vs registry is free.
-        self.compilation.deferred_table.deinit();
-        for (self.compilation.retained_arenas.items) |*arena| arena.deinit();
-        self.compilation.retained_arenas.deinit(self.allocator);
-        self.registry.deinit();
-        self.intern.deinit();
-        // Dangling Value into the freed heap; never read again, but don't
-        // keep it findable.
-        self.builtins_value = null;
+        lifecycle.releaseIfActive(self);
     }
 
     /// Allocator for app-layer values whose ownership is explicitly returned
@@ -2774,9 +2715,7 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Engine) void {
 }
 
 fn releaseForBuild(ev: *Engine, after_release: ?ReleaseAction) void {
-    std.debug.assert(ev.evaluation_phase == .releasing);
-    ev.destroyEvaluationResources();
-    ev.evaluation_phase = .finished;
+    lifecycle.finishRelease(ev);
     if (after_release) |action| action.run(action.context);
 }
 
