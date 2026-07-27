@@ -4,12 +4,17 @@
 
 ## Mental model
 
-A derivation is a **build recipe** the evaluator produces but never runs. Evaluating `derivation { ... }` (or the primitive [`derivationStrict`](../vm/builtins.md)) does two things:
+A derivation is a **build recipe** produced by expression evaluation.
+Evaluating `derivation { ... }` (or the primitive
+[`derivationStrict`](../vm/builtins.md)) does two things without invoking the
+recipe's builder:
 
-1. Computes a `.drv` **store path** and one **output store path** per output — deterministically, from the recipe's contents. See [hashing](./hashing.md) for the path pipeline; this is the [critical-path cost](../perf/model.md) at high worker counts.
+1. Computes a `.drv` **store path** and one **output store path** per output — deterministically, from the recipe's contents. See [hashing](./hashing.md) for the path pipeline; derivation hashing appeared on the critical path of the dated NixOS profile in the [performance model](../perf/model.md).
 2. Returns an **attrset value** that looks like a derivation to Nix code: `type = "derivation"`, `outPath`, `drvPath`, the output attrs, etc. Store-path [strings carry context](./context.md) so that a downstream `derivation` referencing this one records it as an input.
 
-The recipe is deterministic in its inputs, so the same attrset always yields the same paths. No I/O, no builder execution — that is the store daemon's job, outside the evaluator.
+Path computation is deterministic from the normalized recipe and its resolved
+input derivations. It does not run the builder. Writing recipes to the store
+and realizing outputs are separate operations handled through the store layer.
 
 ## The `Drv` data model
 
@@ -64,8 +69,8 @@ Forcing any one of the thunked attrs triggers the full build (via the fast path 
 
 Each lazy derivation attr is a thunk over the `derivationLazyAttr(attrs_id, name)` builtin. Naively, forcing *N* of a derivation's attrs would rebuild the entire derivation *N* times — and the build (normalize + hash) is the bulk of the cost. The fast path deduplicates:
 
-- `derivationLazyAttr` builds the **full lazy value once** (`buildForcedDerivationValue(.lazy)`) and caches it through `RealizationStore`'s evaluation memo, keyed by the input `attrs` [ObjectId](../runtime/heap.md).
-- Subsequent per-attr accesses to the thunked attrs (`drvPath`, `outPath`, `all`, and each named output) hit the cache and just select the requested attr. `type`/`outputName`/`drvAttrs`/`outputs` are plain values in the lazy attrs, so reading them never routes through `derivationLazyAttr`.
+- `derivationLazyAttr` builds the **full lazy value** (`buildForcedDerivationValue(.lazy)`) and tries to cache it through `RealizationStore`'s evaluation memo, keyed by the input `attrs` [ObjectId](../runtime/heap.md).
+- When that memo insertion succeeds, subsequent per-attr accesses to the thunked attrs (`drvPath`, `outPath`, `all`, and each named output) select from the cached value. `type`/`outputName`/`drvAttrs`/`outputs` are plain values in the lazy attrs, so reading them never routes through `derivationLazyAttr`.
 - The cache is **token-guarded**: the key is a raw ObjectId, and after a GC that id may be reused for a different attrs; a per-collection token bumps so a stale entry misses rather than returning another derivation's value. Caching is best-effort (an OOM on insert is ignored — correctness never depends on it).
 
 The fully-built lazy value produced here is the same shape as `derivation`'s eager form (below).

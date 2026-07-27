@@ -66,7 +66,7 @@ const Action = enum {
 };
 
 pub const synopsis =
-    \\usage: fix switch [--nixos|--darwin|--home-manager] [action] [options]
+    \\usage: fix switch [action] [--nixos|--darwin|--home-manager] [options]
     \\
     \\build a NixOS / nix-darwin / home-manager configuration and activate it.
     \\action (first argument) is one of: switch (default), boot, test, build,

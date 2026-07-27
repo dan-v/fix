@@ -1,10 +1,18 @@
 # Compiler Pipeline
 
-*Single-pass AST → bytecode lowering: node-tag dispatch across domain modules, buffered into an immutable Chunk.*
+*Recursive AST → bytecode lowering: node-tag dispatch across domain modules,
+buffered into a registered Chunk.*
 
 ## Mental model
 
-The compiler is a **recursive tree-walk that emits [bytecode](../vm/dispatch.md) as it descends** — no separate IR, no optimization pass over a built graph. `Compiler.compileNode()` dispatches on the [AST `Node.tag`](../syntax/parsing.md) and hands each node to the module that owns its shape. Emission is *stack-oriented*: every node lowers to a sequence that leaves exactly one value on the VM operand stack. Sub-expressions are compiled left-to-right; the parent emits its own op after its children.
+The main lowering pass is a **recursive tree-walk that emits
+[bytecode](../vm/dispatch.md) as it descends**. There is no separate IR or
+optimization pass over a completed program, but lowering invokes additional
+AST walks for jobs such as free-variable collection and strictness analysis.
+`Compiler.compileNode()` dispatches on the [AST `Node.tag`](../syntax/parsing.md)
+and hands each node to the module that owns its shape. Emission is
+stack-oriented: every node lowers to a sequence that leaves one value on the VM
+operand stack.
 
 A `Compiler` instance compiles **one chunk** (one function body / thunk body / file body). Nested bodies (thunks, lambdas, deferred attrs) spawn a **child Compiler** linked by `parent` — the chain drives [name resolution and capture](scopes.md). Scratch state (locals, captures, diagnostics, strictness maps) lives on a per-unit arena and dies with the unit; only bytecode, constants, and the source map are duped onto the persistent allocator at `finish`.
 
@@ -43,18 +51,22 @@ Domain modules call `emit` to write bytes; `emit` sees only opcodes/operands and
 
 The strictness stamp (`strictness.stampOnBuilder`) runs at the **end of body compilation**, before `finish`: it computes the [must-force upvalue masks](strictness.md) and records `body_span`.
 
-At **finish** (`ChunkBuilder.finish`), in one pass, the builder freezes into an immutable **Chunk**:
+At **finish** (`ChunkBuilder.finish`), the builder produces a registered
+**Chunk**:
 
 1. **body_is_substantial** — `code.len + fused_dispatch_weight + schedulingSideTableWeight() ≥ speculation_min_code_bytes` (256), gating [speculation](../parallel/speculation.md); the side-table weight accounts for attr-name/position and capture work moved out of the code stream.
 2. **Trivial-body classify** — the finished body is classified once into a `TrivialBody` variant, else `none` (see [lazy-compile.md](lazy-compile.md) and [runtime/thunks.md](../runtime/thunks.md)); safe because thunk bodies have `local_count == 0`.
 3. The strictness masks, `strict_param`, `strict_via_upvalue`, `arity`, and `strict_params` are copied through into the Chunk.
 
-The caller then registers the frozen Chunk: `ChunkRegistry.register` assigns a **sequential, immutable `ChunkId`** (a lock-free `appendAtomic` cursor bump) and caches the hot scheduling metadata (`trivial`, `body_is_substantial`, `strict_param`, `strict_via_upvalue`) in a dense per-chunk `ChunkSlot` so the thunk-creation path reads it without chasing the Chunk pointer.
+The caller then registers the finished Chunk: `ChunkRegistry.register` assigns
+a sequential `ChunkId` and caches scheduling metadata (`trivial`,
+`body_is_substantial`, `strict_param`, `strict_via_upvalue`) in a dense
+per-chunk `ChunkSlot`.
 
 The frozen **Chunk** carries: `code`, `constants`, `local_count`, `arity`, `strict_params` (per-param must-force bitmask for uncurried chunks), `SchedulingHints` (`strictness` masks + `body_is_substantial` + `trivial` + `strict_param` + `strict_via_upvalue`), `function_args`, `source_map`, and `body_span`.
 
 ```
-ChunkBuilder (mutable, arena)                 Chunk (immutable, persistent)
+ChunkBuilder (mutable, arena)                 Chunk (persistent; normally read-only)
   code[] constants[] function_args[]  stamp   code arity local_count
   source_map[] fused_dispatch_weight  ─────▶   strict_params SchedulingHints
   + strictness masks + body_span      finish    source_map body_span  → ChunkId
@@ -109,7 +121,9 @@ Lambda bodies (`compileLambda` / `compileLambdaAttrs`) enter `compileTailExpress
 - **Emit never re-reads the AST.** `emit` sees only opcodes/operands; all tree knowledge is in the domain modules.
 - **Stamp before finish; classify at finish**, both over the frozen straight-line body.
 - **Persistent vs scratch.** Bytecode/constants/source-map are duped and outlive the unit; locals/captures/diagnostics/strictness maps die with the arena.
-- **ChunkIds are sequential and immutable.** Registration order is stable; a registered Chunk is never mutated.
+- **ChunkIds do not change after registration.** Normal evaluation treats a
+  registered chunk as read-only. Debugger breakpoints are the explicit
+  exception: `BreakpointTable` patches and restores opcode bytes.
 
 Out of scope: how opcodes execute → [vm/dispatch.md](../vm/dispatch.md); name resolution → [scopes.md](scopes.md); strictness masks → [strictness.md](strictness.md); deferral/trivial short-circuits → [lazy-compile.md](lazy-compile.md).
 

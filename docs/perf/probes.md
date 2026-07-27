@@ -2,22 +2,24 @@
 
 *The instrumentation suite — quantify a lever's ceiling before building the optimizer.*
 
-The expensive cycle/debug probes are compile-time `-D` flags (see [build](../build.md)) and are **zero-cost when off**. Structured observations are different: spans/events are always compiled, selected at runtime, and feed both terminal progress and the evaluator-scoped Perfetto recorder. With neither output interested, a span stops at the inline observer gate; `--timeline` installs a recorder with fixed event/name buffers, so recording itself never allocates or reaches process-global state. The cycle profilers keep their counters plain (no atomics): `-Dprof-main` writes only from worker 0, so it stays lock-free at any worker count — run it at `--workers=32` for the wait question and at `--workers=1` for the pathlength floor; `-Dprof-path` requires `--workers=1`, since its span nesting assumes a single fiber forcing LIFO. Results surface either through `--stats` (see [cli](../cli.md)) or a written file.
+The expensive cycle/debug probes are compile-time `-D` flags (see [build](../build.md)); their guarded code is omitted when the flag is off. Structured observations are different: spans/events are always compiled, selected at runtime, and feed both terminal progress and the evaluator-scoped Perfetto recorder. With neither output interested, a span stops at the inline observer gate; `--timeline` installs a recorder with fixed event/name buffers, so recording itself never allocates or reaches process-global state. The cycle profilers keep their counters plain (no atomics): `-Dprof-main` writes only from worker 0, so it stays lock-free at any worker count — run it at `--workers=32` for the wait question and at `--workers=1` for the pathlength floor; `-Dprof-path` requires `--workers=1`, since its span nesting assumes a single fiber forcing LIFO. Results surface either through `--stats` (see [cli](../cli.md)) or a written file.
 
-The governing philosophy: **measure headroom before building.** Every dead-end in the [performance model](./model.md) was probed first — the probe told us the ceiling, and the ceiling told us not to build. Remaining optimization work uses the same gate.
+The governing philosophy is to measure headroom before building. The
+[performance model](./model.md) records the probe evidence behind its dated
+optimization decisions.
 
 ## The suite
 
 | flag | question it answers | output |
 | --- | --- | --- |
-| `-Dprof-main` | Where does main spend cycles, per C++-level op (e.g. `merge_attrs`, `force_value`, `do_call`), and **does main ever wait**? | rdtsc exclusive-cycle breakdown + piggyback censuses (below), via `--stats` |
-| `-Dprof-path` | What is the **force-call critical path** (per-chunk attribution), and what is the `w=∞` floor? | force-call tree + per-chunk self/span time, via `--stats` |
+| `-Dprof-main` | Where does main spend cycles, per coarse evaluator operation (e.g. `merge_attrs`, `force_value`, `do_call`), and **does main ever wait**? | rdtsc exclusive-cycle breakdown + piggyback censuses (below), via `--stats` |
+| `-Dprof-path` | What force-thunk path dominates under the profiler's parallel-floor model? | force-call tree + per-chunk self/span time, via `--stats` |
 | `--timeline` | Per-worker **wall-clock timeline** — structured eval/store spans, fiber-run quanta, GC pauses, counters, metrics, and flows | Perfetto JSON, written via `--timeline[=path]` |
 | `-Dthunks-log` | What value did each thunk resolve to, and **where was it created and targeted** — for cross-run comparison | per-thunk lifecycle event log (create/claim/resolve/reset/errored/blackhole), written via `--thunks-log PATH`; `fix thunks diff` compares logs by the stable `(creator, target)` source-location pair |
 
 ### `-Dprof-main` and its piggyback censuses
 
-`-Dprof-main` is the workhorse. Its core is a per-thread rdtsc stack profiler that charges each instrumented C++-level scope its **exclusive** cycles (inclusive delta minus time already attributed to nested instrumented scopes), so the printed number for a routine is time spent *inside it but not inside any inner instrumented routine* — the right shape for finding a bottleneck. Only worker 0 (main) updates counters; helpers pay one thread-local load + branch.
+`-Dprof-main` is the workhorse. Its core is a per-thread rdtsc stack profiler that charges each instrumented scope its **exclusive** cycles (inclusive delta minus time already attributed to nested instrumented scopes), so the printed number for a routine is time spent inside it but not inside an instrumented child. Only worker 0 (main) updates counters; helpers pay one thread-local load + branch.
 
 On the performance model's 2026-07-11 snapshot, `--workers=32` main parked ~3× and waited ~2× while `force_value` dropped from ~23M (w=1) to ~68K; scheduler machinery was ~7% of wall time (see [model](./model.md)). A set of small counters ride the same flag, written only from worker 0:
 
@@ -29,7 +31,7 @@ On the performance model's 2026-07-11 snapshot, `--workers=32` main parked ~3× 
 
 ### `-Dprof-path`: the critical-path floor
 
-`-Dprof-main` tells you which routines burn cycles, but not which *Nix source* the eval spends its time in, and nothing about the **critical path** — the longest chain of dependent thunk forces, the floor no worker count can beat. `-Dprof-path` runs at `--workers=1`, where forcing is cleanly nested (one fiber, LIFO on the C stack): every `forceThunkImpl` is a span containing exactly the spans of the thunks it forced, keyed by body chunk (≈ a Nix source location). Per span it computes `total` (subtree wall cycles), `self = total − Σ child totals`, and `span = self + max(child span)`. Using `max` (not `sum`) over children models the multi-worker floor — independent siblings would run in parallel — so the root `span` estimates what `w=∞` cannot beat. Compare that estimate with a same-build multi-worker run; the difference is discovery serialization and scheduling overhead.
+`-Dprof-main` tells you which routines burn cycles, but not which *Nix source* the eval spends its time in. `-Dprof-path` runs at `--workers=1`, where forcing is cleanly nested (one fiber, LIFO on the C stack): every `forceThunkImpl` is a span containing the spans of the thunks it forced, keyed by body chunk (approximately a Nix source location). Per span it computes `total` (subtree wall cycles), `self = total − Σ child totals`, and `span = self + max(child span)`. Using `max` (not `sum`) over children models independent siblings as parallel, so the root `span` is an estimate of the force-thunk dependency floor. Comparing it with a same-build multi-worker run also exposes discovery serialization, scheduling overhead, and work outside the profiler's attribution model.
 
 Attribution caveat: spans nest on thunk *forces* only, not on direct closure calls (`do_call`/`do_tail_call` keep running in the same dispatch loop). Work in a directly-called closure that forces no thunk is charged to the *forcing* chunk's self-time. Read the flat profile as "which forcing site drives the most call work", and use `-Dprof-main` for operation-level truth.
 
@@ -41,6 +43,9 @@ Attribution caveat: spans nest on thunk *forces* only, not on direct closure cal
 
 - **Ceiling low → don't build.** Historical opcode-count profiling plus dispatch calibration showed dispatch is ~1.5% of the wall (+10 instr/op ≈ +1.5–1.8%), killing superinstructions/fusion before any optimizer was written; that one-off profiler has since been removed.
 - **Ceiling high by wall → build (with A/B).** `-Dprof-main` at w=32 pointed the whole program at on-chain work-elimination (the layered-`//` and ATerm wins in [model](./model.md)).
-- **Ceiling high by count/bytes, not wall → live but caveated.** Deforestation (single-use intermediates) and the GC RSS bound (see [gc](../gc.md)) are large by structure count / allocated bytes but need an optimizer with reach (or off-clock mark) to convert into wall/RSS.
+- **Ceiling high by count/bytes, not wall → live but caveated.** Deforestation
+  (single-use intermediates) and reclaimable GC storage (see [gc](../gc.md))
+  are large by structure count or allocated bytes but need a separate
+  mechanism to convert that headroom into wall time or lower reservations.
 
 See the [performance model](./model.md) for the full live/dead ledger.

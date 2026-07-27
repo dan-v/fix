@@ -35,7 +35,7 @@ const LineIndex = @import("syntax").diagnostic.LineIndex;
 /// long-lived `allocator` (evaluator lifetime) so the registered chunk's
 /// bytecode outlives this call; transient compile structures are freed
 /// before returning. Safe to call concurrently from multiple workers
-/// (each builds its own chunk; `register` is internally serialized).
+/// (each builds its own chunk; registry publication is thread-safe).
 pub fn compile(
     allocator: std.mem.Allocator,
     registry: *ChunkRegistry,

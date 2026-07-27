@@ -2,7 +2,7 @@
 
 *The threaded bytecode interpreter and the chunk format it runs.*
 
-The interpreter is the canonical evaluator: the bytecode loop is what every correctness claim rests on (byte-identical `.drv`).
+The bytecode interpreter is the execution path used by the evaluator.
 
 ## Mental model
 
@@ -71,7 +71,7 @@ Local access is force-vs-capture split, matching the recursive-`let` cell discip
 2. if `frames_len == stop_depth`, **returns** (leaving the chain) — `runUntil` pops `result` and returns it to its caller;
 3. otherwise dispatches into the resumed caller frame (`ret_frame.ip` already points past the call site).
 
-This is what makes the interpreter **re-entrant**. `runIsolatedFrame(ch, chunk_id, arg_count, upvalues, upvalue_owner)` records `stop_depth = frames_len`, pushes one frame over the pre-staged args, then `runUntil(stop_depth)`; the nested chain runs until exactly that frame rets, yielding its single value. On error it unwinds `frames_len`/`sp` back to the mark and captures a trace. Isolated frames are the universal "run this body and give me the value" primitive — used by thunk forcing ([runtime/thunks.md](../runtime/thunks.md)) and by `callValue`/PAP saturation ([calls.md](calls.md)).
+This is what makes the interpreter **re-entrant**. `runIsolatedFrame(ch, chunk_id, arg_count, upvalues, upvalue_owner)` records `stop_depth = frames_len`, pushes one frame over the pre-staged args, then `runUntil(stop_depth)`; the nested chain runs until exactly that frame rets, yielding its single value. On error it unwinds `frames_len`/`sp` back to the mark and captures a trace. Isolated frames are the shared "run this body and return its value" primitive used by thunk forcing ([runtime/thunks.md](../runtime/thunks.md)) and by `callValue`/PAP saturation ([calls.md](calls.md)).
 
 `halt` (chunk sentinel) and running off the end of `code` both terminate the chain, ensuring at least one value is on the stack for the caller.
 
@@ -83,7 +83,11 @@ This is what makes the interpreter **re-entrant**. `runIsolatedFrame(ch, chunk_i
 
 ## Chunk and registry
 
-A `Chunk` is **immutable after construction**. Key fields (compiler-stamped; see [compiler/scopes.md](../compiler/scopes.md) and [compiler/strictness.md](../compiler/strictness.md)):
+A `Chunk` is fully initialized before registration and treated as read-only by
+normal evaluation. The debugger is the exception: `BreakpointTable`
+temporarily patches opcode bytes. Key fields (compiler-stamped; see
+[compiler/scopes.md](../compiler/scopes.md) and
+[compiler/strictness.md](../compiler/strictness.md)):
 
 | field | role |
 |---|---|
@@ -98,15 +102,23 @@ A `Chunk` is **immutable after construction**. Key fields (compiler-stamped; see
 `ChunkRegistry` is the "program": chunks are stored once and referenced by `ChunkId` across threads. Chunks accumulate at runtime, not just at load — the deferred-attr force path compiles fresh bodies on demand, and speculative-import helpers compile `.nix` files ahead of the demand fiber, so many worker threads register concurrently.
 
 - `get(id)` is **lock-free** (bounds-checked index into stable segments).
-- `register(chunk)` is **lock-free** too: it heap-allocates the immutable `Chunk`, then `appendAtomic`-CAS-bumps the segment cursor to publish a `ChunkSlot`. Alongside the `*Chunk` pointer, the slot inlines a copy of the hot scheduling metadata (`trivial`, `body_is_substantial`, `strict_param`, `strict_via_upvalue`) so the thunk-creation and speculation-gate paths read them from a dense, cache-friendly array instead of chasing the heap-scattered `Chunk`. Once registered, a chunk never changes, so cross-thread `*const Chunk` sharing needs no further synchronization.
+- `register(chunk)` allocates the Chunk, then publishes a `ChunkSlot` through
+  `appendAtomic`. The slot includes a copy of scheduling metadata (`trivial`,
+  `body_is_substantial`, `strict_param`, `strict_via_upvalue`) used on the
+  thunk-creation path. Normal readers do not mutate the Chunk; debugger
+  breakpoint patches are coordinated through `BreakpointTable`.
 
 Two **well-known stub chunks** (`genlist_apply`, `mapattrs_apply`) are registered eagerly at `ChunkRegistry.init` so builtins can materialize lazy elements by reusing a shared stub-chunk body instead of allocating a per-element `builtin_closure` object (see [access.md](access.md)).
 
 ## Invariants
 
 - **Operand stack is a precise GC root.** Values are forced *in place* on the stack, never after popping into a local — forcing is a GC safepoint, and a popped-then-forced value could be swept. Binary ops read via `binTop`, force in place, and `dropBin` only after. (See [gc.md](../gc.md).)
-- **Single reused machine frame.** The `always_tail` chain never grows the native stack; growth is bounded by `max_frames` VM frames, not by opcode count.
-- **Registered chunks are immutable**; a chunk is fully built before its `ChunkSlot` is published, so any thread that resolves the id observes a complete, unchanging `Chunk`.
+- **Single reused dispatch frame.** Handler-to-handler transitions in the
+  `always_tail` chain do not grow the native stack with opcode count. Language
+  calls are tracked in the bounded VM frame array.
+- **Chunks are complete before publication.** Normal evaluation reads them
+  without mutation. Debugger opcode patches are installed and restored through
+  the breakpoint table.
 - **`frame.ip` is written back** before any op that can fault, re-enter the interpreter, or push a frame, so error traces and resumed callers see a consistent ip.
 
 Code: `src/expr/vm/`, `src/expr/bytecode/`

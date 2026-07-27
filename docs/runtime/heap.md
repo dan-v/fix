@@ -7,7 +7,7 @@ Every non-immediate [`Value`](values.md) refers to a boxed runtime object by **`
 ## Mental model
 
 - **Non-moving, but slots recycle.** The heap never *moves* an object, so an `ObjectId` held by reachable state is never relocated or invalidated, and [Intern](interning.md) ids last the whole run. Object ids, though, are **reused**: when the [GC](../gc.md) collects it frees dead object slots to per-worker free lists, and a later allocation is handed the same id for a different object. While the collector stays dormant the stores are strictly append-only and no id is reused. Collection is stop-the-world and recycles only *unreachable* slots, so no reader sees a live slot change under it; a cache that stashes a bare `ObjectId` across a safepoint guards against reuse by keeping the referent rooted or pairing the id with a heap token.
-- **Readers lock-free, writers serialized.** Backing arrays never move, so reads are a single atomic segment-pointer load (or a bare load for the object store). Writers serialize per-store on a `SpinMutex` whose critical section is at most one allocator call.
+- **Readers lock-free, writers serialized.** Backing arrays never move, so reads are a single atomic segment-pointer load (or a bare load for the object store). Reservations that extend a backing store serialize on that store's `SpinMutex`; per-worker allocation normally consumes an already-reserved local chunk.
 - **Values are position-independent.** Copying a `Value` copies 8 bytes; the referent lives in the shared heap.
 
 ## The object store: `FlatStore`
@@ -26,7 +26,10 @@ API: `append(v) → id`, `reserve(len) → Range`, `slice`/`sliceMut`, and tail-
 
 Each worker (including main, indexed by `worker_id`) owns a `HeapLocal` with a `LocalChunk` cursor per store (object/value/attr/attr_pos). A worker **reserves a chunk from the global store once under the store mutex** (8192 objects / 8192 values / 8192 attrs / 4096 attr-positions per refill), then hands out slots lock-free (`fits`/`take`) until the chunk is exhausted and it refills. The larger batches keep parallel allocation bursts from contending on the refill mutex; unused suffixes remain bounded to one chunk per worker.
 
-Reclaimed storage uses **per-worker** free lists (`HeapLocal.gc_free_*`). A minor-sweep participant returns dead slots and ranges to its shard; a major sweep distributes them across shards. Allocation pops locally and can steal from a peer, avoiding a shared allocation mutex.
+Reclaimed storage uses **per-worker** free lists (`HeapLocal.gc_free_*`). Sweep
+returns dead slots and ranges to worker-local lists. At a stop-the-world
+boundary, unused local entries are moved to shared overflow; a worker refills
+its local list from that overflow in batches.
 
 ## `Object` union
 
@@ -53,8 +56,10 @@ An `AttrsObject` holds its `AttrEntry`s **sorted by `InternId`** (name). Lookup 
 The NixOS module/overlay fixpoints `//` a massive accumulator thousands of times; materializing each step copies the whole accumulator (O(N) per step → O(N·K), dominating the attr store). The heap instead records a large `a // b` as an **O(1) `merge_attrs` node** — just `base` + `overlay` ObjectIds + a `depth`. Mechanics:
 
 - **Lookup walks overlay-first without flattening.** `getAttrValueOpt` on a `merge_attrs` checks `overlay` then `base` (`//` is shallow, right-biased); the `(obj, name)` inline cache in the [VM](../vm/access.md) absorbs repeats. `base`/`overlay` may themselves be `merge_attrs`, forming a chain.
-- **Small merges stay eager.** Only when the left side is at least `merge_layer_min_size` (32) entries is a node created; literal `{…} // {…}` stays a flat single-binary-search attrset.
-- **Flatten is deferred and atomically memoized.** The plain flattened attrset (`flattened`, sentinel `no_flattened_attrs` until forced) is produced lazily on first `getAttrs`/iteration by `flattenMerge` — it collects the whole chain's leaves in precedence order and runs *one* right-biased k-way merge (`kwayMergeLeaves`), avoiding the O(depth·N) intermediates a pairwise flatten would allocate — then installs the id with a `cmpxchgStrong` so concurrent forcers converge on the CAS winner's result.
+- **Small merges stay eager.** Only when the left side is at least
+  `merge_layer_min_size` (32) entries is a node created; smaller merges produce
+  a flat attrset.
+- **Flatten is deferred and atomically memoized.** The plain flattened attrset (`flattened`, sentinel `no_flattened_attrs` until forced) is produced when `materializeAttrs` needs a flat entry slice. `flattenMerge` collects the whole chain's leaves in precedence order and runs *one* right-biased k-way merge (`kwayMergeLeaves`), avoiding the O(depth·N) intermediates a pairwise flatten would allocate, then installs the id with a `cmpxchgStrong` so concurrent callers converge on the CAS winner's result.
 - **Chain depth is capped.** Construction (`mergeAttrsLayered`) stops extending the chain once a node's `depth` would exceed `merge_flatten_depth` (8): it eagerly merges (`addMergedAttrs`) instead, which forces the left chain flat and collapses it, bounding both per-lookup overlay walks and the work any single flatten must do.
 
 ## Constants

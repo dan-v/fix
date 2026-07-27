@@ -52,10 +52,13 @@ The threaded VM dispatcher (`src/expr/vm/run.zig`) chains handlers with `@call(.
 
 ## Group test wiring
 
-`zig build test` runs one test artifact for each durable group. `zig build check` runs that suite plus `zig fmt --check` over `build.zig`, `src/`, and `tools/`:
+`zig build test` runs one test artifact for each durable group and the
+end-to-end CLI shell suite. `zig build check` runs that suite, the structure
+check, and `zig fmt --check` over `build.zig`, `src/`, and `tools/`:
 
 ```
-test → base_tests, syntax_tests, runtime_tests, store_tests, fetchers_tests, expr_tests, integration_tests, cli_tests
+test → base_tests, syntax_tests, runtime_tests, store_tests, fetchers_tests,
+       expr_tests, integration_tests, cli_tests, test/e2e/run.sh
 ```
 
 Relative imports inside each durable root let its test artifact discover subsystem tests recursively. `zig build test-syntax` runs the front-end tests alone; `zig build bench-parse -- <file.nix>` runs the parse microbenchmark against `syntax`.
@@ -64,6 +67,9 @@ Expression-engine integration tests live under `src/integration/expr_api`; evalu
 
 ## The correctness gate
 
-The oracle for every change is a **byte-identical `.drv`**: the emitted derivation must match Nix C++ exactly, and the interpreter is canonical. Any build option, module split, collector run, or optimization that perturbs `.drv` output is wrong regardless of speed. See [invariants.md](invariants.md).
+For supported inputs, derivation text and store paths are expected to match
+Nix. Unit and integration tests exercise the hashing and serialization rules;
+the language and benchmark-fixture differential suites are separate build
+steps. See [invariants.md](invariants.md).
 
 Code: `build.zig`

@@ -1,20 +1,29 @@
 # GC
 
-*A non-moving, precise, generational collector. It is part of every supported build and runs at all worker counts. Reclaim tracking is armed lazily at the first budget/2 safepoint, so smaller evaluations avoid young tracking, barriers, and free-list probes. Collection never changes output — the [interpreter](vm/dispatch.md) remains canonical.*
+*A non-moving, precise, generational collector. It is part of every supported
+build and runs at all worker counts. Reclaim tracking is armed lazily at the
+first budget/2 safepoint, so smaller evaluations avoid young tracking,
+barriers, and free-list probes.*
 
-**Why a collector at all.** Without reclamation, the stores track *total* allocation rather than the live set. The collector bounds retained heap storage on memory-constrained machines; current cost measurements belong in [perf/model](perf/model.md).
+**Why a collector at all.** Without reclamation, the stores track *total*
+allocation rather than the live set. The collector lets later allocations
+reuse storage belonging to unreachable objects; current cost measurements
+belong in [perf/model](perf/model.md).
 
 ## Memory budget (the collection policy)
 
-One number decides when the collector runs: a heap-reserved-bytes budget, defended against.
+One number decides when the collector runs: a threshold over heap-reserved
+bytes.
 
 - Resolution order: `--gc-budget=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemTotal**, clamped by defaults of 256 MiB–32 GiB (fallback: half of an assumed 4 GiB). `FIX_GC_FLOOR` and `FIX_GC_CEILING` override those bounds with the same size syntax. The budget covers the evaluator heap stores, not total process RSS; side allocations such as chunks, interned strings, and thread stacks sit outside it. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
 - **Lazy arming**: below budget/2 the heap only compares its reserved-bytes cursor against the threshold once per TLAB refill — no young-slot tracking, no write barrier, no free-list probes. The first budget/2 crossing runs an arming stop-the-world safepoint (`armLazy`): everything allocated so far becomes untracked/old (the unreclaimable floor, ≈ reserved at budget/2 by construction), and real collections start at the full budget, re-armed to `max(budget, reserved + clamp(budget/8, 64MB, 1GB))` after each.
-- Consequence: evaluations below the arming threshold do not collect, while constrained budgets begin reclamation before heap reservations grow without bound.
+- Consequence: evaluations below the arming threshold do not collect, while
+  constrained budgets begin reclamation once reservations cross the configured
+  threshold.
 
 ## Why non-moving + precise
 
-- **Non-moving.** [ObjectIds](runtime/heap.md) are dense indices baked into thunks, [values](runtime/values.md), and range headers across many *suspended [fibers](parallel/fibers.md)*. A moving collector would have to rewrite every ObjectId in every parked fiber's state — infeasible. So objects stay put; survivors are promoted in place (the generation bit flips, the id is unchanged) and fragmentation is accepted as the price.
+- **Non-moving.** [ObjectIds](runtime/heap.md) are dense indices baked into thunks, [values](runtime/values.md), and range headers across many *suspended [fibers](parallel/fibers.md)*. Moving objects would require finding and rewriting every ObjectId in parked fiber state. This collector instead keeps objects in place; survivors are promoted in place (the generation bit flips, the id is unchanged) and may leave fragmentation.
 - **Precise.** No C-stack / register scan. The collector walks *exact heap edges* from an enumerated root set via the heap's trace map. This is why roots must be enumerated explicitly and completely (below) — a missed root is a use-after-free, not a conservative over-retention.
 
 ## Generational structure

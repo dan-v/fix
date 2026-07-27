@@ -1,6 +1,7 @@
 # Builtins
 
-*How the primops — 107 named builtins plus 7 compiler-internal ids (114 `BuiltinId` variants) — are structured, dispatched, and made GC- and parallel-safe.*
+*How named and compiler-internal builtins are structured, dispatched, and made
+GC- and parallel-safe.*
 
 ## Mental model
 
@@ -89,6 +90,7 @@ not force its message; the `trace-verbose` Nix setting enables it.
 - Undersupply ⇒ closure; oversupply ⇒ error. Never silently drop or ignore extra args.
 - Every argument is GC-rooted for the whole call; a builtin may force args and allocate freely without losing them to a sweep.
 - Language-visible builtin logic is fiber-sequential; parallelism comes from submitted thunks, and blocking fetch/store work is isolated on dedicated I/O threads while the fiber parks.
-- Result parity is byte-identical `.drv`; the interpreter path is canonical.
+- Builtins that affect derivations must preserve the serialization, hashing,
+  and string-context rules documented under [derivation](../derivation/model.md).
 
 Code: `src/expr/vm/builtins/`

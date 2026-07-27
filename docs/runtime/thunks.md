@@ -1,16 +1,23 @@
 # Thunks & the `Future` primitive
 
-*The lazily-computed value that doubles as a one-shot concurrent cell — the claim/wait mechanism every subsystem forces through.*
+*The lazily-computed value that doubles as a concurrent claim/wait cell.*
 
-A **thunk** is a suspended computation that yields a Nix [value](values.md) when forced. `fix` evaluates to weak head normal form (WHNF): forcing a thunk drives it far enough to expose the outermost constructor (an int, a list *spine*, an attrset *keyset*, a lambda) — element/field bodies stay thunked until forced in turn. Forcing is idempotent and memoized: the first force computes, all later forces return the stored result.
+A **thunk** is a suspended computation that yields a Nix [value](values.md) when forced. `fix` evaluates to weak head normal form (WHNF): forcing a thunk drives it far enough to expose the outermost constructor (an int, a list *spine*, an attrset *keyset*, a lambda) — element/field bodies stay thunked until forced in turn. Successful results and deterministic errors are memoized; explicitly transient failures leave the computation available for another attempt.
 
-In parallel mode the same object is also a **`Future`** — a one-shot concurrent cell. Exactly one fiber *claims* a thunk and runs its body; any other fiber that reaches an in-flight thunk *blocks* on it and observes the claimer's result. There is no duplicate execution and no lock held across evaluation. This single primitive underpins three subsystems: laziness (memoized suspension), parallelism (fibers hand each other results through resolved thunks — see [scheduler](../parallel/scheduler.md), [speculation](../parallel/speculation.md)), and [imports](../parallel/imports.md) (an `ImportEntry` embeds the same `Future`). Wherever you see claim → run → publish → wake, it is this machine.
+In parallel mode the same object is also a **`Future`**. One fiber at a time
+claims an unresolved thunk; another fiber that reaches that in-flight attempt
+can wait for it without holding a lock across evaluation. A successful result
+or deterministic error is memoized. Resource failures and
+`SpeculativeBail` are explicitly transient: they reset the thunk, so a later
+force may run another attempt. The same claim/wait/publish protocol is reused
+by [imports](../parallel/imports.md).
 
-Correctness oracle: byte-identical `.drv`. Speculation and fan-out are *scheduling* decisions; they never change which value a thunk resolves to.
+Speculation and fan-out use this protocol to change when eligible work runs.
+They are required to preserve the value produced by ordinary demand.
 
 ## Representation
 
-Millions of thunks are live at once on a real eval, so thunk-only metadata stays on `Thunk` while the reusable synchronization primitive remains small. A normal `Future` is 24 bytes; a production `Thunk` is at most 56 bytes, while safety builds retain an active-union tag and allow up to 80. Tests enforce those bounds. Two ideas keep unrelated future users from paying for evaluator state and keep the thunk payload bounded:
+Large evaluations can keep millions of thunks live, so thunk-only metadata stays on `Thunk` while the reusable synchronization primitive remains small. On the current 64-bit layout a `Future` is 24 bytes. A production `Thunk` is at most 56 bytes, while safety builds retain an active-union tag and allow up to 80; a size test enforces the `Thunk` bounds. Two ideas keep unrelated future users from paying for evaluator state and keep the thunk payload bounded:
 
 - **Separated responsibilities.** `Future` owns only state, claimer identity, and waiters. `Thunk` adds `demanded`, the `TargetKind` discriminant, and optional profiling fields. Imports, realization claims, and I/O futures therefore do not carry thunk scheduling metadata.
 - **`target` XOR `result` overlap.** The `Payload` is a bare 24-byte union: `.target` (what to evaluate) is the live arm while unresolved/evaluating; `.result` (the resolved `Value`, or an `*ErrorInfo`'s bits) is live once terminal. They are *never both live* — the body reads `target`, then the resolver overwrites the same bytes with `result`. So resolving costs no growth. `future.state` is the discriminant that says which arm is live.
@@ -40,7 +47,7 @@ Thunk
 | `closure` | Call a `Value` (user closure → run its chunk; builtin/builtin-closure → apply) | The general case. |
 | `bytecode` | Run `chunk_id` with captured upvalues | Up to `inline_capacity` = 2 upvalues live **inline** in the thunk (one alloc, one cache line on the force path); wider captures spill to a slice in the [heap's `values` store](heap.md). `upvalue_count` *is* the discriminant — no tag word, struct stays 24B. |
 | `pass_through` | Force a wrapped `Value`, memoize its result | How the compiler models recursive let cells; also `deepSeq`-style memo. |
-| `attr_access` | `getAttrValue(base, name)` directly | **Frameless, O(1)**: no frame push, no bytecode dispatch. Serves the overwhelmingly common `someUpvalue.attr` shape (`config.foo`, `lib.bar`, attrset-pattern params) directly; a `bytecode` thunk over a tiny `up_get_attr; ret` chunk would instead run a whole isolated frame, and `run_isolated_frame` is the biggest machinery bucket on the serial critical path. |
+| `attr_access` | `getAttrValue(base, name)` directly | **Frameless**: no frame push and no bytecode dispatch. It serves the common `someUpvalue.attr` shape (`config.foo`, `lib.bar`, attrset-pattern params) without running a tiny `up_get_attr; ret` chunk. |
 | `deferred` | Compile an AST node on first force, then run like `bytecode` | Lazy per-attr compilation of huge generated attrsets (e.g. nixpkgs hackage-packages). The compiled `ChunkId` is cached on the shared `DeferredTable` entry; see [lazy-compile](../compiler/lazy-compile.md). |
 
 Inline-vs-spill storage is mirrored in `deferred` so that arm doesn't widen the union either.
@@ -64,7 +71,9 @@ Inline-vs-spill storage is mirrored in `deferred` so that arm doesn't widen the 
 - **evaluating**, claimer == *other* → `.busy`. A different fiber is running it; enroll and park.
 - **resolved / errored** → `.already_resolved` / `.errored`; read the embedder's `result` slot.
 
-**`ClaimerId` is per-fiber, globally unique, allocated at fiber creation, and does *not* encode the worker.** So blackhole detection is exact: a fiber that migrates across workers keeps its identity, and two *distinct* fibers touching the same thunk always see `.busy`, never a false blackhole. This is the invariant that makes concurrent forking safe.
+**`ClaimerId` is allocated per fiber and does *not* encode the worker.** A
+fiber that migrates across workers keeps its id, so blackhole detection follows
+the computation rather than the OS thread.
 
 ## Waiter list & wake
 
@@ -95,7 +104,7 @@ The result store *happens-before* the state release-store; a reader that acquire
 
 `forceThunkImpl`: hit the [GC](../gc.md) safepoint, `tryClaim`, then on `.claimed` check the [memo](#thread-local-thunk-result-memo) and `evalThunkTarget`:
 
-- `bytecode` / `deferred` → `runBytecodeChunk`, which runs the chunk on a fresh interpreter frame (`runIsolatedFrame` — the interpreter is the sole execution engine)
+- `bytecode` / `deferred` → `runBytecodeChunk`, which runs the chunk on a fresh interpreter frame (`runIsolatedFrame`)
 - `closure` → `evalThunkClosure`: run a user closure's chunk on a fresh frame, or `applyBuiltin` for a builtin/builtin-closure
 - `attr_access` → frameless `getAttrValue`
 - `pass_through` → recurse `forceValueImpl` on the wrapped value
@@ -134,7 +143,7 @@ Checked on the freshly-claimed path before running the body; a hit resolves the 
 
 ## Invariants & gotchas
 
-- **`reset()` is transient-only.** It drops to `.unresolved` and wakes waiters to retry — used *only* for `error.OutOfMemory`, `error.StackOverflow`, `error.SpeculativeBail` (the target arm is untouched; a transient failure never wrote a result). **It is NOT a safe general retry:** re-running a body after `StackOverflow` can yield a *different* value (a shrunk VM stack changes what the body computes). Deterministic failures instead go **sticky** via `.errored`, replaying the cached `ErrorInfo` on every later force.
+- **`reset()` is transient-only.** It drops to `.unresolved` and wakes waiters to retry — used *only* for `error.OutOfMemory`, `error.StackOverflow`, and `error.SpeculativeBail` (the target arm is untouched; a transient failure never wrote a result). It is not a general retry mechanism; deterministic failures instead go **sticky** via `.errored`, replaying the cached `ErrorInfo` on every later force.
 - **Terminal states never revert** — except the binding-cell's deliberate `.evaluating → .unresolved` publish.
 - **Claim is per-fiber**, not per-worker. Never key blackhole/claim decisions on the OS thread.
 - **Thunks are GC-rooted through the in-flight force chain** (`vm.gc_roots.force_chain` roots the `.evaluating` thunk's target closure / upvalues / attr-access base). See [gc](../gc.md).

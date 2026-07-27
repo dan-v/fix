@@ -4,9 +4,15 @@
 
 ## Mental model
 
-`import <path>` is a memoized, coordinated computation keyed by resolved path. Two independent fibers importing the same file must **share** one evaluation, not race two. The machinery is the [thunk claim/wait/wake protocol](../runtime/thunks.md) applied to paths instead of thunks: a path maps to an `ImportEntry` wrapping a `Future`, and *a Future is a Future* whether it backs a thunk or a file. There is no main/helper asymmetry.
+`import <path>` is a memoized, coordinated computation keyed by resolved path.
+Concurrent fibers importing the same file share the in-flight attempt through
+an `ImportEntry` wrapping a `Future`. A completed value or deterministic error
+is cached. A transient resource failure resets the entry and can therefore
+lead to a later retry.
 
-But import resolution is also the **serialization floor** for the whole evaluator: discovering a module's imports and compiling them is largely single-threaded, and must complete *before* the N-way parallel eval of that module's contents can begin. See [perf/model.md](../perf/model.md).
+On the profiled NixOS workload, import discovery contributes to the serial
+critical path: a file must be found, parsed, and compiled before work exposed by
+that file can be scheduled. See [perf/model.md](../perf/model.md).
 
 ---
 
@@ -54,7 +60,7 @@ loop:
 - **Cycles** come for free: a `ClaimerId` is stable across [fiber migration](fibers.md), so `A imports B imports A` reaches a slot the *same claimer* already owns → `Future` returns `.blackhole` → `error.ImportCycle`.
 
 ### Failure caching
-A failed compile publishes an `ErrorInfo` sidecar via `publishErrored`, so the same error replays on every later force — imports that fail (file-not-found, parse error) fail deterministically. Resource-pressure failures (`OutOfMemory`, `StackOverflow`) are the exception: they are **never** cached — the future is `reset` (transient) so the next caller retries — because a speculative prefetch fiber hitting a memory/stack limit must not poison the path for real demand. If even the `ErrorInfo` allocation fails, the future is likewise `reset`.
+A failed compile publishes an `ErrorInfo` sidecar via `publishErrored`, so the same error replays on every later force — imports that fail (file-not-found, parse error) fail deterministically. `OutOfMemory`, `StackOverflow`, and `SpeculativeBail` are the exceptions: they are not cached, and the future is reset so a later caller may retry. If even the `ErrorInfo` allocation fails, the future is likewise reset.
 
 ### Directories & corepkgs
 `import <dir>` redirects to `<dir>/default.nix`. `<nix/fetchurl.nix>` resolves to the synthetic source in `eval/imports/corepkgs.zig`, so no corepkgs store path is needed on disk. Both flow back through the same registry.
@@ -72,21 +78,28 @@ Cycle detection therefore cannot rely on the Future. `scopedImportResolvedPath` 
 
 ---
 
-## The discovery serialization floor
+## Discovery and the critical path
 
-The registry parallelizes *duplicate* imports (many fibers, one eval) and lets independent import subtrees [fan out](speculation.md). What it **cannot** parallelize is the shape of discovery itself:
+The registry coordinates *duplicate* imports (many fibers, one evaluation),
+and prefetch can start independent imports before demand. Discovery can still
+form a serial dependency chain:
 
 - to evaluate a module you must first know its imports;
 - collecting them means **parsing and compiling** the file — largely single-threaded work;
 - that parse+compile must finish before the module's contents can be forced N-ways.
 
-So the critical path is a **serial chain of parse+compile through the import graph**, and it is the high-worker-count floor. Adding cores speeds up the *forcing* of already-discovered work; it does not speed up discovering it. The `import_prefetch` lane above attacks exactly this chain by running a file's parse+compile ahead of demand. See [perf/model.md](../perf/model.md).
+For workloads with a deep import-discovery chain, parse and compile time on that
+chain limits the work that additional workers can see. The `import_prefetch`
+lane tries to expose some of it earlier by starting a file before demand. The
+measured contribution for one NixOS workload is in
+[perf/model.md](../perf/model.md).
 
 ---
 
 ## Invariants
 
-- One resolved path ⇒ at most one non-scoped evaluation (registry dedup).
+- One resolved path has at most one non-scoped attempt in flight. A completed
+  value or deterministic error is reused; transient failures may be retried.
 - The claimer runs compile **inline**; waiters **park**, never spin — same protocol as [thunks](../runtime/thunks.md).
 - Cycle = same-claimer recursion (non-scoped) or fiber-scoped frame hit (scoped) ⇒ `error.ImportCycle`.
 - `result` is written **before** `publish()`; waiters read it after wake.

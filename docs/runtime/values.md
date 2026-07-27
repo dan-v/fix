@@ -1,6 +1,7 @@
 # Values
 
-*The NaN-boxed 8-byte `Value` and its Nix-C++-parity numeric semantics.*
+*The NaN-boxed 8-byte `Value` and the numeric compatibility rules implemented
+by the evaluator.*
 
 Every runtime value is an 8-byte `extern struct { bits: u64 }`. Scalars and object references are **NaN-boxed** into the payload space of an IEEE-754 double: a `Value` is *either* a live `f64` *or* a tagged non-float, discriminated by its top bits. Object references never store host pointers — they carry an [`ObjectId`](heap.md) or [`InternId`](interning.md), keeping values position-independent and copyable by value.
 
@@ -54,9 +55,9 @@ Arithmetic can produce NaNs whose bit pattern lands anywhere in qNaN space — i
 
 `idEq` compares scalars and object refs by raw `bits` (the tag is part of the pattern, so equal bits ⇒ same kind + payload). **Floats use IEEE equality** — so two canonical NaNs compare *unequal*, matching the semantics `idEq` callers rely on. `idHash` returns the raw `bits`. These are pointer-identity/reference semantics, not Nix structural `==`.
 
-## Numerics (Nix-C++ parity)
+## Numeric semantics
 
-Arithmetic lives in `numeric.zig` and matches the C++ evaluator exactly (the [correctness oracle](../invariants.md)):
+Arithmetic lives in `numeric.zig`. Its compatibility-sensitive cases are:
 
 - **Checked integer overflow.** `add`/`sub`/`mul` use Zig's `*WithOverflow` and raise `error.IntegerOverflow` on wrap — never silent two's-complement. `negate` routes through `checkedSub(0, v)` so `-i64_min` raises.
 - **Int/float promotion.** If both operands are any-int → checked integer path (result boxed if needed). If either is float → both promote to `f64` (`toFloat`) and the op is IEEE. `toFloat` accepts int/boxed_int/float; anything else is `error.TypeError`.

@@ -1,10 +1,16 @@
 # Workers & the eval driver
 
-*N symmetric worker threads draining a shared [scheduler](scheduler.md), plus the top-level fiber that drives root evaluation — where "parallel mode" actually runs.*
+*N worker threads draining a shared [scheduler](scheduler.md), plus the
+top-level fiber that drives root evaluation — where "parallel mode" actually
+runs.*
 
 ## Worker model
 
-`--workers N` spawns **N total** threads: **N−1 helpers** plus **main, running on the calling thread**. Workers are **symmetric** — there is no behavioral main/helper split. Main is worker 0 and steals, parks, and drains exactly like a helper; the only structural difference is that worker 0 runs on the thread that launched the eval (and delivers the result), so the scheduler spawns only `N−1` helper threads.
+`--workers N` uses **N total worker threads**: **N−1 spawned helpers** plus
+**worker 0 on the calling thread**. They share the same queue and fiber
+machinery. Worker 0 additionally launches and returns the top-level demand
+fiber, and a few policies recognize that role; for example, it is exempt from
+the helper spinner cap. The scheduler spawns only workers `1..N−1`.
 
 Each worker `i` owns (see [scheduler](scheduler.md) for the queue internals):
 
@@ -16,8 +22,10 @@ Each worker `i` owns (see [scheduler](scheduler.md) for the queue internals):
 Creating a fiber costs a 16 MiB virtual `mmap` plus a VM; [`reset`](fibers.md)ting one is a single trampoline-slot store — so workers pool them:
 
 - **Prewarm** `prewarm_fiber_count = 4` fibers per worker at `Worker.init`; **grow on demand** when more blocking work is in flight than the pool holds. There is no fixed pool size.
-- `acquireFreeFiber` pops the free-list LIFO (hottest cache) or allocates a fresh slot; a finished fiber is **`reset` in place** (stack pointer rewound, new entry/arg installed) rather than freed and re-allocated, so the per-task cost is a memcpy of the trampoline address.
-- **Ownership returns home.** A fiber stolen and run by another worker is, once `.finished`, pushed back onto its **allocator-worker's** free-list — not the thief's — and that owner is nudged in case it is parked waiting on this very fiber. This keeps free-lists balanced and bounds each worker's fiber count. The per-slot `run_mu` SpinMutex and `in_runfiber` atomic coordinate the hand-back safely (below).
+- `acquireFreeFiber` pops the free-list LIFO or allocates a fresh slot; a
+  finished fiber is **`reset` in place** (stack pointer rewound, new entry/arg
+  installed) rather than freed and re-allocated.
+- **Ownership returns home.** A fiber stolen and run by another worker is, once `.finished`, pushed back onto its **allocator-worker's** free-list — not the thief's — and that owner is nudged in case it is parked waiting on this very fiber. This keeps allocation and teardown ownership unambiguous. The per-slot `run_mu` SpinMutex and `in_runfiber` atomic coordinate the hand-back safely (below).
 - **Overflow stacks are trimmed.** When a worker is about to park it calls `sweepFreeStacks`: free-list fibers deeper than the prewarm count are spike overflow (a burst of blocking work grew the pool) and give their dirty 16 MiB mappings back to the OS via [`releaseStackPages`](fibers.md), keeping a 64 KiB warm top. A `stack_released` flag (cleared on reuse) makes each park-cycle release a fiber at most once. This runs only at park time — never on the task-completion path, where `madvise` volume would dominate.
 
 Each fiber also owns a **scratch arena** backing its VM's run-path allocations (builtin temp buffers, drv hashing, equality scratch). Arena semantics are load-bearing: run paths free best-effort and error/suspend paths abandon allocations wholesale. `recycleScratch` resets the arena (retaining one 64 KiB chunk) each time the fiber returns to the free-list, so a never-reset arena's dead interleaved pages don't accumulate.
@@ -60,7 +68,10 @@ Root evaluation does **not** run on the bare main thread. Instead `runTopLevel`:
 
 1. Main resets `suppress_background` to false (each top-level entry begins able to start background work), acquires a free fiber, marks it the **demand** fiber, and resumes it to evaluate the root expression.
 2. When that fiber forces a busy [thunk](../runtime/thunks.md) — one another worker already claimed — it **parks on the [`Future`](../runtime/thunks.md)** (yields), exactly like any other blocked fiber.
-3. **While the top-level fiber is parked, main runs `drainStep`** — draining its own ready fibers and stealing tasks. So main **participates in stealing and never idle-waits**: the calling thread is a full worker, not a supervisor blocked on a condition variable.
+3. **While the top-level fiber is parked, main runs `drainStep`** — draining
+   its own ready fibers and stealing tasks. If no runnable work exists, main can
+   park like the other workers; it is a worker, not a supervisor waiting only
+   for the root result.
 4. Once the demanded result is ready (the top-level fiber is back on the free-list), main sets `suppress_background` so no *new* speculative/fan-out work starts; it then keeps draining until **every fiber on this worker is back on a free-list** — i.e. all in-flight suspended fibers have quiesced. In-flight fibers still finish (a suspended fiber only waits on an already-claimed thunk, never on a queued task), so only un-started backlog is skipped.
 
 This is why main is "just worker 0": the root computation is a fiber like any other, and the thread that launched the eval spends its time as a peer worker.

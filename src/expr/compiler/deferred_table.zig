@@ -96,7 +96,8 @@ pub const Entry = struct {
     policy: LanguagePolicy = .{},
     /// Compile cache: 0 = not yet compiled, else `ChunkId + 1`. Published
     /// once via CAS on the force path; concurrent racers converge on one
-    /// canonical ChunkId (the loser's chunk is orphaned-but-correct).
+    /// selected ChunkId. A losing registration may already have converged on
+    /// that id through registry deduplication, or may remain unreferenced.
     compiled: std.atomic.Value(u32) = .init(0),
     /// Always-on qualified-name node for the deferred body (see `name_tree`).
     name_id: NameId = root_name_id,

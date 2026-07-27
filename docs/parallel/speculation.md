@@ -4,9 +4,14 @@
 
 ## Mental model
 
-Nix evaluation is lazy: a value is computed only when forced. On one core that is optimal. On many cores it leaves helper [workers](workers.md) idle, because demand is a narrow serial chain. Speculation and fan-out **manufacture demand early** — they force thunks the demanded result *will probably* need, off the critical path, so the answer is already resolved (or in flight) by the time real demand arrives.
+Nix evaluation is lazy: a thunk is normally computed when forced. `fix` uses
+speculation and fan-out to submit selected thunk work before the ordinary
+demand path reaches it.
 
-Neither changes results. Both are pure earliness: the [claim/waiter protocol](../runtime/thunks.md) publishes at most one terminal result and makes concurrent forcers converge, so a bad guess costs work, never correctness.
+Both mechanisms are scheduling policies and are required to preserve demand
+semantics. The [claim/waiter protocol](../runtime/thunks.md) coordinates
+concurrent forces of the same thunk; a bad speculative choice can still cost
+work and allocation.
 
 Language-visible effects are demand-committed too. A helper that reaches
 `builtins.trace`, `traceVerbose`, or `warn` records the sanitized message in its
@@ -33,7 +38,9 @@ the same child effect.
 
 When it fires, a `force_thunk` task for the body goes to the speculation queue and the caller continues with a lazy thunk; the task runs the force with `speculation.active = true`.
 
-**Why a size gate.** A trivial body (return-upvalue, constant) is cheaper to run inline than to package as a task — the [trivial-body short-circuit](../compiler/lazy-compile.md) skips thunk allocation for those entirely. The 256-byte line is where packaging pays off.
+**Why a size gate.** The [trivial-body short-circuit](../compiler/lazy-compile.md)
+already skips thunk allocation for return-upvalue and constant bodies. The
+256-byte cutoff keeps smaller compiled bodies out of the speculation queue.
 
 **Novel-chunk priority lane.** The **first** speculative instance of any chunk — a new code region, a potential subsystem or chain root — is routed to the high-priority [novel lane](scheduler.md) (`FIX_SPEC_NOVEL`) via `submitNovel` instead of the bulk backlog; repeat instances stay in the bulk lane. `isNovelClosureChunk` test-and-sets the chunk's "spec submitted" bit, so the routing costs one flag flip and the lane's total volume is bounded at one task per chunk. This keeps a lone chain-seed thunk from having to win a pop/steal race against repeat-instance work.
 
@@ -59,7 +66,8 @@ A further `readdir_prefetch` lane (`FIX_READDIR_PREFETCH`, on by default wheneve
 
 ## Safety & bounding
 
-The danger: a speculatively-forced sibling that real demand *never touches* could be enormous (a whole unused package tree) and extend wall time past the serial baseline. Three guards prevent this.
+Speculatively forcing a value that demand never touches can add substantial
+work and allocation. The following mechanisms limit that exposure.
 
 ### The speculation brake
 Creation-time `makeThunk` speculation and sibling sweeps stop re-submitting while `speculation.active` is set. Strict consumer fan-out may recurse, and map-style builtins may submit element thunks; fixed queue capacities, the speculative backlog cap, and per-task budgets bound those cascades.
@@ -82,20 +90,26 @@ specBailRequested(vm)  ==  vm.speculation.active and
 ### Per-task creation budgets
 `specBailRequested` also fires when an untrusted-band spec task exceeds its creation budget (`FIX_SPEC_BAND_BUDGET`), or a sibling sweep exceeds its per-member claim/creation budgets. Urgent tasks do not carry that speculative creation budget, but their queue is fixed-capacity. Bailing is a transient reset; resolved sub-thunks are kept.
 
-### Why byte-identity is free here
-Bail fires **only after** the demanded result already exists (or a bounded budget is blown) — so whatever a bailed speculation would have produced is either already computed or genuinely undemanded. The `.drv` is byte-identical regardless of how aggressively we bail. **There is no correctness knob to tune.**
+### Correctness condition
+
+Bailing resets the speculative thunk instead of publishing a sticky error. If
+real demand later reaches it, the thunk is evaluated again on the demand path.
+Changing bail or admission policy must not change the resulting Nix value or
+derivation.
 
 ---
 
 ## Contribution & floor
 
-Fan-out and speculation are independent levers and each contributes a substantial share of the parallel speedup on realistic workloads; measured contributions and the residual **discovery-serialization floor** they cannot cross live in [perf/model.md](../perf/model.md).
+Fan-out and speculation are independent levers. Their contribution on one
+dated NixOS workload, along with the observed discovery-serialization floor, is
+recorded in [perf/model.md](../perf/model.md).
 
 ## Invariants
 
-- Speculation/fan-out **never** change a result — earliness only; the [claim protocol](../runtime/thunks.md) serializes publication.
+- Speculation and fan-out must preserve demand evaluation results.
 - Creation-time speculation and sibling sweeps do not recursively submit from speculative work; queue and task budgets bound the paths that may cascade.
-- Bail fires **only after** the demanded result exists (or a budget is blown) ⇒ byte-identical, untunable.
+- A bail publishes no language result; it resets the thunk for a later demand.
 - `SpeculativeBail` is **transient** — the thunk is reset and recomputed on real demand, never cached as an error.
 - Language-visible effects are journaled by helpers and committed exactly once by real demand; transiently abandoned work drops only its journal reference, not a visible effect.
 - Urgent fan-out may recurse; speculative admission remains bounded.

@@ -1,10 +1,14 @@
 # Derivation Hashing
 
-*The pipeline that turns a `Drv` into store paths, and the byte-identity oracle that makes it correct.*
+*The pipeline that turns a `Drv` into store paths, including the serialization and hashing rules covered by the derivation tests.*
 
 ## Why this is the hot path
 
-Store-path computation is **the** correctness oracle for this evaluator: every `.drv` and every output path must be **byte-identical** to what `nix-instantiate` produces. It is also a serial [critical-path cost](../perf/model.md): every input-addressed derivation is serialized to ATerm three times (masked hash-modulo, unmasked hash-modulo, `.drv` text — see the three-serialization table in step 5), and that serialization runs on the drv-hashing chain. Constant-factor wins in ATerm string-building therefore transfer to high-worker wall time (below).
+For supported inputs, the compatibility target is the same `.drv` text and the
+same `.drv` and output store-path strings as `nix-instantiate`. Focused tests
+cover the serialization, hashing, and path rules described here. On the dated
+NixOS measurements in [perf/model](../perf/model.md), ATerm serialization also
+appears on the serial critical path.
 
 ## The pipeline
 
@@ -46,7 +50,7 @@ Invariants baked in:
 - **Canonical sort** of *everything* with a defined order — outputs by name, inputs by drv path, input output-name lists, srcs, and env by name — all lexicographic (byte-wise).
 - **String escaping** is applied to only four fields: `builder`, each `args` element, and each `env` entry's name and value are quoted **and** escaped (`"` `\` `\n` `\r` `\t` → backslash escapes). Everything else — the output tuple fields (`name`, `path`, `hash_algo`, `hash`), input drv paths, src and output-name lists, and `system` — is quoted but **not** escaped, since those are known store-path / identifier shaped. Matching Nix's exact escaped-field set is load-bearing.
 
-**Pre-sized buffer + escape-free bulk copy.** The output buffer is pre-sized from the dominant content (a 256-byte base, plus each env entry's name+value+8 and each input path+16) to avoid grow-and-copy reallocs; and quoted-string emission (`appendString`) bulk-copies each maximal escape-free run with one `appendSlice` rather than appending byte-by-byte. Env values (build scripts, dependency lists) are large and almost entirely escape-free, so the common case is one copy per value. Because ATerm building runs on the serial drv-hashing chain, this transfers to high-worker wall time.
+**Pre-sized buffer + escape-free bulk copy.** The output buffer is pre-sized from the dominant content (a 256-byte base, plus each env entry's name+value+8 and each input path+16) to avoid grow-and-copy reallocs; and quoted-string emission (`appendString`) bulk-copies each maximal escape-free run with one `appendSlice` rather than appending byte-by-byte. Env values (build scripts, dependency lists) are often largely escape-free. The dated NixOS measurements in [perf/model](../perf/model.md) record the wall-time effect of this change.
 
 ### 2. hashModulo / hashModuloInputs (input-addressed hashing)
 
@@ -139,9 +143,9 @@ User-supplied fixed-output hashes arrive in many encodings; `hashToBase16(expect
 - `algo:hash` or SRI `algo-hash` prefix → algo checked against `expected_algo`; SRI (`-`) body decoded as base64.
 - Bare body: valid hex → passthrough; contains `= + /` → base64; else → **nixBase32-decode** (rejecting out-of-alphabet or malformed-length input rather than crashing).
 
-## What must be byte-identical
+## Compatibility-sensitive details
 
-Any drift here silently produces the wrong store path. The oracle enforces exact equality with Nix C++ on:
+Changes to these rules change derivation text or store paths:
 
 - **ATerm ordering** — lexicographic sort of outputs, inputs, input output-name lists, srcs, and env (`args` keep source order); the exact `Derive(...)` field layout.
 - **String escaping** — only `"` `\` `\n` `\r` `\t`, and only in `builder` / `args` / `env` name+value; every other field (including `system` and the output tuple fields) quoted-but-unescaped.

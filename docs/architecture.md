@@ -2,7 +2,10 @@
 
 *The whole system in one pass: what `fix` is, how an expression becomes a derivation, and how the pieces fit.*
 
-`fix` is a from-scratch evaluator for the Nix expression language, written in Zig. It targets **parity with `nix-instantiate`** — byte-identical `.drv` store paths — while evaluating **in parallel** across many cores. The bet: Nix evaluation is a huge graph of independent lazy computations, so with cheap enough suspensions and a work-stealing scheduler, idle cores can force thunks ahead of demand without changing a single result.
+`fix` is a from-scratch evaluator for the Nix expression language, written in
+Zig. It targets the same evaluated values, derivation text, and store paths as
+`nix-instantiate`. Its runtime can force thunks on multiple worker threads,
+including work submitted ahead of demand.
 
 Read this page first, then follow the reading order at the bottom.
 
@@ -11,17 +14,22 @@ Read this page first, then follow the reading order at the bottom.
 ```
 source text
   → scanner ─ tokens ─ LALR(1) parser        → AST            [syntax]
-  → single-pass compiler                      → bytecode Chunk [compiler + bytecode]
+  → bytecode compiler + analyses              → bytecode Chunk [compiler + bytecode]
   → threaded VM forces lazy thunks            → Value          [vm + runtime]
-  → derivation builtins hash the drv graph    → .drv + store paths  [derivation]
+  → derivation builtins serialize and hash    → .drv text + store paths [derivation]
   → realization recipes + nix-daemon client  → .drv files in the store, built
                                                 outputs, result links  [store]
 ```
 
-Each stage is lazy at the seams: the compiler emits **thunks** for anything not needed immediately, and the VM forces them only on demand (or *speculatively*, ahead of demand, on idle cores).
+The compiler uses thunks at lazy positions. The VM normally forces them on
+demand; the scheduler may also submit eligible thunks speculatively.
 
 - **[syntax](syntax/parsing.md)** — a streaming scanner and a table-driven LALR(1) parser build an arena-allocated AST. Nix's awkward corners (interpolation, indented strings, paths, `inherit`, attr patterns, dynamic attrs) are handled here → [nix-syntax](syntax/nix-syntax.md).
-- **[compiler](compiler/pipeline.md)** — walks the AST once and lowers it to immutable **bytecode chunks**. It resolves names to stack slots and [upvalue captures](compiler/scopes.md), computes [strictness](compiler/strictness.md) masks, and decides what to make lazy vs eager vs [deferred](compiler/lazy-compile.md).
+- **[compiler](compiler/pipeline.md)** — recursively lowers the AST to
+  **bytecode chunks**, with separate name, reference, and
+  [strictness](compiler/strictness.md) analyses where needed. It resolves names
+  to stack slots and [upvalue captures](compiler/scopes.md), and decides what to
+  make lazy, eager, or [deferred](compiler/lazy-compile.md).
 - **[runtime](runtime/values.md)** — the data model: an 8-byte NaN-boxed [`Value`](runtime/values.md), a flat [object heap](runtime/heap.md), string [interning](runtime/interning.md), and the [thunk](runtime/thunks.md) that carries laziness.
 - **[vm](vm/dispatch.md)** — a direct-threaded bytecode interpreter that [forces thunks](runtime/thunks.md), [calls closures](vm/calls.md), [reads attrsets/lists](vm/access.md), and runs the [builtins](vm/builtins.md).
 - **[store / derivation](derivation/model.md)** — the domain model: `Drv`, canonical hashing and paths, string context, and the evaluation-scoped registry of computed derivations. The `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths.
@@ -87,23 +95,37 @@ it without making mutation the default modeling tool.
 
 ## Laziness and parallelism are one primitive
 
-The spine of the system is the [thunk / `Future`](runtime/thunks.md). A thunk is a suspended computation; in parallel mode it is *also* a one-shot concurrent cell. Exactly one [fiber](parallel/fibers.md) **claims** it (CAS `unresolved → evaluating`), runs the body, and **publishes** the result; any other fiber that reaches an in-flight thunk **parks** on its waiter list and is **woken** when the result lands. No duplicate execution, no lock held across evaluation. Imports use the same machine (an `ImportEntry` embeds a `Future`).
+The spine of the system is the [thunk / `Future`](runtime/thunks.md). A thunk is
+a suspended computation; in parallel mode it is also a concurrent cell. One
+[fiber](parallel/fibers.md) at a time claims an unresolved thunk and runs its
+body. Other fibers reaching that attempt can park on its waiter list. A
+successful result or deterministic error is memoized; explicitly transient
+failures reset the thunk for a later attempt. Imports use the same `Future`
+protocol in an `ImportEntry`.
 
 ## The concurrency model
 
 - **[Fibers](parallel/fibers.md)** — stackful user-space coroutines with x86-64 and AArch64 stack-switching. A yielded fiber is fully-captured, movable state, so it can be stolen and resumed on any worker. This is why the engine uses fibers, not OS threads: "steal the work while it waits."
 - **[Scheduler](parallel/scheduler.md)** — per-worker work-stealing queues, classed by submission lane: an *urgent* lane (demand-driven fan-out, a fixed-capacity lock-free Chase-Lev deque) and capped, best-effort *speculative* lanes (a mutex-protected bounded ring). Idle workers steal; parked workers spin then futex-sleep.
-- **[Workers](parallel/workers.md)** — N symmetric workers; the main thread runs a top-level fiber and, whenever it parks, joins the others in stealing. It never idle-waits.
+- **[Workers](parallel/workers.md)** — N workers; the main thread runs the
+  top-level fiber and participates in the drain loop while that fiber is
+  parked.
 - **[Speculation & fan-out](parallel/speculation.md)** — the evaluator forces likely-needed thunks ahead of demand (speculation) and forks a collection's element thunks in parallel (fan-out), gated by [strictness](compiler/strictness.md) and bounded by bail-on-demand and per-task budgets.
 
 ## Why it's shaped this way (performance)
 
-Parallel evaluation is ultimately bounded by the **serial critical path** through the derivation-hashing DAG and module-system fixpoint. Once helpers keep that path supplied, additional throughput cannot shorten its dependency depth; useful optimizations must remove work from the chain itself. This drives lean thunks, frameless attr access, layered merges, and bulk ATerm construction. Current evidence and rejected experiments belong in [perf/model](perf/model.md).
+On the NixOS workload recorded in [perf/model](perf/model.md), scaling is
+bounded by a serial critical path through module evaluation and derivation
+hashing. That observation motivated lean thunks, frameless attr access, layered
+merges, and bulk ATerm construction. It is a measured workload result, not a
+property asserted for every Nix expression.
 
 ## Correctness posture
 
-- **Byte-identical `.drv`** vs Nix C++ is the oracle for every change. See [invariants](invariants.md).
-- **The interpreter is the sole execution engine and is canonical.** The [GC](gc.md) is part of every supported build; it bounds evaluator-heap growth and never changes output — evaluation is byte-identical whether it stays dormant or collects.
+- Matching derivation text and store paths is a compatibility target covered by
+  derivation tests and differential workloads. See [invariants](invariants.md).
+- The interpreter is the execution engine. The [GC](gc.md) is part of every
+  supported build and must preserve evaluator results while reclaiming storage.
 - **Headroom is measured before it's built.** A suite of [probes](perf/probes.md) (compile-time `-D` flags) quantifies each lever's ceiling first.
 
 ## Reading order

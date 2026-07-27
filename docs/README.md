@@ -2,7 +2,9 @@
 
 *A parallel evaluator for the Nix expression language, in Zig. These docs describe the system you're about to modify.*
 
-`fix` parses and evaluates Nix expressions to values and derivations, aiming for **byte-identical `.drv` output** to `nix-instantiate` while evaluating **in parallel** — idle cores force lazy thunks ahead of demand without changing any result.
+`fix` parses and evaluates Nix expressions to values and derivations. It targets
+the same derivation text and store paths as `nix-instantiate`, and can schedule
+thunk evaluation across a pool of worker threads.
 
 **Start with [architecture](architecture.md)** for the whole system in one pass and the recommended reading order, then [invariants](invariants.md) for the cross-cutting rules every change must respect.
 
@@ -21,7 +23,7 @@
 - [lazy-compile](compiler/lazy-compile.md) — deferred compilation + trivial-body elision
 
 **Runtime** — [`runtime/`](runtime/)
-- [values](runtime/values.md) — NaN-boxed `Value` + Nix-parity numerics
+- [values](runtime/values.md) — NaN-boxed `Value` + numeric semantics
 - [heap](runtime/heap.md) — object store + layered `//` merge
 - [interning](runtime/interning.md) — string/symbol table
 - [thunks](runtime/thunks.md) — **the laziness + concurrency primitive**
@@ -34,7 +36,7 @@
 
 **Derivations** — [`derivation/`](derivation/)
 - [model](derivation/model.md) — the `Drv` and how `derivation` builds one
-- [hashing](derivation/hashing.md) — ATerm → store paths; the byte-identity oracle
+- [hashing](derivation/hashing.md) — ATerm serialization, hashing, and store paths
 - [context](derivation/context.md) — string context tracking
 
 **Parallelism** — [`parallel/`](parallel/)
@@ -49,8 +51,9 @@
 - [probes](perf/probes.md) — the `-D` headroom-measurement suite
 - [hugetlb](perf/hugetlb.md) — 2 MB huge-page heap backing (`--hugetlb`)
 
-**Memory** — the interpreter stays canonical
-- [gc](gc.md) — non-moving generational collector that bounds evaluator-heap growth; never changes output
+**Memory management**
+- [gc](gc.md) — non-moving generational collector used to reclaim evaluator
+  heap storage
 
 **Operating**
 - [build](build.md) — module layout, `-D` flags, lint, tests
@@ -59,4 +62,6 @@
 ## Conventions
 
 - Docs describe **the system** — mechanisms, data flow, invariants, and the *why* — not the text of specific `.zig` files. Subsystem docs include a `Code:` pointer to their implementation area.
-- The **interpreter is the sole engine and is canonical**; collection and diagnostic probes never change output. Byte-identical `.drv` is the ground truth for correctness.
+- The interpreter is the execution engine. Collection and diagnostic probes
+  must not change language results. Derivation text and store paths are covered
+  by focused tests and differential workload checks.

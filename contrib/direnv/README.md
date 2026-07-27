@@ -2,9 +2,8 @@
 
 `fix print-dev-env` is a `nix print-dev-env` analogue: it reproduces a
 derivation's **build environment** (buildInputs on `PATH`, `NIX_CFLAGS_COMPILE`,
-`shellHook`, …) *without building the derivation itself*, emitting a flat,
-side-effect-free bash script. That's exactly what direnv needs to replace
-`use nix` / `use flake`.
+`shellHook`, …) *without building the derivation itself*, emitting a Bash
+export script for `use nix` / `use flake`-style environments.
 
 ## Install
 
@@ -61,9 +60,12 @@ then `direnv allow`.
    `nix develop`). Because the env is computed *inside the build*, this is pure
    and works against a remote store; `$out` is read back off local disk, or via
    the daemon (`NarFromPath`) for a remote store.
-2. The `use fix` function caches that script under `.direnv/`, re-running
-   `fix print-dev-env` only when the fix binary or the input files change
-   (`watch_file`).
+2. The `use fix` function caches that script under `.direnv/`. The cache key
+   includes the `fix` path, its mtime, and the command arguments.
+   `shell.nix`, `default.nix`, `flake.nix`, and `flake.lock` invalidate an
+   existing cache entry when newer; explicit file arguments are registered
+   with direnv's `watch_file`, but are not currently part of the cache-mtime
+   check.
 3. It `eval`s the cached script, then appends your original `PATH` so your
    personal tools still resolve after the dev-shell tools.
 
@@ -75,8 +77,9 @@ eval "$(fix print-dev-env ./shell.nix)"   # enter the dev shell in-place
 
 ## Caveats / not-yet
 
-- **No GC roots.** A `nix-collect-garbage` can drop the realized inputs; the
-  next `cd`/reload rebuilds them. (A future `fix print-dev-env --add-root` would
+- **No GC roots.** A `nix-collect-garbage` can drop realized inputs referenced
+  by a cached environment. Remove the corresponding `.direnv/fix-*.env` cache
+  entry to recompute it. (A future `fix print-dev-env --add-root` would
   register roots like `nix-direnv`.)
 - **`__structuredAttrs` derivations are not yet supported** (the env is emitted
   as a single `__json` blob rather than individual variables). `fix

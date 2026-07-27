@@ -4,8 +4,8 @@
 
 ## What it does
 
-With `--hugetlb` engaged, the two structures that dominate the eval's memory
-traffic are backed by explicit `MAP_HUGETLB` mappings instead of 4 KB pages:
+With `--hugetlb` engaged, several large evaluator mappings can use explicit
+`MAP_HUGETLB` backing instead of ordinary pages:
 
 - the **flat object store** (`base/segments.zig FlatStore`) — a reserved
   huge-page *prefix* grown chunk-wise (32 MB) ahead of the bump cursor when
@@ -20,11 +20,11 @@ traffic are backed by explicit `MAP_HUGETLB` mappings instead of 4 KB pages:
   class blocks and >64 MB pass-throughs that back the smaller segments,
   parse/compile arenas, and retained ASTs.
 
-One 2 MB TLB entry replaces 512 4 KB entries and first-touch faults drop
-512×. Point-in-time measurements from 2026-07-10 on `test/nixos_toplevel.nix` (ReleaseFast): **w=1 −8.3%**
+One 2 MB page covers the address range of 512 4 KB pages. Point-in-time
+measurements from 2026-07-10 on `test/nixos_toplevel.nix` (ReleaseFast): **w=1 −8.3%**
 wall (exact, 3/3 interleaved pairs), w=8 **page faults −57% / dTLB misses
 −47%**, and it eliminates a +202 ms bimodal slow mode under memory-pressure
-co-load entirely (w=16 co-loaded −20%). Output is byte-identical on/off.
+co-load entirely (w=16 co-loaded −20%).
 Transparent huge pages do cover the advised, sequentially-grown flat store
 (~750 MB `AnonHugePages` on the NixOS workload), but the short-lived block and
 segment mappings remain unreliable candidates. Explicit hugetlb also retains
@@ -40,8 +40,8 @@ sudo sysctl vm.nr_hugepages=2048        # 4 GB pool of 2 MB pages
 ```
 
 (Persist in `/etc/sysctl.d/`; allocate early after boot — a fragmented
-machine may not be able to assemble the pages later.) A NixOS-toplevel
-eval uses ~1.65 GB of pool at peak. Every accepted hugetlb mapping is
+machine may not be able to assemble the pages later.) The profiled NixOS
+toplevel evaluation used ~1.65 GB of pool at peak. Every accepted hugetlb mapping is
 write-prefaulted; chunk-grown prefixes keep its unused grow-ahead slack to
 one 32 MB chunk per active store. A 4 GB pool (`2048`) leaves headroom;
 undersizing is safe (overflow falls back to normal pages) but gives up

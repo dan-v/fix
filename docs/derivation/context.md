@@ -6,7 +6,10 @@
 
 In Nix, a string is not just text — it may carry a **context**: the set of store paths that must exist before the string is meaningful, each tagged with *which* dependency it induces. When you interpolate `drv.outPath` into a build script, the resulting string remembers "this text mentions `/nix/store/…-foo.drv`, and I depend on its `out` output." When that string later lands in a `derivation`'s env, the [derivation builder](./model.md) reads the context back out to populate `input_drvs` / `input_srcs`.
 
-Context is therefore **load-bearing for correctness**: a derivation's dependency edges are *derived entirely from the context of its attribute strings*. Drop or mis-merge a context entry and the `.drv` gets the wrong dependency set — a byte-different, wrong derivation.
+Context is therefore **load-bearing for correctness**: the derivation
+normalizer derives `input_drvs` and `input_srcs` from the contexts of its
+string-coerced attributes. Dropping or mis-merging an entry produces the wrong
+dependency set.
 
 ## What a context is
 
@@ -32,11 +35,13 @@ Strings come in three [value](../runtime/values.md) forms:
 
 ## Propagation and merging through string ops
 
-Every string operation that produces a new string must **carry the union of its inputs' contexts** — otherwise a dependency is silently dropped. See [string ops](../vm/access.md) for the operations themselves; the context rules:
+Context-preserving string operations carry the dependencies of the values they
+use. The explicit `unsafeDiscard*` builtins below are the exceptions. See
+[string ops](../vm/access.md) for the operations themselves; the main rules are:
 
-- **Concatenation** (`++` on strings, `builtins.concatStringsSep`, interpolation): the result's context is the union of all operands' contexts. If no operand had context the result is a plain string; otherwise a context string.
-- **`substring` / `replaceStrings` / other transforms**: propagate the source string's context wholesale (context tracks *the whole string's* dependencies, not per-character — a substring keeps them all).
-- **path ++ string** (`concatPathLike`): the result is **path-typed** (the concatenated, absolute-resolved path), carrying the right operand's context; a bare path is treated as its implicit `{path=true}` when the result's context is later queried. Appending a string that carries **store-path** context onto a path is rejected (`InvalidPathConcatenation`) — a filesystem path cannot be turned into a store dependency this way.
+- **Concatenation** (`+` on strings, `builtins.concatStringsSep`, interpolation): the result's context is the union of the operands' contexts. If no operand had context the result is a plain string; otherwise a context string.
+- **`substring`** keeps the source string's entire context, including when the selected text is empty. **`replaceStrings`** keeps the source context and adds the contexts of replacements that actually match.
+- **path + string** (`concatPathLike`): the result is **path-typed** (the concatenated, absolute-resolved path), carrying the right operand's context; a bare path is treated as its implicit `{path=true}` when the result's context is later queried. Appending a string that carries **store-path** context onto a path is rejected (`InvalidPathConcatenation`) — a filesystem path cannot be turned into a store dependency this way.
 
 **Merge algorithm.** Unioning happens at two levels.
 
@@ -69,6 +74,6 @@ When [`derivation`](./model.md) normalizes its argument, each attribute value is
 - A context entry whose path **ends in `.drv`** becomes an **`input_drvs`** edge — the requested output names come straight from the descriptor (`allOutputs` → the input drv's recorded output names; `outputs=[…]` → those names; bare → `["out"]`). Duplicate input paths are **merged by union of output names**, matching the [hashing](./hashing.md) `hashModuloInputs` invariant.
 - A context entry whose path is **not** a `.drv` becomes an **`input_srcs`** edge, and — for source paths — the referenced path text is rewritten to its computed store path (NAR-hashed via [source-path hashing](./hashing.md)).
 
-The store-path strings a derivation *hands out* are themselves context strings that seed this: `drvPath` carries `{ <drv> = { allOutputs = true; }; }`, and each `outPath` carries `{ <drv> = { outputs = [ <thatOutput> ]; }; }`. So the moment one derivation's `outPath` flows into another's env, the consumer records the exact input-drv edge and output name. This closed loop — context in the produced strings, context read back at consumption — is what makes cross-derivation dependency tracking byte-correct.
+The store-path strings a derivation *hands out* are themselves context strings that seed this: `drvPath` carries `{ <drv> = { allOutputs = true; }; }`, and each `outPath` carries `{ <drv> = { outputs = [ <thatOutput> ]; }; }`. So the moment one derivation's `outPath` flows into another's env, the consumer records the exact input-drv edge and output name. This closed loop — context in the produced strings, context read back at consumption — is how dependency information survives composition across derivations.
 
 Code: `src/runtime/heap.zig` (`ContextString`, `addContextString`), `src/expr/vm/strings.zig` (concat / path-concat context union), `src/expr/vm/builtins/string_context.zig` (context builtins), `src/expr/vm/builtins/derivation.zig` (`normalizeDerivationString`: context → `.drv`/src deps)

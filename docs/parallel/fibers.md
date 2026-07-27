@@ -4,7 +4,13 @@
 
 ## Mental model
 
-A **fiber** is a computation running on its own stack. Its owner (a [worker](workers.md) thread) calls `resume_` to switch onto the fiber's stack; the fiber calls `yield` to switch back, suspending itself for later resumption. The key property: **once a fiber yields, its entire live state is captured in its `Context` + stack** — immutable until the next resume. Nothing lives in thread-local or register state that the resumer must reconstruct. That is what makes a suspended fiber a *value* the scheduler can hand to any thread.
+A **fiber** is a computation running on its own stack. Its owner (a
+[worker](workers.md) thread) calls `resume_` to switch onto the fiber's stack;
+the fiber calls `yield` to switch back, suspending itself for later resumption.
+Once a fiber yields, the execution state needed to continue is captured in its
+`Context` and stack. Scheduler metadata around the fiber can still change while
+it is suspended. Because continuation does not depend on the original worker's
+register state, the scheduler can hand the suspended fiber to another thread.
 
 Each fiber carries **its own VM**. The VM's shared pointers reference the [`Engine`](workers.md) tables (chunk registry, [intern](../runtime/interning.md) table, [heap](../runtime/heap.md), scheduler, file/import caches); the per-fiber part is the interpreter value stack, the frame chain, and a private scratch arena backing the VM's run-path allocations. So resuming a fiber on a different thread is sound: the shared state is shared, the private state travels in the stack.
 
@@ -12,10 +18,16 @@ Each fiber carries **its own VM**. The VM's shared pointers reference the [`Engi
 
 When a thunk force blocks on an in-flight [`Future`](../runtime/thunks.md), the blocked computation must be parked so its worker can do other work. Two rejected alternatives:
 
-- **OS threads / blocking:** parking on a futex burns a whole OS thread per blocked force; at realistic fan-out that is thousands of threads. A yielded fiber's incremental switch state is a 24-byte `Context`; its stack stays mapped but demand-paged (committed RSS tracks only the depth touched), and overflow fibers hand their pages back to the OS.
+- **OS threads / blocking:** parking on a futex consumes an OS thread per
+  blocked force. A yielded fiber's incremental switch state is a 24-byte
+  `Context`; its stack stays mapped but demand-paged, and overflow fibers can
+  return their pages to the OS.
 - **Steal-while-waiting** (a worker, while blocked, dives into the scheduler to run unrelated work on the *same* stack): this pins the resumption to the waiting thread and grows the stack unboundedly with nested unrelated frames. Fibers instead *yield the frame away* — the waiter becomes a stealable object and its thread returns to the drain loop clean.
 
-Payoff and cost profile: at high `--workers` counts helpers are mostly idle (see the [critical-path floor](../perf/model.md)); the wall is dependency-chain depth, not throughput. So the machinery that matters is *low-overhead, affinity-free resumption of blocked work*, exactly what a yielded fiber gives. Fiber creation is amortized by recycling (below), so parking/resuming is close to a `swap` + a queue push.
+On the dated NixOS profile in the [performance model](../perf/model.md), helper
+utilization is limited by dependency-chain discovery at high worker counts.
+Fibers let a blocked computation yield its worker and later resume on another
+one; the worker pool recycles their mappings.
 
 ## The swap primitive
 
@@ -42,7 +54,7 @@ For a never-run fiber the jump target is the trampoline, seeded directly into `C
 
 ## Stacks
 
-Each fiber reserves a **16 MiB** anonymous mapping (`mmap` with `PROT_READ|PROT_WRITE`, `MAP_ANONYMOUS|MAP_PRIVATE`, demand-paged). The kernel commits pages only as the fiber recurses, so **RSS tracks actual depth, not the reservation**. The mapping buys deep-recursion headroom while costing almost no physical memory for shallow fibers. It is registered with the RSS attributor (`vma`) so the process's most numerous large mappings do not merge into an unattributable anonymous blob.
+Each fiber reserves a **16 MiB** anonymous mapping (`mmap` with `PROT_READ|PROT_WRITE`, `MAP_ANONYMOUS|MAP_PRIVATE`, demand-paged). Untouched pages do not become resident; pages used by overflow fibers can later be released as described below. The mapping is registered with the RSS attributor (`vma`) so fiber stacks remain a distinct memory category.
 
 `releaseStackPages(retain_top, lazy)` gives a dead fiber's stack pages back to the OS — `MADV_FREE` (reclaimed only under pressure) or `MADV_DONTNEED` (immediate). It is only ever called on a `.finished`/`.ready` fiber, whose frames are garbage by definition: a later re-fault reading zeros is indistinguishable from a fresh stack (`reset` reseeds the trampoline address into the context, and running code always writes a frame before reading it). The [worker](workers.md) uses this to trim spike-overflow fibers when it parks.
 

@@ -7,7 +7,11 @@ Two independent levers reduce compile-time and force-time cost:
 - **(a) Deferred per-attr compilation** — don't compile an attribute's value body until it's forced (for huge generated attrsets).
 - **(b) Trivial-body short-circuits** — for bodies that reduce to a single value with no real work, skip thunk allocation entirely.
 
-Both preserve the correctness oracle: deferred bytecode is equivalent to eager bytecode; a short-circuited thunk yields the same value. Both reference [runtime/thunks.md](../runtime/thunks.md) (thunk targets) and interact with [speculation](../parallel/speculation.md).
+Both are intended to preserve evaluation semantics: deferred compilation emits
+the same operations when the body is demanded, and a short-circuited thunk
+yields the value its classified body would have returned. Both reference
+[runtime/thunks.md](../runtime/thunks.md) (thunk targets) and interact with
+[speculation](../parallel/speculation.md).
 
 ---
 
@@ -51,8 +55,17 @@ force time:     synthetic parent(locals = snapshot) → compile child (captures 
 
 ### Correctness
 
-- **Byte-identical to eager.** The synthetic-parent trick guarantees the produced bytecode is equivalent to what an eager compile emitted — the only difference is *when* it is compiled, and internal upvalue numbering (never observable in output).
-- **Concurrency-safe.** Each forcer builds its own chunk on a per-body scratch arena; `ChunkRegistry.register` bumps a lock-free atomic cursor (`StableSegments.appendAtomic`), so racers get distinct `ChunkId`s; the CAS on the entry's cached `compiled` word (`ChunkId + 1`, `0` = uncompiled) then ensures a single winner (the loser's chunk is orphaned but correct). Runs on any worker.
+- **Equivalent to eager lowering.** The synthetic parent reconstructs the
+  bindings the eager compiler would have resolved. Compilation happens later,
+  and internal chunk ids or upvalue numbering may differ; language values and
+  derivation output must not.
+- **Concurrency-safe.** Each racing forcer can compile its own chunk on a
+  per-body scratch arena. Persistent and debugging evaluators pass the result
+  through structural registry deduplication; transient one-shot evaluators
+  register it directly. The CAS on the entry's cached `compiled` word
+  (`ChunkId + 1`, `0` = uncompiled) chooses the id subsequent forces use. A
+  losing registration is either the same deduplicated id or an unreferenced
+  but valid chunk. Deferred compilation can run on any worker.
 - **Elision-aware.** A deferred leaf's body may itself be an `.elided` span that the parser never parsed; `deferred.compile` sub-parses it at first force (into a throwaway arena, never mutating the shared AST), so a syntax error inside an elided body surfaces at force time rather than parse time.
 - **One funnel.** Deferred and eager compilation share `finishCompiledChild`, so strictness stamping / trivial classification / registration are identical.
 
@@ -91,7 +104,8 @@ Emit-time super-op fusion (see [pipeline.md](pipeline.md)) shrinks a body's enco
 
 ## Invariants
 
-- **Deferral changes only *when*.** Deferred bytecode ≡ eager bytecode (modulo internal upvalue numbering); output is byte-identical.
+- **Deferral changes compilation timing, not language semantics.** Internal
+  chunk ids and upvalue numbering are not part of the Nix result.
 - **Classify runs once, over the frozen body**, guarded by `local_count == 0` — the shape set is exhaustive for thunk bodies.
 - **Short-circuit ≡ force.** Pushing the trivial value directly yields exactly what forcing the thunk would have.
 - **Fusion is size-neutral to the scheduler.** `fused_dispatch_weight` restores the dispatch weight removed by the `*_get_attr` and store-fusion rewrites for the `body_is_substantial` decision.

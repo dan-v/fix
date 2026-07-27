@@ -63,16 +63,19 @@ Bit `i` corresponds to the chunk-relative [upvalue index](scopes.md) `i`. **Chun
 
 **3. Per-parameter strictness (`bodyMustForceName` / `forwardingUpvalue`).** A single-parameter lambda whose body must-forces its parameter (`bodyMustForceName`) sets `SchedulingHints.strict_param` — a caller holding the closure passes its argument eagerly. Only when that fails, a structural check (`forwardingUpvalue`) matches the forwarder shape `x: f x` and records `f`'s upvalue index in `strict_via_upvalue`, so the lambda forces its parameter iff `f` does. An uncurried (arity > 1) lambda instead records a per-parameter `strict_params` bitmask (bit *i* = param *i* must-forced), which the saturated [`call_n`](pipeline.md) path (`vm/closures.zig forceStrictArgs`) forces eagerly in place. A directly-applied strict lambda `(x: body) arg` (`directlyAppliedStrictLambda`, also `bodyMustForceName`) likewise lets the caller pass `arg` eagerly instead of thunking it. `strict_param` and `strict_via_upvalue` are gated to `local_count == 1` at `ChunkBuilder.finish`.
 
-The **zero-capture case is elided**: `stampOnBuilder` returns early for a capture-free body, since its mask would be all-zero anyway — the whole analysis walk is skipped, byte-identically.
+The **zero-capture case is elided**: `stampOnBuilder` returns early for a
+capture-free body, since its mask would be all-zero.
 
 ## Invariants
 
 - **Two soundness directions, one walk.** `shallow`/`deep` are may-force (over-approximations, safe for scheduling/speculation); `shallow_must` is a sound must-force under-approximation (safe for eager evaluation). `shallow_must ⊆ shallow ⊆ deep`.
 - **Local to the chunk.** No recursion into lambda/nested-chunk bodies; each analysis describes only its own free variables.
 - **> 64 upvalue slots degrade, never break.** Dropping high slots loses information, not correctness.
-- **Hint- and reorder-only.** Strictness influences *when* and *how urgently* a value is computed (and lets already-inevitable forces happen without a thunk) — never *whether* a value is computed or *what* it is. Removing all strictness signals leaves output byte-identical (modulo which error surfaces first in a failing eval).
+- **Preserve successful results.** Strictness may change when an inevitable
+  force runs and which error surfaces first in an already-failing evaluation;
+  it must not turn a successful lazy evaluation into a failure or change its
+  value.
 
 Out of scope: scheduler speculation and fan-out → [parallel/speculation.md](../parallel/speculation.md); thunk representation → [runtime/thunks.md](../runtime/thunks.md); the stamp site in the pipeline → [pipeline.md](pipeline.md).
 
 Code: `src/expr/compiler/strictness.zig`
-</content>

@@ -2,7 +2,11 @@
 
 *Why the measured wall is dependency-chain depth, not throughput, and which lever moves it.*
 
-The correctness oracle is byte-identical `.drv` (see [invariants](../invariants.md)); every figure below holds that fixed. Wall figures are point-in-time measurements from 2026-07-11 on `test/nixos_toplevel.nix`, ReleaseFast, on a 16-core/32-thread host; they are evidence, not performance guarantees.
+Wall figures below are point-in-time measurements recorded on 2026-07-11 for
+`test/nixos_toplevel.nix`, ReleaseFast, on a 16-core/32-thread host. They are
+historical engineering notes, not performance guarantees. The timing harness
+does not validate results; the current reusable workload comparison is
+`zig build test-bench-fixtures`.
 
 ## The cost-model flip
 
@@ -29,7 +33,10 @@ Consequence: "eliminate duplicate work" and "add more parallelism" are both larg
 - **drv-hashing DAG** — `derivationLazyAttr` computing outPath/drvPath SHA256 over the input-derivation graph (~477–828 drvs, ~3 ATerm serializations each), memoized O(N) via the derivation `Registry` hosted by the realization store. See [derivation/hashing](../derivation/hashing.md).
 - **module-system fixpoint** — applying millions of user functions (`lib/modules.nix`) and option-merging the config tree. See [derivation/model](../derivation/model.md).
 
-**Machinery is ~7% of the w=32 wall** (`run_isolated_frame` + `do_call` + `force_*` ≈ 100M excl cycles). That ~7% is the entire ceiling for any dispatch- or execution-speed optimization — the other ~93% is data-dependency latency the interpreter cannot outrun.
+The instrumented `run_isolated_frame`, `do_call`, and `force_*` machinery
+accounted for roughly 7% of the w=32 wall (~100M exclusive cycles). That puts a
+small ceiling on optimizations confined to those paths in this run; the profile
+attributes most of the remaining time to dependency-chain latency.
 
 ### Wall numbers
 
@@ -43,7 +50,9 @@ Parallelism buys ~0.69s of *earliness*, split ~50/50 between speculation and fan
 
 ## The lever: eliminate on-chain work
 
-Since main runs the chain and rarely waits, the direct lever on this workload is removing real work *on the chain* (structurally — remove it rather than adding a per-op runtime check). Landed wins, all byte-identical, all transfer to w=32:
+Since main runs the chain and rarely waits, the direct lever on this workload
+is removing real work *on the chain*. The notes record the following
+point-in-time effects at w=32:
 
 | win | effect | doc |
 | --- | --- | --- |
@@ -57,7 +66,8 @@ Since main runs the chain and rarely waits, the direct lever on this workload is
 | flat object store (`get(id)=base[id]`) | ~-3–4% w=1 | [runtime/heap](../runtime/heap.md) |
 | trivial-body short-circuit (skip thunk alloc) | ~-5% w=32 | [compiler/lazy-compile](../compiler/lazy-compile.md) |
 
-Cumulative session ~-5.5% w=32. The cheap and medium on-chain work-elimination wins are spent; the big remaining chain items (drv hashing, module user-fns) are inherent.
+Cumulative session ~-5.5% w=32. Derivation hashing and module-function work
+remained the largest observed chain items after these changes.
 
 ## Dead-ends — measured neutral or regressive, do NOT re-explore
 
@@ -66,10 +76,10 @@ Cumulative session ~-5.5% w=32. The cheap and medium on-chain work-elimination w
 | Superinstructions / opcode fusion | Dispatch is ~1.5% of wall (ngram calibration: +10 instr/op ≈ +1.5–1.8%); fusion is sub-noise → [vm/dispatch](../vm/dispatch.md) |
 | Locality: nursery / SoA / prefetch / THP | NOT memory-bound. cachegrind LL read-miss ~0% (working set fits L3). Bottleneck is instructions + dependent-latency + branch-mispredict (IPC ~1.2–1.5) |
 | SHA-NI / faster crypto | Swap SHA256→free hash = w=1 0.6%, w=32 0%. drv-hash cost is ATerm build + encoding + alloc, not compression |
-| Lazy-attr materialization (lazy mapAttrs, mapped_attrs object) | Byte-identical but +1–2% REGRESSION w=1 AND w=32 (merge materializes immediately) |
+| Lazy-attr materialization (lazy mapAttrs, mapped_attrs object) | +1–2% REGRESSION w=1 AND w=32 (merge materializes immediately) |
 | Thunk-result memo past ≤2 upvalues | 3–4 ups ~0.1% redundant, 5+ ~0%, closure thunks 0 forces → nothing to gain |
 | Burst dispatch / batched submit / long-spin | Wall-neutral or worse; wake/dispatch mechanics aren't the bottleneck — helpers idle because work doesn't exist yet |
-| Deep-fanout / dedup of duplicate drv builds | drv frontier ~92% already resolved-ahead at w=32; in-flight dedup byte-identical + stable but WALL-NEUTRAL (dups off-path on idle helpers) |
+| Deep-fanout / dedup of duplicate drv builds | drv frontier ~92% already resolved-ahead at w=32; in-flight dedup was wall-neutral (duplicates were off-path on idle helpers) |
 | Parallel drv-hashing as an "option B" | ~95% of drv builds already run on helpers at w=32; main only ~5% — refuted; floor is serial module discovery |
 
 ## Remaining headroom
@@ -77,11 +87,17 @@ Cumulative session ~-5.5% w=32. The cheap and medium on-chain work-elimination w
 Both are large by **count / bytes**, not by wall — the opposite shape of an on-chain win — and both are caveated.
 
 - **Deforestation.** The module fixpoint builds single-use intermediate lists and attrsets by the million and consumes most exactly once. The ceiling is by **count, not wall**; realizing it needs an optimizer with reach (targeted fusion, or a trace deforester), and a naive lazy-materialization attempt already regressed (see dead-ends).
-- **GC policy for peak RSS.** The collector already bounds retained storage; budget and generation-policy changes trade pause cost against reserved memory. On this snapshot, `--gc-budget=512m` held nixos_toplevel at ~850 MB reserved versus ~1.4 GB with collection disabled. See [gc](../gc.md).
+- **GC policy for peak RSS.** The collector reuses unreachable heap storage;
+  budget and generation-policy changes trade pause cost against reserved
+  memory. On this snapshot, `--gc-budget=512m` held nixos_toplevel at ~850 MB
+  reserved versus ~1.4 GB with collection disabled. See [gc](../gc.md).
 
 ## Methodology
 
 1. **Measure headroom before building.** Every direction above was probed first — see [perf/probes](./probes.md). The philosophy is: quantify the ceiling of a lever before writing the optimizer.
 2. **A/B at both ends.** Controlled A/B at w=1 (ReleaseFast, throughput floor) and w=32 (critical-path floor), back-to-back, best+median. w=1-only wins that don't touch the chain do not transfer.
-3. **Byte-identical `.drv` gate, always.** Plus `zig build test`. A perf change that alters the store path is a bug, not a win.
+3. **Check results separately from timing.** The timing harness does not
+   compare evaluator output. `zig build test-bench-fixtures` evaluates its
+   workloads under both `fix` and `nix-instantiate` and compares the strict JSON
+   values.
 4. **`-Dprof-path` runs at `--workers=1`** (its span nesting assumes one fiber forcing LIFO); **`-Dprof-main` writes counters only from worker 0**, so they stay plain (no atomics) at any worker count — that is how it profiles main's serial pathlength at `--workers=32` (above) as well as at `--workers=1`.

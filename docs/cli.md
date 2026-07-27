@@ -100,7 +100,12 @@ Frames show names when chunk-name capture is on (`--debugger` and every REPL ses
 
 `break FILE:LINE` pauses whenever execution reaches that line — set it during any pause (drop a `builtins.break` near the entry to get an initial one). The request may name a file which has not been imported yet; it is listed as pending, resolves to the nearest executable line when that file finishes its first compilation, and patches later deferred bodies too. It's implemented by **patching the bytecode**, not by a per-instruction check: the opcode byte at the line's first instruction is overwritten with a dedicated `breakpoint` opcode that pauses the debugger and then chains to the saved original opcode (its operands are untouched). The hot dispatch loop is byte-for-byte unchanged and pays nothing until a patched instruction actually runs — so this ships in the default binary with no build flag. `delete N` restores the original bytes. Because bodies compile lazily (imports, deferred attrs register mid-evaluation), a per-registry hook re-patches pending breakpoints onto each newly registered chunk.
 
-The compiler emits a source-map entry per expression node, so essentially every line is breakpointable; a requested line still resolves to the nearest line carrying code (reported when it differs). One caveat: a single source line can compile into several chunks (e.g. a call and its argument thunk), so a breakpoint may report multiple sites and pause at each. Breakpoints force `--workers=1`, so patched bytecode is never shared across threads.
+The compiler emits source-map entries for expression nodes; a requested line
+resolves to the nearest line carrying code and reports when that differs. A
+single source line can compile into several chunks, so one request may resolve
+to multiple sites. Persistent `fix eval --debugger` and
+`fix repl --debugger` sessions use one worker. A transient `:debug` evaluation
+in an ordinary REPL enables the scheduler's debug-serial gate instead.
 
 ### Stepping
 
@@ -110,7 +115,17 @@ One honest caveat: this is a **lazy** language, so stepping follows *demand* ord
 
 **Source locations.** A frame's `ip` is resolved with `disasm.frameSpan` — the narrowest covering source span, but with an *inclusive* end and a `body_span` fallback. The inclusive end matters for a caller frame, whose `ip` points *past* the call it's suspended on (exactly at the covering span's exclusive end); plain `bestSpan` (used by `fix disasm` for the instruction about to execute) would miss it and the frame would show no location. This is why a backtrace reads `f.nix:11:8 f ← 13:42 ← 13:3` rather than blank caller lines.
 
-**Architecture.** The engine exposes a neutral break seam so the layering stays down-only: `vm.BreakSink` on the VM (null in every normal run — `builtins.break` is then a plain identity, zero cost off the debug path), the `breakpoint` opcode + `bytecode.BreakpointTable` (patch/restore, with new chunks patched by the evaluator's `chunkRegistered` callback), an `expr.DebugSession` view over the paused VM (backtrace, scope, evaluate-in-place, value rendering, frame disassembly, breakpoint set/list/delete, stepping), and `Engine.setDebugUi`. The `cli` layer supplies either the console (`src/cli/debugger.zig`) or the integrated VM screen (`src/cli/repl/vm/`) through that view. Both share `debugger_command.zig`; the console and non-TUI REPL additionally share the bounded query implementation in `src/cli/repl/vm/plain.zig`.
+**Architecture.** The engine exposes a neutral break seam so the layering stays
+down-only: `vm.BreakSink` on the VM (null in normal runs, where
+`builtins.break` acts as identity), the `breakpoint` opcode +
+`bytecode.BreakpointTable` (patch/restore, with new chunks patched by the
+evaluator's `chunkRegistered` callback), an `expr.DebugSession` view over the
+paused VM (backtrace, scope, evaluate-in-place, value rendering, frame
+disassembly, breakpoint set/list/delete, stepping), and `Engine.setDebugUi`.
+The `cli` layer supplies either the console (`src/cli/debugger.zig`) or the
+integrated VM screen (`src/cli/repl/vm/`) through that view. Both share
+`debugger_command.zig`; the console and non-TUI REPL additionally share the
+bounded query implementation in `src/cli/repl/vm/plain.zig`.
 
 ## Key flags
 
@@ -229,6 +244,10 @@ eval is just the "pin everything" caller of the same machinery.
 ### System activation (`switch`)
 
 The optional action is `switch` (default), `boot`, `test`, `build`, or `dry-activate`. Select the platform with `--nixos`, `--darwin`, or `--home-manager`; `--target-host [USER@]HOST` copies and activates remotely, and `--use-remote-sudo` runs the remote activation under `sudo`.
+
+The action, when present, must be the first argument after `fix switch`, for
+example `fix switch build --nixos`. This command is experimental: its scope and
+interface are still being worked out and are likely to change.
 
 ### Introspection / trace flags
 
