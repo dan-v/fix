@@ -24,7 +24,7 @@ API: `append(v) → id`, `reserve(len) → Range`, `slice`/`sliceMut`, and tail-
 
 ## Per-worker TLABs (`HeapLocal`)
 
-Each worker (including main, indexed by `worker_id`) owns a `HeapLocal` with a `LocalChunk` cursor per store (object/value/attr/attr_pos). A worker **reserves a chunk from the global store once under the store mutex** (256 objects / 1024 values / 512 attrs / 256 attr-positions per refill), then hands out slots lock-free (`fits`/`take`) until the chunk is exhausted and it refills. This keeps the allocation fast path off the global mutex on list/attrset/upvalue-heavy workloads.
+Each worker (including main, indexed by `worker_id`) owns a `HeapLocal` with a `LocalChunk` cursor per store (object/value/attr/attr_pos). A worker **reserves a chunk from the global store once under the store mutex** (8192 objects / 8192 values / 8192 attrs / 4096 attr-positions per refill), then hands out slots lock-free (`fits`/`take`) until the chunk is exhausted and it refills. The larger batches keep parallel allocation bursts from contending on the refill mutex; unused suffixes remain bounded to one chunk per worker.
 
 Reclaimed storage uses **per-worker** free lists (`HeapLocal.gc_free_*`). A minor-sweep participant returns dead slots and ranges to its shard; a major sweep distributes them across shards. Allocation pops locally and can steal from a peer, avoiding a shared allocation mutex.
 
@@ -46,7 +46,7 @@ Source positions live inside the `attrs` variant rather than in every object. `p
 
 ## Attrsets: sorted, binary-searched, dup-rejecting
 
-An `AttrsObject` holds its `AttrEntry`s **sorted by `InternId`** (name). Lookup (`getAttrValueOpt` → `binarySearchAttr`) is a binary search over the entry slice; construction (`prepareAttrsRange`) sorts with `std.mem.sort` and **rejects duplicate names** (`rejectDuplicateAttrs`). This ordering is an invariant relied on everywhere — producers that emit already-sorted-unique output take `addAttrsSorted` / `addAttrsFromStackPairsSorted`, which skip the re-sort and dup-check (the k-way flatten, `intersectAttrs`, and the compiler's sorted attrset literals (`attrs_new_srt` / `attrs_new_named*`)).
+An `AttrsObject` holds its `AttrEntry`s **sorted by `InternId`** (name). Lookup (`getAttrValueOpt` → `binarySearchAttr`) is a binary search over the entry slice; sets of up to four entries use the equivalent fixed decision tree to avoid loop and midpoint bookkeeping. Construction (`prepareAttrsRange`) sorts with `std.mem.sort` and **rejects duplicate names** (`rejectDuplicateAttrs`). This ordering is an invariant relied on everywhere — producers that emit already-sorted-unique output take `addAttrsSorted` / `addAttrsFromStackPairsSorted`, which skip the re-sort and dup-check (the k-way flatten, `intersectAttrs`, and the compiler's sorted attrset literals (`attrs_new_srt` / `attrs_new_named*`)).
 
 ## Layered merge (`merge_attrs`) for `//`
 

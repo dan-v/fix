@@ -107,9 +107,9 @@ const mem_tag = @import("mem_tag.zig");
 const ObjectStore = segments.FlatStore(Object, .{ .max_slots = object_max_slots, .vma_tag = .objects }, mem_tag.vma);
 // Large tail segments use sparse mappings with a chunk-grown hugetlb prefix.
 // Their cursors advance only under `write_mu`, as the overlay requires.
-const ValueStore = segments.StableSegments(Value, .{ .first_segment_size = 1024, .vma_tag = .values, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
-const AttrStore = segments.StableSegments(AttrEntry, .{ .first_segment_size = 512, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
-const AttrPosStore = segments.StableSegments(AttrPosEntry, .{ .first_segment_size = 512, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+const ValueStore = segments.StableSegments(Value, .{ .first_segment_size = value_chunk_size, .vma_tag = .values, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+const AttrStore = segments.StableSegments(AttrEntry, .{ .first_segment_size = attr_chunk_size, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+const AttrPosStore = segments.StableSegments(AttrPosEntry, .{ .first_segment_size = attr_position_chunk_size, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 
 pub var next_heap_token: std.atomic.Value(u64) = .init(1);
 
@@ -238,10 +238,10 @@ pub const Object = union(enum) {
 /// supports reserving a slot up front (`reserveObjectSlot`/`fillObjectSlot`) so
 /// a value can learn its own ObjectId before the object exists — how
 /// `buildAttrSet` builds the `builtins.builtins` self-reference.
-const object_chunk_size: u32 = 256;
-const value_chunk_size: u32 = 1024;
-const attr_chunk_size: u32 = 512;
-const attr_position_chunk_size: u32 = 256;
+const object_chunk_size: u32 = 8192;
+const value_chunk_size: u32 = 8192;
+const attr_chunk_size: u32 = 8192;
+const attr_position_chunk_size: u32 = 4096;
 
 const LocalSlice = struct { segment: u32, offset: u32, len: u32 };
 
@@ -2937,6 +2937,54 @@ inline fn gcAssertNotPoisonName(name: InternId) void {
 }
 
 fn binarySearchAttrIndex(entries: []const AttrEntry, name: InternId) ?usize {
+    // Most compulsory lookups are into tiny attrsets. Spell out the same
+    // binary-search decision tree for up to four entries so those searches
+    // avoid loop bookkeeping and midpoint arithmetic.
+    switch (entries.len) {
+        0 => return null,
+        1 => {
+            const n0 = entries[0].name;
+            gcAssertNotPoisonName(n0);
+            return if (n0 == name) 0 else null;
+        },
+        2 => {
+            const n1 = entries[1].name;
+            gcAssertNotPoisonName(n1);
+            if (n1 == name) return 1;
+            if (name > n1) return null;
+            const n0 = entries[0].name;
+            gcAssertNotPoisonName(n0);
+            return if (n0 == name) 0 else null;
+        },
+        3 => {
+            const n1 = entries[1].name;
+            gcAssertNotPoisonName(n1);
+            if (n1 == name) return 1;
+            const index: usize = if (name < n1) 0 else 2;
+            const candidate = entries[index].name;
+            gcAssertNotPoisonName(candidate);
+            return if (candidate == name) index else null;
+        },
+        4 => {
+            const n2 = entries[2].name;
+            gcAssertNotPoisonName(n2);
+            if (n2 == name) return 2;
+            if (name > n2) {
+                const n3 = entries[3].name;
+                gcAssertNotPoisonName(n3);
+                return if (n3 == name) 3 else null;
+            }
+            const n1 = entries[1].name;
+            gcAssertNotPoisonName(n1);
+            if (n1 == name) return 1;
+            if (name > n1) return null;
+            const n0 = entries[0].name;
+            gcAssertNotPoisonName(n0);
+            return if (n0 == name) 0 else null;
+        },
+        else => {},
+    }
+
     var lo: usize = 0;
     var hi: usize = entries.len;
     while (lo < hi) {
@@ -2977,6 +3025,24 @@ fn attrEntriesContainName(entries: []const AttrEntry, name: InternId) bool {
     }
 
     return false;
+}
+
+test "binary attr search covers unrolled tiny sets" {
+    const entries = [_]AttrEntry{
+        .{ .name = 2, .value = Value.int(2) },
+        .{ .name = 4, .value = Value.int(4) },
+        .{ .name = 6, .value = Value.int(6) },
+        .{ .name = 8, .value = Value.int(8) },
+        .{ .name = 10, .value = Value.int(10) },
+    };
+    const missing = [_]InternId{ 1, 3, 5, 7, 9, 11 };
+
+    for (0..entries.len + 1) |len| {
+        for (entries[0..len], 0..) |entry, index|
+            try std.testing.expectEqual(index, binarySearchAttrIndex(entries[0..len], entry.name).?);
+        for (missing) |name|
+            try std.testing.expectEqual(@as(?usize, null), binarySearchAttrIndex(entries[0..len], name));
+    }
 }
 
 test {

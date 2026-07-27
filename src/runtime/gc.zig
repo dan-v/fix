@@ -960,7 +960,7 @@ test "range TLAB refill returns the abandoned tail" {
     defer heap.deinit();
     heap_collector.enableCollect(&heap, 64 << 20, 0);
 
-    const first_values = try allocator.alloc(Value, 900);
+    const first_values = try allocator.alloc(Value, 8000);
     defer allocator.free(first_values);
     @memset(first_values, Value.int(1));
     const first = try heap.addList(first_values);
@@ -972,9 +972,9 @@ test "range TLAB refill returns the abandoned tail" {
     const second_values = try allocator.alloc(Value, 200);
     defer allocator.free(second_values);
     @memset(second_values, Value.int(2));
-    _ = try heap.addList(second_values); // replaces the TLAB with 124 slots left
+    _ = try heap.addList(second_values); // replaces the TLAB with 192 slots left
 
-    const tail_values = try allocator.alloc(Value, 124);
+    const tail_values = try allocator.alloc(Value, 192);
     defer allocator.free(tail_values);
     @memset(tail_values, Value.int(3));
     const tail = try heap.addList(tail_values);
@@ -983,7 +983,7 @@ test "range TLAB refill returns the abandoned tail" {
         else => unreachable,
     };
     try std.testing.expectEqual(first_range.segment, tail_range.segment);
-    try std.testing.expectEqual(first_range.offset + 900, tail_range.offset);
+    try std.testing.expectEqual(first_range.offset + 8000, tail_range.offset);
 }
 
 test "gc sweep coalesces consecutive adjacent dead ranges" {
