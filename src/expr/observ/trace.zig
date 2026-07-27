@@ -67,9 +67,11 @@ pub const Trace = struct {
 
     pub fn pushContext(self: *Trace, frame: []const u8) !void {
         if (self.frames_disabled) return;
+        const message = try self.allocator.dupe(u8, frame);
+        errdefer self.allocator.free(message);
         try self.frames.append(self.allocator, .{
             .kind = .context,
-            .message = try self.allocator.dupe(u8, frame),
+            .message = message,
         });
     }
 
@@ -98,3 +100,19 @@ pub const Trace = struct {
         return self.frames.items.len;
     }
 };
+
+fn checkTraceAllocationFailures(allocator: std.mem.Allocator) !void {
+    var trace = Trace.init(allocator);
+    defer trace.deinit();
+    try trace.setMessage("top-level failure");
+    try trace.pushContext("while evaluating a package");
+    try trace.pushContext("while evaluating an option");
+}
+
+test "trace ownership handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkTraceAllocationFailures,
+        .{},
+    );
+}

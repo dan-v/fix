@@ -6,25 +6,14 @@ const std = @import("std");
 /// matching both command-line and evaluator environment configuration.
 pub fn parseSize(text: []const u8) ?u64 {
     if (text.len == 0) return null;
-    var number = text;
-    var multiplier: u64 = 1 << 20;
-    switch (text[text.len - 1]) {
-        'k', 'K' => {
-            multiplier = 1 << 10;
-            number = text[0 .. text.len - 1];
-        },
-        'm', 'M' => {
-            multiplier = 1 << 20;
-            number = text[0 .. text.len - 1];
-        },
-        'g', 'G' => {
-            multiplier = 1 << 30;
-            number = text[0 .. text.len - 1];
-        },
-        else => {},
-    }
-    const value = std.fmt.parseInt(u64, number, 10) catch return null;
-    return value *| multiplier;
+    const parsed = switch (text[text.len - 1]) {
+        'k', 'K' => .{ text[0 .. text.len - 1], @as(u64, 1 << 10) },
+        'm', 'M' => .{ text[0 .. text.len - 1], @as(u64, 1 << 20) },
+        'g', 'G' => .{ text[0 .. text.len - 1], @as(u64, 1 << 30) },
+        else => .{ text, @as(u64, 1 << 20) },
+    };
+    const value = std.fmt.parseInt(u64, parsed[0], 10) catch return null;
+    return value *| parsed[1];
 }
 
 test "parseSize accepts bare MiB and k/m/g suffixes" {

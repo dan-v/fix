@@ -63,6 +63,7 @@ const compiler_mod = @import("compiler.zig");
 const VmTrace = @import("vm.zig").trace_log.VmTrace;
 const ThunkTrace = @import("probe.zig").thunk_trace.ThunkTrace;
 const SpinMutex = @import("base").sync.SpinMutex;
+const owned_strings = @import("base").owned_strings;
 
 const parse_observation: observ.SpanSpec = .{
     .category = "eval",
@@ -463,7 +464,7 @@ pub const Evaluator = struct {
     policy: LanguagePolicy = .{},
     /// Owns the backing strings for `policy.allowed_path_roots` (the flake
     /// source tree(s) readable under pure eval). Set via `setPureEval`.
-    pure_eval_roots: std.ArrayListUnmanaged([]const u8) = .empty,
+    pure_eval_roots: [][]u8 = &.{},
     debugger: DebuggerState = .{},
     /// Colorize `writeValue` output (strings/numbers/keywords/attr names). Set
     /// by the CLI from its terminal-color decision; default off (plain text for
@@ -553,8 +554,7 @@ pub const Evaluator = struct {
     pub fn deinit(self: *Evaluator) void {
         self.debugger.deinit();
         self.releaseEvalState();
-        for (self.pure_eval_roots.items) |root| self.allocator.free(root);
-        self.pure_eval_roots.deinit(self.allocator);
+        owned_strings.free(self.allocator, self.pure_eval_roots);
         if (self.sources.base_path) |path| self.allocator.free(path);
         // Language workers are joined by releaseEvalState, so no fiber remains
         // parked on the store's fast IO lane when it is shut down here.
@@ -649,11 +649,11 @@ pub const Evaluator = struct {
     /// call replaces the allowed-path roots; `roots` (the flake source tree(s)
     /// readable besides the store) are copied into evaluator-owned storage.
     pub fn setPureEval(self: *Evaluator, pure: bool, roots: []const []const u8) !void {
-        for (self.pure_eval_roots.items) |root| self.allocator.free(root);
-        self.pure_eval_roots.clearRetainingCapacity();
-        for (roots) |root| try self.pure_eval_roots.append(self.allocator, try self.allocator.dupe(u8, root));
+        const replacement = try owned_strings.clone(self.allocator, roots);
+        owned_strings.free(self.allocator, self.pure_eval_roots);
+        self.pure_eval_roots = replacement;
         self.policy.pure_eval = pure;
-        self.policy.allowed_path_roots = self.pure_eval_roots.items;
+        self.policy.allowed_path_roots = self.pure_eval_roots;
     }
 
     pub fn languagePolicy(self: *const Evaluator) LanguagePolicy {

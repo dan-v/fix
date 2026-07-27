@@ -92,9 +92,13 @@ pub fn ingestFetchedTree(self: *VM, cache_path: []const u8, name: []const u8, re
     // Plain eval: keep the on-disk cache path (readable) and defer the NAR hash
     // (empty sentinel -> `treeNarHashValue` makes it a lazy thunk), so we match
     // Nix's real narHash without eagerly hashing trees that aren't inspected.
+    const out_path = try self.allocator.dupe(u8, cache_path);
+    errdefer self.allocator.free(out_path);
+    const nar_hash = try self.allocator.dupe(u8, "");
+    errdefer self.allocator.free(nar_hash);
     return .{
-        .out_path = try self.allocator.dupe(u8, cache_path),
-        .nar_hash = try self.allocator.dupe(u8, ""),
+        .out_path = out_path,
+        .nar_hash = nar_hash,
     };
 }
 

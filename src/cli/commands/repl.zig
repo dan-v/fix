@@ -444,7 +444,9 @@ const Repl = struct {
             .quit => self.quit = true,
             .load => {
                 if (try self.loadFile(rest)) {
-                    try self.loaded.append(self.allocator, try self.allocator.dupe(u8, rest));
+                    try self.loaded.ensureUnusedCapacity(self.allocator, 1);
+                    const path = try self.allocator.dupe(u8, rest);
+                    self.loaded.appendAssumeCapacity(path);
                     try self.collectBetweenInputs();
                 }
             },

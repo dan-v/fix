@@ -28,3 +28,16 @@ test "clone owns the outer and inner slices" {
     try std.testing.expectEqualStrings("one", copy[0]);
     try std.testing.expect(copy[0].ptr != original[0].ptr);
 }
+
+fn checkCloneAllocationFailures(allocator: std.mem.Allocator) !void {
+    const copy = try clone(allocator, &.{ "one", "two", "three" });
+    defer free(allocator, copy);
+}
+
+test "clone handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkCloneAllocationFailures,
+        .{},
+    );
+}

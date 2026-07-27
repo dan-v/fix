@@ -51,8 +51,6 @@ pub const Paths = struct {
         ctx: anytype,
         comptime resolve: fn (@TypeOf(ctx), []const u8) anyerror!ResolvedPath,
     ) !void {
-        self.deinit(allocator);
-
         var entries: std.ArrayListUnmanaged(Entry) = .empty;
         errdefer {
             for (entries.items) |entry| entry.deinit(allocator);
@@ -76,13 +74,24 @@ pub const Paths = struct {
             };
             defer if (resolved.owned) allocator.free(resolved.text);
 
-            try entries.append(allocator, .{
-                .prefix = try allocator.dupe(u8, prefix),
-                .path = try allocator.dupe(u8, resolved.text),
+            // Reserve the list slot before cloning either field, then keep
+            // each clone in a local until the complete Entry can be published.
+            // This makes every OOM boundary transactional: no half-entry is
+            // reachable and the previous Paths value remains unchanged.
+            try entries.ensureUnusedCapacity(allocator, 1);
+            const owned_prefix = try allocator.dupe(u8, prefix);
+            errdefer allocator.free(owned_prefix);
+            const owned_path = try allocator.dupe(u8, resolved.text);
+            errdefer allocator.free(owned_path);
+            entries.appendAssumeCapacity(.{
+                .prefix = owned_prefix,
+                .path = owned_path,
             });
         }
 
-        self.entries = try entries.toOwnedSlice(allocator);
+        const replacement = try entries.toOwnedSlice(allocator);
+        self.deinit(allocator);
+        self.entries = replacement;
     }
 
     /// Walk entries looking for one whose `prefix` matches `name`. On
@@ -167,6 +176,30 @@ fn candidate(
     if (try files.pathExists(result)) return result;
     allocator.free(result);
     return null;
+}
+
+fn borrowedTestPath(_: u8, path: []const u8) anyerror!ResolvedPath {
+    return .{ .text = path, .owned = false };
+}
+
+fn checkPathAllocationFailures(allocator: std.mem.Allocator) !void {
+    var paths: Paths = .{};
+    defer paths.deinit(allocator);
+    try paths.set(
+        allocator,
+        "nixpkgs=/sources/nixpkgs:local=/sources/local",
+        @as(u8, 0),
+        borrowedTestPath,
+    );
+    try std.testing.expectEqual(@as(usize, 2), paths.entries.len);
+}
+
+test "search paths handle every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkPathAllocationFailures,
+        .{},
+    );
 }
 
 test "NIX_PATH separators preserve HTTP schemes and ports" {

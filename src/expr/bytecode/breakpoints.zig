@@ -124,11 +124,16 @@ pub const BreakpointTable = struct {
     /// later.
     pub fn set(self: *BreakpointTable, registry: *ChunkRegistry, file: []const u8, line: u32) !SetResult {
         const resolved = self.nearestLine(registry, file, line);
+        try self.requests.ensureUnusedCapacity(self.gpa, 1);
+        if (resolved != null)
+            try self.placements.ensureUnusedCapacity(self.gpa, @intCast(registry.count()));
+        const owned_file = try self.gpa.dupe(u8, file);
+
         const id = self.next_id;
         self.next_id += 1;
-        try self.requests.append(self.gpa, .{
+        self.requests.appendAssumeCapacity(.{
             .id = id,
-            .file = try self.gpa.dupe(u8, file),
+            .file = owned_file,
             .requested_line = line,
             .line = resolved orelse line,
             .pending = resolved == null,
@@ -205,11 +210,15 @@ pub const BreakpointTable = struct {
     /// the one instruction the caller selected. Source rows use `setSpan`
     /// because several nested spans may share an entry offset.
     pub fn setAt(self: *BreakpointTable, registry: *ChunkRegistry, chunk_id: ChunkId, offset: u32) !SetResult {
+        try self.requests.ensureUnusedCapacity(self.gpa, 1);
+        try self.placements.ensureUnusedCapacity(self.gpa, 1);
+        const owned_file = try self.gpa.dupe(u8, "");
+
         const id = self.next_id;
         self.next_id += 1;
-        try self.requests.append(self.gpa, .{
+        self.requests.appendAssumeCapacity(.{
             .id = id,
-            .file = try self.gpa.dupe(u8, ""),
+            .file = owned_file,
             .requested_line = 0,
             .line = 0,
             .pending = false,
@@ -250,11 +259,15 @@ pub const BreakpointTable = struct {
             .pending = false,
         };
 
+        try self.requests.ensureUnusedCapacity(self.gpa, 1);
+        try self.placements.ensureUnusedCapacity(self.gpa, 1);
+        const owned_file = try self.gpa.dupe(u8, "");
+
         const id = self.next_id;
         self.next_id += 1;
-        try self.requests.append(self.gpa, .{
+        self.requests.appendAssumeCapacity(.{
             .id = id,
-            .file = try self.gpa.dupe(u8, ""),
+            .file = owned_file,
             .requested_line = span.line,
             .line = span.line,
             .pending = false,
@@ -368,6 +381,9 @@ pub const BreakpointTable = struct {
         max_depth: u32,
         follow_new_chunks: bool,
     ) !void {
+        // Preflight the only fallible mutation. After clearStep the placement
+        // loop is allocation-free, so OOM cannot leave a half-armed step.
+        try self.step_temps.ensureTotalCapacity(self.gpa, sites.len);
         self.clearStep(registry);
         self.step_max_depth = max_depth;
         self.step_follow_new_chunks = follow_new_chunks;
@@ -383,9 +399,10 @@ pub const BreakpointTable = struct {
     /// This is the native `:debug` entry stop: user source is compiled exactly
     /// as written, without a synthetic `builtins.break` wrapper.
     pub fn armEntry(self: *BreakpointTable, registry: *ChunkRegistry, chunk_id: ChunkId) !bool {
-        self.clearStep(registry);
         const chunk = registry.get(chunk_id) orelse return false;
         const offset = firstMappedOffset(chunk) orelse return false;
+        try self.step_temps.ensureTotalCapacity(self.gpa, 1);
+        self.clearStep(registry);
         self.step_max_depth = std.math.maxInt(u32);
         self.step_armed = true;
         self.step_hit_kind = .entry;

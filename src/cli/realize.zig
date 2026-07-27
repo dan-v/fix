@@ -20,6 +20,29 @@ pub const Realized = struct {
     /// `<out_path>/bin/<program>`.
     app_program: ?[]const u8 = null,
 
+    fn initCopy(
+        allocator: std.mem.Allocator,
+        drv_path: []const u8,
+        out_path: []const u8,
+        program: ?[]const u8,
+        app_program: ?[]const u8,
+    ) !Realized {
+        const owned_drv_path = try allocator.dupe(u8, drv_path);
+        errdefer allocator.free(owned_drv_path);
+        const owned_out_path = try allocator.dupe(u8, out_path);
+        errdefer allocator.free(owned_out_path);
+        const owned_program = if (program) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (owned_program) |value| allocator.free(value);
+        const owned_app_program = if (app_program) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (owned_app_program) |value| allocator.free(value);
+        return .{
+            .drv_path = owned_drv_path,
+            .out_path = owned_out_path,
+            .program = owned_program,
+            .app_program = owned_app_program,
+        };
+    }
+
     pub fn deinit(self: Realized, allocator: std.mem.Allocator) void {
         allocator.free(self.drv_path);
         allocator.free(self.out_path);
@@ -531,10 +554,12 @@ pub fn realize(
     // language heap.
     if (want_program) {
         if (try ev.appProgram(value)) |app| {
-            const app_program = try allocator.dupe(u8, app.program);
-            const app_drv = if (app.drv_path) |d| try allocator.dupe(u8, d) else null;
-            if (app_drv) |drv| {
-                const derived_app = try std.fmt.allocPrint(allocator, "{s}!*", .{drv});
+            const app_drv = app.drv_path orelse "";
+            const realized = try Realized.initCopy(allocator, app_drv, "", null, app.program);
+            var transfer_realized = false;
+            defer if (!transfer_realized) realized.deinit(allocator);
+            if (app.drv_path != null) {
+                const derived_app = try std.fmt.allocPrint(allocator, "{s}!*", .{realized.drv_path});
                 defer allocator.free(derived_app);
                 if (options.stats) stats.report(ev);
                 var bps = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, &progress);
@@ -555,12 +580,8 @@ pub fn realize(
             }
             progress.deinit(true);
             torn_down = true;
-            return .{ .ok = .{
-                .drv_path = app_drv orelse try allocator.dupe(u8, ""),
-                .out_path = try allocator.dupe(u8, ""),
-                .program = null,
-                .app_program = app_program,
-            } };
+            transfer_realized = true;
+            return .{ .ok = realized };
         }
     }
 
@@ -578,12 +599,9 @@ pub fn realize(
 
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
-    var realized: Realized = .{
-        .drv_path = try allocator.dupe(u8, drv_path),
-        .out_path = try allocator.dupe(u8, out_path),
-        .program = if (program) |name| try allocator.dupe(u8, name) else null,
-    };
-    errdefer realized.deinit(allocator);
+    const realized = try Realized.initCopy(allocator, drv_path, out_path, program, null);
+    var transfer_realized = false;
+    defer if (!transfer_realized) realized.deinit(allocator);
 
     if (options.stats) stats.report(ev);
     var build_progress_state = build_progress.BuildProgress.init(allocator, io, terminal.color_depth, terminal.log_progress, &progress);
@@ -604,5 +622,25 @@ pub fn realize(
     build_progress_state.deinit();
     progress.deinit(true);
     torn_down = true;
+    transfer_realized = true;
     return .{ .ok = realized };
+}
+
+fn checkRealizedAllocationFailures(allocator: std.mem.Allocator) !void {
+    const realized = try Realized.initCopy(
+        allocator,
+        "/nix/store/example.drv",
+        "/nix/store/example",
+        "example",
+        "/nix/store/example/bin/example",
+    );
+    defer realized.deinit(allocator);
+}
+
+test "realized output handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkRealizedAllocationFailures,
+        .{},
+    );
 }

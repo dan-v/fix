@@ -40,27 +40,28 @@ pub const Client = struct {
         var instantiated = self.instantiated.keyIterator();
         while (instantiated.next()) |key| self.allocator.free(key.*);
         self.instantiated.deinit(self.allocator);
-        for (self.overrides.items) |override| {
-            self.allocator.free(override.name);
-            self.allocator.free(override.value);
-        }
-        self.overrides.deinit(self.allocator);
+        deinitOverrides(self.allocator, &self.overrides);
         if (self.socket_owned) |owned| self.allocator.free(owned);
         if (self.last_error_msg) |message| self.allocator.free(message);
     }
 
     pub fn setBuildSettings(self: *Client, settings: rstore.BuildSettings) !void {
-        for (self.overrides.items) |override| {
-            self.allocator.free(override.name);
-            self.allocator.free(override.value);
-        }
-        self.overrides.clearRetainingCapacity();
+        var replacement: std.ArrayListUnmanaged(rstore.Setting) = .empty;
+        errdefer deinitOverrides(self.allocator, &replacement);
+        try replacement.ensureTotalCapacity(self.allocator, settings.overrides.len);
         for (settings.overrides) |override| {
-            try self.overrides.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, override.name),
-                .value = try self.allocator.dupe(u8, override.value),
+            const name = try self.allocator.dupe(u8, override.name);
+            errdefer self.allocator.free(name);
+            const value = try self.allocator.dupe(u8, override.value);
+            errdefer self.allocator.free(value);
+            replacement.appendAssumeCapacity(.{
+                .name = name,
+                .value = value,
             });
         }
+
+        deinitOverrides(self.allocator, &self.overrides);
+        self.overrides = replacement;
         var owned = settings;
         owned.overrides = self.overrides.items;
         self.options = owned;
@@ -174,3 +175,33 @@ pub const Client = struct {
         return if (self.pool_executor) |executor| executor.parkFuture(future) else false;
     }
 };
+
+fn deinitOverrides(
+    allocator: std.mem.Allocator,
+    overrides: *std.ArrayListUnmanaged(rstore.Setting),
+) void {
+    for (overrides.items) |override| {
+        allocator.free(override.name);
+        allocator.free(override.value);
+    }
+    overrides.deinit(allocator);
+    overrides.* = .empty;
+}
+
+fn checkBuildSettingsAllocationFailures(allocator: std.mem.Allocator) !void {
+    var client = Client.init(allocator);
+    defer client.deinit();
+    try client.setBuildSettings(.{ .overrides = &.{
+        .{ .name = "max-jobs", .value = "4" },
+        .{ .name = "cores", .value = "8" },
+    } });
+    try std.testing.expectEqual(@as(usize, 2), client.overrides.items.len);
+}
+
+test "build settings own complete overrides across every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkBuildSettingsAllocationFailures,
+        .{},
+    );
+}

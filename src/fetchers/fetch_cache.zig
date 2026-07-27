@@ -224,23 +224,19 @@ pub const FetchCache = struct {
         if (self.cache_root) |root| self.allocator.free(root);
         if (self.ssl_cert_file) |path| self.allocator.free(path);
         if (self.flake_registry_url) |url| self.allocator.free(url);
-        for (self.access_tokens.items) |t| {
-            self.allocator.free(t.host);
-            self.allocator.free(t.token);
-        }
-        self.access_tokens.deinit(self.allocator);
-        self.clearNetrc();
-        self.netrc.deinit(self.allocator);
+        self.deinitAccessTokens(&self.access_tokens);
+        self.deinitNetrc(&self.netrc);
         if (self.subprocess_env) |*e| e.deinit();
     }
 
-    fn clearNetrc(self: *FetchCache) void {
-        for (self.netrc.items) |e| {
+    fn deinitNetrc(self: *FetchCache, entries: *std.ArrayListUnmanaged(NetrcEntry)) void {
+        for (entries.items) |e| {
             if (e.machine) |m| self.allocator.free(m);
             self.allocator.free(e.login);
             self.allocator.free(e.password);
         }
-        self.netrc.clearRetainingCapacity();
+        entries.deinit(self.allocator);
+        entries.* = .empty;
     }
 
     /// Parse a `netrc`-format file into credential entries, replacing the
@@ -249,41 +245,59 @@ pub const FetchCache = struct {
     /// (the name and next token are skipped). Later duplicate machines just add
     /// another entry; lookup takes the first match.
     pub fn setNetrc(self: *FetchCache, content: []const u8) !void {
-        self.clearNetrc();
+        var replacement: std.ArrayListUnmanaged(NetrcEntry) = .empty;
+        errdefer self.deinitNetrc(&replacement);
         var it = std.mem.tokenizeAny(u8, content, " \t\r\n");
         var cur: ?usize = null;
         while (it.next()) |tok| {
             if (std.mem.eql(u8, tok, "machine")) {
                 const name = it.next() orelse break;
-                try self.netrc.append(self.allocator, .{
-                    .machine = try self.allocator.dupe(u8, name),
-                    .login = try self.allocator.dupe(u8, ""),
-                    .password = try self.allocator.dupe(u8, ""),
+                try replacement.ensureUnusedCapacity(self.allocator, 1);
+                const machine = try self.allocator.dupe(u8, name);
+                errdefer self.allocator.free(machine);
+                const login = try self.allocator.dupe(u8, "");
+                errdefer self.allocator.free(login);
+                const password = try self.allocator.dupe(u8, "");
+                errdefer self.allocator.free(password);
+                replacement.appendAssumeCapacity(.{
+                    .machine = machine,
+                    .login = login,
+                    .password = password,
                 });
-                cur = self.netrc.items.len - 1;
+                cur = replacement.items.len - 1;
             } else if (std.mem.eql(u8, tok, "default")) {
-                try self.netrc.append(self.allocator, .{
+                try replacement.ensureUnusedCapacity(self.allocator, 1);
+                const login = try self.allocator.dupe(u8, "");
+                errdefer self.allocator.free(login);
+                const password = try self.allocator.dupe(u8, "");
+                errdefer self.allocator.free(password);
+                replacement.appendAssumeCapacity(.{
                     .machine = null,
-                    .login = try self.allocator.dupe(u8, ""),
-                    .password = try self.allocator.dupe(u8, ""),
+                    .login = login,
+                    .password = password,
                 });
-                cur = self.netrc.items.len - 1;
+                cur = replacement.items.len - 1;
             } else if (std.mem.eql(u8, tok, "login")) {
                 const v = it.next() orelse break;
                 if (cur) |i| {
-                    self.allocator.free(self.netrc.items[i].login);
-                    self.netrc.items[i].login = try self.allocator.dupe(u8, v);
+                    const login = try self.allocator.dupe(u8, v);
+                    self.allocator.free(replacement.items[i].login);
+                    replacement.items[i].login = login;
                 }
             } else if (std.mem.eql(u8, tok, "password")) {
                 const v = it.next() orelse break;
                 if (cur) |i| {
-                    self.allocator.free(self.netrc.items[i].password);
-                    self.netrc.items[i].password = try self.allocator.dupe(u8, v);
+                    const password = try self.allocator.dupe(u8, v);
+                    self.allocator.free(replacement.items[i].password);
+                    replacement.items[i].password = password;
                 }
             } else if (std.mem.eql(u8, tok, "account") or std.mem.eql(u8, tok, "macdef")) {
                 _ = it.next(); // skip the value / macro name
             }
         }
+
+        self.deinitNetrc(&self.netrc);
+        self.netrc = replacement;
     }
 
     /// The `Authorization: Basic` header for a request to `url` if the netrc has
@@ -314,10 +328,7 @@ pub const FetchCache = struct {
         const buf = try alloc.alloc(u8, enc.calcSize(creds.len));
         defer alloc.free(buf);
         const b64 = enc.encode(buf, creds);
-        return .{
-            .name = try alloc.dupe(u8, "Authorization"),
-            .value = try std.fmt.allocPrint(alloc, "Basic {s}", .{b64}),
-        };
+        return try authHeaderFormat(alloc, "Authorization", "Basic {s}", .{b64});
     }
 
     pub fn setIo(self: *FetchCache, io: std.Io) void {
@@ -356,23 +367,36 @@ pub const FetchCache = struct {
     /// `<host>[/<path>]=<token>` entries — replacing the current set. Later
     /// entries win on a duplicate key. Malformed entries (no `=`) are skipped.
     pub fn setAccessTokens(self: *FetchCache, raw: []const u8) !void {
-        for (self.access_tokens.items) |t| {
-            self.allocator.free(t.host);
-            self.allocator.free(t.token);
-        }
-        self.access_tokens.clearRetainingCapacity();
-
+        var replacement: std.ArrayListUnmanaged(TokenEntry) = .empty;
+        errdefer self.deinitAccessTokens(&replacement);
         var it = std.mem.tokenizeAny(u8, raw, " \t");
         while (it.next()) |entry| {
             const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
             const host = entry[0..eq];
             const token = entry[eq + 1 ..];
             if (host.len == 0 or token.len == 0) continue;
-            try self.access_tokens.append(self.allocator, .{
-                .host = try self.allocator.dupe(u8, host),
-                .token = try self.allocator.dupe(u8, token),
+            try replacement.ensureUnusedCapacity(self.allocator, 1);
+            const owned_host = try self.allocator.dupe(u8, host);
+            errdefer self.allocator.free(owned_host);
+            const owned_token = try self.allocator.dupe(u8, token);
+            errdefer self.allocator.free(owned_token);
+            replacement.appendAssumeCapacity(.{
+                .host = owned_host,
+                .token = owned_token,
             });
         }
+
+        self.deinitAccessTokens(&self.access_tokens);
+        self.access_tokens = replacement;
+    }
+
+    fn deinitAccessTokens(self: *FetchCache, entries: *std.ArrayListUnmanaged(TokenEntry)) void {
+        for (entries.items) |entry| {
+            self.allocator.free(entry.host);
+            self.allocator.free(entry.token);
+        }
+        entries.deinit(self.allocator);
+        entries.* = .empty;
     }
 
     /// Split `url` into its host (authority without `user@`/`:port`) and path.
@@ -418,6 +442,33 @@ pub const FetchCache = struct {
         }
     };
 
+    fn authHeaderCopy(
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        value: []const u8,
+    ) !AuthHeader {
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        return .{
+            .name = owned_name,
+            .value = try allocator.dupe(u8, value),
+        };
+    }
+
+    fn authHeaderFormat(
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !AuthHeader {
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        return .{
+            .name = owned_name,
+            .value = try std.fmt.allocPrint(allocator, fmt, args),
+        };
+    }
+
     /// Build the `access-tokens` auth header for a `forge` request to `url`, per
     /// Nix's per-forge conventions (`libfetchers/github.cc:accessHeaderFromToken`):
     ///   - github:    `Authorization: token <tok>`
@@ -437,27 +488,17 @@ pub const FetchCache = struct {
         };
         const alloc = self.allocator;
         return switch (forge) {
-            .github => .{
-                .name = try alloc.dupe(u8, "Authorization"),
-                .value = try std.fmt.allocPrint(alloc, "token {s}", .{token}),
-            },
-            .sourcehut => .{
-                .name = try alloc.dupe(u8, "Authorization"),
-                .value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token}),
-            },
+            .github => try authHeaderFormat(alloc, "Authorization", "token {s}", .{token}),
+            .sourcehut => try authHeaderFormat(alloc, "Authorization", "Bearer {s}", .{token}),
             .gitlab => blk: {
                 const colon = std.mem.indexOfScalar(u8, token, ':');
                 const kind = if (colon) |c| token[0..c] else token;
                 const value = if (colon) |c| token[c + 1 ..] else "";
-                if (std.mem.eql(u8, kind, "OAuth2")) break :blk .{
-                    .name = try alloc.dupe(u8, "Authorization"),
-                    .value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}),
-                };
-                if (std.mem.eql(u8, kind, "PAT")) break :blk .{
-                    .name = try alloc.dupe(u8, "Private-token"),
-                    .value = try alloc.dupe(u8, value),
-                };
-                break :blk .{ .name = try alloc.dupe(u8, kind), .value = try alloc.dupe(u8, value) };
+                if (std.mem.eql(u8, kind, "OAuth2"))
+                    break :blk try authHeaderFormat(alloc, "Authorization", "Bearer {s}", .{value});
+                if (std.mem.eql(u8, kind, "PAT"))
+                    break :blk try authHeaderCopy(alloc, "Private-token", value);
+                break :blk try authHeaderCopy(alloc, kind, value);
             },
         };
     }
@@ -1345,13 +1386,17 @@ pub const FetchCache = struct {
         errdefer self.allocator.free(rev);
         const short_rev = try self.allocator.dupe(u8, result.rev[0..7]);
         errdefer self.allocator.free(short_rev);
+        const out_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(out_path);
+        const last_modified_date = try self.allocator.dupe(u8, &result.last_modified_date);
+        errdefer self.allocator.free(last_modified_date);
         return .{
-            .out_path = try self.allocator.dupe(u8, path),
+            .out_path = out_path,
             .rev = rev,
             .short_rev = short_rev,
             .rev_count = result.rev_count,
             .last_modified = result.last_modified,
-            .last_modified_date = try self.allocator.dupe(u8, &result.last_modified_date),
+            .last_modified_date = last_modified_date,
             .submodules = submodules,
         };
     }
@@ -1409,10 +1454,14 @@ pub const FetchCache = struct {
         const short_len = @min(clean_rev.len, 12);
         const short_rev = try self.allocator.dupe(u8, clean_rev[0..short_len]);
         errdefer self.allocator.free(short_rev);
+        const out_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(out_path);
+        const owned_rev = try self.allocator.dupe(u8, clean_rev);
+        errdefer self.allocator.free(owned_rev);
 
         return .{
-            .out_path = try self.allocator.dupe(u8, path),
-            .rev = try self.allocator.dupe(u8, clean_rev),
+            .out_path = out_path,
+            .rev = owned_rev,
             .short_rev = short_rev,
         };
     }
@@ -1566,6 +1615,45 @@ test "access-tokens: parse and longest-prefix host/path match" {
     // No token for an unlisted host; `github.comX` must not match `github.com`.
     try testing.expect(fc.tokenFor("https://codeberg.org/o/r") == null);
     try testing.expect(fc.tokenFor("https://github.com.evil.example/x") == null);
+}
+
+fn checkOwnedConfigurationAllocationFailures(allocator: std.mem.Allocator) !void {
+    var cache = FetchCache.init(allocator);
+    defer cache.deinit();
+
+    try cache.setNetrc(
+        "machine example.org login alice password secret " ++
+            "default login fallback password fallback-secret",
+    );
+    try cache.setAccessTokens(
+        "github.com=ghp_base github.com/acme=ghp_acme " ++
+            "gitlab.example.org=PAT:glpat",
+    );
+
+    const basic = (try cache.netrcHeader("https://example.org/source")).?;
+    defer basic.deinit(allocator);
+    const token = (try cache.authHeader(
+        .github,
+        "https://github.com/acme/repo/archive/main.tar.gz",
+    )) orelse return error.OutOfMemory;
+    defer token.deinit(allocator);
+    const hg = try cache.mercurialResult("/cache/repo", "1234567890abcdef+");
+    defer hg.deinit(allocator);
+    const git = try cache.gitResultFromTransport("/cache/git", .{
+        .rev = "0123456789012345678901234567890123456789".*,
+        .rev_count = 7,
+        .last_modified = 1_767_225_845,
+        .last_modified_date = "20260102030405".*,
+    }, false);
+    defer git.deinit(allocator);
+}
+
+test "owned fetch configuration handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkOwnedConfigurationAllocationFailures,
+        .{},
+    );
 }
 
 test "netrc: basic-auth header by machine, else default" {

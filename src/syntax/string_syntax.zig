@@ -283,8 +283,10 @@ fn appendDoubleText(
             else => raw[i],
         });
     }
+    const bytes = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(bytes);
     try parts.append(allocator, .{ .text = .{
-        .bytes = try out.toOwnedSlice(allocator),
+        .bytes = bytes,
         .owned = true,
     } });
 }
@@ -441,6 +443,7 @@ fn flushOwnedText(
     if (text.items.len == 0) return;
     const bytes = try text.toOwnedSlice(allocator);
     text.* = .empty;
+    errdefer allocator.free(bytes);
     try parts.append(allocator, .{ .text = .{ .bytes = bytes, .owned = true } });
 }
 
@@ -550,6 +553,24 @@ fn isIndentByte(byte: u8) bool {
     // Nix only treats spaces as indentation whitespace; tabs count as content
     // (their display width is unknowable), so they end leading-indent counting.
     return byte == ' ';
+}
+
+fn checkLiteralAllocationFailures(allocator: std.mem.Allocator) !void {
+    const source = "\"a\\n${\"b\"}c\\t\"";
+    const parsed = try parseLiteral(
+        allocator,
+        source,
+        .{ .start = 0, .end = @intCast(source.len) },
+    );
+    defer parsed.deinit();
+}
+
+test "literal parsing handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkLiteralAllocationFailures,
+        .{},
+    );
 }
 
 test "scans nested interpolation strings" {

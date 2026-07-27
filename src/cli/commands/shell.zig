@@ -115,8 +115,14 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
             std.debug.print("error: '{s}' is not a derivation\n", .{name});
             return 1;
         };
-        try out_paths.append(allocator, try allocator.dupe(u8, (try ev.derivationOutPath(drv)) orelse drv_path));
-        try derived.append(allocator, try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path}));
+        try out_paths.ensureUnusedCapacity(allocator, 1);
+        try derived.ensureUnusedCapacity(allocator, 1);
+        const out_path = try allocator.dupe(u8, (try ev.derivationOutPath(drv)) orelse drv_path);
+        errdefer allocator.free(out_path);
+        const derived_path = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
+        errdefer allocator.free(derived_path);
+        out_paths.appendAssumeCapacity(out_path);
+        derived.appendAssumeCapacity(derived_path);
     }
 
     // Evaluation is done and its results are copied out: drop the language
@@ -155,7 +161,9 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
         std.debug.print("error: expression did not evaluate to a derivation\n", .{});
         return 1;
     };
-    try out_paths.append(allocator, try allocator.dupe(u8, (try ev.derivationOutPath(result)) orelse drv_path));
+    try out_paths.ensureUnusedCapacity(allocator, 1);
+    const out_path = try allocator.dupe(u8, (try ev.derivationOutPath(result)) orelse drv_path);
+    out_paths.appendAssumeCapacity(out_path);
 
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);

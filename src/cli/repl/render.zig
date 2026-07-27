@@ -82,6 +82,26 @@ pub const Renderer = struct {
         self.prev_rows.clearRetainingCapacity();
     }
 
+    fn replacePrevRows(self: *Renderer) !void {
+        var replacement: std.ArrayListUnmanaged(Row) = .empty;
+        errdefer {
+            for (replacement.items) |row| self.allocator.free(row.bytes);
+            replacement.deinit(self.allocator);
+        }
+        try replacement.ensureTotalCapacity(self.allocator, self.rows.items.len);
+        for (self.rows.items) |row| {
+            const bytes = try self.allocator.dupe(u8, row.bytes);
+            replacement.appendAssumeCapacity(.{
+                .bytes = bytes,
+                .prompt_len = row.prompt_len,
+            });
+        }
+
+        self.freePrevRows();
+        self.prev_rows.deinit(self.allocator);
+        self.prev_rows = replacement;
+    }
+
     /// Forget the on-screen frame (after ^L, a resize, or foreign output).
     /// The next `draw` repaints everything from the current cursor row.
     pub fn invalidate(self: *Renderer) void {
@@ -131,13 +151,7 @@ pub const Renderer = struct {
         try self.moveToCol(w, &phys, cursor_pos.col);
 
         // Swap frames: current rows become the previous frame (owned copies).
-        self.freePrevRows();
-        for (self.rows.items) |row| {
-            try self.prev_rows.append(self.allocator, .{
-                .bytes = try self.allocator.dupe(u8, row.bytes),
-                .prompt_len = row.prompt_len,
-            });
-        }
+        try self.replacePrevRows();
         self.prev_row_count = self.rows.items.len;
         self.prev_cursor = cursor_pos;
     }
@@ -321,7 +335,10 @@ pub fn formatColumns(
     max_rows: usize,
 ) ![]const []const u8 {
     var rows: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer rows.deinit(allocator);
+    errdefer {
+        for (rows.items) |row| allocator.free(row);
+        rows.deinit(allocator);
+    }
     if (items.len == 0) return rows.toOwnedSlice(allocator);
 
     var col_width: usize = 0;
@@ -344,11 +361,14 @@ pub fn formatColumns(
                 try line.appendNTimes(allocator, ' ', pad);
             }
         }
-        try rows.append(allocator, try line.toOwnedSlice(allocator));
+        try rows.ensureUnusedCapacity(allocator, 1);
+        const owned_line = try line.toOwnedSlice(allocator);
+        rows.appendAssumeCapacity(owned_line);
     }
     if (shown_items < items.len) {
+        try rows.ensureUnusedCapacity(allocator, 1);
         const more = try std.fmt.allocPrint(allocator, "… and {d} more", .{items.len - shown_items});
-        try rows.append(allocator, more);
+        rows.appendAssumeCapacity(more);
     }
     return rows.toOwnedSlice(allocator);
 }
@@ -356,6 +376,24 @@ pub fn formatColumns(
 pub fn freeColumns(allocator: std.mem.Allocator, rows: []const []const u8) void {
     for (rows) |r| allocator.free(r);
     allocator.free(rows);
+}
+
+fn checkColumnAllocationFailures(allocator: std.mem.Allocator) !void {
+    const rows = try formatColumns(
+        allocator,
+        &.{ "alpha", "beta", "gamma", "delta", "epsilon" },
+        18,
+        2,
+    );
+    defer freeColumns(allocator, rows);
+}
+
+test "columns handle every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkColumnAllocationFailures,
+        .{},
+    );
 }
 
 // ---------------------------------------------------------------------------
