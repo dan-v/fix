@@ -261,7 +261,6 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
               .p15 = true,
               .fpcr = true,
               .fpsr = true,
-              .ffr = true,
               .memory = true,
             }),
         else => unreachable,
@@ -592,15 +591,19 @@ test "two fibers multiplex on one thread" {
             // Append three tag bytes interleaved with yields.
             var i: u8 = 0;
             while (i < 3) : (i += 1) {
-                ctx.log.append(testing.allocator, ctx.tag) catch unreachable;
+                // The testing allocator captures an allocation stack. A
+                // manually switched AArch64 stack has no unwind edge back to
+                // the test runner, so use the page allocator for this
+                // fiber-local allocation test.
+                ctx.log.append(std.heap.page_allocator, ctx.tag) catch unreachable;
                 Fiber.yield();
             }
         }
     };
     var ctx_a: Ctx = .{ .tag = 'A' };
     var ctx_b: Ctx = .{ .tag = 'B' };
-    defer ctx_a.log.deinit(testing.allocator);
-    defer ctx_b.log.deinit(testing.allocator);
+    defer ctx_a.log.deinit(std.heap.page_allocator);
+    defer ctx_b.log.deinit(std.heap.page_allocator);
 
     var fa = try Fiber.init(testing.allocator, Fiber.min_stack_bytes, Ctx.entry, &ctx_a);
     var fb = try Fiber.init(testing.allocator, Fiber.min_stack_bytes, Ctx.entry, &ctx_b);

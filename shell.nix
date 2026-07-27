@@ -8,6 +8,7 @@ in
       packages = [
         pkgs.zig_0_16
         pkgs.pkg-config
+        pkgs.ripgrep
         pkgs.hyperfine
         pkgs.vhs
         pkgs.curl

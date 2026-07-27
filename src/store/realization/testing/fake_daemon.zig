@@ -5,6 +5,7 @@
 //! buildPaths. It is not a general nix-daemon emulator.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const owned_strings = @import("base").owned_strings;
 const sync = @import("base").sync;
 const runtime_store = @import("../../daemon.zig");
@@ -79,7 +80,13 @@ pub const FakeDaemon = struct {
     }
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io) !*FakeDaemon {
-        const socket_path = try makeSocketPath(allocator);
+        // Linux supports an abstract Unix-socket namespace (leading NUL).
+        // Darwin treats that byte sequence as a filesystem address and bind(2)
+        // fails with ENOENT, so use a short pathname there.
+        const socket_path = if (builtin.os.tag == .linux)
+            try makeSocketPath(allocator)
+        else
+            try makeFilesystemSocketPath(allocator);
         defer allocator.free(socket_path);
         return startAt(allocator, io, socket_path);
     }

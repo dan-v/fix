@@ -25,10 +25,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/determinate-nix-action@v3
 
-      - name: Build and test
-        run: |
-          nix-shell --run '
-            zig build -Doptimize=ReleaseFast
-            zig build check
-            zig build test-lang -Doptimize=ReleaseFast
-          '
+      - name: Build
+        run: nix-shell --run 'zig build -Doptimize=ReleaseFast'
+
+      - name: Unit and end-to-end tests
+        run: nix-shell --run 'zig build check'
+
+      - name: Language conformance
+        run: nix-shell --run 'zig build test-lang -Doptimize=ReleaseFast'
