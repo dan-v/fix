@@ -371,53 +371,24 @@ pub const Console = struct {
 
     /// `break FILE:LINE` — set a source-line breakpoint.
     fn addBreakpoint(self: *Console, s: *DebugSession, arg: []const u8) !void {
-        const colon = std.mem.lastIndexOfScalar(u8, arg, ':') orelse {
-            try self.reportErr("usage: break FILE:LINE", .{});
-            return;
-        };
-        const file = std.mem.trim(u8, arg[0..colon], " \t");
-        const line = std.fmt.parseInt(u32, std.mem.trim(u8, arg[colon + 1 ..], " \t"), 10) catch {
-            try self.reportErr("usage: break FILE:LINE (LINE must be a number)", .{});
-            return;
-        };
-        if (file.len == 0) {
-            try self.reportErr("usage: break FILE:LINE", .{});
-            return;
-        }
-        const set = s.setBreakpoint(file, line) catch |e| {
-            try self.reportErr("{s}", .{@errorName(e)});
-            return;
-        };
         var out = self.stderr();
         defer out.interface.flush() catch {};
-        const w = &out.interface;
-        try w.print("breakpoint {d} {s}at {s}:{d}", .{ set.id, if (set.pending) "pending " else "", file, set.line });
-        if (set.line != line) try w.print(" (nearest code to line {d})", .{line});
-        try w.print(" — {d} site(s)\n", .{set.sites});
+        try command_mod.addBreakpoint(s, &out.interface, arg);
+        try out.interface.writeByte('\n');
     }
 
     fn listBreakpoints(self: *Console, s: *DebugSession) !void {
         var out = self.stderr();
         defer out.interface.flush() catch {};
-        const w = &out.interface;
-        const items = s.listBreakpoints();
-        if (items.len == 0) {
-            try w.writeAll("(no breakpoints)\n");
-            return;
-        }
-        for (items) |bp| try w.print("  {d}  {s}:{d}{s}\n", .{ bp.id, bp.file, bp.line, if (bp.pending) " (pending)" else "" });
+        try command_mod.listBreakpoints(s, &out.interface, "  ");
+        try out.interface.writeByte('\n');
     }
 
     fn deleteBreakpoint(self: *Console, s: *DebugSession, arg: []const u8) !void {
-        const id = std.fmt.parseInt(u32, std.mem.trim(u8, arg, " \t"), 10) catch {
-            try self.reportErr("usage: delete N", .{});
-            return;
-        };
-        if (s.deleteBreakpoint(id)) {
-            try self.note("deleted breakpoint {d}", .{id});
-        } else {
-            try self.reportErr("no breakpoint {d}", .{id});
-        }
+        var out = self.stderr();
+        defer out.interface.flush() catch {};
+        try command_mod.deleteBreakpoint(s, &out.interface, arg);
+        try out.interface.writeByte('\n');
     }
 
     fn printValue(self: *Console, s: *DebugSession, v: Value) !void {
@@ -436,12 +407,7 @@ pub const Console = struct {
 
     fn renderTo(self: *Console, w: *std.Io.Writer, s: *DebugSession, v: Value) !void {
         _ = self;
-        // Shallow-force so the immediate value is concrete (an unforced thunk
-        // otherwise renders as `...`); nested laziness still shows `...`, which
-        // the user can drill into with `p <expr>`. Best-effort: a value that
-        // errors on force is rendered as-is.
-        const shown = s.force(v) catch v;
-        try s.writeValue(w, shown);
+        try command_mod.writeValue(s, w, v);
     }
 
     fn help(self: *Console) !void {
@@ -472,12 +438,6 @@ pub const Console = struct {
 
     fn style(self: *Console, w: *std.Io.Writer, which: presentation.Style) !void {
         try presentation.style(w, self.use_color, which);
-    }
-
-    fn note(self: *Console, comptime fmt: []const u8, fmt_args: anytype) !void {
-        var out = self.stderr();
-        defer out.interface.flush() catch {};
-        try out.interface.print(fmt ++ "\n", fmt_args);
     }
 
     fn reportErr(self: *Console, comptime fmt: []const u8, fmt_args: anytype) !void {

@@ -35,7 +35,7 @@ const history_mod = @import("../repl/history.zig");
 const editor_mod = @import("../repl/editor.zig");
 const complete_mod = @import("../repl/complete.zig");
 const line_input = @import("../repl/line_input.zig");
-const vm_explorer = @import("../repl/vm_explorer.zig");
+const vm_ui = @import("../repl/vm/root.zig");
 const transcript_mod = @import("../repl/transcript.zig");
 
 const Options = args.Options;
@@ -107,7 +107,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var repl = Repl.init(allocator, init, options, &ev, if (interactive) term.color_depth else .none, interactive);
     defer repl.deinit();
     repl.debug_console = &console;
-    var vm_debugger = vm_explorer.VmDebugger.init(allocator, init.io, &ev, term.color_depth, &repl.history);
+    var vm_debugger = vm_ui.VmDebugger.init(allocator, init.io, &ev, term.color_depth, &repl.history);
     if (tui_enabled) repl.debug_ui = &vm_debugger;
     if (options.debugger) {
         if (tui_enabled) vm_debugger.install(&ev) else console.install(&ev);
@@ -145,7 +145,7 @@ const Repl = struct {
     debug_console: ?*debugger.Console = null,
     /// The consolidated VM-explorer debug UI, selected only when TUI workspaces
     /// are enabled. Null for --no-tui/streaming sessions (they use the console).
-    debug_ui: ?*vm_explorer.VmDebugger = null,
+    debug_ui: ?*vm_ui.VmDebugger = null,
 
     /// Scope bindings, insertion-ordered. Keys are owned; values are heap
     /// Values kept alive via the evaluator's external roots and scope attrset.
@@ -321,7 +321,7 @@ const Repl = struct {
 
         self.tui_active = true;
         defer self.tui_active = false;
-        vm_explorer.runSession(self.allocator, self.io, self.ev, self.color_depth, editor, &journal, .{
+        vm_ui.runSession(self.allocator, self.io, self.ev, self.color_depth, editor, &journal, .{
             .ctx = self,
             .executeFn = sessionExecute,
             .focusFn = sessionFocus,
@@ -881,7 +881,7 @@ const Repl = struct {
         } else {
             var out = self.output();
             defer out.flush() catch {};
-            try vm_explorer.writePlain(self.allocator, out.writer(), self.ev, chunk_id);
+            try vm_ui.writePlain(self.allocator, out.writer(), self.ev, chunk_id);
         }
     }
 
@@ -1352,7 +1352,7 @@ test {
     _ = @import("../repl/check.zig");
     _ = @import("../repl/commands.zig");
     _ = @import("../repl/complete.zig");
-    _ = @import("../repl/vm_explorer.zig");
+    _ = @import("../repl/vm/root.zig");
     _ = @import("../repl/transcript.zig");
 }
 

@@ -1,7 +1,14 @@
-//! Presentation-neutral debugger command parsing shared by the line console
-//! and the interactive terminal UI.
+//! Shared debugger command parsing and execution helpers.
+//!
+//! The line console and terminal UI own their interaction and layout, but use
+//! these helpers for value forcing and breakpoint semantics so the two surfaces
+//! do not drift.
 
 const std = @import("std");
+const engine = @import("expr");
+const runtime = @import("runtime");
+
+const DebugSession = engine.DebugSession;
 
 pub const Step = enum { over, into, out };
 
@@ -49,6 +56,88 @@ pub fn parse(line_raw: []const u8) Command {
     return .{ .eval = line };
 }
 
+const BreakpointTarget = struct {
+    file: []const u8,
+    line: u32,
+};
+
+const BreakpointTargetError = error{
+    MissingBreakpointFile,
+    InvalidBreakpointLine,
+};
+
+fn parseBreakpointTarget(arg: []const u8) BreakpointTargetError!BreakpointTarget {
+    const colon = std.mem.lastIndexOfScalar(u8, arg, ':') orelse return error.MissingBreakpointFile;
+    const file = std.mem.trim(u8, arg[0..colon], " \t");
+    if (file.len == 0) return error.MissingBreakpointFile;
+    const line = std.fmt.parseInt(u32, std.mem.trim(u8, arg[colon + 1 ..], " \t"), 10) catch
+        return error.InvalidBreakpointLine;
+    return .{ .file = file, .line = line };
+}
+
+/// Render a debugger value consistently across the console and full-screen UI.
+/// Only the immediate thunk is forced; nested lazy values remain inspectable.
+pub fn writeValue(session: *DebugSession, writer: *std.Io.Writer, value: runtime.Value) !void {
+    const shown = session.force(value) catch value;
+    try session.writeValue(writer, shown);
+}
+
+pub fn addBreakpoint(session: *DebugSession, writer: *std.Io.Writer, arg: []const u8) !void {
+    const target = parseBreakpointTarget(arg) catch |err| {
+        return writer.writeAll(switch (err) {
+            error.MissingBreakpointFile => "usage: break FILE:LINE",
+            error.InvalidBreakpointLine => "usage: break FILE:LINE (LINE must be a number)",
+        });
+    };
+    const result = session.setBreakpoint(target.file, target.line) catch |err| {
+        return writer.print("error: {s}", .{@errorName(err)});
+    };
+    try writer.print("breakpoint {d} {s}at {s}:{d}", .{
+        result.id,
+        if (result.pending) "pending " else "",
+        target.file,
+        result.line,
+    });
+    if (result.line != target.line)
+        try writer.print(" (nearest code to line {d})", .{target.line});
+    try writer.print(" — {d} site(s)", .{result.sites});
+}
+
+pub fn listBreakpoints(session: *const DebugSession, writer: *std.Io.Writer, prefix: []const u8) !void {
+    const items = session.listBreakpoints();
+    if (items.len == 0) return writer.writeAll("(no breakpoints)");
+    for (items, 0..) |bp, i| {
+        if (i != 0) try writer.writeByte('\n');
+        try writer.writeAll(prefix);
+        if (bp.span) |span| {
+            try writer.print("{d}  chunk[0x{x}] L{d}:{d} (source span)", .{
+                bp.id,
+                bp.span_chunk.?,
+                span.line,
+                span.column,
+            });
+        } else if (bp.site_only) {
+            try writer.print("{d}  (per-instruction site)", .{bp.id});
+        } else {
+            try writer.print("{d}  {s}:{d}{s}", .{
+                bp.id,
+                bp.file,
+                bp.line,
+                if (bp.pending) " (pending)" else "",
+            });
+        }
+    }
+}
+
+pub fn deleteBreakpoint(session: *DebugSession, writer: *std.Io.Writer, arg: []const u8) !void {
+    const id = std.fmt.parseInt(u32, std.mem.trim(u8, arg, " \t"), 10) catch
+        return writer.writeAll("usage: delete N");
+    if (session.deleteBreakpoint(id))
+        try writer.print("deleted breakpoint {d}", .{id})
+    else
+        try writer.print("no breakpoint {d}", .{id});
+}
+
 fn firstWord(s: []const u8) []const u8 {
     const end = std.mem.indexOfAny(u8, s, " \t") orelse s.len;
     return s[0..end];
@@ -66,4 +155,12 @@ test "debugger command ambiguity keeps expressions intact" {
     try std.testing.expectEqualStrings("n + 1", parse("n + 1").eval);
     try std.testing.expect(parse(":next") == .step);
     try std.testing.expect(parse("break file.nix:12") == .breakpoint);
+}
+
+test "breakpoint targets split at the final colon" {
+    const target = try parseBreakpointTarget("path:with:colon.nix:42");
+    try std.testing.expectEqualStrings("path:with:colon.nix", target.file);
+    try std.testing.expectEqual(@as(u32, 42), target.line);
+    try std.testing.expectError(error.MissingBreakpointFile, parseBreakpointTarget(":12"));
+    try std.testing.expectError(error.InvalidBreakpointLine, parseBreakpointTarget("file.nix:nope"));
 }

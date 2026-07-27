@@ -9,11 +9,66 @@ const std = @import("std");
 const sync = @import("base").sync;
 const engine = @import("expr");
 const runtime = @import("runtime");
-const vm_tree = @import("vm_tree.zig");
-const vm_refs = @import("vm_refs.zig");
+const vm_tree = @import("tree.zig");
+const vm_refs = @import("refs.zig");
 
 const Evaluator = engine.Evaluator;
 const bytecode = engine.bytecode;
+
+/// All background work owned by one explorer session. The aggregate keeps
+/// thread cleanup and command-boundary invalidation in one lifecycle object.
+pub const Session = struct {
+    names: NameIndex,
+    heap: HeapCensus,
+    objects: ObjectSnapshot,
+    references: References,
+
+    pub fn init(ev: *Evaluator) Session {
+        return .{
+            .names = .{
+                .registry = ev.chunkRegistry(),
+                .intern = ev.internTable(),
+                .base_path = ev.basePath(),
+            },
+            .heap = .{ .ev = ev },
+            .objects = .{ .ev = ev },
+            .references = .{ .ev = ev },
+        };
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.names.deinit();
+        self.heap.deinit();
+        self.objects.deinit();
+        self.references.deinit();
+    }
+
+    pub fn finish(
+        self: *Session,
+        tree_index: *vm_tree.Index,
+        stats: *?runtime.ObjectHeap.Stats,
+        objects: *?runtime.ObjectHeap.ObjectSnapshot,
+        references: *?vm_refs.Graph,
+    ) void {
+        _ = self.names.finish(tree_index);
+        self.heap.finish(stats);
+        self.objects.finish(objects);
+        _ = self.references.finish(references);
+    }
+
+    pub fn clearFailures(self: *Session) void {
+        self.names.failed.store(false, .release);
+        self.objects.failed.store(false, .release);
+        self.references.failed.store(false, .release);
+    }
+
+    pub fn hasThread(self: *const Session) bool {
+        return self.names.thread != null or
+            self.heap.thread != null or
+            self.objects.thread != null or
+            self.references.thread != null;
+    }
+};
 
 pub const NameIndex = struct {
     registry: *const bytecode.ChunkRegistry,
