@@ -1778,7 +1778,8 @@ pub const ObjectHeap = struct {
         // Record the id in this worker's young-slot list: the minor iterates
         // exactly these (O(young)), and it's robust to slot reuse and the
         // reserved-vs-filled TLAB tail (both of which broke an id-range frontier).
-        if (self.collection.collect_enabled) local.gc_young_slots.append(self.allocator, id) catch {};
+        if (self.collection.collect_enabled)
+            local.gc_young_slots.append(self.allocator, id) catch @panic("gc young-object tracking exhausted");
         return id;
     }
 
@@ -1993,7 +1994,10 @@ pub const ObjectHeap = struct {
         const ref_id = gcHeapId(referent) orelse return;
         if (!self.gcIsYoung(ref_id)) return; // referent already old
         if (self.gcIsYoung(source)) return; // source young → not old→young
-        self.currentLocal().gc_remset.append(self.allocator, source) catch {};
+        // Dropping an old→young edge permits a live young object to be swept
+        // during the next minor collection. The remembered set is therefore
+        // correctness metadata, not an optional optimization.
+        self.currentLocal().gc_remset.append(self.allocator, source) catch @panic("gc remembered set exhausted");
     }
 
     /// GC minor-collect statistics; populated by the collector

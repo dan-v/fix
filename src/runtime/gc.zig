@@ -91,9 +91,12 @@ pub const Marker = struct {
         // referents arrive via the remembered set). Same gate as the serial
         // `Tracer.markObject`, so parallel and serial minors agree.
         if (self.minor_gate and !heap.gcIsYoung(id)) return;
-        // OOM: undercount rather than crash, matching the serial path. In
-        // practice the worklist peaks near the live-set size and never OOMs.
-        if (atomicTestAndSet(self.mark_bits, id)) self.deque.push(self.allocator, id) catch {};
+        // The worklist is correctness metadata: once the mark bit is published,
+        // this object must be scanned. Continuing after a failed push would let
+        // sweep reclaim reachable descendants, so allocation exhaustion is
+        // deliberately fail-closed.
+        if (atomicTestAndSet(self.mark_bits, id))
+            self.deque.push(self.allocator, id) catch @panic("gc parallel mark worklist exhausted");
     }
     inline fn countObject(self: *Marker) void {
         self.stats.objects += 1;
@@ -219,7 +222,10 @@ pub const Tracer = struct {
             return;
         }
         if (!self.testAndSet(id)) return;
-        self.stack.append(self.allocator, id) catch return; // OOM: undercount, don't crash
+        // A marked object that is not queued leaves its children untraced.
+        // Collection cannot recover from that locally, so fail closed rather
+        // than allowing an incomplete mark to reach sweep.
+        self.stack.append(self.allocator, id) catch @panic("gc serial mark worklist exhausted");
     }
 
     /// Serial drain (`--workers=1`): process the work stack until empty via the

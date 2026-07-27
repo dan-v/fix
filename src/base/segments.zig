@@ -244,9 +244,11 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
                     _ = self.cursor.cmpxchgWeak(cur, packCursor(seg + 1, 0), .acq_rel, .monotonic);
                     continue;
                 }
-                if (self.cursor.cmpxchgWeak(cur, packCursor(seg, used + 1), .acq_rel, .monotonic) != null) continue;
-                // Won slot (seg, used). Ensure the segment is allocated, then write.
                 try self.ensureSegmentAtomic(allocator, seg);
+                if (self.cursor.cmpxchgWeak(cur, packCursor(seg, used + 1), .acq_rel, .monotonic) != null) continue;
+                // Won slot (seg, used). Its segment existed before the cursor
+                // publication, so a recoverable allocation failure can never
+                // leave count() spanning an unwritten hole.
                 const slot = self.segments[seg].load(.acquire).?;
                 slot[used] = value;
                 return globalIdOf(seg, used);

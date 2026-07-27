@@ -71,7 +71,9 @@ pub const default_parallel_cap: u32 = 8;
 pub fn registerVm(ev: Context, vm: *VM) void {
     ev.import_vms_mu.lock();
     defer ev.import_vms_mu.unlock();
-    ev.import_vms.append(ev.allocator, vm) catch {};
+    // An unregistered VM is invisible to the root scan. Continuing would turn
+    // allocation pressure into collection-time use-after-free.
+    ev.import_vms.append(ev.allocator, vm) catch @panic("gc VM root registry exhausted");
 }
 pub fn unregisterVm(ev: Context, vm: *VM) void {
     ev.import_vms_mu.lock();
