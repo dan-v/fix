@@ -49,14 +49,14 @@ const disasm_options: disasm.Options = .{
 
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.RenderedValue;
-        const Layout = Explorer.Ops.Layout;
-        const StoreRecord = Explorer.Ops.StoreRecord;
-        const OpenMode = Explorer.Ops.OpenMode;
-        const TreeViewport = Explorer.Ops.TreeViewport;
-        const TreeCell = Explorer.Ops.TreeCell;
-        const DebugOutcome = Explorer.Ops.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.DebugCloseIntent;
+        const RenderedValue = Explorer.Ops.pages.RenderedValue;
+        const Layout = Explorer.Ops.view_state.Layout;
+        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
+        const OpenMode = Explorer.Ops.controller.OpenMode;
+        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
+        const TreeCell = Explorer.Ops.tree_render.TreeCell;
+        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
+        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
         const range_leaf = Explorer.range_leaf;
         const range_branch = Explorer.range_branch;
         const preview_line_cap = Explorer.preview_line_cap;
@@ -125,13 +125,13 @@ pub fn Methods(comptime Explorer: type) type {
                 break :blk .{ "<repl expression>", direct };
             };
 
-            try Explorer.Ops.appendSourceHeading(self, document, id, chunk, shown_span);
+            try Explorer.Ops.source_view.appendSourceHeading(self, document, id, chunk, shown_span);
             try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{ label, shown_span.line, shown_span.column }), .none);
             const bytes = source orelse {
                 try document.line("(source text is unavailable)", .none);
                 return;
             };
-            try Explorer.Ops.appendSourceExcerpt(
+            try Explorer.Ops.source_view.appendSourceExcerpt(
                 self,
                 document,
                 bytes,
@@ -157,13 +157,13 @@ pub fn Methods(comptime Explorer: type) type {
                 suggested_span
             else
                 vm_source.first(chunk) orelse suggested_span;
-            try Explorer.Ops.appendSourceHeading(self, document, id, chunk, span);
+            try Explorer.Ops.source_view.appendSourceHeading(self, document, id, chunk, span);
             try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{
                 if (span.file) |file| self.ev.internTable().get(file) else "<repl expression>",
                 span.line,
                 span.column,
             }), .none);
-            try Explorer.Ops.appendSourceExcerpt(
+            try Explorer.Ops.source_view.appendSourceExcerpt(
                 self,
                 document,
                 source,
@@ -209,18 +209,18 @@ pub fn Methods(comptime Explorer: type) type {
         /// jump when the excerpt's line count changes.
         pub fn selectedSourceChanged(self: *Explorer) !void {
             const source_session = self.source_session orelse return;
-            const selected = Explorer.Ops.selectedSourceLocation(self) orelse return;
+            const selected = Explorer.Ops.source_view.selectedSourceLocation(self) orelse return;
             if (selected.chunk_id != source_session) return;
             self.source_focus = .{ .chunk_id = selected.chunk_id, .span = selected.span.? };
 
-            const source_document = switch (Explorer.Ops.currentKind(self)) {
+            const source_document = switch (Explorer.Ops.view_state.currentKind(self)) {
                 .debug_frame, .chunk => true,
                 else => false,
             };
             if (!source_document) return;
 
-            const kind = Explorer.Ops.currentKind(self);
-            try Explorer.Ops.refreshPage(self, kind);
+            const kind = Explorer.Ops.view_state.currentKind(self);
+            try Explorer.Ops.pages.refreshPage(self, kind);
             for (self.page.locations, 0..) |candidate, i| {
                 const location = candidate orelse continue;
                 const span = location.span orelse continue;
@@ -230,7 +230,7 @@ pub fn Methods(comptime Explorer: type) type {
                     span.len == selected.span.?.len)
                 {
                     self.navigation.detail_selection = i;
-                    Explorer.Ops.ensureDetailVisible(self);
+                    Explorer.Ops.controller.ensureDetailVisible(self);
                     break;
                 }
             }
@@ -299,7 +299,7 @@ pub fn Methods(comptime Explorer: type) type {
                     break :blk .{ .start = selected_start - cursor, .end = selected_end - cursor };
                 } else null;
                 const breakpoints = if (chunk_id) |target|
-                    try Explorer.Ops.sourceBreakpointRanges(self, document.arena, target, cursor, shown_end)
+                    try Explorer.Ops.source_view.sourceBreakpointRanges(self, document.arena, target, cursor, shown_end)
                 else
                     &.{};
                 try source_render.writeLine(&rendered.writer, source[cursor..shown_end], .{
@@ -312,15 +312,15 @@ pub fn Methods(comptime Explorer: type) type {
                 const result_here = active and returned_value != null and focus_end <= line_end;
                 if (result_here) {
                     var annotation: std.Io.Writer.Allocating = .init(document.arena);
-                    try Explorer.Ops.writeReturnAnnotation(
+                    try Explorer.Ops.source_view.writeReturnAnnotation(
                         self,
                         document.arena,
                         &annotation.writer,
                         returned_value.?,
-                        Explorer.Ops.layout(self).main_width -| 14,
+                        Explorer.Ops.view_state.layout(self).main_width -| 14,
                     );
                     if (tui.displayWidth(rendered.written(), width_mod.cpWidth) +
-                        tui.displayWidth(annotation.written(), width_mod.cpWidth) <= Explorer.Ops.layout(self).main_width -| 2)
+                        tui.displayWidth(annotation.written(), width_mod.cpWidth) <= Explorer.Ops.view_state.layout(self).main_width -| 2)
                     {
                         try rendered.writer.writeAll(annotation.written());
                     } else {
@@ -332,7 +332,7 @@ pub fn Methods(comptime Explorer: type) type {
                 else
                     .none;
                 if (result_here and wrapped_result == null) {
-                    const result_action = Explorer.Ops.valueRowAction(self, returned_value.?);
+                    const result_action = Explorer.Ops.pages.valueRowAction(self, returned_value.?);
                     if (result_action != .none) row_action = result_action;
                 }
                 if (active and location != null) {
@@ -341,7 +341,7 @@ pub fn Methods(comptime Explorer: type) type {
                     try document.line(rendered.written(), row_action);
                 }
                 if (wrapped_result) |result|
-                    try document.line(result, Explorer.Ops.valueRowAction(self, returned_value.?));
+                    try document.line(result, Explorer.Ops.pages.valueRowAction(self, returned_value.?));
                 line_number += 1;
                 if (newline >= end or newline == source.len) break;
                 cursor = newline + 1;
@@ -371,7 +371,7 @@ pub fn Methods(comptime Explorer: type) type {
                 try writer.writeAll(if (self.return_flash) "\x1b[1;7m" else "\x1b[1;4m");
             }
             try writer.writeAll("⇒ ");
-            const rendered = try Explorer.Ops.renderValue(self, arena, value, max_cells, false);
+            const rendered = try Explorer.Ops.pages.renderValue(self, arena, value, max_cells, false);
             try writer.writeAll(rendered.text);
             try writer.writeAll("\x1b[0m");
         }

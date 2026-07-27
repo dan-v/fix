@@ -49,14 +49,14 @@ const disasm_options: disasm.Options = .{
 
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.RenderedValue;
-        const Layout = Explorer.Ops.Layout;
-        const StoreRecord = Explorer.Ops.StoreRecord;
-        const OpenMode = Explorer.Ops.OpenMode;
-        const TreeViewport = Explorer.Ops.TreeViewport;
-        const TreeCell = Explorer.Ops.TreeCell;
-        const DebugOutcome = Explorer.Ops.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.DebugCloseIntent;
+        const RenderedValue = Explorer.Ops.pages.RenderedValue;
+        const Layout = Explorer.Ops.view_state.Layout;
+        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
+        const OpenMode = Explorer.Ops.controller.OpenMode;
+        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
+        const TreeCell = Explorer.Ops.tree_render.TreeCell;
+        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
+        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
         const range_leaf = Explorer.range_leaf;
         const range_branch = Explorer.range_branch;
         const preview_line_cap = Explorer.preview_line_cap;
@@ -94,7 +94,7 @@ pub fn Methods(comptime Explorer: type) type {
             if (explorer_rows > 0 and (self.viewport.cols != cols or self.viewport.rows != explorer_rows)) {
                 self.viewport.cols = cols;
                 self.viewport.rows = explorer_rows;
-                try Explorer.Ops.refreshPage(self, Explorer.Ops.currentKind(self));
+                try Explorer.Ops.pages.refreshPage(self, Explorer.Ops.view_state.currentKind(self));
             }
 
             const mode: []const u8 = if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector";
@@ -102,25 +102,25 @@ pub fn Methods(comptime Explorer: type) type {
             const header = if (self.debug_session) |session|
                 std.fmt.bufPrint(&header_buf, " fix vm  ·  ◆ paused/{s}  ·  frame {?d}  ·  {s} ", .{
                     vm_helpers.reasonName(session.reason),
-                    Explorer.Ops.currentDebugFrame(self),
+                    Explorer.Ops.view_state.currentDebugFrame(self),
                     mode,
                 }) catch " fix vm  ·  paused "
-            else if (Explorer.Ops.currentChunk(self)) |id|
+            else if (Explorer.Ops.view_state.currentChunk(self)) |id|
                 std.fmt.bufPrint(&header_buf, " fix vm  ·  chunk[0x{x}]  ·  {s} ", .{
                     id,
                     if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
                 }) catch " fix repl "
-            else if (Explorer.Ops.currentHeap(self)) |view|
+            else if (Explorer.Ops.view_state.currentHeap(self)) |view|
                 std.fmt.bufPrint(&header_buf, " fix vm  ·  heap/{s}  ·  {s} ", .{
                     @tagName(view),
                     if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
                 }) catch " fix vm "
-            else if (Explorer.Ops.currentObject(self)) |id|
+            else if (Explorer.Ops.view_state.currentObject(self)) |id|
                 std.fmt.bufPrint(&header_buf, " fix vm  ·  objects[0x{x}]  ·  {s} ", .{
                     id,
                     if (prompt_active) "repl" else if (self.navigation.focus == .tree) "tree" else "inspector",
                 }) catch " fix vm "
-            else if (Explorer.Ops.currentStoreRecord(self)) |record|
+            else if (Explorer.Ops.view_state.currentStoreRecord(self)) |record|
                 std.fmt.bufPrint(&header_buf, " fix vm  ·  {s}[0x{x}]  ·  {s} ", .{
                     @tagName(record.view),
                     record.id,
@@ -133,7 +133,7 @@ pub fn Methods(comptime Explorer: type) type {
             try frame.bar(1, header, cols, .header);
 
             if (explorer_rows > 0) {
-                try Explorer.Ops.drawExplorerBody(self, arena, &frame, 2, explorer_rows, cols);
+                try Explorer.Ops.preview.drawExplorerBody(self, arena, &frame, 2, explorer_rows, cols);
                 const separator_row = 2 + explorer_rows;
                 try frame.clearRow(separator_row);
                 const separator = " ─ transcript ";
@@ -142,7 +142,7 @@ pub fn Methods(comptime Explorer: type) type {
             }
 
             const transcript_start = 2 + explorer_rows + @intFromBool(explorer_rows > 0);
-            try Explorer.Ops.drawTranscript(self, &frame, transcript_start, transcript_rows, cols, capture.written());
+            try Explorer.Ops.tree_render.drawTranscript(self, &frame, transcript_start, transcript_rows, cols, capture.written());
 
             var footer_buf: [512]u8 = undefined;
             const footer = if (prompt_active and capture.omitted() > 0)
@@ -151,7 +151,7 @@ pub fn Methods(comptime Explorer: type) type {
                 " Enter evaluate · Esc explorer · Ctrl-D leave VM · Tab complete · Ctrl-R history "
             else if (self.debug_session != null)
                 " s step · n next · f finish · c continue · p break · ↵ inspect · i expr · q abort "
-            else if (Explorer.Ops.filterActive(self))
+            else if (Explorer.Ops.tree_projection.filterActive(self))
                 std.fmt.bufPrint(&footer_buf, " filter '{s}' · F edit · Esc up/clear · q exit · Tab pane · ↵ inspect ", .{self.tree.filter_query.items}) catch " filtered "
             else
                 " Esc up · q exit · i expr · : cmd · Tab pane · p break · F filter · ↵ inspect ";
@@ -168,43 +168,43 @@ pub fn Methods(comptime Explorer: type) type {
         }
 
         pub fn drawExplorerBody(self: *Explorer, arena: std.mem.Allocator, frame: *tui.Frame, first_row: usize, rows: usize, cols: usize) !void {
-            const layout_now = Explorer.Ops.layout(self);
-            Explorer.Ops.clampScroll(self);
+            const layout_now = Explorer.Ops.view_state.layout(self);
+            Explorer.Ops.controller.clampScroll(self);
             self.navigation.tree_selection = @min(self.navigation.tree_selection, self.tree.rows.items.len -| 1);
             for (0..rows) |row| {
                 const screen_row = first_row + row;
                 try frame.clearRow(screen_row);
                 if (layout_now.split) {
                     try frame.at(screen_row, 1);
-                    try Explorer.Ops.drawChunkRow(self, arena, frame, row, layout_now.sidebar_width, rows);
+                    try Explorer.Ops.tree_render.drawChunkRow(self, arena, frame, row, layout_now.sidebar_width, rows);
                     const inspector_focused = self.navigation.focus == .subject;
-                    try Explorer.Ops.drawFocusDivider(self, frame, screen_row, layout_now.sidebar_width + 1, inspector_focused);
+                    try Explorer.Ops.tree_render.drawFocusDivider(self, frame, screen_row, layout_now.sidebar_width + 1, inspector_focused);
                     try frame.at(screen_row, layout_now.main_col);
-                    try Explorer.Ops.drawDisasmRow(self, frame, row, layout_now.main_width);
+                    try Explorer.Ops.tree_render.drawDisasmRow(self, frame, row, layout_now.main_width);
                 } else if (self.navigation.focus == .tree) {
                     try frame.at(screen_row, 1);
-                    try Explorer.Ops.drawChunkRow(self, arena, frame, row, cols, rows);
+                    try Explorer.Ops.tree_render.drawChunkRow(self, arena, frame, row, cols, rows);
                 } else {
                     try frame.at(screen_row, 1);
-                    try Explorer.Ops.drawDisasmRow(self, frame, row, layout_now.main_width);
+                    try Explorer.Ops.tree_render.drawDisasmRow(self, frame, row, layout_now.main_width);
                 }
             }
 
             // Peeks are overlays, not columns: moving the selection no longer
             // changes either pane's width or reflows the inspector.
-            const popup_width = Explorer.Ops.hoverMaxOuterWidth(self, cols, layout_now) -| 2;
-            const popup = if (self.navigation.focus == .tree and !Explorer.Ops.selectedTreeRowIsCurrentSubject(self))
-                try Explorer.Ops.previewLines(self, arena, popup_width)
-            else if (Explorer.Ops.detailPreviewAction(self) != null)
-                try Explorer.Ops.detailPreviewLines(self, arena, popup_width)
+            const popup_width = Explorer.Ops.preview.hoverMaxOuterWidth(self, cols, layout_now) -| 2;
+            const popup = if (self.navigation.focus == .tree and !Explorer.Ops.tree_projection.selectedTreeRowIsCurrentSubject(self))
+                try Explorer.Ops.preview.previewLines(self, arena, popup_width)
+            else if (Explorer.Ops.view_state.detailPreviewAction(self) != null)
+                try Explorer.Ops.preview.detailPreviewLines(self, arena, popup_width)
             else
                 &.{};
             if (popup.len > 1 and cols >= 40 and rows >= 6)
-                try Explorer.Ops.drawHoverPopup(self, arena, frame, first_row, rows, cols, layout_now, popup);
+                try Explorer.Ops.preview.drawHoverPopup(self, arena, frame, first_row, rows, cols, layout_now, popup);
         }
 
         pub fn previewRole(self: *const Explorer) tui.Role {
-            if (self.navigation.focus == .subject) return switch (Explorer.Ops.detailPreviewAction(self) orelse return .section) {
+            if (self.navigation.focus == .subject) return switch (Explorer.Ops.view_state.detailPreviewAction(self) orelse return .section) {
                 .chunk => .chunk,
                 .object, .store_record => .object,
                 else => .section,
@@ -237,7 +237,7 @@ pub fn Methods(comptime Explorer: type) type {
             layout_now: Layout,
             lines: []const []const u8,
         ) !void {
-            const max_outer = Explorer.Ops.hoverMaxOuterWidth(self, cols, layout_now);
+            const max_outer = Explorer.Ops.preview.hoverMaxOuterWidth(self, cols, layout_now);
             if (max_outer < 4) return;
             var desired: usize = @min(@as(usize, 28), max_outer);
             for (lines) |line| desired = @max(desired, tui.displayWidth(line, width_mod.cpWidth) + 2);
@@ -259,7 +259,7 @@ pub fn Methods(comptime Explorer: type) type {
                 lines[0];
 
             const anchor_row = if (self.navigation.focus == .tree)
-                Explorer.Ops.treeSelectionSlot(self, if (layout_now.split) layout_now.sidebar_width else cols, rows) orelse 0
+                Explorer.Ops.tree_render.treeSelectionSlot(self, if (layout_now.split) layout_now.sidebar_width else cols, rows) orelse 0
             else
                 self.navigation.detail_selection -| self.navigation.scroll;
             // Put the first content row level with the selected row whenever there
@@ -273,7 +273,7 @@ pub fn Methods(comptime Explorer: type) type {
                     @min(cols / 3 + 1, cols - outer_width + 1)
             else
                 cols - outer_width + 1;
-            const role = Explorer.Ops.previewRole(self);
+            const role = Explorer.Ops.preview.previewRole(self);
             const fill = try arena.alloc(u8, content_width);
             @memset(fill, ' ');
             var horizontal: std.Io.Writer.Allocating = .init(arena);
@@ -332,14 +332,14 @@ pub fn Methods(comptime Explorer: type) type {
                         try lines.append(arena, try std.fmt.allocPrint(arena, " arity {d} · {d} spans", .{ chunk.arity, chunk.source_map.len }));
                         if (chunk.source_map.len > 0) {
                             try lines.append(arena, "");
-                            const src = Explorer.Ops.chunkSourceText(self, entry.id, chunk);
+                            const src = Explorer.Ops.source_view.chunkSourceText(self, entry.id, chunk);
                             for (chunk.source_map, 0..) |sm, i| {
                                 if (i >= 6) break;
                                 const snip = vm_helpers.spanSnippet(arena, src, sm.span, content_width -| 1) catch "";
                                 if (snip.len > 0) try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{snip}));
                             }
                         }
-                        try Explorer.Ops.appendChunkCodePreview(self, &lines, arena, entry.id, chunk, preview_line_cap);
+                        try Explorer.Ops.preview.appendChunkCodePreview(self, &lines, arena, entry.id, chunk, preview_line_cap);
                     }
                 },
                 .name => |entry| {
@@ -349,20 +349,20 @@ pub fn Methods(comptime Explorer: type) type {
                 },
                 .object => |entry| {
                     const ref_width = content_width -| 1;
-                    const summary = try Explorer.Ops.objectSummary(
+                    const summary = try Explorer.Ops.value_summary.objectSummary(
                         self,
                         arena,
                         entry.id,
-                        Explorer.Ops.storePreviewBudget(self, "objects", entry.id, ref_width),
+                        Explorer.Ops.value_summary.storePreviewBudget(self, "objects", entry.id, ref_width),
                     );
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                        try Explorer.Ops.canonicalStoreRef(self, arena, .objects, entry.id, summary, true),
+                        try Explorer.Ops.value_summary.canonicalStoreRef(self, arena, .objects, entry.id, summary, true),
                     }));
-                    try Explorer.Ops.appendObjectPreview(self, &lines, arena, entry.id, content_width);
+                    try Explorer.Ops.preview.appendObjectPreview(self, &lines, arena, entry.id, content_width);
                 },
                 .heap => |entry| {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " heap/{s}", .{@tagName(entry.view)}));
-                    try lines.append(arena, try std.fmt.allocPrint(arena, " {d} live · {d} reserved", .{ Explorer.Ops.liveStoreCount(self, entry.view), Explorer.Ops.storeCount(self, entry.view) }));
+                    try lines.append(arena, try std.fmt.allocPrint(arena, " {d} live · {d} reserved", .{ Explorer.Ops.view_state.liveStoreCount(self, entry.view), Explorer.Ops.view_state.storeCount(self, entry.view) }));
                 },
                 .debug_frame => |entry| if (self.debug_session) |session| if (entry.index < session.frameCount()) {
                     const info = session.frame(entry.index);
@@ -370,15 +370,15 @@ pub fn Methods(comptime Explorer: type) type {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {s}:{d}", .{ if (info.file) |f| std.fs.path.basename(f) else "<repl>", info.line }));
                 },
                 .store_record => |entry| {
-                    const summary = try Explorer.Ops.storeRecordSummary(
+                    const summary = try Explorer.Ops.value_summary.storeRecordSummary(
                         self,
                         arena,
                         entry.view,
                         entry.id,
-                        Explorer.Ops.storePreviewBudget(self, @tagName(entry.view), entry.id, content_width -| 1),
+                        Explorer.Ops.value_summary.storePreviewBudget(self, @tagName(entry.view), entry.id, content_width -| 1),
                     );
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                        try Explorer.Ops.canonicalStoreRef(self, arena, entry.view, entry.id, summary, true),
+                        try Explorer.Ops.value_summary.canonicalStoreRef(self, arena, entry.view, entry.id, summary, true),
                     }));
                 },
                 .category => |entry| {
@@ -387,12 +387,12 @@ pub fn Methods(comptime Explorer: type) type {
                         // The heap census lives here (it's no longer a browsable folder).
                         const c = self.ev.heapCounts();
                         try lines.append(arena, "");
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " objects  {d} live", .{Explorer.Ops.liveStoreCount(self, .objects)}));
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " values   {d} live · {d} slots", .{ Explorer.Ops.liveStoreCount(self, .values), c.values }));
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " attrs    {d} live · {d} slots", .{ Explorer.Ops.liveStoreCount(self, .attrs), c.attrs }));
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " attrpos  {d} live · {d} slots", .{ Explorer.Ops.liveStoreCount(self, .attr_positions), c.attr_positions }));
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " intern   {d}", .{Explorer.Ops.liveStoreCount(self, .intern)}));
-                        try lines.append(arena, try std.fmt.allocPrint(arena, " builtin  {d}", .{Explorer.Ops.liveStoreCount(self, .builtin)}));
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " objects  {d} live", .{Explorer.Ops.view_state.liveStoreCount(self, .objects)}));
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " values   {d} live · {d} slots", .{ Explorer.Ops.view_state.liveStoreCount(self, .values), c.values }));
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " attrs    {d} live · {d} slots", .{ Explorer.Ops.view_state.liveStoreCount(self, .attrs), c.attrs }));
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " attrpos  {d} live · {d} slots", .{ Explorer.Ops.view_state.liveStoreCount(self, .attr_positions), c.attr_positions }));
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " intern   {d}", .{Explorer.Ops.view_state.liveStoreCount(self, .intern)}));
+                        try lines.append(arena, try std.fmt.allocPrint(arena, " builtin  {d}", .{Explorer.Ops.view_state.liveStoreCount(self, .builtin)}));
                         if (self.heap_index.stats) |stats| {
                             try lines.append(arena, "");
                             try lines.append(arena, " object types");
@@ -416,21 +416,21 @@ pub fn Methods(comptime Explorer: type) type {
         pub fn detailPreviewLines(self: *Explorer, arena: std.mem.Allocator, content_width: usize) ![]const []const u8 {
             var lines: std.ArrayListUnmanaged([]const u8) = .empty;
             try lines.append(arena, " PREVIEW");
-            const action = Explorer.Ops.detailPreviewAction(self) orelse return lines.items;
+            const action = Explorer.Ops.view_state.detailPreviewAction(self) orelse return lines.items;
             switch (action) {
                 .object => |id| {
                     const ref_width = content_width -| 1;
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                        try Explorer.Ops.canonicalStoreRef(
+                        try Explorer.Ops.value_summary.canonicalStoreRef(
                             self,
                             arena,
                             .objects,
                             id,
-                            try Explorer.Ops.objectSummary(self, arena, id, Explorer.Ops.storePreviewBudget(self, "objects", id, ref_width)),
+                            try Explorer.Ops.value_summary.objectSummary(self, arena, id, Explorer.Ops.value_summary.storePreviewBudget(self, "objects", id, ref_width)),
                             true,
                         ),
                     }));
-                    try Explorer.Ops.appendObjectPreview(self, &lines, arena, id, content_width);
+                    try Explorer.Ops.preview.appendObjectPreview(self, &lines, arena, id, content_width);
                 },
                 .chunk => |id| {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " chunk[0x{x}]", .{id}));
@@ -439,25 +439,25 @@ pub fn Methods(comptime Explorer: type) type {
                         if (chunk.source_map.len > 0) {
                             const snip = vm_helpers.spanSnippet(
                                 arena,
-                                Explorer.Ops.chunkSourceText(self, id, chunk),
+                                Explorer.Ops.source_view.chunkSourceText(self, id, chunk),
                                 chunk.source_map[0].span,
                                 content_width -| 1,
                             ) catch "";
                             if (snip.len > 0) try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{snip}));
                         }
-                        try Explorer.Ops.appendChunkCodePreview(self, &lines, arena, id, chunk, preview_line_cap);
+                        try Explorer.Ops.preview.appendChunkCodePreview(self, &lines, arena, id, chunk, preview_line_cap);
                     }
                 },
                 .store_record => |record| {
-                    const summary = try Explorer.Ops.storeRecordSummary(
+                    const summary = try Explorer.Ops.value_summary.storeRecordSummary(
                         self,
                         arena,
                         record.view,
                         record.id,
-                        Explorer.Ops.storePreviewBudget(self, @tagName(record.view), record.id, content_width -| 1),
+                        Explorer.Ops.value_summary.storePreviewBudget(self, @tagName(record.view), record.id, content_width -| 1),
                     );
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                        try Explorer.Ops.canonicalStoreRef(self, arena, record.view, record.id, summary, true),
+                        try Explorer.Ops.value_summary.canonicalStoreRef(self, arena, record.view, record.id, summary, true),
                     }));
                 },
                 else => {},
@@ -527,7 +527,7 @@ pub fn Methods(comptime Explorer: type) type {
                     for (attrs[0..@min(attrs.len, preview_line_cap)]) |entry| {
                         const name = self.ev.internTable().get(entry.name);
                         const value_width = content_width -| width_mod.strWidth(name) -| 4;
-                        const detail = try Explorer.Ops.shallowValueSummary(self, arena, entry.value, value_width);
+                        const detail = try Explorer.Ops.value_summary.shallowValueSummary(self, arena, entry.value, value_width);
                         try lines.append(arena, try std.fmt.allocPrint(arena, "  {s} = {s}", .{ name, detail }));
                     }
                     if (attrs.len > preview_line_cap) try lines.append(arena, try std.fmt.allocPrint(
@@ -541,7 +541,7 @@ pub fn Methods(comptime Explorer: type) type {
                     for (items[0..@min(items.len, preview_line_cap)], 0..) |item, i| {
                         var prefix_buf: [32]u8 = undefined;
                         const prefix = std.fmt.bufPrint(&prefix_buf, "  [{d}] ", .{i}) catch "  ";
-                        const detail = try Explorer.Ops.shallowValueSummary(
+                        const detail = try Explorer.Ops.value_summary.shallowValueSummary(
                             self,
                             arena,
                             item,
@@ -565,21 +565,21 @@ pub fn Methods(comptime Explorer: type) type {
                             .bytecode => |body| {
                                 try lines.append(arena, try std.fmt.allocPrint(arena, " chunk[0x{x}] · {d} captures", .{ body.chunk, body.captures }));
                                 if (self.ev.getChunk(body.chunk)) |chunk|
-                                    try Explorer.Ops.appendChunkCodePreview(self, lines, arena, body.chunk, chunk, preview_line_cap);
+                                    try Explorer.Ops.preview.appendChunkCodePreview(self, lines, arena, body.chunk, chunk, preview_line_cap);
                             },
                             .closure => |value| {
-                                const rendered = try Explorer.Ops.renderValueRef(self, arena, value, content_width -| 9, true);
+                                const rendered = try Explorer.Ops.pages.renderValueRef(self, arena, value, content_width -| 9, true);
                                 try lines.append(arena, try std.fmt.allocPrint(arena, " closure {s}", .{rendered.text}));
                             },
                             .pass_through => |value| {
-                                const rendered = try Explorer.Ops.renderValueRef(self, arena, value, content_width -| 7, true);
+                                const rendered = try Explorer.Ops.pages.renderValueRef(self, arena, value, content_width -| 7, true);
                                 try lines.append(arena, try std.fmt.allocPrint(arena, " value {s}", .{rendered.text}));
                             },
                             .attr_access => |access| try lines.append(arena, try std.fmt.allocPrint(arena, " attribute intern[0x{x}]", .{access.name})),
                             .deferred => |body| try lines.append(arena, try std.fmt.allocPrint(arena, " deferred[0x{x}] · {d} captures", .{ body.id, body.captures })),
                         },
                         .result => |value| {
-                            const rendered = try Explorer.Ops.renderValueRef(self, arena, value, content_width -| 8, true);
+                            const rendered = try Explorer.Ops.pages.renderValueRef(self, arena, value, content_width -| 8, true);
                             try lines.append(arena, try std.fmt.allocPrint(arena, " result {s}", .{rendered.text}));
                         },
                         .error_name => |name| try lines.append(arena, try std.fmt.allocPrint(arena, " error {s}", .{name})),
@@ -587,7 +587,7 @@ pub fn Methods(comptime Explorer: type) type {
                 },
                 .builtin_closure => |closure| {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
-                        try Explorer.Ops.locatedValue(
+                        try Explorer.Ops.value_summary.locatedValue(
                             self,
                             arena,
                             "builtin",
@@ -601,7 +601,7 @@ pub fn Methods(comptime Explorer: type) type {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {d} arguments", .{closure.args}));
                 },
                 .closure => |closure| if (self.ev.getChunk(closure.chunk)) |chunk|
-                    try Explorer.Ops.appendChunkCodePreview(self, lines, arena, closure.chunk, chunk, preview_line_cap),
+                    try Explorer.Ops.preview.appendChunkCodePreview(self, lines, arena, closure.chunk, chunk, preview_line_cap),
                 else => {},
             }
         }

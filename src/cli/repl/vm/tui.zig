@@ -237,7 +237,7 @@ pub const VmDebugger = struct {
             );
             index.deinit();
             index.* = next;
-            if (explorer.tree.projected_chunk) |id| try Tui.Ops.projectFocusedPath(explorer, id);
+            if (explorer.tree.projected_chunk) |id| try Tui.Ops.tree_projection.projectFocusedPath(explorer, id);
         }
         return explorer;
     }
@@ -246,7 +246,7 @@ pub const VmDebugger = struct {
         const self: *VmDebugger = @ptrCast(@alignCast(ctx));
         // Borrowed: a live `:vm` explorer already owns the screen; just drive it.
         if (self.active_tui) |tui_ptr| {
-            _ = try Tui.Ops.debugRun(tui_ptr, session, self.history);
+            _ = try Tui.Ops.debug_view.debugRun(tui_ptr, session, self.history);
             return;
         }
 
@@ -256,7 +256,7 @@ pub const VmDebugger = struct {
             self.leaveOwnedScreen();
             return err;
         };
-        const intent = Tui.Ops.debugRun(explorer, session, self.history) catch |err| {
+        const intent = Tui.Ops.debug_view.debugRun(explorer, session, self.history) catch |err| {
             self.leaveOwnedScreen();
             return err;
         };
@@ -342,10 +342,10 @@ const Tui = struct {
             .help;
         try self.navigation.back.append(self.allocator, .{ .kind = initial });
         if (focused) |id| {
-            try Tui.Ops.expandFocusedPath(self, id);
-            try Tui.Ops.rebuildTree(self, id);
+            try Tui.Ops.tree_projection.expandFocusedPath(self, id);
+            try Tui.Ops.tree_projection.rebuildTree(self, id);
         } else {
-            try Tui.Ops.rebuildTree(self, std.math.maxInt(ChunkId));
+            try Tui.Ops.tree_projection.rebuildTree(self, std.math.maxInt(ChunkId));
         }
         if (host.start_heap) {
             for (self.tree.rows.items, 0..) |row, i| switch (row) {
@@ -356,8 +356,8 @@ const Tui = struct {
                 else => {},
             };
         }
-        try Tui.Ops.refreshPage(self, initial);
-        try Tui.Ops.selectedSourceChanged(self);
+        try Tui.Ops.pages.refreshPage(self, initial);
+        try Tui.Ops.source_view.selectedSourceChanged(self);
     }
 
     fn pollSessionJobs(self: *Tui, jobs: *SessionJobs) !void {
@@ -366,8 +366,8 @@ const Tui = struct {
             // Display-node ids belong to one index generation. Re-project the
             // stable chunk anchor through the newly adopted index before
             // rebuilding; explicit expansions use semantic keys and survive.
-            if (self.tree.projected_chunk) |id| try Tui.Ops.projectFocusedPath(self, id);
-            try Tui.Ops.rebuildTreeForCurrent(self);
+            if (self.tree.projected_chunk) |id| try Tui.Ops.tree_projection.projectFocusedPath(self, id);
+            try Tui.Ops.tree_projection.rebuildTreeForCurrent(self);
         }
         const registry = self.ev.chunkRegistry();
         const names_stale = self.tree_index.registry_count != registry.count() or self.tree_index.name_count != registry.nameCount();
@@ -380,8 +380,8 @@ const Tui = struct {
         self.tree.indexing = !names_failed and (names_stale or jobs.names.running.load(.acquire));
         if (names_stale and names_failed) self.status_msg = "(name index failed)";
 
-        if (jobs.heap.poll(&self.heap_index.stats) and Tui.Ops.currentHeap(self) != null)
-            try Tui.Ops.refreshPage(self, Tui.Ops.currentKind(self));
+        if (jobs.heap.poll(&self.heap_index.stats) and Tui.Ops.view_state.currentHeap(self) != null)
+            try Tui.Ops.pages.refreshPage(self, Tui.Ops.view_state.currentKind(self));
         // The collapsed HEAP row owns the aggregate census preview, so populate
         // it for every explorer session rather than waiting for a folder/page
         // to be opened.
@@ -392,15 +392,15 @@ const Tui = struct {
         }
 
         if (jobs.objects.poll(&self.heap_index.objects)) {
-            try Tui.Ops.rebuildTreeForCurrent(self);
-            if (Tui.Ops.currentObject(self) != null) try Tui.Ops.refreshPage(self, Tui.Ops.currentKind(self));
+            try Tui.Ops.tree_projection.rebuildTreeForCurrent(self);
+            if (Tui.Ops.view_state.currentObject(self) != null) try Tui.Ops.pages.refreshPage(self, Tui.Ops.view_state.currentKind(self));
         }
         const objects_failed = jobs.objects.failed.load(.acquire);
         if (objects_failed != self.heap_index.objects_failed) {
             self.heap_index.objects_failed = objects_failed;
-            if (Tui.Ops.currentObject(self) != null) try Tui.Ops.refreshPage(self, Tui.Ops.currentKind(self));
+            if (Tui.Ops.view_state.currentObject(self) != null) try Tui.Ops.pages.refreshPage(self, Tui.Ops.view_state.currentKind(self));
         }
-        const wants_objects = Tui.Ops.currentObject(self) != null or self.tree.heap_views[@intFromEnum(HeapView.objects)];
+        const wants_objects = Tui.Ops.view_state.currentObject(self) != null or self.tree.heap_views[@intFromEnum(HeapView.objects)];
         if (wants_objects and objects_failed) self.status_msg = "(object index failed)";
         if (wants_objects and self.heap_index.objects == null and jobs.objects.thread == null and !objects_failed) {
             jobs.objects.start() catch {
@@ -409,9 +409,9 @@ const Tui = struct {
         }
 
         // References are part of chunk and heap-object inspector documents.
-        const shows_references = Tui.Ops.currentChunk(self) != null or Tui.Ops.currentObject(self) != null;
+        const shows_references = Tui.Ops.view_state.currentChunk(self) != null or Tui.Ops.view_state.currentObject(self) != null;
         if (jobs.references.poll(&self.references.graph)) {
-            if (shows_references) try Tui.Ops.refreshPage(self, Tui.Ops.currentKind(self));
+            if (shows_references) try Tui.Ops.pages.refreshPage(self, Tui.Ops.view_state.currentKind(self));
         }
         const references_failed = jobs.references.failed.load(.acquire);
         self.references.failed = references_failed;
@@ -439,14 +439,14 @@ const Tui = struct {
         self.clearReferenceGraph();
         if (capture.written().len > 0 and capture.written()[capture.written().len - 1] != '\n')
             try capture.writer.writeByte('\n');
-        try Tui.Ops.rebuildTranscriptLines(self, capture.written());
+        try Tui.Ops.source_view.rebuildTranscriptLines(self, capture.written());
         if (host.takeHeapRequest()) {
-            try Tui.Ops.open(self, .{ .heap = .overview });
+            try Tui.Ops.controller.open(self, .{ .heap = .overview });
         } else if (host.focusedChunk()) |id| {
-            if (Tui.Ops.currentChunk(self) != id)
-                try Tui.Ops.open(self, .{ .chunk = id })
+            if (Tui.Ops.view_state.currentChunk(self) != id)
+                try Tui.Ops.controller.open(self, .{ .chunk = id })
             else
-                try Tui.Ops.refreshPage(self, .{ .chunk = id });
+                try Tui.Ops.pages.refreshPage(self, .{ .chunk = id });
         }
         return host.quitting();
     }
@@ -502,7 +502,7 @@ const Tui = struct {
             w.flush() catch {};
         }
 
-        try Tui.Ops.rebuildTranscriptLines(self, capture.written());
+        try Tui.Ops.source_view.rebuildTranscriptLines(self, capture.written());
         try self.initializeSession(host);
 
         var jobs = SessionJobs.init(self.ev);
@@ -528,12 +528,12 @@ const Tui = struct {
             try self.pollSessionJobs(&jobs);
 
             _ = frame_arena.reset(.retain_capacity);
-            var prompt_view = try Tui.Ops.sessionPromptView(self, editor, frame_arena.allocator());
+            var prompt_view = try Tui.Ops.source_view.sessionPromptView(self, editor, frame_arena.allocator());
             const size = term_mod.size();
             prompt_renderer.setWidth(size.cols);
             prompt_view.max_rows = size.rows -| 2;
             const prompt_rows = if (prompt_active) try prompt_renderer.measure(prompt_view) else 0;
-            try Tui.Ops.drawSession(self, frame_arena.allocator(), w, &prompt_renderer, prompt_view, prompt_rows, capture, prompt_active);
+            try Tui.Ops.preview.drawSession(self, frame_arena.allocator(), w, &prompt_renderer, prompt_view, prompt_rows, capture, prompt_active);
             try w.flush();
 
             // Keep polling while a thread handle exists, even if the worker
@@ -576,7 +576,7 @@ const Tui = struct {
                         .cancel => {
                             editor.reset();
                             try capture.writer.writeAll("^C\n");
-                            try Tui.Ops.rebuildTranscriptLines(self, capture.written());
+                            try Tui.Ops.source_view.rebuildTranscriptLines(self, capture.written());
                         },
                         .clear_screen => try screen.clear(),
                         .suspend_process => {
@@ -589,7 +589,7 @@ const Tui = struct {
                 }
 
                 if (key.code == .escape) {
-                    if (try Tui.Ops.escapeLayer(self)) continue;
+                    if (try Tui.Ops.controller.escapeLayer(self)) continue;
                     return;
                 }
                 const leave_explorer = switch (key.code) {
@@ -614,7 +614,7 @@ const Tui = struct {
                     prompt_active = true;
                     continue;
                 }
-                if (!try Tui.Ops.handleKey(self, key)) {
+                if (!try Tui.Ops.controller.handleKey(self, key)) {
                     prompt_active = true;
                     _ = try editor.handleKey(key);
                 }

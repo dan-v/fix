@@ -48,12 +48,12 @@ const disasm_options: disasm.Options = .{
 
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.RenderedValue;
-        const Layout = Explorer.Ops.Layout;
-        const StoreRecord = Explorer.Ops.StoreRecord;
-        const OpenMode = Explorer.Ops.OpenMode;
-        const DebugOutcome = Explorer.Ops.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.DebugCloseIntent;
+        const RenderedValue = Explorer.Ops.pages.RenderedValue;
+        const Layout = Explorer.Ops.view_state.Layout;
+        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
+        const OpenMode = Explorer.Ops.controller.OpenMode;
+        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
+        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
         const range_leaf = Explorer.range_leaf;
         const range_branch = Explorer.range_branch;
         const preview_line_cap = Explorer.preview_line_cap;
@@ -81,13 +81,13 @@ pub fn Methods(comptime Explorer: type) type {
         pub fn drawDisasmRow(self: *Explorer, frame: *tui.Frame, row: usize, width: usize) !void {
             const idx = self.navigation.scroll + row;
             if (idx < self.page.lines.len) {
-                const selected = idx == self.navigation.detail_selection and self.navigation.focus == .subject and Explorer.Ops.rowActionable(self, idx);
-                const breakpoint = idx < self.page.locations.len and if (self.page.locations[idx]) |location| Explorer.Ops.hasBreakpoint(self, location) else false;
+                const selected = idx == self.navigation.detail_selection and self.navigation.focus == .subject and Explorer.Ops.controller.rowActionable(self, idx);
+                const breakpoint = idx < self.page.locations.len and if (self.page.locations[idx]) |location| Explorer.Ops.tree_render.hasBreakpoint(self, location) else false;
                 if ((selected or breakpoint) and width >= 2) {
                     try frame.text(if (selected and breakpoint) "◆ " else if (selected) "› " else "● ", 0, 2, if (selected) .selection_marker else .current);
-                    try frame.text(self.page.lines[idx], self.navigation.x_scroll, width - 2, Explorer.Ops.detailRole(self, idx));
+                    try frame.text(self.page.lines[idx], self.navigation.x_scroll, width - 2, Explorer.Ops.tree_render.detailRole(self, idx));
                 } else {
-                    try frame.text(self.page.lines[idx], self.navigation.x_scroll, width, Explorer.Ops.detailRole(self, idx));
+                    try frame.text(self.page.lines[idx], self.navigation.x_scroll, width, Explorer.Ops.tree_render.detailRole(self, idx));
                 }
             } else if (idx == self.page.lines.len and self.page.lines.len != 0) {
                 try frame.text("(end)", 0, width, .muted);
@@ -145,7 +145,7 @@ pub fn Methods(comptime Explorer: type) type {
             while (pass < 2) : (pass += 1) {
                 result.start = @min(self.navigation.tree_selection -| (normal_slots / 2), count -| normal_slots);
                 var hidden_nearest: [64]usize = undefined;
-                const hidden_count = Explorer.Ops.hiddenTreeAncestors(self, result.start, &hidden_nearest);
+                const hidden_count = Explorer.Ops.tree_render.hiddenTreeAncestors(self, result.start, &hidden_nearest);
                 result.pin_count = @min(@min(hidden_count, hidden_nearest.len), slots -| 1);
                 var i: usize = 0;
                 while (i < result.pin_count) : (i += 1) {
@@ -188,13 +188,13 @@ pub fn Methods(comptime Explorer: type) type {
         /// pinned breadcrumbs may consume several rows; ordinary rows stay one
         /// line and are middle-ellipsized by the renderer below.
         pub fn treeCell(self: *const Explorer, slot: usize, width: usize, slots: usize) ?TreeCell {
-            const viewport = Explorer.Ops.treeViewport(self, slots);
+            const viewport = Explorer.Ops.tree_render.treeViewport(self, slots);
             var pin_start: usize = 0;
             var pin_height: usize = 0;
-            for (viewport.pinned[0..viewport.pin_count]) |index| pin_height += Explorer.Ops.treeDisplayHeight(self, index, width, slots, true);
-            const selected_height = Explorer.Ops.treeDisplayHeight(self, self.navigation.tree_selection, width, slots, false);
+            for (viewport.pinned[0..viewport.pin_count]) |index| pin_height += Explorer.Ops.tree_render.treeDisplayHeight(self, index, width, slots, true);
+            const selected_height = Explorer.Ops.tree_render.treeDisplayHeight(self, self.navigation.tree_selection, width, slots, false);
             while (pin_start < viewport.pin_count and pin_height + selected_height > slots) : (pin_start += 1) {
-                pin_height -|= Explorer.Ops.treeDisplayHeight(self, viewport.pinned[pin_start], width, slots, true);
+                pin_height -|= Explorer.Ops.tree_render.treeDisplayHeight(self, viewport.pinned[pin_start], width, slots, true);
             }
 
             var normal_start = viewport.start;
@@ -206,7 +206,7 @@ pub fn Methods(comptime Explorer: type) type {
 
             var physical: usize = 0;
             for (viewport.pinned[pin_start..viewport.pin_count]) |index| {
-                const height = Explorer.Ops.treeDisplayHeight(self, index, width, slots, true);
+                const height = Explorer.Ops.tree_render.treeDisplayHeight(self, index, width, slots, true);
                 if (slot < physical + height) return .{
                     .index = index,
                     .segment = slot - physical,
@@ -218,7 +218,7 @@ pub fn Methods(comptime Explorer: type) type {
 
             var index = normal_start;
             while (index < self.tree.rows.items.len and physical < slots) : (index += 1) {
-                const height = Explorer.Ops.treeDisplayHeight(self, index, width, slots, false);
+                const height = Explorer.Ops.tree_render.treeDisplayHeight(self, index, width, slots, false);
                 if (slot < physical + height) return .{
                     .index = index,
                     .segment = slot - physical,
@@ -232,7 +232,7 @@ pub fn Methods(comptime Explorer: type) type {
 
         pub fn treeSelectionSlot(self: *const Explorer, width: usize, slots: usize) ?usize {
             for (0..slots) |slot| {
-                const cell = Explorer.Ops.treeCell(self, slot, width, slots) orelse continue;
+                const cell = Explorer.Ops.tree_render.treeCell(self, slot, width, slots) orelse continue;
                 if (cell.index == self.navigation.tree_selection and cell.segment == 0)
                     return slot;
             }
@@ -243,7 +243,7 @@ pub fn Methods(comptime Explorer: type) type {
             if (index >= self.tree.rows.items.len or width < 8) return 1;
             const selected = index == self.navigation.tree_selection and self.navigation.focus == .tree;
             if (!pinned and !selected) return 1;
-            const content_width = Explorer.Ops.longTreeContentWidth(self, self.tree.rows.items[index]) orelse return 1;
+            const content_width = Explorer.Ops.tree_render.longTreeContentWidth(self, self.tree.rows.items[index]) orelse return 1;
             const prefix = @min(1 + @as(usize, treeRowDepth(self.tree.rows.items[index])) * 2 + 2, width - 1);
             const available = width - prefix;
             const height = @max(@as(usize, 1), (content_width + available - 1) / available);
@@ -265,7 +265,7 @@ pub fn Methods(comptime Explorer: type) type {
                 .chunk => |entry| if (entry.label) |node_id| blk: {
                     const node = self.tree_index.node(node_id) orelse return null;
                     const chunk = self.ev.getChunk(entry.id) orelse return null;
-                    const relation = Explorer.Ops.chunkEquivalenceSuffix(self, &relation_buf, entry.id);
+                    const relation = Explorer.Ops.pages.chunkEquivalenceSuffix(self, &relation_buf, entry.id);
                     const suffix = std.fmt.bufPrint(&suffix_buf, "  chunk[0x{x}] · {Bi}{s}", .{ entry.id, chunk.code.len, relation }) catch "";
                     break :blk width_mod.strWidth(node.label) + width_mod.strWidth(suffix);
                 } else null,
@@ -279,21 +279,21 @@ pub fn Methods(comptime Explorer: type) type {
                 0 => {
                     const root_stats = self.tree_index.statsOf(vm_tree.root_node_id);
                     const heap_counts = self.ev.heapCounts();
-                    const line = if (Explorer.Ops.filterActive(self))
+                    const line = if (Explorer.Ops.tree_projection.filterActive(self))
                         std.fmt.bufPrint(&line_buf, " VM STATE · filter '{s}' · F edit · Esc clear", .{self.tree.filter_query.items}) catch " VM STATE · filtered"
                     else
                         std.fmt.bufPrint(&line_buf, " VM STATE · {d} chunks · {d} object slots", .{ root_stats.chunks, heap_counts.objects }) catch " VM STATE";
-                    try frame.text(line, 0, width, if (Explorer.Ops.filterActive(self)) .source_focus else .section);
+                    try frame.text(line, 0, width, if (Explorer.Ops.tree_projection.filterActive(self)) .source_focus else .section);
                 },
                 1 => {
-                    const id = Explorer.Ops.currentChunk(self) orelse {
-                        if (Explorer.Ops.currentObject(self)) |object_id| {
+                    const id = Explorer.Ops.view_state.currentChunk(self) orelse {
+                        if (Explorer.Ops.view_state.currentObject(self)) |object_id| {
                             const line = std.fmt.bufPrint(&line_buf, " ● objects[0x{x}]", .{object_id}) catch " object";
                             try frame.text(line, 0, width, .object);
-                        } else if (Explorer.Ops.currentHeap(self)) |view| {
+                        } else if (Explorer.Ops.view_state.currentHeap(self)) |view| {
                             const line = std.fmt.bufPrint(&line_buf, " ● heap/{s}", .{@tagName(view)}) catch " heap";
                             try frame.text(line, 0, width, .section);
-                        } else if (Explorer.Ops.currentStoreRecord(self)) |record| {
+                        } else if (Explorer.Ops.view_state.currentStoreRecord(self)) |record| {
                             const line = std.fmt.bufPrint(&line_buf, " ● {s}[0x{x}]", .{
                                 @tagName(record.view),
                                 record.id,
@@ -308,7 +308,7 @@ pub fn Methods(comptime Explorer: type) type {
                         return true;
                     };
                     var relation_buf: [96]u8 = undefined;
-                    const relation = Explorer.Ops.chunkEquivalenceSuffix(self, &relation_buf, id);
+                    const relation = Explorer.Ops.pages.chunkEquivalenceSuffix(self, &relation_buf, id);
                     const line = if (self.ev.getChunk(id)) |chunk|
                         std.fmt.bufPrint(&line_buf, " ● chunk[0x{x}]  {d}b · {d}c · a{d}{s}", .{ id, chunk.code.len, chunk.constants.len, chunk.arity, relation }) catch " current chunk"
                     else
@@ -323,7 +323,7 @@ pub fn Methods(comptime Explorer: type) type {
 
         pub fn drawChunkRow(self: *Explorer, arena: std.mem.Allocator, frame: *tui.Frame, row: usize, width: usize, rows: usize) !void {
             var line_buf: [512]u8 = undefined;
-            if (try Explorer.Ops.drawTreeHeader(self, frame, row, width)) return;
+            if (try Explorer.Ops.tree_render.drawTreeHeader(self, frame, row, width)) return;
 
             const count = self.tree.rows.items.len;
             if (count == 0) {
@@ -333,7 +333,7 @@ pub fn Methods(comptime Explorer: type) type {
             const slots = rows -| 3;
             if (slots == 0) return;
             const slot = row - 3;
-            const cell = Explorer.Ops.treeCell(self, slot, width, slots) orelse return;
+            const cell = Explorer.Ops.tree_render.treeCell(self, slot, width, slots) orelse return;
             const index = cell.index;
             if (index >= count) return;
             const pinned = cell.pinned;
@@ -342,8 +342,8 @@ pub fn Methods(comptime Explorer: type) type {
                 .category => |entry| blk: {
                     const is_open = self.tree.categories[@intFromEnum(entry.kind)];
                     const projected = !is_open and switch (entry.kind) {
-                        .bytecode => Explorer.Ops.currentChunk(self) != null,
-                        .heap => Explorer.Ops.currentObject(self) != null,
+                        .bytecode => Explorer.Ops.view_state.currentChunk(self) != null,
+                        .heap => Explorer.Ops.view_state.currentObject(self) != null,
                     };
                     break :blk switch (entry.kind) {
                         .bytecode => blk2: {
@@ -381,12 +381,12 @@ pub fn Methods(comptime Explorer: type) type {
                     const chunk = self.ev.getChunk(entry.id);
                     const label = if (entry.label) |node_id| (self.tree_index.node(node_id) orelse return).label else "";
                     var relation_buf: [96]u8 = undefined;
-                    const relation = Explorer.Ops.chunkEquivalenceSuffix(self, &relation_buf, entry.id);
+                    const relation = Explorer.Ops.pages.chunkEquivalenceSuffix(self, &relation_buf, entry.id);
                     break :blk if (chunk) |ch|
                         if (label.len > 0)
                             try std.fmt.allocPrint(arena, " {s}{s} {s}  chunk[0x{x}] · {Bi}{s}", .{
                                 indent[0..indent_len],
-                                if (Explorer.Ops.currentChunk(self) == entry.id) "●" else "·",
+                                if (Explorer.Ops.view_state.currentChunk(self) == entry.id) "●" else "·",
                                 label,
                                 entry.id,
                                 ch.code.len,
@@ -395,7 +395,7 @@ pub fn Methods(comptime Explorer: type) type {
                         else
                             std.fmt.bufPrint(&line_buf, " {s}{s} chunk[0x{x}]  {Bi}{s}", .{
                                 indent[0..indent_len],
-                                if (Explorer.Ops.currentChunk(self) == entry.id) "●" else "·",
+                                if (Explorer.Ops.view_state.currentChunk(self) == entry.id) "●" else "·",
                                 entry.id,
                                 ch.code.len,
                                 relation,
@@ -428,7 +428,7 @@ pub fn Methods(comptime Explorer: type) type {
                             }) catch " chunk range";
                         },
                         .objects => blk2: {
-                            const reference = try Explorer.Ops.canonicalStoreRange(
+                            const reference = try Explorer.Ops.value_summary.canonicalStoreRange(
                                 self,
                                 arena,
                                 .objects,
@@ -439,7 +439,7 @@ pub fn Methods(comptime Explorer: type) type {
                             );
                             break :blk2 try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
                                 indent[0..indent_len],
-                                if (is_open) "▾" else if (Explorer.Ops.currentObject(self)) |id| (if (id >= entry.start and id < entry.start + entry.len) "›" else "▸") else "▸",
+                                if (is_open) "▾" else if (Explorer.Ops.view_state.currentObject(self)) |id| (if (id >= entry.start and id < entry.start + entry.len) "›" else "▸") else "▸",
                                 reference,
                             });
                         },
@@ -452,7 +452,7 @@ pub fn Methods(comptime Explorer: type) type {
                                 .builtin => .builtin,
                                 else => unreachable,
                             };
-                            const reference = try Explorer.Ops.canonicalStoreRange(
+                            const reference = try Explorer.Ops.value_summary.canonicalStoreRange(
                                 self,
                                 arena,
                                 view,
@@ -473,8 +473,8 @@ pub fn Methods(comptime Explorer: type) type {
                     var indent: [64]u8 = undefined;
                     const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                     @memset(indent[0..indent_len], ' ');
-                    const projected = (entry.view == .objects and Explorer.Ops.currentObject(self) != null) or
-                        (if (Explorer.Ops.currentStoreRecord(self)) |r| r.view == entry.view else false);
+                    const projected = (entry.view == .objects and Explorer.Ops.view_state.currentObject(self) != null) or
+                        (if (Explorer.Ops.view_state.currentStoreRecord(self)) |r| r.view == entry.view else false);
                     const marker = if (entry.view == .overview)
                         "·"
                     else if (self.tree.heap_views[@intFromEnum(entry.view)])
@@ -486,13 +486,13 @@ pub fn Methods(comptime Explorer: type) type {
                     const snapshot = if (entry.view == .objects)
                         (if (self.heap_index.objects) |*s| s else null)
                     else
-                        Explorer.Ops.ensureStoreSnapshot(self, entry.view);
+                        Explorer.Ops.view_state.ensureStoreSnapshot(self, entry.view);
                     if (entry.view == .objects and snapshot == null) {
                         break :blk if (self.heap_index.stats) |stats|
                             try std.fmt.allocPrint(arena, " {s}{s} objects · {d} live", .{
                                 indent[0..indent_len],
                                 marker,
-                                Explorer.Ops.liveObjectCount(stats),
+                                Explorer.Ops.view_state.liveObjectCount(stats),
                             })
                         else
                             try std.fmt.allocPrint(arena, " {s}{s} objects", .{
@@ -500,9 +500,9 @@ pub fn Methods(comptime Explorer: type) type {
                                 marker,
                             });
                     }
-                    const extent = if (snapshot) |s| s.liveExtent() else Explorer.Ops.storeCount(self, entry.view);
-                    const live = if (snapshot) |s| s.live_count else Explorer.Ops.storeCount(self, entry.view);
-                    const reference = try Explorer.Ops.canonicalStoreRange(
+                    const extent = if (snapshot) |s| s.liveExtent() else Explorer.Ops.view_state.storeCount(self, entry.view);
+                    const live = if (snapshot) |s| s.live_count else Explorer.Ops.view_state.storeCount(self, entry.view);
+                    const reference = try Explorer.Ops.value_summary.canonicalStoreRange(
                         self,
                         arena,
                         entry.view,
@@ -522,13 +522,13 @@ pub fn Methods(comptime Explorer: type) type {
                     const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                     @memset(indent[0..indent_len], ' ');
                     const ref_width = width -| indent_len -| 4;
-                    const preview = try Explorer.Ops.objectSummary(
+                    const preview = try Explorer.Ops.value_summary.objectSummary(
                         self,
                         arena,
                         entry.id,
-                        Explorer.Ops.storePreviewBudget(self, "objects", entry.id, ref_width),
+                        Explorer.Ops.value_summary.storePreviewBudget(self, "objects", entry.id, ref_width),
                     );
-                    const reference = try Explorer.Ops.canonicalStoreRef(
+                    const reference = try Explorer.Ops.value_summary.canonicalStoreRef(
                         self,
                         arena,
                         .objects,
@@ -538,7 +538,7 @@ pub fn Methods(comptime Explorer: type) type {
                     );
                     break :blk try std.fmt.allocPrint(arena, " {s}{s} {s}", .{
                         indent[0..indent_len],
-                        if (Explorer.Ops.currentObject(self) == entry.id) "●" else "·",
+                        if (Explorer.Ops.view_state.currentObject(self) == entry.id) "●" else "·",
                         reference,
                     });
                 },
@@ -546,16 +546,16 @@ pub fn Methods(comptime Explorer: type) type {
                     var indent: [64]u8 = undefined;
                     const indent_len = @min(@as(usize, entry.depth) * 2, indent.len);
                     @memset(indent[0..indent_len], ' ');
-                    const current = if (Explorer.Ops.currentStoreRecord(self)) |r| (r.view == entry.view and r.id == entry.id) else false;
+                    const current = if (Explorer.Ops.view_state.currentStoreRecord(self)) |r| (r.view == entry.view and r.id == entry.id) else false;
                     const ref_width = width -| indent_len -| 4;
-                    const detail = try Explorer.Ops.storeRecordSummary(
+                    const detail = try Explorer.Ops.value_summary.storeRecordSummary(
                         self,
                         arena,
                         entry.view,
                         entry.id,
-                        Explorer.Ops.storePreviewBudget(self, @tagName(entry.view), entry.id, ref_width),
+                        Explorer.Ops.value_summary.storePreviewBudget(self, @tagName(entry.view), entry.id, ref_width),
                     );
-                    const reference = try Explorer.Ops.canonicalStoreRef(
+                    const reference = try Explorer.Ops.value_summary.canonicalStoreRef(
                         self,
                         arena,
                         entry.view,
@@ -584,7 +584,7 @@ pub fn Methods(comptime Explorer: type) type {
                     @memset(indent[0..indent_len], ' ');
                     break :blk try std.fmt.allocPrint(arena, " {s}{s} #{d} {s}:{d} {s}", .{
                         indent[0..indent_len],
-                        if (Explorer.Ops.currentDebugFrame(self) == entry.index) "●" else "·",
+                        if (Explorer.Ops.view_state.currentDebugFrame(self) == entry.index) "●" else "·",
                         entry.index,
                         if (info.file) |f| std.fs.path.basename(f) else "<repl>",
                         info.line,
@@ -595,7 +595,7 @@ pub fn Methods(comptime Explorer: type) type {
                     const session = self.debug_session orelse break :blk " value";
                     const v = session.value;
                     const label = vm_helpers.returnValueHeading(session.reason);
-                    const detail = try Explorer.Ops.valueSummary(self, arena, v, width -| 24);
+                    const detail = try Explorer.Ops.value_summary.valueSummary(self, arena, v, width -| 24);
                     break :blk try std.fmt.allocPrint(arena, " ↳ {s}: {s}", .{ label, detail });
                 },
             };
@@ -608,17 +608,17 @@ pub fn Methods(comptime Explorer: type) type {
                 .name => .name,
                 // Chunks keep their own hue whether or not they're the open one; the
                 // `●` marker (not a color change) signals which is current.
-                .chunk => |entry| if (Explorer.Ops.currentChunk(self) == entry.id) .chunk_current else .chunk,
+                .chunk => |entry| if (Explorer.Ops.view_state.currentChunk(self) == entry.id) .chunk_current else .chunk,
                 .range => .range,
-                .object => |entry| if (Explorer.Ops.currentObject(self) == entry.id) .chunk_current else .object,
-                .store_record => |entry| if (Explorer.Ops.currentStoreRecord(self)) |r| (if (r.view == entry.view and r.id == entry.id) .chunk_current else .object) else .object,
-                .heap => |entry| switch (Explorer.Ops.currentKind(self)) {
+                .object => |entry| if (Explorer.Ops.view_state.currentObject(self) == entry.id) .chunk_current else .object,
+                .store_record => |entry| if (Explorer.Ops.view_state.currentStoreRecord(self)) |r| (if (r.view == entry.view and r.id == entry.id) .chunk_current else .object) else .object,
+                .heap => |entry| switch (Explorer.Ops.view_state.currentKind(self)) {
                     .heap => |view| if (view == entry.view) .section else .name,
                     else => .name,
                 },
                 .debug_root => .section,
                 // A live paused frame is genuine current execution — green stays apt.
-                .debug_frame => |entry| if (Explorer.Ops.currentDebugFrame(self) == entry.index) .current else .name,
+                .debug_frame => |entry| if (Explorer.Ops.view_state.currentDebugFrame(self) == entry.index) .current else .name,
                 // The pause's return/break/error value stands out (gold, bold).
                 .debug_value => .source_focus,
             };

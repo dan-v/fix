@@ -51,12 +51,12 @@ const disasm_options: disasm.Options = .{
 
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.RenderedValue;
-        const Layout = Explorer.Ops.Layout;
-        const StoreRecord = Explorer.Ops.StoreRecord;
-        const OpenMode = Explorer.Ops.OpenMode;
-        const TreeViewport = Explorer.Ops.TreeViewport;
-        const TreeCell = Explorer.Ops.TreeCell;
+        const RenderedValue = Explorer.Ops.pages.RenderedValue;
+        const Layout = Explorer.Ops.view_state.Layout;
+        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
+        const OpenMode = Explorer.Ops.controller.OpenMode;
+        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
+        const TreeCell = Explorer.Ops.tree_render.TreeCell;
         const range_leaf = Explorer.range_leaf;
         const range_branch = Explorer.range_branch;
         const preview_line_cap = Explorer.preview_line_cap;
@@ -91,10 +91,10 @@ pub fn Methods(comptime Explorer: type) type {
             self.debug_nav_mark = self.navigation.back.items.len;
             defer {
                 self.return_flash = false;
-                Explorer.Ops.exitDebugView(self);
+                Explorer.Ops.debug_view.exitDebugView(self);
             }
-            try Explorer.Ops.open(self, .{ .debug_frame = session.frameCount() -| 1 });
-            if (session.reason == .return_step) Explorer.Ops.focusValueRow(self, session.value);
+            try Explorer.Ops.controller.open(self, .{ .debug_frame = session.frameCount() -| 1 });
+            if (session.reason == .return_step) Explorer.Ops.pages.focusValueRow(self, session.value);
             // `open` updates the subject and normally focuses it. Across a requested
             // step, keep whichever pane owned interaction focus while still showing
             // the newly-current frame in the subject.
@@ -104,7 +104,7 @@ pub fn Methods(comptime Explorer: type) type {
             defer editor.deinit();
             var capture = transcript_mod.Capture.init(self.allocator, 256 * 1024);
             defer capture.deinit();
-            try Explorer.Ops.rebuildTranscriptLines(self, capture.written());
+            try Explorer.Ops.source_view.rebuildTranscriptLines(self, capture.written());
 
             var prompt_style_buf: [64]u8 = undefined;
             var prompt_renderer = render_mod.Renderer.init(
@@ -128,19 +128,19 @@ pub fn Methods(comptime Explorer: type) type {
                 // heap via `session.eval`, so we draw from the (possibly stale)
                 // existing indexes rather than racing a background snapshot.
                 _ = frame_arena.reset(.retain_capacity);
-                var prompt_view = try Explorer.Ops.sessionPromptView(self, &editor, frame_arena.allocator());
+                var prompt_view = try Explorer.Ops.source_view.sessionPromptView(self, &editor, frame_arena.allocator());
                 const size = term_mod.size();
                 prompt_renderer.setWidth(size.cols);
                 prompt_view.max_rows = size.rows -| 2;
                 const prompt_rows = if (prompt_active) try prompt_renderer.measure(prompt_view) else 0;
-                try Explorer.Ops.drawSession(self, frame_arena.allocator(), w, &prompt_renderer, prompt_view, prompt_rows, &capture, prompt_active);
+                try Explorer.Ops.preview.drawSession(self, frame_arena.allocator(), w, &prompt_renderer, prompt_view, prompt_rows, &capture, prompt_active);
                 try w.flush();
 
                 const flash_drawn = self.return_flash;
                 const result = term_mod.readInput(&read_buf, if (decoder.wantsMore()) 40 else if (flash_drawn) 180 else -1);
                 if (flash_drawn) {
                     self.return_flash = false;
-                    try Explorer.Ops.refreshPage(self, Explorer.Ops.currentKind(self));
+                    try Explorer.Ops.pages.refreshPage(self, Explorer.Ops.view_state.currentKind(self));
                 }
                 events.clearRetainingCapacity();
                 switch (result) {
@@ -155,9 +155,9 @@ pub fn Methods(comptime Explorer: type) type {
 
                 for (events.items) |key| {
                     const outcome = if (prompt_active)
-                        try Explorer.Ops.debugPromptKey(self, session, &editor, &capture, &prompt_active, w, &prompt_renderer, key)
+                        try Explorer.Ops.debug_view.debugPromptKey(self, session, &editor, &capture, &prompt_active, w, &prompt_renderer, key)
                     else
-                        try Explorer.Ops.debugKey(self, session, &editor, &prompt_active, key);
+                        try Explorer.Ops.debug_view.debugKey(self, session, &editor, &prompt_active, key);
                     switch (outcome) {
                         .running => {},
                         .resume_keep => return .keep,
@@ -171,17 +171,17 @@ pub fn Methods(comptime Explorer: type) type {
         pub fn debugKey(self: *Explorer, session: *DebugSession, editor: *editor_mod.Editor, prompt_active: *bool, key: keys_mod.Key) !DebugOutcome {
             self.status_msg = "";
             switch (key.code) {
-                .escape => return if (try Explorer.Ops.escapeLayer(self)) .running else .resume_close,
+                .escape => return if (try Explorer.Ops.controller.escapeLayer(self)) .running else .resume_close,
                 .cp => |cp| {
                     if (key.ctrl) {
                         if (cp == 'd') return .abort;
-                        _ = try Explorer.Ops.handleKey(self, key);
+                        _ = try Explorer.Ops.controller.handleKey(self, key);
                         return .running;
                     }
                     switch (cp) {
-                        's' => return Explorer.Ops.debugStep(self, session, .into),
-                        'n' => return Explorer.Ops.debugStep(self, session, .over),
-                        'f' => return Explorer.Ops.debugStep(self, session, .out),
+                        's' => return Explorer.Ops.debug_view.debugStep(self, session, .into),
+                        'n' => return Explorer.Ops.debug_view.debugStep(self, session, .over),
+                        'f' => return Explorer.Ops.debug_view.debugStep(self, session, .out),
                         'c' => return .resume_close,
                         'q' => return .abort,
                         ':' => {
@@ -194,13 +194,13 @@ pub fn Methods(comptime Explorer: type) type {
                             return .running;
                         },
                         else => {
-                            _ = try Explorer.Ops.handleKey(self, key);
+                            _ = try Explorer.Ops.controller.handleKey(self, key);
                             return .running;
                         },
                     }
                 },
                 else => {
-                    _ = try Explorer.Ops.handleKey(self, key);
+                    _ = try Explorer.Ops.controller.handleKey(self, key);
                     return .running;
                 },
             }
@@ -236,7 +236,7 @@ pub fn Methods(comptime Explorer: type) type {
                     const input = try editor.takeText();
                     defer self.allocator.free(input);
                     prompt_active.* = false;
-                    return Explorer.Ops.debugExecute(self, session, capture, std.mem.trim(u8, input, " \t\r\n"));
+                    return Explorer.Ops.debug_view.debugExecute(self, session, capture, std.mem.trim(u8, input, " \t\r\n"));
                 },
                 .eof => return .abort,
                 .cancel => {
@@ -257,18 +257,18 @@ pub fn Methods(comptime Explorer: type) type {
                 .none => {},
                 .proceed => return .resume_close,
                 .abort => return .abort,
-                .step => |kind| return Explorer.Ops.debugStep(self, session, switch (kind) {
+                .step => |kind| return Explorer.Ops.debug_view.debugStep(self, session, switch (kind) {
                     .over => .over,
                     .into => .into,
                     .out => .out,
                 }),
-                .help => try Explorer.Ops.debugSetCapture(self, capture, vm_helpers.debug_help_text),
-                .backtrace, .locals => try Explorer.Ops.debugSetCapture(self, capture, "The tree shows the paused stack; select a frame to inspect its source, locals, and code."),
-                .value => try Explorer.Ops.debugRenderValue(self, session, capture, session.value),
+                .help => try Explorer.Ops.debug_view.debugSetCapture(self, capture, vm_helpers.debug_help_text),
+                .backtrace, .locals => try Explorer.Ops.debug_view.debugSetCapture(self, capture, "The tree shows the paused stack; select a frame to inspect its source, locals, and code."),
+                .value => try Explorer.Ops.debug_view.debugRenderValue(self, session, capture, session.value),
                 .eval => |source| {
                     const scope = session.scopeAttrs() catch session.bindValueScope("it") catch null;
                     const value = session.eval(source, scope) catch |err| {
-                        try Explorer.Ops.debugSetCaptureFmt(self, capture, "error: {s}", .{@errorName(err)});
+                        try Explorer.Ops.debug_view.debugSetCaptureFmt(self, capture, "error: {s}", .{@errorName(err)});
                         return .running;
                     };
                     // Debugger evaluation may allocate or resolve objects without
@@ -276,15 +276,15 @@ pub fn Methods(comptime Explorer: type) type {
                     self.clearHeapSnapshots();
                     self.clearReferenceGraph();
                     self.refreshPausedTreeSnapshots();
-                    try Explorer.Ops.rebuildTreeForCurrent(self);
-                    try Explorer.Ops.debugRenderValue(self, session, capture, value);
-                    try Explorer.Ops.refreshPage(self, Explorer.Ops.currentKind(self));
+                    try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
+                    try Explorer.Ops.debug_view.debugRenderValue(self, session, capture, value);
+                    try Explorer.Ops.pages.refreshPage(self, Explorer.Ops.view_state.currentKind(self));
                 },
-                .breakpoint => |arg| try Explorer.Ops.debugAddBreakpoint(self, session, capture, arg),
-                .breakpoints => try Explorer.Ops.debugListBreakpoints(self, session, capture),
-                .delete => |arg| try Explorer.Ops.debugDeleteBreakpoint(self, session, capture, arg),
+                .breakpoint => |arg| try Explorer.Ops.debug_view.debugAddBreakpoint(self, session, capture, arg),
+                .breakpoints => try Explorer.Ops.debug_view.debugListBreakpoints(self, session, capture),
+                .delete => |arg| try Explorer.Ops.debug_view.debugDeleteBreakpoint(self, session, capture, arg),
             }
-            try Explorer.Ops.rebuildTranscriptLines(self, capture.written());
+            try Explorer.Ops.source_view.rebuildTranscriptLines(self, capture.written());
             return .running;
         }
 
@@ -336,8 +336,8 @@ pub fn Methods(comptime Explorer: type) type {
             self.navigation.forward.clearRetainingCapacity();
             if (self.navigation.back.items.len == 0) return;
             const visit = self.navigation.back.items[self.navigation.back.items.len - 1];
-            Explorer.Ops.rebuildTreeForCurrent(self) catch {};
-            Explorer.Ops.refreshPage(self, visit.kind) catch {};
+            Explorer.Ops.tree_projection.rebuildTreeForCurrent(self) catch {};
+            Explorer.Ops.pages.refreshPage(self, visit.kind) catch {};
             self.navigation.scroll = visit.scroll;
             self.navigation.tree_selection = visit.tree_selection;
             self.navigation.detail_selection = visit.detail_selection;
