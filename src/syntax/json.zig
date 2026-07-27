@@ -18,22 +18,8 @@ const ast = @import("ast.zig");
 const Node = ast.Node;
 const string_syntax = @import("string_syntax.zig");
 const parser_mod = @import("parser.zig");
-
-/// A minimal JSON value model. Built in an arena, then emitted. Keeping an
-/// explicit tree (rather than streaming) lets us sort object keys and omit
-/// empty fields uniformly.
-const JsonValue = union(enum) {
-    int: i64,
-    /// A float, emitted with a forced decimal point (Nix/nlohmann style).
-    float: f64,
-    str: []const u8,
-    boolean: bool,
-    nul,
-    array: []const JsonValue,
-    object: []const Field,
-
-    pub const Field = struct { key: []const u8, val: JsonValue };
-};
+const JsonValue = @import("json/value.zig").Value;
+const emitter = @import("json/emitter.zig");
 
 /// Serialize `node` (a parse-OKAY AST rooted in `source`) as JSON to `writer`.
 /// `gpa` backs a scratch arena for the JSON tree, decoded strings, and the
@@ -48,7 +34,7 @@ pub fn write(
     defer arena_state.deinit();
     var ser: Serializer = .{ .arena = arena_state.allocator(), .gpa = gpa, .source = source };
     const j = try ser.node(node);
-    try emit(writer, arena_state.allocator(), j, 0);
+    try emitter.write(writer, arena_state.allocator(), j);
     try writer.writeByte('\n');
 }
 
@@ -807,125 +793,7 @@ const BInheritFrom = struct {
     names: std.ArrayListUnmanaged([]const u8),
 };
 
-// ---------------------------------------------------------------------------
-// Emitting (nlohmann dump(2) shape: 2-space indent, `_type` first, keys sorted)
-// ---------------------------------------------------------------------------
-
-fn emit(w: *std.Io.Writer, scratch: std.mem.Allocator, j: JsonValue, indent: usize) !void {
-    switch (j) {
-        .int => |v| try w.print("{d}", .{v}),
-        .float => |v| try emitFloat(w, v),
-        .str => |s| try emitString(w, s),
-        .boolean => |b| try w.writeAll(if (b) "true" else "false"),
-        .nul => try w.writeAll("null"),
-        .array => |items| {
-            if (items.len == 0) {
-                try w.writeAll("[]");
-                return;
-            }
-            try w.writeAll("[\n");
-            for (items, 0..) |item, i| {
-                try indentBy(w, indent + 2);
-                try emit(w, scratch, item, indent + 2);
-                if (i + 1 != items.len) try w.writeByte(',');
-                try w.writeByte('\n');
-            }
-            try indentBy(w, indent);
-            try w.writeByte(']');
-        },
-        .object => |fields| {
-            if (fields.len == 0) {
-                try w.writeAll("{}");
-                return;
-            }
-            // Sort every object: `_type` first, then lexicographic by key.
-            // The serializer's arena owns this short-lived working copy.
-            const sorted = try scratch.dupe(JsonValue.Field, fields);
-            std.mem.sort(JsonValue.Field, sorted, {}, fieldLess);
-            try w.writeAll("{\n");
-            for (sorted, 0..) |field, i| {
-                try indentBy(w, indent + 2);
-                try emitString(w, field.key);
-                try w.writeAll(": ");
-                try emit(w, scratch, field.val, indent + 2);
-                if (i + 1 != sorted.len) try w.writeByte(',');
-                try w.writeByte('\n');
-            }
-            try indentBy(w, indent);
-            try w.writeByte('}');
-        },
-    }
-}
-
-fn fieldLess(_: void, a: JsonValue.Field, b: JsonValue.Field) bool {
-    const a_type = std.mem.eql(u8, a.key, "_type");
-    const b_type = std.mem.eql(u8, b.key, "_type");
-    if (a_type != b_type) return a_type; // `_type` sorts first
-    return std.mem.lessThan(u8, a.key, b.key);
-}
-
-fn indentBy(w: *std.Io.Writer, n: usize) !void {
-    try w.splatByteAll(' ', n);
-}
-
-/// nlohmann prints doubles with a forced decimal point for integral values
-/// (`1` → `1.0`); Zig's `{d}` gives the shortest round-trip but drops the point.
-fn emitFloat(w: *std.Io.Writer, v: f64) !void {
-    var buf: [64]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch {
-        try w.print("{d}", .{v});
-        return;
-    };
-    try w.writeAll(s);
-    if (std.mem.indexOfAny(u8, s, ".eEnN") == null) try w.writeAll(".0");
-}
-
-fn emitString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            0x08 => try w.writeAll("\\b"),
-            0x0c => try w.writeAll("\\f"),
-            else => if (c < 0x20) {
-                try w.print("\\u{x:0>4}", .{c});
-            } else {
-                try w.writeByte(c);
-            },
-        }
-    }
-    try w.writeByte('"');
-}
-
-test "JSON emission sorts objects of every width" {
-    var key_storage: [26][1]u8 = undefined;
-    var fields: [26]JsonValue.Field = undefined;
-    for (0..fields.len) |i| {
-        key_storage[i][0] = 'z' - @as(u8, @intCast(i));
-        fields[i] = .{
-            .key = key_storage[i][0..],
-            .val = .nul,
-        };
-    }
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    var buffer: [1024]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buffer);
-    try emit(&writer, arena_state.allocator(), .{ .object = &fields }, 0);
-
-    const output = writer.buffered();
-    const a = std.mem.indexOf(u8, output, "\"a\"").?;
-    const m = std.mem.indexOf(u8, output, "\"m\"").?;
-    const z = std.mem.indexOf(u8, output, "\"z\"").?;
-    try std.testing.expect(a < m);
-    try std.testing.expect(m < z);
-}
-
 test {
     _ = @import("json/tests.zig");
+    _ = emitter;
 }
