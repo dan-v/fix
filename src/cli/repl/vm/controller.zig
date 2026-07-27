@@ -6,12 +6,12 @@
 const std = @import("std");
 const engine = @import("expr");
 const runtime = @import("runtime");
-const term_mod = @import("../term.zig");
 const keys_mod = @import("../keys.zig");
 const width_mod = @import("../width.zig");
 const vm_navigation = @import("navigation.zig");
 const vm_model = @import("model.zig");
 const vm_source = @import("source.zig");
+const prompt = @import("prompt.zig");
 const source_render = @import("../../source_render.zig");
 const debugger = @import("../../debugger.zig");
 const base = @import("base");
@@ -575,114 +575,24 @@ pub fn Methods(comptime Explorer: type) type {
         /// Modal one-line search input on the status row.
         pub fn searchPrompt(self: *Explorer) !void {
             self.navigation.search.clearRetainingCapacity();
-            var out_buf: [1024]u8 = undefined;
-            var out = std.Io.File.stdout().writerStreaming(self.io, &out_buf);
-            const w = &out.interface;
-            var decoder = keys_mod.Decoder{};
-            var events: keys_mod.Decoder.List = .empty;
-            defer events.deinit(self.allocator);
-            var read_buf: [64]u8 = undefined;
-
-            while (true) {
-                const size = term_mod.size();
-                var frame = tui.Frame.init(w, self.color_depth, width_mod.cpWidth);
-                try frame.clearRow(size.rows);
-                try frame.at(size.rows, 1);
-                var search_buf: [1024]u8 = undefined;
-                const search_line = std.fmt.bufPrint(&search_buf, "/{s}", .{self.navigation.search.items}) catch "/";
-                try frame.text(search_line, 0, size.cols, .section);
-                try w.flush();
-                const result = term_mod.readInput(&read_buf, if (decoder.wantsMore()) 40 else -1);
-                events.clearRetainingCapacity();
-                switch (result) {
-                    .timeout => try decoder.idleFlush(self.allocator, &events),
-                    .winch => continue,
-                    .eof => return,
-                    .data => |n| for (read_buf[0..n]) |b| try decoder.feed(self.allocator, b, &events),
-                }
-                for (events.items) |key| {
-                    switch (key.code) {
-                        .enter => {
-                            Explorer.Ops.controller.findNext(self, 1);
-                            return;
-                        },
-                        .escape => return,
-                        .backspace => {
-                            if (self.navigation.search.items.len > 0) _ = self.navigation.search.pop();
-                        },
-                        .cp => |cp| {
-                            if (key.isCtrl('g') or key.isCtrl('c')) return;
-                            if (cp >= 0x20 and cp != 0x7F) {
-                                var utf8: [4]u8 = undefined;
-                                const n = std.unicode.utf8Encode(cp, &utf8) catch continue;
-                                try self.navigation.search.appendSlice(self.allocator, utf8[0..n]);
-                            }
-                        },
-                        else => {},
-                    }
-                }
-            }
+            if (try prompt.read(self.allocator, self.io, self.color_depth, "/", &self.navigation.search) == .submitted)
+                Explorer.Ops.controller.findNext(self, 1);
         }
 
         /// Modal filter input on the status row. Enter applies the substring filter
         /// to the bytecode name tree; Esc clears it. An empty query means no filter.
         pub fn filterPrompt(self: *Explorer) !void {
-            var out_buf: [1024]u8 = undefined;
-            var out = std.Io.File.stdout().writerStreaming(self.io, &out_buf);
-            const w = &out.interface;
-            var decoder = keys_mod.Decoder{};
-            var events: keys_mod.Decoder.List = .empty;
-            defer events.deinit(self.allocator);
-            var read_buf: [64]u8 = undefined;
-
-            while (true) {
-                const size = term_mod.size();
-                var frame = tui.Frame.init(w, self.color_depth, width_mod.cpWidth);
-                try frame.clearRow(size.rows);
-                try frame.at(size.rows, 1);
-                var line_buf: [1024]u8 = undefined;
-                const line = std.fmt.bufPrint(&line_buf, "filter (name): {s}", .{self.tree.filter_query.items}) catch "filter:";
-                try frame.text(line, 0, size.cols, .section);
-                try w.flush();
-                const result = term_mod.readInput(&read_buf, if (decoder.wantsMore()) 40 else -1);
-                events.clearRetainingCapacity();
-                switch (result) {
-                    .timeout => try decoder.idleFlush(self.allocator, &events),
-                    .winch => continue,
-                    .eof => return,
-                    .data => |n| for (read_buf[0..n]) |b| try decoder.feed(self.allocator, b, &events),
-                }
-                for (events.items) |key| {
-                    switch (key.code) {
-                        .enter => {
-                            try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
-                            self.status_msg = if (Explorer.Ops.tree_projection.filterActive(self)) "(filter applied)" else "(filter cleared)";
-                            return;
-                        },
-                        .escape => {
-                            self.tree.filter_query.clearRetainingCapacity();
-                            try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
-                            self.status_msg = "(filter cleared)";
-                            return;
-                        },
-                        .backspace => {
-                            if (self.tree.filter_query.items.len > 0) _ = self.tree.filter_query.pop();
-                        },
-                        .cp => |cp| {
-                            if (key.isCtrl('g') or key.isCtrl('c')) {
-                                self.tree.filter_query.clearRetainingCapacity();
-                                try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
-                                return;
-                            }
-                            if (cp >= 0x20 and cp != 0x7F) {
-                                var utf8: [4]u8 = undefined;
-                                const n = std.unicode.utf8Encode(cp, &utf8) catch continue;
-                                try self.tree.filter_query.appendSlice(self.allocator, utf8[0..n]);
-                            }
-                        },
-                        else => {},
-                    }
-                }
+            switch (try prompt.read(self.allocator, self.io, self.color_depth, "filter (name): ", &self.tree.filter_query)) {
+                .submitted => {
+                    try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
+                    self.status_msg = if (Explorer.Ops.tree_projection.filterActive(self)) "(filter applied)" else "(filter cleared)";
+                },
+                .cancelled => {
+                    self.tree.filter_query.clearRetainingCapacity();
+                    try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
+                    self.status_msg = "(filter cleared)";
+                },
+                .eof => {},
             }
         }
 
