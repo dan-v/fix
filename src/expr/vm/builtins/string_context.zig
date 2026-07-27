@@ -43,7 +43,7 @@ pub fn builtinAppendContext(self: *VM, string_arg: Value, context_arg: Value) !V
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
     for (try contextEntriesForValue(self, string_value)) |entry| try appendContextEntry(self, &entries, entry.name, entry.value);
-    for (try self.heap.getAttrs(context_value.asObjectId())) |entry| try appendContextEntry(self, &entries, entry.name, entry.value);
+    for (try self.heap.materializeAttrs(context_value.asObjectId())) |entry| try appendContextEntry(self, &entries, entry.name, entry.value);
 
     if (entries.items.len == 0) return Value.string(try strings.stringTextInternId(self, string_value));
     return Value.contextString(try self.heap.addContextString(try strings.stringTextInternId(self, string_value), entries.items));

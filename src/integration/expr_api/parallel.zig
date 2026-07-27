@@ -86,7 +86,7 @@ test "parallel: automatic collector dispatches a major with 4 workers" {
     try std.testing.expectEqual(@as(u64, 1), collected.collections);
     try std.testing.expect(!ev.heap.isObjectAllocatedForTest(garbage_id));
 
-    const attrs = try ev.heap.getAttrs(live.asObjectId());
+    const attrs = try ev.heap.materializeAttrs(live.asObjectId());
     try std.testing.expectEqual(@as(usize, 1), attrs.len);
     try std.testing.expectEqual(@as(i64, 42), attrs[0].value.asInt());
 }

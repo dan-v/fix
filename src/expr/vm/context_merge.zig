@@ -56,8 +56,8 @@ pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !Obje
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, Value.attrs(left_id));
     vm_force.rootKeep(self, Value.attrs(right_id));
-    const left = try self.heap.getAttrs(left_id);
-    const right = try self.heap.getAttrs(right_id);
+    const left = try self.heap.materializeAttrs(left_id);
+    const right = try self.heap.materializeAttrs(right_id);
     const left_len = left.len;
     const right_len = right.len;
 

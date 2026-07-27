@@ -1048,7 +1048,7 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
             }
         },
         .force_attrs_sweep => |attrs_id| {
-            const entries = heap.getAttrs(attrs_id) catch return;
+            const entries = heap.materializeAttrs(attrs_id) catch return;
             for (entries) |entry| {
                 if (!entry.value.isThunk()) continue;
                 total.* += 1;
@@ -1056,7 +1056,7 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
             }
         },
         .force_attrs_range => |range| {
-            const entries = heap.getAttrs(range.attrs_id) catch return;
+            const entries = heap.materializeAttrs(range.attrs_id) catch return;
             const end = @min(@as(usize, range.offset) + @as(usize, range.len), entries.len);
             var i: usize = range.offset;
             while (i < end) : (i += 1) {
@@ -1154,7 +1154,7 @@ fn runAttrsRangeTask(f: *WorkerFiber, range: scheduler_mod.ForceAttrsRange) void
     const roots = vm_force.rootsBegin(&f.vm);
     defer vm_force.rootsEnd(&f.vm, roots);
     vm_force.rootKeep(&f.vm, Value.attrs(range.attrs_id));
-    const entries = f.vm.heap.getAttrs(range.attrs_id) catch return;
+    const entries = f.vm.heap.materializeAttrs(range.attrs_id) catch return;
     const start: usize = range.offset;
     const end = @min(start + @as(usize, range.len), entries.len);
     for (entries[start..end]) |entry| {
@@ -1166,7 +1166,7 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
     const roots = vm_force.rootsBegin(&f.vm);
     defer vm_force.rootsEnd(&f.vm, roots);
     vm_force.rootKeep(&f.vm, Value.attrs(attrs_id));
-    const entries = f.vm.heap.getAttrs(attrs_id) catch return;
+    const entries = f.vm.heap.materializeAttrs(attrs_id) catch return;
     const log = f.vm.scheduler.config.sibling_log;
     const objects_before: u32 = if (log) f.vm.heap.objects.count() else 0;
     var label_buf: [160]u8 = undefined;

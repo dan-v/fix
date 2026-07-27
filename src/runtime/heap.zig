@@ -192,7 +192,7 @@ pub const AttrsObject = struct {
 /// real merge) once `depth` exceeds `merge_flatten_depth`, bounding both
 /// lookup depth and the chain length any single flatten must walk.
 /// `flattened` memoizes the flattened plain-attrs object (no_flattened_attrs until
-/// first `getAttrs`/iteration forces it).
+/// first `materializeAttrs`/iteration forces it).
 pub const MergeAttrsObject = struct {
     base: ObjectId,
     overlay: ObjectId,
@@ -2099,11 +2099,11 @@ pub const ObjectHeap = struct {
         return items[index];
     }
 
-    /// Full attr entries. A `attrs_merge` (layered `//`) is flattened to a
-    /// real attrs object on first call (memoized), so value-iterating
-    /// callers (deep force, `==`, JSON/XML, `attrNames`) see a normal
-    /// sorted entry slice. Non-const because flattening allocates.
-    pub fn getAttrs(self: *ObjectHeap, id: ObjectId) ![]const AttrEntry {
+    /// Return a flat, sorted attr slice, materializing a layered `//` merge
+    /// when necessary. Materialization allocates and atomically publishes a
+    /// memoized heap object; callers that only need one name should use
+    /// `getAttrValueOpt` to keep the operation read-only.
+    pub fn materializeAttrs(self: *ObjectHeap, id: ObjectId) ![]const AttrEntry {
         return switch (self.get(id).*) {
             .attrs => |a| self.attrs.slice(a.range),
             .merge_attrs => self.attrs.slice(self.get(try self.flattenMerge(id)).attrs.range),
@@ -2500,8 +2500,8 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addMergedAttrs(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
-        const left = try self.getAttrs(left_id);
-        const right = try self.getAttrs(right_id);
+        const left = try self.materializeAttrs(left_id);
+        const right = try self.materializeAttrs(right_id);
 
         // Reserve worst-case capacity and write the merge directly into heap
         // storage. Inputs are both sorted and deduplicated, so

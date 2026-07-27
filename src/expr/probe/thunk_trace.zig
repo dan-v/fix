@@ -286,7 +286,7 @@ fn writeValueInner(
                 try writer.writeAll("{...}");
                 return;
             }
-            const entries = heap.getAttrs(value.asObjectId()) catch {
+            const entries = heap.materializeAttrs(value.asObjectId()) catch {
                 try writer.writeAll("{attrs_err}");
                 return;
             };

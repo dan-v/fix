@@ -198,7 +198,7 @@ fn collectWithScopes(ctx: Context, map: *std.AutoArrayHashMapUnmanaged(types.Int
 fn mergeWithAttrs(ctx: Context, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), subject: Value) !void {
     const forced = vm_force.forceValue(ctx.vm, subject) catch return;
     if (!forced.isAttrs()) return;
-    const entries = ctx.heap.getAttrs(forced.asObjectId()) catch return;
+    const entries = ctx.heap.materializeAttrs(forced.asObjectId()) catch return;
     for (entries) |entry| try map.put(ctx.allocator, entry.name, entry.value);
 }
 

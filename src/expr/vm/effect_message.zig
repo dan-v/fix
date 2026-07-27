@@ -104,7 +104,7 @@ fn writeList(self: *VM, writer: *std.Io.Writer, id: ObjectId, seen: *std.AutoHas
 
 fn writeAttrs(self: *VM, writer: *std.Io.Writer, id: ObjectId, seen: *std.AutoHashMapUnmanaged(u64, void)) !void {
     if (!try enter(seen, self.allocator, id, 2)) return writer.writeAll("«repeated»");
-    const stored = try self.heap.getAttrs(id);
+    const stored = try self.heap.materializeAttrs(id);
     const Entry = std.meta.Elem(@TypeOf(stored));
     const entries = try self.allocator.dupe(Entry, stored);
     defer self.allocator.free(entries);

@@ -636,7 +636,7 @@ test "buildStrictValue exposes drvPath and each output path as plain attrs" {
     };
 
     const value = try value_mod.buildStrictValue(std.testing.allocator, &intern, &heap, spec);
-    const attrs = try heap.getAttrs(value.asObjectId());
+    const attrs = try heap.materializeAttrs(value.asObjectId());
 
     try std.testing.expectEqual(@as(usize, 2), attrs.len);
     var found_drv_path = false;

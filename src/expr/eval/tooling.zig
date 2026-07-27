@@ -11,7 +11,7 @@ pub fn Adapter(comptime Engine: type) type {
         const Self = @This();
 
         pub fn attrs(self: Self, value: Value) ![]const runtime.heap.AttrEntry {
-            return self.ev.heap.getAttrs(value.asObjectId());
+            return self.ev.heap.materializeAttrs(value.asObjectId());
         }
 
         pub fn listLen(self: Self, value: Value) !usize {

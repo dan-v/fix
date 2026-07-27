@@ -238,7 +238,7 @@ const ValuePrinter = struct {
             return;
         }
 
-        const stored = try self.host.heap.getAttrs(id);
+        const stored = try self.host.heap.materializeAttrs(id);
         // Empty attrs are never «repeated» (see writeList) — render `{ }`
         // before recording identity.
         if (stored.len == 0) {

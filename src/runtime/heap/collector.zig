@@ -479,7 +479,7 @@ pub fn verifyMarkClosed(heap: *ObjectHeap, mark_bits: []const u64) void {
 /// (unresolved dead thunk) or immediately after a force publishes its result.
 /// `attrs_merge`/`boxed_int` own no ranges.
 fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) void {
-    // Detector: poison the freed range so a dangling raw `getList`/`getAttrs`
+    // Detector: poison the freed range so a dangling raw `getList`/`materializeAttrs`
     // slice (owner swept while a Zig local held the slice — the class the
     // reuse-off object-read assert can't see) traps on next access instead
     // of silently reading stale-but-valid data. Poison is a thunk to an

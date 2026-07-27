@@ -97,7 +97,7 @@ fn buildLazyDerivationValue(self: *VM, attrs_id: ObjectId) !Value {
         output.* = .{ .name = output_name, .out_path = output_name };
     }
 
-    const original_attrs = try self.heap.getAttrs(attrs_id);
+    const original_attrs = try self.heap.materializeAttrs(attrs_id);
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
 
@@ -337,7 +337,7 @@ fn buildDerivationResult(
         .default_output = header.outputs.names[0],
         .outputs = outputs,
         .explicit_outputs = header.outputs.explicit,
-        .original_attrs = try self.heap.getAttrs(attrs_id),
+        .original_attrs = try self.heap.materializeAttrs(attrs_id),
     };
     const t_bv = prof.start(.drv_build_value);
     defer prof.end(.drv_build_value, t_bv);
@@ -417,7 +417,7 @@ fn normalizeDerivation(self: *VM, attrs_id: ObjectId, drv_name: []const u8, outp
 
     var env: std.ArrayListUnmanaged(derivation.EnvVar) = .empty;
     errdefer env.deinit(self.allocator);
-    const original_attrs = try self.heap.getAttrs(attrs_id);
+    const original_attrs = try self.heap.materializeAttrs(attrs_id);
     if (structured) {
         const json = try structuredAttrsJson(self, attrs_id, output_names.names, output_names.explicit, ignore_nulls, &inputs, &owned_strings);
         try owned_strings.append(self.allocator, json);
@@ -437,7 +437,7 @@ fn normalizeDerivation(self: *VM, attrs_id: ObjectId, drv_name: []const u8, outp
         const attrs_len = original_attrs.len;
         var ai: usize = 0;
         while (ai < attrs_len) : (ai += 1) {
-            const entry = (try self.heap.getAttrs(attrs_id))[ai];
+            const entry = (try self.heap.materializeAttrs(attrs_id))[ai];
             // Interned attr name — stable, no dupe (see note above).
             const attr_name = self.intern.get(entry.name);
             if (std.mem.eql(u8, attr_name, "args")) continue;

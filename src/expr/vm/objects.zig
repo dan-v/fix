@@ -69,8 +69,8 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
     force.rootKeep(self, Value.attrs(left_id));
     force.rootKeep(self, Value.attrs(right_id));
 
-    const left = try self.heap.getAttrs(left_id);
-    const right = try self.heap.getAttrs(right_id);
+    const left = try self.heap.materializeAttrs(left_id);
+    const right = try self.heap.materializeAttrs(right_id);
     const left_len = left.len;
     const right_len = right.len;
 

@@ -142,7 +142,7 @@ pub fn attrsEqual(self: *VM, a: Value, b: Value, seen: *EqualityPairSet) anyerro
     if (a.asObjectId() == b.asObjectId()) return true;
     if (try equalityPairSeen(self, a, b, seen)) return true;
 
-    // a/b may be nested containers reached via getAttrs (not on the operand
+    // a/b may be nested containers reached via materializeAttrs (not on the operand
     // stack); root them so a_entries/b_entries survive the value forces in
     // derivationAttrsEqual + the element loop.
     const gc_roots = force.rootsBegin(self);
@@ -154,14 +154,14 @@ pub fn attrsEqual(self: *VM, a: Value, b: Value, seen: *EqualityPairSet) anyerro
     const b_id = b.asObjectId();
     if (try derivationAttrsEqual(self, a_id, b_id, seen)) |equal| return equal;
 
-    const a_len = (try self.heap.getAttrs(a_id)).len;
-    const b_len = (try self.heap.getAttrs(b_id)).len;
+    const a_len = (try self.heap.materializeAttrs(a_id)).len;
+    const b_len = (try self.heap.materializeAttrs(b_id)).len;
     if (a_len != b_len) return false;
 
     var i: usize = 0;
     while (i < a_len) : (i += 1) {
-        const a_entry = (try self.heap.getAttrs(a_id))[i];
-        const b_entry = (try self.heap.getAttrs(b_id))[i];
+        const a_entry = (try self.heap.materializeAttrs(a_id))[i];
+        const b_entry = (try self.heap.materializeAttrs(b_id))[i];
         if (a_entry.name != b_entry.name) return false;
         if (!try valuesEqualSeen(self, a_entry.value, b_entry.value, seen)) return false;
     }
@@ -181,8 +181,8 @@ pub fn derivationAttrsEqual(
     if (!try attrsHaveDerivationType(self, b_id, type_name, derivation_type)) return null;
 
     const out_path_name = try self.intern.intern("outPath");
-    const a_out_path = attrValue(try self.heap.getAttrs(a_id), out_path_name) orelse return null;
-    const b_out_path = attrValue(try self.heap.getAttrs(b_id), out_path_name) orelse return null;
+    const a_out_path = attrValue(try self.heap.materializeAttrs(a_id), out_path_name) orelse return null;
+    const b_out_path = attrValue(try self.heap.materializeAttrs(b_id), out_path_name) orelse return null;
 
     return try valuesEqualSeen(self, a_out_path, b_out_path, seen);
 }
@@ -193,7 +193,7 @@ pub fn attrsHaveDerivationType(
     type_name: InternId,
     derivation_type: InternId,
 ) !bool {
-    const type_value = attrValue(try self.heap.getAttrs(id), type_name) orelse return false;
+    const type_value = attrValue(try self.heap.materializeAttrs(id), type_name) orelse return false;
     const forced = try force.forceValue(self, type_value);
     if (!isStringComparable(forced)) return false;
     const text_id = try strings.stringTextInternId(self, forced);

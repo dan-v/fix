@@ -821,7 +821,7 @@ fn opApplyOverrides(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_de
 /// the override; for a new name, collect it and rebuild the attrset with
 /// the additions. Mirrors Nix's `ExprAttrs::eval` `__overrides` branch.
 fn applyOverrides(vm: *VM, built_id: types.ObjectId, ov_id: types.ObjectId) !void {
-    const ov_entries = try vm.heap.getAttrs(ov_id);
+    const ov_entries = try vm.heap.materializeAttrs(ov_id);
 
     var new_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer new_entries.deinit(vm.allocator);
@@ -851,7 +851,7 @@ fn applyOverrides(vm: *VM, built_id: types.ObjectId, ov_id: types.ObjectId) !voi
     // Rebuild with the additions in one sorted attrset.
     var all: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer all.deinit(vm.allocator);
-    try all.appendSlice(vm.allocator, try vm.heap.getAttrs(built_id));
+    try all.appendSlice(vm.allocator, try vm.heap.materializeAttrs(built_id));
     try all.appendSlice(vm.allocator, new_entries.items);
     const merged_id = try vm.heap.addAttrs(all.items);
     vm.stack[vm.sp - 1] = Value.attrs(merged_id);
@@ -954,7 +954,7 @@ fn attrBindOp(comptime wide: bool) HandlerFn {
             const attrs = try force.forceValue(vm, vm.stack[vm.sp - 1]);
             vm.stack[vm.sp - 1] = attrs;
             if (!attrs.isAttrs()) return trace.typeErrorExpected(vm, "attrs", attrs);
-            const entries = try vm.heap.getAttrs(attrs.asObjectId());
+            const entries = try vm.heap.materializeAttrs(attrs.asObjectId());
 
             var entry_i: usize = 0;
             var pair_i: usize = 0;

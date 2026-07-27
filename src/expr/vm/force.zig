@@ -344,7 +344,7 @@ pub fn forceDeepCounted(self: *VM, value: Value) !void {
         }
     } else {
         if (!try enterDeep(self, .attrs, id, &seen)) return;
-        const entries = try self.heap.getAttrs(id);
+        const entries = try self.heap.materializeAttrs(id);
         forceAttrsAccelerate(self, id, entries);
         for (entries) |entry| {
             try forceDeepInner(self, entry.value, &seen);
@@ -372,7 +372,7 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *SeenDeepSet) anyerror!void
                 for (items) |item| try forceDeepInner(self, item, seen);
             } else {
                 if (!try enterDeep(self, .attrs, id, seen)) return;
-                const entries = try self.heap.getAttrs(id);
+                const entries = try self.heap.materializeAttrs(id);
                 forceAttrsAccelerate(self, id, entries);
                 for (entries) |entry| try forceDeepInner(self, entry.value, seen);
             }

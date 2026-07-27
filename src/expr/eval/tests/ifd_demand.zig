@@ -247,7 +247,7 @@ test "cold output demand survives a major GC with only output context rooted" {
         const output = produced.output;
         const subject = try fixture.registerOutputTree(output);
         defer fixture.allocator.free(subject);
-        try std.testing.expect((try fixture.ev.heap.getAttrs(produced.derivation_id)).len != 0);
+        try std.testing.expect((try fixture.ev.heap.materializeAttrs(produced.derivation_id)).len != 0);
 
         try fixture.ev.gcSetExternalRoots(&.{output});
         defer fixture.ev.gcSetExternalRoots(&.{}) catch {};
@@ -286,7 +286,7 @@ test "concurrent cold output demands issue exactly one daemon build" {
             \\}
         , scope);
         try fixture.ev.forceDeep(demands);
-        for (try fixture.ev.heap.getAttrs(demands.asObjectId())) |entry| {
+        for (try fixture.ev.heap.materializeAttrs(demands.asObjectId())) |entry| {
             try std.testing.expectEqualStrings("cold payload", try valueText(&fixture, entry.value));
         }
         try fixture.assertOneRealization(output, subject);

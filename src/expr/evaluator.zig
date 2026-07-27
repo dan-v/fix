@@ -1512,7 +1512,7 @@ pub const Engine = struct {
     /// Enumerate an attrs / list object's members (non-forcing) for the VM
     /// explorer, so a container value inspects into its actual entries.
     pub fn heapAttrsOf(self: *Engine, id: runtime.types.ObjectId) ![]const runtime.heap.AttrEntry {
-        return self.heap.getAttrs(id);
+        return self.heap.materializeAttrs(id);
     }
 
     pub fn heapListOf(self: *const Engine, id: runtime.types.ObjectId) ![]const Value {
@@ -2173,7 +2173,7 @@ pub const Engine = struct {
     pub fn attrNames(self: *Engine, allocator: std.mem.Allocator, value: Value) !?[][]const u8 {
         const forced = try self.forceValue(value);
         if (!forced.isAttrs()) return null;
-        const attrs = try self.heap.getAttrs(forced.asObjectId());
+        const attrs = try self.heap.materializeAttrs(forced.asObjectId());
         const names = try allocator.alloc([]const u8, attrs.len);
         for (attrs, 0..) |e, i| names[i] = self.intern.get(e.name);
         std.mem.sort([]const u8, names, {}, struct {

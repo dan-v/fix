@@ -68,7 +68,7 @@ pub fn builtinZipAttrsWith(self: *VM, func_arg: Value, list_arg: Value) !Value {
         const attrs = try vm_force.forceValue(self, item);
         if (!attrs.isAttrs()) return error.TypeError;
 
-        for (try self.heap.getAttrs(attrs.asObjectId())) |entry| {
+        for (try self.heap.materializeAttrs(attrs.asObjectId())) |entry| {
             const index = (try group_idx.find(self.allocator, groups.items, entry.name)) orelse blk: {
                 try groups.append(self.allocator, .{ .name = entry.name });
                 const idx = groups.items.len - 1;
@@ -133,7 +133,7 @@ pub fn sortedAttrEntries(self: *VM, arg: Value) ![]heap_mod.AttrEntry {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) return error.TypeError;
 
-    const entries = try self.heap.getAttrs(value.asObjectId());
+    const entries = try self.heap.materializeAttrs(value.asObjectId());
     const sorted = try self.allocator.dupe(heap_mod.AttrEntry, entries);
     const Comparator = struct {
         pub fn lessThan(vm: @TypeOf(self), a: heap_mod.AttrEntry, b: heap_mod.AttrEntry) bool {
@@ -168,7 +168,7 @@ pub fn builtinMapAttrs(self: *VM, fn_arg: Value, attrs_arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, attrs_arg);
     if (!attrs.isAttrs()) return error.TypeError;
 
-    const attr_entries = try self.heap.getAttrs(attrs.asObjectId());
+    const attr_entries = try self.heap.materializeAttrs(attrs.asObjectId());
     const out = try self.allocator.alloc(heap_mod.AttrEntry, attr_entries.len);
     defer self.allocator.free(out);
 
@@ -278,10 +278,10 @@ pub fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value 
     const attrs_id = attrs.asObjectId();
     const names_id = names.asObjectId();
     const names_len = try self.heap.getListLen(names_id);
-    const n = (try self.heap.getAttrs(attrs_id)).len;
+    const n = (try self.heap.materializeAttrs(attrs_id)).len;
     var i: usize = 0;
     outer: while (i < n) : (i += 1) {
-        const entry = (try self.heap.getAttrs(attrs_id))[i];
+        const entry = (try self.heap.materializeAttrs(attrs_id))[i];
         for (resolved.items) |name_id| {
             if (name_id == entry.name) continue :outer;
         }
@@ -335,8 +335,8 @@ pub fn builtinIntersectAttrs(self: *VM, left_arg: Value, right_arg: Value) !Valu
     const right = try vm_force.forceValue(self, right_arg);
     if (!left.isAttrs() or !right.isAttrs()) return error.TypeError;
 
-    const left_entries = try self.heap.getAttrs(left.asObjectId());
-    const right_entries = try self.heap.getAttrs(right.asObjectId());
+    const left_entries = try self.heap.materializeAttrs(left.asObjectId());
+    const right_entries = try self.heap.materializeAttrs(right.asObjectId());
 
     var entries = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, @min(left_entries.len, right_entries.len));
     defer entries.deinit(self.allocator);
