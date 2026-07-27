@@ -37,6 +37,7 @@ const editor_mod = @import("editor.zig");
 const complete_mod = @import("complete.zig");
 const line_input = @import("line_input.zig");
 const vm_ui = @import("vm/root.zig");
+const vm_plain = @import("vm/plain.zig");
 const vm_query_cache = @import("vm/query_cache.zig");
 const transcript_mod = @import("transcript.zig");
 
@@ -96,6 +97,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     ev.setCaptureChunkNames(true);
 
     var console: debugger.Console = .{ .allocator = allocator, .io = init.io, .use_color = term.use_color };
+    defer console.deinit();
     if (options.debugger) {
         ev.setParallelismToggles(true, true);
     }
@@ -495,7 +497,7 @@ const Repl = struct {
                 }
             },
             .gc => {
-                self.clearVmObjects();
+                self.clearVmRuntime();
                 const r = self.ev.collectMajorNow();
                 var out = self.output();
                 defer out.flush() catch {};
@@ -527,7 +529,7 @@ const Repl = struct {
     }
 
     fn evalExprMode(self: *Repl, source: []const u8, debug_entry: bool) !?Value {
-        self.clearVmObjects();
+        self.clearVmRuntime();
         self.ev.setDebugSource(source);
         defer self.ev.setDebugSource(null);
         const first_chunk = self.ev.chunkRegistry().count();
@@ -684,7 +686,7 @@ const Repl = struct {
     /// garbage too (a minor leaves the old generation, which under parallel
     /// workers otherwise ratchets reserved memory up across inputs).
     fn collectBetweenInputs(self: *Repl) !void {
-        self.clearVmObjects();
+        self.clearVmRuntime();
         _ = self.ev.collectMajorNow();
     }
 
@@ -814,12 +816,34 @@ const Repl = struct {
         const word_end = std.mem.indexOfAny(u8, text, " \t") orelse text.len;
         const word = text[0..word_end];
         const rest = std.mem.trim(u8, text[word_end..], " \t");
-        if (std.mem.eql(u8, word, "help") or std.mem.eql(u8, word, "?")) return self.vmHelp();
-        if (std.mem.eql(u8, word, "ls") or std.mem.eql(u8, word, "tree")) return self.vmList(rest);
-        if (std.mem.eql(u8, word, "chunks")) return self.vmChunks(rest);
+        if (!self.tui_enabled) {
+            if (try self.vmPlainQuery(text)) return;
+        }
+        if (std.mem.eql(u8, word, "help") or
+            std.mem.eql(u8, word, "?") or
+            std.mem.eql(u8, word, "ls") or
+            std.mem.eql(u8, word, "tree") or
+            std.mem.eql(u8, word, "chunks") or
+            std.mem.eql(u8, word, "objects") or
+            std.mem.eql(u8, word, "object") or
+            std.mem.eql(u8, word, "find") or
+            std.mem.eql(u8, word, "search") or
+            std.mem.eql(u8, word, "spans") or
+            std.mem.eql(u8, word, "store") or
+            std.mem.eql(u8, word, "record") or
+            std.mem.eql(u8, word, "refs") or
+            std.mem.eql(u8, word, "references") or
+            std.mem.eql(u8, word, "break-at") or
+            std.mem.eql(u8, word, "break") or
+            std.mem.eql(u8, word, "clear-at") or
+            std.mem.eql(u8, word, "unbreak") or
+            std.mem.eql(u8, word, "breakpoints") or
+            std.mem.eql(u8, word, "delete"))
+        {
+            _ = try self.vmPlainQuery(text);
+            return;
+        }
         if (std.mem.eql(u8, word, "heap")) return self.vmHeap();
-        if (std.mem.eql(u8, word, "objects")) return self.vmObjects(rest);
-        if (std.mem.eql(u8, word, "object")) return self.vmObject(rest);
         if (std.mem.eql(u8, word, "chunk") or std.mem.eql(u8, word, "code")) {
             if (rest.len > 0) {
                 self.vm_focus = parseChunkId(rest) orelse {
@@ -860,342 +884,36 @@ const Repl = struct {
         } else {
             var out = self.output();
             defer out.flush() catch {};
-            try vm_ui.writePlain(self.allocator, out.writer(), self.ev, chunk_id);
+            var query = self.vmPlainContext(out.writer());
+            try query.writeChunk(chunk_id);
         }
     }
 
     fn vmHeap(self: *Repl) !void {
-        if (self.tui_enabled) {
-            self.vm_heap_requested = true;
-            if (!self.tui_active) self.vm_requested = true;
-            return;
-        }
-        const heap_stats = self.ev.heapStats();
-        const heap_counts = self.ev.heapCounts();
-        var out = self.output();
-        defer out.flush() catch {};
-        const w = out.writer();
-        try w.print("heap: {d} object slots, {d} value slots, {d} attr slots, {d} attr-position slots\n", .{
-            heap_counts.objects,
-            heap_counts.values,
-            heap_counts.attrs,
-            heap_counts.attr_positions,
-        });
-        for (heap_stats.variant_counts, 0..) |count, i| {
-            try w.print("  {s:<20} {d:>12}\n", .{ runtime.ObjectHeap.Stats.variantName(i), count });
-        }
-        try w.writeAll("  thunk states\n");
-        for (heap_stats.thunk_states, 0..) |count, i| {
-            try w.print("    {s:<18} {d:>12}\n", .{ runtime.ObjectHeap.Stats.thunkStateName(i), count });
-        }
+        self.vm_heap_requested = true;
+        if (!self.tui_active) self.vm_requested = true;
     }
 
-    fn clearVmObjects(self: *Repl) void {
-        self.vm_queries.clearObjects();
+    fn clearVmRuntime(self: *Repl) void {
+        self.vm_queries.clearRuntime();
     }
 
-    fn ensureVmObjects(self: *Repl) !*runtime.ObjectHeap.ObjectSnapshot {
-        return self.vm_queries.objectSnapshot(self.allocator, self.ev);
-    }
-
-    fn vmObjects(self: *Repl, args_text: []const u8) !void {
-        var start: runtime.types.ObjectId = 0;
-        var limit: usize = 40;
-        var tokens = std.mem.tokenizeAny(u8, args_text, " \t");
-        if (tokens.next()) |text| {
-            start = parseChunkId(text) orelse {
-                try self.printError("invalid object id `{s}`", .{text});
-                return;
-            };
-            if (tokens.next()) |text_limit| limit = (try self.parseVmLimit(text_limit)) orelse return;
-        }
-        if (tokens.next() != null) {
-            try self.printError(":vm objects takes at most START and LIMIT", .{});
-            return;
-        }
-
-        const snapshot = try self.ensureVmObjects();
-        var out = self.output();
-        defer out.flush() catch {};
-        const w = out.writer();
-        try w.print("objects[0x0:0x{x}] ({d})\n", .{ snapshot.high_water, snapshot.live_count });
-        var next = snapshot.nextLive(start);
-        var shown: usize = 0;
-        var continuation: ?runtime.types.ObjectId = null;
-        while (next) |id| {
-            if (shown >= limit) {
-                continuation = id;
-                break;
-            }
-            const info = self.ev.inspectHeapObject(snapshot, id) catch {
-                next = snapshot.nextLive(id + 1);
-                continue;
-            };
-            try w.writeAll("  ");
-            try disasm.writeStoreRef(w, "objects", id, .object, objectInfoLabel(info), self.color_depth);
-            try w.writeByte('\n');
-            shown += 1;
-            next = snapshot.nextLive(id + 1);
-        }
-        if (shown == 0) try w.writeAll("  (no live objects at or after that id)\n");
-        if (continuation) |id| try w.print("continue with `:vm objects {d} {d}`\n", .{ id, limit });
-    }
-
-    fn vmObject(self: *Repl, args_text: []const u8) !void {
-        const text = std.mem.trim(u8, args_text, " \t");
-        const id = parseChunkId(text) orelse {
-            try self.printError(":vm object needs an object id", .{});
-            return;
+    fn vmPlainContext(self: *Repl, writer: *std.Io.Writer) vm_plain.Context {
+        return .{
+            .allocator = self.allocator,
+            .writer = writer,
+            .ev = self.ev,
+            .cache = &self.vm_queries,
+            .color_depth = self.color_depth,
+            .focused_chunk = self.vm_focus,
         };
-        const snapshot = try self.ensureVmObjects();
-        const info = self.ev.inspectHeapObject(snapshot, id) catch {
-            try self.printError("objects[0x{x}] is not live", .{id});
-            return;
-        };
+    }
+
+    fn vmPlainQuery(self: *Repl, text: []const u8) !bool {
         var out = self.output();
         defer out.flush() catch {};
-        const w = out.writer();
-        try disasm.writeStoreRef(w, "objects", id, .object, objectInfoLabel(info), self.color_depth);
-        try w.writeByte('\n');
-        switch (info) {
-            .list => |list| try w.print("  items: {d}\n", .{list.len}),
-            .attrs => |attrs| try w.print("  attrs: {d}, positions: {d}, sibling swept: {s}\n", .{ attrs.len, attrs.positions, if (attrs.sibling_swept) "yes" else "no" }),
-            .merge_attrs => |merge| {
-                try self.writeVmObjectField(w, "base", merge.base);
-                try self.writeVmObjectField(w, "overlay", merge.overlay);
-                try w.print("  depth: {d}\n", .{merge.depth});
-                if (merge.flattened) |flat| try self.writeVmObjectField(w, "flattened", flat);
-            },
-            .closure => |closure| {
-                try w.writeAll("  chunk: ");
-                try disasm.writeStoreRef(w, "chunk", closure.chunk, .chunk, null, self.color_depth);
-                try w.print("\n  upvalues: {d}\n", .{closure.upvalues});
-            },
-            .builtin_closure => |closure| {
-                try w.writeAll("  builtin: ");
-                try disasm.writeStoreRef(w, "builtin", closure.builtin, .builtin, disasm.builtinName(closure.builtin), self.color_depth);
-                try w.print("\n  arguments: {d}\n", .{closure.args});
-            },
-            .thunk => |thunk| {
-                try w.print("  state: {s}\n  demanded: {s}\n", .{ @tagName(thunk.state), if (thunk.demanded) "yes" else "no" });
-                switch (thunk.body) {
-                    .result => |value| try self.writeVmValueRef(w, "result", value),
-                    .error_name => |name| try w.print("  error: {s}\n", .{name}),
-                    .target => |target| switch (target) {
-                        .closure => |value| try self.writeVmValueRef(w, "closure", value),
-                        .bytecode => |body| {
-                            try w.writeAll("  chunk: ");
-                            try disasm.writeStoreRef(w, "chunk", body.chunk, .chunk, null, self.color_depth);
-                            try w.print("\n  captures: {d}\n", .{body.captures});
-                        },
-                        .pass_through => |value| try self.writeVmValueRef(w, "value", value),
-                        .attr_access => |access| {
-                            try self.writeVmValueRef(w, "base", access.base);
-                            try w.writeAll("  attribute: ");
-                            try disasm.writeStoreRef(w, "intern", access.name, .intern, null, self.color_depth);
-                            try w.writeByte('\n');
-                        },
-                        .deferred => |body| try w.print("  deferred: 0x{x}\n  captures: {d}\n", .{ body.id, body.captures }),
-                    },
-                }
-            },
-            .context_string => |string| {
-                try w.writeAll("  text: ");
-                try disasm.writeStoreRef(w, "intern", string.text, .intern, "string", self.color_depth);
-                try w.print("\n  context entries: {d}\n", .{string.context});
-            },
-            .boxed_int => |value| try w.print("  value: {d}\n", .{value}),
-            .partial_app => |partial| {
-                try self.writeVmValueRef(w, "function", partial.function);
-                try w.print("  arguments: {d}\n", .{partial.args});
-            },
-        }
-    }
-
-    fn writeVmObjectField(self: *Repl, w: *std.Io.Writer, label: []const u8, id: runtime.types.ObjectId) !void {
-        var preview: ?[]const u8 = null;
-        if (self.vm_queries.objects) |*snapshot| {
-            if (self.ev.inspectHeapObject(snapshot, id)) |info| {
-                preview = objectInfoLabel(info);
-            } else |_| {}
-        }
-        try w.print("  {s}: ", .{label});
-        try disasm.writeStoreRef(w, "objects", id, .object, preview, self.color_depth);
-        try w.writeByte('\n');
-    }
-
-    fn writeVmValueRef(self: *Repl, w: *std.Io.Writer, label: []const u8, value: runtime.heap.ValueRef) !void {
-        try w.print("  {s}: ", .{label});
-        switch (value.target) {
-            .none => try w.writeAll(disasm.valueKindLabel(value.kind)),
-            .object => |id| try disasm.writeStoreRef(w, "objects", id, .object, disasm.valueKindLabel(value.kind), self.color_depth),
-            .chunk => |id| try disasm.writeStoreRef(
-                w,
-                "chunk",
-                id,
-                .chunk,
-                if (value.kind == .closure) "function" else disasm.valueKindLabel(value.kind),
-                self.color_depth,
-            ),
-            .intern => |id| try disasm.writeStoreRef(w, "intern", id, .intern, disasm.valueKindLabel(value.kind), self.color_depth),
-            .builtin => |id| try disasm.writeStoreRef(w, "builtin", id, .builtin, disasm.builtinName(id), self.color_depth),
-        }
-        try w.writeByte('\n');
-    }
-
-    fn vmHelp(self: *Repl) !void {
-        var out = self.output();
-        defer out.flush() catch {};
-        try out.writer().writeAll(
-            \\:vm [EXPR]              evaluate and focus a value's chunk
-            \\:vm                     show the focused chunk
-            \\:vm chunk ID            focus and show a chunk directly
-            \\:vm ls [@NAME] [LIMIT]  list one bounded name-tree level
-            \\:vm chunks [@NAME] [LIMIT]
-            \\                         list chunks directly attached to a name
-            \\:vm heap                inspect heap stores and object census
-            \\:vm objects [START] [LIMIT]
-            \\                         list live objects from an id (default 40)
-            \\:vm object ID           inspect one live object and its references
-            \\:vm eval EXPR            disambiguate an expression starting with
-            \\                         a VM subcommand word
-            \\Name and chunk ids printed by the explorer are stable for this
-            \\REPL session. Listings default to 40 rows and never dump a whole
-            \\NixOS-scale registry implicitly.
-            \\
-        );
-    }
-
-    fn ensureVmIndex(self: *Repl) !*engine.bytecode.inspect.NameIndex {
-        return self.vm_queries.nameIndex(self.allocator, self.ev);
-    }
-
-    fn vmList(self: *Repl, args_text: []const u8) !void {
-        const query = (try self.parseVmRange(args_text, .root)) orelse return;
-        const index = try self.ensureVmIndex();
-        if (index.node(query.name_id) == null) {
-            try self.printError("name @{d} not found", .{query.name_id});
-            return;
-        }
-        var out = self.output();
-        defer out.flush() catch {};
-        const w = out.writer();
-        try self.writeVmNameHeader(w, index, query.name_id);
-
-        var shown: usize = 0;
-        var active: usize = 0;
-        for (index.childrenOf(query.name_id)) |child| {
-            const summary = index.statsOf(child);
-            if (summary.chunks == 0) continue;
-            active += 1;
-            if (shown >= query.limit) continue;
-            const node = index.node(child).?;
-            try w.print("  @{d:<8} {s}{s:<28} {d:>9} chunks  {Bi:>10} code\n", .{
-                child,
-                if (node.synthetic) "·" else "",
-                self.ev.internTable().get(node.segment),
-                summary.chunks,
-                summary.code_bytes,
-            });
-            shown += 1;
-        }
-        if (active == 0) try w.writeAll("  (no named children)\n");
-        if (active > shown) try w.print("  ... {d} more; increase LIMIT to show them\n", .{active - shown});
-    }
-
-    fn vmChunks(self: *Repl, args_text: []const u8) !void {
-        const default_name: VmDefaultName = if (self.vm_focus) |id|
-            .{ .chunk = id }
-        else
-            .root;
-        const query = (try self.parseVmRange(args_text, default_name)) orelse return;
-        const index = try self.ensureVmIndex();
-        if (index.node(query.name_id) == null) {
-            try self.printError("name @{d} not found", .{query.name_id});
-            return;
-        }
-        var out = self.output();
-        defer out.flush() catch {};
-        const w = out.writer();
-        try self.writeVmNameHeader(w, index, query.name_id);
-        const chunks = index.chunksOf(query.name_id);
-        const shown = @min(chunks.len, query.limit);
-        for (chunks[0..shown]) |id| {
-            const chunk = self.ev.getChunk(id) orelse continue;
-            try w.print("  chunk[0x{x}]  {Bi:>9} code  {d:>7} constants  arity {d}\n", .{
-                id,
-                chunk.code.len,
-                chunk.constants.len,
-                chunk.arity,
-            });
-        }
-        if (chunks.len == 0) try w.writeAll("  (no directly attached chunks)\n");
-        if (chunks.len > shown) try w.print("  ... {d} more; increase LIMIT to show them\n", .{chunks.len - shown});
-    }
-
-    const VmDefaultName = union(enum) { root, chunk: types.ChunkId };
-    const VmRange = struct { name_id: engine.bytecode.NameId, limit: usize };
-
-    fn parseVmRange(self: *Repl, text: []const u8, default_name: VmDefaultName) !?VmRange {
-        var name_id: engine.bytecode.NameId = switch (default_name) {
-            .root => engine.bytecode.root_name_id,
-            .chunk => |id| self.ev.chunkRegistry().nameOf(id) orelse engine.bytecode.root_name_id,
-        };
-        var limit: usize = 40;
-        var tokens = std.mem.tokenizeAny(u8, text, " \t");
-        if (tokens.next()) |first| {
-            if (first.len > 1 and first[0] == '@') {
-                name_id = std.fmt.parseInt(engine.bytecode.NameId, first[1..], 10) catch {
-                    try self.printError("invalid name id `{s}`", .{first});
-                    return null;
-                };
-                if (tokens.next()) |n| limit = (try self.parseVmLimit(n)) orelse return null;
-            } else {
-                limit = (try self.parseVmLimit(first)) orelse return null;
-            }
-        }
-        if (tokens.next() != null) {
-            try self.printError("too many VM query arguments", .{});
-            return null;
-        }
-        return .{ .name_id = name_id, .limit = limit };
-    }
-
-    fn parseVmLimit(self: *Repl, text: []const u8) !?usize {
-        const limit = std.fmt.parseInt(usize, text, 10) catch {
-            try self.printError("invalid row limit `{s}`", .{text});
-            return null;
-        };
-        if (limit == 0 or limit > 1000) {
-            try self.printError("row limit must be between 1 and 1000", .{});
-            return null;
-        }
-        return limit;
-    }
-
-    fn writeVmNameHeader(self: *Repl, w: *std.Io.Writer, index: *const engine.bytecode.inspect.NameIndex, name_id: engine.bytecode.NameId) !void {
-        try w.print("@{d} ", .{name_id});
-        try self.writeVmNamePath(w, index, name_id);
-        const summary = index.statsOf(name_id);
-        try w.print(" — {d} chunks, {Bi} code, {d} constants\n", .{ summary.chunks, summary.code_bytes, summary.constants });
-    }
-
-    fn writeVmNamePath(self: *Repl, w: *std.Io.Writer, index: *const engine.bytecode.inspect.NameIndex, name_id: engine.bytecode.NameId) !void {
-        if (name_id == engine.bytecode.root_name_id) return w.writeAll("<root>");
-        var ancestors: std.ArrayListUnmanaged(engine.bytecode.NameId) = .empty;
-        defer ancestors.deinit(self.allocator);
-        var cursor = name_id;
-        while (cursor != engine.bytecode.root_name_id) {
-            try ancestors.append(self.allocator, cursor);
-            cursor = (index.node(cursor) orelse break).parent;
-        }
-        var i = ancestors.items.len;
-        while (i > 0) {
-            i -= 1;
-            const node = index.node(ancestors.items[i]) orelse continue;
-            if (i != ancestors.items.len - 1) try w.writeAll(if (node.synthetic) "·" else ".");
-            try w.writeAll(self.ev.internTable().get(node.segment));
-        }
+        var query = self.vmPlainContext(out.writer());
+        return query.execute(text);
     }
 
     // -- small output helpers ----------------------------------------------------
@@ -1266,26 +984,8 @@ const nix_keywords = [_][]const u8{
     "let", "in", "if", "then", "else", "with", "rec", "inherit", "assert", "or",
 };
 
-fn objectInfoLabel(info: runtime.heap.ObjectInfo) []const u8 {
-    return switch (info) {
-        .list => "list",
-        .attrs => "attrs",
-        .merge_attrs => "attrs merge",
-        .closure => "closure",
-        .builtin_closure => "builtin closure",
-        .thunk => "thunk",
-        .context_string => "context string",
-        .boxed_int => "boxed int",
-        .partial_app => "partial application",
-    };
-}
-
 fn parseChunkId(input: []const u8) ?types.ChunkId {
-    var text = std.mem.trim(u8, input, " \t");
-    if (text.len > 0 and text[0] == '#') text = text[1..];
-    if (text.len > 2 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X'))
-        return std.fmt.parseInt(types.ChunkId, text[2..], 16) catch null;
-    return std.fmt.parseInt(types.ChunkId, text, 10) catch null;
+    return vm_plain.parseId(input);
 }
 
 /// Recognize a top-level `name = expr` binding (nix-repl style). The name
@@ -1348,5 +1048,6 @@ test "parseChunkId accepts explorer display forms" {
     try testing.expectEqual(@as(?types.ChunkId, 42), parseChunkId("42"));
     try testing.expectEqual(@as(?types.ChunkId, 42), parseChunkId("#42"));
     try testing.expectEqual(@as(?types.ChunkId, 42), parseChunkId("#0x2a"));
+    try testing.expectEqual(@as(?types.ChunkId, 42), parseChunkId("chunk[0x2a]"));
     try testing.expect(parseChunkId("nope") == null);
 }

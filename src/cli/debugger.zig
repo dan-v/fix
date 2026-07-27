@@ -18,6 +18,8 @@ const presentation = @import("presentation.zig");
 const term_mod = @import("repl/term.zig");
 const command_mod = @import("debugger_command.zig");
 const source_render = @import("source_render.zig");
+const vm_plain = @import("repl/vm/plain.zig");
+const vm_query_cache = @import("repl/vm/query_cache.zig");
 
 const DebugSession = engine.DebugSession;
 const Value = runtime.Value;
@@ -37,14 +39,23 @@ pub const Console = struct {
     ext_reader: ?*std.Io.File.Reader = null,
     /// How many times we've paused (for the banner).
     hits: usize = 0,
+    /// The attached engine and cold indexes back the console's `:vm` queries.
+    ev: ?*engine.Engine = null,
+    vm_queries: vm_query_cache.Cache = .{},
 
     /// Attach this console to `ev`; `builtins.break`/errors now route here.
     pub fn install(self: *Console, ev: *engine.Engine) void {
+        self.ev = ev;
         ev.setDebugUi(self, runCallback);
     }
 
     pub fn uninstall(_: *Console, ev: *engine.Engine) void {
         ev.clearDebugUi();
+    }
+
+    pub fn deinit(self: *Console) void {
+        self.vm_queries.deinit();
+        self.ev = null;
     }
 
     /// Read console input from `r` (a shared reader) rather than our own — the
@@ -168,7 +179,9 @@ pub const Console = struct {
             },
             .backtrace => try self.backtrace(s),
             .locals => try self.locals(s),
+            .frame => |arg| try self.inspectFrame(s, arg),
             .value => try self.printValue(s, s.value),
+            .explore => |arg| try self.explore(s, arg),
             .breakpoint => |arg| try self.addBreakpoint(s, arg),
             .breakpoints => try self.listBreakpoints(s),
             .delete => |arg| try self.deleteBreakpoint(s, arg),
@@ -178,6 +191,7 @@ pub const Console = struct {
                     try self.reportErr("{s}", .{@errorName(e)});
                     return false;
                 };
+                self.vm_queries.clearRuntime();
                 try self.printValue(s, result);
             },
         }
@@ -201,7 +215,7 @@ pub const Console = struct {
         try w.writeByte('\n');
         if (s.currentFrame()) |f| {
             try self.writeFrameLine(w, s, 0, s.frameCount() - 1, true);
-            try self.sourceSnippet(w, s, f);
+            try self.sourceSnippet(w, s, s.frameCount() - 1, f);
         }
         if (s.reason == .return_step) {
             try self.style(w, .note_label);
@@ -220,9 +234,9 @@ pub const Console = struct {
     /// Print the source line at the current frame's span, syntax-highlighted,
     /// with a caret underlining the span. One line of context each side. A
     /// no-op when the source or span is unavailable (e.g. a spanless thunk).
-    fn sourceSnippet(self: *Console, w: *std.Io.Writer, s: *DebugSession, f: engine.DebugFrame) !void {
+    fn sourceSnippet(self: *Console, w: *std.Io.Writer, s: *DebugSession, frame_idx: usize, f: engine.DebugFrame) !void {
         const span = f.span orelse return;
-        const text = s.frameSourceText(s.frameCount() - 1) orelse return;
+        const text = s.frameSourceText(frame_idx) orelse return;
         if (span.offset >= text.len) return;
 
         const cur = lineBounds(text, span.offset);
@@ -330,6 +344,73 @@ pub const Console = struct {
         if (!shown) try w.writeAll("(no named locals in scope)\n");
     }
 
+    /// Console peer of the TUI's frame document: source, non-forcing locals
+    /// and operand stack, followed by the current annotated instruction stream.
+    /// DEPTH uses backtrace numbering (#0 is the innermost frame).
+    fn inspectFrame(self: *Console, s: *DebugSession, arg: []const u8) !void {
+        const depth = if (std.mem.trim(u8, arg, " \t").len == 0)
+            0
+        else
+            std.fmt.parseInt(usize, std.mem.trim(u8, arg, " \t"), 10) catch {
+                try self.reportErr("usage: :frame [DEPTH]", .{});
+                return;
+            };
+        const count = s.frameCount();
+        if (depth >= count) {
+            try self.reportErr("no frame #{d}", .{depth});
+            return;
+        }
+        const idx = count - 1 - depth;
+        var out = self.stderr();
+        defer out.interface.flush() catch {};
+        const w = &out.interface;
+        try self.writeFrameLine(w, s, depth, idx, depth == 0);
+        try self.sourceSnippet(w, s, idx, s.frame(idx));
+
+        try w.writeAll("LOCALS · values are not forced\n");
+        if (!try self.frameLocals(w, s, idx, depth))
+            try w.writeAll("  (no named locals or upvalues)\n");
+
+        const stack_count = s.stackSlotCount(idx);
+        if (stack_count > 0) {
+            try w.print("VM STACK · {d} · values are not forced\n", .{stack_count});
+            var n: usize = stack_count;
+            while (n > 0) {
+                n -= 1;
+                try w.print("  [{d}] ", .{n});
+                s.writeValueSummary(w, s.stackSlot(idx, n)) catch try w.writeAll("<unavailable>");
+                try w.writeByte('\n');
+            }
+        }
+
+        try w.print("CODE · chunk[0x{x}]\n", .{s.frameChunkId(idx)});
+        try s.writeFrameCode(
+            self.allocator,
+            w,
+            idx,
+            if (self.use_color) .ansi16 else .none,
+        );
+    }
+
+    fn explore(self: *Console, s: *DebugSession, args: []const u8) !void {
+        const ev = self.ev orelse {
+            try self.reportErr("VM explorer unavailable", .{});
+            return;
+        };
+        var out = self.stderr();
+        defer out.interface.flush() catch {};
+        var query: vm_plain.Context = .{
+            .allocator = self.allocator,
+            .writer = &out.interface,
+            .ev = ev,
+            .cache = &self.vm_queries,
+            .color_depth = if (self.use_color) .ansi16 else .none,
+            .focused_chunk = if (s.frameCount() > 0) s.frameChunkId(s.frameCount() - 1) else null,
+        };
+        if (!try query.execute(args))
+            try out.interface.writeAll("error: unknown VM query; use `:vm help`\n");
+    }
+
     /// Print frame `idx`'s named locals and upvalues (with a header). Returns
     /// true if it printed anything.
     fn frameLocals(self: *Console, w: *std.Io.Writer, s: *DebugSession, idx: usize, depth: usize) !bool {
@@ -342,7 +423,7 @@ pub const Console = struct {
             if (!any) try self.localsHeader(w, s, idx, depth);
             any = true;
             try w.print("  {s} = ", .{name});
-            self.renderTo(w, s, s.localValue(idx, slot)) catch try w.writeAll("<error>");
+            s.writeValueSummary(w, s.localValue(idx, slot)) catch try w.writeAll("<unavailable>");
             try w.writeByte('\n');
         }
         var up: usize = 0;
@@ -351,7 +432,7 @@ pub const Console = struct {
             if (!any) try self.localsHeader(w, s, idx, depth);
             any = true;
             try w.print("  {s} = ", .{name});
-            self.renderTo(w, s, s.upvalueValue(idx, up)) catch try w.writeAll("<error>");
+            s.writeValueSummary(w, s.upvalueValue(idx, up)) catch try w.writeAll("<unavailable>");
             try w.writeByte('\n');
         }
         return any;
@@ -420,7 +501,9 @@ pub const Console = struct {
             \\expression like `n + 1` to evaluate — or `:n` to force the command.
             \\  bt / backtrace    show the call stack with source locations
             \\  l / locals        show in-scope locals and upvalues, per frame
+            \\  :frame [DEPTH]    source, locals, VM stack, and code for a frame
             \\  v / value         print the current pause value/result
+            \\  :vm QUERY         explore chunks, heap stores, objects, and refs
             \\  break FILE:LINE   set a source-line breakpoint (nearest code line)
             \\  breakpoints       list breakpoints
             \\  delete N          remove breakpoint N

@@ -70,7 +70,7 @@ out=$(printf '1\n:vm heap\n' | "$FIX" repl --bare --color=never 2>/dev/null)
 t "bare: :vm heap has bounded aggregate output" "object slots" "$out"
 t "bare: :vm heap includes object variants" "thunk states" "$out"
 heap_lines=$(wc -l <<<"$out")
-if ((heap_lines <= 24)); then
+if ((heap_lines <= 28)); then
     pass "bare: :vm heap stays bounded"
 else
     fail "bare: :vm heap emitted $heap_lines lines"
@@ -84,16 +84,41 @@ else
     pass "bare: :vm object rows use canonical stores"
 fi
 
+out=$(printf '1\n:vm help\n' | "$FIX" repl --no-tui --color=never 2>/dev/null)
+t "bare: :vm help lists heap stores" "store NAME [START] [LIMIT]" "$out"
+t "bare: :vm help lists references" "refs (chunk|object) ID [LIMIT]" "$out"
+t "bare: :vm help lists instruction breakpoints" "break-at CHUNK OFFSET" "$out"
+
+out=$(printf '{ a = 1; b = [ 2 3 ]; }\n:vm store values 0 3\n:vm store attrs 0 3\n:vm store attr-positions 0 3\n:vm store intern 0 3\n:vm store builtin 0 3\n' |
+    "$FIX" repl --no-tui --color=never 2>/dev/null)
+t "bare: values store is queryable" "values[0x0:" "$out"
+t "bare: attrs store is queryable" "attrs[0x0:" "$out"
+t "bare: attr-position store is queryable" "attr-positions[0x0:" "$out"
+t "bare: intern store is queryable" "intern[0x0:" "$out"
+t "bare: builtin store is queryable" "builtin[0x0:" "$out"
+
+out=$(printf '[ 1 2 ]\n:vm object 0 3\n:vm refs chunk 0 3\n:vm spans\n:vm find top 3\n:vm break-at 0 0\n:vm breakpoints\n:vm clear-at 0 0\n' |
+    "$FIX" repl --no-tui --color=never 2>/dev/null)
+t "bare: object inspection includes members" "ITEMS" "$out"
+t "bare: object inspection includes outgoing refs" "OUTGOING" "$out"
+t "bare: object inspection includes incoming refs" "INCOMING" "$out"
+t "bare: source spans are queryable" "SOURCE SPANS" "$out"
+t "bare: bytecode names are searchable" "(top)" "$out"
+t "bare: instruction breakpoints are settable" "breakpoint" "$out"
+
 # The automation frontend remains line-oriented while exercising the same
 # entry stop, deferred import stepping, pending breakpoints, and logical stack.
 # Crossing the import boundary takes two steps: push_const -> the import `call`,
 # then a step into the imported chunk (where the pending breakpoint resolves).
-out=$(printf ':d (import ./test/imported.nix).value\nbreak test/imported.nix:1\nbreakpoints\ns\ns\nbt\nfinish\nc\n' |
+out=$(printf ':d (import ./test/imported.nix).value\nbreak test/imported.nix:1\nbreakpoints\ns\ns\nbt\n:frame 0\n:vm store intern 0 2\nfinish\nc\n' |
     "$FIX" repl --bare --color=never 2>&1)
 t "bare debug: native entry" "-- debugger #1 (entry) --" "$out"
 t "bare debug: pending import breakpoint" "test/imported.nix:1 (pending)" "$out"
 t "bare debug: steps into import" "imported.nix:1:3" "$out"
 t "bare debug: cross-import caller" "#1 <repl>:1:2" "$out"
+t "bare debug: frame document includes non-forcing locals" "LOCALS · values are not forced" "$out"
+t "bare debug: frame document includes code" "CODE · chunk[0x" "$out"
+t "bare debug: VM queries reach heap stores" "intern[0x0:" "$out"
 if [[ "$out" == *$'\x1b['* ]]; then
     fail "bare debug: no CSI output"
 else

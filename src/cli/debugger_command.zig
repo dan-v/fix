@@ -19,7 +19,9 @@ pub const Command = union(enum) {
     step: Step,
     backtrace,
     locals,
+    frame: []const u8,
     value,
+    explore: []const u8,
     breakpoint: []const u8,
     breakpoints,
     delete: []const u8,
@@ -51,6 +53,8 @@ pub fn parse(line_raw: []const u8) Command {
         if (isWord(word, &.{ "breakpoints", "info" })) return .breakpoints;
         if (isWord(word, &.{ "help", "h", "?" })) return .help;
     }
+    if (explicit and isWord(word, &.{"frame"})) return .{ .frame = rest };
+    if (explicit and isWord(word, &.{"vm"})) return .{ .explore = rest };
     if (isWord(word, &.{"break"})) return .{ .breakpoint = rest };
     if (isWord(word, &.{"delete"})) return .{ .delete = rest };
     return .{ .eval = line };
@@ -154,6 +158,11 @@ test "debugger command ambiguity keeps expressions intact" {
     try std.testing.expect(parse("n + 1") == .eval);
     try std.testing.expectEqualStrings("n + 1", parse("n + 1").eval);
     try std.testing.expect(parse(":next") == .step);
+    try std.testing.expectEqualStrings("2", parse(":frame 2").frame);
+    try std.testing.expectEqualStrings("", parse(":frame").frame);
+    try std.testing.expectEqualStrings("object 3", parse(":vm object 3").explore);
+    try std.testing.expectEqualStrings("frame", parse("frame").eval);
+    try std.testing.expectEqualStrings("frame 2", parse("frame 2").eval);
     try std.testing.expect(parse("break file.nix:12") == .breakpoint);
 }
 

@@ -48,6 +48,7 @@ const imports_mod = @import("eval/imports.zig");
 const tuning = @import("eval/tuning.zig");
 const debugger_state = @import("eval/debugger_state.zig");
 const debug_session = @import("eval/debug_session.zig");
+const bytecode_disasm = @import("tooling/bytecode/disasm.zig");
 const effects_mod = @import("effects.zig");
 
 const worker_mod = execution.worker;
@@ -195,6 +196,39 @@ pub const DebugSession = struct {
     /// the pause.
     pub fn frameSourceText(self: *DebugSession, i: usize) ?[]const u8 {
         return debug_session.frameSourceText(debugContext(self), i);
+    }
+
+    /// Render one frame's current bytecode location without exposing the
+    /// evaluator or raw VM to a line-oriented debugger frontend.
+    pub fn writeFrameCode(
+        self: *const DebugSession,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        i: usize,
+        color_depth: @import("base").terminal_color.Depth,
+    ) !void {
+        const frame_ref = debug_session.frameRef(self.vm, i);
+        const vm_frame = frame_ref.frame();
+        const chunk = self.ev.registry.get(vm_frame.chunk_id) orelse return;
+        var inspected = chunk.*;
+        inspected.code = try self.ev.unpatchedChunkCode(allocator, vm_frame.chunk_id, chunk);
+        defer allocator.free(inspected.code);
+        try bytecode_disasm.writeChunk(
+            allocator,
+            writer,
+            vm_frame.chunk_id,
+            &inspected,
+            .{ .intern = &self.ev.intern, .registry = &self.ev.registry },
+            .{
+                .show_header = false,
+                .show_constants = false,
+                .show_code = true,
+                .show_source = true,
+                .show_bytes = true,
+                .color_depth = color_depth,
+                .current_offset = self.frame(i).instruction,
+            },
+        );
     }
 
     /// Local slots of frame `i` (the values in `vm.stack[base..base+count]`).

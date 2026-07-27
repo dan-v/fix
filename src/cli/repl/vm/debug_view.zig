@@ -264,7 +264,22 @@ pub fn Methods(comptime Explorer: type) type {
                 }),
                 .help => try Explorer.Ops.debug_view.debugSetCapture(self, capture, vm_helpers.debug_help_text),
                 .backtrace, .locals => try Explorer.Ops.debug_view.debugSetCapture(self, capture, "The tree shows the paused stack; select a frame to inspect its source, locals, and code."),
+                .frame => |arg| {
+                    const depth = if (arg.len == 0)
+                        0
+                    else
+                        std.fmt.parseInt(usize, arg, 10) catch {
+                            try Explorer.Ops.debug_view.debugSetCapture(self, capture, "usage: :frame [DEPTH]");
+                            return .running;
+                        };
+                    if (depth >= session.frameCount()) {
+                        try Explorer.Ops.debug_view.debugSetCaptureFmt(self, capture, "no frame #{d}", .{depth});
+                    } else {
+                        try Explorer.Ops.controller.open(self, .{ .debug_frame = session.frameCount() - 1 - depth });
+                    }
+                },
                 .value => try Explorer.Ops.debug_view.debugRenderValue(self, session, capture, session.value),
+                .explore => try Explorer.Ops.debug_view.debugSetCapture(self, capture, "Use the VM tree to browse chunks, heap stores, objects, and references."),
                 .eval => |source| {
                     const scope = session.scopeAttrs() catch session.bindValueScope("it") catch null;
                     const value = session.eval(source, scope) catch |err| {
