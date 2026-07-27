@@ -132,7 +132,7 @@
   '';
   prepareMemory = pkgs.writeShellScript "fix-bench-prepare-memory" ''
     set -euo pipefail
-    exec sudo -n ${reclaimMemoryAsRoot}
+    exec sudo ${reclaimMemoryAsRoot}
   '';
 in
   pkgs.writeShellApplication {
