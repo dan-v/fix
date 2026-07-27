@@ -497,9 +497,9 @@ pub const Engine = struct {
     /// on first force. See `compiler/deferred_table.zig`.
     compilation: CompilationState,
     collection: CollectionState,
-    /// Whether `releaseEvalState` already ran (the build-phase memory
-    /// release). Makes the release idempotent so `deinit` can share it.
-    eval_released: bool = false,
+    /// Evaluation has one terminal transition. Store-side build sessions may
+    /// outlive it, but no language operation is valid after `.finished`.
+    evaluation_phase: enum { active, releasing, finished } = .active,
 
     pub const Evaluation = capability.Evaluation(Engine);
     pub const Values = capability.Values(Engine);
@@ -614,28 +614,46 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         self.debugger.deinit();
-        self.releaseEvalState();
+        self.releaseEvaluationResources();
         owned_strings.free(self.allocator, self.pure_eval_roots);
         if (self.sources.base_path) |path| self.allocator.free(path);
-        // Language workers are joined by releaseEvalState, so no fiber remains
+        // Language workers are joined by releaseEvaluationResources, so no fiber remains
         // parked on the store's fast IO lane when it is shut down here.
         self.store.deinit();
     }
 
-    /// Free the language-evaluation half of the evaluator — workers and
+    /// Finish language evaluation and free its resources — workers and
     /// their fiber stacks, the object heap (flat store + segment stores),
     /// file/fetch caches, retained AST, bytecode registry, and the intern
     /// table — while keeping the store half (daemon connection + IO thread,
-    /// progress session) alive. Once build targets are copied out, the daemon
-    /// needs only store state. Also flushes cached segment blocks.
+    /// progress session) alive. This is a terminal transition: callers may
+    /// continue store work, but must not call another language operation.
     ///
-    /// Idempotent; `deinit` runs it too. After this only store-side entry
-    /// points are valid (`StoreState`/`BuildSession` and the progress-session
-    /// calls) — no evaluation, value
-    /// access, or diagnostics rendering.
-    pub fn releaseEvalState(self: *Engine) void {
-        if (self.eval_released) return;
-        self.eval_released = true;
+    /// `deinit` performs the same cleanup when evaluation is still active.
+    pub fn finishEvaluation(self: *Engine) void {
+        std.debug.assert(self.evaluation_phase == .active);
+        self.evaluation_phase = .releasing;
+        self.destroyEvaluationResources();
+        self.evaluation_phase = .finished;
+    }
+
+    fn requireActiveEvaluation(self: *const Engine) !void {
+        if (self.evaluation_phase != .active) return error.EvaluationFinished;
+    }
+
+    /// Idempotent only so whole-Engine destruction can share the teardown
+    /// path with the explicit terminal transition.
+    fn releaseEvaluationResources(self: *Engine) void {
+        switch (self.evaluation_phase) {
+            .active => self.evaluation_phase = .releasing,
+            .finished => return,
+            .releasing => @panic("evaluation teardown is still running"),
+        }
+        self.destroyEvaluationResources();
+        self.evaluation_phase = .finished;
+    }
+
+    fn destroyEvaluationResources(self: *Engine) void {
         mem_report.report(&self.heap, &self.intern, &self.registry, self.compilation.retained_arenas.items, self.collection.mem_report_mode);
         gc.recordFinalTotal(&self.heap.collection.report, self.heap.totalReservedBytes());
         if (self.collection.report_on) gc.report(&self.heap.collection.report, self.heap.collection.budget_bytes);
@@ -1037,6 +1055,7 @@ pub const Engine = struct {
         source_path: ?[]const u8,
         scope: ?Value,
     ) !ChunkId {
+        try self.requireActiveEvaluation();
         var parsed = try self.parseSourceUnit(source, source_path);
         var retain_arena = false;
         defer if (!retain_arena) parsed.arena.deinit();
@@ -1649,6 +1668,7 @@ pub const Engine = struct {
     }
 
     fn prepareEvaluations(self: *Engine) !void {
+        try self.requireActiveEvaluation();
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only
@@ -1913,6 +1933,7 @@ pub const Engine = struct {
     }
 
     pub fn writeJsonValue(self: *Engine, writer: *std.Io.Writer, value: Value) !void {
+        try self.requireActiveEvaluation();
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
         self.report.trace.clear();
@@ -1924,6 +1945,7 @@ pub const Engine = struct {
     /// Nix string interpolation would (strings, paths, `outPath`,
     /// `__toString`; never integers), then emit the bytes verbatim.
     pub fn writeRawValue(self: *Engine, writer: *std.Io.Writer, value: Value) !void {
+        try self.requireActiveEvaluation();
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
         self.report.trace.clear();
@@ -1932,6 +1954,7 @@ pub const Engine = struct {
     }
 
     pub fn writeXmlValue(self: *Engine, writer: *std.Io.Writer, value: Value) !void {
+        try self.requireActiveEvaluation();
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
         self.report.trace.clear();
@@ -1940,6 +1963,7 @@ pub const Engine = struct {
     }
 
     pub fn forceValue(self: *Engine, value: Value) !Value {
+        try self.requireActiveEvaluation();
         self.report.trace.clear();
         return self.forceValueUntraced(value);
     }
@@ -2124,14 +2148,19 @@ pub const Engine = struct {
     /// Language teardown overlaps daemon work once the returned session starts
     /// a build; callers must keep the session alive until that work completes.
     pub fn beginBuildPhase(self: *Engine, derived_paths: []const []const u8, after_release: ?ReleaseAction) !BuildSession {
+        try self.requireActiveEvaluation();
         // Writes are demand-driven: materialize each target's `.drv` closure now,
         // BEFORE releasing eval state — `ensureClosure` walks the recipe graph,
-        // which `releaseEvalState` frees. (Cheap, and inherently sequential: the
+        // which evaluation teardown frees. (Cheap, and inherently sequential: the
         // daemon can't build a `.drv` whose closure isn't on disk yet.)
         for (derived_paths) |derived| {
             const drv = derived[0..(std.mem.indexOfScalar(u8, derived, '!') orelse derived.len)];
             try self.store.realization.ensureClosure(drv);
         }
+        // Publish the terminal transition before the releaser starts. The
+        // caller can never observe an apparently-active Engine while its
+        // language state is concurrently being destroyed.
+        self.evaluation_phase = .releasing;
         // Release on a helper so teardown overlaps daemon startup. If spawning
         // fails, release synchronously.
         const releaser = std.Thread.spawn(.{}, releaseForBuild, .{ self, after_release }) catch blk: {
@@ -2236,6 +2265,7 @@ pub const Engine = struct {
     }
 
     pub fn forceDeep(self: *Engine, value: Value) !void {
+        try self.requireActiveEvaluation();
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "strict result" } });
         defer observation.cancel();
         self.report.trace.clear();
@@ -2251,6 +2281,7 @@ pub const Engine = struct {
     /// instead of blocking the thread. The body's payload type is
     /// inferred from its return signature; void payloads work too.
     fn runWithVm(self: *Engine, comptime body: anytype, args: anytype) !ReturnPayload(@TypeOf(body)) {
+        try self.requireActiveEvaluation();
         if (fiber_mod.currentFiber() != null) {
             var scratch = @import("base").arena.ArenaAllocator.init(self.allocator);
             defer scratch.deinit();
@@ -2699,6 +2730,7 @@ pub const Engine = struct {
     }
 
     pub fn writeValue(self: *Engine, writer: *std.Io.Writer, value: Value) !void {
+        try self.requireActiveEvaluation();
         var observation = self.observer.begin(&render_observation, .{ .subject = .{ .text = "result" } });
         defer observation.cancel();
         try self.runWithVm(writeValueBody, .{ self, writer, value });
@@ -2742,7 +2774,9 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Engine) void {
 }
 
 fn releaseForBuild(ev: *Engine, after_release: ?ReleaseAction) void {
-    ev.releaseEvalState();
+    std.debug.assert(ev.evaluation_phase == .releasing);
+    ev.destroyEvaluationResources();
+    ev.evaluation_phase = .finished;
     if (after_release) |action| action.run(action.context);
 }
 

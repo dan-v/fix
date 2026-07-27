@@ -262,9 +262,8 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session, success: bool) void {
-        // Join producers before serializing, then detach because the evaluator
-        // can outlive this command-local progress frame.
-        self.ev.releaseEvalState();
+        // Detach because the evaluator can outlive this command-local progress
+        // frame. Engine/build-session ownership decides when evaluation ends.
         self.ev.setObserver(.{});
         self.progress.deinit(success);
         if (self.timeline_path) |path| self.timeline.?.dump(self.io, path);

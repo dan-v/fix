@@ -1213,7 +1213,7 @@ const LifecycleTrackingAllocator = struct {
     }
 };
 
-test "releaseEvalState releases retained flat recipe payload" {
+test "finishEvaluation releases retained flat recipe payload" {
     if (comptime @hasDecl(RealizationStore, "recordFlatRecipe") and @hasDecl(RealizationStore, "releaseRecipePayloads")) {
         var tracking = LifecycleTrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
@@ -1230,9 +1230,9 @@ test "releaseEvalState releases retained flat recipe payload" {
         try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
 
         // RealizationStore remains alive after this call. The payload can be
-        // freed here only if releaseEvalState explicitly drops its recipe
+        // freed here only if finishEvaluation explicitly drops its recipe
         // reference; review separately enforces that call precedes files.deinit.
-        ev.releaseEvalState();
+        ev.finishEvaluation();
         try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
     } else return error.MissingRecipeRegistryApi;
 }

@@ -206,7 +206,7 @@ pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *En
     return 1;
 }
 
-/// `storeOrEvalFailure` for after `Engine.releaseEvalState`: the language
+/// `storeOrEvalFailure` for after `Engine.finishEvaluation`: the language
 /// heap (diagnostics, trace, intern table) is gone, so a build failure can
 /// only render store-side state. Evaluation already succeeded by the time a
 /// build runs — there are no eval diagnostics to lose — and the daemon's own

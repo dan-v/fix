@@ -10,10 +10,10 @@ const renderStrictForTest = helpers.renderStrictForTest;
 const renderForTestFromCurrentPath = helpers.renderForTestFromCurrentPath;
 const renderXmlForTest = helpers.renderXmlForTest;
 
-test "language release is evaluator-owned and idempotent" {
+test "finishing evaluation is terminal" {
     var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
-    ev.releaseEvalState();
-    ev.releaseEvalState();
+    ev.finishEvaluation();
+    try std.testing.expectError(error.EvaluationFinished, ev.evaluate("1"));
     ev.deinit();
 }
 

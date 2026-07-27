@@ -307,7 +307,7 @@ pub fn realizeMany(
     // Every demand fiber has either enqueued its build or completed its request
     // with an error. Nothing below reads language values.
     if (options.stats) stats.report(ev);
-    ev.releaseEvalState();
+    ev.finishEvaluation();
     if (release_action) |action| action.run(action.context);
 
     printer.awaitAll();
