@@ -101,7 +101,7 @@ fn findFiles(io: std.Io, ev: *Engine, sources: []const args.SourceArg) !u8 {
             .file => |path| path,
             .flake => |installable| installable,
         };
-        const path = ev.resolveLookupPath(name) catch |err| {
+        const path = ev.resolveLookupPath(ev.hostAllocator(), name) catch |err| {
             try stdout.interface.flush();
             if (err == error.FileNotFound)
                 std.debug.print("error: file '{s}' was not found in the Nix search path (add it using $NIX_PATH or -I)\n", .{name})

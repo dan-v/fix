@@ -86,12 +86,12 @@ pub fn Sources(comptime Service: type) type {
             return self.engine.readSourceFile(path);
         }
 
-        pub fn resolveLookupPath(self: @This(), name: []const u8) ![]u8 {
-            return self.engine.resolveLookupPath(name);
+        pub fn resolveLookupPath(self: @This(), allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+            return self.engine.resolveLookupPath(allocator, name);
         }
 
-        pub fn fetchTarballPath(self: @This(), url: []const u8) ![]u8 {
-            return self.engine.fetchTarballPath(url);
+        pub fn fetchTarballPath(self: @This(), allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+            return self.engine.fetchTarballPath(allocator, url);
         }
 
         pub fn resolveHostPath(self: @This(), path: []const u8) !@import("../eval/search_path.zig").ResolvedPath {

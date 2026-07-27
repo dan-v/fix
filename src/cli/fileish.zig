@@ -61,12 +61,12 @@ pub fn load(ev: *Engine, io: std.Io, input: []const u8) !Source {
             defer resolved.deinit(allocator);
             break :blk try allocator.dupe(u8, resolved.slice());
         },
-        .lookup => try ev.resolveLookupPath(input[1 .. input.len - 1]),
-        .tarball => try ev.fetchTarballPath(input),
+        .lookup => try ev.resolveLookupPath(allocator, input[1 .. input.len - 1]),
+        .tarball => try ev.fetchTarballPath(allocator, input),
         .channel => blk: {
             const url = try channelUrl(allocator, input["channel:".len..]);
             defer allocator.free(url);
-            break :blk try ev.fetchTarballPath(url);
+            break :blk try ev.fetchTarballPath(allocator, url);
         },
         .flake => try ev.fetchFlakeSourcePath(input["flake:".len..]),
     };

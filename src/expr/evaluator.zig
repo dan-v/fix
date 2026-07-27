@@ -941,16 +941,19 @@ pub const Engine = struct {
         return self.sources.files.readFile(resolved.slice());
     }
 
-    /// Resolve `<name>` through the configured NIX_PATH to an owned host path.
-    pub fn resolveLookupPath(self: *Engine, name: []const u8) ![]u8 {
-        return self.sources.search_paths.resolveName(self.allocator, &self.sources.files, name);
+    /// Resolve `<name>` through NIX_PATH. The caller owns the returned path
+    /// with `allocator`, making its lifetime independent of the engine.
+    pub fn resolveLookupPath(self: *Engine, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        return self.sources.search_paths.resolveName(allocator, &self.sources.files, name);
     }
 
-    /// Fetch and unpack a legacy fileish tarball, returning its owned cache path.
-    pub fn fetchTarballPath(self: *Engine, url: []const u8) ![]u8 {
+    /// Fetch and unpack a legacy fileish tarball. The caller owns the returned
+    /// cache path with `allocator`; all fetch-service temporaries stay owned by
+    /// the engine.
+    pub fn fetchTarballPath(self: *Engine, allocator: std.mem.Allocator, url: []const u8) ![]u8 {
         const result = try self.fetchTarball(url);
-        if (result.nar_payload) |payload| self.allocator.free(payload.bytes);
-        return result.path;
+        defer result.deinit(self.allocator);
+        return allocator.dupe(u8, result.path);
     }
 
     fn fetchTarball(self: *Engine, url: []const u8) !@import("fetchers").FetchService.TarballResult {
