@@ -5,7 +5,7 @@
 //! here as `parser_tables`. This file is the runtime: a tight shift/reduce loop
 //! over the flat tables, plus the semantic actions that build the AST.
 //!
-//! Pipeline: source → scanner → token array → driver. The driver maintains a
+//! Pipeline: source → streaming scanner → driver. The driver maintains a
 //! state stack and a parallel semantic-value stack; each reduce runs one action
 //! to fold children into an AST node. Nodes live in the caller's arena. The
 //! grammar is pure LR — the lambda-pattern-vs-attrset ambiguity is resolved
@@ -223,7 +223,8 @@ pub const Parser = struct {
     }
 
     fn noteWarningAt(self: *Parser, kind: DeprecationWarning.Kind, offset: u32, len: u32) void {
-        self.warnings.append(self.allocator, .{ .kind = kind, .offset = offset, .len = len }) catch {};
+        self.warnings.append(self.allocator, .{ .kind = kind, .offset = offset, .len = len }) catch
+            @panic("out of memory recording parser warning");
     }
 
     pub fn span(self: *const Parser, tok: Token) []const u8 {
@@ -263,7 +264,7 @@ pub const Parser = struct {
             .len = tok.len,
             .token_type = tok.type,
             .message = msg,
-        }) catch {};
+        }) catch @panic("out of memory recording parser diagnostic");
     }
 
     /// Report a semantic parse error anchored at an AST atom (an attribute or
@@ -289,7 +290,7 @@ pub const Parser = struct {
             .len = at.len,
             .token_type = null,
             .message = msg,
-        }) catch {};
+        }) catch @panic("out of memory recording parser diagnostic");
     }
 
     fn atomText(self: *Parser, at: Node.Atom) []const u8 {
@@ -386,7 +387,8 @@ pub const Parser = struct {
         self.first_cr_offset = scanner.first_cr;
         self.first_tokens_no_ws_offset = scanner.first_tokens_no_ws;
         if (scanner.first_float_no_zero) |f| {
-            self.warnings.append(self.allocator, .{ .kind = .floating_without_zero, .offset = f.offset, .len = f.len }) catch {};
+            self.warnings.append(self.allocator, .{ .kind = .floating_without_zero, .offset = f.offset, .len = f.len }) catch
+                @panic("out of memory recording parser warning");
         }
 
         if (self.had_error) return error.ParseError;
@@ -424,7 +426,7 @@ pub const Parser = struct {
         // stack starts at a depth that covers any sane nesting (left
         // recursion keeps lists flat, so depth tracks *nesting* only) and
         // grows geometrically for pathological inputs.
-        var cap: usize = 4096;
+        var cap: usize = 256;
         var states = try gpa.alloc(u32, cap);
         defer gpa.free(states);
         var vals = try gpa.alloc(Value, cap);
