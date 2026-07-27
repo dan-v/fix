@@ -19,7 +19,7 @@ const Engine = engine.Engine;
 /// `min(12, cpu_count)` (1 when single-threaded).
 /// The default cap limits speculative and idle-thread overhead after demand
 /// parallelism saturates. `--workers` remains available for explicit tuning.
-pub fn workerCount(options: args.Options) !u8 {
+pub fn workerCount(options: *const args.Options) !u8 {
     return options.workers orelse if (builtin.single_threaded)
         1
     else
@@ -74,7 +74,7 @@ pub fn applyMemoryBacking(
 pub fn loadSettingsAndFlakeConfig(
     allocator: std.mem.Allocator,
     init: std.process.Init,
-    options: args.Options,
+    options: *const args.Options,
 ) !nix_conf.Settings {
     var settings = try nix_conf.load(allocator, init.environ_map, init.io);
     errdefer settings.deinit();
@@ -90,7 +90,7 @@ pub fn loadSettingsAndFlakeConfig(
 pub fn configure(
     ev: *Engine,
     init: std.process.Init,
-    options: args.Options,
+    options: *const args.Options,
     settings: *nix_conf.Settings,
 ) !Terminal {
     // Language effects are durable stderr records, independent of progress
@@ -179,7 +179,7 @@ pub fn configure(
 /// real evaluation reuses it); a private/custom-registry flake may not resolve
 /// with the throwaway evaluator's minimal config. Best-effort: any failure
 /// leaves settings untouched.
-fn applyFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, options: args.Options, settings: *nix_conf.Settings) void {
+fn applyFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, options: *const args.Options, settings: *nix_conf.Settings) void {
     for (options.sources.items) |src| {
         if (src != .flake) continue;
         const inst = src.flake;
@@ -249,7 +249,7 @@ fn foldFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, ref:
 /// `/etc/nix/nix.conf` the daemon does, so unchanged values are no-ops; only
 /// user/CLI overrides differ. `set_options` is only emitted when the store
 /// actually connects (build/instantiate/run/shell), never for plain `eval`.
-fn applyDaemonSettings(ev: *Engine, options: args.Options, settings: *nix_conf.Settings) !void {
+fn applyDaemonSettings(ev: *Engine, options: *const args.Options, settings: *nix_conf.Settings) !void {
     const allocator = ev.hostAllocator();
     var overrides: std.ArrayListUnmanaged(store.daemon.Setting) = .empty;
     defer overrides.deinit(allocator);
@@ -327,7 +327,7 @@ fn jobsSetting(settings: *nix_conf.Settings, key: []const u8, default: u64) u64 
 /// Build the evaluator's search path from `-I`/`--include` entries followed by
 /// `$NIX_PATH`. Command-line entries come first so they take precedence, as in
 /// Nix. A no-op when neither is present.
-fn applyNixPath(ev: *Engine, init: std.process.Init, options: args.Options) !void {
+fn applyNixPath(ev: *Engine, init: std.process.Init, options: *const args.Options) !void {
     const allocator = ev.hostAllocator();
     const env_path = init.environ_map.get("NIX_PATH");
     if (options.include.items.len == 0) {

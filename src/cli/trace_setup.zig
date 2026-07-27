@@ -35,7 +35,7 @@ pub fn setupThunkTrace(
     allocator: std.mem.Allocator,
     io: std.Io,
     ev: *Engine,
-    options: Options,
+    options: *const Options,
 ) !ThunkTraceSetup {
     var setup: ThunkTraceSetup = .{};
     const path = options.thunks_log_path orelse return setup;
@@ -85,7 +85,7 @@ pub const VmTraceSetup = struct {
     }
 };
 
-pub fn setupVmTrace(allocator: std.mem.Allocator, io: std.Io, options: Options) !VmTraceSetup {
+pub fn setupVmTrace(allocator: std.mem.Allocator, io: std.Io, options: *const Options) !VmTraceSetup {
     var setup: VmTraceSetup = .{};
     const path = options.vm_trace_path orelse return setup;
 

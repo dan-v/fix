@@ -16,7 +16,7 @@ const TextRef = @import("base").TextRef;
 
 /// The build realization mode selected by `--check`/`--repair` (`--check`
 /// takes precedence). `--repair`/`--check` require a trusted daemon user.
-pub fn buildMode(options: args.Options) store.daemon.BuildMode {
+pub fn buildMode(options: *const args.Options) store.daemon.BuildMode {
     if (options.check) return .check;
     if (options.repair) return .repair;
     return .normal;

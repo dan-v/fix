@@ -35,13 +35,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
     defer options.deinit(allocator);
 
-    const worker_count = try setup.workerCount(options);
+    const worker_count = try setup.workerCount(&options);
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
 
     const input_plan = eval_support.InputPlan.init(&options, init.io);
     if (!options.find_file) {
@@ -62,7 +62,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         init.io,
         &ev,
         term,
-        options,
+        &options,
         timeline_source,
     );
     var ok = false;
@@ -88,7 +88,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
             continue;
         };
         defer input.deinit(&ev);
-        ok = (try instantiateOne(allocator, init, term, options, &ev, input, index)) and ok;
+        ok = (try instantiateOne(allocator, init, term, &options, &ev, input, index)) and ok;
     }
     if (options.stats) stats.report(&ev);
     return if (ok) 0 else 1;
@@ -122,7 +122,7 @@ fn instantiateOne(
     allocator: std.mem.Allocator,
     init: std.process.Init,
     term: setup.Terminal,
-    options: args.Options,
+    options: *const args.Options,
     ev: *Engine,
     input: eval_support.LoadedInput,
     index: usize,

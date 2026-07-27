@@ -106,14 +106,14 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     // Re-exec'd privileged half: skip eval/build, activate the given path.
     if (options.activate_toplevel) |top| {
-        const target = resolveTarget(init, options) catch {
+        const target = resolveTarget(init, &options) catch {
             std.debug.print("error: --activate-toplevel needs an explicit --nixos/--darwin/--home-manager\n", .{});
             return 2;
         };
         return activate(allocator, init, target, action, top);
     }
 
-    const target = resolveTarget(init, options) catch {
+    const target = resolveTarget(init, &options) catch {
         std.debug.print("error: could not detect the target; pass --nixos, --darwin, or --home-manager\n", .{});
         return 2;
     };
@@ -155,13 +155,13 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
         break :blk options.source.?;
     };
 
-    const worker_count = try setup.workerCount(options.*);
+    const worker_count = try setup.workerCount(options);
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options.*);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options.*, &settings);
+    const term = try setup.configure(&ev, init, options, &settings);
 
     if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
@@ -176,7 +176,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
 
     ev.enableStoreWrites();
 
-    const realized = switch (try realization_workflow.realize(allocator, init.io, &ev, process.eval_release, term, options.*, source_arg, source, false)) {
+    const realized = switch (try realization_workflow.realize(allocator, init.io, &ev, process.eval_release, term, options, source_arg, source, false)) {
         .failed => |code| return code,
         .ok => |r| r,
     };
@@ -396,7 +396,7 @@ fn runActivation(allocator: std.mem.Allocator, init: std.process.Init, target: T
 /// Resolve the activation target: an explicit flag, else auto-detect from the
 /// host (`uname == Darwin` → darwin; a NixOS marker → nixos). home-manager is
 /// never auto-detected — it coexists with a system.
-fn resolveTarget(init: std.process.Init, options: args.Options) !Target {
+fn resolveTarget(init: std.process.Init, options: *const args.Options) !Target {
     if (options.switch_target) |t| return t;
     const u = std.posix.uname();
     if (std.mem.eql(u8, std.mem.sliceTo(&u.sysname, 0), "Darwin")) return .darwin;

@@ -39,13 +39,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     const source_arg = options.source orelse options.defaultSource();
 
-    const worker_count = try setup.workerCount(options);
+    const worker_count = try setup.workerCount(&options);
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
 
     if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
@@ -60,7 +60,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     ev.enableStoreWrites();
 
-    const realized = switch (try realization_workflow.realize(allocator, init.io, &ev, process.eval_release, term, options, source_arg, source, true)) {
+    const realized = switch (try realization_workflow.realize(allocator, init.io, &ev, process.eval_release, term, &options, source_arg, source, true)) {
         .failed => |code| return code,
         .ok => |r| r,
     };

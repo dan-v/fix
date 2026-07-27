@@ -33,13 +33,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
     defer options.deinit(allocator);
 
-    const worker_count = try setup.workerCount(options);
+    const worker_count = try setup.workerCount(&options);
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
 
     ev.enableStoreWrites();
 
@@ -58,7 +58,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         init.io,
         &ev,
         term,
-        options,
+        &options,
         timeline_source,
     );
     var ok = false;
@@ -80,9 +80,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     }
 
     const code = if (options.dry_run)
-        try realization_workflow.dryRunMany(allocator, init.io, &ev, process.eval_release, term, options, inputs)
+        try realization_workflow.dryRunMany(allocator, init.io, &ev, process.eval_release, term, &options, inputs)
     else
-        try realization_workflow.realizeMany(allocator, init.io, &ev, process.eval_release, term, options, progress.renderer(), inputs);
+        try realization_workflow.realizeMany(allocator, init.io, &ev, process.eval_release, term, &options, progress.renderer(), inputs);
     ok = code == 0;
     return code;
 }

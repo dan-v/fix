@@ -229,7 +229,7 @@ pub const Session = struct {
         io: std.Io,
         ev: *Engine,
         terminal: setup.Terminal,
-        options: args.Options,
+        options: *const args.Options,
         source: []const u8,
     ) !Session {
         var session: Session = .{

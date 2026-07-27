@@ -122,7 +122,7 @@ const OrderedPrinter = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     ev: *Engine,
-    options: args.Options,
+    options: *const args.Options,
     slots: []BuildSlot,
     use_color: bool,
     failed: bool = false,
@@ -260,7 +260,7 @@ pub fn realizeMany(
     ev: *Engine,
     release_action: ?@import("expr").ReleaseAction,
     terminal: setup.Terminal,
-    options: args.Options,
+    options: *const args.Options,
     progress: *EvalProgress,
     inputs: []const BuildInput,
 ) !u8 {
@@ -326,7 +326,7 @@ pub fn dryRunMany(
     ev: *Engine,
     release_action: ?@import("expr").ReleaseAction,
     terminal: setup.Terminal,
-    options: args.Options,
+    options: *const args.Options,
     inputs: []const BuildInput,
 ) !u8 {
     const derived = try allocator.alloc([]const u8, inputs.len);
@@ -534,7 +534,7 @@ pub fn realize(
     ev: *Engine,
     release_action: ?@import("expr").ReleaseAction,
     terminal: setup.Terminal,
-    options: args.Options,
+    options: *const args.Options,
     source_arg: args.SourceArg,
     source: eval_support.Source,
     want_program: bool,

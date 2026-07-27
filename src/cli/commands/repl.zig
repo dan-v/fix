@@ -83,13 +83,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     // The debugger needs a deterministic pause point: one worker, no
     // speculation. Same posture as `fix eval --debugger`.
-    const worker_count = if (options.debugger) 1 else try setup.workerCount(options);
+    const worker_count = if (options.debugger) 1 else try setup.workerCount(&options);
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
     // The explorer is a first-class REPL surface: retain binding and synthetic
     // lambda/node path segments for every session, not only --debugger runs.
     ev.setCaptureChunkNames(true);
@@ -107,7 +107,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // Streaming output suppresses automatic color; a tty retains the resolved
     // terminal decision even when its alternate-screen workspaces are disabled.
     ev.setValueColor(if (options.debugger) term.use_color else (term.use_color and interactive));
-    var repl = Repl.init(allocator, init, options, &ev, if (interactive) term.color_depth else .none, interactive);
+    var repl = Repl.init(allocator, init, &options, &ev, if (interactive) term.color_depth else .none, interactive);
     defer repl.deinit();
     repl.debug_console = &console;
     var vm_debugger = vm_ui.VmDebugger.init(allocator, init.io, &ev, term.color_depth, &repl.history);
@@ -137,7 +137,7 @@ const Repl = struct {
     allocator: std.mem.Allocator,
     proc_init: std.process.Init,
     io: std.Io,
-    options: Options,
+    options: *const Options,
     ev: *Engine,
     use_color: bool,
     color_depth: presentation.ColorDepth,
@@ -182,7 +182,7 @@ const Repl = struct {
     fn init(
         allocator: std.mem.Allocator,
         proc_init: std.process.Init,
-        options: Options,
+        options: *const Options,
         ev: *Engine,
         color_depth: presentation.ColorDepth,
         interactive: bool,

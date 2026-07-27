@@ -79,13 +79,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         return 2;
     }
 
-    const worker_count = try setup.workerCount(options);
+    const worker_count = try setup.workerCount(&options);
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
     ev.enableStoreWrites();
     // Retain each forced derivation's full recipe so we can build a get-env
     // variant of it (the normal eval path discards the Drv).
@@ -152,7 +152,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         return eval_support.buildFailure(init.io, term.use_color, ev.lastStoreError(), err);
     };
     defer build_session.deinit();
-    build_session.buildPaths(&[_][]const u8{derived}, null, eval_support.buildMode(options)) catch |err| {
+    build_session.buildPaths(&[_][]const u8{derived}, null, eval_support.buildMode(&options)) catch |err| {
         return eval_support.buildFailure(init.io, term.use_color, build_session.lastStoreError(), err);
     };
 

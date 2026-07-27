@@ -53,19 +53,19 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // on unguarded worker fibers can blow their stacks on deeply or infinitely
     // recursive values (e.g. a NixOS toplevel). The static path never evaluates,
     // so its worker count is immaterial.
-    const worker_count: u8 = if (options.disasm_eval) 1 else try setup.workerCount(options);
+    const worker_count: u8 = if (options.disasm_eval) 1 else try setup.workerCount(&options);
 
     // Resolve heap backing before the evaluator maps its stores
     // (`--hugetlb`, otherwise auto).
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
     // Configure features (pipe-operators/flakes), base path, and NIX_PATH so the
     // compile matches what `eval`/`build` would see. No progress: disasm prints
     // bytecode, not evaluation records.
-    _ = try setup.configure(&ev, init, options, &settings);
+    _ = try setup.configure(&ev, init, &options, &settings);
     if (options.disasm_eval) ev.setParallelismToggles(true, true);
     // Best-effort chunk naming: attribute each lambda/thunk chunk to the attr
     // or let binding it was compiled for, so the disassembly headers read like

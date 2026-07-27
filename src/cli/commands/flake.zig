@@ -59,32 +59,32 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer options.deinit(allocator);
 
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
     defer settings.deinit();
     var ev = try Engine.init(
         allocator,
-        setup.engineConfig(init, try setup.workerCount(options), memory_backing),
+        setup.engineConfig(init, try setup.workerCount(&options), memory_backing),
     );
     defer ev.deinit();
-    _ = try setup.configure(&ev, init, options, &settings);
+    _ = try setup.configure(&ev, init, &options, &settings);
     if (!ev.languagePolicy().flakes_enabled) {
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
 
-    if (std.mem.eql(u8, sub, "metadata")) return metadata(&ev, init.io, allocator, flakeRefOf(options));
-    if (std.mem.eql(u8, sub, "show")) return show(&ev, init.io, allocator, flakeRefOf(options));
-    if (std.mem.eql(u8, sub, "check")) return check(&ev, init.io, allocator, flakeRefOf(options));
+    if (std.mem.eql(u8, sub, "metadata")) return metadata(&ev, init.io, allocator, flakeRefOf(&options));
+    if (std.mem.eql(u8, sub, "show")) return show(&ev, init.io, allocator, flakeRefOf(&options));
+    if (std.mem.eql(u8, sub, "check")) return check(&ev, init.io, allocator, flakeRefOf(&options));
     // update/lock operate on the cwd flake; positionals are input names.
-    if (std.mem.eql(u8, sub, "update")) return lockCmd(&ev, init.io, allocator, options, true);
-    if (std.mem.eql(u8, sub, "lock")) return lockCmd(&ev, init.io, allocator, options, false);
+    if (std.mem.eql(u8, sub, "update")) return lockCmd(&ev, init.io, allocator, &options, true);
+    if (std.mem.eql(u8, sub, "lock")) return lockCmd(&ev, init.io, allocator, &options, false);
 
     std.debug.print("error: unknown flake subcommand '{s}'\n\n{s}\n", .{ sub, synopsis });
     return 2;
 }
 
 /// The flakeref positional, or `.` when none was given.
-fn flakeRefOf(options: args.Options) []const u8 {
+fn flakeRefOf(options: *const args.Options) []const u8 {
     if (options.sources.items.len == 0) return ".";
     return switch (options.sources.items[0]) {
         .file => |p| p,
@@ -334,7 +334,7 @@ fn reportCheckFailure(out: *std.Io.Writer, category: []const u8, system: ?[]cons
 /// side effect of evaluating outputs. `update` with no inputs re-pins
 /// everything; `update x y` re-pins only x and y; `lock` just completes a
 /// missing lock, keeping existing pins.
-fn lockCmd(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, options: args.Options, is_update: bool) !u8 {
+fn lockCmd(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, options: *const args.Options, is_update: bool) !u8 {
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer names.deinit(allocator);
     for (options.sources.items) |src| switch (src) {

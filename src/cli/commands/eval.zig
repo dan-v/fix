@@ -36,13 +36,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     // The debugger needs a deterministic pause point: one worker, no
     // speculative forcing racing ahead of the break.
-    const worker_count = if (options.debugger) 1 else try setup.workerCount(options);
+    const worker_count = if (options.debugger) 1 else try setup.workerCount(&options);
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, options);
+    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
-    const term = try setup.configure(&ev, init, options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
     if (options.read_write_mode) {
         // Store writes are observable. Keep them on the demand path so helper
         // speculation cannot instantiate derivations the user never demanded.
@@ -75,18 +75,18 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         init.io,
         &ev,
         term,
-        options,
+        &options,
         timeline_source,
     );
     var ok = false;
     defer progress.deinit(ok);
     progress.install();
 
-    var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, options);
+    var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, &options);
     defer vm_trace.deinit(allocator);
     if (vm_trace.trace) |t| ev.setVmTrace(t);
 
-    var thunks_setup = try trace_setup.setupThunkTrace(allocator, init.io, &ev, options);
+    var thunks_setup = try trace_setup.setupThunkTrace(allocator, init.io, &ev, &options);
     defer thunks_setup.deinit(allocator);
     if (thunks_setup.trace) |t| ev.setThunkTrace(t);
 

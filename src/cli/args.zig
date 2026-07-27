@@ -278,12 +278,12 @@ pub const Options = struct {
     /// The source to evaluate when none was given on the command line: the
     /// `./default.nix`, matching `nix-build`/`nix-instantiate`. Flakes are
     /// explicit typed inputs (`--flake REF`), so they never change this default.
-    pub fn defaultSource(self: Options) SourceArg {
+    pub fn defaultSource(self: *const Options) SourceArg {
         _ = self;
         return .{ .file = "default.nix" };
     }
 
-    pub fn evaluationMode(self: Options) EvaluationMode {
+    pub fn evaluationMode(self: *const Options) EvaluationMode {
         return .{
             .output = self.output,
             .strict = self.strict,

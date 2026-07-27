@@ -50,14 +50,14 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     }
 
     const memory_backing = setup.applyMemoryBacking(process, null);
-    var settings = setup.loadSettingsAndFlakeConfig(allocator, init, options) catch |err| {
+    var settings = setup.loadSettingsAndFlakeConfig(allocator, init, &options) catch |err| {
         if (err != error.ConfigError) return err;
         return 1;
     };
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, memory_backing));
     defer ev.deinit();
-    _ = setup.configure(&ev, init, options, &settings) catch |err| {
+    _ = setup.configure(&ev, init, &options, &settings) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -101,7 +101,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     // Deprecation warnings: emit each recorded warning whose feature is not
     // enabled (to stderr, semantically — not Nix's exact prose).
-    try emitWarnings(init, allocator, &parser, options, source, source_path);
+    try emitWarnings(init, allocator, &parser, &options, source, source_path);
 
     // A surviving CR line ending means cr-line-endings is enabled (otherwise
     // compileSource would have errored above); Lix still warns in that case.
@@ -142,7 +142,7 @@ fn loadSource(ev: *Engine, io: std.Io, source: args.SourceArg) !fileish.Source {
     };
 }
 
-fn emitWarnings(init: std.process.Init, allocator: std.mem.Allocator, parser: *Parser, options: args.Options, source: []const u8, source_path: ?[]const u8) !void {
+fn emitWarnings(init: std.process.Init, allocator: std.mem.Allocator, parser: *Parser, options: *const args.Options, source: []const u8, source_path: ?[]const u8) !void {
     if (parser.warnings.items.len == 0) return;
     var warns: std.ArrayListUnmanaged(Diagnostic) = .empty;
     defer warns.deinit(allocator);
