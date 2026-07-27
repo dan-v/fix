@@ -126,6 +126,11 @@ pub const ChunkRegistry = struct {
     /// runs), `registerDeduped` skips the dedup shard mutexes and `register`
     /// takes the serial slot-append path. Reads remain lock-free. Default off.
     solo: bool = false,
+    /// Persistent and debugging evaluators canonicalize structurally equal
+    /// compiler output so repeated evaluations retain stable ChunkIds. A
+    /// one-shot CLI eval may disable this: its chunks cannot be observed by a
+    /// later evaluation, and almost every registration is unique.
+    dedup_compiler_chunks: bool = true,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{

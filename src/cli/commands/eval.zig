@@ -41,7 +41,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
-    defer ev.deinit();
+    ev.setTransientChunkRegistration(process.exits_after_command and !options.debugger);
+    // `main` terminates the process immediately after this command returns.
+    // Releasing a nixpkgs-sized heap node-by-node on that path only delays
+    // exit; the kernel will reclaim it wholesale. Keep explicit teardown for
+    // embedders/tests and for reports emitted by Engine.deinit().
+    defer if (!process.exits_after_command or options.mem_report != null or options.gc_report) ev.deinit();
     const term = try setup.configure(&ev, init, &options, &settings);
     if (options.read_write_mode) {
         // Store writes are observable. Keep them on the demand path so helper

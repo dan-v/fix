@@ -1213,20 +1213,27 @@ pub const Engine = struct {
             (self.registry.childName(bytecode.root_name_id, try self.intern.intern("(top)"), true) catch bytecode.root_name_id)
         else
             bytecode.root_name_id;
-        const registered = try self.registry.registerDeduped(chunk, top_name);
-        if (registered.reused) {
-            var duplicate = chunk;
-            duplicate.deinit(self.allocator);
-        }
-        self.chunkRegistered(registered.id);
-        if (compiler.source_file_id) |file| try self.registry.recordFile(registered.id, file);
+        const id = if (self.registry.dedup_compiler_chunks) blk: {
+            const registered = try self.registry.registerDeduped(chunk, top_name);
+            if (registered.reused) {
+                var duplicate = chunk;
+                duplicate.deinit(self.allocator);
+            }
+            break :blk registered.id;
+        } else blk: {
+            // A one-shot source body is almost always unique; register it
+            // directly instead of hashing bytecode and all of its side tables.
+            break :blk try self.registry.registerNamed(chunk, top_name);
+        };
+        self.chunkRegistered(id);
+        if (compiler.source_file_id) |file| try self.registry.recordFile(id, file);
         if (self.registry.capture_names)
-            try self.registry.recordLocalNames(registered.id, compiler.local_names.items);
+            try self.registry.recordLocalNames(id, compiler.local_names.items);
         if (source_path) |path| {
             if (self.debugger.breakpoints) |*breakpoints|
                 breakpoints.resolvePendingFile(&self.registry, path);
         }
-        return registered.id;
+        return id;
     }
 
     fn retainDeferredArena(self: *Engine, arena: ast_mod.AstArena) void {
@@ -1294,6 +1301,13 @@ pub const Engine = struct {
     /// parallel import compilation. Set before compiling.
     pub fn setCaptureChunkNames(self: *Engine, on: bool) void {
         self.registry.capture_names = on;
+    }
+
+    /// Use direct chunk registration for an evaluator whose compiled state
+    /// cannot be observed by a later evaluation. Persistent/debug evaluators
+    /// retain exact structural deduplication by default.
+    pub fn setTransientChunkRegistration(self: *Engine, transient: bool) void {
+        self.registry.dedup_compiler_chunks = !transient;
     }
 
     /// Install (or clear) the interactive debugger. `run` is called on the

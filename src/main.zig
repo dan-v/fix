@@ -97,6 +97,7 @@ pub fn main(init: std.process.Init) !void {
         .allocator = allocator,
         .eval_release = .{ .context = &big_blocks, .run = trimLargeBlocks },
         .memory_backing = big_blocks.hugePolicy(),
+        .exits_after_command = true,
     };
 
     var args_iter = try init.minimal.args.iterateAllocator(allocator);

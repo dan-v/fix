@@ -305,11 +305,18 @@ pub const Compiler = struct {
 
     /// Register `ch`, tagging it with this compiler's qualified-name node.
     pub fn registerChunk(self: *Compiler, ch: chunk.Chunk) !types.ChunkId {
-        // Content-addressed dedup over FULL structural equality (code, constant
-        // bits, side tables, source map, spans): field-equal chunks carry
-        // identical semantics AND identical diagnostics, so sharing one
-        // registration is observation-free. Folded-constant chunks self-exclude
-        // (their pool Values hold per-fold ObjectIds that never bit-match).
+        if (!self.registry.dedup_compiler_chunks) {
+            // One-shot compilation overwhelmingly produces unique chunks.
+            // Hashing every body and its side tables, then allocating a dedup
+            // candidate, costs more than the vanishingly rare reuse saves.
+            const id = try self.registry.registerNamed(ch, self.name_id);
+            try self.recordChunkSidecar(id, &ch);
+            if (self.registration_sink) |sink| sink.notify(id);
+            return id;
+        }
+
+        // Persistent/debug evaluators can compile the same source repeatedly;
+        // preserve canonical ids and their cross-evaluation memo behavior.
         const r = try self.registry.registerDeduped(ch, self.name_id);
         if (r.reused) {
             var copy = ch;
@@ -317,9 +324,6 @@ pub const Compiler = struct {
         } else {
             try self.recordChunkSidecar(r.id, &ch);
         }
-        // A canonical reuse is still about to execute in this compile path.
-        // Report it so debugger step-following can patch an already-registered
-        // imported body; the evaluator deduplicates other cold side effects.
         if (self.registration_sink) |sink| sink.notify(r.id);
         return r.id;
     }
