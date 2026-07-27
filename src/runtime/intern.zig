@@ -33,23 +33,29 @@ const shard_count: u32 = 64;
 const shard_mask: u64 = shard_count - 1;
 
 const cache_size: usize = 512;
-const cache_max_len: usize = 24;
+const cache_max_len: usize = 19;
 
+/// Exactly half a cache line: two slots pack without straddling. Table
+/// identity lives once per thread rather than in every slot.
 const CacheSlot = struct {
     hash: u64 = 0,
-    table_token: u64 = 0,
     id: InternId = 0,
     len: u8 = 0,
     bytes: [cache_max_len]u8 = @splat(0),
 };
+comptime {
+    std.debug.assert(@sizeOf(CacheSlot) == 32);
+}
 
 /// Per-thread direct-mapped cache for short-string interns. Indexed
-/// by the input's Wyhash mod `cache_size`. `table_token` distinguishes
-/// InternTable instances — pointer comparison fails when the allocator
-/// reuses the same address across deinit/init (which broke the cache
-/// across sequential tests). Tokens are monotonic and unique per
-/// table init. Strings longer than `cache_max_len` skip the cache.
+/// by the input's Wyhash mod `cache_size`. `thread_cache_token`
+/// distinguishes InternTable instances — pointer comparison fails when
+/// the allocator reuses the same address across deinit/init (which broke
+/// the cache across sequential tests). Switching tables clears the cache
+/// once instead of storing and checking the same token in every slot.
+/// Strings longer than `cache_max_len` skip the cache.
 threadlocal var thread_cache: [cache_size]CacheSlot = @splat(.{});
+threadlocal var thread_cache_token: u64 = 0;
 
 var next_table_token: std.atomic.Value(u64) = .init(1);
 
@@ -144,6 +150,11 @@ pub const InternTable = struct {
     pub fn intern(self: *InternTable, s: []const u8) !InternId {
         const h = hashString(s);
 
+        if (thread_cache_token != self.token) {
+            thread_cache = @splat(.{});
+            thread_cache_token = self.token;
+        }
+
         // Thread-local direct-mapped cache. Short identifiers get
         // re-interned repeatedly from many call sites (attr names,
         // builtin args, paths); a per-thread cache short-circuits the
@@ -152,8 +163,8 @@ pub const InternTable = struct {
         // per slot) instead of paying a `data.slice` indirection.
         if (s.len <= cache_max_len) {
             const slot = &thread_cache[h % cache_size];
-            if (slot.hash == h and slot.table_token == self.token and
-                slot.len == s.len and std.mem.eql(u8, slot.bytes[0..s.len], s))
+            if (slot.hash == h and slot.len == s.len and
+                std.mem.eql(u8, slot.bytes[0..s.len], s))
             {
                 return slot.id;
             }
@@ -171,7 +182,6 @@ pub const InternTable = struct {
             if (s.len <= cache_max_len) {
                 const slot = &thread_cache[h % cache_size];
                 slot.hash = h;
-                slot.table_token = self.token;
                 slot.id = gop.key_ptr.*;
                 slot.len = @intCast(s.len);
                 @memcpy(slot.bytes[0..s.len], s);
@@ -199,7 +209,6 @@ pub const InternTable = struct {
         if (s.len <= cache_max_len) {
             const slot = &thread_cache[h % cache_size];
             slot.hash = h;
-            slot.table_token = self.token;
             slot.id = new_id;
             slot.len = @intCast(s.len);
             @memcpy(slot.bytes[0..s.len], s);
