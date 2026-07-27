@@ -43,7 +43,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options, &settings);
 
-    const input_plan = eval_support.InputPlan.init(options, init.io);
+    const input_plan = eval_support.InputPlan.init(&options, init.io);
     if (!options.find_file) {
         input_plan.validate(&ev) catch |err| {
             std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });

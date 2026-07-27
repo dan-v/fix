@@ -60,6 +60,15 @@ pub const ArgDef = struct {
     is_string: bool,
 };
 
+/// Borrowed, value-oriented projection used by source loading/lowering.
+/// It cannot deinitialize or mutate the owning `Options` lists.
+pub const SourceOptions = struct {
+    cmd: Cmd = .eval,
+    attr: ?[]const u8 = null,
+    arg_defs: []const ArgDef = &.{},
+    impure: bool = false,
+};
+
 /// A `--option NAME VALUE` override for a `nix.conf` setting. Applied over the
 /// loaded config at highest precedence (see `setup.configure`). Borrowed from
 /// argv.
@@ -278,6 +287,19 @@ pub const Options = struct {
         return .{
             .output = self.output,
             .strict = self.strict,
+        };
+    }
+
+    pub fn sourceOptions(self: *const Options) SourceOptions {
+        return self.sourceOptionsWithAttr(self.attr);
+    }
+
+    pub fn sourceOptionsWithAttr(self: *const Options, attr: ?[]const u8) SourceOptions {
+        return .{
+            .cmd = self.cmd,
+            .attr = attr,
+            .arg_defs = self.arg_defs.items,
+            .impure = self.impure,
         };
     }
 };

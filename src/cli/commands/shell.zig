@@ -148,7 +148,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Engi
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
-    var source = eval_support.getSource(ev, init.io, source_arg, options) catch |err| {
+    var source = eval_support.getSource(ev, init.io, source_arg, options.sourceOptions()) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };

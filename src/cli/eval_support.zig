@@ -77,11 +77,11 @@ pub fn sourceRequiresFlakes(source: SourceArg) bool {
 }
 
 /// One ordered CLI input after expanding sources × `-A` selectors. The options
-/// value borrows all list storage from the command's parsed Options and changes
-/// only the legacy single-selector mirror consumed by `getSource`.
+/// The source projection is a non-owning value, so selecting one attribute
+/// cannot accidentally create a second apparent owner of every CLI list.
 pub const SelectedInput = struct {
     source_arg: SourceArg,
-    options: args.Options,
+    options: args.SourceOptions,
 };
 
 pub const LoadedInput = struct {
@@ -100,12 +100,12 @@ pub const LoadedInput = struct {
 /// Shared ordered expansion used by build, eval, and instantiate. Inputs are
 /// source-major, with repeated `-A` selectors kept in their command-line order.
 pub const InputPlan = struct {
-    parsed: args.Options,
+    parsed: *const args.Options,
     io: std.Io,
     default_source: SourceArg,
     selector_count: usize,
 
-    pub fn init(options: args.Options, io: std.Io) InputPlan {
+    pub fn init(options: *const args.Options, io: std.Io) InputPlan {
         return .{
             .parsed = options,
             .io = io,
@@ -126,9 +126,11 @@ pub const InputPlan = struct {
             self.default_source
         else
             self.parsed.sources.items[source_index];
-        var input_options = self.parsed;
-        input_options.attr = if (self.parsed.attrs.items.len == 0) null else self.parsed.attrs.items[selector_index];
-        return .{ .source_arg = source_arg, .options = input_options };
+        const attr = if (self.parsed.attrs.items.len == 0) null else self.parsed.attrs.items[selector_index];
+        return .{
+            .source_arg = source_arg,
+            .options = self.parsed.sourceOptionsWithAttr(attr),
+        };
     }
 
     pub fn validate(self: InputPlan, ev: *Engine) !void {
@@ -163,7 +165,7 @@ test "input plan shares ordered source and selector expansion" {
     try options.attrs.append(std.testing.allocator, "first");
     try options.attrs.append(std.testing.allocator, "second");
 
-    const plan = InputPlan.init(options, std.testing.io);
+    const plan = InputPlan.init(&options, std.testing.io);
     try std.testing.expectEqual(@as(usize, 4), try plan.count());
     const expected_sources = [_][]const u8{ "one", "one", "two", "two" };
     const expected_attrs = [_][]const u8{ "first", "second", "first", "second" };
@@ -218,18 +220,18 @@ pub fn buildFailure(io: std.Io, use_color: bool, last_store_error: ?[]const u8, 
     return 1;
 }
 
-pub fn getSource(ev: *Engine, io: std.Io, source: SourceArg, options: args.Options) !Source {
+pub fn getSource(ev: *Engine, io: std.Io, source: SourceArg, options: args.SourceOptions) !Source {
     return getSourceMode(ev, io, source, options, false);
 }
 
 /// Load a source for attribute discovery. Unlike ordinary evaluation without
 /// selectors, completion auto-calls a top-level attrset function with `{}` so
 /// files such as `default.nix` expose outputs whose formals all have defaults.
-pub fn getCompletionSource(ev: *Engine, io: std.Io, source: SourceArg, options: args.Options) !Source {
+pub fn getCompletionSource(ev: *Engine, io: std.Io, source: SourceArg, options: args.SourceOptions) !Source {
     return getSourceMode(ev, io, source, options, true);
 }
 
-fn getSourceMode(ev: *Engine, io: std.Io, source: SourceArg, options: args.Options, completion_auto_call: bool) !Source {
+fn getSourceMode(ev: *Engine, io: std.Io, source: SourceArg, options: args.SourceOptions, completion_auto_call: bool) !Source {
     const allocator = ev.hostAllocator();
     // Load the base source text (borrowed for expr/file, owned for flake).
     var base: Source = switch (source) {
@@ -261,9 +263,9 @@ fn getSourceMode(ev: *Engine, io: std.Io, source: SourceArg, options: args.Optio
 /// with those args intersected against its formals; then select the `-A`
 /// attribute path. Returns owned wrapped text, or `base_text` borrowed when no
 /// selector applies.
-fn applySelectors(ev: *Engine, base_text: []const u8, options: args.Options, completion_auto_call: bool) !Source {
+fn applySelectors(ev: *Engine, base_text: []const u8, options: args.SourceOptions, completion_auto_call: bool) !Source {
     const alloc = ev.hostAllocator();
-    const has_args = options.arg_defs.items.len > 0;
+    const has_args = options.arg_defs.len > 0;
     // A `-A` with only empty components (`.`/``) selects nothing.
     const has_attr = if (options.attr) |a| std.mem.indexOfNone(u8, a, ".") != null else false;
     if (!has_args and !has_attr and !completion_auto_call) return .{ .text = .{ .borrowed = base_text } };
@@ -280,7 +282,7 @@ fn applySelectors(ev: *Engine, base_text: []const u8, options: args.Options, com
     // back to their defaults and extra args are dropped). A non-function value
     // passes through unchanged, so plain attrset files still work with `-A`.
     try out.appendSlice(alloc, "    __fix_args = {");
-    for (options.arg_defs.items) |a| {
+    for (options.arg_defs) |a| {
         try out.appendSlice(alloc, " \"");
         try appendNixEscaped(alloc, &out, a.name);
         try out.appendSlice(alloc, "\" = ");
@@ -357,7 +359,7 @@ fn appendFlakeCandidate(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
     try out.appendSlice(alloc, suffix);
 }
 
-fn lowerFlakeInstallable(ev: *Engine, installable: []const u8, options: args.Options) ![]u8 {
+fn lowerFlakeInstallable(ev: *Engine, installable: []const u8, options: args.SourceOptions) ![]u8 {
     const alloc = ev.hostAllocator();
     const hash = std.mem.indexOfScalar(u8, installable, '#');
     const flake_ref = if (hash) |i| installable[0..i] else installable;

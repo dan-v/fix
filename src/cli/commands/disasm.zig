@@ -82,7 +82,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
     const color_depth = presentation.colorDepthForTerminal(options.color, stdout_tty, init.environ_map);
 
-    var source = runner.getSource(&ev, init.io, source_arg, options) catch |err| {
+    var source = runner.getSource(&ev, init.io, source_arg, options.sourceOptions()) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
