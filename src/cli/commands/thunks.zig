@@ -7,12 +7,9 @@
 //! keyed by the *creator* source location, since chunk and thunk ids
 //! aren't stable across runs but `(file, line, col)` is.
 //!
-//! Algorithm (two streaming passes per log):
-//!   1. Pass 1: read every `kind=create` event, build
-//!      `thunk_id → creator (file, line, col)` map.
-//!   2. Pass 2: read every `kind=resolve|errored|reset` event, look
-//!      up the creator location via the map, accumulate outcomes
-//!      per location into a histogram.
+//! Algorithm (one streaming pass per log): create events populate a
+//! `thunk_id → creator (file, line, col)` map; later resolve/errored/reset
+//! events look up that creator and update its outcome histogram.
 //!
 //! Output: list locations whose outcome multisets differ between
 //! the two logs, sorted by the earliest seq number observed at the
@@ -400,43 +397,6 @@ fn parseUntilSpace(comptime T: type, s: *[]const u8) ?T {
     return std.fmt.parseInt(T, tok, 10) catch null;
 }
 
-/// Take the value portion of a `key=value` pair starting at `s`. Values
-/// may be:
-///   - bare tokens terminated by space
-///   - quoted strings starting with `"` and ending at the matching `"`
-///     (no escape handling — escapes inside the log are `\\` and `\"`
-///     which we keep as-is for fingerprinting purposes)
-///   - structured `"file":line:col` where the quoted portion is the file
-fn takeValue(s: *[]const u8) []const u8 {
-    if (s.*.len == 0) return "";
-    if (s.*[0] == '"') {
-        // Find matching unescaped `"` then optionally consume `:N:N` suffix.
-        var i: usize = 1;
-        while (i < s.*.len) {
-            if (s.*[i] == '\\' and i + 1 < s.*.len) {
-                i += 2;
-                continue;
-            }
-            if (s.*[i] == '"') {
-                i += 1;
-                break;
-            }
-            i += 1;
-        }
-        // Continue past `:line:col` (and possibly more) until space.
-        while (i < s.*.len and s.*[i] != ' ' and s.*[i] != '\t') : (i += 1) {}
-        const out = s.*[0..i];
-        s.* = s.*[i..];
-        return out;
-    }
-    return takeUntilSpace(s);
-}
-
-fn stripQuotes(s: []const u8) []const u8 {
-    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') return s[1 .. s.len - 1];
-    return s;
-}
-
 /// Parse `"file":line:col`. Tolerates the unknown-source sentinel
 /// `"?":L:C`. Writes back into the provided pointers; sets file to ""
 /// and line/col to 0 on parse failure.
@@ -462,12 +422,8 @@ fn loadLog(arena: std.mem.Allocator, intern: *PathIntern, io: std.Io, path: []co
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
 
-    // Two passes: first builds thunk_id → creator location; second
-    // looks up the location for each resolve/errored/reset and folds
-    // the outcome into the per-location aggregate. We do both in one
-    // pass over the file by keeping a thunk_id→loc HashMap. That eats
-    // RAM (~16B/entry × millions of thunks) but the file is too big to
-    // hold in memory and reading it twice doubles disk IO.
+    // Creation precedes resolution in the trace, so one pass can retain the
+    // thunk→location index and fold each later outcome immediately.
     var thunk_to_loc: std.AutoHashMapUnmanaged(u32, LocationKey) = .empty;
 
     var read_buf: [256 * 1024]u8 = undefined;
