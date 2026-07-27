@@ -31,8 +31,8 @@ pub fn MercurialFetcher(comptime Service: type) type {
     return struct {
         service: *Service,
 
-        pub fn fetch(self: @This(), files: *FileCache, spec: types.MercurialSpec) !types.MercurialResult {
-            return self.service.fetchMercurial(files, spec);
+        pub fn fetch(self: @This(), files: *FileCache, spec: types.MercurialSpec, reporter: ?types.Reporter) !types.MercurialResult {
+            return self.service.fetchMercurial(files, spec, reporter);
         }
     };
 }

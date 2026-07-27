@@ -105,7 +105,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "file")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, null);
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchService.fetchUrl, spec.borrowed());
+        const result = try offloadFetch(self, .url, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
         defer self.allocator.free(path);
@@ -115,7 +115,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "tarball")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, "source");
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchService.fetchTarball, FetchService.TarballSpec{ .url = spec.url, .name = spec.name });
+        const result = try offloadFetch(self, .tarball, FetchService.TarballSpec{ .url = spec.url, .name = spec.name });
         defer result.deinit(self.fetchers.allocator);
         const out = try ingestFetchedTree(self, result.path, spec.name, "", null);
         defer out.deinit(self.allocator);
@@ -125,7 +125,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "git")) {
         const spec = try fetchGitSpecFromAttrs(self, attrs_id);
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchService.fetchGit, spec.borrowed());
+        const result = try offloadFetch(self, .git, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         return gitResultValue(self, spec.name, result);
     }
@@ -141,7 +141,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
             .gitlab
         else
             .sourcehut;
-        const result = try offloadFetch(self, FetchService.fetchTarball, FetchService.TarballSpec{
+        const result = try offloadFetch(self, .tarball, FetchService.TarballSpec{
             .url = spec.url,
             .name = spec.name,
             .forge = forge,
@@ -160,7 +160,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "mercurial")) {
         const spec = try fetchMercurialSpecFromAttrs(self, attrs_id);
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchService.fetchMercurial, spec.borrowed());
+        const result = try offloadFetch(self, .mercurial, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         return mercurialResultValue(self, spec.name, result);
     }

@@ -170,8 +170,20 @@ const FetchReport = struct {
 /// fetch's borrowed args stay valid because the fiber stays parked for the whole
 /// call. The blocking thread opens the progress span immediately before the
 /// `FetchCache` call and closes it immediately after.
-pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload {
-    const Res = @typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload;
+pub const FetchOperation = enum { url, tarball, git, mercurial };
+
+pub fn offloadFetch(self: *VM, comptime operation: FetchOperation, spec: anytype) anyerror!switch (operation) {
+    .url => FetchService.UrlResult,
+    .tarball => FetchService.TarballResult,
+    .git => FetchService.GitResult,
+    .mercurial => FetchService.MercurialResult,
+} {
+    const Res = switch (operation) {
+        .url => FetchService.UrlResult,
+        .tarball => FetchService.TarballResult,
+        .git => FetchService.GitResult,
+        .mercurial => FetchService.MercurialResult,
+    };
     const Cell = struct {
         fetchers: *FetchService,
         files: *FileCache,
@@ -188,7 +200,12 @@ pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype) anyerror!@
             const reporter: ?FetchService.Reporter = if (span.active()) blk: {
                 break :blk .{ .ctx = &report_store, .report = FetchReport.report };
             } else null;
-            c.res = call(c.fetchers, c.files, c.spec, reporter) catch |e| {
+            c.res = switch (operation) {
+                .url => c.fetchers.urls().fetch(c.files, c.spec, reporter),
+                .tarball => c.fetchers.urls().fetchTarball(c.files, c.spec, reporter),
+                .git => c.fetchers.git().fetch(c.files, c.spec, reporter),
+                .mercurial => c.fetchers.mercurial().fetch(c.files, c.spec, reporter),
+            } catch |e| {
                 c.err = e;
                 return;
             };
@@ -232,7 +249,7 @@ pub fn builtinFetchGit(self: *VM, arg: Value) !Value {
     const spec = try fetchGitSpec(self, arg);
     defer spec.deinit(self.allocator);
 
-    const result = try offloadFetch(self, FetchService.fetchGit, spec.borrowed());
+    const result = try offloadFetch(self, .git, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return gitResultValue(self, spec.name, result);
 }
@@ -385,7 +402,7 @@ pub fn builtinFetchurl(self: *VM, arg: Value) !Value {
             return contextStringWithPath(self, try self.intern.intern(store_path));
     }
 
-    const result = try offloadFetch(self, FetchService.fetchUrl, spec.borrowed());
+    const result = try offloadFetch(self, .url, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     try validateFetchedSha256(self, "file", spec.url, expected_hash, result.hash);
     const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
@@ -514,7 +531,7 @@ pub fn builtinFetchTarball(self: *VM, arg: Value) !Value {
             return contextStringWithPath(self, try self.intern.intern(store_path));
     }
 
-    const result = try offloadFetch(self, FetchService.fetchTarball, FetchService.TarballSpec{
+    const result = try offloadFetch(self, .tarball, FetchService.TarballSpec{
         .url = spec.url,
         .name = spec.name,
         .serialize_nar = expected_hash != null,
@@ -565,7 +582,7 @@ pub fn materializePendingFetch(self: *VM, demanded_path: []const u8) !bool {
     defer pending.deinit(self.realization.allocator);
 
     if (pending.recursive) {
-        const result = try offloadFetch(self, FetchService.fetchTarball, FetchService.TarballSpec{
+        const result = try offloadFetch(self, .tarball, FetchService.TarballSpec{
             .url = pending.url,
             .name = pending.name,
             .serialize_nar = true,
@@ -587,7 +604,7 @@ pub fn materializePendingFetch(self: *VM, demanded_path: []const u8) !bool {
         return true;
     }
 
-    const result = try offloadFetch(self, FetchService.fetchUrl, FetchService.UrlSpec{
+    const result = try offloadFetch(self, .url, FetchService.UrlSpec{
         .url = pending.url,
         .name = pending.name,
     });
@@ -641,7 +658,7 @@ pub fn builtinFetchMercurial(self: *VM, arg: Value) !Value {
     const spec = try fetchMercurialSpec(self, arg);
     defer spec.deinit(self.allocator);
 
-    const result = try offloadFetch(self, FetchService.fetchMercurial, spec.borrowed());
+    const result = try offloadFetch(self, .mercurial, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return mercurialResultValue(self, spec.name, result);
 }
