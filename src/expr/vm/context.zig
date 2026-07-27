@@ -26,7 +26,7 @@ const Scheduler = @import("../eval/workers/scheduler.zig").Scheduler;
 const heap_mod = @import("runtime").heap;
 const ObjectHeap = heap_mod.ObjectHeap;
 const FileCache = @import("store").FileCache;
-const FetchCache = @import("fetchers").FetchCache;
+const FetchService = @import("fetchers").FetchService;
 const RealizationStore = @import("store").RealizationStore;
 const eval_trace = @import("../observ.zig").trace;
 const observ = @import("base").observ;
@@ -232,7 +232,7 @@ pub const VM = struct {
     /// Evaluator-owned filesystem cache.
     files: *FileCache,
     /// Evaluator-owned network/source fetch cache.
-    fetchers: *FetchCache,
+    fetchers: *FetchService,
     /// Evaluator-owned realization service for recipes, store I/O, and builds.
     realization: *RealizationStore,
     /// Global scheduler (for spawning work).
@@ -334,7 +334,7 @@ pub const VM = struct {
         intern: *InternTable,
         heap: *ObjectHeap,
         files: *FileCache,
-        fetchers: *FetchCache,
+        fetchers: *FetchService,
         realization: *RealizationStore,
         scheduler: *Scheduler,
         trace_sink: ?*eval_trace.Trace = null,

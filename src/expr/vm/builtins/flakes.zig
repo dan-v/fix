@@ -6,7 +6,7 @@ const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
-const fetch_cache = @import("fetchers").fetch_cache;
+const FetchService = @import("fetchers").FetchService;
 const derivation = @import("store").derivation;
 const path_ops = @import("runtime").paths;
 const flake_registry = @import("flake_registry.zig");
@@ -20,7 +20,6 @@ const vm_trace = @import("../trace.zig");
 const fetch = @import("fetch.zig");
 const arguments = @import("arguments.zig");
 
-const FetchCache = fetch_cache.FetchCache;
 const attrEntryNameIndex = attrsets.attrEntryNameIndex;
 const stringArg = strings.stringArg;
 const appendStringAttr = arguments.appendStringAttr;
@@ -106,7 +105,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "file")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, null);
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed());
+        const result = try offloadFetch(self, FetchService.fetchUrl, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
         defer self.allocator.free(path);
@@ -116,7 +115,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "tarball")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, "source");
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name });
+        const result = try offloadFetch(self, FetchService.fetchTarball, FetchService.TarballSpec{ .url = spec.url, .name = spec.name });
         defer result.deinit(self.fetchers.allocator);
         const out = try ingestFetchedTree(self, result.path, spec.name, "", null);
         defer out.deinit(self.allocator);
@@ -126,7 +125,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "git")) {
         const spec = try fetchGitSpecFromAttrs(self, attrs_id);
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchCache.fetchGit, spec.borrowed());
+        const result = try offloadFetch(self, FetchService.fetchGit, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         return gitResultValue(self, spec.name, result);
     }
@@ -136,13 +135,13 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
         defer spec.deinit(self.allocator);
         // Tag the fetch with the forge so `access-tokens` are applied with the
         // right per-forge auth header (as in Nix); other fetches get no token.
-        const forge: FetchCache.Forge = if (std.mem.eql(u8, type_value, "github"))
+        const forge: FetchService.Forge = if (std.mem.eql(u8, type_value, "github"))
             .github
         else if (std.mem.eql(u8, type_value, "gitlab"))
             .gitlab
         else
             .sourcehut;
-        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
+        const result = try offloadFetch(self, FetchService.fetchTarball, FetchService.TarballSpec{
             .url = spec.url,
             .name = spec.name,
             .forge = forge,
@@ -161,7 +160,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "mercurial")) {
         const spec = try fetchMercurialSpecFromAttrs(self, attrs_id);
         defer spec.deinit(self.allocator);
-        const result = try offloadFetch(self, FetchCache.fetchMercurial, spec.borrowed());
+        const result = try offloadFetch(self, FetchService.fetchMercurial, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         return mercurialResultValue(self, spec.name, result);
     }

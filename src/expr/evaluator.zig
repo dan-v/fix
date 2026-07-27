@@ -25,7 +25,7 @@ const vm_strings = @import("vm.zig").strings;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_collector = @import("runtime").heap_collector;
 const FileCache = store_domain.FileCache;
-const FetchCache = fetchers_mod.FetchCache;
+const FetchService = fetchers_mod.FetchService;
 const regex_mod = @import("support.zig").regex;
 const corepkgs = @import("eval/imports/corepkgs.zig");
 const vma_mod = @import("runtime").mem_tag.vma;
@@ -401,7 +401,7 @@ const PrefetchState = struct {
 
 const SourceState = struct {
     files: FileCache,
-    fetchers: FetchCache,
+    fetchers: FetchService,
     imports: imports_mod.Registry = .{},
     search_paths: search_path_mod.Paths = .{},
     base_path: ?[:0]u8 = null,
@@ -518,11 +518,17 @@ pub const Evaluator = struct {
         var store = try StoreState.init(allocator);
         errdefer store.deinit();
 
+        var heap = try ObjectHeap.init(allocator, worker_count);
+        errdefer heap.deinit();
+
+        var fetch_service = try FetchService.init(allocator, .{});
+        errdefer fetch_service.deinit();
+
         const ev: Evaluator = .{
             .allocator = allocator,
             .intern = intern,
             .registry = registry,
-            .heap = try ObjectHeap.init(allocator, worker_count),
+            .heap = heap,
             .execution = .{
                 .scheduler = scheduler,
                 .vm_buffers = vm_mod.BufferPool.init(allocator),
@@ -530,7 +536,7 @@ pub const Evaluator = struct {
             },
             .sources = .{
                 .files = FileCache.init(allocator),
-                .fetchers = FetchCache.init(allocator),
+                .fetchers = fetch_service,
             },
             .store = store,
             .regexes = regex_mod.PatternCache.init(allocator),
@@ -893,7 +899,7 @@ pub const Evaluator = struct {
         return result.path;
     }
 
-    fn fetchTarball(self: *Evaluator, url: []const u8) !@import("fetchers").FetchCache.TarballResult {
+    fn fetchTarball(self: *Evaluator, url: []const u8) !@import("fetchers").FetchService.TarballResult {
         var span = self.observer.begin(&fetch_observation, .{ .subject = .{ .url = url } });
         defer span.cancel();
         const result = try self.sources.fetchers.fetchTarball(&self.sources.files, .{ .url = url, .name = "source" }, null);

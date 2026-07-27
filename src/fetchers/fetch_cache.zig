@@ -13,7 +13,10 @@ const sync = @import("base").sync;
 const curl_transport = @import("curl_transport.zig");
 const git_transport = @import("git_transport.zig");
 const BlockingPool = @import("base").BlockingPool;
-const forge_mod = @import("forge.zig");
+const fetch_types = @import("fetch/types.zig");
+const fetch_config = @import("fetch/config.zig");
+const service_api = @import("fetch/service.zig");
+const auth_mod = @import("fetch/auth.zig");
 
 /// Download-staging cache under `$XDG_CACHE_HOME/fix` (default `~/.cache/fix`,
 /// mirroring Nix's `~/.cache/nix`; falls back to `./.zig-cache/fix` when the
@@ -55,13 +58,7 @@ pub const FetchCache = struct {
     /// Opportunistic URL/tarball-cache pruning runs at most once per process.
     cache_prune_mu: sync.BlockingMutex = .{},
     cache_pruned: bool = false,
-    /// `access-tokens` from `nix.conf`: `<host>[/<path>] -> <token>`, converted
-    /// to the matching forge's HTTP header or Git credential convention.
-    access_tokens: std.ArrayListUnmanaged(TokenEntry) = .empty,
-    /// Parsed `netrc-file` entries: HTTP basic-auth credentials applied to a
-    /// plain (non-forge) download whose host matches, as Nix does via curl.
-    /// Owned; see `setNetrc`.
-    netrc: std.ArrayListUnmanaged(NetrcEntry) = .empty,
+    auth: auth_mod.Auth,
     /// The process environment (borrowed), inherited by tar and Mercurial
     /// subprocesses and consulted by the in-process transports.
     env: ?*const std.process.Environ.Map = null,
@@ -72,148 +69,58 @@ pub const FetchCache = struct {
     /// Built on first subprocess run (most evals never fetch); freed in deinit.
     subprocess_env: ?std.process.Environ.Map = null,
 
-    const TokenEntry = struct { host: []u8, token: []u8 };
-    /// A `netrc` machine entry (owned). `machine == null` is the `default` entry.
-    const NetrcEntry = struct { machine: ?[]u8, login: []u8, password: []u8 };
-
-    /// The forge whose token-header convention applies to a download. Like Nix,
-    /// `access-tokens` only authenticate forge (and git) fetches, not arbitrary
-    /// `fetchurl`/`fetchTarball`; the header format is per-forge (see
-    /// `authHeader`). Null on a spec = no token, ever.
-    pub const Forge = forge_mod.Forge;
+    pub const Forge = fetch_types.Forge;
 
     const command_stderr_limit = 512 * 1024;
-    pub const GitSpec = struct {
-        url: []const u8,
-        name: []const u8 = "source",
-        rev: ?[]const u8 = null,
-        ref: ?[]const u8 = null,
-        submodules: bool = false,
-    };
+    pub const GitSpec = fetch_types.GitSpec;
+    pub const UrlSpec = fetch_types.UrlSpec;
+    pub const TarballSpec = fetch_types.TarballSpec;
+    pub const MercurialSpec = fetch_types.MercurialSpec;
+    pub const Reporter = fetch_types.Reporter;
+    pub const UrlResult = fetch_types.UrlResult;
+    pub const TarballNar = fetch_types.TarballNar;
+    pub const TarballResult = fetch_types.TarballResult;
+    pub const ForgeMetadata = fetch_types.ForgeMetadata;
+    pub const GitResult = fetch_types.GitResult;
+    pub const MercurialResult = fetch_types.MercurialResult;
+    pub const Config = fetch_config.Config;
+    pub const UrlFetcher = service_api.UrlFetcher(FetchCache);
+    pub const GitFetcher = service_api.GitFetcher(FetchCache);
+    pub const MercurialFetcher = service_api.MercurialFetcher(FetchCache);
 
-    pub const UrlSpec = struct {
-        url: []const u8,
-        name: []const u8,
-        forge: ?Forge = null,
-        /// URL used only for access-token matching. Forge API endpoints often
-        /// have a different path (or, for github.com, a different host) from
-        /// the repository URL users configure tokens for.
-        auth_url: ?[]const u8 = null,
-    };
-
-    pub const TarballSpec = struct {
-        url: []const u8,
-        name: []const u8 = "source",
-        forge: ?Forge = null,
-        metadata_url: ?[]const u8 = null,
-        metadata_ref: ?[]const u8 = null,
-        metadata_head_url: ?[]const u8 = null,
-        resolved_rev: ?[]const u8 = null,
-        /// Forge archive URL containing one or more literal `{rev}` markers.
-        /// When metadata resolves a symbolic ref, download this exact commit
-        /// rather than racing the mutable ref between API and archive calls.
-        resolved_url_template: ?[]const u8 = null,
-        /// Serialize and hash the unpacked tree while still on the bounded
-        /// fetch worker. Direct hashed fetchTarball requests this payload;
-        /// unhashed and fetchTree callers retain the original extraction-only
-        /// path.
-        serialize_nar: bool = false,
-    };
-
-    pub const MercurialSpec = struct {
-        url: []const u8,
-        name: []const u8 = "source",
-        rev: ?[]const u8 = null,
-    };
-
-    /// Byte-progress callback for a download (from the fetching thread). `total`
-    /// 0 = size not yet known. The vm/observ layer wraps a progress span in one
-    /// of these; runtime stays unaware of the progress types.
-    pub const Reporter = struct {
-        ctx: *anyopaque,
-        report: *const fn (ctx: *anyopaque, downloaded: u64, total: u64) void,
-
-        fn emit(self: ?Reporter, downloaded: u64, total: u64) void {
-            if (self) |r| r.report(r.ctx, downloaded, total);
-        }
-    };
-
-    pub const UrlResult = struct {
-        path: []u8,
-        hash: []u8,
-        /// True when a fresh URL-cache entry supplied the content without a
-        /// network transfer during this operation.
-        cached: bool = false,
-
-        pub fn deinit(self: UrlResult, allocator: std.mem.Allocator) void {
-            allocator.free(self.path);
-            allocator.free(self.hash);
-        }
-    };
-
-    pub const TarballNar = struct {
-        bytes: []u8,
-        digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
-    };
-
-    pub const TarballResult = struct {
-        path: []u8,
-        nar_payload: ?TarballNar,
-        forge_metadata: ?ForgeMetadata,
-        cached: bool = false,
-
-        pub fn deinit(self: TarballResult, allocator: std.mem.Allocator) void {
-            allocator.free(self.path);
-            if (self.nar_payload) |payload| allocator.free(payload.bytes);
-            if (self.forge_metadata) |metadata| metadata.deinit(allocator);
-        }
-    };
-
-    pub const ForgeMetadata = struct {
-        rev: []u8,
-        last_modified: i64,
-        last_modified_date: []u8,
-
-        fn deinit(self: ForgeMetadata, allocator: std.mem.Allocator) void {
-            allocator.free(self.rev);
-            allocator.free(self.last_modified_date);
-        }
-    };
-
-    pub const GitResult = struct {
-        out_path: []u8,
-        rev: []u8,
-        short_rev: []u8,
-        rev_count: i64,
-        last_modified: i64,
-        last_modified_date: []u8,
-        submodules: bool,
-
-        pub fn deinit(self: GitResult, allocator: std.mem.Allocator) void {
-            allocator.free(self.out_path);
-            allocator.free(self.rev);
-            allocator.free(self.short_rev);
-            allocator.free(self.last_modified_date);
-        }
-    };
-
-    pub const MercurialResult = struct {
-        out_path: []u8,
-        rev: []u8,
-        short_rev: []u8,
-
-        pub fn deinit(self: MercurialResult, allocator: std.mem.Allocator) void {
-            allocator.free(self.out_path);
-            allocator.free(self.rev);
-            allocator.free(self.short_rev);
-        }
-    };
-
-    pub fn init(allocator: std.mem.Allocator) FetchCache {
-        return .{
+    pub fn init(allocator: std.mem.Allocator, config: Config) !FetchCache {
+        var service: FetchCache = .{
             .allocator = allocator,
-            .io = null,
+            .io = config.io,
+            .auth = auth_mod.Auth.init(allocator),
         };
+        errdefer service.deinit();
+
+        service.download_attempts = @max(1, config.download_attempts);
+        service.tarball_ttl = config.tarball_ttl;
+        service.connect_timeout_seconds = config.connect_timeout_seconds;
+        service.stalled_timeout_seconds = config.stalled_timeout_seconds;
+        service.download_speed_kib = config.download_speed_kib;
+        if (config.environment) |environment| service.setEnvironment(environment);
+        if (config.cache_root) |root| try service.setCacheRoot(root);
+        if (config.ssl_cert_file) |path| try service.setSslCertFile(path);
+        try service.setFlakeRegistryUrl(config.flake_registry_url);
+        if (config.access_tokens) |tokens| try service.setAccessTokens(tokens);
+        if (config.netrc) |netrc| try service.setNetrc(netrc);
+        try service.setMaxConnections(config.max_connections);
+        return service;
+    }
+
+    pub fn urls(self: *FetchCache) UrlFetcher {
+        return .{ .service = self };
+    }
+
+    pub fn git(self: *FetchCache) GitFetcher {
+        return .{ .service = self };
+    }
+
+    pub fn mercurial(self: *FetchCache) MercurialFetcher {
+        return .{ .service = self };
     }
 
     pub fn deinit(self: *FetchCache) void {
@@ -224,111 +131,16 @@ pub const FetchCache = struct {
         if (self.cache_root) |root| self.allocator.free(root);
         if (self.ssl_cert_file) |path| self.allocator.free(path);
         if (self.flake_registry_url) |url| self.allocator.free(url);
-        self.deinitAccessTokens(&self.access_tokens);
-        self.deinitNetrc(&self.netrc);
+        self.auth.deinit();
         if (self.subprocess_env) |*e| e.deinit();
     }
 
-    fn deinitNetrc(self: *FetchCache, entries: *std.ArrayListUnmanaged(NetrcEntry)) void {
-        for (entries.items) |e| {
-            if (e.machine) |m| self.allocator.free(m);
-            self.allocator.free(e.login);
-            self.allocator.free(e.password);
-        }
-        entries.deinit(self.allocator);
-        entries.* = .empty;
-    }
-
-    /// Parse a `netrc`-format file into credential entries, replacing the
-    /// current set. Handles the `machine`/`default`/`login`/`password`/`account`
-    /// keywords (whitespace-separated tokens); `macdef` bodies are not executed
-    /// (the name and next token are skipped). Later duplicate machines just add
-    /// another entry; lookup takes the first match.
     pub fn setNetrc(self: *FetchCache, content: []const u8) !void {
-        var replacement: std.ArrayListUnmanaged(NetrcEntry) = .empty;
-        errdefer self.deinitNetrc(&replacement);
-        var it = std.mem.tokenizeAny(u8, content, " \t\r\n");
-        var cur: ?usize = null;
-        while (it.next()) |tok| {
-            if (std.mem.eql(u8, tok, "machine")) {
-                const name = it.next() orelse break;
-                try replacement.ensureUnusedCapacity(self.allocator, 1);
-                const machine = try self.allocator.dupe(u8, name);
-                errdefer self.allocator.free(machine);
-                const login = try self.allocator.dupe(u8, "");
-                errdefer self.allocator.free(login);
-                const password = try self.allocator.dupe(u8, "");
-                errdefer self.allocator.free(password);
-                replacement.appendAssumeCapacity(.{
-                    .machine = machine,
-                    .login = login,
-                    .password = password,
-                });
-                cur = replacement.items.len - 1;
-            } else if (std.mem.eql(u8, tok, "default")) {
-                try replacement.ensureUnusedCapacity(self.allocator, 1);
-                const login = try self.allocator.dupe(u8, "");
-                errdefer self.allocator.free(login);
-                const password = try self.allocator.dupe(u8, "");
-                errdefer self.allocator.free(password);
-                replacement.appendAssumeCapacity(.{
-                    .machine = null,
-                    .login = login,
-                    .password = password,
-                });
-                cur = replacement.items.len - 1;
-            } else if (std.mem.eql(u8, tok, "login")) {
-                const v = it.next() orelse break;
-                if (cur) |i| {
-                    const login = try self.allocator.dupe(u8, v);
-                    self.allocator.free(replacement.items[i].login);
-                    replacement.items[i].login = login;
-                }
-            } else if (std.mem.eql(u8, tok, "password")) {
-                const v = it.next() orelse break;
-                if (cur) |i| {
-                    const password = try self.allocator.dupe(u8, v);
-                    self.allocator.free(replacement.items[i].password);
-                    replacement.items[i].password = password;
-                }
-            } else if (std.mem.eql(u8, tok, "account") or std.mem.eql(u8, tok, "macdef")) {
-                _ = it.next(); // skip the value / macro name
-            }
-        }
-
-        self.deinitNetrc(&self.netrc);
-        self.netrc = replacement;
+        return self.auth.setNetrc(content);
     }
 
-    /// The `Authorization: Basic` header for a request to `url` if the netrc has
-    /// credentials for its host (exact `machine` match, else the `default`
-    /// entry). Null if none. Owned; caller frees.
     fn netrcHeader(self: *const FetchCache, url: []const u8) !?AuthHeader {
-        if (self.netrc.items.len == 0) return null;
-        const host = urlHostPath(url).host;
-        var match: ?NetrcEntry = null;
-        for (self.netrc.items) |e| {
-            if (e.machine) |m| if (std.mem.eql(u8, m, host)) {
-                match = e;
-                break;
-            };
-        }
-        if (match == null) for (self.netrc.items) |e| {
-            if (e.machine == null) {
-                match = e;
-                break;
-            }
-        };
-        const e = match orelse return null;
-        if (e.login.len == 0) return null;
-        const alloc = self.allocator;
-        const creds = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ e.login, e.password });
-        defer alloc.free(creds);
-        const enc = std.base64.standard.Encoder;
-        const buf = try alloc.alloc(u8, enc.calcSize(creds.len));
-        defer alloc.free(buf);
-        const b64 = enc.encode(buf, creds);
-        return try authHeaderFormat(alloc, "Authorization", "Basic {s}", .{b64});
+        return self.auth.netrcHeader(url);
     }
 
     pub fn setIo(self: *FetchCache, io: std.Io) void {
@@ -363,111 +175,23 @@ pub const FetchCache = struct {
         return &self.subprocess_env.?;
     }
 
-    /// Parse a `nix.conf` `access-tokens` value — space-separated
-    /// `<host>[/<path>]=<token>` entries — replacing the current set. Later
-    /// entries win on a duplicate key. Malformed entries (no `=`) are skipped.
     pub fn setAccessTokens(self: *FetchCache, raw: []const u8) !void {
-        var replacement: std.ArrayListUnmanaged(TokenEntry) = .empty;
-        errdefer self.deinitAccessTokens(&replacement);
-        var it = std.mem.tokenizeAny(u8, raw, " \t");
-        while (it.next()) |entry| {
-            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-            const host = entry[0..eq];
-            const token = entry[eq + 1 ..];
-            if (host.len == 0 or token.len == 0) continue;
-            try replacement.ensureUnusedCapacity(self.allocator, 1);
-            const owned_host = try self.allocator.dupe(u8, host);
-            errdefer self.allocator.free(owned_host);
-            const owned_token = try self.allocator.dupe(u8, token);
-            errdefer self.allocator.free(owned_token);
-            replacement.appendAssumeCapacity(.{
-                .host = owned_host,
-                .token = owned_token,
-            });
-        }
-
-        self.deinitAccessTokens(&self.access_tokens);
-        self.access_tokens = replacement;
-    }
-
-    fn deinitAccessTokens(self: *FetchCache, entries: *std.ArrayListUnmanaged(TokenEntry)) void {
-        for (entries.items) |entry| {
-            self.allocator.free(entry.host);
-            self.allocator.free(entry.token);
-        }
-        entries.deinit(self.allocator);
-        entries.* = .empty;
+        return self.auth.setAccessTokens(raw);
     }
 
     /// Split `url` into its host (authority without `user@`/`:port`) and path.
-    fn urlHostPath(url: []const u8) struct { host: []const u8, path: []const u8 } {
-        var rest = url;
-        if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
-        const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
-        var authority = rest[0..path_start];
-        if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
-        if (std.mem.indexOfScalar(u8, authority, ':')) |c| authority = authority[0..c];
-        return .{ .host = authority, .path = rest[path_start..] };
+    fn urlHostPath(url: []const u8) auth_mod.UrlHostPath {
+        return auth_mod.urlHostPath(url);
     }
 
     /// The access token for a request to `url`, matched by the longest
     /// `<host>[/<path>]` key that is a prefix of the URL's `host/path` (so
     /// `github.com/org` beats a bare `github.com`). Null if none matches.
     fn tokenFor(self: *const FetchCache, url: []const u8) ?[]const u8 {
-        if (self.access_tokens.items.len == 0) return null;
-        const hp = urlHostPath(url);
-        const lookup = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ hp.host, hp.path }) catch return null;
-        defer self.allocator.free(lookup);
-
-        var best: ?[]const u8 = null;
-        var best_len: usize = 0;
-        for (self.access_tokens.items) |t| {
-            const matches = std.mem.eql(u8, lookup, t.host) or
-                (lookup.len > t.host.len and std.mem.startsWith(u8, lookup, t.host) and lookup[t.host.len] == '/');
-            if (matches and t.host.len >= best_len) {
-                best = t.token;
-                best_len = t.host.len;
-            }
-        }
-        return best;
+        return self.auth.tokenFor(url);
     }
 
-    /// An owned HTTP header for an authenticated forge request.
-    pub const AuthHeader = struct {
-        name: []u8,
-        value: []u8,
-        fn deinit(self: AuthHeader, allocator: std.mem.Allocator) void {
-            allocator.free(self.name);
-            allocator.free(self.value);
-        }
-    };
-
-    fn authHeaderCopy(
-        allocator: std.mem.Allocator,
-        name: []const u8,
-        value: []const u8,
-    ) !AuthHeader {
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-        return .{
-            .name = owned_name,
-            .value = try allocator.dupe(u8, value),
-        };
-    }
-
-    fn authHeaderFormat(
-        allocator: std.mem.Allocator,
-        name: []const u8,
-        comptime fmt: []const u8,
-        args: anytype,
-    ) !AuthHeader {
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-        return .{
-            .name = owned_name,
-            .value = try std.fmt.allocPrint(allocator, fmt, args),
-        };
-    }
+    pub const AuthHeader = auth_mod.Header;
 
     /// Build the `access-tokens` auth header for a `forge` request to `url`, per
     /// Nix's per-forge conventions (`libfetchers/github.cc:accessHeaderFromToken`):
@@ -478,29 +202,7 @@ pub const FetchCache = struct {
     ///     header `<type>: <value>` (a bare, colon-less token yields the Nix
     ///     degenerate `<token>:` empty-value header). Null if no token matches.
     fn authHeader(self: *const FetchCache, forge: Forge, url: []const u8) !?AuthHeader {
-        var github_lookup: ?[]u8 = null;
-        defer if (github_lookup) |value| self.allocator.free(value);
-        const direct = self.tokenFor(url);
-        const token = direct orelse token: {
-            if (forge != .github or !std.mem.eql(u8, urlHostPath(url).host, "codeload.github.com")) return null;
-            github_lookup = try std.fmt.allocPrint(self.allocator, "https://github.com{s}", .{urlHostPath(url).path});
-            break :token self.tokenFor(github_lookup.?) orelse return null;
-        };
-        const alloc = self.allocator;
-        return switch (forge) {
-            .github => try authHeaderFormat(alloc, "Authorization", "token {s}", .{token}),
-            .sourcehut => try authHeaderFormat(alloc, "Authorization", "Bearer {s}", .{token}),
-            .gitlab => blk: {
-                const colon = std.mem.indexOfScalar(u8, token, ':');
-                const kind = if (colon) |c| token[0..c] else token;
-                const value = if (colon) |c| token[c + 1 ..] else "";
-                if (std.mem.eql(u8, kind, "OAuth2"))
-                    break :blk try authHeaderFormat(alloc, "Authorization", "Bearer {s}", .{value});
-                if (std.mem.eql(u8, kind, "PAT"))
-                    break :blk try authHeaderCopy(alloc, "Private-token", value);
-                break :blk try authHeaderCopy(alloc, kind, value);
-            },
-        };
+        return self.auth.forgeHeader(forge, url);
     }
 
     /// Set the concurrent-fetch cap (`http-connections`; 0 = unlimited).
@@ -1250,43 +952,10 @@ pub const FetchCache = struct {
         return self.gitResultFromTransport(path, result, spec.submodules);
     }
 
-    const GitCredential = struct {
-        username: []u8,
-        password: []u8,
-        fn deinit(self: GitCredential, allocator: std.mem.Allocator) void {
-            allocator.free(self.username);
-            allocator.free(self.password);
-        }
-    };
+    const GitCredential = auth_mod.Credentials;
 
     fn gitCredential(self: *const FetchCache, url: []const u8) !?GitCredential {
-        if (self.tokenFor(url)) |token_raw| {
-            const colon = std.mem.indexOfScalar(u8, token_raw, ':');
-            const host = urlHostPath(url).host;
-            const token = if (colon) |index| token: {
-                const kind = token_raw[0..index];
-                break :token if (std.mem.eql(u8, kind, "PAT") or std.mem.eql(u8, kind, "OAuth2")) token_raw[index + 1 ..] else token_raw;
-            } else token_raw;
-            return try self.ownedGitCredential(if (std.mem.indexOf(u8, host, "github") != null) "x-access-token" else "oauth2", token);
-        }
-        const host = urlHostPath(url).host;
-        var fallback: ?NetrcEntry = null;
-        for (self.netrc.items) |entry| {
-            if (entry.machine) |machine| {
-                if (std.mem.eql(u8, machine, host)) return if (entry.login.len == 0) null else try self.ownedGitCredential(entry.login, entry.password);
-            } else if (fallback == null) fallback = entry;
-        }
-        if (fallback) |entry| if (entry.login.len != 0) return try self.ownedGitCredential(entry.login, entry.password);
-        return null;
-    }
-
-    fn ownedGitCredential(self: *const FetchCache, username: []const u8, password: []const u8) !GitCredential {
-        const owned_username = try self.allocator.dupe(u8, username);
-        errdefer self.allocator.free(owned_username);
-        return .{
-            .username = owned_username,
-            .password = try self.allocator.dupe(u8, password),
-        };
+        return self.auth.gitCredentials(url);
     }
 
     fn timestampFresh(self: *FetchCache, io: std.Io, marker: []const u8) !bool {
@@ -1601,7 +1270,7 @@ test "forge archive revision templates pin every ref occurrence" {
 
 test "access-tokens: parse and longest-prefix host/path match" {
     const testing = std.testing;
-    var fc = FetchCache.init(testing.allocator);
+    var fc = try FetchCache.init(testing.allocator, .{});
     defer fc.deinit();
     try fc.setAccessTokens("github.com=ghp_base gitlab.example.org=glpat github.com/acme=ghp_acme  =skip  bad_no_eq");
 
@@ -1618,7 +1287,7 @@ test "access-tokens: parse and longest-prefix host/path match" {
 }
 
 fn checkOwnedConfigurationAllocationFailures(allocator: std.mem.Allocator) !void {
-    var cache = FetchCache.init(allocator);
+    var cache = try FetchCache.init(allocator, .{});
     defer cache.deinit();
 
     try cache.setNetrc(
@@ -1658,7 +1327,7 @@ test "owned fetch configuration handles every allocation failure" {
 
 test "netrc: basic-auth header by machine, else default" {
     const testing = std.testing;
-    var fc = FetchCache.init(testing.allocator);
+    var fc = try FetchCache.init(testing.allocator, .{});
     defer fc.deinit();
     try fc.setNetrc(
         \\machine example.com login alice password s3cret
@@ -1687,7 +1356,7 @@ test "netrc: basic-auth header by machine, else default" {
     // to `default` — the host has its own entry).
     try testing.expect((try fc.netrcHeader("https://noauth.example/x")) == null);
 
-    var empty = FetchCache.init(testing.allocator);
+    var empty = try FetchCache.init(testing.allocator, .{});
     defer empty.deinit();
     try testing.expect((try empty.netrcHeader("https://example.com")) == null);
 }
@@ -1699,7 +1368,7 @@ test "subprocess env: inherits parent and normalizes Mercurial" {
     try parent.put("HOME", "/home/u");
     try parent.put("SSH_AUTH_SOCK", "/run/ssh");
 
-    var fc = FetchCache.init(testing.allocator);
+    var fc = try FetchCache.init(testing.allocator, .{});
     defer fc.deinit();
     fc.setEnvironment(&parent);
 
@@ -1709,14 +1378,14 @@ test "subprocess env: inherits parent and normalizes Mercurial" {
     try testing.expectEqualStrings("/run/ssh", env.get("SSH_AUTH_SOCK").?); // inherited (creds/ssh)
 
     // With no environment set, subprocesses inherit the parent unchanged (null).
-    var bare = FetchCache.init(testing.allocator);
+    var bare = try FetchCache.init(testing.allocator, .{});
     defer bare.deinit();
     try testing.expect((try bare.subprocessEnviron()) == null);
 }
 
 test "access-tokens: per-forge auth header (matches Nix)" {
     const testing = std.testing;
-    var fc = FetchCache.init(testing.allocator);
+    var fc = try FetchCache.init(testing.allocator, .{});
     defer fc.deinit();
     try fc.setAccessTokens("github.com=ghp_x gl.example.org=PAT:glpat gl2.example.org=OAuth2:oa sh.example.org=shtok gitea.example.org=abc:def git.sr.ht=srhtok");
 
@@ -1774,7 +1443,7 @@ test "fetchTarball only serializes NAR when requested" {
     var files = FileCache.init(testing.allocator);
     defer files.deinit();
     files.setIo(testing.io);
-    var fc = FetchCache.init(testing.allocator);
+    var fc = try FetchCache.init(testing.allocator, .{});
     defer fc.deinit();
     fc.setIo(testing.io);
     try fc.setCacheRoot(cache_path);
@@ -1800,7 +1469,7 @@ test "URL metadata cheaply reuses immutable files and verifies legacy entries" {
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
-    var fc = FetchCache.init(testing.allocator);
+    var fc = try FetchCache.init(testing.allocator, .{});
     defer fc.deinit();
     fc.setIo(testing.io);
     try fc.setCacheRoot(root);
@@ -1855,7 +1524,7 @@ test "URL generation pruning uses explicit timestamps and removes legacy orphans
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
-    var fc = FetchCache.init(testing.allocator);
+    var fc = try FetchCache.init(testing.allocator, .{});
     defer fc.deinit();
     fc.setIo(testing.io);
     try fc.setCacheRoot(root);
@@ -1901,7 +1570,7 @@ test "URL generation pruning uses explicit timestamps and removes legacy orphans
 }
 
 test "http-connections zero remains truly unlimited" {
-    var fc = FetchCache.init(std.testing.allocator);
+    var fc = try FetchCache.init(std.testing.allocator, .{});
     defer fc.deinit();
     try fc.setMaxConnections(0);
     try std.testing.expectEqual(@as(u32, 0), fc.max_connections);
@@ -1937,7 +1606,7 @@ test "remote URL retries transient status then reuses the verified TTL cache" {
     var files = FileCache.init(testing.allocator);
     defer files.deinit();
     files.setIo(testing.io);
-    var fc = FetchCache.init(testing.allocator);
+    var fc = try FetchCache.init(testing.allocator, .{});
     defer fc.deinit();
     fc.setIo(testing.io);
     fc.setDownloadAttempts(2);

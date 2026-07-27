@@ -10,7 +10,7 @@ const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
 const fetchers = @import("fetchers");
 const file_cache = fetchers.file_cache;
-const fetch_cache = fetchers.fetch_cache;
+const FetchService = fetchers.FetchService;
 const forge_mod = fetchers.forge;
 const derivation = @import("store").derivation;
 const nar = fetchers.nar;
@@ -55,7 +55,7 @@ pub const FetchGitSpec = struct {
         if (self.ref) |ref| allocator.free(ref);
     }
 
-    pub fn borrowed(self: FetchGitSpec) fetch_cache.FetchCache.GitSpec {
+    pub fn borrowed(self: FetchGitSpec) FetchService.GitSpec {
         return .{
             .url = self.url,
             .name = self.name,
@@ -129,7 +129,7 @@ fn hgFilterAccept(_: *anyopaque, path: []const u8, _: file_cache.FileCache.FileK
 var hg_filter_ctx: u8 = 0;
 const hg_filter = nar.Filter{ .context = &hg_filter_ctx, .accept = hgFilterAccept };
 
-pub fn mercurialResultValue(self: *VM, name: []const u8, result: fetch_cache.FetchCache.MercurialResult) !Value {
+pub fn mercurialResultValue(self: *VM, name: []const u8, result: FetchService.MercurialResult) !Value {
     const out = try ingestFetchedTree(self, result.out_path, name, result.rev, hg_filter);
     defer out.deinit(self.allocator);
     const entries = [_]heap_mod.AttrEntry{
@@ -141,7 +141,6 @@ pub fn mercurialResultValue(self: *VM, name: []const u8, result: fetch_cache.Fet
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-const FetchCache = fetch_cache.FetchCache;
 const FileCache = file_cache.FileCache;
 
 /// Wraps a fetch progress span so the runtime download loop can report bytes
@@ -174,7 +173,7 @@ const FetchReport = struct {
 pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload {
     const Res = @typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload;
     const Cell = struct {
-        fetchers: *FetchCache,
+        fetchers: *FetchService,
         files: *FileCache,
         spec: @TypeOf(spec),
         observer: observ.Observer,
@@ -186,7 +185,7 @@ pub fn offloadFetch(self: *VM, comptime call: anytype, spec: anytype) anyerror!@
             var span = c.observer.begin(&fetch_observation, .{ .subject = .{ .url = c.spec.url } });
             defer span.cancel();
             var report_store: FetchReport = .{ .span = &span };
-            const reporter: ?FetchCache.Reporter = if (span.active()) blk: {
+            const reporter: ?FetchService.Reporter = if (span.active()) blk: {
                 break :blk .{ .ctx = &report_store, .report = FetchReport.report };
             } else null;
             c.res = call(c.fetchers, c.files, c.spec, reporter) catch |e| {
@@ -233,12 +232,12 @@ pub fn builtinFetchGit(self: *VM, arg: Value) !Value {
     const spec = try fetchGitSpec(self, arg);
     defer spec.deinit(self.allocator);
 
-    const result = try offloadFetch(self, FetchCache.fetchGit, spec.borrowed());
+    const result = try offloadFetch(self, FetchService.fetchGit, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return gitResultValue(self, spec.name, result);
 }
 
-pub fn gitResultValue(self: *VM, name: []const u8, result: fetch_cache.FetchCache.GitResult) !Value {
+pub fn gitResultValue(self: *VM, name: []const u8, result: FetchService.GitResult) !Value {
     const out = try ingestFetchedTree(self, result.out_path, name, result.rev, git_filter);
     defer out.deinit(self.allocator);
     const entries = [_]heap_mod.AttrEntry{
@@ -357,7 +356,7 @@ pub const FetchUrlSpec = struct {
         allocator.free(self.name);
     }
 
-    pub fn borrowed(self: FetchUrlSpec) fetch_cache.FetchCache.UrlSpec {
+    pub fn borrowed(self: FetchUrlSpec) FetchService.UrlSpec {
         return .{ .url = self.url, .name = self.name };
     }
 };
@@ -386,7 +385,7 @@ pub fn builtinFetchurl(self: *VM, arg: Value) !Value {
             return contextStringWithPath(self, try self.intern.intern(store_path));
     }
 
-    const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed());
+    const result = try offloadFetch(self, FetchService.fetchUrl, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     try validateFetchedSha256(self, "file", spec.url, expected_hash, result.hash);
     const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
@@ -515,7 +514,7 @@ pub fn builtinFetchTarball(self: *VM, arg: Value) !Value {
             return contextStringWithPath(self, try self.intern.intern(store_path));
     }
 
-    const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
+    const result = try offloadFetch(self, FetchService.fetchTarball, FetchService.TarballSpec{
         .url = spec.url,
         .name = spec.name,
         .serialize_nar = expected_hash != null,
@@ -566,7 +565,7 @@ pub fn materializePendingFetch(self: *VM, demanded_path: []const u8) !bool {
     defer pending.deinit(self.realization.allocator);
 
     if (pending.recursive) {
-        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
+        const result = try offloadFetch(self, FetchService.fetchTarball, FetchService.TarballSpec{
             .url = pending.url,
             .name = pending.name,
             .serialize_nar = true,
@@ -588,7 +587,7 @@ pub fn materializePendingFetch(self: *VM, demanded_path: []const u8) !bool {
         return true;
     }
 
-    const result = try offloadFetch(self, FetchCache.fetchUrl, FetchCache.UrlSpec{
+    const result = try offloadFetch(self, FetchService.fetchUrl, FetchService.UrlSpec{
         .url = pending.url,
         .name = pending.name,
     });
@@ -632,7 +631,7 @@ pub const FetchMercurialSpec = struct {
         if (self.rev) |rev| allocator.free(rev);
     }
 
-    pub fn borrowed(self: FetchMercurialSpec) fetch_cache.FetchCache.MercurialSpec {
+    pub fn borrowed(self: FetchMercurialSpec) FetchService.MercurialSpec {
         return .{ .url = self.url, .name = self.name, .rev = self.rev };
     }
 };
@@ -642,7 +641,7 @@ pub fn builtinFetchMercurial(self: *VM, arg: Value) !Value {
     const spec = try fetchMercurialSpec(self, arg);
     defer spec.deinit(self.allocator);
 
-    const result = try offloadFetch(self, FetchCache.fetchMercurial, spec.borrowed());
+    const result = try offloadFetch(self, FetchService.fetchMercurial, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return mercurialResultValue(self, spec.name, result);
 }
@@ -713,7 +712,7 @@ pub fn forgeTreeSpec(self: *VM, attrs_id: ObjectId, forge: []const u8) !ForgeTre
     };
 }
 
-pub fn githubTreeValue(self: *VM, path: []const u8, nar_hash: []const u8, rev: ?[]const u8, metadata: ?FetchCache.ForgeMetadata) !Value {
+pub fn githubTreeValue(self: *VM, path: []const u8, nar_hash: []const u8, rev: ?[]const u8, metadata: ?FetchService.ForgeMetadata) !Value {
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
     try entries.appendSlice(self.allocator, &.{
