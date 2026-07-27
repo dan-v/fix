@@ -653,17 +653,19 @@ const Repl = struct {
         }
         const tooling = self.ev.tooling();
         const entries = tooling.attrs(forced) catch return false;
-        var added: usize = 0;
+        var updates: std.ArrayListUnmanaged(Engine.ScopeBinding) = .empty;
+        defer updates.deinit(self.allocator);
+        try updates.ensureTotalCapacity(self.allocator, entries.len);
         for (entries) |entry| {
-            const name = tooling.internText(entry.name);
-            try self.bindNoRebuild(name, entry.value);
-            added += 1;
+            updates.appendAssumeCapacity(.{
+                .name = tooling.internText(entry.name),
+                .value = entry.value,
+            });
         }
-        // One scope rebuild for the whole file, not one per attribute.
-        try self.rebuildScope();
+        try self.applyBindingUpdates(updates.items);
         var out = self.output();
         defer out.flush() catch {};
-        try out.writer().print("added {d} bindings\n", .{added});
+        try out.writer().print("added {d} bindings\n", .{entries.len});
         return true;
     }
 
@@ -671,29 +673,73 @@ const Repl = struct {
 
     /// Bind `name` to `value` and rebuild the scope attrset + GC roots.
     fn bind(self: *Repl, name: []const u8, value: Value) !void {
-        try self.bindNoRebuild(name, value);
-        try self.rebuildScope();
+        try self.applyBindingUpdates(&.{.{ .name = name, .value = value }});
     }
 
-    fn bindNoRebuild(self: *Repl, name: []const u8, value: Value) !void {
-        const gop = try self.bindings.getOrPut(self.allocator, name);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, name);
+    /// Apply one or more binding changes as one transaction. Every owned key,
+    /// map capacity, candidate scope, and evaluator root replacement exists
+    /// before the live binding map changes; after the root swap, commit is
+    /// allocation-free.
+    fn applyBindingUpdates(self: *Repl, updates: []const Engine.ScopeBinding) !void {
+        if (updates.len == 0) return;
+
+        var update_values: std.StringHashMapUnmanaged(Value) = .empty;
+        defer update_values.deinit(self.allocator);
+        try update_values.ensureTotalCapacity(self.allocator, @intCast(updates.len));
+        for (updates) |update| {
+            const gop = update_values.getOrPutAssumeCapacity(update.name);
+            std.debug.assert(!gop.found_existing);
+            gop.value_ptr.* = update.value;
         }
-        gop.value_ptr.* = value;
-    }
 
-    /// Ask the evaluator to rebuild the scope attrset and replace its GC roots
-    /// as one operation.
-    fn rebuildScope(self: *Repl) !void {
-        var bindings: std.ArrayListUnmanaged(Engine.ScopeBinding) = .empty;
-        defer bindings.deinit(self.allocator);
+        var new_count: usize = 0;
+        for (updates) |update| {
+            if (!self.bindings.contains(update.name)) new_count += 1;
+        }
+        try self.bindings.ensureUnusedCapacity(self.allocator, new_count);
 
+        const OwnedBinding = struct { name: []u8, value: Value };
+        var new_bindings: std.ArrayListUnmanaged(OwnedBinding) = .empty;
+        defer new_bindings.deinit(self.allocator);
+        try new_bindings.ensureTotalCapacity(self.allocator, new_count);
+        var keys_committed = false;
+        defer if (!keys_committed) {
+            for (new_bindings.items) |binding| self.allocator.free(binding.name);
+        };
+        for (updates) |update| {
+            if (self.bindings.contains(update.name)) continue;
+            new_bindings.appendAssumeCapacity(.{
+                .name = try self.allocator.dupe(u8, update.name),
+                .value = update.value,
+            });
+        }
+
+        var candidate: std.ArrayListUnmanaged(Engine.ScopeBinding) = .empty;
+        defer candidate.deinit(self.allocator);
+        try candidate.ensureTotalCapacity(self.allocator, self.bindings.count() + new_count);
         var it = self.bindings.iterator();
         while (it.next()) |e| {
-            try bindings.append(self.allocator, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
+            candidate.appendAssumeCapacity(.{
+                .name = e.key_ptr.*,
+                .value = update_values.get(e.key_ptr.*) orelse e.value_ptr.*,
+            });
         }
-        self.scope = try self.ev.replaceExternalScope(bindings.items);
+        for (new_bindings.items) |binding| {
+            candidate.appendAssumeCapacity(.{ .name = binding.name, .value = binding.value });
+        }
+
+        const replacement_scope = try self.ev.replaceExternalScope(candidate.items);
+
+        for (updates) |update| {
+            if (self.bindings.getPtr(update.name)) |value| value.* = update.value;
+        }
+        for (new_bindings.items) |binding| {
+            const gop = self.bindings.getOrPutAssumeCapacity(binding.name);
+            std.debug.assert(!gop.found_existing);
+            gop.value_ptr.* = binding.value;
+        }
+        keys_committed = true;
+        self.scope = replacement_scope;
     }
 
     /// The between-inputs collection: reclaim the last evaluation's garbage
