@@ -646,118 +646,101 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 replayCachedMessage(self, info.*.message);
                 return info.*.err;
             },
-            .claimed => {
-                // Discovery probe: main out-ran the helpers — this thunk was
-                // not resolved ahead of demand, so main must compute it itself.
-                // The age probe additionally buckets how long the thunk sat
-                // forcible before main reached it (look-ahead ceiling).
-                var age_t: u64 = std.math.maxInt(u64);
-                if (comptime prof.enabled) {
-                    if (real_demand and self.workerId() == 0) {
-                        prof_census.disc.claimed_by_main += 1;
-                        // Coverage-miss breakdown: main is computing this
-                        // itself, so speculation did NOT cover it. Split by
-                        // whether spec ever aimed here (disposition) crossed
-                        // with whether it had time to (age).
-                        prof_census.recordCoverage(
-                            thunk.specDispValue(),
-                            thunk.created_tsc,
-                            @intFromEnum(thunk.targetKind()),
-                        );
-                        age_t = prof.ageForceBegin(
-                            thunk.created_tsc,
-                            @intFromEnum(thunk.targetKind()),
-                            pathKey(self, &thunk.payload.target, thunk.targetKind()),
-                        );
-                    }
-                }
-                defer if (comptime prof.enabled) prof.ageForceEnd(age_t);
-                try enforceSpeculationBudget(self, thunk, thunk_id);
-                const memo_key = claimedMemoKey(self, thunk);
-                if (memo_key) |key|
-                    if (reuseMemoizedThunk(self, thunk, thunk_id, key, real_demand)) |value| return value;
-
-                const effect_checkpoint = self.effect_journal.items.len;
-                const effect_epoch = self.effect_epoch;
-
-                const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
-                defer prof_path.exit(pp);
-                trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
-                // An evaluating thunk is off the operand stack. Once transient
-                // rooting is active, the force chain keeps its target reachable
-                // across nested collections. Before activation the thunk is
-                // below the collector's sweep floor; arming occurs at STW.
-                const gc_root_chain = self.heap.collection.root_active;
-                if (gc_root_chain) self.gc_roots.force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
-                defer {
-                    if (gc_root_chain) _ = self.gc_roots.force_chain.pop();
-                }
-                // Native-stack guard, checked right before we run the body (the
-                // recursion point). Forcing recurses on the fiber's fixed stack
-                // — one native frame nest per link of a deep lazy chain (e.g. a
-                // lazy left-fold accumulator's `+` thunks) — and, unlike function
-                // application, is NOT bounded by `max-call-depth`: thunk bodies
-                // run with `is_call = false`, so `pushFrame` never counts them.
-                // Without this the recursion runs off the low end of the
-                // (guardless) fiber stack into an unmapped page → raw SIGSEGV.
-                // Trip a graceful error `stack_guard_margin` short of that end.
-                // Placed on the claimed-run path (not at entry) so the
-                // resolved/busy/memo early returns stay lean; `stack_limit` is 0
-                // for VMs not bound to a fiber, so it never fires there.
-                if (@frameAddress() < self.ctx.stack_limit) return vm_trace.stackOverflow(self);
-                // We own this thunk now; compute and publish (or
-                // sticky-error / reset on failure).
-                const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {
-                    if (self.speculation.active and !isTransientThunkError(err)) {
-                        attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |effect_err| {
-                            publishThunkFailure(self, thunk, thunk_id, effect_err);
-                            trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
-                            return effect_err;
-                        };
-                    }
-                    publishThunkFailure(self, thunk, thunk_id, err);
-                    trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
-                    return err;
-                };
-                // If a tail call/functor/builtin left a *forwarding* thunk as
-                // result, peek through already-resolved links before publishing
-                // this thunk. Besides finding the WHNF, speculative peeking
-                // propagates any held effects into this thunk's journal group.
-                const whnf = if (result.isThunk()) try derefForwarder(self, result, real_demand) else result;
-                if (self.speculation.active) attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |err| {
-                    publishThunkFailure(self, thunk, thunk_id, err);
-                    trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
-                    return err;
-                };
-                // The body frame has unwound, so no raw upvalue slice aliases
-                // this target's spilled capture range. Return it before the
-                // target arm is overwritten by the resolved result.
-                self.heap.gcReleaseThunkSpill(thunk);
-                resolveDispatch(self, thunk, result);
-                self.heap.gcRecordEdge(thunk_id, result); // old→young barrier
-                if (memo_key) |k| {
-                    if (self.effect_epoch == effect_epoch) {
-                        thread_caches.get().thunk_memo[k.idx] = .{
-                            .token = self.heap.token,
-                            .chunk = k.chunk,
-                            .count = k.count,
-                            .up0 = k.up0,
-                            .up1 = k.up1,
-                            .value = whnf,
-                        };
-                    }
-                }
-                recordResolve(self, thunk_id, whnf);
-                trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, true);
-                if (real_demand) thunk.markDemanded();
-                return whnf;
-            },
+            .claimed => return forceClaimedThunk(self, thunk, thunk_id, real_demand),
             .busy => {
                 waitForBusyThunk(self, thunk, thunk_id, real_demand);
                 continue;
             },
         }
     }
+}
+
+/// Evaluate and publish a thunk after this fiber has won its claim. Keeping the
+/// claimed lifecycle in one cold helper leaves outcome dispatch auditable and
+/// adds no allocation, synchronization, or atomic operation to the force path.
+fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_demand: bool) anyerror!Value {
+    // Discovery probe: main out-ran the helpers — this thunk was not resolved
+    // ahead of demand, so main must compute it itself.
+    var age_t: u64 = std.math.maxInt(u64);
+    if (comptime prof.enabled) {
+        if (real_demand and self.workerId() == 0) {
+            prof_census.disc.claimed_by_main += 1;
+            prof_census.recordCoverage(
+                thunk.specDispValue(),
+                thunk.created_tsc,
+                @intFromEnum(thunk.targetKind()),
+            );
+            age_t = prof.ageForceBegin(
+                thunk.created_tsc,
+                @intFromEnum(thunk.targetKind()),
+                pathKey(self, &thunk.payload.target, thunk.targetKind()),
+            );
+        }
+    }
+    defer if (comptime prof.enabled) prof.ageForceEnd(age_t);
+
+    try enforceSpeculationBudget(self, thunk, thunk_id);
+    const memo_key = claimedMemoKey(self, thunk);
+    if (memo_key) |key|
+        if (reuseMemoizedThunk(self, thunk, thunk_id, key, real_demand)) |value| return value;
+
+    const effect_checkpoint = self.effect_journal.items.len;
+    const effect_epoch = self.effect_epoch;
+    const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
+    defer prof_path.exit(pp);
+    trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
+
+    // An evaluating thunk is off the operand stack. Once transient rooting is
+    // active, the force chain keeps its target reachable across collections.
+    const gc_root_chain = self.heap.collection.root_active;
+    if (gc_root_chain) self.gc_roots.force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
+    defer {
+        if (gc_root_chain) _ = self.gc_roots.force_chain.pop();
+    }
+
+    // Checked at the recursion point so resolved/busy/memo paths stay lean.
+    if (@frameAddress() < self.ctx.stack_limit) return vm_trace.stackOverflow(self);
+    const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {
+        if (self.speculation.active and !isTransientThunkError(err)) {
+            attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |effect_err| {
+                publishThunkFailure(self, thunk, thunk_id, effect_err);
+                trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
+                return effect_err;
+            };
+        }
+        publishThunkFailure(self, thunk, thunk_id, err);
+        trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
+        return err;
+    };
+
+    // A tail call may leave a forwarding thunk; peek through already-resolved
+    // links before publishing while retaining the original result as the edge.
+    const whnf = if (result.isThunk()) try derefForwarder(self, result, real_demand) else result;
+    if (self.speculation.active) attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |err| {
+        publishThunkFailure(self, thunk, thunk_id, err);
+        trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
+        return err;
+    };
+
+    self.heap.gcReleaseThunkSpill(thunk);
+    resolveDispatch(self, thunk, result);
+    self.heap.gcRecordEdge(thunk_id, result);
+    if (memo_key) |key| {
+        if (self.effect_epoch == effect_epoch) {
+            thread_caches.get().thunk_memo[key.idx] = .{
+                .token = self.heap.token,
+                .chunk = key.chunk,
+                .count = key.count,
+                .up0 = key.up0,
+                .up1 = key.up1,
+                .value = whnf,
+            };
+        }
+    }
+    recordResolve(self, thunk_id, whnf);
+    trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, true);
+    if (real_demand) thunk.markDemanded();
+    return whnf;
 }
 
 fn enforceSpeculationBudget(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId) !void {

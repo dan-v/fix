@@ -36,155 +36,17 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
 
     scope.beginScope(self);
 
-    // For each unique binding root, classify how it should be
-    // compiled. Four kinds:
-    //   .unreferenced      — nothing else in this let (or its body)
-    //                        mentions the name; skip the binding
-    //                        entirely. Nix is pure and lazy: if no
-    //                        one forces the RHS, its side-effects
-    //                        never fire, so omitting it is observably
-    //                        equivalent.
-    //   .literal           — RHS is a pure literal; eagerly bind value
-    //                        directly into the slot (no cell).
-    //   .uncaptured        — non-literal RHS, no earlier binding in
-    //                        this let references the name; we can skip
-    //                        the cell and just `loc_set` the lazy
-    //                        thunk value in pass 2. The body and any
-    //                        later binding's RHS will see the bound
-    //                        thunk and force normally.
-    //   .needs_cell        — non-literal RHS that *is* referenced by
-    //                        an earlier binding (forward reference);
-    //                        the cell exists so the earlier RHS can
-    //                        capture a mutable handle that this
-    //                        binding's pass 2 mutates.
-    const kinds = try classifyLetBindings(self, let_in.bindings, let_in.body);
-    defer self.allocator.free(kinds);
-
-    // Strictness-driven eagerness. Two analyses over the body:
-    //   `eager_flags`      — may-force shallow set; drives the eager
-    //                        *thunk* submit hint (helpers race ahead).
-    //   `must_force_flags` — sound must-force set; drives eager
-    //                        *elision* (pass 2): a non-recursive binding
-    //                        the body unconditionally forces is compiled
-    //                        straight into its slot, with no thunk at
-    //                        all. Sound because lazy eval would force it
-    //                        regardless — can't turn a success into an
-    //                        error (only reorder which error surfaces in
-    //                        an already-failing eval).
-    const binding_name_ids = try self.allocator.alloc(InternId, let_in.bindings.len);
-    defer self.allocator.free(binding_name_ids);
-    for (let_in.bindings, binding_name_ids) |binding, *nid| {
-        const name = attrs.attrSegmentSpan(self, binding.path[0]);
-        nid.* = try self.intern.intern(name);
-    }
-    // Earliest source index of each binding root — the forward-ref guard
-    // for eager elision (a binding can't be eagerly evaluated if its RHS
-    // references a binding defined later, whose slot isn't filled yet).
-    var earliest_index: std.AutoHashMapUnmanaged(InternId, usize) = .empty;
-    defer earliest_index.deinit(self.allocator);
-    for (binding_name_ids, 0..) |nid, i| {
-        if (!earliest_index.contains(nid)) try earliest_index.put(self.allocator, nid, i);
-    }
-
-    const eager_flags = try self.allocator.alloc(bool, let_in.bindings.len);
-    defer self.allocator.free(eager_flags);
-    const must_force_flags = try self.allocator.alloc(bool, let_in.bindings.len);
-    defer self.allocator.free(must_force_flags);
-    // One walk of the let body yields both the may-force (eager submit)
-    // and must-force (eager elision) sets — they differ only at assert/with.
-    try strictness.analyzeLetBindings(
-        self.allocator,
-        self.intern,
-        self.source,
-        let_in.body,
-        binding_name_ids,
-        eager_flags,
-        must_force_flags,
-    );
-    // Eager elision may hoist a binding's evaluation ahead of the body's
-    // reduction; if it isn't the FIRST thing the body demands, that reorders
-    // which error surfaces (observable under `builtins.tryEval`: caught
-    // `throw` vs uncaught `1/0`). Restrict elision to the single
-    // first-demanded binding so eager order == lazy order. See firstForcedName.
-    const first_demanded: ?InternId = try strictness.firstForcedName(self.intern, self.source, let_in.body);
-
-    for (let_in.bindings, kinds, 0..) |binding, kind, index| {
-        if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
-        if (kind == .unreferenced) continue;
-        const name = attrs.attrSegmentSpan(self, binding.path[0]);
-        const name_id = try self.intern.intern(name);
-        const slot = try scope.declareLocal(self, name, name_id);
-        switch (kind) {
-            .literal => {
-                const leaf = singleLeafBinding(self, let_in.bindings, binding.path[0]).?;
-                self.armRecursiveName(name_id);
-                try access.compileContainerValue(self, leaf.expr, .{});
-                try emit.emitSetLocal(self, slot);
-            },
-            .uncaptured => {}, // pass 2 will fill the slot directly
-            .needs_cell => try emit.emitInitCellSlot(self, slot),
-            .unreferenced => unreachable,
-        }
-    }
+    var plan = try LetPlan.init(self, let_in.bindings, let_in.body);
+    defer plan.deinit(self.allocator);
+    try declareBindingSlots(self, let_in.bindings, plan);
 
     // Hidden locals for `inherit (expr)` sources. They are declared after all
     // user bindings (so they cannot affect lexical resolution) and initialized
     // lazily at the first live member's source position in pass 2.
-    const InheritState = struct { slot: u16, initialized: bool = false };
     var inherit_states: std.AutoHashMapUnmanaged(u32, InheritState) = .empty;
     defer inherit_states.deinit(self.allocator);
-    const inherit_name = "\x00inherit-source";
-    const inherit_name_id = try self.intern.intern(inherit_name);
-    for (let_in.bindings, kinds) |binding, kind| {
-        if (binding.inherit_group == 0 or kind == .unreferenced or inherit_states.contains(binding.inherit_group)) continue;
-        try inherit_states.put(self.allocator, binding.inherit_group, .{
-            .slot = try scope.declareLocal(self, inherit_name, inherit_name_id),
-        });
-    }
-
-    for (let_in.bindings, kinds, 0..) |binding, kind, index| {
-        if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
-        if (kind == .literal or kind == .unreferenced) continue;
-        const name = attrs.attrSegmentSpan(self, binding.path[0]);
-        const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
-
-        // Eager elision: a non-recursive (`.uncaptured`) binding that the
-        // body unconditionally forces, with a computational RHS that
-        // references no later binding — evaluate it straight into the
-        // slot, skipping the thunk alloc + force + frame entirely.
-        if (binding.inherit_group == 0 and kind == .uncaptured and must_force_flags[index] and
-            first_demanded != null and binding_name_ids[index] == first_demanded.?)
-        {
-            if (eligibleEagerLeaf(self, let_in.bindings, binding.path[0], &earliest_index, index)) |leaf| {
-                self.armRecursiveName(binding_name_ids[index]);
-                try self.compileNode(leaf.expr);
-                self.name_hint = null; // don't leak a nameless RHS onto the body
-                try emit.emitSetLocal(self, slot);
-                continue;
-            }
-        }
-
-        var inherit_source_slot: ?u16 = null;
-        if (binding.inherit_group != 0) {
-            const state = inherit_states.getPtr(binding.inherit_group) orelse return error.InvalidAttributePath;
-            if (!state.initialized) {
-                const inherited = ast.unwrapParens(binding.expr);
-                if (inherited.tag != .attr_path or inherited.data.attr_path.segments.len != 1) return error.InvalidAttributePath;
-                try thunks.compileThunk(self, inherited.data.attr_path.root);
-                try emit.emitSetLocal(self, state.slot);
-                state.initialized = true;
-            }
-            inherit_source_slot = state.slot;
-        }
-
-        self.armRecursiveName(binding_name_ids[index]);
-        try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot, eager_flags[index], inherit_source_slot);
-        switch (kind) {
-            .needs_cell => try emit.emitSetCellLocal(self, slot),
-            .uncaptured => try emit.emitSetLocal(self, slot),
-            .literal, .unreferenced => unreachable,
-        }
-    }
+    try declareInheritSlots(self, let_in.bindings, plan.kinds, &inherit_states);
+    try emitBindingInitializers(self, let_in.bindings, plan, &inherit_states);
 
     if (tail_body) {
         try lambda.compileTailExpression(self, let_in.body);
@@ -196,6 +58,152 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
 }
 
 const LetBindingKind = enum { unreferenced, literal, uncaptured, needs_cell };
+const InheritState = struct { slot: u16, initialized: bool = false };
+
+/// Immutable analysis result consumed by the two bytecode-emission passes.
+/// All arrays and the lookup map are region-local to one `let`.
+const LetPlan = struct {
+    kinds: []LetBindingKind,
+    name_ids: []InternId,
+    eager: []bool,
+    must_force: []bool,
+    earliest_index: std.AutoHashMapUnmanaged(InternId, usize),
+    first_demanded: ?InternId,
+
+    fn init(self: *Compiler, bindings: []const Node.Binding, body: *const Node) !LetPlan {
+        const kinds = try classifyLetBindings(self, bindings, body);
+        errdefer self.allocator.free(kinds);
+
+        const name_ids = try self.allocator.alloc(InternId, bindings.len);
+        errdefer self.allocator.free(name_ids);
+        for (bindings, name_ids) |binding, *name_id| {
+            name_id.* = try self.intern.intern(attrs.attrSegmentSpan(self, binding.path[0]));
+        }
+
+        var earliest_index: std.AutoHashMapUnmanaged(InternId, usize) = .empty;
+        errdefer earliest_index.deinit(self.allocator);
+        for (name_ids, 0..) |name_id, index| {
+            if (!earliest_index.contains(name_id))
+                try earliest_index.put(self.allocator, name_id, index);
+        }
+
+        const eager = try self.allocator.alloc(bool, bindings.len);
+        errdefer self.allocator.free(eager);
+        const must_force = try self.allocator.alloc(bool, bindings.len);
+        errdefer self.allocator.free(must_force);
+        try strictness.analyzeLetBindings(
+            self.allocator,
+            self.intern,
+            self.source,
+            body,
+            name_ids,
+            eager,
+            must_force,
+        );
+
+        return .{
+            .kinds = kinds,
+            .name_ids = name_ids,
+            .eager = eager,
+            .must_force = must_force,
+            .earliest_index = earliest_index,
+            .first_demanded = try strictness.firstForcedName(self.intern, self.source, body),
+        };
+    }
+
+    fn deinit(self: *LetPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.kinds);
+        allocator.free(self.name_ids);
+        allocator.free(self.eager);
+        allocator.free(self.must_force);
+        self.earliest_index.deinit(allocator);
+    }
+};
+
+fn declareBindingSlots(self: *Compiler, bindings: []const Node.Binding, plan: LetPlan) !void {
+    for (bindings, plan.kinds, 0..) |binding, kind, index| {
+        if (bindingRootSeen(self, bindings[0..index], binding.path[0])) continue;
+        if (kind == .unreferenced) continue;
+        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        const name_id = plan.name_ids[index];
+        const slot = try scope.declareLocal(self, name, name_id);
+        switch (kind) {
+            .literal => {
+                const leaf = singleLeafBinding(self, bindings, binding.path[0]).?;
+                self.armRecursiveName(name_id);
+                try access.compileContainerValue(self, leaf.expr, .{});
+                try emit.emitSetLocal(self, slot);
+            },
+            .uncaptured => {},
+            .needs_cell => try emit.emitInitCellSlot(self, slot),
+            .unreferenced => unreachable,
+        }
+    }
+}
+
+fn declareInheritSlots(
+    self: *Compiler,
+    bindings: []const Node.Binding,
+    kinds: []const LetBindingKind,
+    states: *std.AutoHashMapUnmanaged(u32, InheritState),
+) !void {
+    const inherit_name = "\x00inherit-source";
+    const inherit_name_id = try self.intern.intern(inherit_name);
+    for (bindings, kinds) |binding, kind| {
+        if (binding.inherit_group == 0 or kind == .unreferenced or states.contains(binding.inherit_group)) continue;
+        try states.put(self.allocator, binding.inherit_group, .{
+            .slot = try scope.declareLocal(self, inherit_name, inherit_name_id),
+        });
+    }
+}
+
+fn emitBindingInitializers(
+    self: *Compiler,
+    bindings: []const Node.Binding,
+    plan: LetPlan,
+    inherit_states: *std.AutoHashMapUnmanaged(u32, InheritState),
+) !void {
+    for (bindings, plan.kinds, 0..) |binding, kind, index| {
+        if (bindingRootSeen(self, bindings[0..index], binding.path[0])) continue;
+        if (kind == .literal or kind == .unreferenced) continue;
+        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
+
+        if (binding.inherit_group == 0 and kind == .uncaptured and plan.must_force[index] and
+            plan.first_demanded != null and plan.name_ids[index] == plan.first_demanded.?)
+        {
+            if (eligibleEagerLeaf(self, bindings, binding.path[0], &plan.earliest_index, index)) |leaf| {
+                self.armRecursiveName(plan.name_ids[index]);
+                try self.compileNode(leaf.expr);
+                self.name_hint = null;
+                try emit.emitSetLocal(self, slot);
+                continue;
+            }
+        }
+
+        var inherit_source_slot: ?u16 = null;
+        if (binding.inherit_group != 0) {
+            const state = inherit_states.getPtr(binding.inherit_group) orelse return error.InvalidAttributePath;
+            if (!state.initialized) {
+                const inherited = ast.unwrapParens(binding.expr);
+                if (inherited.tag != .attr_path or inherited.data.attr_path.segments.len != 1)
+                    return error.InvalidAttributePath;
+                try thunks.compileThunk(self, inherited.data.attr_path.root);
+                try emit.emitSetLocal(self, state.slot);
+                state.initialized = true;
+            }
+            inherit_source_slot = state.slot;
+        }
+
+        self.armRecursiveName(plan.name_ids[index]);
+        try compileLetRootBinding(self, bindings, binding.path[0], slot, plan.eager[index], inherit_source_slot);
+        switch (kind) {
+            .needs_cell => try emit.emitSetCellLocal(self, slot),
+            .uncaptured => try emit.emitSetLocal(self, slot),
+            .literal, .unreferenced => unreachable,
+        }
+    }
+}
 
 /// Decide for each binding whether it can skip the cell. A binding
 /// needs a cell iff some *earlier* binding (which gets compiled first

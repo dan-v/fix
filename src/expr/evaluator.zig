@@ -1027,13 +1027,33 @@ pub const Engine = struct {
         source_path: ?[]const u8,
         scope: ?Value,
     ) !ChunkId {
+        var parsed = try self.parseSourceUnit(source, source_path);
+        var retain_arena = false;
+        defer if (!retain_arena) parsed.arena.deinit();
+
+        return self.compileParsedUnit(
+            &parsed,
+            source,
+            base_path,
+            source_path,
+            scope,
+            &retain_arena,
+        );
+    }
+
+    const ParsedSource = struct {
+        arena: ast_mod.AstArena,
+        root: *ast_mod.Node,
+    };
+
+    /// Parse and policy-check one source unit. The returned arena owns `root`
+    /// and is either released by the caller or transferred to deferred
+    /// compilation storage.
+    fn parseSourceUnit(self: *Engine, source: []const u8, source_path: ?[]const u8) !ParsedSource {
         const subject = source_path orelse "expression";
 
         var arena = ast_mod.AstArena.init(self.allocator);
-        // Freed here unless a deferred attr body retains nodes into it
-        // (then the arena is moved into `retained_arenas`, below).
-        var retain_arena = false;
-        defer if (!retain_arena) arena.deinit();
+        errdefer arena.deinit();
 
         var parser = parser_mod.Parser.init(self.allocator, &arena, source);
         defer parser.deinit();
@@ -1066,7 +1086,22 @@ pub const Engine = struct {
         };
 
         try self.validateParserPolicy(&parser, source, source_path);
+        return .{ .arena = arena, .root = ast_node };
+    }
 
+    /// Compile and register an already validated source unit. All compiler
+    /// scratch is region-owned and dies here; only bytecode and, when needed,
+    /// the parsed AST arena cross the boundary.
+    fn compileParsedUnit(
+        self: *Engine,
+        parsed: *ParsedSource,
+        source: []const u8,
+        base_path: ?[]const u8,
+        source_path: ?[]const u8,
+        scope: ?Value,
+        retain_arena: *bool,
+    ) !ChunkId {
+        const subject = source_path orelse "expression";
         // Per-compilation-unit scratch arena: all of the compiler's
         // transient structures (builder buffers, locals/captures, strictness
         // and name-resolution maps, diagnostics) allocate here and are freed
@@ -1113,7 +1148,7 @@ pub const Engine = struct {
         // below alongside deferred bodies); this compile is single-threaded,
         // so in-place node replacement is safe and keeps every later
         // consumer's view identical to an eager parse.
-        compiler.ast_arena = &arena;
+        compiler.ast_arena = &parsed.arena;
         compiler.elide_mutable = true;
         defer compiler.deinit();
 
@@ -1122,7 +1157,7 @@ pub const Engine = struct {
             defer observation.cancel();
             const ct = prof.start(.compile);
             defer prof.end(.compile, ct);
-            compiler.compileAndFinish(ast_node, scope) catch |err| {
+            compiler.compileAndFinish(parsed.root, scope) catch |err| {
                 try self.copyDiagnostics(compiler.diagnostics.items, source, source_path);
                 return err;
             };
@@ -1136,8 +1171,8 @@ pub const Engine = struct {
         // referenced by `deferred_table` entries and must outlive the
         // compile — keep the arena alive for the evaluator's lifetime.
         if (compiler.deferred_count > 0) {
-            retain_arena = true;
-            self.retainDeferredArena(arena);
+            retain_arena.* = true;
+            self.retainDeferredArena(parsed.arena);
         }
         return chunk_id;
     }

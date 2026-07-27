@@ -190,6 +190,44 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, Value.attrs(attrs_id));
+
+    var header = try readDerivationHeader(self, attrs_id);
+    defer header.deinit(self.allocator);
+
+    var observation = self.observer.begin(&compute_derivation_observation, .{
+        .subject = .{ .text = header.name },
+    });
+    defer observation.cancel();
+
+    var artifact = try computeDerivationArtifact(self, attrs_id, header);
+    defer artifact.deinit(self);
+    try recordDerivationArtifact(self, &artifact);
+    const value = try buildDerivationResult(self, attrs_id, mode, header, &artifact.normalized, artifact.computed.drv_path);
+
+    observation.finish(.{
+        .details = .{
+            .subject = .{ .text = header.name },
+            .destination = .{ .path = artifact.computed.drv_path },
+        },
+        .metrics = &.{.{
+            .name = "outputs",
+            .value = .{ .unsigned = header.outputs.names.len },
+            .unit = .items,
+        }},
+    });
+    return value;
+}
+
+const DerivationHeader = struct {
+    name: []const u8,
+    outputs: DerivationOutputNames,
+
+    fn deinit(self: *DerivationHeader, allocator: std.mem.Allocator) void {
+        allocator.free(self.outputs.names);
+    }
+};
+
+fn readDerivationHeader(self: *VM, attrs_id: ObjectId) !DerivationHeader {
     const name_id = try self.intern.intern("name");
     const name_value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, name_id));
     if (!isPlainString(name_value)) return error.TypeError;
@@ -197,21 +235,35 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
     const drv_name = self.intern.get(drv_name_id);
     try validateDerivationName(self, drv_name);
 
-    var observation = self.observer.begin(&compute_derivation_observation, .{
-        .subject = .{ .text = drv_name },
-    });
-    defer observation.cancel();
+    return .{
+        .name = drv_name,
+        .outputs = try derivationOutputNames(self, attrs_id),
+    };
+}
 
-    const output_names = try derivationOutputNames(self, attrs_id);
-    defer self.allocator.free(output_names.names);
+const DerivationArtifact = struct {
+    normalized: NormalizedDerivation,
+    computed: derivation.ComputedPaths,
+    aterm_owned: bool = true,
 
+    fn deinit(self: *DerivationArtifact, vm: *VM) void {
+        self.normalized.deinit(vm.allocator);
+        vm.allocator.free(self.computed.drv_path);
+        self.computed.hash_modulo.deinit(vm.allocator);
+        vm.allocator.free(self.computed.drv_text_references);
+        if (self.aterm_owned) vm.realization.allocator.free(self.computed.drv_aterm);
+    }
+};
+
+fn computeDerivationArtifact(self: *VM, attrs_id: ObjectId, header: DerivationHeader) !DerivationArtifact {
     const t_norm = prof.start(.drv_normalize);
-    var normalized = normalizeDerivation(self, attrs_id, drv_name, output_names) catch |err| {
+    var normalized = normalizeDerivation(self, attrs_id, header.name, header.outputs) catch |err| {
         prof.end(.drv_normalize, t_norm);
         return err;
     };
     prof.end(.drv_normalize, t_norm);
-    defer normalized.deinit(self.allocator);
+    errdefer normalized.deinit(self.allocator);
+
     const t_comp = prof.start(.drv_compute);
     const computed = normalized.drv.computePathsWithPayloadAllocator(
         self.allocator,
@@ -222,14 +274,13 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
         return err;
     };
     prof.end(.drv_compute, t_comp);
-    defer self.allocator.free(computed.drv_path);
-    defer computed.hash_modulo.deinit(self.allocator);
-    defer self.allocator.free(computed.drv_text_references);
-    var drv_aterm_owned = true;
-    defer if (drv_aterm_owned) self.realization.allocator.free(computed.drv_aterm);
-    try self.realization.record(computed.drv_path, computed.hash_modulo.view(), normalized.drv.outputs);
-    try self.realization.recordDebug(&normalized.drv, computed);
+    return .{ .normalized = normalized, .computed = computed };
+}
 
+fn recordDerivationArtifact(self: *VM, artifact: *DerivationArtifact) !void {
+    const computed = artifact.computed;
+    try self.realization.record(computed.drv_path, computed.hash_modulo.view(), artifact.normalized.drv.outputs);
+    try self.realization.recordDebug(&artifact.normalized.drv, computed);
     // Render the ATerm exactly once and transfer that allocation to the store's
     // recipe graph. `recordOwnedTextRecipe` only records an in-memory recipe;
     // the `.drv` is written to the store on demand (see `ensureClosure`), and
@@ -237,7 +288,7 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
     // here, where every instantiated derivation (demanded or not) passes.
     try self.realization.noteProducerPayloadForTest(computed.drv_path, computed.drv_aterm);
     // recordOwnedTextRecipe consumes drv_aterm on success and error.
-    drv_aterm_owned = false;
+    artifact.aterm_owned = false;
     try self.realization.recordOwnedTextRecipe(
         computed.drv_path,
         computed.drv_aterm,
@@ -251,7 +302,16 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
     // speculative or unrelated derivations.
     if (self.realization.eagerEvaluationWritesEnabled())
         try self.realization.ensureClosure(computed.drv_path);
+}
 
+fn buildDerivationResult(
+    self: *VM,
+    attrs_id: ObjectId,
+    mode: DerivationMode,
+    header: DerivationHeader,
+    normalized: *const NormalizedDerivation,
+    drv_path: []const u8,
+) !Value {
     // Instantiation deliberately does NOT build the derivation. Instantiating
     // a derivation only means it was evaluated — not that its output is needed.
     // Building is reserved for
@@ -262,9 +322,9 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
     // which instantiation won the demand-vs-speculation race decided the set —
     // burning builder time for no output.
 
-    const outputs = try self.allocator.alloc(derivation.ValueOutput, output_names.names.len);
+    const outputs = try self.allocator.alloc(derivation.ValueOutput, header.outputs.names.len);
     defer self.allocator.free(outputs);
-    for (output_names.names, outputs) |output_name, *output| {
+    for (header.outputs.names, outputs) |output_name, *output| {
         const path = normalized.outputPath(self.intern.get(output_name)) orelse return error.InvalidDerivationOutput;
         output.* = .{
             .name = output_name,
@@ -273,10 +333,10 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
     }
 
     const spec: derivation.ValueSpec = .{
-        .drv_path = try self.intern.intern(computed.drv_path),
-        .default_output = output_names.names[0],
+        .drv_path = try self.intern.intern(drv_path),
+        .default_output = header.outputs.names[0],
         .outputs = outputs,
-        .explicit_outputs = output_names.explicit,
+        .explicit_outputs = header.outputs.explicit,
         .original_attrs = try self.heap.getAttrs(attrs_id),
     };
     const t_bv = prof.start(.drv_build_value);
@@ -285,17 +345,6 @@ fn buildForcedDerivationValue(self: *VM, attrs_id: ObjectId, mode: DerivationMod
         .lazy => derivation.buildValue(self.allocator, self.intern, self.heap, spec),
         .strict => derivation.buildStrictValue(self.allocator, self.intern, self.heap, spec),
     };
-    observation.finish(.{
-        .details = .{
-            .subject = .{ .text = drv_name },
-            .destination = .{ .path = computed.drv_path },
-        },
-        .metrics = &.{.{
-            .name = "outputs",
-            .value = .{ .unsigned = output_names.names.len },
-            .unit = .items,
-        }},
-    });
     return value;
 }
 
