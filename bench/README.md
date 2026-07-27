@@ -19,7 +19,7 @@ Build the contained harness and run one or more suites:
 
 ```console
 $ nix-build -A bench
-$ RUNS=3 ./result/bin/fix-bench torture
+$ TOOLS=fix-1core RUNS=3 ./result/bin/fix-bench torture
 $ RUNS=3 ./result/bin/fix-bench realworld json
 ```
 
@@ -36,6 +36,12 @@ the harness without creating a `result` link. Useful environment variables are:
   as in `TOOLS=fix,-fix-16core`. Fix profiles use 1, 2, 8, 16, and automatic
   workers. Determinate uses 1 and automatic evaluator cores in scalar suites,
   adding 2, 8, and 16 cores for JSON.
+- During focused development, always set `TOOLS` explicitly (normally
+  `TOOLS=fix-1core`, optionally plus one relevant parallel Fix row). The `fix`
+  group expands to every worker profile and is intended for a deliberate full
+  matrix, not a routine refactor check. `bench.sh` recognizes Fix-only selector
+  lists and builds the lightweight `benchFix` harness, so unrelated evaluator
+  packages are not realized before filtering.
 - `WORKLOADS=call-heavy,string-heavy` selects workloads by basename.
 - `OUT=/path` selects the result directory instead of `/tmp/fix-bench.XXXXXX`.
 - `BENCH_NIX_PATH` overrides the harness's pinned source search path.

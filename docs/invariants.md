@@ -12,6 +12,13 @@ These span subsystems, so they're collected here. Violating one usually shows up
 
 ## Values & memory
 
+- **Ownership is tagged, never inferred from a boolean.** Use `TextRef` (or a
+  domain-specific tagged union) when a field may be borrowed or owned. A
+  pointer `deinit` releases the owned case; transferring ownership uses
+  `take`. Do not reintroduce `owned: bool` beside an untyped slice.
+- **Owned replacements are transactional.** Allocate and validate a
+  replacement before freeing the current value. On allocation or parse failure,
+  the observable state and its ownership remain unchanged.
 - **Canonical-NaN scrub.** Every `f64` entering a `Value` goes through `float()`, which scrubs any NaN to one canonical positive NaN. Never hand-construct a NaN into a `Value`, and never assume an arbitrary NaN bit pattern is a float — a stray sign=1 NaN aliases the tagged-value prefix. → [runtime/values](runtime/values.md)
 - **Boxed integers.** i64 outside i48 range lives in a heap `boxed_int`. Use `isAnyInt`/`int.get`, never branch on `isInt` alone where a big integer is possible. → [runtime/values](runtime/values.md)
 - **IDs never move; a *reachable* object's ID stays valid.** `ObjectId` and `InternId` index segmented stores whose backing pages are never relocated, so a value copied by bits keeps addressing the same slot — the [GC](gc.md) is non-moving *because* suspended fibers hold `ObjectId`s that can't be rewritten. `InternId`s are append-only and never reclaimed. But a swept object's slot is reclaimed onto a free list and reused for a later allocation, so a stale (unrooted) `ObjectId` can silently alias a *different* object — which is exactly why rooting (below) is load-bearing. → [runtime/heap](runtime/heap.md)
@@ -46,5 +53,5 @@ These span subsystems, so they're collected here. Violating one usually shows up
 ## Build & structure
 
 - **LLVM is forced** (`use_llvm=true`) because the threaded dispatcher relies on `@call(.always_tail)`; other backends would unbounded-recurse. → [build](build.md), [vm/dispatch](vm/dispatch.md)
-- **Module-boundary hygiene.** Import the durable groups (`base`, `syntax`, `runtime`, `store`, `fetchers`, `expr`, `cli`) by name. Inside a durable module, use ordinary relative imports so each type has one canonical instance. → [build](build.md)
+- **Module-boundary hygiene.** Import the durable groups (`base`, `syntax`, `runtime`, `store`, `fetchers`, `expr`, `cli`) by name. Inside a durable module, use ordinary relative imports so each type has one canonical instance. Durable implementation belongs in responsibility-named subdirectories, not the `src/` root or catch-all `util`/`common`/`helpers` files. `zig build structure-check` enforces this shape, tagged ownership, and removal of the legacy `Evaluator` API. → [build](build.md)
 - **Chunks are immutable after registration**, and their constants are permanent GC roots (never swept). Per-thread inline caches/memos are guarded by `heap_token`. → [vm/dispatch](vm/dispatch.md)

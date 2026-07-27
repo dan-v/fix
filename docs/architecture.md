@@ -26,7 +26,7 @@ Each stage is lazy at the seams: the compiler emits **thunks** for anything not 
 - **[vm](vm/dispatch.md)** — a direct-threaded bytecode interpreter that [forces thunks](runtime/thunks.md), [calls closures](vm/calls.md), [reads attrsets/lists](vm/access.md), and runs the [builtins](vm/builtins.md).
 - **[store / derivation](derivation/model.md)** — the domain model: `Drv`, canonical hashing and paths, string context, and the evaluation-scoped registry of computed derivations. The `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths.
 - **store / realization** — turns derivation records and source-path recipes into concrete store actions. It owns the evaluation's `RealizationStore`, lazy derivation cache, source snapshots and NAR encoding, closure planning, realization claims, and nix-daemon protocol/runtime. An explicit executor capability lets evaluator fibers park without making the store depend on evaluator workers.
-- **fetchers** — remote source acquisition outside the expression engine: remote-source caching, Git/curl transports, and provider-specific GitHub/GitLab/SourceHut request planning. VM builtins only decode Nix values and map fetch results back to values.
+- **fetchers** — remote source acquisition outside the expression engine. `FetchService` owns cache/transport lifecycle; `fetch/` owns borrowed configuration, request/result values, authentication, and narrow URL/Git/Mercurial views. VM builtins only decode Nix values and map fetch results back to values.
 
 ## The module DAG
 
@@ -63,9 +63,27 @@ src/main.zig       → cli, process_support
 
 `base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and the runtime supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
 
-Within `expr` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `evaluator.zig` composes those services into `Engine`. `eval/workers/` owns the scheduler, fiber workers, fiber-scoped context, and capabilities for parking futures and blocking work away from compute workers; the VM borrows that context and capability without owning worker machinery. `store/realization/daemon_execution.zig` defines the store-facing executor capability, while `expr/eval/workers/daemon_executor.zig` supplies its fiber implementation. The CLI consumes `expr`, `runtime`, `syntax`, and `store` directly instead of routing them through an umbrella module. Deferred-body compilation calls from `vm` into `compiler`, while import orchestration and synthetic corepkgs sources remain evaluator-owned and `eval/imports.zig` owns only the concurrent registry/entry state. See [build](build.md).
+Within `expr` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `evaluator.zig` composes those services into `Engine`. Construction takes one borrowed `EngineConfig` value, and callers can borrow responsibility-oriented `evaluation`, `values`, `sourceAccess`, `debugging`, `inspection`, `builds`, and `instrumentation` views. `eval/workers/` owns the scheduler, fiber workers, fiber-scoped context, and capabilities for parking futures and blocking work away from compute workers; queue mechanics live below scheduler policy in `eval/workers/scheduler/`. The VM borrows worker capabilities without owning worker machinery. `store/realization/daemon_execution.zig` defines the store-facing executor capability, while `expr/eval/workers/daemon_executor.zig` supplies its fiber implementation. The CLI consumes `expr`, `runtime`, `syntax`, and `store` directly instead of routing them through an umbrella module. Deferred-body compilation calls from `vm` into `compiler`, while import orchestration and synthetic corepkgs sources remain engine-owned and `eval/imports.zig` owns only the concurrent registry/entry state. See [build](build.md).
 
-Callbacks mark real ownership, policy, or execution-domain changes: CLI debugger/progress/build sinks, heap/scheduler GC dispatch, fiber wakeups, blocking execution, and leaf policies such as NAR filters. File extraction alone is not a boundary. Engine helper files therefore receive concrete state views (for example debugger `Context`) or remain evaluator-owned instead of back-calling through opaque “host” bundles. Concurrent progress `Span` handles retain the sink that created them, so a sink replacement cannot misroute an in-flight token.
+Callbacks mark real ownership, policy, or execution-domain changes: CLI debugger/progress/build sinks, heap/scheduler GC dispatch, fiber wakeups, blocking execution, and leaf policies such as NAR filters. File extraction alone is not a boundary. Engine helper files therefore receive concrete state views (for example debugger `Context`) or remain engine-owned instead of back-calling through opaque “host” bundles. Concurrent progress `Span` handles retain the sink that created them, so a sink replacement cannot misroute an in-flight token.
+
+## Ownership and state changes
+
+Ownership is represented in types, not parallel flags. Text that may be
+borrowed or heap-owned uses `base.TextRef`; `deinit` consumes a pointer and frees
+only the `.owned` case. Owned configuration replacement is transactional:
+allocate/parse the replacement first, then swap it into live state and release
+the old value. A failed update therefore leaves the previous configuration
+intact.
+
+Long-lived mutable owners are kept few and explicit (`Engine`, `FetchService`,
+`ObjectHeap`, `Scheduler`). Their inputs and intermediate decisions are values:
+`EngineConfig`/`FetchConfig`, parsed source units, `LetPlan`, derivation
+artifacts, and validated REPL command invocations. Orchestrators sequence those
+values through named phases; mechanisms such as heap range reuse, inspection
+projections, scheduler queues, and CLI option application live in focused
+subdirectories. This preserves mutation where identity or concurrency requires
+it without making mutation the default modeling tool.
 
 ## Laziness and parallelism are one primitive
 
