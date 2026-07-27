@@ -2,14 +2,12 @@
 
 const std = @import("std");
 const VM = @import("../context.zig").VM;
-const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
-const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
 const FetchService = @import("fetchers").FetchService;
 const derivation = @import("store").derivation;
 const path_ops = @import("runtime").paths;
-const flake_registry = @import("flake_registry.zig");
+const flake_ref = @import("flake_ref.zig");
 const shared = @import("shared.zig");
 const purity = @import("purity.zig");
 const attrsets = @import("attrsets.zig");
@@ -22,7 +20,6 @@ const arguments = @import("arguments.zig");
 
 const attrEntryNameIndex = attrsets.attrEntryNameIndex;
 const stringArg = strings.stringArg;
-const appendStringAttr = arguments.appendStringAttr;
 const dupPathAttr = arguments.dupPathAttr;
 const optionalStringAttr = arguments.optionalStringAttr;
 const requiredStringAttr = arguments.requiredStringAttr;
@@ -41,6 +38,8 @@ const forgeTreeSpec = fetch.forgeTreeSpec;
 const githubTreeValue = fetch.githubTreeValue;
 const fetchMercurialSpecFromAttrs = fetch.fetchMercurialSpecFromAttrs;
 const mercurialResultValue = fetch.mercurialResultValue;
+pub const builtinParseFlakeRef = flake_ref.parse;
+pub const builtinFlakeRefToString = flake_ref.render;
 
 /// Dispatch entry for a direct `builtins.fetchTree` call. Gated on the
 /// `fetch-tree` experimental feature (Nix parity). `getFlake` bypasses this by
@@ -1174,198 +1173,4 @@ fn flakeResultValue(self: *VM, source_info: Value, inputs: Value, outputs: Value
         }
     }
     return Value.attrs(try self.heap.addAttrs(entries.items));
-}
-
-/// A 40-char lowercase-hex git revision (as opposed to a branch/tag `ref`).
-fn looksLikeGitRev(s: []const u8) bool {
-    if (s.len != 40) return false;
-    for (s) |c| if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) return false;
-    return true;
-}
-
-pub fn builtinParseFlakeRef(self: *VM, arg: Value) !Value {
-    const ref = try stringArg(self, arg);
-    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
-    defer entries.deinit(self.allocator);
-
-    // Query string (`?dir=…&rev=…`) applies to every scheme; split it off first
-    // so it never leaks into a path/repo/url segment.
-    const q_idx = std.mem.indexOfScalar(u8, ref, '?');
-    const base = if (q_idx) |i| ref[0..i] else ref;
-    const query = if (q_idx) |i| ref[i + 1 ..] else "";
-
-    // Explicit indirect scheme `flake:<id>` — the same thing as a bare id, just
-    // spelled out. Strip the prefix and re-parse (re-attaching the query) so it
-    // reaches the registry resolution below.
-    if (std.mem.startsWith(u8, base, "flake:")) {
-        const rest = base["flake:".len..];
-        const full = if (q_idx != null)
-            try std.fmt.allocPrint(self.allocator, "{s}?{s}", .{ rest, query })
-        else
-            try self.allocator.dupe(u8, rest);
-        defer self.allocator.free(full);
-        return builtinParseFlakeRef(self, Value.string(try self.intern.intern(full)));
-    }
-
-    // Shorthand forge refs: github:/gitlab:/sourcehut: owner/repo[/refOrRev].
-    inline for (.{ "github", "gitlab", "sourcehut" }) |forge| {
-        if (std.mem.startsWith(u8, base, forge ++ ":")) {
-            try appendStringAttr(self, &entries, "type", forge);
-            var parts = std.mem.splitScalar(u8, base[forge.len + 1 ..], '/');
-            const owner = parts.next() orelse return error.InvalidFlakeRef;
-            const repo = parts.next() orelse return error.InvalidFlakeRef;
-            try appendStringAttr(self, &entries, "owner", owner);
-            try appendStringAttr(self, &entries, "repo", repo);
-            if (parts.next()) |seg| if (seg.len != 0) {
-                try appendStringAttr(self, &entries, if (looksLikeGitRev(seg)) "rev" else "ref", seg);
-            };
-            try appendFlakeQueryAttrs(self, &entries, query);
-            return Value.attrs(try self.heap.addAttrs(entries.items));
-        }
-    }
-
-    // git+<transport> / bare git:/ssh: → a git flake; the URL is what git clones.
-    if (std.mem.startsWith(u8, base, "git+")) {
-        try appendStringAttr(self, &entries, "type", "git");
-        try appendStringAttr(self, &entries, "url", base["git+".len..]);
-        try appendFlakeQueryAttrs(self, &entries, query);
-        return Value.attrs(try self.heap.addAttrs(entries.items));
-    }
-    if (std.mem.startsWith(u8, base, "git://") or std.mem.startsWith(u8, base, "ssh://")) {
-        try appendStringAttr(self, &entries, "type", "git");
-        try appendStringAttr(self, &entries, "url", base);
-        try appendFlakeQueryAttrs(self, &entries, query);
-        return Value.attrs(try self.heap.addAttrs(entries.items));
-    }
-
-    // tarball+<url>, or a bare http(s) URL (Nix treats bare http(s) as a tarball).
-    if (std.mem.startsWith(u8, base, "tarball+")) {
-        try appendStringAttr(self, &entries, "type", "tarball");
-        try appendStringAttr(self, &entries, "url", base["tarball+".len..]);
-        try appendFlakeQueryAttrs(self, &entries, query);
-        return Value.attrs(try self.heap.addAttrs(entries.items));
-    }
-    if (std.mem.startsWith(u8, base, "http://") or std.mem.startsWith(u8, base, "https://")) {
-        try appendStringAttr(self, &entries, "type", "tarball");
-        try appendStringAttr(self, &entries, "url", base);
-        try appendFlakeQueryAttrs(self, &entries, query);
-        return Value.attrs(try self.heap.addAttrs(entries.items));
-    }
-
-    // path: / bare absolute path.
-    if (std.mem.startsWith(u8, base, "path:")) {
-        try appendStringAttr(self, &entries, "type", "path");
-        try appendStringAttr(self, &entries, "path", base["path:".len..]);
-        try appendFlakeQueryAttrs(self, &entries, query);
-        return Value.attrs(try self.heap.addAttrs(entries.items));
-    }
-    if (std.fs.path.isAbsolute(base)) {
-        try appendStringAttr(self, &entries, "type", "path");
-        try appendStringAttr(self, &entries, "path", base);
-        try appendFlakeQueryAttrs(self, &entries, query);
-        return Value.attrs(try self.heap.addAttrs(entries.items));
-    }
-
-    // Bare indirect id (`nixpkgs`, `nixpkgs/nixos-24.05`): resolve through the
-    // flake registry to a concrete ref, re-attach the query, and re-parse.
-    if (try flake_registry.resolve(self, base)) |concrete| {
-        defer self.allocator.free(concrete);
-        const full = if (q_idx != null)
-            try std.fmt.allocPrint(self.allocator, "{s}?{s}", .{ concrete, query })
-        else
-            try self.allocator.dupe(u8, concrete);
-        defer self.allocator.free(full);
-        return builtinParseFlakeRef(self, Value.string(try self.intern.intern(full)));
-    }
-    return error.InvalidFlakeRef;
-}
-
-pub fn builtinFlakeRefToString(self: *VM, arg: Value) !Value {
-    const attrs = try vm_force.forceValue(self, arg);
-    if (!attrs.isAttrs()) return error.TypeError;
-    const id = attrs.asObjectId();
-
-    const type_value = try requiredStringAttr(self, id, "type");
-    defer self.allocator.free(type_value);
-
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(self.allocator);
-
-    if (std.mem.eql(u8, type_value, "github") or std.mem.eql(u8, type_value, "gitlab") or std.mem.eql(u8, type_value, "sourcehut")) {
-        const owner = try requiredStringAttr(self, id, "owner");
-        defer self.allocator.free(owner);
-        const repo = try requiredStringAttr(self, id, "repo");
-        defer self.allocator.free(repo);
-        // A pinned `rev` (or else a `ref`) goes in the path segment, as Nix does.
-        const pin = (try optionalStringAttr(self, id, "rev")) orelse (try optionalStringAttr(self, id, "ref"));
-        defer if (pin) |seg| self.allocator.free(seg);
-        const head = if (pin) |seg|
-            try std.fmt.allocPrint(self.allocator, "{s}:{s}/{s}/{s}", .{ type_value, owner, repo, seg })
-        else
-            try std.fmt.allocPrint(self.allocator, "{s}:{s}/{s}", .{ type_value, owner, repo });
-        defer self.allocator.free(head);
-        try out.appendSlice(self.allocator, head);
-        var first = true;
-        try appendFlakeQueryStrings(self, id, &.{ "host", "dir", "narHash", "submodules" }, &out, &first);
-        return Value.string(try self.intern.intern(out.items));
-    }
-
-    if (std.mem.eql(u8, type_value, "path")) {
-        const path = try requiredStringAttr(self, id, "path");
-        defer self.allocator.free(path);
-        try out.appendSlice(self.allocator, "path:");
-        try out.appendSlice(self.allocator, path);
-        var first = true;
-        try appendFlakeQueryStrings(self, id, &.{ "ref", "rev", "narHash", "dir" }, &out, &first);
-        return Value.string(try self.intern.intern(out.items));
-    }
-
-    // URL-backed types serialize as `<prefix><url>` + query. `tarball` uses a
-    // bare http(s) URL (Nix infers tarball from the scheme) and only prefixes
-    // when the scheme wouldn't round-trip.
-    const url_type: ?struct { prefix: []const u8, bare_http: bool } =
-        if (std.mem.eql(u8, type_value, "git")) .{ .prefix = "git+", .bare_http = false } else if (std.mem.eql(u8, type_value, "mercurial")) .{ .prefix = "hg+", .bare_http = false } else if (std.mem.eql(u8, type_value, "file")) .{ .prefix = "file+", .bare_http = false } else if (std.mem.eql(u8, type_value, "tarball")) .{ .prefix = "tarball+", .bare_http = true } else null;
-    if (url_type) |ut| {
-        const url = try requiredStringAttr(self, id, "url");
-        defer self.allocator.free(url);
-        const http = std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
-        if (!(ut.bare_http and http)) try out.appendSlice(self.allocator, ut.prefix);
-        try out.appendSlice(self.allocator, url);
-        var first = true;
-        try appendFlakeQueryStrings(self, id, &.{ "ref", "rev", "narHash", "dir", "host", "submodules", "shallow" }, &out, &first);
-        return Value.string(try self.intern.intern(out.items));
-    }
-
-    return error.InvalidFlakeRef;
-}
-
-fn appendFlakeQueryAttrs(self: *VM, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), query: []const u8) !void {
-    var parts = std.mem.splitScalar(u8, query, '&');
-    while (parts.next()) |part| {
-        if (part.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
-        const key = part[0..eq];
-        const value = part[eq + 1 ..];
-        inline for (.{ "ref", "rev", "narHash", "dir", "host", "submodules", "shallow", "lastModified", "revCount" }) |known| {
-            if (std.mem.eql(u8, key, known)) {
-                try appendStringAttr(self, entries, key, value);
-                break;
-            }
-        }
-    }
-}
-
-/// Append `?k1=v1&k2=v2` for each of `names` present on `attrs_id`, in order.
-fn appendFlakeQueryStrings(self: *VM, attrs_id: ObjectId, names: []const []const u8, out: *std.ArrayListUnmanaged(u8), first: *bool) !void {
-    for (names) |name| try appendFlakeQueryString(self, attrs_id, name, out, first);
-}
-
-fn appendFlakeQueryString(self: *VM, attrs_id: ObjectId, name: []const u8, out: *std.ArrayListUnmanaged(u8), first: *bool) !void {
-    const value = try optionalStringAttr(self, attrs_id, name) orelse return;
-    defer self.allocator.free(value);
-    try out.append(self.allocator, if (first.*) '?' else '&');
-    first.* = false;
-    try out.appendSlice(self.allocator, name);
-    try out.append(self.allocator, '=');
-    try out.appendSlice(self.allocator, value);
 }
