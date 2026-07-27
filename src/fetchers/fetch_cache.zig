@@ -101,7 +101,7 @@ pub const FetchCache = struct {
         service.connect_timeout_seconds = config.connect_timeout_seconds;
         service.stalled_timeout_seconds = config.stalled_timeout_seconds;
         service.download_speed_kib = config.download_speed_kib;
-        if (config.environment) |environment| service.setEnvironment(environment);
+        if (config.environment) |environment| try service.setEnvironment(environment);
         if (config.cache_root) |root| try service.setCacheRoot(root);
         if (config.ssl_cert_file) |path| try service.setSslCertFile(path);
         try service.setFlakeRegistryUrl(config.flake_registry_url);
@@ -149,15 +149,23 @@ pub const FetchCache = struct {
 
     /// Set the process environment inherited by tar/hg subprocesses and used
     /// to derive proxy/TLS settings for libcurl and libgit2.
-    pub fn setEnvironment(self: *FetchCache, env: *const std.process.Environ.Map) void {
-        self.env = env;
+    pub fn setEnvironment(self: *FetchCache, env: *const std.process.Environ.Map) !void {
+        // Derive every owned field before disturbing the live environment.
+        // Absence in the replacement environment deliberately clears a prior
+        // environment-derived certificate.
+        const ca = env.get("NIX_SSL_CERT_FILE") orelse env.get("SSL_CERT_FILE");
+        const replacement_ca = if (ca) |path|
+            if (path.len != 0) try self.allocator.dupe(u8, path) else null
+        else
+            null;
+
         if (self.subprocess_env) |*e| { // rebuild lazily on next use
             e.deinit();
             self.subprocess_env = null;
         }
-        // Nix's environment precedence for evaluator-owned HTTPS downloads.
-        const ca = env.get("NIX_SSL_CERT_FILE") orelse env.get("SSL_CERT_FILE");
-        if (ca) |path| if (path.len != 0) self.setSslCertFile(path) catch {};
+        if (self.ssl_cert_file) |old| self.allocator.free(old);
+        self.ssl_cert_file = replacement_ca;
+        self.env = env;
     }
 
     /// The environment for a tar/hg subprocess: the inherited process env
@@ -207,17 +215,19 @@ pub const FetchCache = struct {
 
     /// Set the concurrent-fetch cap (`http-connections`; 0 = unlimited).
     pub fn setMaxConnections(self: *FetchCache, n: u32) !void {
-        if (self.fetch_pool) |pool| {
+        const replacement: ?*BlockingPool = if (n == 0) null else blk: {
+            const pool = try self.allocator.create(BlockingPool);
+            pool.* = BlockingPool.init(self.allocator, n);
+            break :blk pool;
+        };
+
+        const old = self.fetch_pool;
+        self.fetch_pool = replacement;
+        self.max_connections = n;
+        if (old) |pool| {
             pool.deinit();
             self.allocator.destroy(pool);
-            self.fetch_pool = null;
         }
-        self.max_connections = n;
-        if (n == 0) return;
-        const pool = try self.allocator.create(BlockingPool);
-        errdefer self.allocator.destroy(pool);
-        pool.* = BlockingPool.init(self.allocator, n);
-        self.fetch_pool = pool;
     }
 
     /// Set `download-attempts` (total tries per download; clamped to >= 1).
@@ -1370,7 +1380,7 @@ test "subprocess env: inherits parent and normalizes Mercurial" {
 
     var fc = try FetchCache.init(testing.allocator, .{});
     defer fc.deinit();
-    fc.setEnvironment(&parent);
+    try fc.setEnvironment(&parent);
 
     const env = (try fc.subprocessEnviron()).?;
     try testing.expectEqualStrings("", env.get("HGPLAIN").?);

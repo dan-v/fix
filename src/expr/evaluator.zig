@@ -578,7 +578,7 @@ pub const Engine = struct {
             },
         };
         if (config.io) |io| ev.setFileIo(io);
-        if (config.environment) |env_map| ev.setEnvironment(env_map);
+        if (config.environment) |env_map| try ev.setEnvironment(env_map);
         return ev;
     }
 
@@ -822,11 +822,12 @@ pub const Engine = struct {
     }
 
     pub fn setBasePathFromCurrentPath(self: *Engine, io: std.Io) !void {
+        const replacement = try std.process.currentPathAlloc(io, self.allocator);
         self.sources.files.setIo(io);
         self.sources.fetchers.setIo(io);
         self.store.realization.setIo(io);
         if (self.sources.base_path) |path| self.allocator.free(path);
-        self.sources.base_path = try std.process.currentPathAlloc(io, self.allocator);
+        self.sources.base_path = replacement;
     }
 
     pub fn setFileIo(self: *Engine, io: std.Io) void {
@@ -849,9 +850,9 @@ pub const Engine = struct {
         self.sources.base_path = owned;
     }
 
-    pub fn setEnvironment(self: *Engine, env_map: *const std.process.Environ.Map) void {
+    pub fn setEnvironment(self: *Engine, env_map: *const std.process.Environ.Map) !void {
+        try self.sources.fetchers.setEnvironment(env_map);
         self.sources.env_map = env_map;
-        self.sources.fetchers.setEnvironment(env_map);
         // Point the fetch download-cache at `$XDG_CACHE_HOME/fix` (default
         // `~/.cache/fix`), mirroring Nix's `~/.cache/nix`. Best-effort; without
         // HOME/XDG the FetchCache keeps its `./.zig-cache/fix` fallback.
@@ -2346,8 +2347,9 @@ pub const Engine = struct {
     /// `collection.extra_roots`). The repl passes its scope attrset + loose values
     /// here whenever they change; they stay rooted until replaced.
     pub fn gcSetExternalRoots(self: *Engine, roots: []const Value) !void {
+        try self.collection.extra_roots.ensureTotalCapacity(self.allocator, roots.len);
         self.collection.extra_roots.clearRetainingCapacity();
-        try self.collection.extra_roots.appendSlice(self.allocator, roots);
+        self.collection.extra_roots.appendSliceAssumeCapacity(roots);
     }
 
     pub const CollectNowResult = struct {
