@@ -658,6 +658,7 @@ const Line = struct {
     n: usize = 0,
     buf: [1024]u8 = undefined,
     used: usize = 0,
+    overflowed: bool = false,
     /// Token index where the `;` comment starts, if any. The renderer pads the
     /// tokens before it out to `field_comment_col` so comment semicolons align.
     comment_tok: ?usize = null,
@@ -668,47 +669,53 @@ const Line = struct {
         self.n = 0;
         self.used = 0;
         self.comment_tok = null;
+        self.overflowed = false;
     }
 
     fn store(self: *Line, comptime fmt: []const u8, args: anytype) []const u8 {
-        const s = std.fmt.bufPrint(self.buf[self.used..], fmt, args) catch self.buf[self.used..self.used];
+        const s = std.fmt.bufPrint(self.buf[self.used..], fmt, args) catch {
+            self.overflowed = true;
+            return self.buf[self.used..self.used];
+        };
         self.used += s.len;
         return s;
     }
+
+    fn append(self: *Line, tok: Tok) void {
+        if (self.n == self.toks.len) {
+            self.overflowed = true;
+            return;
+        }
+        self.toks[self.n] = tok;
+        self.n += 1;
+    }
+
+    fn validate(self: *const Line) !void {
+        if (self.overflowed) return error.DisassemblyLineTooLong;
+    }
+
     /// Dim structural text (brackets, separators, `chunk `), consumes no bytes.
     fn glue(self: *Line, comptime fmt: []const u8, args: anytype) void {
         const s = self.store(fmt, args);
-        if (self.n < self.toks.len) {
-            self.toks[self.n] = .{ .text = s };
-            self.n += 1;
-        }
+        self.append(.{ .text = s });
     }
     /// A decoded value: `len` bytes at `byte_off`, text tinted to match them.
     fn group(self: *Line, byte_off: u16, len: u16, comptime fmt: []const u8, args: anytype) void {
         const s = self.store(fmt, args);
-        if (self.n < self.toks.len) {
-            self.toks[self.n] = .{ .byte_off = byte_off, .len = len, .text = s, .colored = true };
-            self.n += 1;
-        }
+        self.append(.{ .byte_off = byte_off, .len = len, .text = s, .colored = true });
     }
     /// Like `group`, but with an explicit identity `color` (its bytes take it
     /// too) instead of the running-hue assignment — for a chunk id, whose color
     /// is fixed to the chunk it names.
     fn groupPinned(self: *Line, byte_off: u16, len: u16, color: [3]u8, comptime fmt: []const u8, args: anytype) void {
         const s = self.store(fmt, args);
-        if (self.n < self.toks.len) {
-            self.toks[self.n] = .{ .byte_off = byte_off, .len = len, .text = s, .colored = true, .pin = true, .color = color };
-            self.n += 1;
-        }
+        self.append(.{ .byte_off = byte_off, .len = len, .text = s, .colored = true, .pin = true, .color = color });
     }
     /// Colored text that maps to no bytes — an interpretive comment fragment
     /// (`chunk[0xN]`, a name) drawn in a fixed color rather than dim grey.
     fn tint(self: *Line, color: [3]u8, comptime fmt: []const u8, args: anytype) void {
         const s = self.store(fmt, args);
-        if (self.n < self.toks.len) {
-            self.toks[self.n] = .{ .text = s, .colored = true, .pin = true, .color = color };
-            self.n += 1;
-        }
+        self.append(.{ .text = s, .colored = true, .pin = true, .color = color });
     }
     /// Begin the `;` comment: marks the alignment point, then writes ` ; `.
     fn comment(self: *Line) void {
@@ -791,6 +798,7 @@ fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, bg: ?[3]u
 /// row (a continuous gutter) but the interpretation only on the first. `seq` is
 /// the running per-instruction color counter (shared with the mnemonic).
 fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, last_mask: u8, bg: ?[3]u8, env: Env) !void {
+    try line.validate();
     const base = off.*;
     const total = line.total();
     line.paint(seq, env.color_depth);
@@ -1237,6 +1245,7 @@ fn headInterp(l: *Line, f: Operand, chunk: *const Chunk, code: []const u8, off: 
 /// colored to match) then the mnemonic and the inline head operand. `head` is
 /// from `buildHead`; `head_len` its operand byte count.
 fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: OpCode, head: *Line, head_len: u16, seq: *usize, bg: ?[3]u8, env: Env) !void {
+    try head.validate();
     head.paint(seq, env.color_depth);
     if (env.show_bytes) {
         var c: u16 = 0;
@@ -2332,6 +2341,17 @@ test "canonical store references and half-open ranges" {
     out.clearRetainingCapacity();
     try writeEscapedSnippet(&out.writer, "ab中def", 5);
     try std.testing.expectEqualStrings("ab中…", out.written());
+}
+
+test "operand lines report capacity overflow instead of truncating" {
+    var line: Line = undefined;
+    line.reset();
+    for (0..line.toks.len + 1) |_| line.glue("x", .{});
+    try std.testing.expectError(error.DisassemblyLineTooLong, line.validate());
+
+    line.reset();
+    line.glue("{s}", .{[_]u8{'x'} ** (line.buf.len + 1)});
+    try std.testing.expectError(error.DisassemblyLineTooLong, line.validate());
 }
 
 test "value digests use canonical location-first references" {
