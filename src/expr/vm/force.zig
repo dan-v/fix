@@ -309,17 +309,13 @@ fn attachSpeculativeEffects(self: *VM, thunk: *Thunk, checkpoint: usize) !void {
 }
 
 pub fn forceDeep(self: *VM, value: Value) !void {
-    var seen: std.ArrayListUnmanaged(SeenDeepObject) = .empty;
+    var seen: SeenDeepSet = .empty;
     defer seen.deinit(self.allocator);
     try forceDeepInner(self, value, &seen);
 }
 
 pub const SeenDeepKind = enum { list, attrs };
-
-pub const SeenDeepObject = struct {
-    kind: SeenDeepKind,
-    id: ObjectId,
-};
+pub const SeenDeepSet = std.AutoHashMapUnmanaged(u64, void);
 
 /// Like `forceDeep`, but reports `[i/N]` over the TOP-LEVEL members (a list's
 /// elements / an attrset's entries) on the active render node. Used only by the
@@ -328,7 +324,7 @@ pub const SeenDeepObject = struct {
 /// The count is on the outermost fan-out only; nested forces recurse via the
 /// uncounted `forceDeepInner`.
 pub fn forceDeepCounted(self: *VM, value: Value) !void {
-    var seen: std.ArrayListUnmanaged(SeenDeepObject) = .empty;
+    var seen: SeenDeepSet = .empty;
     defer seen.deinit(self.allocator);
     const forced = try forceValue(self, value);
     switch (forced.kind()) {
@@ -356,7 +352,7 @@ pub fn forceDeepCounted(self: *VM, value: Value) !void {
     }
 }
 
-pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(SeenDeepObject)) anyerror!void {
+pub fn forceDeepInner(self: *VM, value: Value, seen: *SeenDeepSet) anyerror!void {
     const forced = try forceValue(self, value);
     switch (forced.kind()) {
         .list, .attrs => {
@@ -479,12 +475,9 @@ pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []con
     fanOutAttrsShallow(self, attrs_id, entries);
 }
 
-pub fn enterDeep(self: *VM, kind: SeenDeepKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenDeepObject)) !bool {
-    for (seen.items) |item| {
-        if (item.kind == kind and item.id == id) return false;
-    }
-    try seen.append(self.allocator, .{ .kind = kind, .id = id });
-    return true;
+pub fn enterDeep(self: *VM, kind: SeenDeepKind, id: ObjectId, seen: *SeenDeepSet) !bool {
+    const key = (@as(u64, @intFromEnum(kind)) << 32) | @as(u64, id);
+    return !(try seen.getOrPut(self.allocator, key)).found_existing;
 }
 
 pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {

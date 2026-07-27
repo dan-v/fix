@@ -156,7 +156,7 @@ fn gcKeyHashCode(self: *VM, key: Value) !u64 {
 /// `gcKeyHashCode`; membership is confirmed by `valuesEqualForced`.
 pub const GcKeySet = struct {
     index: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(Value)) = .empty,
-    seen: std.ArrayListUnmanaged(vm_equality.EqualityPair) = .empty,
+    seen: vm_equality.EqualityPairSet = .empty,
 
     pub fn deinit(self: *GcKeySet, allocator: std.mem.Allocator) void {
         var it = self.index.valueIterator();

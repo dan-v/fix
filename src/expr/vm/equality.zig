@@ -16,7 +16,7 @@ const strings = @import("strings.zig");
 const VM = vm_mod.VM;
 
 pub fn valuesEqual(self: *VM, a: Value, b: Value) anyerror!bool {
-    var seen: std.ArrayListUnmanaged(EqualityPair) = .empty;
+    var seen: EqualityPairSet = .empty;
     defer seen.deinit(self.allocator);
     return valuesEqualSeen(self, a, b, &seen);
 }
@@ -32,7 +32,7 @@ pub fn valueSliceContainsForcedValue(self: *VM, forced_needle: Value, list_id: h
     const n = try self.heap.getListLen(list_id);
     if (n == 0) return false;
 
-    var seen: std.ArrayListUnmanaged(EqualityPair) = .empty;
+    var seen: EqualityPairSet = .empty;
     defer seen.deinit(self.allocator);
 
     var i: usize = 0;
@@ -49,17 +49,41 @@ pub const EqualityPair = struct {
     right: Value,
 };
 
-pub fn valuesEqualSeen(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
+pub const EqualityPairSet = std.HashMapUnmanaged(
+    EqualityPair,
+    void,
+    EqualityPairContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+const EqualityPairContext = struct {
+    pub fn hash(_: EqualityPairContext, pair: EqualityPair) u64 {
+        const left = pair.left.idHash();
+        const right = pair.right.idHash();
+        const ordered = if (left <= right)
+            [2]u64{ left, right }
+        else
+            [2]u64{ right, left };
+        return std.hash.Wyhash.hash(0, std.mem.asBytes(&ordered));
+    }
+
+    pub fn eql(_: EqualityPairContext, a: EqualityPair, b: EqualityPair) bool {
+        return (a.left.idEq(b.left) and a.right.idEq(b.right)) or
+            (a.left.idEq(b.right) and a.right.idEq(b.left));
+    }
+};
+
+pub fn valuesEqualSeen(self: *VM, a: Value, b: Value, seen: *EqualityPairSet) anyerror!bool {
     const va = try force.forceValue(self, a);
     return valuesEqualSeenForcedLeft(self, va, b, seen);
 }
 
-pub fn valuesEqualSeenForcedLeft(self: *VM, va: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
+pub fn valuesEqualSeenForcedLeft(self: *VM, va: Value, b: Value, seen: *EqualityPairSet) anyerror!bool {
     const vb = try force.forceValue(self, b);
     return valuesEqualForced(self, va, vb, seen);
 }
 
-pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
+pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *EqualityPairSet) anyerror!bool {
     if (int_mod.isAnyInt(va) and int_mod.isAnyInt(vb)) {
         return int_mod.get(va, self.heap) == int_mod.get(vb, self.heap);
     }
@@ -88,7 +112,7 @@ pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *std.ArrayListUn
 
 pub const CompareResult = enum { lt, eq, gt };
 
-pub fn listsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
+pub fn listsEqual(self: *VM, a: Value, b: Value, seen: *EqualityPairSet) anyerror!bool {
     if (a.asObjectId() == b.asObjectId()) return true;
     if (try equalityPairSeen(self, a, b, seen)) return true;
 
@@ -114,7 +138,7 @@ pub fn listsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(E
     return true;
 }
 
-pub fn attrsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
+pub fn attrsEqual(self: *VM, a: Value, b: Value, seen: *EqualityPairSet) anyerror!bool {
     if (a.asObjectId() == b.asObjectId()) return true;
     if (try equalityPairSeen(self, a, b, seen)) return true;
 
@@ -148,7 +172,7 @@ pub fn derivationAttrsEqual(
     self: *VM,
     a_id: heap_mod.ObjectId,
     b_id: heap_mod.ObjectId,
-    seen: *std.ArrayListUnmanaged(EqualityPair),
+    seen: *EqualityPairSet,
 ) !?bool {
     const type_name = try self.intern.intern("type");
     const derivation_type = try self.intern.intern("derivation");
@@ -194,16 +218,8 @@ pub fn attrValue(entries: []const heap_mod.AttrEntry, name: InternId) ?Value {
     return null;
 }
 
-pub fn equalityPairSeen(self: *VM, left: Value, right: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) !bool {
-    for (seen.items) |pair| {
-        if ((pair.left.idEq(left) and pair.right.idEq(right)) or
-            (pair.left.idEq(right) and pair.right.idEq(left)))
-        {
-            return true;
-        }
-    }
-    try seen.append(self.allocator, .{ .left = left, .right = right });
-    return false;
+pub fn equalityPairSeen(self: *VM, left: Value, right: Value, seen: *EqualityPairSet) !bool {
+    return (try seen.getOrPut(self.allocator, .{ .left = left, .right = right })).found_existing;
 }
 
 pub fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
