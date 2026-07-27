@@ -37,6 +37,7 @@ const editor_mod = @import("editor.zig");
 const complete_mod = @import("complete.zig");
 const line_input = @import("line_input.zig");
 const vm_ui = @import("vm/root.zig");
+const vm_query_cache = @import("vm/query_cache.zig");
 const transcript_mod = @import("transcript.zig");
 
 const Options = args.Options;
@@ -158,13 +159,8 @@ const Repl = struct {
     /// Stable VM explorer focus. Ordinary evaluations update it to the
     /// result's backing chunk (closure/thunk) or their compiled entry chunk.
     vm_focus: ?types.ChunkId = null,
-    /// Cold hierarchy projection, rebuilt only after the append-only registry
-    /// or name tree grows. Bare queries share it instead of rescanning millions
-    /// of chunks for every command.
-    vm_index: ?engine.bytecode.inspect.NameIndex = null,
-    /// Compact live-object index for bounded inline `:vm objects` queries.
-    /// Invalidated before evaluation or collection mutates the heap.
-    vm_objects: ?runtime.ObjectHeap.ObjectSnapshot = null,
+    /// Cold name and live-object indexes for bounded text-mode VM queries.
+    vm_queries: vm_query_cache.Cache = .{},
     /// Direct REPL sources are not backed by the evaluator's file cache. Keep
     /// the source alongside the chunk generation so the VM inspector can show
     /// real text for expression spans as well as imported-file spans.
@@ -205,8 +201,7 @@ const Repl = struct {
         self.scope_bindings.deinit(self.allocator);
         for (self.loaded.items) |p| self.allocator.free(p);
         self.loaded.deinit(self.allocator);
-        if (self.vm_index) |*index| index.deinit();
-        if (self.vm_objects) |*snapshot| snapshot.deinit();
+        self.vm_queries.deinit();
         for (self.vm_sources.items) |source| self.allocator.free(source.text);
         self.vm_sources.deinit(self.allocator);
         self.history.deinit();
@@ -896,13 +891,11 @@ const Repl = struct {
     }
 
     fn clearVmObjects(self: *Repl) void {
-        if (self.vm_objects) |*snapshot| snapshot.deinit();
-        self.vm_objects = null;
+        self.vm_queries.clearObjects();
     }
 
     fn ensureVmObjects(self: *Repl) !*runtime.ObjectHeap.ObjectSnapshot {
-        if (self.vm_objects == null) self.vm_objects = try self.ev.heapObjectSnapshot(self.allocator);
-        return &self.vm_objects.?;
+        return self.vm_queries.objectSnapshot(self.allocator, self.ev);
     }
 
     fn vmObjects(self: *Repl, args_text: []const u8) !void {
@@ -1021,7 +1014,7 @@ const Repl = struct {
 
     fn writeVmObjectField(self: *Repl, w: *std.Io.Writer, label: []const u8, id: runtime.types.ObjectId) !void {
         var preview: ?[]const u8 = null;
-        if (self.vm_objects) |*snapshot| {
+        if (self.vm_queries.objects) |*snapshot| {
             if (self.ev.inspectHeapObject(snapshot, id)) |info| {
                 preview = objectInfoLabel(info);
             } else |_| {}
@@ -1074,14 +1067,7 @@ const Repl = struct {
     }
 
     fn ensureVmIndex(self: *Repl) !*engine.bytecode.inspect.NameIndex {
-        const registry = self.ev.chunkRegistry();
-        if (self.vm_index) |*index| {
-            if (index.registry_count == registry.count() and index.name_count == registry.nameCount()) return index;
-            index.deinit();
-            self.vm_index = null;
-        }
-        self.vm_index = try engine.bytecode.inspect.NameIndex.build(self.allocator, registry);
-        return &self.vm_index.?;
+        return self.vm_queries.nameIndex(self.allocator, self.ev);
     }
 
     fn vmList(self: *Repl, args_text: []const u8) !void {
