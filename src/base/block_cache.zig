@@ -68,6 +68,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
         const Self = @This();
 
         backing: Allocator,
+        huge_policy: hugetlb.Policy,
         mu: SpinMutex = .{},
         blocks: [size_class_count][max_blocks_per_class][*]u8 = undefined,
         counts: [size_class_count]u8 = @splat(0),
@@ -115,7 +116,18 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
         }
 
         pub fn init(backing: Allocator) Self {
-            return .{ .backing = backing };
+            return .{
+                .backing = backing,
+                .huge_policy = .init(.off),
+            };
+        }
+
+        pub fn setHugeMode(self: *Self, mode: hugetlb.Mode) void {
+            self.huge_policy.setMode(mode);
+        }
+
+        pub fn hugePolicy(self: *Self) *hugetlb.Policy {
+            return &self.huge_policy;
         }
 
         /// Release every retained block back to the backing allocator (or
@@ -192,8 +204,8 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
                 // >64 MB pass-through blocks (the biggest store segments)
                 // get their own hugetlb mapping when enabled; a failed mmap
                 // (pool exhausted) or a full tracking table falls back.
-                if (len >= huge_page_size and hugetlb.wanted()) {
-                    if (hugetlb.map(len)) |hp| {
+                if (len >= huge_page_size and self.huge_policy.wanted()) {
+                    if (hugetlb.map(&self.huge_policy, len)) |hp| {
                         const rounded = hugetlb.roundedLen(len);
                         if (self.hugeTrack(hp, rounded)) {
                             if (trackable(len)) Vma.registerRegion(hp, len, Vma.alloc_tag);
@@ -221,8 +233,8 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             // Fresh class blocks of ≥2 MB come from an explicit hugetlb
             // mapping when enabled (clean fallback on pool exhaustion).
             // Class sizes ≥2 MB are 2 MB multiples already.
-            if (classSize(class) >= huge_page_size and hugetlb.wanted()) {
-                if (hugetlb.map(classSize(class))) |hp| {
+            if (classSize(class) >= huge_page_size and self.huge_policy.wanted()) {
+                if (hugetlb.map(&self.huge_policy, classSize(class))) |hp| {
                     if (self.hugeTrack(hp, classSize(class))) {
                         Vma.registerRegion(hp, classSize(class), Vma.alloc_tag);
                         return hp;
@@ -394,12 +406,9 @@ test "block cache: hugetlb-eligible blocks round-trip in every mode" {
     // (engaged) or not (clean fallback to the backing allocator), the
     // blocks must be usable end to end and every free must reach the
     // right owner — std.testing.allocator flags a leak or a foreign free.
-    const saved = hugetlb.getMode();
-    hugetlb.setMode(.on);
-    defer hugetlb.setMode(saved orelse .off);
-
     var cache = BlockCacheAllocator(TestVma).init(std.testing.allocator);
     defer cache.deinit();
+    cache.setHugeMode(.on);
     const a = cache.allocator();
 
     // 4 MB class block: write both ends, free (parks it), realloc same class
@@ -429,7 +438,7 @@ test "block cache: hugetlb-eligible blocks round-trip in every mode" {
     // Off again: fresh ≥2 MB blocks route to the backing allocator, and a
     // still-live hugetlb block allocated while on would still free correctly
     // (ownership is per-block, not per-mode).
-    hugetlb.setMode(.off);
+    cache.setHugeMode(.off);
     const off_blk = try a.alloc(u8, 2 << 20);
     off_blk[0] = 7;
     a.free(off_blk);

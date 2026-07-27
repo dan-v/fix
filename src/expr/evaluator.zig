@@ -37,6 +37,7 @@ const parser_mod = @import("syntax").parser;
 const diagnostic = @import("syntax").diagnostic;
 const eval_trace = @import("observ.zig").trace;
 const observ = @import("base").observ;
+const hugetlb = @import("base").hugetlb;
 const ast_mod = @import("syntax").ast;
 const deferred_mod = @import("compiler.zig").deferred_table;
 const EvaluationReport = @import("eval/report.zig").EvaluationReport;
@@ -453,6 +454,7 @@ pub const Config = struct {
     io: ?std.Io = null,
     environment: ?*const std.process.Environ.Map = null,
     fetch: FetchService.Config = .{},
+    memory_backing: ?*hugetlb.Policy = null,
 };
 
 pub const Engine = struct {
@@ -538,7 +540,7 @@ pub const Engine = struct {
         var store = try StoreState.init(allocator);
         errdefer store.deinit();
 
-        var heap = try ObjectHeap.init(allocator, worker_count);
+        var heap = try ObjectHeap.initWithMemoryPolicy(allocator, worker_count, config.memory_backing);
         errdefer heap.deinit();
 
         var fetch_config = config.fetch;

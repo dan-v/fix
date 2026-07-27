@@ -119,6 +119,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             break :blk arr;
         },
         write_mu: SpinMutex = .{},
+        huge_policy: ?*hugetlb.Policy = null,
 
         // --- per-segment hugetlb overlay (`params.huge_overlay_min`) ---
         //
@@ -145,6 +146,10 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         const segment_populate_chunk_size: usize = 32 << 20;
 
         pub const empty: Self = .{};
+
+        pub fn setHugePolicy(self: *Self, policy: ?*hugetlb.Policy) void {
+            self.huge_policy = policy;
+        }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             for (&self.segments, 0..) |*atom, i| {
@@ -413,7 +418,8 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             const bytes = segmentBytes(segment);
             if (bytes < params.huge_overlay_min) return false;
             if (bytes % hugetlb.huge_page_size != 0) return false;
-            if (!hugetlb.wanted()) return false;
+            const policy = self.huge_policy orelse return false;
+            if (!policy.wanted()) return false;
             // Over-reserve by one huge page and trim to a 2 MB-aligned
             // window (a MAP_FIXED hugetlb overlay needs an aligned target).
             const mem = std.posix.mmap(
@@ -464,7 +470,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
                 return;
             }
             const basep: [*]u8 = @ptrCast(self.segments[segment].load(.monotonic).?);
-            if (hugetlb.overlayFixed(basep + frontier, target - frontier)) {
+            if (hugetlb.overlayFixed(self.huge_policy.?, basep + frontier, target - frontier)) {
                 self.seg_huge_frontier[segment] = target;
                 if (target == limit) self.seg_huge_off[segment] = true;
             } else {
@@ -595,6 +601,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
         /// `count()` so an opportunistic reader doesn't tear.
         cursor: std.atomic.Value(u32),
         write_mu: SpinMutex,
+        huge_policy: ?*hugetlb.Policy,
         /// Hugetlb prefix frontier: bytes `[0, huge_frontier)` of the
         /// reservation are backed by reserved, DONTFORK, write-prefaulted
         /// huge pages, so pool/NUMA/cgroup failure can only fail a frontier
@@ -613,15 +620,20 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
         const huge_chunk_size: usize = params.huge_chunk;
 
         pub fn init() !Self {
+            return initWithPolicy(null);
+        }
+
+        pub fn initWithPolicy(policy: ?*hugetlb.Policy) !Self {
             var self: Self = .{
                 .base = undefined,
                 .cursor = .init(0),
                 .write_mu = .{},
+                .huge_policy = policy,
                 .huge_frontier = 0,
                 .huge_grow_off = true,
             };
             const use_huge = comptime_linux and huge_limit >= hugetlb.huge_page_size and
-                byte_count % page_size_min == 0 and hugetlb.wanted();
+                byte_count % page_size_min == 0 and policy != null and policy.?.wanted();
             const mem: [*]align(page_size_min) u8 = if (use_huge) blk: {
                 // A hugetlb overlay (MAP_FIXED) needs a 2 MB-aligned target,
                 // so over-reserve by one huge page and trim to an aligned
@@ -744,7 +756,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
                 return;
             }
             const basep: [*]u8 = @ptrCast(self.base);
-            if (hugetlb.overlayFixed(basep + self.huge_frontier, target - self.huge_frontier)) {
+            if (hugetlb.overlayFixed(self.huge_policy.?, basep + self.huge_frontier, target - self.huge_frontier)) {
                 self.huge_frontier = target;
                 if (target == huge_limit) self.huge_grow_off = true;
             } else {
@@ -977,12 +989,10 @@ test "flat store: hugetlb prefix — data intact across many frontier crossings"
     // extension falls back, store behaves plainly), the data written before,
     // at, and after each crossing must round-trip — this is the invariant
     // that the MAP_FIXED overlay never covers handed-out slots.
-    const saved = hugetlb.getMode();
-    hugetlb.setMode(.on);
-    defer hugetlb.setMode(saved orelse .off);
+    var policy = hugetlb.Policy.init(.on);
 
     const Store = FlatStore(u64, .{ .max_slots = 1 << 20, .huge_chunk = 2 << 20 }, TestVma);
-    var store = try Store.init();
+    var store = try Store.initWithPolicy(&policy);
     defer store.deinit(std.testing.allocator);
 
     // Mixed-size reservations so range ends land on both sides of 2 MB lines.

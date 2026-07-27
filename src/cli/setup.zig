@@ -29,11 +29,16 @@ pub fn workerCount(options: args.Options) !u8 {
 /// Resolve the process capabilities that must be present when the engine's
 /// long-lived services are constructed. Remaining language/store policy is
 /// applied by `configure` after nix.conf has been folded.
-pub fn engineConfig(init: std.process.Init, worker_count: u8) engine.EngineConfig {
+pub fn engineConfig(
+    init: std.process.Init,
+    worker_count: u8,
+    memory_backing: ?*hugetlb.Policy,
+) engine.EngineConfig {
     return .{
         .worker_count = worker_count,
         .io = init.io,
         .environment = init.environ_map,
+        .memory_backing = memory_backing,
     };
 }
 
@@ -47,15 +52,20 @@ pub const Terminal = struct {
     }
 };
 
-/// Resolve process-level memory-backing policy that must be decided BEFORE
+/// Resolve the process-owned memory-backing policy that must be decided BEFORE
 /// `Engine.init` maps the heap (the flat object store picks its mapping
 /// at init): `--hugetlb` (`cli_mode`, null for subcommands without the shared
 /// parser), defaulting to `auto`.
 /// Deliberately NOT a nix.conf setting: config loads in `configure`, after
 /// the heap already exists, so a config-sourced value could only half-apply.
 /// Call before `Engine.init` in every eval-producing subcommand.
-pub fn applyMemoryBacking(cli_mode: ?hugetlb.Mode) void {
-    hugetlb.setMode(cli_mode orelse .auto);
+pub fn applyMemoryBacking(
+    process: @import("process_context.zig").ProcessContext,
+    cli_mode: ?hugetlb.Mode,
+) ?*hugetlb.Policy {
+    const policy = process.memory_backing orelse return null;
+    policy.setMode(cli_mode orelse .auto);
+    return policy;
 }
 
 /// Apply the shared `Options → Engine` configuration (feature toggles,
@@ -188,7 +198,7 @@ fn resolveNixConfigRef(allocator: std.mem.Allocator, io: std.Io, ref: []const u8
 fn foldFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, ref: []const u8, settings: *nix_conf.Settings) void {
     // A ref with quotes/backslashes is invalid; skip rather than mis-escape it.
     if (std.mem.indexOfAny(u8, ref, "\"\\\n") != null) return;
-    var ev = Engine.init(allocator, engineConfig(init, 1)) catch return;
+    var ev = Engine.init(allocator, engineConfig(init, 1, null)) catch return;
     defer ev.deinit();
     // fetchTree / parseFlakeRef need the flakes feature (which implies fetch-tree).
     var feats: args.ExperimentalFeatures = .{};

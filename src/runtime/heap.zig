@@ -27,6 +27,7 @@ const types = @import("types.zig");
 /// nondeterministic segfault much later. Off in ReleaseFast (production).
 pub const gc_debug = builtin.mode == .ReleaseSafe;
 const segments = @import("base").segments;
+const hugetlb = @import("base").hugetlb;
 const sync = @import("base").sync;
 const worker_id_mod = @import("base").worker_id;
 const Value = @import("value.zig").Value;
@@ -425,16 +426,30 @@ pub const ObjectHeap = struct {
     discarded_object_tails: std.ArrayListUnmanaged([2]ObjectId) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
-        var objects = try ObjectStore.init();
+        return initWithMemoryPolicy(allocator, worker_count, null);
+    }
+
+    pub fn initWithMemoryPolicy(
+        allocator: std.mem.Allocator,
+        worker_count: u8,
+        huge_policy: ?*hugetlb.Policy,
+    ) !ObjectHeap {
+        var objects = try ObjectStore.initWithPolicy(huge_policy);
         errdefer objects.deinit(allocator);
+        var values: ValueStore = .empty;
+        values.setHugePolicy(huge_policy);
+        var attrs: AttrStore = .empty;
+        attrs.setHugePolicy(huge_policy);
+        var attr_positions: AttrPosStore = .empty;
+        attr_positions.setHugePolicy(huge_policy);
         const locals = try allocator.alloc(HeapLocal, @max(worker_count, 1));
         for (locals) |*l| l.* = .{};
         return .{
             .allocator = allocator,
             .objects = objects,
-            .values = .empty,
-            .attrs = .empty,
-            .attr_positions = .empty,
+            .values = values,
+            .attrs = attrs,
+            .attr_positions = attr_positions,
             .worker_locals = locals,
             .gc_shared_free_objects = .empty,
             .gc_shared_free_mu = .{},

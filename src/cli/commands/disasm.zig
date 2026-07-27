@@ -57,8 +57,8 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     // Resolve heap backing before the evaluator maps its stores
     // (`--hugetlb`, otherwise auto).
-    setup.applyMemoryBacking(options.hugetlb);
-    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count));
+    const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
     // Configure features (pipe-operators/flakes), base path, and NIX_PATH so the
     // compile matches what `eval`/`build` would see. No progress: disasm prints

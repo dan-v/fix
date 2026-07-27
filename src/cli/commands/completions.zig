@@ -441,7 +441,7 @@ fn completeFlake(
 /// List the declared input names of the flake in the current directory
 /// (`flake.nix`'s `inputs` attrset) — no fetch, no outputs.
 fn completeFlakeInputNames(allocator: std.mem.Allocator, init: std.process.Init, w: *std.Io.Writer, prefix: []const u8) !void {
-    var ev = try Engine.init(allocator, setup.engineConfig(init, 1));
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     const cwd = try std.process.currentPathAlloc(init.io, allocator);
@@ -685,7 +685,7 @@ fn completeSourceAttrs(
     const source_arg = options.source orelse options.defaultSource();
     if (source_arg == .flake) options.experimental_features.insert(.flakes);
 
-    var ev = try Engine.init(allocator, setup.engineConfig(init, 1));
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     _ = try setup.configure(&ev, init, options);
@@ -707,7 +707,7 @@ fn completePackageAttrs(
 ) !void {
     var options = try parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
-    var ev = try Engine.init(allocator, setup.engineConfig(init, 1));
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     _ = try setup.configure(&ev, init, options);
@@ -733,7 +733,7 @@ fn completeFlakeAttrs(
     var options = try parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
     options.experimental_features.insert(.flakes);
-    var ev = try Engine.init(allocator, setup.engineConfig(init, 1));
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     _ = try setup.configure(&ev, init, options);

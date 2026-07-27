@@ -4,8 +4,7 @@
 //! reserve, exclude themselves from `fork`, and write-prefault before they are
 //! published. Any failure falls back to ordinary mappings.
 //!
-//! Mode is process-global and starts unconfigured so early allocations cannot
-//! engage hugetlb before CLI setup resolves the user's intent:
+//! Each process composition root owns a `Policy` and passes it to consumers:
 //!   - `off`  — never.
 //!   - `on`   — always try; warn once when the pool can't serve a mapping.
 //!   - `auto` — engage only when the 2 MB pool has unreserved capacity for a
@@ -31,32 +30,64 @@ pub const auto_floor_bytes: usize = 256 << 20;
 
 pub const Mode = enum(u8) { auto, on, off };
 
-/// 0 = unconfigured (treated as off); otherwise `@intFromEnum(Mode) + 1`.
-var mode_state: std.atomic.Value(u8) = .init(0);
-/// Cached `auto` resolution: 0 = unresolved, 1 = engaged, 2 = declined.
-var auto_state: std.atomic.Value(u8) = .init(0);
-var warned_fallback: std.atomic.Value(bool) = .init(false);
-
 /// Bytes currently mapped as hugetlb by this process (via `map`/`mapFixed`),
 /// and the high-water mark. `map` write-prefaults every page before returning,
 /// so mapped bytes are both committed to the pool and physically instantiated.
 var mapped_bytes: std.atomic.Value(usize) = .init(0);
 var peak_mapped_bytes: std.atomic.Value(usize) = .init(0);
 
-/// Set the process-wide mode. Called once by CLI setup before the heap maps;
-/// safe to call again (e.g. tests) — consumers read it per-decision, and
-/// block ownership is tracked per-mapping, so flipping modes never
-/// mismatches an munmap. Re-arms the cached `auto` resolution.
-pub fn setMode(m: Mode) void {
-    mode_state.store(@intFromEnum(m) + 1, .monotonic);
-    auto_state.store(0, .monotonic);
-}
+pub const Policy = struct {
+    mode: std.atomic.Value(Mode),
+    /// Cached `auto` resolution: 0 = unresolved, 1 = engaged, 2 = declined.
+    auto_state: std.atomic.Value(u8) = .init(0),
+    warned_fallback: std.atomic.Value(bool) = .init(false),
 
-pub fn getMode() ?Mode {
-    const s = mode_state.load(.monotonic);
-    if (s == 0) return null;
-    return @enumFromInt(s - 1);
-}
+    pub fn init(mode: Mode) Policy {
+        return .{ .mode = .init(mode) };
+    }
+
+    /// Reconfigure this policy before publishing it to memory consumers.
+    /// Re-arms the cached `auto` decision and one-shot warning.
+    pub fn setMode(self: *Policy, mode: Mode) void {
+        self.mode.store(mode, .monotonic);
+        self.auto_state.store(0, .monotonic);
+        self.warned_fallback.store(false, .monotonic);
+    }
+
+    pub fn getMode(self: *const Policy) Mode {
+        return self.mode.load(.monotonic);
+    }
+
+    /// Should a consumer attempt hugetlb right now? The mmap itself remains
+    /// authoritative when pool state changes concurrently.
+    pub fn wanted(self: *Policy) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+        return switch (self.getMode()) {
+            .off => false,
+            .on => true,
+            .auto => self.autoEngaged(),
+        };
+    }
+
+    fn autoEngaged(self: *Policy) bool {
+        const state = self.auto_state.load(.monotonic);
+        if (state != 0) return state == 1;
+        const engaged = defaultHugePageIs2M() and availablePoolBytes() >= auto_floor_bytes;
+        self.auto_state.store(if (engaged) 1 else 2, .monotonic);
+        return engaged;
+    }
+
+    fn noteFallback(self: *Policy) void {
+        if (self.getMode() != .on) return;
+        if (comptime builtin.is_test) return;
+        if (self.warned_fallback.swap(true, .monotonic)) return;
+        std.debug.print(
+            "fix: warning: hugetlb pool exhausted, unavailable, or mapping hardening failed; falling back to normal pages " ++
+                "(provision with `sysctl vm.nr_hugepages=N`, or pass --hugetlb off)\n",
+            .{},
+        );
+    }
+};
 
 /// Parse a mode from CLI text.
 pub fn parseMode(text: []const u8) ?Mode {
@@ -64,31 +95,6 @@ pub fn parseMode(text: []const u8) ?Mode {
     if (std.mem.eql(u8, text, "on")) return .on;
     if (std.mem.eql(u8, text, "off")) return .off;
     return null;
-}
-
-/// Should a consumer *attempt* hugetlb right now? The mmap itself remains
-/// the authoritative check (pool state races are resolved by clean mmap
-/// failure + fallback); this only gates the attempt.
-pub fn wanted() bool {
-    if (comptime builtin.os.tag != .linux) return false;
-    const m = getMode() orelse return false;
-    return switch (m) {
-        .off => false,
-        .on => true,
-        .auto => autoEngaged(),
-    };
-}
-
-/// `auto`: resolve once — default huge page size must be 2 MB and the pool
-/// must have `auto_floor_bytes` of unreserved capacity. Cached (the answer
-/// gates a whole run's policy; per-mapping failures degrade gracefully
-/// anyway).
-fn autoEngaged() bool {
-    const s = auto_state.load(.monotonic);
-    if (s != 0) return s == 1;
-    const ok = defaultHugePageIs2M() and availablePoolBytes() >= auto_floor_bytes;
-    auto_state.store(if (ok) 1 else 2, .monotonic);
-    return ok;
 }
 
 /// Unreserved 2 MB-pool capacity in bytes: (free − reserved) huge pages.
@@ -159,7 +165,7 @@ pub fn roundedLen(len: usize) usize {
 /// Any failure unmaps the candidate and returns null so the caller can use its
 /// ordinary allocation path. This intentionally makes Linux <5.14 (which has
 /// no madv_populate_write) fall back rather than expose a weaker guarantee.
-pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
+pub fn map(policy: *Policy, len: usize) ?[*]align(std.heap.page_size_min) u8 {
     if (comptime builtin.os.tag != .linux) return null;
     const rounded = roundedLen(len);
     const mem = std.posix.mmap(
@@ -170,7 +176,7 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
         -1,
         0,
     ) catch {
-        noteFallback();
+        policy.noteFallback();
         return null;
     };
     const ptr: [*]u8 = mem.ptr;
@@ -178,7 +184,7 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
         std.os.linux.errno(std.os.linux.madvise(ptr, rounded, madv_populate_write)) != .SUCCESS)
     {
         std.posix.munmap(mem);
-        noteFallback();
+        policy.noteFallback();
         return null;
     }
     noteMapped(rounded);
@@ -199,10 +205,10 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
 ///      single syscall under mmap_lock, so no userspace-visible window
 ///      where the target is unmapped.
 /// On failure the target is preserved or restored, and false is returned.
-pub fn overlayFixed(target: [*]u8, len: usize) bool {
+pub fn overlayFixed(policy: *Policy, target: [*]u8, len: usize) bool {
     if (comptime builtin.os.tag != .linux) return false;
     std.debug.assert(@intFromPtr(target) % huge_page_size == 0 and len % huge_page_size == 0 and len > 0);
-    const src = map(len) orelse return false;
+    const src = map(policy, len) orelse return false;
     const rc = std.os.linux.mremap(src, len, len, .{ .MAYMOVE = true, .FIXED = true }, target);
     if (std.os.linux.errno(rc) == .SUCCESS and rc == @intFromPtr(target)) return true;
     // mremap failed (kernel VMA bookkeeping ENOMEM — not pool pressure).
@@ -254,19 +260,6 @@ pub fn peakMappedBytes() usize {
     return peak_mapped_bytes.load(.monotonic);
 }
 
-/// `on` means the user asked for hugetlb explicitly — tell them once when
-/// the pool can't serve it (auto stays silent; fallback is its contract).
-fn noteFallback() void {
-    if (getMode() != .on) return;
-    if (comptime builtin.is_test) return; // stderr corrupts the test runner
-    if (warned_fallback.swap(true, .monotonic)) return;
-    std.debug.print(
-        "fix: warning: hugetlb pool exhausted, unavailable, or mapping hardening failed; falling back to normal pages " ++
-            "(provision with `sysctl vm.nr_hugepages=N`, or pass --hugetlb off)\n",
-        .{},
-    );
-}
-
 test "parseMode accepts CLI mode names" {
     try std.testing.expectEqual(@as(?Mode, .auto), parseMode("auto"));
     try std.testing.expectEqual(@as(?Mode, .on), parseMode("on"));
@@ -276,18 +269,15 @@ test "parseMode accepts CLI mode names" {
     try std.testing.expectEqual(@as(?Mode, null), parseMode("yes"));
 }
 
-test "mode state: unconfigured is off; setMode round-trips" {
-    // Restore the pristine state for later tests regardless of outcome.
-    const saved = mode_state.load(.monotonic);
-    defer mode_state.store(saved, .monotonic);
-    mode_state.store(0, .monotonic);
-    try std.testing.expectEqual(@as(?Mode, null), getMode());
-    try std.testing.expect(!wanted());
-    setMode(.off);
-    try std.testing.expectEqual(@as(?Mode, .off), getMode());
-    try std.testing.expect(!wanted());
-    setMode(.on);
-    try std.testing.expectEqual(@as(?Mode, .on), getMode());
+test "policy mode is local and reconfigurable" {
+    var first = Policy.init(.off);
+    var second = Policy.init(.on);
+    try std.testing.expectEqual(Mode.off, first.getMode());
+    try std.testing.expect(!first.wanted());
+    try std.testing.expectEqual(Mode.on, second.getMode());
+    first.setMode(.auto);
+    try std.testing.expectEqual(Mode.auto, first.getMode());
+    try std.testing.expectEqual(Mode.on, second.getMode());
 }
 
 test "parseLeadingUint" {
@@ -306,11 +296,9 @@ test "roundedLen rounds to 2 MB" {
 test "map/unmap: accounting balances whether or not the pool serves it" {
     if (comptime builtin.os.tag != .linux) return;
     const linux = std.os.linux;
-    const saved = mode_state.load(.monotonic);
-    defer mode_state.store(saved, .monotonic);
-    setMode(.on);
+    var policy = Policy.init(.on);
     const before = mappedBytes();
-    if (map(3 << 20)) |p| {
+    if (map(&policy, 3 << 20)) |p| {
         // Rounded to 2 huge pages; memory is usable end to end.
         try std.testing.expectEqual(before + (4 << 20), mappedBytes());
         try std.testing.expect(peakMappedBytes() >= mappedBytes());

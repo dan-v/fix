@@ -96,6 +96,7 @@ pub fn main(init: std.process.Init) !void {
     const process: cli.ProcessContext = .{
         .allocator = allocator,
         .eval_release = .{ .context = &big_blocks, .run = trimLargeBlocks },
+        .memory_backing = big_blocks.hugePolicy(),
     };
 
     var args_iter = try init.minimal.args.iterateAllocator(allocator);
