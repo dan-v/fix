@@ -415,25 +415,21 @@ const Repl = struct {
     }
 
     fn runCommand(self: *Repl, input: []const u8) !void {
-        const word_end = std.mem.indexOfAny(u8, input, " \t") orelse input.len;
-        const word = input[0..word_end];
-        const rest = std.mem.trim(u8, input[word_end..], " \t");
-
-        const cmd = commands.find(word) orelse {
-            try self.printError("unknown command `{s}` — :? lists commands", .{word});
+        const invocation = commands.parse(input) catch |err| {
+            const word_end = std.mem.indexOfAny(u8, input, " \t") orelse input.len;
+            const word = input[0..word_end];
+            switch (err) {
+                error.UnknownCommand => try self.printError("unknown command `{s}` — :? lists commands", .{word}),
+                error.MissingArgument => {
+                    const command = commands.find(word).?;
+                    try self.printError("{s} needs {s} — :? for details", .{ word, command.metavar });
+                },
+                error.UnexpectedArgument => try self.printError("{s} takes no argument", .{word}),
+            }
             return;
         };
-        switch (cmd.arg) {
-            .expr, .path => if (rest.len == 0) {
-                try self.printError("{s} needs {s} — :? for details", .{ word, cmd.metavar });
-                return;
-            },
-            .none => if (rest.len != 0) {
-                try self.printError("{s} takes no argument", .{word});
-                return;
-            },
-            .opt_expr => {},
-        }
+        const cmd = invocation.command;
+        const rest = invocation.argument;
 
         switch (cmd.id) {
             .help => {

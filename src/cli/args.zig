@@ -8,6 +8,8 @@ const std = @import("std");
 const presentation = @import("presentation.zig");
 const engine = @import("expr");
 const hugetlb = @import("base").hugetlb;
+const feature_lists = @import("args/features.zig");
+const option_apply = @import("args/apply.zig");
 
 pub const OutputFormat = enum {
     nix,
@@ -18,46 +20,20 @@ pub const OutputFormat = enum {
 
 /// Nix-style experimental features. Names match Nix's spelling so that the
 /// same `--experimental-features pipe-operators` invocation works here.
-pub const ExperimentalFeature = engine.ExperimentalFeature;
-pub const ExperimentalFeatures = engine.ExperimentalFeatures;
+pub const ExperimentalFeature = feature_lists.ExperimentalFeature;
+pub const ExperimentalFeatures = feature_lists.ExperimentalFeatures;
 
 /// Nix-style deprecated features (Lix `--extra-deprecated-features`). Enabling
 /// one re-permits behaviour that fix rejects by default. Names match Lix.
-pub const DeprecatedFeature = engine.DeprecatedFeature;
-pub const DeprecatedFeatures = engine.DeprecatedFeatures;
-
-fn parseDeprecatedList(set: *DeprecatedFeatures, list: []const u8) !void {
-    var it = std.mem.tokenizeScalar(u8, list, ' ');
-    while (it.next()) |name| {
-        // Unknown names are accepted as no-ops: many Lix deprecated features
-        // (rec-set-overrides, ancient-let, rec-set-dynamic-attrs, …) name
-        // behaviour fix implements unconditionally, so enabling them changes
-        // nothing. Only the gated ones (nul-bytes, floor-ceil-corrupt-integers)
-        // matter.
-        if (DeprecatedFeature.fromName(name)) |feat| set.insert(feat);
-    }
-}
-
-/// Parse a space-separated feature list into `set`, inserting each recognized
-/// feature. Unknown names are an error (Nix warns; we reject to keep the CLI's
-/// fail-fast behaviour). An empty/whitespace-only list inserts nothing.
-fn parseFeatureList(set: *ExperimentalFeatures, list: []const u8) !void {
-    var it = std.mem.tokenizeScalar(u8, list, ' ');
-    while (it.next()) |name| {
-        const feat = ExperimentalFeature.fromName(name) orelse return error.UnknownExperimentalFeature;
-        set.insert(feat);
-    }
-}
+pub const DeprecatedFeature = feature_lists.DeprecatedFeature;
+pub const DeprecatedFeatures = feature_lists.DeprecatedFeatures;
 
 /// Like `parseFeatureList`, but for features sourced from `nix.conf` rather than
 /// argv: unknown names are silently skipped (Nix only warns for config-sourced
 /// `experimental-features`, and rejecting would make an unrelated Nix setting
 /// break `fix`). Never fails.
 pub fn mergeConfigFeatures(set: *ExperimentalFeatures, list: []const u8) void {
-    var it = std.mem.tokenizeScalar(u8, list, ' ');
-    while (it.next()) |name| {
-        if (ExperimentalFeature.fromName(name)) |feat| set.insert(feat);
-    }
+    feature_lists.mergeConfigured(set, list);
 }
 
 pub const EvaluationMode = struct {
@@ -276,7 +252,7 @@ pub const Options = struct {
     /// separate recorder budget and cannot displace primary spans.
     timeline_flows: bool = true,
 
-    fn addSource(self: *Options, allocator: std.mem.Allocator, source: SourceArg) !void {
+    pub fn addSource(self: *Options, allocator: std.mem.Allocator, source: SourceArg) !void {
         try self.sources.append(allocator, source);
         if (self.source == null) self.source = source;
     }
@@ -311,7 +287,7 @@ pub const Options = struct {
 // ---------------------------------------------------------------------------
 
 /// Stable identity of each option. `apply` switches on it.
-const Opt = enum {
+pub const Opt = enum {
     // Source selection.
     expr,
     file,
@@ -878,130 +854,7 @@ fn repeatedVerbose(arg: []const u8) ?u8 {
 /// (present according to the spec's arity). Value-format failures surface as
 /// the specific `Invalid*` errors.
 fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]const u8, v1: ?[:0]const u8) !void {
-    switch (id) {
-        .expr => try options.addSource(allocator, .{ .expr = v0.? }),
-        .file => try options.addSource(allocator, .{ .file = v0.? }),
-        .flake => try options.addSource(allocator, .{ .flake = v0.? }),
-        .include => try options.include.append(allocator, v0.?),
-        .attr => {
-            try options.attrs.append(allocator, v0.?);
-            options.attr = v0.?;
-        },
-        .arg => try options.arg_defs.append(allocator, .{ .name = v0.?, .value = v1.?, .is_string = false }),
-        .argstr => try options.arg_defs.append(allocator, .{ .name = v0.?, .value = v1.?, .is_string = true }),
-
-        .json => options.output = .json,
-        .raw => options.output = .raw,
-        .xml => options.output = .xml,
-        .no_location => options.no_location = true,
-        .impure => options.impure = true,
-        .strict => options.strict = true,
-        .read_write_mode => options.read_write_mode = true,
-
-        .experimental_features => {
-            options.experimental_features = .{};
-            options.experimental_features_reset = true;
-            try parseFeatureList(&options.experimental_features, v0.?);
-        },
-        .extra_experimental_features => try parseFeatureList(&options.experimental_features, v0.?),
-        .deprecated_features => {
-            options.deprecated_features = .{};
-            options.deprecated_features_reset = true;
-            try parseDeprecatedList(&options.deprecated_features, v0.?);
-        },
-        .extra_deprecated_features => try parseDeprecatedList(&options.deprecated_features, v0.?),
-        .option => try options.option_overrides.append(allocator, .{ .name = v0.?, .value = v1.? }),
-
-        .no_link => options.no_link = true,
-        .dry_run => options.dry_run = true,
-        .find_file => options.find_file = true,
-        .no_build_output => options.no_build_output = true,
-        .out_link => options.out_link = v0.?,
-        .drv_link => options.drv_link = v0.?,
-        .add_drv_link => options.add_drv_link = true,
-        .add_root => options.add_root = v0.?,
-        .indirect => options.indirect = true,
-        .check => options.check = true,
-        .repair => options.repair = true,
-        // Build-setting sugar: fold into the nix.conf override list so
-        // `setup.configure` applies them via `set_options` (same path as
-        // `--option`). `--cores 4` == `--option cores 4`.
-        .max_jobs => {
-            const value = v0.?;
-            if (!std.mem.eql(u8, value, "auto")) _ = std.fmt.parseInt(u64, value, 10) catch return error.InvalidMaxJobs;
-            try options.option_overrides.append(allocator, .{ .name = "max-jobs", .value = value });
-        },
-        .cores => {
-            const value = v0.?;
-            _ = std.fmt.parseInt(u64, value, 10) catch return error.InvalidCores;
-            try options.option_overrides.append(allocator, .{ .name = "cores", .value = value });
-        },
-        .max_silent_time => try options.option_overrides.append(allocator, .{ .name = "max-silent-time", .value = v0.? }),
-        .timeout => try options.option_overrides.append(allocator, .{ .name = "timeout", .value = v0.? }),
-        .store => try options.option_overrides.append(allocator, .{ .name = "store", .value = v0.? }),
-        .fallback => try options.option_overrides.append(allocator, .{ .name = "fallback", .value = "true" }),
-        .keep_failed => try options.option_overrides.append(allocator, .{ .name = "keep-failed", .value = "true" }),
-        .keep_going => try options.option_overrides.append(allocator, .{ .name = "keep-going", .value = "true" }),
-        .verbose => options.verbose +|= 1,
-
-        .show_trace => options.show_trace = true,
-        .debugger => options.debugger = true,
-        .color => options.color = if (v0) |v| (presentation.parseWhen(v) orelse return error.InvalidColorMode) else .always,
-        .no_color => options.color = .never,
-        .progress => options.progress = .enabled,
-        .no_progress => options.progress = .disabled,
-        .gc_budget => options.gc_budget = engine.parseMemorySize(v0.?) orelse return error.InvalidGcBudget,
-        .hugetlb => options.hugetlb = hugetlb.parseMode(v0.?) orelse return error.InvalidHugetlbMode,
-        .help => return error.Help,
-
-        .no_tui => options.no_tui = true,
-
-        .packages => unreachable, // handled in the parse loop
-
-        .nixos => options.switch_target = .nixos,
-        .darwin => options.switch_target = .darwin,
-        .home_manager => options.switch_target = .home_manager,
-        .activate_toplevel => options.activate_toplevel = v0.?,
-        .target_host => options.target_host = v0.?,
-        .use_remote_sudo => options.use_remote_sudo = true,
-
-        // Accept decimal or `0x` hex (disasm prints ids in hex).
-        .chunk => options.disasm_chunk = std.fmt.parseInt(u32, v0.?, 0) catch return error.InvalidChunkId,
-        .no_recurse => options.disasm_no_recurse = true,
-        .no_source => options.disasm_no_source = true,
-        .no_constants => options.disasm_no_constants = true,
-        .no_bytes => options.disasm_no_bytes = true,
-        .no_pager => options.disasm_no_pager = true,
-        .disasm_eval => options.disasm_eval = true,
-        .stats => options.stats = true,
-
-        .workers => options.workers = std.fmt.parseInt(u8, v0.?, 10) catch return error.InvalidWorkers,
-        .vm_trace => options.vm_trace_path = v0 orelse "-",
-        .vm_trace_format => options.vm_trace_format = parseVmTraceFormat(v0.?) orelse return error.InvalidVmTraceFormat,
-        .vm_trace_max_events => options.vm_trace_max_events = std.fmt.parseInt(u64, v0.?, 10) catch return error.InvalidVmTraceMaxEvents,
-        .vm_trace_main_only => options.vm_trace_main_only = true,
-        .thunks_log => options.thunks_log_path = v0.?,
-        .no_spec_thunks => options.disable_spec_thunks = true,
-        .no_fanout => options.disable_fanout = true,
-        .mem_report => options.mem_report = v0 orelse "",
-        .gc_report => options.gc_report = true,
-        .timeline => options.timeline_path = v0 orelse "fix-timeline.json",
-        .timeline_flows => {
-            const v = v0.?;
-            options.timeline_flows = if (std.mem.eql(u8, v, "off"))
-                false
-            else if (std.mem.eql(u8, v, "all"))
-                true
-            else
-                return error.InvalidTimelineFlows;
-        },
-    }
-}
-
-fn parseVmTraceFormat(text: []const u8) ?@TypeOf(@as(Options, undefined).vm_trace_format) {
-    if (std.mem.eql(u8, text, "binary")) return .binary;
-    if (std.mem.eql(u8, text, "text")) return .text;
-    return null;
+    return option_apply.apply(Options, Opt, options, allocator, id, v0, v1);
 }
 
 // ---------------------------------------------------------------------------

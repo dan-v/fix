@@ -36,8 +36,12 @@ const clock = @import("base").clock;
 const build_options = @import("build_options");
 pub const Config = @import("scheduler/config.zig").Config;
 const gc_barrier_mod = @import("scheduler/gc_barrier.zig");
+const queue = @import("scheduler/queues.zig");
 pub const GcMarkHook = gc_barrier_mod.MarkHook;
 const GcBarrier = gc_barrier_mod.Barrier;
+pub const ReadyNode = queue.ReadyNode;
+const ReadyQueue = queue.ReadyQueue;
+pub const WakeWord = queue.WakeWord;
 
 /// Idle-scan cost census (piggybacks on `-Dprof-main`, like the probes in
 /// `probe/prof.zig` — the scheduler can't import that layer, so the tiny
@@ -181,93 +185,6 @@ pub const ForceAttrsRange = struct {
     len: u8,
 };
 
-/// Work-first (Cilk/sparks) split-and-steal continuation — a half-open range
-/// Embeddable linked-list node for the per-worker ready queue.
-/// Each Fiber struct (in worker.zig) inlines one of these; the
-/// scheduler holds queues of `*ReadyNode` and the worker recovers
-/// the parent Fiber via `@fieldParentPtr`.
-///
-/// `queued` is a CAS-protected dedup flag: `enqueueReady` only
-/// pushes when it can transition 0→1, and `pop` resets to 0. This
-/// keeps the node from being on the queue more than once even when
-/// multiple wakers and runner-tail paths race to enqueue.
-pub const ReadyNode = struct {
-    next: ?*ReadyNode = null,
-    queued: std.atomic.Value(u8) = .init(0),
-};
-
-/// Mutex-protected FIFO of fibers ready to resume. Sits on the
-/// scheduler so any worker can push (when waking a fiber) or steal
-/// (when its own queue is empty). Treiber stacks would suffice if
-/// only the owner consumed, but stealing needs MPMC pop and Treiber's
-/// CAS pop has ABA hazards under concurrent consumers.
-const ReadyQueue = struct {
-    /// `align(cache_line)`: one ready queue per destructive-interference
-    /// block (128B). `mu`/`head`/`tail` are written together under the
-    /// lock, so they share a line. Padding keeps neighboring workers' queues
-    /// from sharing that line.
-    mu: sync.SpinMutex align(std.atomic.cache_line),
-    /// Mutated only under `mu`; additionally probed lock-free by `pop`'s
-    /// empty fast path (monotonic — the lock provides the real
-    /// synchronization for any node actually taken).
-    head: std.atomic.Value(?*ReadyNode),
-    tail: ?*ReadyNode,
-
-    comptime {
-        std.debug.assert(@sizeOf(ReadyQueue) % std.atomic.cache_line == 0);
-    }
-
-    fn init() ReadyQueue {
-        return .{ .mu = .{}, .head = .init(null), .tail = null };
-    }
-
-    fn push(self: *ReadyQueue, node: *ReadyNode) void {
-        node.next = null;
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.tail) |t| {
-            t.next = node;
-        } else {
-            self.head.store(node, .monotonic);
-        }
-        self.tail = node;
-    }
-
-    fn pop(self: *ReadyQueue) ?*ReadyNode {
-        // Read-only empty probe BEFORE touching the lock. Idle workers'
-        // steal scans call `pop` on every peer's (almost always empty)
-        // queue each rescan; the unconditional `mu.lock()` CAS was a
-        // read-for-ownership that ping-ponged the queue's line between
-        // every scanning core even when nothing was queued. A stale null
-        // here is benign — same outcome as scanning just before the
-        // racing push; the wake/futex protocol re-engages parked workers.
-        if (self.head.load(.monotonic) == null) return null;
-        self.mu.lock();
-        defer self.mu.unlock();
-        const n = self.head.load(.monotonic) orelse return null;
-        self.head.store(n.next, .monotonic);
-        if (n.next == null) self.tail = null;
-        n.next = null;
-        // Mark off-queue so the next `enqueueReady` for this node can
-        // win its CAS. Release-store so it's visible to the next
-        // would-be enqueuer.
-        n.queued.store(0, .release);
-        return n;
-    }
-};
-
-/// One worker's futex wake word, alone in its destructive-interference
-/// block (128B). As a bare `[]std.atomic.Value(u32)`, 32 workers' wake
-/// words all sat in ONE cache line: every park (store 0) and every wake
-/// (swap 1) invalidated the line under every other parking/waking core.
-pub const WakeWord = struct {
-    word: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
-
-    comptime {
-        std.debug.assert(@sizeOf(WakeWord) % std.atomic.cache_line == 0);
-    }
-};
-
 /// Lock-free Chase-Lev work-stealing deque, specialized to `Task`.
 ///
 /// Owner-only `push` and `pop` (LIFO) — atomic stores on `bottom`
@@ -303,105 +220,7 @@ pub const TracedTask = struct {
 
 const TaskQueue = containers.Deque(TracedTask);
 
-/// Mutex-protected bounded ring for low-volume speculative tasks. Bulk owners
-/// pop newest while stealers take oldest; novel work is newest-first and may
-/// overwrite its oldest entry.
-///
-/// `head` is one past the newest slot; `tail` is the oldest. Both wrap; the
-/// occupancy is `head -% tail`. All mutation is under `mu`; the GC mark walk
-/// (`specQueueGcMark`) runs at the STW safepoint where no mutator is live.
-const SpecQueue = struct {
-    /// Keep each ring's jointly mutated state on its own interference block.
-    mu: sync.SpinMutex align(std.atomic.cache_line),
-    items: []TracedTask,
-    mask: u32,
-    head: u32,
-    tail: u32,
-    /// This ring's index in its lane (owner worker id), i.e. its bit in
-    /// the lane's non-empty victim mask. Rings past bit 63 don't
-    /// participate (the scan falls back to a full walk there).
-    idx: u8,
-
-    comptime {
-        std.debug.assert(@sizeOf(SpecQueue) % std.atomic.cache_line == 0);
-    }
-
-    const PushResult = enum { pushed, pushed_evicted, full };
-
-    fn init(allocator: std.mem.Allocator, capacity: u32, idx: u8) !SpecQueue {
-        std.debug.assert(std.math.isPowerOfTwo(capacity));
-        const items = try allocator.alloc(TracedTask, capacity);
-        return .{ .mu = .{}, .items = items, .mask = capacity - 1, .head = 0, .tail = 0, .idx = idx };
-    }
-
-    fn deinit(self: *SpecQueue, allocator: std.mem.Allocator) void {
-        allocator.free(self.items);
-    }
-
-    /// Set/clear this ring's bit in the lane's non-empty victim mask.
-    /// Called ONLY while holding `mu`, so per-ring bit updates are
-    /// ordered exactly with the occupancy transitions they mirror — the
-    /// mask itself is never stale for a ring; only a scanner's loaded
-    /// copy can be (benign: it re-probes an emptied ring and moves on).
-    inline fn maskSet(self: *const SpecQueue, lane_mask: *std.atomic.Value(u64)) void {
-        if (self.idx >= 64) return;
-        _ = lane_mask.fetchOr(@as(u64, 1) << @intCast(self.idx), .release);
-    }
-    inline fn maskClear(self: *const SpecQueue, lane_mask: *std.atomic.Value(u64)) void {
-        if (self.idx >= 64) return;
-        _ = lane_mask.fetchAnd(~(@as(u64, 1) << @intCast(self.idx)), .release);
-    }
-
-    /// Append at the newest end. On a full ring: drop the oldest when
-    /// `evict`, else reject.
-    fn push(self: *SpecQueue, t: TracedTask, evict: bool, lane_mask: *std.atomic.Value(u64)) PushResult {
-        self.mu.lock();
-        defer self.mu.unlock();
-        var evicted = false;
-        if (self.head -% self.tail > self.mask) {
-            if (!evict) return .full;
-            self.tail +%= 1;
-            evicted = true;
-        }
-        if (self.head == self.tail) self.maskSet(lane_mask);
-        self.items[self.head & self.mask] = t;
-        self.head +%= 1;
-        return if (evicted) .pushed_evicted else .pushed;
-    }
-
-    /// Owner pop, newest first.
-    fn popNewest(self: *SpecQueue, lane_mask: *std.atomic.Value(u64)) ?TracedTask {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.head == self.tail) return null;
-        self.head -%= 1;
-        if (self.head == self.tail) self.maskClear(lane_mask);
-        return self.items[self.head & self.mask];
-    }
-
-    /// Steal newest-first when `lifo`, oldest-first otherwise.
-    fn steal(self: *SpecQueue, lifo: bool, lane_mask: *std.atomic.Value(u64)) ?TracedTask {
-        if (lifo) return self.popNewest(lane_mask);
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.head == self.tail) return null;
-        const t = self.items[self.tail & self.mask];
-        self.tail +%= 1;
-        if (self.head == self.tail) self.maskClear(lane_mask);
-        return t;
-    }
-
-    /// Drop the oldest queued task without running it (backlog-cap ring
-    /// overwrite). Returns false when empty.
-    fn evictOldest(self: *SpecQueue, lane_mask: *std.atomic.Value(u64)) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.head == self.tail) return false;
-        self.tail +%= 1;
-        if (self.head == self.tail) self.maskClear(lane_mask);
-        return true;
-    }
-};
+const SpecQueue = queue.SpecQueue(TracedTask);
 
 /// GC: mark the objects referenced by pending tasks. A queued
 /// `force_thunk`/`force_list_range` is a live reference (a helper — or,

@@ -53,6 +53,31 @@ pub fn find(name: []const u8) ?*const Command {
     return null;
 }
 
+/// Validated command request. Dispatch consumes this value without repeating
+/// tokenization or arity policy.
+pub const Invocation = struct {
+    command: *const Command,
+    spelling: []const u8,
+    argument: []const u8,
+};
+
+pub fn parse(input: []const u8) !Invocation {
+    const word_end = std.mem.indexOfAny(u8, input, " \t") orelse input.len;
+    const spelling = input[0..word_end];
+    const argument = std.mem.trim(u8, input[word_end..], " \t");
+    const command = find(spelling) orelse return error.UnknownCommand;
+    switch (command.arg) {
+        .expr, .path => if (argument.len == 0) return error.MissingArgument,
+        .none => if (argument.len != 0) return error.UnexpectedArgument,
+        .opt_expr => {},
+    }
+    return .{
+        .command = command,
+        .spelling = spelling,
+        .argument = argument,
+    };
+}
+
 /// Render the `:?` help table.
 pub fn writeHelp(w: *std.Io.Writer) !void {
     try w.writeAll(
@@ -110,6 +135,16 @@ test "every alias resolves to its command" {
     try testing.expect(find(":nope") == null);
     try testing.expect(find(":disasm") == null);
     try testing.expectEqual(Id.debug, find(":d").?.id);
+}
+
+test "parse returns a validated invocation value" {
+    const invocation = try parse(":t 1 + 1");
+    try testing.expectEqual(Id.type_of, invocation.command.id);
+    try testing.expectEqualStrings(":t", invocation.spelling);
+    try testing.expectEqualStrings("1 + 1", invocation.argument);
+    try testing.expectError(error.UnknownCommand, parse(":nope"));
+    try testing.expectError(error.MissingArgument, parse(":t"));
+    try testing.expectError(error.UnexpectedArgument, parse(":q now"));
 }
 
 test "help renders every command name" {
