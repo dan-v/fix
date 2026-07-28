@@ -44,8 +44,13 @@ var temp_counter: std.atomic.Value(u64) = .init(0);
 pub fn makeTempDir(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     const n = temp_counter.fetchAdd(1, .monotonic);
     const path = try std.fmt.allocPrint(gpa, "/tmp/fixlang-{d}-{d}", .{ std.c.getpid(), n });
+    errdefer gpa.free(path);
     try Dir.cwd().createDirPath(io, path);
-    return path;
+    var canonical_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const canonical_len = try Dir.realPathFileAbsolute(io, path, &canonical_buf);
+    const canonical = try gpa.dupe(u8, canonical_buf[0..canonical_len]);
+    gpa.free(path);
+    return canonical;
 }
 
 pub fn copyFile(gpa: std.mem.Allocator, io: std.Io, src: []const u8, dst: []const u8) !void {
@@ -78,11 +83,8 @@ pub fn copyTree(gpa: std.mem.Allocator, io: std.Io, src: []const u8, dst: []cons
     }
 }
 
-// POSIX special-file creation (libc; portable across Linux and Darwin). The
-// device-node fixtures instead use a run-time bind-mount, so mknod here only
-// ever makes FIFO/socket inodes, both permitted unprivileged.
+// POSIX FIFO creation. Device-node fixtures instead use a run-time bind-mount.
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
-extern "c" fn mknod(path: [*:0]const u8, mode: std.c.mode_t, dev: std.c.dev_t) c_int;
 
 /// A FIFO inode (unprivileged).
 pub fn mkfifoAt(gpa: std.mem.Allocator, path: []const u8) !void {
@@ -91,9 +93,11 @@ pub fn mkfifoAt(gpa: std.mem.Allocator, path: []const u8) !void {
     if (mkfifo(z.ptr, @intCast(std.c.S.IFIFO | @as(u32, 0o666))) != 0) return error.MkfifoFailed;
 }
 
-/// A socket inode (unprivileged; enough for a filesystem-type probe).
-pub fn mksocket(gpa: std.mem.Allocator, path: []const u8) !void {
-    const z = try gpa.dupeZ(u8, path);
-    defer gpa.free(z);
-    if (mknod(z.ptr, @intCast(std.c.S.IFSOCK | @as(u32, 0o666)), 0) != 0) return error.MknodFailed;
+/// Create a real Unix-domain socket inode and close the listener. Unlike
+/// `mknod(S_IFSOCK)`, binding a socket is supported on both Linux and Darwin;
+/// the pathname remains until the fixture tree is removed.
+pub fn mksocket(io: std.Io, path: []const u8) !void {
+    const address = try std.Io.net.UnixAddress.init(path);
+    var server = try address.listen(io, .{});
+    server.deinit(io);
 }

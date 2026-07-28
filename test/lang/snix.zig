@@ -4,6 +4,7 @@
 //! drive the program through `fix eval`, and compare.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const kdl = @import("kdl.zig");
 const fsx = @import("fsx.zig");
 const proc = @import("proc.zig");
@@ -183,7 +184,7 @@ fn materializeFixtures(
         } else if (std.mem.eql(u8, fx.name, "socket")) {
             const target = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dest, arg0 });
             try fsx.mkpath(io, std.fs.path.dirname(target) orelse dest);
-            try fsx.mksocket(gpa, target);
+            try fsx.mksocket(io, target);
         } else if (isDeviceKind(fx.name)) {
             if (std.fs.path.isAbsolute(arg0)) {
                 if (!fsx.exists(io, arg0))
@@ -249,7 +250,17 @@ pub fn runCase(ctx: Ctx, c: Case, arena: std.mem.Allocator) !Result {
     // Copy the program in and run it from the temp dir.
     const nix_name = std.fs.path.basename(nix_src);
     const dst_nix = try std.fmt.allocPrint(arena, "{s}/{s}", .{ tmp, nix_name });
-    try fsx.copyFile(gpa, io, nix_src, dst_nix);
+    if (builtin.os.tag.isDarwin() and std.mem.eql(u8, c.ident, "environment/import-from-derivation")) {
+        // The corpus uses `echo -n` only to create an IFD payload. Darwin's
+        // /bin/sh prints `-n` literally, so make that incidental fixture
+        // portable while preserving the derivation/readFile behavior under
+        // test.
+        const source = try fsx.readFile(arena, io, nix_src);
+        const portable = try replaceAll(arena, source, "echo -n hello > $out", "printf %s hello > $out");
+        try fsx.writeFile(io, dst_nix, portable);
+    } else {
+        try fsx.copyFile(gpa, io, nix_src, dst_nix);
+    }
 
     var env = try proc.cloneEnv(gpa, ctx.parent_env);
     defer env.deinit();
