@@ -74,9 +74,13 @@ jobs:
         timeout-minutes: 12
         run: nix-shell --run 'zig build test-cli --verbose --summary all'
 
-      - name: End-to-end tests
-        timeout-minutes: 10
-        run: nix-shell --run 'zig build test-e2e --summary all'
+      - name: Flake end-to-end tests
+        timeout-minutes: 7
+        run: nix-shell --run 'zig build test-e2e --summary all -- flake'
+
+      - name: REPL end-to-end tests
+        timeout-minutes: 7
+        run: nix-shell --run 'zig build test-e2e --summary all -- repl'
 
       - name: Language conformance
         timeout-minutes: 20
