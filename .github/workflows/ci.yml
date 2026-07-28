@@ -23,13 +23,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: cachix/install-nix-action@v31
 
       - name: Build
-        run: nix-shell --run 'zig build -Doptimize=ReleaseFast'
+        timeout-minutes: 20
+        run: nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
 
       - name: Unit and end-to-end tests
-        run: nix-shell --run 'zig build check'
+        timeout-minutes: 20
+        run: nix-shell --run 'zig build check --summary all --test-timeout 10m'
 
       - name: Language conformance
-        run: nix-shell --run 'zig build test-lang -Doptimize=ReleaseFast'
+        timeout-minutes: 20
+        run: nix-shell --run 'zig build test-lang -Doptimize=ReleaseFast --summary all'
