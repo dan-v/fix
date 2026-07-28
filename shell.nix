@@ -7,6 +7,7 @@ in
 
       packages = [
         pkgs.zig_0_16
+        pkgs.coreutils
         pkgs.pkg-config
         pkgs.ripgrep
         pkgs.hyperfine

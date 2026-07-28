@@ -190,6 +190,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = simple_test_runner,
         .use_llvm = true,
     });
+    base_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_base_tests = b.addRunArtifact(base_tests);
 
     const runtime_tests = b.addTest(.{
@@ -198,6 +199,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = simple_test_runner,
         .use_llvm = true,
     });
+    runtime_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_runtime_tests = b.addRunArtifact(runtime_tests);
 
     const syntax_tests = b.addTest(.{
@@ -206,6 +208,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = simple_test_runner,
         .use_llvm = true,
     });
+    syntax_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_syntax_tests = b.addRunArtifact(syntax_tests);
 
     const expr_tests = b.addTest(.{
@@ -214,6 +217,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = simple_test_runner,
         .use_llvm = true,
     });
+    expr_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_expr_tests = b.addRunArtifact(expr_tests);
 
     const integration_test_mod = b.createModule(.{
@@ -231,6 +235,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = simple_test_runner,
         .use_llvm = true,
     });
+    integration_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
     const fetchers_tests = b.addTest(.{
@@ -239,6 +244,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = simple_test_runner,
         .use_llvm = true,
     });
+    fetchers_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_fetchers_tests = b.addRunArtifact(fetchers_tests);
 
     const store_tests = b.addTest(.{
@@ -247,6 +253,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = simple_test_runner,
         .use_llvm = true,
     });
+    store_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_store_tests = b.addRunArtifact(store_tests);
 
     const cli_tests = b.addTest(.{
@@ -255,6 +262,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = simple_test_runner,
         .use_llvm = true,
     });
+    cli_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
     const test_step = b.step("test", "Run tests");
