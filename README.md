@@ -77,26 +77,37 @@ that evaluation's heap remains available to inspect.
 
 ## Quick start
 
-The Nix package supports Linux and aarch64 macOS. Tagged releases publish
-optimized build archives for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
-Nix is required to build `fix`, and commands that write to or realize the store
-require a reachable Nix daemon. Build it from the repository with:
+`fix` is alpha-quality software under active development. Development currently
+takes place on x86_64 Linux; other platforms have not received the same level
+of use.
+
+Nix is not required to build `fix`. A direct build requires Zig 0.16,
+`pkg-config`, libcurl, and libgit2:
 
 ```console
 $ git clone https://github.com/psyclyx/fix
 $ cd fix
-$ nix-build -A fix
+$ zig build --release=fast
 ```
 
-The executable is `result/bin/fix`:
+The executable is `zig-out/bin/fix`. Alternatively, Nix can provide the pinned
+build environment and dependencies:
 
 ```console
-$ ./result/bin/fix eval -E '1 + 2'
+$ nix-shell --run 'zig build --release=fast'
+```
+
+Nix is required to use `fix`: keep a working Nix installation and reachable
+Nix daemon on the system where it runs. Tagged releases publish optimized build
+archives for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
+
+```console
+$ ./zig-out/bin/fix eval -E '1 + 2'
 3
 
-$ ./result/bin/fix build -f default.nix -A fix
+$ ./zig-out/bin/fix build -A fix
 
-$ ./result/bin/fix repl
+$ ./zig-out/bin/fix repl
 ```
 
 The package also includes shell completions for Bash, Fish, and Zsh.
@@ -125,18 +136,19 @@ Run `fix <command> --help` for the documented inputs and options.
 
 ### Evaluate, instantiate, and build
 
-Commands accept expressions, files, attribute paths, and repeated mixed inputs:
+Commands accept expressions, file paths, attribute paths, and repeated mixed
+inputs. File paths are positional, and omitting the source uses `./default.nix`:
 
 ```console
 $ fix eval -E '{ answer = 6 * 7; }' -A answer
 42
 
-$ fix eval --strict --json ./packages.nix
+$ fix eval --strict --json packages.nix
 
-$ fix instantiate -f default.nix -A fix
+$ fix instantiate -A fix
 /nix/store/...-fix.drv
 
-$ fix build -f default.nix -A fix
+$ fix build -A fix
 ```
 
 Arguments can be supplied with `--arg` and `--argstr`. Evaluation can produce
@@ -447,11 +459,12 @@ without direnv.
 
 ## Project status
 
-`fix` is under active development. Compatibility is a concrete target and is
-continuously tested, but this is not yet a promise that every Nix program or
-workflow is supported. Linux is the primary target; release builds also cover
-aarch64 macOS. Keep Nix installed: `fix` uses the Nix daemon for store
-operations and builds.
+`fix` is alpha-quality software under active development. Compatibility is a
+concrete target and is continuously tested, but this is not yet a promise that
+every Nix program or workflow is supported. Development currently takes place
+on x86_64 Linux; release builds also cover aarch64 Linux and aarch64 macOS.
+Keep Nix installed: it is a runtime requirement because `fix` uses the Nix
+daemon for store operations and builds.
 
 If `fix` produces a different value, derivation, or store path from Nix for
 supported input, that is a bug.
@@ -461,7 +474,7 @@ supported input, that is a bug.
 Enter the pinned development environment and build an optimized binary with:
 
 ```console
-$ nix-shell --run 'zig build -Doptimize=ReleaseFast'
+$ nix-shell --run 'zig build --release=fast'
 ```
 
 The result is `zig-out/bin/fix`. Useful checks include:
