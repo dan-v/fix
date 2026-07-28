@@ -8,8 +8,8 @@
 //!
 //! Stack switching is done by `contextSwitch`, an inline-asm routine
 //! vendored from Zig's `std.Io.fiber`. It saves the stack pointer, frame
-//! pointer and resume address into a `Context`. AArch64 Linux also saves the
-//! link register explicitly; every other register
+//! pointer and resume address into a `Context`. AArch64 also saves the link
+//! register explicitly; every other register
 //! — callee-saved GPRs, the vector file, and the FP/flags control state
 //! (`mxcsr`/`fpcr`/direction flag) — is listed as clobbered, so the compiler
 //! spills whatever is live around each swap site. Being `inline` is required:
@@ -72,12 +72,10 @@ pub inline fn censusNow() u64 {
 }
 
 /// Minimal saved state for an inactive fiber. The offsets are load-bearing —
-/// `contextSwitch` reads them directly. AArch64 Linux also saves x30
-/// explicitly: LLVM may allocate a live value there across inline asm even
-/// when x30 is listed as clobbered. Other targets leave x30 to LLVM, as they did
-/// in Zig's original implementation, so their platform-specific link-register
-/// state stays compiler-managed. Everything else the swap needs to preserve
-/// rides the clobber list, not this struct.
+/// `contextSwitch` reads them directly. AArch64 also saves x30 explicitly:
+/// LLVM may allocate a live value there across inline asm even when x30 is
+/// listed as clobbered. Everything else the swap needs to preserve rides the
+/// clobber list, not this struct.
 pub const Context = switch (builtin.cpu.arch) {
     .x86_64 => extern struct { rsp: u64 = 0, rbp: u64 = 0, rip: u64 = 0 },
     .aarch64 => extern struct { sp: u64 = 0, fp: u64 = 0, pc: u64 = 0, lr: u64 = 0 },
@@ -88,7 +86,7 @@ pub const Context = switch (builtin.cpu.arch) {
 /// `contextSwitch` reads: `old` at offset 0, `new` at offset 8.
 const Switch = extern struct { old: *Context, new: *Context };
 
-const aarch64_switch_asm = if (builtin.os.tag == .linux)
+const aarch64_switch_asm =
     \\ ldp x0, x2, [x1]
     \\ ldr x3, [x2, #16]
     \\ mov x4, sp
@@ -101,17 +99,6 @@ const aarch64_switch_asm = if (builtin.os.tag == .linux)
     \\ mov sp, x4
     \\ br x3
     \\0:
-else
-    \\ ldp x0, x2, [x1]
-    \\ ldr x3, [x2, #16]
-    \\ mov x4, sp
-    \\ stp x4, fp, [x0]
-    \\ adr x5, 0f
-    \\ ldp x4, fp, [x2]
-    \\ str x5, [x0, #16]
-    \\ mov sp, x4
-    \\ br x3
-    \\0:
 ;
 
 /// Save the current CPU state into `s.old`, restore `s.new`, and continue at
@@ -119,8 +106,8 @@ else
 /// register removed from each architecture's clobber list: it is already an
 /// input and output operand, and declaring all three roles miscompiles optimized
 /// builds (ziglang/zig#35724). The stack/frame/resume state is stored
-/// explicitly, as is AArch64 x30 on Linux; the remaining clobbers
-/// force the compiler to preserve live state around the emitted swap. MUST stay
+/// explicitly, as is AArch64 x30; the remaining clobbers force the compiler to
+/// preserve live state around the emitted swap. MUST stay
 /// `inline` — the clobbers only bind at the real call site, never behind a call
 /// boundary. The returned `*const Switch` is the resumer's message (unused
 /// here).
@@ -236,11 +223,6 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
               .x26 = true,
               .x27 = true,
               .x28 = true,
-              // Keep non-Linux platform-specific link-register state
-              // compiler-managed. Linux needs the explicit save/restore above
-              // because LLVM can otherwise keep a live value in x30 despite
-              // the clobber.
-              .x30 = builtin.os.tag != .linux,
               .z0 = true,
               .z1 = true,
               .z2 = true,

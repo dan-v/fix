@@ -60,13 +60,59 @@ pub fn run(
             .stderr = try std.fmt.allocPrint(gpa, "failed to launch: {s}", .{@errorName(err)}),
         },
     };
+    errdefer gpa.free(res.stdout);
+    errdefer gpa.free(res.stderr);
+    const stderr = switch (res.term) {
+        .exited => res.stderr,
+        .signal => |sig| annotated: {
+            const text = try std.fmt.allocPrint(
+                gpa,
+                "{s}{s}process terminated by signal {s} ({d})",
+                .{
+                    res.stderr,
+                    if (res.stderr.len == 0 or res.stderr[res.stderr.len - 1] == '\n') "" else "\n",
+                    @tagName(sig),
+                    @intFromEnum(sig),
+                },
+            );
+            gpa.free(res.stderr);
+            break :annotated text;
+        },
+        .stopped => |sig| annotated: {
+            const text = try std.fmt.allocPrint(
+                gpa,
+                "{s}{s}process stopped by signal {s} ({d})",
+                .{
+                    res.stderr,
+                    if (res.stderr.len == 0 or res.stderr[res.stderr.len - 1] == '\n') "" else "\n",
+                    @tagName(sig),
+                    @intFromEnum(sig),
+                },
+            );
+            gpa.free(res.stderr);
+            break :annotated text;
+        },
+        .unknown => |status| annotated: {
+            const text = try std.fmt.allocPrint(
+                gpa,
+                "{s}{s}process terminated with unknown status {d}",
+                .{
+                    res.stderr,
+                    if (res.stderr.len == 0 or res.stderr[res.stderr.len - 1] == '\n') "" else "\n",
+                    status,
+                },
+            );
+            gpa.free(res.stderr);
+            break :annotated text;
+        },
+    };
     return .{
         .rc = switch (res.term) {
             .exited => |c| @intCast(c),
             else => -1,
         },
         .stdout = res.stdout,
-        .stderr = res.stderr,
+        .stderr = stderr,
     };
 }
 
