@@ -29,6 +29,11 @@ jobs:
           primary-key: nix-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
           restore-prefixes-first-match: nix-${{ matrix.system }}-
 
+      - name: Configure pinned NIX_PATH
+        run: |
+          nixpkgs="$(nix eval --raw --impure --expr '(import ./npins).nixpkgs.outPath')"
+          echo "NIX_PATH=nixpkgs=$nixpkgs" >> "$GITHUB_ENV"
+
       - name: Build
         timeout-minutes: 20
         run: nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
