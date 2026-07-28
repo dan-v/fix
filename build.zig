@@ -171,16 +171,11 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // Run tests as ordinary terminal processes. The server runner hides the
-    // current test behind `--listen=-`; in CI that makes a stuck test
-    // indistinguishable from a stuck build step.
+    // Run tests as ordinary terminal processes. The repository-owned runner
+    // reports the active test and lets the OS terminate a crashing process
+    // without asking Zig's unwinder to walk a switched fiber stack.
     const simple_test_runner: std.Build.Step.Compile.TestRunner = .{
-        .path = .{
-            .cwd_relative = b.graph.zig_lib_directory.join(
-                b.allocator,
-                &.{ "compiler", "test_runner.zig" },
-            ) catch @panic("OOM"),
-        },
+        .path = b.path("tools/test_runner.zig"),
         .mode = .simple,
     };
 
