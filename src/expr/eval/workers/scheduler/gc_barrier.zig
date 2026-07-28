@@ -8,7 +8,13 @@ pub const MarkHook = struct {
 };
 
 pub const Barrier = struct {
-    stop_requested: std.atomic.Value(bool) = .init(false),
+    const State = enum(u8) {
+        idle,
+        collecting,
+        releasing,
+    };
+
+    state: std.atomic.Value(u8) = .init(@intFromEnum(State.idle)),
     worker_parked: []std.atomic.Value(bool),
     mark_open: std.atomic.Value(bool) = .init(false),
     mark_hook: ?MarkHook = null,
@@ -25,11 +31,16 @@ pub const Barrier = struct {
     }
 
     pub inline fn requested(self: *const Barrier) bool {
-        return self.stop_requested.load(.acquire);
+        return self.state.load(.acquire) == @intFromEnum(State.collecting);
     }
 
     pub fn tryBegin(self: *Barrier) bool {
-        return self.stop_requested.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null;
+        return self.state.cmpxchgStrong(
+            @intFromEnum(State.idle),
+            @intFromEnum(State.collecting),
+            .acq_rel,
+            .monotonic,
+        ) == null;
     }
 
     pub fn waitAllParked(self: *Barrier, collector_id: u8) void {
@@ -40,11 +51,16 @@ pub const Barrier = struct {
     }
 
     pub fn end(self: *Barrier, collector_id: u8) void {
-        self.stop_requested.store(false, .release);
+        // Let this cycle's peers leave, but keep the barrier unavailable to a
+        // new collector until every parked flag from this generation is down.
+        // A reusable boolean has an ABA window here: a second collector can
+        // raise it again while a slow peer is still leaving the first cycle.
+        self.state.store(@intFromEnum(State.releasing), .release);
         for (self.worker_parked, 0..) |*flag, id| {
             if (id == collector_id) continue;
             while (flag.load(.acquire)) std.atomic.spinLoopHint();
         }
+        self.state.store(@intFromEnum(State.idle), .release);
     }
 
     pub fn setMarkHook(self: *Barrier, hook: MarkHook) void {
@@ -62,11 +78,57 @@ pub const Barrier = struct {
     pub fn park(self: *Barrier, worker_id: u8) void {
         self.worker_parked[worker_id].store(true, .release);
         if (self.mark_hook) |hook| {
-            while (self.stop_requested.load(.acquire) and
+            while (self.requested() and
                 !self.mark_open.load(.acquire)) std.atomic.spinLoopHint();
             if (self.mark_open.load(.acquire)) hook.help(hook.ctx, worker_id);
         }
-        while (self.stop_requested.load(.acquire)) std.atomic.spinLoopHint();
+        while (self.requested()) std.atomic.spinLoopHint();
         self.worker_parked[worker_id].store(false, .release);
     }
 };
+
+test "a new collection cannot begin while the prior generation is releasing" {
+    var barrier = try Barrier.init(std.testing.allocator, 2);
+    defer barrier.deinit(std.testing.allocator);
+
+    const HookContext = struct {
+        hold: std.atomic.Value(bool) = .init(true),
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn help(raw: *anyopaque, _: u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.store(true, .release);
+            while (self.hold.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    const Run = struct {
+        fn park(b: *Barrier) void {
+            b.park(1);
+        }
+
+        fn end(b: *Barrier) void {
+            b.end(0);
+        }
+    };
+
+    var hook_context = HookContext{};
+    barrier.setMarkHook(.{ .ctx = &hook_context, .help = HookContext.help });
+    try std.testing.expect(barrier.tryBegin());
+    barrier.openMark();
+
+    const helper = try std.Thread.spawn(.{}, Run.park, .{&barrier});
+    while (!hook_context.entered.load(.acquire)) std.atomic.spinLoopHint();
+    barrier.closeMark();
+
+    const releaser = try std.Thread.spawn(.{}, Run.end, .{&barrier});
+    while (barrier.requested()) std.atomic.spinLoopHint();
+    const begin_blocked = !barrier.tryBegin();
+
+    hook_context.hold.store(false, .release);
+    helper.join();
+    releaser.join();
+
+    try std.testing.expect(begin_blocked);
+    try std.testing.expect(barrier.tryBegin());
+    barrier.end(0);
+}
