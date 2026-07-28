@@ -40,7 +40,7 @@ jobs:
 
       - name: Unit and end-to-end tests
         timeout-minutes: 20
-        run: nix-shell --run 'zig build check --summary all --test-timeout 10m'
+        run: nix-shell --run 'zig build check --verbose --summary all --test-timeout 10m'
 
       - name: Language conformance
         timeout-minutes: 20

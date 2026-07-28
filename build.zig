@@ -171,26 +171,47 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // Run tests as ordinary terminal processes. The server runner hides the
+    // current test behind `--listen=-`; in CI that makes a stuck test
+    // indistinguishable from a stuck build step.
+    const simple_test_runner: std.Build.Step.Compile.TestRunner = .{
+        .path = .{
+            .cwd_relative = b.graph.zig_lib_directory.join(
+                b.allocator,
+                &.{ "compiler", "test_runner.zig" },
+            ) catch @panic("OOM"),
+        },
+        .mode = .simple,
+    };
+
     const base_tests = b.addTest(.{
+        .name = "base-tests",
         .root_module = base_mod,
+        .test_runner = simple_test_runner,
         .use_llvm = true,
     });
     const run_base_tests = b.addRunArtifact(base_tests);
 
     const runtime_tests = b.addTest(.{
+        .name = "runtime-tests",
         .root_module = runtime_mod,
+        .test_runner = simple_test_runner,
         .use_llvm = true,
     });
     const run_runtime_tests = b.addRunArtifact(runtime_tests);
 
     const syntax_tests = b.addTest(.{
+        .name = "syntax-tests",
         .root_module = syntax_mod,
+        .test_runner = simple_test_runner,
         .use_llvm = true,
     });
     const run_syntax_tests = b.addRunArtifact(syntax_tests);
 
     const expr_tests = b.addTest(.{
+        .name = "expr-tests",
         .root_module = expr_mod,
+        .test_runner = simple_test_runner,
         .use_llvm = true,
     });
     const run_expr_tests = b.addRunArtifact(expr_tests);
@@ -205,25 +226,33 @@ pub fn build(b: *std.Build) void {
         },
     });
     const integration_tests = b.addTest(.{
+        .name = "integration-tests",
         .root_module = integration_test_mod,
+        .test_runner = simple_test_runner,
         .use_llvm = true,
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
     const fetchers_tests = b.addTest(.{
+        .name = "fetchers-tests",
         .root_module = fetchers_mod,
+        .test_runner = simple_test_runner,
         .use_llvm = true,
     });
     const run_fetchers_tests = b.addRunArtifact(fetchers_tests);
 
     const store_tests = b.addTest(.{
+        .name = "store-tests",
         .root_module = store_mod,
+        .test_runner = simple_test_runner,
         .use_llvm = true,
     });
     const run_store_tests = b.addRunArtifact(store_tests);
 
     const cli_tests = b.addTest(.{
+        .name = "cli-tests",
         .root_module = cli_mod,
+        .test_runner = simple_test_runner,
         .use_llvm = true,
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);

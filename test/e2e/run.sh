@@ -48,6 +48,19 @@ failed_suites=()
 total_pass=0
 total_fail=0
 total_skip=0
+suite_log="$(mktemp)"
+trap 'rm -f "$suite_log"' EXIT
+suite_timeout="${E2E_SUITE_TIMEOUT:-5m}"
+
+run_suite() {
+    local frag="$1" fix="$2"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --kill-after=5s "$suite_timeout" bash "$frag" "$fix"
+    else
+        bash "$frag" "$fix"
+    fi
+}
+
 for name in "${names[@]}"; do
     frag="$here/$name.sh"
     if [[ ! -f "$frag" ]]; then
@@ -56,11 +69,31 @@ for name in "${names[@]}"; do
         continue
     fi
     echo "=== e2e: $name ==="
-    out="$(bash "$frag" "$fix" 2>&1)"
-    code=$?
-    echo "$out" | grep -v '^##E2E '
+    : >"$suite_log"
+    (
+        elapsed=0
+        while sleep 30; do
+            elapsed=$((elapsed + 30))
+            echo
+            echo "=== e2e: $name still running after ${elapsed}s ==="
+            ps -Ao pid,ppid,etime,state,command 2>/dev/null |
+                awk 'NR == 1 || /(^|[/ ])fix( |$)/ || /fix repl/ || index($0, "test/e2e") || /script -q/'
+        done
+    ) &
+    heartbeat_pid=$!
+    run_suite "$frag" "$fix" 2>&1 |
+        tee "$suite_log" |
+        while IFS= read -r line; do
+            [[ "$line" == "##E2E "* ]] || printf '%s\n' "$line"
+        done
+    code=${PIPESTATUS[0]}
+    kill "$heartbeat_pid" 2>/dev/null || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+    if ((code == 124)); then
+        echo "FAIL e2e suite '$name' timed out after $suite_timeout"
+    fi
     # Aggregate the machine-readable tally line each fragment emits.
-    tally="$(grep '^##E2E ' <<<"$out" | tail -1)"
+    tally="$(grep '^##E2E ' "$suite_log" | tail -1)"
     if [[ "$tally" =~ pass=([0-9]+)\ fail=([0-9]+)\ skip=([0-9]+) ]]; then
         total_pass=$((total_pass + BASH_REMATCH[1]))
         total_fail=$((total_fail + BASH_REMATCH[2]))
