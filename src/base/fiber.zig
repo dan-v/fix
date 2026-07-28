@@ -88,6 +88,32 @@ pub const Context = switch (builtin.cpu.arch) {
 /// `contextSwitch` reads: `old` at offset 0, `new` at offset 8.
 const Switch = extern struct { old: *Context, new: *Context };
 
+const aarch64_switch_asm = if (builtin.os.tag == .linux)
+    \\ ldp x0, x2, [x1]
+    \\ ldr x3, [x2, #16]
+    \\ mov x4, sp
+    \\ stp x4, fp, [x0]
+    \\ adr x5, 0f
+    \\ ldp x4, fp, [x2]
+    \\ str x5, [x0, #16]
+    \\ str x30, [x0, #24]
+    \\ ldr x30, [x2, #24]
+    \\ mov sp, x4
+    \\ br x3
+    \\0:
+else
+    \\ ldp x0, x2, [x1]
+    \\ ldr x3, [x2, #16]
+    \\ mov x4, sp
+    \\ stp x4, fp, [x0]
+    \\ adr x5, 0f
+    \\ ldp x4, fp, [x2]
+    \\ str x5, [x0, #16]
+    \\ mov sp, x4
+    \\ br x3
+    \\0:
+;
+
 /// Save the current CPU state into `s.old`, restore `s.new`, and continue at
 /// `s.new`'s resume address. Based on Zig 0.16 `std.Io.fiber`, with the message
 /// register removed from each architecture's clobber list: it is already an
@@ -174,23 +200,7 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
               .dirflag = true,
               .memory = true,
             }),
-        .aarch64 => asm volatile (
-            \\ ldp x0, x2, [x1]
-            \\ ldr x3, [x2, #16]
-            \\ mov x4, sp
-            \\ stp x4, fp, [x0]
-            \\ adr x5, 0f
-            \\ ldp x4, fp, [x2]
-            \\ str x5, [x0, #16]
-        ++ if (builtin.os.tag != .linux) "\n" else
-            \\
-            \\ str x30, [x0, #24]
-            \\ ldr x30, [x2, #24]
-            \\
-        ++
-            \\ mov sp, x4
-            \\ br x3
-            \\0:
+        .aarch64 => asm volatile (aarch64_switch_asm
             : [received_message] "={x1}" (-> *const Switch),
             : [message_to_send] "{x1}" (s),
             : .{
