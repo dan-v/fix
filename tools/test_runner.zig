@@ -12,6 +12,13 @@ const testing = std.testing;
 
 pub const std_options: std.Options = .{
     .enable_segfault_handler = false,
+    // Zig's DebugAllocator captures a backtrace for every testing-allocator
+    // operation. Darwin's unwinder does not safely traverse the evaluator's
+    // mmap-backed switched stacks and can fault during those allocations.
+    // Empty allocation traces retain allocator identity, safety checks, and
+    // leak detection; only the per-allocation call-site diagnostics are absent
+    // on this target.
+    .allow_stack_tracing = !(builtin.cpu.arch == .aarch64 and builtin.os.tag.isDarwin()),
     .logFn = log,
 };
 
