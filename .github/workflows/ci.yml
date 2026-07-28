@@ -38,9 +38,45 @@ jobs:
         timeout-minutes: 20
         run: nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
 
-      - name: Unit and end-to-end tests
-        timeout-minutes: 20
-        run: nix-shell --run 'zig build check --verbose --summary all --test-timeout 10m'
+      - name: Static checks
+        timeout-minutes: 10
+        run: nix-shell --run 'zig build check-static --summary all'
+
+      - name: Base tests
+        timeout-minutes: 12
+        run: nix-shell --run 'zig build test-base --verbose --summary all'
+
+      - name: Syntax tests
+        timeout-minutes: 12
+        run: nix-shell --run 'zig build test-syntax --verbose --summary all'
+
+      - name: Runtime tests
+        timeout-minutes: 12
+        run: nix-shell --run 'zig build test-runtime --verbose --summary all'
+
+      - name: Store tests
+        timeout-minutes: 12
+        run: nix-shell --run 'zig build test-store --verbose --summary all'
+
+      - name: Fetcher tests
+        timeout-minutes: 12
+        run: nix-shell --run 'zig build test-fetchers --verbose --summary all'
+
+      - name: Evaluator tests
+        timeout-minutes: 12
+        run: nix-shell --run 'zig build test-expr --verbose --summary all'
+
+      - name: Integration tests
+        timeout-minutes: 12
+        run: nix-shell --run 'zig build test-integration --verbose --summary all'
+
+      - name: CLI tests
+        timeout-minutes: 12
+        run: nix-shell --run 'zig build test-cli --verbose --summary all'
+
+      - name: End-to-end tests
+        timeout-minutes: 10
+        run: nix-shell --run 'zig build test-e2e --summary all'
 
       - name: Language conformance
         timeout-minutes: 20

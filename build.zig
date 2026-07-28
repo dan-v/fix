@@ -265,6 +265,21 @@ pub fn build(b: *std.Build) void {
     cli_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    const test_base_step = b.step("test-base", "Run base unit tests");
+    test_base_step.dependOn(&run_base_tests.step);
+    const test_runtime_step = b.step("test-runtime", "Run runtime unit tests");
+    test_runtime_step.dependOn(&run_runtime_tests.step);
+    const test_store_step = b.step("test-store", "Run store unit tests");
+    test_store_step.dependOn(&run_store_tests.step);
+    const test_fetchers_step = b.step("test-fetchers", "Run fetcher unit tests");
+    test_fetchers_step.dependOn(&run_fetchers_tests.step);
+    const test_expr_step = b.step("test-expr", "Run evaluator unit tests");
+    test_expr_step.dependOn(&run_expr_tests.step);
+    const test_integration_step = b.step("test-integration", "Run integration tests");
+    test_integration_step.dependOn(&run_integration_tests.step);
+    const test_cli_step = b.step("test-cli", "Run CLI unit tests");
+    test_cli_step.dependOn(&run_cli_tests.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_base_tests.step);
     test_step.dependOn(&run_syntax_tests.step);
@@ -286,9 +301,12 @@ pub fn build(b: *std.Build) void {
     const structure_check_step = b.step("structure-check", "Check durable module and ownership boundaries");
     structure_check_step.dependOn(&run_structure_check.step);
 
+    const static_check_step = b.step("check-static", "Check formatting and module boundaries");
+    static_check_step.dependOn(&format_check.step);
+    static_check_step.dependOn(structure_check_step);
+
     const check_step = b.step("check", "Check formatting and run unit tests");
-    check_step.dependOn(&format_check.step);
-    check_step.dependOn(structure_check_step);
+    check_step.dependOn(static_check_step);
     check_step.dependOn(test_step);
 
     // Quick syntax-only tests. The parser imports the build-generated
