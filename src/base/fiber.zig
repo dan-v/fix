@@ -7,18 +7,18 @@
 //! resumption.
 //!
 //! Stack switching is done by `contextSwitch`, an inline-asm routine
-//! vendored from Zig's `std.Io.fiber`. It saves only the stack pointer,
-//! frame pointer, and resume address into a `Context`; every other register
+//! vendored from Zig's `std.Io.fiber`. It saves the stack pointer, frame
+//! pointer, resume address, and AArch64 link register into a `Context`; every
+//! other register
 //! — callee-saved GPRs, the vector file, and the FP/flags control state
 //! (`mxcsr`/`fpcr`/direction flag) — is listed as clobbered, so the compiler
 //! spills whatever is live around each swap site. Being `inline` is required:
 //! the clobbers must apply at the real call sites. This also preserves FP
 //! rounding mode and the direction flag across a swap.
 //!
-//! Fibers can be resumed from any OS thread. `caller_ctx` points into
-//! the resumer's stack frame for the duration of one `resume_` call
-//! and is cleared on return — so a later `resume_` from a different
-//! thread establishes a fresh `caller_ctx` on the new resumer's frame.
+//! Fibers can be resumed from any OS thread. Each `resume_` replaces
+//! `caller_ctx` with a pointer into that resumer's stack frame before switching
+//! to the fiber. A stale pointer is never read between resumptions.
 //! Thread-affinity is a property of the *wake/dispatch* layer above
 //! fibers (a wake puts the fiber on a specific worker's ready stack);
 //! the fiber primitive itself doesn't impose it.
@@ -71,13 +71,14 @@ pub inline fn censusNow() u64 {
     return (@as(u64, high) << 32) | @as(u64, low);
 }
 
-/// Minimal saved state for an inactive fiber: stack pointer, frame pointer, and
-/// resume address. The offsets (0, 8, 16) are load-bearing — `contextSwitch`
-/// reads them directly. Everything else the swap needs to preserve rides the
-/// clobber list, not this struct. Vendored from Zig's `std.Io.fiber`.
+/// Minimal saved state for an inactive fiber. The offsets are load-bearing —
+/// `contextSwitch` reads them directly. AArch64 also saves x30 explicitly:
+/// LLVM may allocate a live value there across inline asm even when x30 is
+/// listed as clobbered. Everything else the swap needs to preserve rides the
+/// clobber list, not this struct.
 pub const Context = switch (builtin.cpu.arch) {
     .x86_64 => extern struct { rsp: u64 = 0, rbp: u64 = 0, rip: u64 = 0 },
-    .aarch64 => extern struct { sp: u64 = 0, fp: u64 = 0, pc: u64 = 0 },
+    .aarch64 => extern struct { sp: u64 = 0, fp: u64 = 0, pc: u64 = 0, lr: u64 = 0 },
     else => unreachable, // gated by the comptime block above
 };
 
@@ -89,10 +90,11 @@ const Switch = extern struct { old: *Context, new: *Context };
 /// `s.new`'s resume address. Based on Zig 0.16 `std.Io.fiber`, with the message
 /// register removed from each architecture's clobber list: it is already an
 /// input and output operand, and declaring all three roles miscompiles optimized
-/// builds (ziglang/zig#35724). Only sp/fp/pc are stored; the remaining clobbers
-/// force the compiler to preserve live state around the emitted swap. MUST stay
-/// `inline` — the clobbers only bind at the real call site, never behind a call
-/// boundary. The returned `*const Switch` is the resumer's message (unused here).
+/// builds (ziglang/zig#35724). The stack/frame/resume state and AArch64 x30 are
+/// stored explicitly; the remaining clobbers force the compiler to preserve
+/// live state around the emitted swap. MUST stay `inline` — the clobbers only
+/// bind at the real call site, never behind a call boundary. The returned
+/// `*const Switch` is the resumer's message (unused here).
 inline fn contextSwitch(s: *const Switch) *const Switch {
     return switch (builtin.cpu.arch) {
         .x86_64 => asm volatile (
@@ -177,6 +179,8 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
             \\ adr x5, 0f
             \\ ldp x4, fp, [x2]
             \\ str x5, [x0, #16]
+            \\ str x30, [x0, #24]
+            \\ ldr x30, [x2, #24]
             \\ mov sp, x4
             \\ br x3
             \\0:
@@ -200,6 +204,11 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
               .x15 = true,
               .x16 = true,
               .x17 = true,
+              // x18 is the platform register on Darwin and must not be
+              // clobbered there. Linux treats it as an ordinary caller-saved
+              // register, so LLVM must not keep a live value in it across the
+              // stack switch.
+              .x18 = !builtin.os.tag.isDarwin(),
               .x19 = true,
               .x20 = true,
               .x21 = true,
@@ -210,7 +219,6 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
               .x26 = true,
               .x27 = true,
               .x28 = true,
-              .x30 = true,
               .z0 = true,
               .z1 = true,
               .z2 = true,
@@ -332,9 +340,9 @@ pub const Fiber = struct {
     entry: ?EntryFn,
     entry_arg: ?*anyopaque,
     /// Where to switch back to on yield/finish. Valid only while
-    /// `state == .running`. Pointer into the resumer's stack — set
-    /// fresh on each `resume_`, cleared on return, so a subsequent
-    /// resume from a different thread is safe.
+    /// `state == .running`. Pointer into the resumer's stack, replaced before
+    /// every switch to the fiber so a later resume from a different thread is
+    /// safe.
     caller_ctx: ?*Context,
 
     /// Per-fiber stack reservation. Provisioned as a virtual mapping

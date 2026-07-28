@@ -70,16 +70,21 @@ pub fn run(
     };
 }
 
-/// Resolve an npins pin to its /nix/store path (run.py's `pin_path`): force the
-/// corpus into the store, then print its path. Caller owns the returned slice.
+/// Resolve an npins pin to a materialized /nix/store path. Recent Nix versions
+/// can leave builtin-fetcher results as lazy trees: evaluator builtins can read
+/// them, but an ordinary process cannot open the printed store path. Copying
+/// through a derivation makes the corpus a normal, realized store object.
+/// Caller owns the returned slice.
 pub fn resolvePin(gpa: std.mem.Allocator, io: std.Io, repo: []const u8, name: []const u8) ![]u8 {
     const expr = try std.fmt.allocPrint(gpa,
-        \\let source = (import {s}/npins).{s};
-        \\in builtins.seq (builtins.readDir source) (builtins.toString source)
-    , .{ repo, name });
+        \\let
+        \\  pkgs = import <nixpkgs> {{}};
+        \\  source = (import {s}/npins).{s};
+        \\in pkgs.runCommand "fix-lang-{s}" {{}} "cp -R ${{source}}/. $out"
+    , .{ repo, name, name });
     defer gpa.free(expr);
-    const argv = [_][]const u8{ "nix-instantiate", "--eval", "--strict", "--raw", "--expr", expr };
-    var out = try run(gpa, io, &argv, null, null, 120 * std.time.ns_per_s);
+    const argv = [_][]const u8{ "nix-build", "--no-out-link", "--expr", expr };
+    var out = try run(gpa, io, &argv, null, null, 5 * 60 * std.time.ns_per_s);
     defer out.deinit(gpa);
     if (out.rc != 0) {
         std.debug.print("failed to resolve pin '{s}':\n{s}\n", .{ name, out.stderr });

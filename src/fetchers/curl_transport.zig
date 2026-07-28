@@ -212,6 +212,12 @@ test "HTTP download follows redirects and streams decoded bytes" {
             for (0..2) |request_index| {
                 const stream = s.accept(testing.io) catch return;
                 defer stream.close(testing.io);
+                var read_buffer: [2048]u8 = undefined;
+                var reader = std.Io.net.Stream.Reader.init(stream, testing.io, &read_buffer);
+                while (true) {
+                    const line = reader.interface.takeDelimiterExclusive('\n') catch return;
+                    if (line.len == 0 or std.mem.eql(u8, line, "\r")) break;
+                }
                 var write_buffer: [2048]u8 = undefined;
                 var writer = std.Io.net.Stream.Writer.init(stream, testing.io, &write_buffer);
                 if (request_index == 0)

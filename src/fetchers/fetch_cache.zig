@@ -1597,6 +1597,12 @@ test "remote URL retries transient status then reuses the verified TTL cache" {
             for (0..2) |attempt| {
                 const stream = s.accept(testing.io) catch return;
                 defer stream.close(testing.io);
+                var read_buffer: [2048]u8 = undefined;
+                var reader = std.Io.net.Stream.Reader.init(stream, testing.io, &read_buffer);
+                while (true) {
+                    const line = reader.interface.takeDelimiterExclusive('\n') catch return;
+                    if (line.len == 0 or std.mem.eql(u8, line, "\r")) break;
+                }
                 var buffer: [1024]u8 = undefined;
                 var writer = std.Io.net.Stream.Writer.init(stream, testing.io, &buffer);
                 if (attempt == 0)
