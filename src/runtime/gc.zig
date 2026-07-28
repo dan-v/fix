@@ -1278,9 +1278,9 @@ test "major coalescing joins adjacent ranges freed by different collections" {
     defer heap.deinit();
     heap_collector.enableCollect(&heap, 64 << 20, 0);
 
-    const saved_worker = containers.worker_id.current;
-    defer containers.worker_id.current = saved_worker;
-    containers.worker_id.current = 0;
+    const saved_worker = containers.worker_id.state();
+    defer containers.worker_id.set(saved_worker.id, saved_worker.is_worker);
+    containers.worker_id.set(0, saved_worker.is_worker);
 
     const dead_first = try heap.addList(&.{ Value.int(1), Value.int(2) });
     const live_first = try heap.addList(&.{ Value.int(3), Value.int(4), Value.int(5) });
@@ -1356,17 +1356,17 @@ test "minor sweep publishes every allocation worker's storage for reuse" {
     defer heap.deinit();
     heap_collector.enableCollect(&heap, 64 << 20, 0);
 
-    const saved_worker = containers.worker_id.current;
-    defer containers.worker_id.current = saved_worker;
+    const saved_worker = containers.worker_id.state();
+    defer containers.worker_id.set(saved_worker.id, saved_worker.is_worker);
 
-    containers.worker_id.current = 0;
+    containers.worker_id.set(0, saved_worker.is_worker);
     const dead_0 = try heap.addList(&.{ Value.int(1), Value.int(2), Value.int(3) });
     const range_0 = switch (heap.get(dead_0).*) {
         .list => |range| range,
         else => unreachable,
     };
 
-    containers.worker_id.current = 1;
+    containers.worker_id.set(1, saved_worker.is_worker);
     const dead_1 = try heap.addList(&.{ Value.int(4), Value.int(5), Value.int(6) });
     const range_1 = switch (heap.get(dead_1).*) {
         .list => |range| range,
@@ -1382,13 +1382,13 @@ test "minor sweep publishes every allocation worker's storage for reuse" {
     // The coordinator ran with worker 1 current. Object slots and ranges may
     // cross workers through their shared batch pools.
     const objects_before = heap.objects.count();
-    containers.worker_id.current = 0;
+    containers.worker_id.set(0, saved_worker.is_worker);
     const reused_0 = try heap.addList(&.{ Value.int(7), Value.int(8), Value.int(9) });
     const reused_range_0 = switch (heap.get(reused_0).*) {
         .list => |range| range,
         else => unreachable,
     };
-    containers.worker_id.current = 1;
+    containers.worker_id.set(1, saved_worker.is_worker);
     const reused_1 = try heap.addList(&.{ Value.int(10), Value.int(11), Value.int(12) });
     const reused_range_1 = switch (heap.get(reused_1).*) {
         .list => |range| range,
@@ -1412,9 +1412,9 @@ test "collection boundary makes free storage available to an idle worker" {
     defer heap.deinit();
     heap_collector.enableCollect(&heap, 64 << 20, 0);
 
-    const saved_worker = containers.worker_id.current;
-    defer containers.worker_id.current = saved_worker;
-    containers.worker_id.current = 0;
+    const saved_worker = containers.worker_id.state();
+    defer containers.worker_id.set(saved_worker.id, saved_worker.is_worker);
+    containers.worker_id.set(0, saved_worker.is_worker);
 
     var live: [3]ObjectId = undefined;
     for (&live) |*root| {
@@ -1435,7 +1435,7 @@ test "collection boundary makes free storage available to an idle worker" {
     // neither backing store.
     const objects_before = heap.objects.count();
     const values_before = heap.values.count();
-    containers.worker_id.current = 1;
+    containers.worker_id.set(1, saved_worker.is_worker);
     _ = try heap.addList(&.{Value.int(3)});
     try std.testing.expectEqual(objects_before, heap.objects.count());
     try std.testing.expectEqual(values_before, heap.values.count());

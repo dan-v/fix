@@ -107,7 +107,7 @@ inline fn rdtsc() u64 {
 /// sentinel on disabled builds / helper threads / stack overflow.
 pub inline fn enter(key: u32) usize {
     if (!enabled) return std.math.maxInt(usize);
-    if (worker_id.current != 0) return std.math.maxInt(usize);
+    if (worker_id.currentId() != 0) return std.math.maxInt(usize);
     if (stack_len >= stack_cap) {
         overflowed = true;
         return std.math.maxInt(usize);

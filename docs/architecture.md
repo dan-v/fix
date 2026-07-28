@@ -105,7 +105,7 @@ protocol in an `ImportEntry`.
 
 ## The concurrency model
 
-- **[Fibers](parallel/fibers.md)** — stackful user-space coroutines with x86-64 and AArch64 stack-switching. A yielded fiber is fully-captured, movable state, so it can be stolen and resumed on any worker. This is why the engine uses fibers, not OS threads: "steal the work while it waits."
+- **[Fibers](parallel/fibers.md)** — stackful user-space coroutines with x86-64 and AArch64 stack-switching. A yielded fiber carries its evaluation state and can be stolen and resumed by another worker; OS-thread-local services are resolved again through non-inlined accessors after migration.
 - **[Scheduler](parallel/scheduler.md)** — per-worker work-stealing queues, classed by submission lane: an *urgent* lane (demand-driven fan-out, a fixed-capacity lock-free Chase-Lev deque) and capped, best-effort *speculative* lanes (a mutex-protected bounded ring). Idle workers steal; parked workers spin then futex-sleep.
 - **[Workers](parallel/workers.md)** — N workers; the main thread runs the
   top-level fiber and participates in the drain loop while that fiber is

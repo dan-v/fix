@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const base_options = @import("base_options");
 
 pub const huge_page_size: usize = 2 << 20;
 
@@ -303,26 +304,33 @@ test "map/unmap: accounting balances whether or not the pool serves it" {
         try std.testing.expectEqual(before + (4 << 20), mappedBytes());
         try std.testing.expect(peakMappedBytes() >= mappedBytes());
 
-        // madv_populate_write made every base page resident before `map`
-        // returned, rather than leaving a possible SIGBUS for first touch.
-        var resident: [(4 << 20) / std.heap.page_size_min]u8 = @splat(0);
-        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mincore(p, 4 << 20, &resident)));
-        for (resident) |state| try std.testing.expect(state & 1 != 0);
+        // QEMU user mode reports success for these guest madvise calls but
+        // does not reproduce their kernel-visible residency/fork effects.
+        // Cross-emulated tests still exercise the mapping and accounting;
+        // native Linux CI verifies the two madvise contracts below.
+        if (!base_options.test_emulated) {
+            // madv_populate_write made every base page resident before `map`
+            // returned, rather than leaving a possible SIGBUS for first touch.
+            var resident: [(4 << 20) / std.heap.page_size_min]u8 = @splat(0);
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mincore(p, 4 << 20, &resident)));
+            for (resident) |state| try std.testing.expect(state & 1 != 0);
 
-        // MADV_DONTFORK removes the VMA from a child. Keep the child path to
-        // raw syscalls only: this test may fork from a multithreaded runner.
-        const fork_rc = linux.fork();
-        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(fork_rc));
-        if (fork_rc == 0) {
-            var state: [1]u8 = .{0};
-            const inherited = linux.errno(linux.mincore(p, std.heap.page_size_min, &state)) == .SUCCESS;
-            linux.exit_group(if (inherited) 1 else 0);
+            // MADV_DONTFORK removes the VMA from a child. Keep the child path
+            // to raw syscalls only: this test may fork from a multithreaded
+            // runner.
+            const fork_rc = linux.fork();
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(fork_rc));
+            if (fork_rc == 0) {
+                var state: [1]u8 = .{0};
+                const inherited = linux.errno(linux.mincore(p, std.heap.page_size_min, &state)) == .SUCCESS;
+                linux.exit_group(if (inherited) 1 else 0);
+            }
+            var status: u32 = 0;
+            const waited = linux.waitpid(@intCast(fork_rc), &status, 0);
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(waited));
+            try std.testing.expect(linux.W.IFEXITED(status));
+            try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
         }
-        var status: u32 = 0;
-        const waited = linux.waitpid(@intCast(fork_rc), &status, 0);
-        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(waited));
-        try std.testing.expect(linux.W.IFEXITED(status));
-        try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
 
         p[0] = 0xAB;
         p[(4 << 20) - 1] = 0xCD;

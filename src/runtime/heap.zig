@@ -373,7 +373,7 @@ pub const ObjectHeap = struct {
     attrs: AttrStore,
     attr_positions: AttrPosStore,
     /// One entry per worker (including the main thread). Indexed by
-    /// `worker_id_mod.current`.
+    /// `worker_id_mod.currentId()`.
     worker_locals: []HeapLocal,
     /// Cross-worker overflow for reclaimed object ids. Mutators refill their
     /// lock-free local stack in large batches, so imbalance costs one lock per
@@ -1282,7 +1282,7 @@ pub const ObjectHeap = struct {
     }
 
     pub inline fn currentLocal(self: *ObjectHeap) *HeapLocal {
-        return &self.worker_locals[worker_id_mod.current];
+        return &self.worker_locals[worker_id_mod.currentId()];
     }
 
     /// Update this worker thread's creation-context flag (see

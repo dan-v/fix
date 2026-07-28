@@ -50,7 +50,7 @@ contextSwitch(from, to):          # inline at each call site
 
 `inline` is mandatory: the clobbers only force the compiler to preserve live registers when the asm is emitted *at the real call site* (`resume_`/`yield`/`trampoline`), not behind a call boundary. A non-inline wrapper would save and restore registers around a stack it is about to switch away from, corrupting state. The clobber list includes `mxcsr`/`fpcr`/direction flag, preserving FP and direction state across a swap.
 
-For a never-run fiber the jump target is the trampoline, seeded directly into `Context.rip`/`pc` by `bootstrapContext` (no return address is pushed). The trampoline can't receive arguments through the ABI, so a fiber finds itself via a thread-local `current` pointer that `resume_` sets before swapping in and restores on return.
+For a never-run fiber the jump target is the trampoline, seeded directly into `Context.rip`/`pc` by `bootstrapContext` (no return address is pushed). The trampoline can't receive arguments through the ABI, so a fiber finds itself via a thread-local `current` pointer that `resume_` sets before swapping in and restores on return. Reads and writes of that pointer cross a `noinline` function boundary, matching `std.Io`'s scheduler TLS access: optimized AArch64 code may otherwise retain `TPIDR_EL0` in a suspended frame and address the previous thread's TLS after migration.
 
 ## Stacks
 
@@ -71,7 +71,7 @@ Each fiber reserves a **16 MiB** anonymous mapping (`mmap` with `PROT_READ|PROT_
 ```
 
 - **`.ready`** — initialized, never resumed; `entry` runs on first resume.
-- **`.running`** — executing on its owner's thread.
+- **`.running`** — executing on its current resumer's thread.
 - **`.suspended`** — yielded; `ctx` holds the resumable state.
 - **`.finished`** — `entry` returned; not resumable. `entry`/`arg` are cleared so a finished fiber holds no dangling capture.
 
@@ -79,15 +79,17 @@ Each fiber reserves a **16 MiB** anonymous mapping (`mmap` with `PROT_READ|PROT_
 
 ## Cross-thread resume safety (load-bearing invariants)
 
-Fibers migrate — a fiber allocated on worker A may be stolen and resumed on worker B. Three invariants make concurrent/serial resumption from arbitrary threads correct. They are not optimizations; each closes a race that produces real corruption (see the resume-race and waiter-race analysis in [invariants](../invariants.md)).
+Fibers migrate — a fiber allocated on worker A may be stolen and resumed on worker B. Four invariants make concurrent/serial resumption from arbitrary threads correct. They are not optimizations; each closes a race that produces real corruption (see the resume-race and waiter-race analysis in [invariants](../invariants.md)).
 
-1. **Fresh `caller_ctx` per resume.** `caller_ctx` — where the fiber swaps *back* to on yield/finish — points into the *resumer's* current stack frame. `resume_` sets it fresh on every call and clears it on return. So the "return path" is always the current resumer's, never a stale pointer into a thread that has since moved on. A resume from a different thread than the previous one is therefore safe by construction.
+1. **Fresh `caller_ctx` per resume.** `caller_ctx` — where the fiber swaps *back* to on yield/finish — points into the *resumer's* current stack frame. `resume_` replaces it before every switch into the fiber; an inactive fiber never reads it. So the "return path" is always the current resumer's, never a stale pointer into a thread that has since moved on.
 
-2. **Per-slot `run_mu` (SpinMutex) serializes concurrent `resume_`.** A wake can enqueue a fiber onto a worker's ready queue at the same instant the fiber's previous owner is still unwinding out of it. Without serialization two threads could `resume_` the same fiber concurrently — two live stacks, one `Context`. The [worker](workers.md) holds `run_mu` on the fiber slot around the run; the loser waits, observes the fiber `.finished`/`.suspended`, and does the right thing. `ReadyNode.queued` (below) independently prevents the double-enqueue, so in normal flow `run_mu` is uncontended.
+2. **TLS is resolved outside the suspended frame.** LLVM assumes an ordinary function remains on one OS thread and can retain a TLS base across calls. Scheduler TLS (`current` fiber, worker id, and thread-local evaluator caches) is therefore reached through non-inlined accessors that execute on the active thread after each migration.
 
-3. **`ReadyNode.queued` 0→1 CAS gate.** A fiber must appear on the ready queues **at most once**. `enqueueReady` only pushes when it wins the `queued` CAS from 0→1; `pop` resets it to 0. This prevents double-enqueue — two dequeues of the same node racing into `resume_` — even when several wakers fire for the same fiber simultaneously.
+3. **Per-slot `run_mu` (SpinMutex) serializes concurrent `resume_`.** A wake can enqueue a fiber onto a worker's ready queue at the same instant the fiber's previous owner is still unwinding out of it. Without serialization two threads could `resume_` the same fiber concurrently — two live stacks, one `Context`. The [worker](workers.md) holds `run_mu` on the fiber slot around the run; the loser waits, observes the fiber `.finished`/`.suspended`, and does the right thing. `ReadyNode.queued` (below) independently prevents the double-enqueue, so in normal flow `run_mu` is uncontended.
 
-Corollary — **ownership returns home:** a stolen fiber, once `.finished`, is returned to its *allocator*-worker's free-list, not the thief's (see [workers](workers.md)). Thread-affinity is a property of the wake/dispatch layer above fibers; the primitive itself imposes none.
+4. **`ReadyNode.queued` 0→1 CAS gate.** A fiber must appear on the ready queues **at most once**. `enqueueReady` only pushes when it wins the `queued` CAS from 0→1; `pop` resets it to 0. This prevents double-enqueue — two dequeues of the same node racing into `resume_` — even when several wakers fire for the same fiber simultaneously.
+
+Corollary — **ownership returns home:** a stolen fiber, once `.finished`, is returned to its *allocator*-worker's free-list, not the thief's (see [workers](workers.md)). The primitive itself does not pin a suspended fiber to an OS thread.
 
 ---
 

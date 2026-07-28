@@ -159,7 +159,7 @@ pub const fiberLiveDec = prof_fiber.fiberLiveDec;
 /// inclusive timestamp without going through the prof stack.
 pub inline fn tscMainOnly() u64 {
     if (!enabled) return 0;
-    if (worker_id.current != 0) return 0;
+    if (worker_id.currentId() != 0) return 0;
     return rdtsc();
 }
 
@@ -223,7 +223,7 @@ pub inline fn rdtsc() u64 {
 /// `prof_stack` index of the pushed frame (always < stack_cap).
 pub inline fn start(comptime path: Path) u64 {
     if (!enabled) return std.math.maxInt(u64);
-    if (worker_id.current != 0) return std.math.maxInt(u64);
+    if (worker_id.currentId() != 0) return std.math.maxInt(u64);
     if (prof_stack_len >= stack_cap) return std.math.maxInt(u64);
     const idx = prof_stack_len;
     prof_stack[idx] = .{
@@ -242,7 +242,7 @@ pub inline fn start(comptime path: Path) u64 {
 /// i.e. the builtin's own body cost. Pair with `end(.apply_builtin, _)`.
 pub inline fn startBuiltin(builtin_id: u16) u64 {
     if (!enabled) return std.math.maxInt(u64);
-    if (worker_id.current != 0) return std.math.maxInt(u64);
+    if (worker_id.currentId() != 0) return std.math.maxInt(u64);
     if (prof_stack_len >= stack_cap) return std.math.maxInt(u64);
     const idx = prof_stack_len;
     prof_stack[idx] = .{

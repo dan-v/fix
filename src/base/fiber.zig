@@ -19,9 +19,8 @@
 //! Fibers can be resumed from any OS thread. Each `resume_` replaces
 //! `caller_ctx` with a pointer into that resumer's stack frame before switching
 //! to the fiber. A stale pointer is never read between resumptions.
-//! Thread-affinity is a property of the *wake/dispatch* layer above
-//! fibers (a wake puts the fiber on a specific worker's ready stack);
-//! the fiber primitive itself doesn't impose it.
+//! Threadlocal scheduler state is accessed through non-inlined functions so
+//! its address is formed on the OS thread that is active after each migration.
 //!
 //! Lifecycle:
 //!   .ready    — initialized, never resumed. `entry` will run on first resume.
@@ -54,10 +53,43 @@ comptime {
 /// Zero-footprint when the build flag is off.
 pub const census_enabled: bool = base_options.fiber_census and builtin.cpu.arch == .x86_64;
 
-pub threadlocal var census_pre_swap: u64 = 0;
-pub threadlocal var census_exit_swap: u64 = 0;
-pub threadlocal var census_in_cy: u64 = 0;
-pub threadlocal var census_in_n: u64 = 0;
+threadlocal var census_pre_swap: u64 = 0;
+threadlocal var census_exit_swap: u64 = 0;
+threadlocal var census_in_cy: u64 = 0;
+threadlocal var census_in_n: u64 = 0;
+
+pub const CensusSample = struct {
+    exit_swap: u64,
+    in_cy: u64,
+    in_n: u64,
+};
+
+pub noinline fn censusSeed(pre_swap: u64) void {
+    if (comptime census_enabled) census_pre_swap = pre_swap;
+}
+
+noinline fn censusRecordEntry(now: u64) void {
+    if (comptime census_enabled) {
+        census_in_cy += now -| census_pre_swap;
+        census_in_n += 1;
+    }
+}
+
+noinline fn censusRecordExit(now: u64) void {
+    if (comptime census_enabled) census_exit_swap = now;
+}
+
+pub noinline fn censusDrain() CensusSample {
+    if (comptime !census_enabled) return .{ .exit_swap = 0, .in_cy = 0, .in_n = 0 };
+    const sample: CensusSample = .{
+        .exit_swap = census_exit_swap,
+        .in_cy = census_in_cy,
+        .in_n = census_in_n,
+    };
+    census_in_cy = 0;
+    census_in_n = 0;
+    return sample;
+}
 
 pub inline fn censusNow() u64 {
     if (comptime !census_enabled) return 0;
@@ -330,8 +362,16 @@ pub const EntryFn = *const fn (arg: *anyopaque) void;
 /// through the standard ABI.
 threadlocal var current: ?*Fiber = null;
 
-pub fn currentFiber() ?*Fiber {
+/// Form the TLS address in a fresh function invocation on the active OS
+/// thread. This mirrors std.Io's `Thread.current`: if this access is inlined
+/// into a fiber frame, LLVM may retain AArch64's TPIDR_EL0 across a yield and
+/// address the previous thread's TLS after migration.
+pub noinline fn currentFiber() ?*Fiber {
     return current;
+}
+
+noinline fn setCurrentFiber(fiber: ?*Fiber) void {
+    current = fiber;
 }
 
 pub const Fiber = struct {
@@ -458,8 +498,8 @@ pub const Fiber = struct {
     pub fn resume_(self: *Fiber) void {
         std.debug.assert(self.state == .ready or self.state == .suspended);
         var here: Context = .{};
-        const prev = current;
-        current = self;
+        const prev = currentFiber();
+        setCurrentFiber(self);
         self.caller_ctx = &here;
         self.state = .running;
         swap(&here, &self.ctx);
@@ -474,21 +514,18 @@ pub const Fiber = struct {
         // The clear is also unnecessary: the next `resume_` sets `caller_ctx`
         // afresh before the fiber runs again, and `reset` nulls it for a recycled
         // fiber, so no stale/dangling value is ever read.
-        current = prev;
+        setCurrentFiber(prev);
     }
 
     /// Yield from the *currently running* fiber back to whoever resumed it.
     /// Call only from inside a fiber's `entry` (directly or transitively).
     pub fn yield() void {
-        const self = current orelse @panic("Fiber.yield called outside a fiber");
+        const self = currentFiber() orelse @panic("Fiber.yield called outside a fiber");
         const back = self.caller_ctx orelse @panic("running fiber has no caller_ctx");
         self.state = .suspended;
-        if (comptime census_enabled) census_exit_swap = censusNow();
+        if (comptime census_enabled) censusRecordExit(censusNow());
         swap(&self.ctx, back);
-        if (comptime census_enabled) {
-            census_in_cy += censusNow() -| census_pre_swap;
-            census_in_n += 1;
-        }
+        if (comptime census_enabled) censusRecordEntry(censusNow());
         // Resumed: caller_ctx has been set to the new resumer.
         self.state = .running;
     }
@@ -501,11 +538,8 @@ pub const Fiber = struct {
 /// entry, and then swap back permanently — `entry` returning means the fiber
 /// is done.
 fn trampoline() callconv(.c) void {
-    if (comptime census_enabled) {
-        census_in_cy += censusNow() -| census_pre_swap;
-        census_in_n += 1;
-    }
-    const self = current orelse @panic("trampoline started with no current fiber");
+    if (comptime census_enabled) censusRecordEntry(censusNow());
+    const self = currentFiber() orelse @panic("trampoline started with no current fiber");
     const arg = self.entry_arg orelse unreachable;
     const entry = self.entry orelse unreachable;
     entry(arg);
@@ -516,7 +550,7 @@ fn trampoline() callconv(.c) void {
     const back = self.caller_ctx orelse @panic("finished fiber has no caller_ctx");
     self.entry = null;
     self.entry_arg = null;
-    if (comptime census_enabled) census_exit_swap = censusNow();
+    if (comptime census_enabled) censusRecordExit(censusNow());
     swap(&self.ctx, back);
     // Should never get here — resuming a `.finished` fiber would re-run
     // the swap, which would land on whatever junk is below this point.
@@ -579,17 +613,17 @@ test "fiber threadlocal `current` is set during run, cleared after" {
         saw_self: ?*Fiber = null,
         fn entry(arg: *anyopaque) void {
             const ctx: *@This() = @ptrCast(@alignCast(arg));
-            ctx.saw_self = current;
+            ctx.saw_self = currentFiber();
         }
     };
     var ctx: Ctx = .{};
     var fiber = try Fiber.init(testing.allocator, Fiber.min_stack_bytes, Ctx.entry, &ctx);
     defer fiber.deinit(testing.allocator);
 
-    try testing.expect(current == null);
+    try testing.expect(currentFiber() == null);
     fiber.resume_();
     try testing.expectEqual(@as(?*Fiber, &fiber), ctx.saw_self);
-    try testing.expect(current == null);
+    try testing.expect(currentFiber() == null);
 }
 
 test "two fibers multiplex on one thread" {
@@ -639,24 +673,30 @@ test "two fibers multiplex on one thread" {
 }
 
 test "fiber resumed by different threads in sequence (migration)" {
-    // Validates that the existing caller_ctx mechanism is safe under
-    // cross-thread resume: thread A drives the fiber to a yield, then
-    // thread B drives it through another yield, then thread A finishes
-    // it. Each `resume_` call allocates a fresh local `here` Context;
-    // `caller_ctx` is set freshly per call and cleared after, so no
-    // stale resumer-stack pointer survives between resumes.
+    // Capture resumer IDs on their native stacks. Calling
+    // std.Thread.getCurrentId() from the fiber body would test Zig's own
+    // inline TLS implementation rather than this fiber primitive.
+    const worker_id = @import("worker_id.zig");
+    const previous_worker = worker_id.state();
+    defer worker_id.set(previous_worker.id, previous_worker.is_worker);
+    worker_id.set(17, true);
+
     const Ctx = struct {
         steps: std.atomic.Value(u32) = .init(0),
-        thread_ids: [3]std.Thread.Id = undefined,
+        observed_current: [3]?*Fiber = @splat(null),
+        observed_worker: [3]u8 = @splat(0),
         fn entry(arg: *anyopaque) void {
             const ctx: *@This() = @ptrCast(@alignCast(arg));
-            ctx.thread_ids[0] = std.Thread.getCurrentId();
+            ctx.observed_current[0] = currentFiber();
+            ctx.observed_worker[0] = worker_id.currentId();
             _ = ctx.steps.fetchAdd(1, .release);
             Fiber.yield();
-            ctx.thread_ids[1] = std.Thread.getCurrentId();
+            ctx.observed_current[1] = currentFiber();
+            ctx.observed_worker[1] = worker_id.currentId();
             _ = ctx.steps.fetchAdd(1, .release);
             Fiber.yield();
-            ctx.thread_ids[2] = std.Thread.getCurrentId();
+            ctx.observed_current[2] = currentFiber();
+            ctx.observed_worker[2] = worker_id.currentId();
             _ = ctx.steps.fetchAdd(1, .release);
         }
     };
@@ -664,28 +704,31 @@ test "fiber resumed by different threads in sequence (migration)" {
     var fiber = try Fiber.init(testing.allocator, Fiber.min_stack_bytes, Ctx.entry, &ctx);
     defer fiber.deinit(testing.allocator);
 
+    const first_thread_id = std.Thread.getCurrentId();
     fiber.resume_();
     try testing.expectEqual(@as(u32, 1), ctx.steps.load(.acquire));
     try testing.expectEqual(State.suspended, fiber.state);
 
-    // Drive the second resume from a different OS thread.
     const Runner = struct {
-        fn run(f: *Fiber) void {
+        fn run(f: *Fiber, thread_id: *std.Thread.Id) void {
+            thread_id.* = std.Thread.getCurrentId();
+            worker_id.set(23, true);
             f.resume_();
         }
     };
-    var t = try std.Thread.spawn(.{}, Runner.run, .{&fiber});
+    var second_thread_id: std.Thread.Id = undefined;
+    var t = try std.Thread.spawn(.{}, Runner.run, .{ &fiber, &second_thread_id });
     t.join();
+    try testing.expect(first_thread_id != second_thread_id);
     try testing.expectEqual(@as(u32, 2), ctx.steps.load(.acquire));
     try testing.expectEqual(State.suspended, fiber.state);
 
-    // Back to the original thread to finish.
     fiber.resume_();
     try testing.expectEqual(@as(u32, 3), ctx.steps.load(.acquire));
     try testing.expectEqual(State.finished, fiber.state);
-
-    // The fiber observed three distinct thread contexts driving it.
-    try testing.expect(ctx.thread_ids[0] != ctx.thread_ids[1]);
+    for (ctx.observed_current) |observed|
+        try testing.expectEqual(@as(?*Fiber, &fiber), observed);
+    try testing.expectEqual([3]u8{ 17, 23, 17 }, ctx.observed_worker);
 }
 
 test "nested fiber call" {
@@ -708,11 +751,11 @@ test "nested fiber call" {
         observed_self_current_between_resumes: ?*Fiber = null,
         fn entry(arg: *anyopaque) void {
             const ctx: *@This() = @ptrCast(@alignCast(arg));
-            ctx.observed_inner_current_before_resume = current;
+            ctx.observed_inner_current_before_resume = currentFiber();
             ctx.inner_fiber.resume_();
             // Now we're back in outer fiber. `current` must point at the
             // outer fiber itself, NOT at the inner one we just resumed.
-            ctx.observed_self_current_between_resumes = current;
+            ctx.observed_self_current_between_resumes = currentFiber();
             ctx.inner_fiber.resume_();
         }
     };

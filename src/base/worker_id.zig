@@ -2,7 +2,7 @@
 //! is worker 0. Helper threads spawned by the scheduler set this in their
 //! loop. Code that needs per-worker storage (heap TLABs, etc.) reads it.
 
-pub threadlocal var current: u8 = 0;
+threadlocal var current: u8 = 0;
 
 /// True on a compute-worker thread (worker 0 or a scheduler helper) once it
 /// has entered its drain loop; false on every other thread — the IO runtime,
@@ -12,4 +12,24 @@ pub threadlocal var current: u8 = 0;
 /// compute worker (its core is cache-hot for the value)" from "resolved by an
 /// IO thread (no useful locality)" so resolver-affinity routing only fires for
 /// compute workers. Set alongside `current` at the two worker-loop entries.
-pub threadlocal var is_worker: bool = false;
+threadlocal var is_worker: bool = false;
+
+pub const State = struct {
+    id: u8,
+    is_worker: bool,
+};
+
+/// Keep evaluator TLS lookup out of migratable fiber frames. See
+/// `fiber.currentFiber` and std.Io's `Thread.current`.
+pub noinline fn state() State {
+    return .{ .id = current, .is_worker = is_worker };
+}
+
+pub noinline fn currentId() u8 {
+    return current;
+}
+
+pub noinline fn set(id: u8, worker: bool) void {
+    current = id;
+    is_worker = worker;
+}

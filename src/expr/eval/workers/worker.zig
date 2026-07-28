@@ -380,8 +380,7 @@ pub const Worker = struct {
 
     /// Helper main loop. Drains until shutdown.
     pub fn run(self: *Worker) void {
-        worker_id_mod.current = self.worker_id;
-        worker_id_mod.is_worker = true;
+        worker_id_mod.set(self.worker_id, true);
         vm_force.gcRegisterWorkerCaches(self.worker_id);
         defer vm_force.gcUnregisterWorkerCaches(self.worker_id);
         while (!self.shouldStop()) {
@@ -409,8 +408,7 @@ pub const Worker = struct {
         entry: fiber_mod.EntryFn,
         arg: *anyopaque,
     ) !void {
-        worker_id_mod.current = self.worker_id;
-        worker_id_mod.is_worker = true;
+        worker_id_mod.set(self.worker_id, true);
         vm_force.gcRegisterWorkerCaches(self.worker_id);
         // Each top-level entry begins able to start background work.
         self.scheduler.setSuppressBackground(false);
@@ -459,8 +457,7 @@ pub const Worker = struct {
     /// demand fiber and is queued onto a different worker when possible.
     pub fn runTopLevels(self: *Worker, entries: []const TopLevelEntry) !void {
         if (entries.len == 0) return;
-        worker_id_mod.current = self.worker_id;
-        worker_id_mod.is_worker = true;
+        worker_id_mod.set(self.worker_id, true);
         vm_force.gcRegisterWorkerCaches(self.worker_id);
         self.scheduler.setSuppressBackground(false);
 
@@ -673,7 +670,7 @@ pub const Worker = struct {
         // dispatcher→body path; the fiber-side hook (trampoline / yield
         // return) closes the window. Symmetric `cy_out` closes at the end
         // of this function's bookkeeping.
-        if (comptime census_on) fiber_mod.census_pre_swap = fiber_mod.censusNow();
+        if (comptime census_on) fiber_mod.censusSeed(fiber_mod.censusNow());
         f.run_mu.lock();
         defer f.run_mu.unlock();
 
@@ -741,12 +738,11 @@ pub const Worker = struct {
             .ready, .running => unreachable,
         }
         if (comptime census_on) {
-            self.census.cy_out += fiber_mod.censusNow() -| fiber_mod.census_exit_swap;
+            const sample = fiber_mod.censusDrain();
+            self.census.cy_out += fiber_mod.censusNow() -| sample.exit_swap;
             self.census.n_out += 1;
-            self.census.cy_in += fiber_mod.census_in_cy;
-            self.census.n_in += fiber_mod.census_in_n;
-            fiber_mod.census_in_cy = 0;
-            fiber_mod.census_in_n = 0;
+            self.census.cy_in += sample.in_cy;
+            self.census.n_in += sample.in_n;
             self.census.resumes += 1;
         }
     }
@@ -1132,7 +1128,7 @@ fn runForceThunkTask(f: *WorkerFiber, thunk_id: types.ObjectId) void {
     }
     _ = vm_force.forceValueSpeculative(&f.vm, Value.thunk(thunk_id)) catch |err| {
         if (err == error.SpeculativeBail)
-            f.vm.scheduler.noteSpecBail(worker_id_mod.current);
+            f.vm.scheduler.noteSpecBail(worker_id_mod.currentId());
     };
 }
 
@@ -1216,7 +1212,7 @@ fn logAttrsSweepStart(
     }
     std.debug.print("sweep attrs={d} n={d} t_us={d} worker={d} claimer={d} first_attr={s} member={s}\n", .{
         attrs_id,             entries.len,
-        vm_force.diagNowUs(), worker_id_mod.current,
+        vm_force.diagNowUs(), worker_id_mod.currentId(),
         f.ctx.claimer_id,     f.vm.intern.get(entries[0].name),
         label,
     });

@@ -2614,7 +2614,7 @@ pub const Engine = struct {
             if (gop.found_existing) return;
             self.sources.prefetch.budget -= 1;
         }
-        _ = self.execution.scheduler.submit(.{ .import_prefetch = path_id }, worker_id_mod.current);
+        _ = self.execution.scheduler.submit(.{ .import_prefetch = path_id }, worker_id_mod.currentId());
     }
 
     fn scopedImportValue(context: *anyopaque, caller: *VM, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {

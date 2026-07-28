@@ -24,6 +24,12 @@ pub fn build(b: *std.Build) void {
 
     const base_options = b.addOptions();
     base_options.addOption(bool, "fiber_census", prof_main);
+    base_options.addOption(
+        bool,
+        "test_emulated",
+        target.result.cpu.arch != b.graph.host.result.cpu.arch or
+            target.result.os.tag != b.graph.host.result.os.tag,
+    );
     const base_options_mod = base_options.createModule();
 
     // Keep build modules for durable domain boundaries. Internal subsystems use

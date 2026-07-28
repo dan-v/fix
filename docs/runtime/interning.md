@@ -33,6 +33,8 @@ Two `StableSegments` hold the data globally (so ids stay dense and `get` needn't
 
 A `threadlocal` **direct-mapped cache** (`cache_size = 512` slots, indexed by `h % 512`) short-circuits the shard lock + HashMap probe + segment slice for hot short identifiers (attr names, builtin args, path components). Each slot is exactly 32 bytes and stores `hash`, `id`, `len`, and an **inlined copy of the bytes** (`len ≤ cache_max_len = 19`), so two slots pack into a cache line and no slot straddles one. Strings longer than 19 bytes skip the cache. Hits require `hash`, `len`, and bytes to match; the slot is also populated on a shard-lock miss (both the found-existing and freshly-interned paths write it back).
 
+Cache reads and writes go through non-inlined helpers. Evaluation fibers can migrate between OS threads, so an optimized suspended frame must not retain one thread's TLS base and use it after another thread resumes the fiber.
+
 **Token invalidation.** Each `InternTable` init takes a unique monotonic `token`. Because the thread-local cache outlives an `Engine` and the allocator may reuse the same heap address for a fresh table, a stale slot could match by pointer identity alone. Each thread stores the active token once alongside its cache; switching tables clears the 16 KiB cache before publishing the new token. This avoids repeating the same token in all 512 slots.
 
 ## Concurrency summary

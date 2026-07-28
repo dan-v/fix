@@ -211,11 +211,12 @@ pub const Recorder = struct {
     }
 
     pub fn nextFlowId(self: *Recorder) u64 {
-        if (!self.flows_enabled or !self.active or !worker_id.is_worker or worker_id.current >= self.lanes.len) return 0;
-        const lane = &self.lanes[worker_id.current];
+        const worker = worker_id.state();
+        if (!self.flows_enabled or !self.active or !worker.is_worker or worker.id >= self.lanes.len) return 0;
+        const lane = &self.lanes[worker.id];
         const sequence = lane.flow_sequence;
         lane.flow_sequence +%= 1;
-        return sequence *% self.lanes.len + worker_id.current + 1;
+        return sequence *% self.lanes.len + worker.id + 1;
     }
 
     pub fn flow(self: *Recorder, spec: *const observ.FlowSpec, id: u64, phase: observ.FlowPhase, track: observ.Track, at_ns: u64) void {
@@ -240,8 +241,9 @@ pub const Recorder = struct {
 
     inline fn reserveEvent(self: *Recorder) ?usize {
         if (!self.active) return null;
-        if (worker_id.is_worker and worker_id.current < self.lanes.len)
-            return self.reserveWorkerSlot(&self.lanes[worker_id.current], .event);
+        const worker = worker_id.state();
+        if (worker.is_worker and worker.id < self.lanes.len)
+            return self.reserveWorkerSlot(&self.lanes[worker.id], .event);
         const offset = self.external_event_len.fetchAdd(1, .monotonic);
         const external_cap = self.events.len - self.worker_event_cap;
         if (offset < external_cap) return self.worker_event_cap + offset;
@@ -250,8 +252,9 @@ pub const Recorder = struct {
     }
 
     inline fn reserveFlow(self: *Recorder) ?usize {
-        if (!self.active or !worker_id.is_worker or worker_id.current >= self.lanes.len) return null;
-        return self.reserveWorkerSlot(&self.lanes[worker_id.current], .flow);
+        const worker = worker_id.state();
+        if (!self.active or !worker.is_worker or worker.id >= self.lanes.len) return null;
+        return self.reserveWorkerSlot(&self.lanes[worker.id], .flow);
     }
 
     inline fn reserveWorkerSlot(self: *Recorder, lane: *Lane, comptime kind: SlotKind) ?usize {
@@ -282,8 +285,9 @@ pub const Recorder = struct {
 
     fn storeText(self: *Recorder, bytes: []const u8) Text {
         if (bytes.len == 0) return .{};
-        if (worker_id.is_worker and worker_id.current < self.lanes.len and bytes.len <= name_chunk_len)
-            return self.storeWorkerText(&self.lanes[worker_id.current], bytes);
+        const worker = worker_id.state();
+        if (worker.is_worker and worker.id < self.lanes.len and bytes.len <= name_chunk_len)
+            return self.storeWorkerText(&self.lanes[worker.id], bytes);
         return self.storeExternalText(bytes);
     }
 
@@ -525,7 +529,10 @@ fn flowLessThan(_: void, a: FlowEvent, b: FlowEvent) bool {
 
 fn trackId(track: observ.Track) u16 {
     return switch (track) {
-        .current => if (worker_id.is_worker) worker_id.current else io_tid,
+        .current => {
+            const worker = worker_id.state();
+            return if (worker.is_worker) worker.id else io_tid;
+        },
         .worker => |id| id,
         .fiber => |id| @intCast(@min(id, std.math.maxInt(u16))),
         .activity => |id| @intCast(@min(id, std.math.maxInt(u16))),
@@ -581,15 +588,10 @@ test "worker producers refill shared buffers only at chunk boundaries" {
     var recorder = try Recorder.init(std.testing.allocator, 2, 4096, &intern);
     defer recorder.deinit();
 
-    const previous_id = worker_id.current;
-    const previous_is_worker = worker_id.is_worker;
-    defer {
-        worker_id.current = previous_id;
-        worker_id.is_worker = previous_is_worker;
-    }
+    const previous = worker_id.state();
+    defer worker_id.set(previous.id, previous.is_worker);
 
-    worker_id.is_worker = true;
-    worker_id.current = 0;
+    worker_id.set(0, true);
     try std.testing.expectEqual(@as(?usize, 0), recorder.reserveEvent());
     try std.testing.expectEqual(@as(?usize, 1), recorder.reserveEvent());
     _ = recorder.storeText("one");
@@ -597,19 +599,19 @@ test "worker producers refill shared buffers only at chunk boundaries" {
     try std.testing.expectEqual(@as(usize, 1), recorder.next_event_chunk.load(.monotonic));
     try std.testing.expectEqual(@as(usize, name_chunk_len), recorder.name_len.load(.monotonic));
 
-    worker_id.current = 1;
+    worker_id.set(1, true);
     try std.testing.expectEqual(@as(?usize, event_chunk_len), recorder.reserveEvent());
     try std.testing.expectEqual(@as(usize, 2), recorder.next_event_chunk.load(.monotonic));
 
-    worker_id.is_worker = false;
+    worker_id.set(1, false);
     try std.testing.expectEqual(@as(?usize, recorder.worker_event_cap), recorder.reserveEvent());
     try std.testing.expectEqual(@as(usize, 1), recorder.external_event_len.load(.monotonic));
 }
 
 test "logical tracks keep daemon and client IO off worker zero" {
-    const previous_is_worker = worker_id.is_worker;
-    defer worker_id.is_worker = previous_is_worker;
-    worker_id.is_worker = false;
+    const previous = worker_id.state();
+    defer worker_id.set(previous.id, previous.is_worker);
+    worker_id.set(previous.id, false);
 
     try std.testing.expectEqual(io_tid, trackId(.current));
     try std.testing.expectEqual(daemon_tid, trackId(.daemon));

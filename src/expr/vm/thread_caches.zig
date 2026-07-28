@@ -50,7 +50,10 @@ var registry: [max_workers]?*Caches = @splat(null);
 /// Return this OS thread's cache bundle, allocating it on first VM use.
 /// Zero is the empty sentinel for every cache's heap token, so byte-zeroing is
 /// sufficient; individual tagged values need not be initialized.
-pub fn get() *Caches {
+/// Resolve the cache pointer on the OS thread active at this call. Keeping
+/// this out of migratable fiber frames prevents LLVM from retaining the old
+/// thread's TLS base across a yield.
+pub noinline fn get() *Caches {
     if (local) |caches| return caches;
     const caches = std.heap.c_allocator.create(Caches) catch @panic("VM thread cache allocation failed");
     @memset(std.mem.asBytes(caches), 0);

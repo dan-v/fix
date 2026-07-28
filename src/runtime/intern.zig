@@ -57,6 +57,36 @@ comptime {
 threadlocal var thread_cache: [cache_size]CacheSlot = @splat(.{});
 threadlocal var thread_cache_token: u64 = 0;
 
+/// Cache operations stay behind non-inlined calls so each invocation forms
+/// its TLS address on the OS thread currently running a migratable fiber.
+noinline fn threadCacheLookup(table_token: u64, h: u64, s: []const u8) ?InternId {
+    if (thread_cache_token != table_token) {
+        thread_cache = @splat(.{});
+        thread_cache_token = table_token;
+    }
+    if (s.len > cache_max_len) return null;
+    const slot = &thread_cache[h % cache_size];
+    if (slot.hash != h or slot.len != s.len or
+        !std.mem.eql(u8, slot.bytes[0..s.len], s))
+    {
+        return null;
+    }
+    return slot.id;
+}
+
+noinline fn threadCacheStore(table_token: u64, h: u64, s: []const u8, id: InternId) void {
+    if (s.len > cache_max_len) return;
+    if (thread_cache_token != table_token) {
+        thread_cache = @splat(.{});
+        thread_cache_token = table_token;
+    }
+    const slot = &thread_cache[h % cache_size];
+    slot.hash = h;
+    slot.id = id;
+    slot.len = @intCast(s.len);
+    @memcpy(slot.bytes[0..s.len], s);
+}
+
 var next_table_token: std.atomic.Value(u64) = .init(1);
 
 fn hashString(s: []const u8) u64 {
@@ -150,25 +180,13 @@ pub const InternTable = struct {
     pub fn intern(self: *InternTable, s: []const u8) !InternId {
         const h = hashString(s);
 
-        if (thread_cache_token != self.token) {
-            thread_cache = @splat(.{});
-            thread_cache_token = self.token;
-        }
-
         // Thread-local direct-mapped cache. Short identifiers get
         // re-interned repeatedly from many call sites (attr names,
         // builtin args, paths); a per-thread cache short-circuits the
         // shard lock + HashMap probe + segment lookup. Inline copy of
         // the bytes keeps the comparison branch-local (one cache line
         // per slot) instead of paying a `data.slice` indirection.
-        if (s.len <= cache_max_len) {
-            const slot = &thread_cache[h % cache_size];
-            if (slot.hash == h and slot.len == s.len and
-                std.mem.eql(u8, slot.bytes[0..s.len], s))
-            {
-                return slot.id;
-            }
-        }
+        if (threadCacheLookup(self.token, h, s)) |id| return id;
 
         const shard = &self.shards[h & shard_mask];
 
@@ -179,13 +197,7 @@ pub const InternTable = struct {
         const ctx = IdContext{ .table = self };
         const gop = try shard.lookup.getOrPutContextAdapted(self.allocator, s, adapter, ctx);
         if (gop.found_existing) {
-            if (s.len <= cache_max_len) {
-                const slot = &thread_cache[h % cache_size];
-                slot.hash = h;
-                slot.id = gop.key_ptr.*;
-                slot.len = @intCast(s.len);
-                @memcpy(slot.bytes[0..s.len], s);
-            }
+            threadCacheStore(self.token, h, s, gop.key_ptr.*);
             return gop.key_ptr.*;
         }
 
@@ -206,13 +218,7 @@ pub const InternTable = struct {
         };
 
         gop.key_ptr.* = new_id;
-        if (s.len <= cache_max_len) {
-            const slot = &thread_cache[h % cache_size];
-            slot.hash = h;
-            slot.id = new_id;
-            slot.len = @intCast(s.len);
-            @memcpy(slot.bytes[0..s.len], s);
-        }
+        threadCacheStore(self.token, h, s, new_id);
         return new_id;
     }
 

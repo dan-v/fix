@@ -414,7 +414,7 @@ pub const VM = struct {
     /// because fibers migrate across workers.
     pub inline fn workerId(self: *const VM) u8 {
         _ = self;
-        return worker_id_mod.current;
+        return worker_id_mod.currentId();
     }
 
     /// Physical frames across the synchronous import-parent chain. Used only

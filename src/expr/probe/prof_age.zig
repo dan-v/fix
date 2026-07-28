@@ -131,7 +131,7 @@ fn youngAggAdd(key: u32, excl: u64) void {
 /// when disabled/off-main; pass to `ageForceEnd`.
 pub inline fn ageForceBegin(created_tsc: u64, kind_idx: u8, key: u32) u64 {
     if (!enabled) return std.math.maxInt(u64);
-    if (worker_id.current != 0) return std.math.maxInt(u64);
+    if (worker_id.currentId() != 0) return std.math.maxInt(u64);
     if (created_tsc == 0) return std.math.maxInt(u64);
     if (age_stack_len >= age_stack_cap) {
         age_drop_full += 1;

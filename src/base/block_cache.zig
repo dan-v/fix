@@ -197,7 +197,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             const self: *Self = @ptrCast(@alignCast(ctx));
             if (alignment.toByteUnits() > std.heap.page_size_min) {
                 const ptr = self.backing.rawAlloc(len, alignment, ret_addr);
-                if (ptr != null and trackable(len)) Vma.registerRegion(ptr.?, len, Vma.alloc_tag);
+                if (ptr != null and trackable(len)) Vma.registerRegion(ptr.?, len, Vma.currentAllocTag());
                 return ptr;
             }
             const class = classOf(len) orelse {
@@ -208,7 +208,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
                     if (hugetlb.map(&self.huge_policy, len)) |hp| {
                         const rounded = hugetlb.roundedLen(len);
                         if (self.hugeTrack(hp, rounded)) {
-                            if (trackable(len)) Vma.registerRegion(hp, len, Vma.alloc_tag);
+                            if (trackable(len)) Vma.registerRegion(hp, len, Vma.currentAllocTag());
                             return hp;
                         }
                         hugetlb.unmap(hp, rounded);
@@ -216,7 +216,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
                 }
                 const ptr = self.backing.rawAlloc(len, alignment, ret_addr);
                 // Outside the class range; >64 MB is still a dedicated mapping.
-                if (ptr != null and trackable(len)) Vma.registerRegion(ptr.?, len, Vma.alloc_tag);
+                if (ptr != null and trackable(len)) Vma.registerRegion(ptr.?, len, Vma.currentAllocTag());
                 return ptr;
             };
             self.mu.lock();
@@ -226,7 +226,8 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
                 self.mu.unlock();
                 _ = retained_bytes.fetchSub(classSize(class), .monotonic);
                 // Reused block: hand it the current owner's attribution tag.
-                if (Vma.alloc_tag != Vma.default_tag) Vma.retagRegion(ptr, Vma.alloc_tag);
+                const tag = Vma.currentAllocTag();
+                if (tag != Vma.default_tag) Vma.retagRegion(ptr, tag);
                 return ptr;
             }
             self.mu.unlock();
@@ -236,7 +237,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             if (classSize(class) >= huge_page_size and self.huge_policy.wanted()) {
                 if (hugetlb.map(&self.huge_policy, classSize(class))) |hp| {
                     if (self.hugeTrack(hp, classSize(class))) {
-                        Vma.registerRegion(hp, classSize(class), Vma.alloc_tag);
+                        Vma.registerRegion(hp, classSize(class), Vma.currentAllocTag());
                         return hp;
                     }
                     hugetlb.unmap(hp, classSize(class));
@@ -247,7 +248,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             // blocks back the parse/compile arenas, retained AST arenas, and
             // builtin temp buffers — one bucket for "large allocator blocks".
             // Store segments re-tag themselves on claim (stable_segments.zig).
-            if (ptr != null) Vma.registerRegion(ptr.?, classSize(class), Vma.alloc_tag);
+            if (ptr != null) Vma.registerRegion(ptr.?, classSize(class), Vma.currentAllocTag());
             return ptr;
         }
 
@@ -283,7 +284,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             _ = self;
             if (ok and (trackable(memory.len) or trackable(new_len))) {
                 Vma.unregisterRegion(memory.ptr);
-                if (trackable(new_len)) Vma.registerRegion(memory.ptr, new_len, Vma.alloc_tag);
+                if (trackable(new_len)) Vma.registerRegion(memory.ptr, new_len, Vma.currentAllocTag());
             }
             return ok;
         }
@@ -315,7 +316,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             _ = self;
             if (new_ptr != null and (trackable(memory.len) or trackable(new_len))) {
                 Vma.unregisterRegion(memory.ptr);
-                if (trackable(new_len)) Vma.registerRegion(new_ptr.?, new_len, Vma.alloc_tag);
+                if (trackable(new_len)) Vma.registerRegion(new_ptr.?, new_len, Vma.currentAllocTag());
             }
             return new_ptr;
         }

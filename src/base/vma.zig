@@ -54,9 +54,13 @@ pub fn Vma(
         /// matter (AST arenas, VM buffers, file texts) set it around their
         /// allocation phase via `setAllocTag` and restore the previous value.
         /// Blocks freed back to the cache's park list revert to `default_tag`.
-        pub threadlocal var alloc_tag: Tag = default_tag;
+        threadlocal var alloc_tag: Tag = default_tag;
 
-        pub fn setAllocTag(tag: Tag) Tag {
+        pub noinline fn currentAllocTag() Tag {
+            return alloc_tag;
+        }
+
+        pub noinline fn setAllocTag(tag: Tag) Tag {
             const prev = alloc_tag;
             alloc_tag = tag;
             return prev;
