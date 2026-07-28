@@ -77,9 +77,10 @@ that evaluation's heap remains available to inspect.
 
 ## Quick start
 
-The packaged build currently targets Linux. Nix is required to build `fix`, and
-commands that write to or realize the store require a reachable Nix daemon.
-Build it from the repository with:
+The Nix package supports Linux and aarch64 macOS. Tagged releases publish
+optimized build archives for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
+Nix is required to build `fix`, and commands that write to or realize the store
+require a reachable Nix daemon. Build it from the repository with:
 
 ```console
 $ git clone https://github.com/psyclyx/fix
@@ -448,8 +449,9 @@ without direnv.
 
 `fix` is under active development. Compatibility is a concrete target and is
 continuously tested, but this is not yet a promise that every Nix program or
-workflow is supported. Linux is the primary and currently packaged target.
-Keep Nix installed: `fix` uses the Nix daemon for store operations and builds.
+workflow is supported. Linux is the primary target; release builds also cover
+aarch64 macOS. Keep Nix installed: `fix` uses the Nix daemon for store
+operations and builds.
 
 If `fix` produces a different value, derivation, or store path from Nix for
 supported input, that is a bug.

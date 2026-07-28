@@ -1,22 +1,101 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-24.04
+  build:
+    name: Build ${{ matrix.system }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-15
+
     steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          restore-prefixes-first-match: nix-${{ matrix.system }}-
+
+      - name: Configure pinned NIX_PATH
+        run: |
+          nixpkgs="$(nix eval --raw --impure --expr '(import ./npins).nixpkgs.outPath')"
+          echo "NIX_PATH=nixpkgs=$nixpkgs" >> "$GITHUB_ENV"
+
+      - name: Build
+        timeout-minutes: 20
+        run: |
+          fix_out="$(nix-build --no-out-link -A fix)"
+          echo "FIX_NIX_OUT=$fix_out" >> "$GITHUB_ENV"
+
+      - name: Package
+        env:
+          RELEASE_SYSTEM: ${{ matrix.system }}
+        run: |
+          version="$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
+          test -n "$version"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package version $version" >&2
+            exit 1
+          fi
+          release_basename="fix-v$version-$RELEASE_SYSTEM"
+          mkdir -p "dist/$release_basename/bin"
+          cp "$FIX_NIX_OUT/bin/.fix-wrapped" "dist/$release_basename/bin/fix"
+          cp -R "$FIX_NIX_OUT/share" "dist/$release_basename/"
+          cp README.md CHANGELOG.md "dist/$release_basename/"
+          test -s "dist/$release_basename/share/bash-completion/completions/fix.bash"
+          test -s "dist/$release_basename/share/fish/vendor_completions.d/fix.fish"
+          test -s "dist/$release_basename/share/zsh/site-functions/_fix"
+          test -s "dist/$release_basename/share/fix/direnv/fix.sh"
+          tar -C dist -czf "dist/$release_basename.tar.gz" "$release_basename"
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.system }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz > SHA256SUMS
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
+          dist/*.tar.gz dist/SHA256SUMS
           --repo "$GITHUB_REPOSITORY"
           --verify-tag
           --generate-notes
