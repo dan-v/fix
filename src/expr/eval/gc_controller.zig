@@ -94,11 +94,17 @@ pub fn helpMark(ev: Context, worker_id: u8) void {
     const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
     const slot = ev.heap.gcMarkSlotGrab();
     if (slot >= marker_count) return;
+    // Capture the phase while joining the mark. Once this worker returns from
+    // drainParallel, the collector may finish the serial major sweep and reset
+    // collecting_major before this thread is scheduled again. Re-reading the
+    // flag below would then make a helper from that major enter the minor-only
+    // sweep loop and wait forever for a gate this collection never opens.
+    const collecting_major = ev.heap.collection.collecting_major;
     // Join the mark. A minor then claims young-object lists from the shared
     // sweep queue; a major leaves every peer parked while the collector runs
     // the full sweep serially.
     ev.tracer.drainParallel(ev.heap, slot);
-    if (!ev.heap.collection.collecting_major)
+    if (!collecting_major)
         heap_collector.minorSweepClaimLoop(ev.heap, ev.tracer.mark_bits);
 }
 

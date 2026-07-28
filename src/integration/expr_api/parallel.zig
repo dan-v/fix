@@ -91,6 +91,31 @@ test "parallel: automatic collector dispatches a major with 4 workers" {
     try std.testing.expectEqual(@as(i64, 42), attrs[0].value.asInt());
 }
 
+test "parallel: repeated explicit major collections release every helper" {
+    const alloc = std.testing.allocator;
+    var ev = try Engine.init(alloc, .{ .worker_count = 4 });
+    defer ev.deinit();
+    ev.configureMemory(64 << 20, null, false);
+
+    _ = try ev.evaluate("1");
+    const armed = ev.collectMajorNow();
+    try std.testing.expect(armed.ran);
+    try std.testing.expectEqual(@as(u64, 0), armed.collections);
+
+    // The REPL performs one of these between inputs. A helper must remember
+    // that it joined a major even if the collector completes its serial sweep
+    // before that helper resumes after the parallel mark.
+    for (0..32) |_| {
+        const value = try ev.evaluate("builtins.genList (n: n + 1) 32");
+        try ev.forceDeep(value);
+        try ev.gcSetExternalRoots(&.{value});
+        const collected = ev.collectMajorNow();
+        try std.testing.expectEqual(@as(u64, 1), collected.collections);
+        try std.testing.expectEqual(@as(usize, 32), try ev.tooling().listLen(value));
+    }
+    try ev.gcSetExternalRoots(&.{});
+}
+
 test "parallel: forceDeep fans wide attrset out to helpers" {
     // Constructs an attrset where every value is a thunk whose body is
     // big enough to make speculation worth it, then strict-forces the
