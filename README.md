@@ -434,6 +434,23 @@ Correctness is checked separately by `zig build test-bench-fixtures`; it is not
 part of the timing script. See [the benchmark documentation](bench/README.md)
 for the workloads and reproduction commands.
 
+### A less rigorous benchmark
+`fix` runs [nixboy](https://github.com/psyclyx/nixboy), a Game Boy emulator written in Nix.
+
+<details>
+<summary>Pokemon Red (every third frame, playback 2x speed)</summary>
+
+https://github.com/user-attachments/assets/0353b17c-f196-4dda-ba19-1329b651d9ae
+
+</details>
+
+<details>
+<summary>Bad Apple!! (every frame, playback 5x speed)</summary>
+  
+https://github.com/user-attachments/assets/3e3e44af-03dc-4c4d-89aa-e64eddf847cc
+
+</details>
+
 ## Installing through a module
 
 The repository exports modules for NixOS, nix-darwin, and Home Manager:
