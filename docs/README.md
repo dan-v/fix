@@ -27,6 +27,8 @@ thunk evaluation across a pool of worker threads.
 - [heap](runtime/heap.md) — object store + layered `//` merge
 - [interning](runtime/interning.md) — string/symbol table
 - [thunks](runtime/thunks.md) — **the laziness + concurrency primitive**
+- [concurrency verification](concurrency-testing.md) — deterministic races,
+  TLA+, TSan, and reproducible seeded stress
 
 **VM** — [`vm/`](vm/)
 - [dispatch](vm/dispatch.md) — threaded interpreter + bytecode format

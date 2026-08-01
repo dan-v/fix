@@ -316,6 +316,27 @@ pub fn build(b: *std.Build) void {
     const test_concurrency_step = b.step("test-concurrency", "Run focused concurrency protocol tests");
     test_concurrency_step.dependOn(&run_concurrency_runtime_tests.step);
     test_concurrency_step.dependOn(&run_concurrency_expr_tests.step);
+
+    const stress_mod = b.createModule(.{
+        .root_source_file = b.path("test/concurrency_stress.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = tsan,
+    });
+    stress_mod.addImport("base", base_mod);
+    stress_mod.addImport("expr", expr_mod);
+    const stress_exe = b.addExecutable(.{
+        .name = "concurrency-stress",
+        .root_module = stress_mod,
+        .use_llvm = true,
+    });
+    const run_stress = b.addSystemCommand(&.{ "timeout", "--kill-after=5s", "10m" });
+    run_stress.addArtifactArg(stress_exe);
+    run_stress.has_side_effects = true;
+    if (b.args) |args| run_stress.addArgs(args);
+    const stress_step = b.step("stress-concurrency", "Run seeded concurrency stress and semantic differentials");
+    stress_step.dependOn(&run_stress.step);
+
     const test_integration_step = b.step("test-integration", "Run integration tests");
     test_integration_step.dependOn(&run_integration_tests.step);
     const test_cli_step = b.step("test-cli", "Run CLI unit tests");

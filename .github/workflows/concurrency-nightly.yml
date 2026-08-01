@@ -1,0 +1,47 @@
+name: Concurrency stress
+
+on:
+  schedule:
+    - cron: '37 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: ${{ matrix.system }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    env:
+      STRESS_SEED: ${{ github.run_id }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: concurrency-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          restore-prefixes-first-match: concurrency-${{ matrix.system }}-
+
+      - name: Debug stress
+        timeout-minutes: 30
+        run: nix-shell --run "zig build stress-concurrency --summary all -- --seed $STRESS_SEED --iterations 20"
+
+      - name: ReleaseFast stress
+        timeout-minutes: 30
+        run: nix-shell --run "zig build stress-concurrency -Doptimize=ReleaseFast --summary all -- --seed $STRESS_SEED --iterations 100"
+
+      - name: ThreadSanitizer stress
+        if: matrix.system == 'x86_64-linux'
+        timeout-minutes: 30
+        env:
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: nix-shell --run "zig build stress-concurrency -Dtsan --summary all -- --seed $STRESS_SEED --iterations 5"
