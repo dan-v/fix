@@ -253,14 +253,14 @@ pub const VM = struct {
     /// Fiber-aware blocking capability supplied by the evaluator. Standalone
     /// VMs leave this null and execute blocking work inline.
     executor: ?FiberExecutor,
-    /// Standalone VMs own their execution context here. Evaluator fibers bind
+    /// Standalone VMs own their execution context here. Engine fibers bind
     /// `ctx` below to their stable fiber-owned context instead.
     local_ctx: ExecutionContext = .{},
     /// Fiber-scoped execution identity: claim id and demand role.
     /// Points at the owning `WorkerFiber`'s context; nested VMs created on
     /// that fiber share the pointer (see `Engine.initVm`), so they cannot
     /// diverge from their fiber's identity. Standalone test VMs (no fiber)
-    /// use `local_ctx`. Evaluator-bound VMs point at mutable fiber-owned state;
+    /// use `local_ctx`. Engine-bound VMs point at mutable fiber-owned state;
     /// only code running that fiber mutates the carrier.
     /// See `eval/workers/context.zig`.
     ctx: ?*ExecutionContext = null,
