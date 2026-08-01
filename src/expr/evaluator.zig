@@ -300,12 +300,14 @@ pub const DebugSession = struct {
 
     /// Force `v` (shallow) on the paused fiber and return the result.
     pub fn force(self: *DebugSession, v: Value) !Value {
-        return self.runAncillary(forceAncillary, .{v});
+        _ = self.retain(v);
+        return self.retain(try self.runAncillary(forceAncillary, .{v}));
     }
 
     /// Render `v` for display (forces thunks as needed), same formatting as the
     /// repl. Runs on the paused fiber's VM.
     pub fn writeValue(self: *DebugSession, writer: *std.Io.Writer, v: Value) !void {
+        _ = self.retain(v);
         return self.runAncillary(writeValueAncillary, .{ writer, v });
     }
 
@@ -325,7 +327,8 @@ pub const DebugSession = struct {
     /// members resolve as free identifiers, like the repl's bindings), reusing
     /// the paused evaluator. Returns the resulting (unforced) value.
     pub fn eval(self: *DebugSession, source: []const u8, scope: ?Value) !Value {
-        return self.runAncillary(evalAncillary, .{ source, scope });
+        if (scope) |value| _ = self.retain(value);
+        return self.retain(try self.runAncillary(evalAncillary, .{ source, scope }));
     }
 
     /// Debugger inspection is ancillary to the paused language evaluation. A
@@ -378,6 +381,11 @@ pub const DebugSession = struct {
 
     fn evalAncillary(self: *DebugSession, source: []const u8, scope: ?Value) !Value {
         return self.ev.debugEvalScoped(self.vm, source, scope);
+    }
+
+    fn retain(self: *DebugSession, value: Value) Value {
+        vm_force.rootKeepAcrossArming(self.vm, value);
+        return value;
     }
 
     /// Set a source-line breakpoint at `file:line`. Resolves to the nearest
@@ -449,6 +457,13 @@ pub const DebugSession = struct {
         if (self.ev.debugger.breakpoints) |*bp| bp.clearStep(&self.ev.registry);
     }
 
+    /// Run a full collection at the paused evaluator safepoint. Unlike the
+    /// REPL's between-input `collectMajorNow`, this keeps live evaluator caches
+    /// and scans the paused VM, including this session's retained UI values.
+    pub fn collectGarbage(self: *DebugSession) Engine.CollectNowResult {
+        return self.ev.collectMajorAtSafepoint(self.vm.workerId());
+    }
+
     /// Build a one-entry scope attrset binding `name` to `self.value` — handy
     /// for the console to expose the break value as an identifier.
     pub fn bindValueScope(self: *DebugSession, name: []const u8) !Value {
@@ -456,7 +471,7 @@ pub const DebugSession = struct {
             .name = try self.ev.intern.intern(name),
             .value = self.value,
         }};
-        return Value.attrs(try self.ev.heap.addAttrs(&entries));
+        return self.retain(Value.attrs(try self.ev.heap.addAttrs(&entries)));
     }
 
     /// The lexical scope at the pause: an ambient attrset of the current frame's
@@ -466,7 +481,7 @@ pub const DebugSession = struct {
     /// recorded names (`--debugger` turns capture on); with no frame or no names
     /// it degrades to just `it`.
     pub fn scopeAttrs(self: *DebugSession) !Value {
-        return debug_session.scopeAttrs(debugContext(self));
+        return self.retain(try debug_session.scopeAttrs(debugContext(self)));
     }
 };
 
@@ -1502,6 +1517,12 @@ pub const Engine = struct {
         // must not recurse into a nested debugger.
         const ui = self.debugger.beginSession() orelse return;
         defer self.debugger.endSession();
+        const root_scope = vm_force.rootsBegin(vm);
+        defer vm_force.rootsEnd(vm, root_scope);
+        // The debugger UI owns every value it receives until this synchronous
+        // pause ends. Register the initial subject even if collection has not
+        // armed yet; DebugSession retains any additional values it returns.
+        vm_force.rootKeepAcrossArming(vm, value);
         var session: DebugSession = .{ .ev = self, .vm = vm, .value = value, .reason = reason };
         try ui.run(ui.ctx, &session);
     }
@@ -2518,6 +2539,24 @@ pub const Engine = struct {
         self.heap.token = runtime.heap.next_heap_token.fetchAdd(1, .monotonic);
         gc_controller.collectMajor(gcContext(self), 0);
         self.execution.scheduler.gcEndCollection(0);
+        self.finishCollectNow(&result, before);
+        return result;
+    }
+
+    /// Full collection while the calling evaluator worker is already stopped
+    /// in native code (currently the debugger UI). The caller remains a live
+    /// evaluation root, so do not pre-invalidate token-keyed caches as the
+    /// between-input collector does; `collectMajor` scans them and advances the
+    /// token after sweeping through the ordinary in-evaluation path.
+    fn collectMajorAtSafepoint(self: *Engine, collector_id: u8) CollectNowResult {
+        var result = self.collectNowResult();
+        if (self.execution.main_worker == null) return result;
+        if (self.heap.collection.threshold_bytes == std.math.maxInt(u64)) return result;
+        if (!self.execution.scheduler.gcTryBeginCollection()) return result;
+        const before = gc.liveReport(&self.heap.collection.report);
+        self.execution.scheduler.gcWaitAllParked(collector_id);
+        gc_controller.collectMajor(gcContext(self), collector_id);
+        self.execution.scheduler.gcEndCollection(collector_id);
         self.finishCollectNow(&result, before);
         return result;
     }

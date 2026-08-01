@@ -170,6 +170,19 @@ pub inline fn rootKeep(self: *VM, v: Value) void {
     self.gc_roots.temporary.append(self.allocator, v) catch @panic("gc temp root oom");
 }
 
+/// Retain a value owned by native code across a boundary that may outlive the
+/// collector's dormant phase. Debugger sessions use this for values handed to
+/// the UI: they can be produced before root tracking arms, then survive across
+/// later console evaluations that do arm and run a collection.
+pub inline fn rootKeepAcrossArming(self: *VM, v: Value) void {
+    // A debugger may render or pass the same value through several facade
+    // methods. Keep the session root set bounded by distinct Value handles.
+    for (self.gc_roots.temporary.items) |root| {
+        if (root.bits == v.bits) return;
+    }
+    self.gc_roots.temporary.append(self.allocator, v) catch @panic("gc persistent temp root oom");
+}
+
 pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
     return forceThunkImpl(self, thunk_val, true);
 }

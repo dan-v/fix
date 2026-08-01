@@ -239,6 +239,59 @@ test "caught debugger eval failure does not mask a later language error" {
     try std.testing.expectEqualStrings("visible program failure", ev.getTrace().message.?);
 }
 
+test "debugger retains evaluated heap values for the lifetime of the pause" {
+    // Keep peer workers present so the in-pause collector must complete the
+    // same stop-the-world barrier used by a parallel embedding.
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 4 });
+    defer ev.deinit();
+    ev.configureMemory(64 << 20, null, false);
+
+    const Ctl = struct {
+        ran: bool = false,
+        retained: bool = false,
+        collections: u64 = 0,
+        rendered: [128]u8 = undefined,
+        rendered_len: usize = 0,
+
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.reason != .break_builtin or self.ran) return;
+            self.ran = true;
+
+            const value = try s.eval("{ retained = 42; }", null);
+            for (s.vm.gc_roots.temporary.items) |root| {
+                if (root.bits == value.bits) self.retained = true;
+            }
+
+            // The first explicit request arms lazy tracking; the second runs a
+            // full collection while the demand fiber is paused in the UI.
+            // The value's producing VM is already gone, so only the session
+            // root keeps it alive.
+            _ = s.collectGarbage();
+            self.collections = s.collectGarbage().collections;
+            // Encourage the allocator to reuse anything the collection swept;
+            // rendering `value` must still refer to the original object.
+            _ = try s.eval("{ replacement = 99; }", null);
+            var writer: std.Io.Writer = .fixed(&self.rendered);
+            try s.writeValue(&writer, value);
+            self.rendered_len = writer.end;
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    const result = try ev.evaluate(
+        \\builtins.seq
+        \\  (builtins.break null)
+        \\  17
+    );
+    try std.testing.expect(ctl.ran);
+    try std.testing.expect(ctl.retained);
+    try std.testing.expect(ctl.collections > 0);
+    try std.testing.expectEqualStrings("{ retained = 42; }", ctl.rendered[0..ctl.rendered_len]);
+    try std.testing.expectEqual(@as(i64, 17), result.asInt());
+}
+
 test "caught debugger eval failure at error entry preserves the original failure" {
     var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
