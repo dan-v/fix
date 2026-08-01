@@ -138,7 +138,11 @@ pub const WorkerFiber = struct {
     /// while error and suspend paths may abandon allocations. Bounded capacity
     /// is retained when the fiber returns to the free list.
     scratch: arena_mod.ArenaAllocator,
-    state: FiberState,
+    /// Owner-visible lifecycle. Fibers may run and finish on a stealing
+    /// worker while their allocator worker is polling for quiescence, so this
+    /// publication must be atomic; queue wakeups are only advisory and are
+    /// not a substitute for synchronizing these observations.
+    state: std.atomic.Value(u8),
     /// Set to 1 while some worker is inside `inner.resume_()` on this
     /// fiber. The owning worker's `deinit` spin-waits on this to drop
     /// to 0 before freeing — protects against a stolen fiber being
@@ -212,9 +216,31 @@ pub const WorkerFiber = struct {
 
     fn yieldImpl(context: *anyopaque) void {
         const self: *WorkerFiber = @ptrCast(@alignCast(context));
-        self.state = .suspended;
+        self.suspendFiber();
+    }
+
+    pub fn lifecycle(self: *const WorkerFiber) FiberState {
+        return @enumFromInt(self.state.load(.acquire));
+    }
+
+    fn setLifecycle(self: *WorkerFiber, state: FiberState) void {
+        self.state.store(@intFromEnum(state), .release);
+    }
+
+    /// The one stack-switching suspension seam for worker fibers. Keeping the
+    /// lifecycle stores here makes every waiter adapter publish the same
+    /// suspended/running protocol around the native fiber yield.
+    pub fn suspendFiber(self: *WorkerFiber) void {
+        self.setLifecycle(.suspended);
         fiber_mod.Fiber.yield();
-        self.state = .running;
+        self.setLifecycle(.running);
+    }
+
+    /// Enroll the fiber's single embedded waiter and suspend if enrollment
+    /// won the resolver race. A false enrollment means the future already
+    /// left `.evaluating`; the caller continues without yielding.
+    pub fn parkOn(self: *WorkerFiber, future: *future_mod.Future) void {
+        if (future.enrollWaiter(&self.waiter)) self.suspendFiber();
     }
 
     /// Sweep the per-fiber scratch arena when the fiber goes back on the
@@ -425,16 +451,16 @@ pub const Worker = struct {
             self.census.tasks += 1;
             prof.fiberLiveInc();
         }
-        top.state = .running;
+        top.setLifecycle(.running);
         self.runFiber(top);
 
-        while (top.state != .free or self.anyFiberSuspended()) {
+        while (top.lifecycle() != .free or self.anyFiberSuspended()) {
             self.gcSafepoint();
             // The demanded result is ready; stop pulling new background
             // tasks and just drain the in-flight suspended fibers. Without
             // this, dead speculation in the backlog keeps running and
             // extends wall time past the answer.
-            if (top.state == .free) self.scheduler.setSuppressBackground(true);
+            if (top.lifecycle() == .free) self.scheduler.setSuppressBackground(true);
             if (try self.drainStep()) continue;
             self.parkAndAccount();
         }
@@ -483,7 +509,7 @@ pub const Worker = struct {
                 self.census.tasks += 1;
                 prof.fiberLiveInc();
             }
-            top.state = .running;
+            top.setLifecycle(.running);
         }
 
         // Publish only after every entry owns a fiber, so a very small first
@@ -553,7 +579,7 @@ pub const Worker = struct {
                 self.census.tasks += 1;
                 prof.fiberLiveInc();
             }
-            f.state = .running;
+            f.setLifecycle(.running);
             self.runFiber(f);
             return true;
         }
@@ -719,7 +745,7 @@ pub const Worker = struct {
                     }
                     prof.fiberLiveDec();
                 }
-                f.state = .free;
+                f.setLifecycle(.free);
                 f.recycleScratch();
                 f.worker.pushFree(f);
                 if (top_completion) |counter| _ = counter.fetchAdd(1, .release);
@@ -883,7 +909,7 @@ pub const Worker = struct {
             // demand-role fields start (and recycle back to) cleared.
             .ctx = .{ .claimer_id = future_mod.makeClaimer(fiber_id) },
             .scratch = arena_mod.ArenaAllocator.init(self.allocator),
-            .state = .free,
+            .state = .init(@intFromEnum(FiberState.free)),
             .in_runfiber = .init(0),
             .run_mu = .{},
             .current_task = null,
@@ -960,7 +986,7 @@ pub const Worker = struct {
 
     fn countSuspended(self: *Worker) usize {
         var c: usize = 0;
-        for (self.fibers.items) |f| if (f.state == .suspended) {
+        for (self.fibers.items) |f| if (f.lifecycle() == .suspended) {
             c += 1;
         };
         return c;
@@ -968,7 +994,7 @@ pub const Worker = struct {
 
     fn anyFiberSuspended(self: *Worker) bool {
         for (self.fibers.items) |f| {
-            if (f.state == .suspended) return true;
+            if (f.lifecycle() == .suspended) return true;
         }
         return false;
     }

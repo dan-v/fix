@@ -2610,11 +2610,7 @@ pub const Engine = struct {
                     const inner = fiber_mod.currentFiber() orelse
                         @panic("import entry became busy outside an evaluator fiber");
                     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-                    if (entry.future.enrollWaiter(&wf.waiter)) {
-                        wf.state = .suspended;
-                        fiber_mod.Fiber.yield();
-                        wf.state = .running;
-                    }
+                    wf.parkOn(&entry.future);
                     continue;
                 },
                 .claimed => {

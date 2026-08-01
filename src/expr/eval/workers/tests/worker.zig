@@ -69,7 +69,7 @@ test "Worker basic init/deinit" {
     try testing.expect(sched.popReady(1) == null);
     for (worker.fibers.items) |fiber| {
         try testing.expectEqual(runtime.future.makeClaimer(fiber.fiber_id), fiber.ctx.claimer_id);
-        try testing.expectEqual(worker_mod.FiberState.free, fiber.state);
+        try testing.expectEqual(worker_mod.FiberState.free, fiber.lifecycle());
     }
     for (worker.fibers.items, 0..) |fiber, i| {
         for (worker.fibers.items[i + 1 ..]) |other| {

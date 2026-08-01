@@ -383,6 +383,10 @@ pub const Scheduler = struct {
         suppress_background: std.atomic.Value(bool) = .init(false),
         /// Temporarily serialize evaluation while the debugger is active.
         debug_serial: std.atomic.Value(bool) = .init(false),
+        /// Blocking/daemon callbacks that still hold pointers into a parked
+        /// fiber stack. Helper quiescence includes this count so no worker can
+        /// unmap a suspended stack before its completion callback returns.
+        external_jobs: std.atomic.Value(u32) = .init(0),
     };
 
     const Metrics = struct {
@@ -773,6 +777,19 @@ pub const Scheduler = struct {
         if (helpers == 0) return;
         _ = self.controls.stopped_helpers.fetchAdd(1, .acq_rel);
         while (self.controls.stopped_helpers.load(.acquire) < helpers) std.atomic.spinLoopHint();
+        // Once every helper crossed the barrier, nobody can submit another
+        // fiber-scoped external job. Wait for callbacks already holding stack
+        // cells/Future pointers to publish and return before Worker.deinit.
+        while (self.controls.external_jobs.load(.acquire) != 0) std.atomic.spinLoopHint();
+    }
+
+    pub fn externalJobBegin(self: *Scheduler) void {
+        _ = self.controls.external_jobs.fetchAdd(1, .acq_rel);
+    }
+
+    pub fn externalJobEnd(self: *Scheduler) void {
+        const previous = self.controls.external_jobs.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
     }
 
     /// Signal helpers to exit and wait for them. Idempotent.

@@ -13,7 +13,10 @@
 //! orderings here are load-bearing.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sync = @import("base").sync;
+
+const protocol_checks = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
 
 /// `state` is a u32 so it's the right shape for futex-style ops if we
 /// ever need them. The low byte encodes the lifecycle (`FutureState`);
@@ -54,6 +57,10 @@ pub fn makeClaimer(fiber_id: u32) ClaimerId {
 pub const Waiter = struct {
     next: ?*Waiter = null,
     wake_fn: *const fn (*Waiter) void,
+    /// Debug/safe-build ownership bit for the embedding contract: one waiter
+    /// node may be enrolled on at most one Future at a time. Release-fast
+    /// builds keep the original zero-overhead representation.
+    enrolled: if (protocol_checks) std.atomic.Value(u8) else void = if (protocol_checks) .init(0) else {},
 };
 
 /// Bare outcome of a claim attempt — no payload. The embedder
@@ -240,6 +247,10 @@ pub const Future = struct {
         defer self.waiters_mu.unlock();
         const s: FutureState = @enumFromInt(self.state.load(.acquire));
         if (s != .evaluating) return false;
+        if (comptime protocol_checks) {
+            if (waiter.enrolled.swap(1, .acq_rel) != 0)
+                @panic("Future waiter enrolled more than once");
+        }
         waiter.next = self.waiters_head;
         self.waiters_head = waiter;
         return true;
@@ -294,6 +305,10 @@ pub const Future = struct {
         while (head) |w| {
             const next = w.next;
             w.next = null;
+            if (comptime protocol_checks) {
+                if (w.enrolled.swap(0, .acq_rel) != 1)
+                    @panic("Future drained a waiter that was not enrolled");
+            }
             w.wake_fn(w);
             head = next;
         }

@@ -131,6 +131,34 @@ test "concurrency: wake before park is never lost across repeated handoffs" {
     parker.join();
 }
 
+test "concurrency: helper teardown waits for external completion callbacks" {
+    var scheduler = try Scheduler.init(std.testing.allocator, 3);
+    defer scheduler.deinit();
+    var arrived: std.atomic.Value(u32) = .init(0);
+    var returned: std.atomic.Value(u32) = .init(0);
+
+    const Helper = struct {
+        fn run(s: *Scheduler, at_barrier: *std.atomic.Value(u32), done: *std.atomic.Value(u32)) void {
+            _ = at_barrier.fetchAdd(1, .acq_rel);
+            s.awaitHelpersQuiescent();
+            _ = done.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    scheduler.externalJobBegin();
+    var helper1 = try std.Thread.spawn(.{}, Helper.run, .{ &scheduler, &arrived, &returned });
+    var helper2 = try std.Thread.spawn(.{}, Helper.run, .{ &scheduler, &arrived, &returned });
+    try waitFor(&arrived, 2);
+    var probes: usize = 0;
+    while (probes < 10_000) : (probes += 1) std.Thread.yield() catch {};
+    try std.testing.expectEqual(@as(u32, 0), returned.load(.acquire));
+
+    scheduler.externalJobEnd();
+    try waitFor(&returned, 2);
+    helper1.join();
+    helper2.join();
+}
+
 test "concurrency: back-to-back GC generations wait for every peer release" {
     const worker_count = 3;
     const cycles = 100;
