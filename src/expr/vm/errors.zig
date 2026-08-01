@@ -5,52 +5,155 @@ const std = @import("std");
 const vm_mod = @import("context.zig");
 const chunk = @import("../bytecode.zig").chunk;
 const diagnostic = @import("syntax").diagnostic;
+const failure_mod = @import("runtime").failure;
+const ErrorTrace = @import("../observ.zig").trace.Trace;
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
+const FailureFrame = failure_mod.FailureFrame;
+const FailureRef = failure_mod.FailureRef;
 
 pub fn captureErrorTrace(self: *VM, err: anyerror) !void {
-    const trace = self.trace orelse return;
-    try trace.setMessageIfAbsent(defaultErrorMessage(err));
-    if (trace.captured_stack) return;
-    // Speculative thunk forces point vm.trace at a per-fiber scratch
-    // trace whose only consumer is publishThunkFailure (which dupes
-    // the message). Walking the frame stack to push N diagnostic
-    // frames here is pure waste — skip it for those traces.
-    if (trace.frames_disabled) {
-        trace.markCapturedStack();
-        return;
+    const ctx = self.executionContext();
+    const propagating = ctx.pending() != null;
+    if (!propagating) {
+        const message = if (self.trace) |trace|
+            trace.message orelse defaultErrorMessage(err)
+        else
+            defaultErrorMessage(err);
+        const frame_count: usize = self.debugFrameDepth();
+        const allocated: ?[]FailureFrame = self.allocator.alloc(FailureFrame, frame_count) catch null;
+        defer if (allocated) |frames| self.allocator.free(frames);
+        const captured: []FailureFrame = allocated orelse @constCast(&[_]FailureFrame{});
+        var len: usize = 0;
+        var cursor: ?*const VM = self;
+        while (cursor) |vm| : (cursor = vm.debug.parent) {
+            var i: usize = vm.frames_len;
+            while (i > 0 and len < captured.len) {
+                i -= 1;
+                const frame = vm.frames[i];
+                captured[len] = .{ .chunk_id = frame.chunk_id, .ip = @intCast(frame.ip) };
+                len += 1;
+            }
+        }
+        ctx.capture(self.heap.failures.captureOrigin(err, message, captured[0..len]));
     }
 
-    var previous: ?chunk.Chunk.SourceSpan = null;
-    var i: usize = self.frames_len;
+    // A speculative observer of an already-frozen failure carries identity
+    // only. The genuine demander later supplies its own continuation.
+    if (propagating and self.speculation.active) return;
+
+    const trace = self.trace orelse return;
+    if (trace.captured_stack) return;
+    try renderFailureTrace(self, ctx.pending().?, trace, false);
+}
+
+/// Materialize a cached failure at a genuine-demand boundary. The immutable
+/// record owns the helper's origin; the currently running demand VM contributes
+/// the continuation that did not exist on the speculative fiber.
+pub fn captureDemandErrorTrace(self: *VM, err: anyerror) !void {
+    const ctx = self.executionContext();
+    if (ctx.pending() == null) return captureErrorTrace(self, err);
+    const trace = self.trace orelse return;
+    if (trace.captured_stack) return;
+    try renderFailureTrace(self, ctx.pending().?, trace, true);
+}
+
+/// Resolve a frozen compact failure into the caller's trace. The immutable
+/// origin remains authoritative; genuine demand may append its live
+/// continuation without changing the record.
+fn renderFailureTrace(self: *VM, failure: FailureRef, trace: *ErrorTrace, demand_continuation: bool) !void {
+    var contexts: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer contexts.deinit(self.allocator);
+    var origin: ?failure_mod.FailureRecord.Origin = null;
+    var current = failure;
+    while (current.record()) |record| switch (record.*) {
+        .context => |context| {
+            try contexts.append(self.allocator, context.message);
+            current = context.cause;
+        },
+        .origin => |captured_origin| {
+            origin = captured_origin;
+            break;
+        },
+    };
+
+    if (origin) |captured_origin| {
+        try trace.setMessageIfAbsent(captured_origin.message);
+        if (!trace.frames_disabled) {
+            const boundary = try renderOriginFrames(self, trace, captured_origin.frames);
+            if (demand_continuation) try renderDemandContinuation(self, trace, boundary);
+        }
+    } else {
+        try trace.setMessageIfAbsent(defaultErrorMessage(current.err()));
+        if (demand_continuation and !trace.frames_disabled)
+            try renderDemandContinuation(self, trace, null);
+    }
+    // Context records are traversed outer-to-inner, while Nix trace order is
+    // origin frames followed by cause-first contexts.
+    var i = contexts.items.len;
     while (i > 0) {
         i -= 1;
-        const frame = self.frames[i];
-        const span = sourceSpanForFrame(frame) orelse continue;
-        if (previous) |prev| {
-            if (sameSourceSpan(prev, span)) continue;
-        }
-        previous = span;
-        // Attribute the frame to its qualified name when we have one, so the
-        // trace reads `while evaluating 'pkgs.hello'` — always available now
-        // via the name tree, no flag. Falls back to the bare note otherwise.
-        var name_buf: [512]u8 = undefined;
-        const message = frameMessage(self, frame.chunk_id, &name_buf);
-        const diag_frame = diagnostic.Diagnostic{
-            .severity = .note,
-            .kind = .compile,
-            .line = span.line,
-            .column = span.column,
-            .offset = span.offset,
-            .len = span.len,
-            .token_type = null,
-            .message = message,
-        };
-        const source_path = if (span.file) |file| self.intern.get(file) else null;
-        try trace.pushDiagnosticFrame(source_path, diag_frame);
+        try trace.pushContext(contexts.items[i]);
     }
     trace.markCapturedStack();
+}
+
+fn renderOriginFrames(self: *VM, trace: *ErrorTrace, frames: []const FailureFrame) !?chunk.Chunk.SourceSpan {
+    var previous: ?chunk.Chunk.SourceSpan = null;
+    for (frames) |failure_frame| {
+        const chunk_ptr = self.registry.get(failure_frame.chunk_id) orelse continue;
+        const span = sourceSpanForChunk(chunk_ptr, failure_frame.ip) orelse continue;
+        if (previous) |prev| if (sameSourceSpan(prev, span)) continue;
+        previous = span;
+        try pushEvaluationFrame(self, trace, failure_frame.chunk_id, span);
+    }
+    return previous;
+}
+
+/// Append the live demander stack after a frozen helper origin. Only adjacent
+/// boundary spans are collapsed; repeated frames elsewhere remain meaningful.
+fn renderDemandContinuation(
+    self: *VM,
+    trace: *ErrorTrace,
+    origin_boundary: ?chunk.Chunk.SourceSpan,
+) !void {
+    var previous = origin_boundary;
+    var cursor: ?*const VM = self;
+    while (cursor) |vm| : (cursor = vm.debug.parent) {
+        var i: usize = vm.frames_len;
+        while (i > 0) {
+            i -= 1;
+            const frame = vm.frames[i];
+            const span = sourceSpanForFrame(frame) orelse continue;
+            if (previous) |prev| if (sameSourceSpan(prev, span)) continue;
+            previous = span;
+            try pushEvaluationFrame(self, trace, frame.chunk_id, span);
+        }
+    }
+}
+
+fn pushEvaluationFrame(
+    self: *VM,
+    trace: *ErrorTrace,
+    chunk_id: @import("runtime").types.ChunkId,
+    span: chunk.Chunk.SourceSpan,
+) !void {
+    // Attribute the frame to its qualified name when available.
+    var name_buf: [512]u8 = undefined;
+    const message = frameMessage(self, chunk_id, &name_buf);
+    const diag_frame = diagnostic.Diagnostic{
+        .severity = .note,
+        .kind = .compile,
+        .line = span.line,
+        .column = span.column,
+        .offset = span.offset,
+        .len = span.len,
+        .token_type = null,
+        .message = message,
+    };
+    const source_path = if (span.file) |file| self.intern.get(file) else null;
+    try trace.pushDiagnosticFrame(source_path, diag_frame);
 }
 
 /// The `while evaluating [<name>]` note for a frame, rendering the chunk's

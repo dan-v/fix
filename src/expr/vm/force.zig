@@ -453,7 +453,7 @@ pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const heap_m
 /// pre-forces; a helper that loses the race sees `.already_resolved`.
 pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const Value) void {
     if (comptime prof.enabled) {
-        if (self.ctx.is_demand and self.workerId() == 0)
+        if (self.executionContextConst().is_demand and self.workerId() == 0)
             prof_census.recordStrictWalk(&prof_census.list_walks, items.len, fan_out_min_items);
     }
     // Solo: no helper can ever drain the fan-out; every submit would be
@@ -468,7 +468,7 @@ pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const V
 /// to idle workers.
 pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []const heap_mod.AttrEntry) void {
     if (comptime prof.enabled) {
-        if (self.ctx.is_demand and self.workerId() == 0)
+        if (self.executionContextConst().is_demand and self.workerId() == 0)
             prof_census.recordStrictWalk(&prof_census.attrs_walks, entries.len, fan_out_min_items);
     }
     if (self.solo) return; // see forceListAccelerate
@@ -602,9 +602,9 @@ pub fn diagNowUs() u64 {
 /// this is a single predictable branch on the claim path at w>1.
 inline fn tryForceDispatch(self: *VM, thunk: *Thunk) thunk_mod.ForceOutcome {
     return if (self.solo)
-        thunk.tryForceSolo(self.ctx.claimer_id)
+        thunk.tryForceSolo(self.executionContextConst().claimer_id)
     else
-        thunk.tryForce(self.ctx.claimer_id);
+        thunk.tryForce(self.executionContextConst().claimer_id);
 }
 
 /// Resolve dispatch, symmetric with `tryForceDispatch` (the solo publish
@@ -634,10 +634,12 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 recordBlackhole(self, thunk_id);
                 return error.RecursiveThunk;
             },
-            .errored => |info| {
+            .errored => |failure| {
                 try observeEffectGroup(self, thunk.effect_group, real_demand);
-                replayCachedMessage(self, info.*.message);
-                return info.*.err;
+                self.executionContext().install(failure);
+                if (real_demand)
+                    vm_errors.captureDemandErrorTrace(self, failure.err()) catch {};
+                return failure.err();
             },
             .claimed => return forceClaimedThunk(self, thunk, thunk_id, real_demand),
             .busy => {
@@ -692,10 +694,11 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     }
 
     // Checked at the recursion point so resolved/busy/memo paths stay lean.
-    if (@frameAddress() < self.ctx.stack_limit) return vm_trace.stackOverflow(self);
+    if (@frameAddress() < self.executionContextConst().stack_limit) return vm_trace.stackOverflow(self);
     const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {
         if (self.speculation.active and !isTransientThunkError(err)) {
             attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |effect_err| {
+                self.executionContext().clearFailure();
                 publishThunkFailure(self, thunk, thunk_id, effect_err);
                 trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
                 return effect_err;
@@ -800,7 +803,7 @@ fn waitForBusyThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, demand: 
     var wait_start: u64 = 0;
     var speculative_owner = false;
     if (comptime prof.enabled) {
-        if (demand and self.workerId() == 0 and self.ctx.is_demand) {
+        if (demand and self.workerId() == 0 and self.executionContextConst().is_demand) {
             speculative_owner = !thunk.isDemanded();
             prof_census.disc.busy_wait += 1;
             if (speculative_owner) prof_census.disc.busy_spec_owned += 1;
@@ -820,7 +823,7 @@ fn waitForBusyThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, demand: 
 
     // Demand priority propagates through chains of speculatively owned thunks.
     if (self.scheduler.config.spec_rescue and
-        (self.ctx.is_demand or self.speculation.demand_rescue.load(.monotonic) != 0) and
+        (self.executionContextConst().is_demand or self.speculation.demand_rescue.load(.monotonic) != 0) and
         !thunk.isDemanded())
     {
         thunk.markDemanded();
@@ -832,12 +835,12 @@ fn waitForBusyThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, demand: 
         std.atomic.spinLoopHint();
     if (!thunk.isEvaluating()) return;
 
-    const park = self.ctx.park orelse
+    const park = self.executionContextConst().park orelse
         @panic("forceThunkImpl hit .busy outside a worker fiber");
     if (!thunk.enrollWaiter(park.waiter)) return;
 
     var label_buf: [128]u8 = undefined;
-    var wait_span = if (self.ctx.is_demand and self.observer.profiling())
+    var wait_span = if (self.executionContextConst().is_demand and self.observer.profiling())
         self.observer.beginOn(
             &critical_wait_observation,
             .{ .subject = force_label.critWaitLabel(self, thunk_id, &label_buf) },
@@ -995,7 +998,7 @@ pub fn makeCell(self: *VM, val: Value) !Value {
 /// installs `pass_through(val)`, transitions back to `.unresolved`,
 /// and wakes parked waiters.
 pub fn makeBindingCell(self: *VM) !Value {
-    const id = try self.heap.addThunk(Thunk.initBindingCell(self.ctx.claimer_id));
+    const id = try self.heap.addThunk(Thunk.initBindingCell(self.executionContextConst().claimer_id));
     recordCreatePassThrough(self, id);
     return Value.thunk(id);
 }
@@ -1012,7 +1015,7 @@ fn claimerFiberId(self: *VM) u32 {
     // claimer_id = (worker_id << 24) | fiber_id_24bits — strip the worker
     // byte to get the local fiber id, which is the more useful field at
     // log-read time.
-    return self.ctx.claimer_id & 0x00FFFFFF;
+    return self.executionContextConst().claimer_id & 0x00FFFFFF;
 }
 
 // ---- thunk-trace recording helpers ----
@@ -1093,61 +1096,20 @@ fn isTransientThunkError(err: anyerror) bool {
 
 fn publishThunkFailure(self: *VM, thunk: *thunk_mod.Thunk, thunk_id: ObjectId, err: anyerror) void {
     if (isTransientThunkError(err)) {
+        const ctx = self.executionContext();
+        if (ctx.pending()) |failure| if (failure.err() != err) ctx.clearFailure();
         recordReset(self, thunk_id, err);
         thunk.reset();
         return;
     }
-    // Move the trace message onto the thunk's sidecar. For local
-    // (speculative) traces we can transfer ownership directly — same
-    // allocator backs both. For the user-facing shared trace we dupe
-    // so subsequent renderers can still read the message.
-    var owned_message: ?[]const u8 = null;
-    if (self.trace) |trace| {
-        if (trace.message) |msg| {
-            if (trace.frames_disabled) {
-                owned_message = msg;
-                trace.message = null;
-            } else {
-                owned_message = self.heap.allocator.dupe(u8, msg) catch null;
-            }
-        }
-    }
-    recordErrored(self, thunk_id, err, owned_message);
-    publishErrored(self, thunk, err, owned_message);
-}
-
-/// Allocate the sidecar `ErrorInfo`, register it with the heap so
-/// `ObjectHeap.deinit` can free it in O(errored_thunks), then transition
-/// the thunk into `.errored`. Falls back to `reset()` on any allocation
-/// failure so the next force can retry under better conditions.
-fn publishErrored(self: *VM, thunk: *thunk_mod.Thunk, err: anyerror, owned_message: ?[]const u8) void {
-    const info = self.heap.allocator.create(thunk_mod.ErrorInfo) catch {
-        if (owned_message) |m| self.heap.allocator.free(m);
-        thunk.reset();
-        return;
-    };
-    info.* = .{ .err = err, .message = owned_message };
-    self.heap.trackErroredInfo(info) catch {
-        // Tracker grew via the heap allocator and failed; the info
-        // would leak if we left it dangling. Tear it down and reset.
-        if (owned_message) |m| self.heap.allocator.free(m);
-        self.heap.allocator.destroy(info);
-        thunk.reset();
-        return;
-    };
+    const ctx = self.executionContext();
+    if (ctx.pending() == null) vm_errors.captureErrorTrace(self, err) catch {};
+    const failure = ctx.pending() orelse
+        @import("runtime").failure.FailureRef.degraded(err);
+    recordErrored(self, thunk_id, err, if (self.trace) |trace| trace.message else null);
     // All fallible sticky-error setup has succeeded and the evaluating frame
     // has unwound. Release spilled captures immediately before overwriting the
     // target arm. Transient/reset paths above deliberately retain them.
     self.heap.gcReleaseThunkSpill(thunk);
-    thunk.markErrored(info);
-}
-
-/// When a force observes a cached error, replay its message onto the
-/// caller's trace so `captureErrorTrace` doesn't fall back to the generic
-/// default. `setMessageIfAbsent` so an outer caller that's already
-/// captured context wins.
-fn replayCachedMessage(self: *VM, message: ?[]const u8) void {
-    const trace = self.trace orelse return;
-    const msg = message orelse return;
-    trace.setMessageIfAbsent(msg) catch {};
+    thunk.markErrored(failure);
 }

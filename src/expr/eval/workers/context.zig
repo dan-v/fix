@@ -17,8 +17,8 @@
 //!     state.
 
 const std = @import("std");
-const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
+const FailureRef = @import("runtime").failure.FailureRef;
 const ErrorTrace = @import("../../observ.zig").trace.Trace;
 
 /// Native-stack headroom reserved below `stack_limit`: the guard trips this
@@ -54,6 +54,13 @@ pub const ExecutionContext = struct {
     /// Per-input error trace installed while a parallel demand fiber runs.
     /// Nested import VMs inherit it through this structural fiber context.
     error_trace: ?*ErrorTrace = null,
+    /// The exception currently propagating through this fiber. Nested VMs
+    /// borrow the same context, so imports and resumed/migrated execution
+    /// cannot lose or replace its diagnostic identity accidentally.
+    pending_failure: ?FailureRef = null,
+    /// `tryEval` catch depth is fiber state: a nested import VM must still
+    /// suppress debugger entry for an exception its caller intends to catch.
+    tryeval_depth: u32 = 0,
     /// Head of the in-progress `builtins.scopedImport` path chain. Unlike an
     /// OS-thread-local, this travels with the fiber when work stealing resumes
     /// it on another worker. Frames themselves live on the suspended fiber's
@@ -63,9 +70,38 @@ pub const ExecutionContext = struct {
     /// importing the concrete WorkerFiber representation.
     park: ?ParkHandle = null,
 
-    /// Neutral identity for VMs not bound to any fiber (standalone test
-    /// VMs, tools). Static and immutable — never dressed.
-    pub const default_instance: ExecutionContext = .{};
+    /// Publish a newly captured origin only when no exception is already
+    /// unwinding. Ancestor catches therefore preserve the original identity.
+    pub fn capture(self: *ExecutionContext, failure: FailureRef) void {
+        if (self.pending_failure == null) self.pending_failure = failure;
+    }
+
+    /// Install a borrowed cached failure at an observation boundary. Existing
+    /// propagation wins so an ancestor cannot replace the original cause.
+    pub fn install(self: *ExecutionContext, failure: FailureRef) void {
+        if (self.pending_failure == null) self.pending_failure = failure;
+    }
+
+    pub fn pending(self: *const ExecutionContext) ?FailureRef {
+        return self.pending_failure;
+    }
+
+    /// Temporarily remove the propagating exception while a catch performs
+    /// fallible work of its own (notably `addErrorContext`'s message coercion).
+    pub fn take(self: *ExecutionContext) ?FailureRef {
+        const failure = self.pending_failure;
+        self.pending_failure = null;
+        return failure;
+    }
+
+    pub fn restore(self: *ExecutionContext, failure: FailureRef) void {
+        std.debug.assert(self.pending_failure == null);
+        self.pending_failure = failure;
+    }
+
+    pub fn clearFailure(self: *ExecutionContext) void {
+        self.pending_failure = null;
+    }
 
     /// Clear the demand-role fields when the fiber recycles onto the free
     /// list (a reused fiber must not mislabel its next task as demand).
@@ -74,7 +110,9 @@ pub const ExecutionContext = struct {
         // A scoped-import frame is stack-scoped and must have unwound before
         // the fiber can finish and return to the recycle list.
         std.debug.assert(self.scoped_import_top == null);
-        std.debug.assert(self.error_trace == null);
+        std.debug.assert(self.tryeval_depth == 0);
+        self.pending_failure = null;
+        self.error_trace = null;
         self.is_demand = false;
         self.parallel_demand = false;
     }

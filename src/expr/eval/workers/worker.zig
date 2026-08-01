@@ -418,6 +418,7 @@ pub const Worker = struct {
         // Dress the top fiber's execution context. Its blocking waits are the
         // critical path. `runFiber`'s finished arm resets the role.
         top.ctx.is_demand = true;
+        top.ctx.error_trace = top.vm.trace;
         top.inner.reset(entry, arg);
         if (comptime census_on) {
             self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
@@ -920,8 +921,8 @@ pub const Worker = struct {
             f.inner.deinit(self.allocator);
         }
 
-        // Bind the VM to this fiber's identity: the constructor hands out
-        // the neutral default; from here on the VM (and every nested VM
+        // Bind the VM to this fiber's identity: the constructor starts with
+        // its VM-local fallback; from here on the VM (and every nested VM
         // created while running on this fiber) reads through `f.ctx`.
         f.vm.ctx = &f.ctx;
         // Speculative work captures only the throw message for sticky
@@ -1002,8 +1003,14 @@ fn slotEntry(arg: *anyopaque) void {
     // onto the thunk.
     const saved_trace = f.vm.trace;
     f.local_trace.clear();
+    f.ctx.clearFailure();
+    f.ctx.error_trace = &f.local_trace;
     f.vm.trace = &f.local_trace;
-    defer f.vm.trace = saved_trace;
+    defer {
+        f.ctx.clearFailure();
+        f.ctx.error_trace = null;
+        f.vm.trace = saved_trace;
+    }
     if (comptime census_on) {
         var live: u64 = 0;
         var total: u64 = 0;
@@ -1142,7 +1149,11 @@ fn runListRangeTask(f: *WorkerFiber, range: scheduler_mod.ForceListRange) void {
     const start: usize = range.offset;
     const end = @min(start + @as(usize, range.len), items.len);
     for (items[start..end]) |item| {
-        if (item.isThunk()) _ = vm_force.forceValueSpeculative(&f.vm, item) catch {};
+        if (item.isThunk()) {
+            _ = vm_force.forceValueSpeculative(&f.vm, item) catch {};
+            f.ctx.clearFailure();
+            f.local_trace.clear();
+        }
     }
 }
 
@@ -1154,7 +1165,11 @@ fn runAttrsRangeTask(f: *WorkerFiber, range: scheduler_mod.ForceAttrsRange) void
     const start: usize = range.offset;
     const end = @min(start + @as(usize, range.len), entries.len);
     for (entries[start..end]) |entry| {
-        if (entry.value.isThunk()) _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+        if (entry.value.isThunk()) {
+            _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+            f.ctx.clearFailure();
+            f.local_trace.clear();
+        }
     }
 }
 
@@ -1182,6 +1197,8 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
             logAttrsSweepMember(f, attrs_id, entry, &label_buf, &rendered_buf);
         } else {
             _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+            f.ctx.clearFailure();
+            f.local_trace.clear();
         }
     }
     if (log) {
@@ -1228,6 +1245,8 @@ fn logAttrsSweepMember(
     const created_before = f.vm.heap.currentLocal().thunks_created;
     const subject = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), label_buf);
     _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+    f.ctx.clearFailure();
+    f.local_trace.clear();
     const created = f.vm.heap.currentLocal().thunks_created -| created_before;
     if (created <= 2000) return;
     const label: []const u8 = switch (subject) {
@@ -1246,6 +1265,8 @@ fn runImportPrefetchTask(f: *WorkerFiber, path_id: types.InternId) void {
     const path = f.vm.intern.get(path_id);
     // Demand replays cached deterministic failures through the same registry.
     _ = host.import_value(host.context, &f.vm, path, 1) catch {};
+    f.ctx.clearFailure();
+    f.local_trace.clear();
 }
 
 fn runReadDirPrefetchTask(f: *WorkerFiber, range: scheduler_mod.ReadDirPrefetch) void {

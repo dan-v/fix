@@ -10,6 +10,9 @@ const vm_force = @import("../force.zig");
 const vm_trace = @import("../trace.zig");
 const effect_message = @import("../effect_message.zig");
 const effects = @import("../../effects.zig");
+const error_capture = @import("../errors.zig");
+const ErrorTrace = @import("../../observ.zig").trace.Trace;
+const FailureRef = @import("runtime").failure.FailureRef;
 
 /// Pause into the debugger at an evaluation error, unless we're inside a
 /// `tryEval` (a caught error) or no debugger is attached. `value` is shown as
@@ -17,7 +20,7 @@ const effects = @import("../../effects.zig");
 /// normally so the caller still propagates the original error; only a `:q`
 /// abort from the console surfaces as an error here.
 pub fn debugBreakError(self: *VM, value: Value) !void {
-    if (self.debug.tryeval_depth != 0) return;
+    if (self.executionContextConst().tryeval_depth != 0) return;
     if (self.debug.break_sink) |sink| {
         self.effect_epoch +%= 1;
         try sink.fire(sink.ctx, self, value, .eval_error);
@@ -38,14 +41,16 @@ pub fn builtinAbort(self: *VM, message_arg: Value) !Value {
 
 pub fn builtinTryEval(self: *VM, arg: Value) !Value {
     // Suppress debugger error-entry for errors caught here.
-    self.debug.tryeval_depth += 1;
-    defer self.debug.tryeval_depth -= 1;
+    const ctx = self.executionContext();
+    ctx.tryeval_depth += 1;
+    defer ctx.tryeval_depth -= 1;
     const value = vm_force.forceValue(self, arg) catch |err| switch (err) {
         error.NixThrow,
         error.NixAbort,
         error.AssertionFailed,
         error.FileNotFound,
         => {
+            ctx.clearFailure();
             vm_trace.clearErrorTrace(self);
             return tryEvalResult(self, false, Value.boolVal(false));
         },
@@ -56,8 +61,33 @@ pub fn builtinTryEval(self: *VM, arg: Value) !Value {
 
 pub fn builtinAddErrorContext(self: *VM, message_arg: Value, value_arg: Value) !Value {
     return vm_force.forceValue(self, value_arg) catch |err| {
-        const message = strings.stringArg(self, message_arg) catch return err;
-        vm_trace.pushErrorContext(self, message) catch return err;
+        // The force path normally captured this already. Keep the fallback so
+        // direct/foreign errors still receive a stable origin.
+        error_capture.captureErrorTrace(self, err) catch {};
+        const ctx = self.executionContext();
+        const cause = ctx.take() orelse FailureRef.degraded(err);
+
+        // Coercing the context message is itself fallible. Give it an isolated
+        // trace and empty carrier; any resulting exception is discarded before
+        // the original is restored, so diagnostics can never cross-associate.
+        const saved_trace = self.trace;
+        var message_trace = ErrorTrace.init(self.allocator);
+        defer message_trace.deinit();
+        self.trace = &message_trace;
+        const message = strings.stringArg(self, message_arg) catch {
+            self.trace = saved_trace;
+            ctx.clearFailure();
+            ctx.restore(cause);
+            return err;
+        };
+        self.trace = saved_trace;
+        ctx.clearFailure();
+        const wrapped = self.heap.failures.addContext(cause, message);
+        ctx.restore(wrapped);
+        // If the origin has already been materialized into this demand trace,
+        // append the new context now. A future cached observer reconstructs it
+        // from `wrapped` instead.
+        vm_trace.pushErrorContext(self, message) catch {};
         return err;
     };
 }

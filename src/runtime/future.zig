@@ -68,7 +68,7 @@ pub const ClaimResult = enum { already_resolved, claimed, blackhole, busy, error
 /// I/O fibers embed one. A `Future` owns a five-state lifecycle, a claimer id,
 /// and a fiber waiter list. It deliberately does NOT
 /// own the result — the embedding struct stores its own typed result
-/// (a `Value`, a `*ErrorInfo`, or in `Thunk`'s case a `result`/`target`
+/// (a `Value`, a `FailureRef`, or in `Thunk`'s case a `result`/`target`
 /// union) and reads/writes it around the state transitions. Keeping the
 /// result out of `Future` lets `Thunk` overlap its resolved value with
 /// its unresolved target (never live at once), shrinking the hottest,
@@ -266,9 +266,9 @@ pub const Future = struct {
     }
 
     /// Publish a deterministic body failure and wake waiters. The
-    /// embedder has already stashed the `*ErrorInfo` in its result slot
-    /// and owns it (and any heap-allocated `info.message`) so it can
-    /// release it at teardown.
+    /// embedder has already stashed its failure handle in the result slot.
+    /// The handle's immutable record, if any, is owned out-of-band by the
+    /// engine rather than by this future.
     pub fn publishErrored(self: *Future) void {
         self.claimer.store(invalid_claimer, .monotonic);
         self.state.store(@intFromEnum(FutureState.errored), .release);

@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const Value = @import("runtime").value.Value;
-const thunk_mod = @import("runtime").thunk;
+const FailureRef = @import("runtime").failure.FailureRef;
 const future_mod = @import("runtime").future;
 const SpinMutex = @import("base").sync.SpinMutex;
 
@@ -38,10 +38,6 @@ pub const Registry = struct {
         var it = entries.iterator();
         while (it.next()) |kv| {
             const entry = kv.value_ptr.*;
-            if (entry.error_info) |info| {
-                if (info.message) |msg| allocator.free(msg);
-                allocator.destroy(info);
-            }
             allocator.free(kv.key_ptr.*);
             allocator.destroy(entry);
         }
@@ -78,8 +74,6 @@ pub const ImportEntry = struct {
     /// Demand-effect group discovered while a speculative import evaluated.
     /// Published before `future` reaches a terminal state, like `result`.
     effect_group: u32 = 0,
-    /// Owned by this entry. Allocated when the compile fails so the
-    /// future can transition to `.errored` with a sidecar. Freed by
-    /// `Registry.deinit`.
-    error_info: ?*thunk_mod.ErrorInfo = null,
+    /// Borrowed immutable failure owned by the engine's failure store.
+    failure: ?FailureRef = null,
 };

@@ -36,12 +36,14 @@ const types = @import("types.zig");
 const Value = @import("value.zig").Value;
 const ChunkId = types.ChunkId;
 const future = @import("future.zig");
+const failure = @import("failure.zig");
 
 const Future = future.Future;
 const FutureState = future.FutureState;
 const Waiter = future.Waiter;
 const ClaimerId = future.ClaimerId;
 const makeClaimer = future.makeClaimer;
+pub const FailureRef = failure.FailureRef;
 
 /// `-Dprof-main` age-at-force probe support. These fields belong to thunks,
 /// not to the generic synchronization primitive used by imports and I/O.
@@ -192,33 +194,20 @@ pub const ThunkTarget = union {
     deferred: DeferredThunk,
 };
 
-/// Captured failure of a thunk's deterministic body, replayed on
-/// subsequent forces. Allocated out-of-band when a thunk transitions
-/// to `.errored`; pointer is stored in the `result_or_error` union
-/// slot (which is otherwise unused in that state). The struct and its
-/// message string are freed in `ObjectHeap.deinit`.
-///
-/// Sidecar storage keeps the error payload out of every thunk.
-pub const ErrorInfo = struct {
-    err: anyerror,
-    message: ?[]const u8,
-};
-
 pub const ForceOutcome = union(enum) {
     already_resolved: Value,
     claimed,
     blackhole,
     busy,
-    /// Borrowed pointer into the heap-owned sidecar; valid for the
-    /// lifetime of the heap. Kept as a pointer rather than an inline
-    /// `ErrorInfo` value so the union remains Value-sized.
-    errored: *const ErrorInfo,
+    /// Borrowed immutable record handle, or an inline degraded error code.
+    /// Both representations fit in the existing Value-sized result word.
+    errored: FailureRef,
 };
 
 /// Atomic lazy thunk: a `Future` (claim/wait state machine) plus a
 /// `result`/`target` union. `target` (what to evaluate) is the live
 /// union arm while the thunk is unresolved/evaluating; `result` (the
-/// resolved Value, or an `*ErrorInfo`'s bits when errored) is live once
+/// resolved Value, or a `FailureRef`'s bits when errored) is live once
 /// the thunk reaches a terminal state. The two are never live at the
 /// same instant — a thunk reads `target` to compute its value, then
 /// overwrites the same bytes with `result` at resolution — so they
@@ -249,7 +238,7 @@ pub const Thunk = struct {
     /// Bare (untagged) union: `future.state` is the only discriminant.
     /// `.resolved`/`.errored` → read `result`; any other state → `target`.
     pub const Payload = union {
-        /// Resolved Value, or (when `.errored`) the `*ErrorInfo` bits
+        /// Resolved Value, or (when `.errored`) the `FailureRef` bits
         /// reinterpreted through `Value.bits`.
         result: Value,
         target: ThunkTarget,
@@ -465,7 +454,7 @@ pub const Thunk = struct {
             // release-store in `publish`/`publishErrored`, so the
             // `payload` reads below observe the published arm.
             .already_resolved => .{ .already_resolved = self.payload.result },
-            .errored => .{ .errored = self.cachedErrorInfo() },
+            .errored => .{ .errored = self.cachedFailure() },
             .claimed => .claimed,
             .busy => .busy,
             .blackhole => .blackhole,
@@ -478,7 +467,7 @@ pub const Thunk = struct {
     pub inline fn tryForceSolo(self: *Thunk, claimer: ClaimerId) ForceOutcome {
         return switch (self.future.tryClaimSolo(claimer)) {
             .already_resolved => .{ .already_resolved = self.payload.result },
-            .errored => .{ .errored = self.cachedErrorInfo() },
+            .errored => .{ .errored = self.cachedFailure() },
             .claimed => .claimed,
             .busy => .busy,
             .blackhole => .blackhole,
@@ -509,15 +498,15 @@ pub const Thunk = struct {
         self.future.reset();
     }
 
-    /// Stash the `*ErrorInfo` in the result slot (overwriting `target`)
+    /// Stash the `FailureRef` in the result slot (overwriting `target`)
     /// and transition to `.errored`.
-    pub fn markErrored(self: *Thunk, info: *ErrorInfo) void {
-        self.payload = .{ .result = .{ .bits = @intFromPtr(info) } };
+    pub fn markErrored(self: *Thunk, failure_ref: FailureRef) void {
+        self.payload = .{ .result = .{ .bits = failure_ref.rawBits() } };
         self.future.publishErrored();
     }
 
-    pub inline fn cachedErrorInfo(self: *const Thunk) *const ErrorInfo {
-        return @ptrFromInt(self.payload.result.bits);
+    pub inline fn cachedFailure(self: *const Thunk) FailureRef {
+        return FailureRef.fromRawBits(self.payload.result.bits);
     }
 
     pub fn blackhole(self: *Thunk) void {
@@ -684,67 +673,53 @@ test "thunk: different fibers see .busy, not blackhole" {
 
 test "thunk: errored caches error and replays on next force" {
     const allocator = std.testing.allocator;
+    var failure_store = failure.FailureStore.init(allocator);
+    defer failure_store.deinit();
     var thunk = Thunk.init(Value.null_val);
-    defer freeErroredInfoForTest(&thunk, allocator);
     const me = makeClaimer(0);
 
     switch (thunk.tryForce(me)) {
         .claimed => {},
         else => return error.UnexpectedOutcome,
     }
-    const owned_msg = try allocator.dupe(u8, "bad value");
-    const info = try allocator.create(ErrorInfo);
-    info.* = .{ .err = error.NixThrow, .message = owned_msg };
-    thunk.markErrored(info);
+    const failure_ref = failure_store.captureOrigin(error.NixThrow, "bad value", &.{});
+    thunk.markErrored(failure_ref);
 
     switch (thunk.tryForce(makeClaimer(1))) {
         .errored => |got| {
-            try std.testing.expectEqual(@as(anyerror, error.NixThrow), got.*.err);
-            try std.testing.expect(got.*.message != null);
-            try std.testing.expectEqualStrings("bad value", got.*.message.?);
+            try std.testing.expectEqual(@as(anyerror, error.NixThrow), got.err());
+            switch (got.record().?.*) {
+                .origin => |origin| try std.testing.expectEqualStrings("bad value", origin.message),
+                .context => return error.ExpectedOrigin,
+            }
         },
         else => return error.ExpectedErroredOutcome,
     }
     // Replay is idempotent.
     switch (thunk.tryForce(makeClaimer(2))) {
-        .errored => |got| try std.testing.expectEqual(@as(anyerror, error.NixThrow), got.*.err),
+        .errored => |got| try std.testing.expectEqual(@as(anyerror, error.NixThrow), got.err()),
         else => return error.ExpectedErroredOutcome,
     }
 }
 
-/// Test helper: mirrors `ObjectHeap`'s sidecar cleanup for thunks
-/// constructed outside the heap. Walks the test thunk's sidecar info
-/// (if any) and releases its allocations.
-fn freeErroredInfoForTest(thunk: *Thunk, allocator: std.mem.Allocator) void {
-    const s: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
-    if (s != .errored) return;
-    const info: *ErrorInfo = @ptrFromInt(thunk.payload.result.bits);
-    if (info.message) |msg| allocator.free(msg);
-    allocator.destroy(info);
-}
-
 test "thunk: errored wakes enrolled waiters" {
-    const allocator = std.testing.allocator;
     var thunk = Thunk.init(Value.null_val);
-    defer freeErroredInfoForTest(&thunk, allocator);
 
     const Failer = struct {
-        fn run(alloc: std.mem.Allocator, th: *Thunk, claimed_signal: *std.atomic.Value(u8), go: *std.atomic.Value(u8)) void {
+        fn run(th: *Thunk, claimed_signal: *std.atomic.Value(u8), go: *std.atomic.Value(u8)) void {
             switch (th.tryForce(makeClaimer(0))) {
                 .claimed => {},
                 else => return,
             }
             claimed_signal.store(1, .release);
             while (go.load(.acquire) == 0) std.atomic.spinLoopHint();
-            const info = alloc.create(ErrorInfo) catch return;
-            info.* = .{ .err = error.NixThrow, .message = null };
-            th.markErrored(info);
+            th.markErrored(FailureRef.degraded(error.NixThrow));
         }
     };
 
     var claimed_signal: std.atomic.Value(u8) = .init(0);
     var go: std.atomic.Value(u8) = .init(0);
-    var t = try std.Thread.spawn(.{}, Failer.run, .{ allocator, &thunk, &claimed_signal, &go });
+    var t = try std.Thread.spawn(.{}, Failer.run, .{ &thunk, &claimed_signal, &go });
 
     while (claimed_signal.load(.acquire) == 0) std.atomic.spinLoopHint();
 

@@ -20,6 +20,7 @@ const execution = @import("eval/workers.zig");
 const VM = vm_mod.VM;
 const LanguagePolicy = @import("policy.zig").LanguagePolicy;
 const vm_force = @import("vm.zig").force;
+const vm_errors = @import("vm.zig").errors;
 const vm_builtins = @import("vm.zig").builtins;
 const vm_strings = @import("vm.zig").strings;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
@@ -123,7 +124,6 @@ fn observationDetails(subject: []const u8) observ.Details {
 
 const gc = @import("runtime").gc;
 const future_mod = @import("runtime").future;
-const thunk_mod = @import("runtime").thunk;
 const worker_id_mod = @import("base").worker_id;
 
 pub const Diagnostic = diagnostic.Diagnostic;
@@ -300,13 +300,13 @@ pub const DebugSession = struct {
 
     /// Force `v` (shallow) on the paused fiber and return the result.
     pub fn force(self: *DebugSession, v: Value) !Value {
-        return vm_force.forceValue(self.vm, v);
+        return self.runAncillary(forceAncillary, .{v});
     }
 
     /// Render `v` for display (forces thunks as needed), same formatting as the
     /// repl. Runs on the paused fiber's VM.
     pub fn writeValue(self: *DebugSession, writer: *std.Io.Writer, v: Value) !void {
-        return eval_print.writeValue(valuePrintHost(self.ev), writer, v);
+        return self.runAncillary(writeValueAncillary, .{ writer, v });
     }
 
     /// Render a concise value description without forcing it. This is safe for
@@ -325,6 +325,58 @@ pub const DebugSession = struct {
     /// members resolve as free identifiers, like the repl's bindings), reusing
     /// the paused evaluator. Returns the resulting (unforced) value.
     pub fn eval(self: *DebugSession, source: []const u8, scope: ?Value) !Value {
+        return self.runAncillary(evalAncillary, .{ source, scope });
+    }
+
+    /// Debugger inspection is ancillary to the paused language evaluation. A
+    /// failed console expression or value rendering is normally caught by the
+    /// UI so the session can continue; it must therefore neither leave its
+    /// exception in the paused fiber's carrier nor overwrite the paused
+    /// evaluation's user-facing trace. Keep both pieces of fiber state scoped
+    /// together, including for nested VMs created by `eval`/the value printer.
+    fn runAncillary(
+        self: *DebugSession,
+        comptime body: anytype,
+        args: anytype,
+    ) !ReturnPayload(@TypeOf(body)) {
+        const ctx = self.vm.executionContext();
+        const saved_failure = ctx.take();
+        const saved_vm_trace = self.vm.trace;
+        const saved_ctx_trace = ctx.error_trace;
+        var scratch_trace = eval_trace.Trace.init(self.ev.allocator);
+        self.vm.trace = &scratch_trace;
+        ctx.error_trace = &scratch_trace;
+        defer {
+            self.vm.trace = saved_vm_trace;
+            ctx.error_trace = saved_ctx_trace;
+            ctx.clearFailure();
+            if (saved_failure) |failure| ctx.restore(failure);
+            scratch_trace.deinit();
+        }
+        return @call(.auto, body, .{self} ++ args);
+    }
+
+    fn forceAncillary(self: *DebugSession, v: Value) !Value {
+        return vm_force.forceValue(self.vm, v);
+    }
+
+    fn writeValueAncillary(self: *DebugSession, writer: *std.Io.Writer, v: Value) !void {
+        var host = valuePrintHost(self.ev);
+        host.context = self;
+        host.force_value = debugPrintForceValue;
+        return eval_print.writeValue(host, writer, v);
+    }
+
+    /// Value rendering normally forces derivation markers through the public
+    /// Engine API, which clears the report trace before each operation. A debug
+    /// rendering is already inside `runAncillary`; use the untraced entry so
+    /// those nested forces stay on its private trace as well.
+    fn debugPrintForceValue(context: *anyopaque, value: Value) anyerror!Value {
+        const self: *DebugSession = @ptrCast(@alignCast(context));
+        return self.ev.forceValueUntraced(value);
+    }
+
+    fn evalAncillary(self: *DebugSession, source: []const u8, scope: ?Value) !Value {
         return self.ev.debugEvalScoped(self.vm, source, scope);
     }
 
@@ -1916,7 +1968,11 @@ pub const Engine = struct {
         if (fiber_mod.currentFiber()) |inner| {
             const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
             vm.ctx = &wf.ctx;
-            if (wf.ctx.parallel_demand) vm.trace = wf.ctx.error_trace;
+            // The fiber owns both exception identity and its diagnostic sink.
+            // Bind unconditionally: a nested import on a speculative helper
+            // must keep using the helper's scratch trace, while ordinary and
+            // parallel demand fibers retain their respective report traces.
+            vm.trace = wf.ctx.error_trace;
         }
         return vm;
     }
@@ -2495,16 +2551,21 @@ pub const Engine = struct {
         debug_parent: *VM,
     ) anyerror!Value {
         const me = currentImportClaimer();
+        const real_demand = !debug_parent.speculation.active;
         while (true) {
             switch (entry.future.tryClaim(me)) {
                 .already_resolved => {
-                    try vm_force.observeEffectGroup(debug_parent, entry.effect_group, true);
+                    try vm_force.observeEffectGroup(debug_parent, entry.effect_group, real_demand);
                     return entry.result;
                 },
                 .blackhole => return error.ImportCycle,
                 .errored => {
-                    try vm_force.observeEffectGroup(debug_parent, entry.effect_group, true);
-                    return entry.error_info.?.err;
+                    try vm_force.observeEffectGroup(debug_parent, entry.effect_group, real_demand);
+                    const failure = entry.failure.?;
+                    debug_parent.executionContext().install(failure);
+                    if (real_demand)
+                        vm_errors.captureDemandErrorTrace(debug_parent, failure.err()) catch {};
+                    return failure.err();
                 },
                 .busy => {
                     const inner = fiber_mod.currentFiber() orelse
@@ -2522,16 +2583,16 @@ pub const Engine = struct {
                     const value = self.compileImportPath(path, parent_depth, debug_parent) catch |err| {
                         if (debug_parent.speculation.active and !isTransientImportError(err)) {
                             entry.effect_group = self.effects.makeGroup(debug_parent.effect_journal.items[effect_checkpoint..]) catch {
-                                self.publishImportFailure(entry, error.OutOfMemory);
+                                self.publishImportFailure(entry, debug_parent, error.OutOfMemory);
                                 return error.OutOfMemory;
                             };
                         }
-                        self.publishImportFailure(entry, err);
+                        self.publishImportFailure(entry, debug_parent, err);
                         return err;
                     };
                     if (debug_parent.speculation.active) {
                         entry.effect_group = self.effects.makeGroup(debug_parent.effect_journal.items[effect_checkpoint..]) catch {
-                            self.publishImportFailure(entry, error.OutOfMemory);
+                            self.publishImportFailure(entry, debug_parent, error.OutOfMemory);
                             return error.OutOfMemory;
                         };
                     }
@@ -2543,22 +2604,22 @@ pub const Engine = struct {
         }
     }
 
-    fn publishImportFailure(self: *Engine, entry: *imports_mod.ImportEntry, err: anyerror) void {
+    fn publishImportFailure(self: *Engine, entry: *imports_mod.ImportEntry, vm: *VM, err: anyerror) void {
+        _ = self;
         switch (err) {
             error.OutOfMemory, error.StackOverflow, error.SpeculativeBail => {
+                const ctx = vm.executionContext();
+                if (ctx.pending()) |failure| if (failure.err() != err) ctx.clearFailure();
                 entry.effect_group = 0;
                 entry.future.reset();
                 return;
             },
             else => {},
         }
-        const info = self.allocator.create(thunk_mod.ErrorInfo) catch {
-            entry.effect_group = 0;
-            entry.future.reset();
-            return;
-        };
-        info.* = .{ .err = err, .message = null };
-        entry.error_info = info;
+        const ctx = vm.executionContext();
+        if (ctx.pending() == null) vm_errors.captureErrorTrace(vm, err) catch {};
+        entry.failure = ctx.pending() orelse
+            runtime.failure.FailureRef.degraded(err);
         entry.future.publishErrored();
     }
 
@@ -2929,6 +2990,12 @@ test "speculative effects wait for demand and fire exactly once" {
     try std.testing.expectError(error.NixThrow, ev.forceValue(bad));
     try std.testing.expectEqual(@as(usize, 2), capture.count);
     try std.testing.expectEqualStrings("before-error", capture.message(1));
+    try std.testing.expectEqualStrings("boom", ev.getTrace().message.?);
+    // A second genuine demand observes the same terminal failure. It must
+    // neither re-evaluate the body nor recommit the failure's effect group.
+    try std.testing.expectError(error.NixThrow, ev.forceValue(bad));
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqualStrings("boom", ev.getTrace().message.?);
 
     // Work that remains purely speculative never becomes language-visible.
     const untouched = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("untouched"));
@@ -2975,6 +3042,214 @@ test "speculative imported traces are committed by their demander" {
     try std.testing.expectEqual(@as(i64, 5), demanded.asInt());
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqualStrings("imported", capture.message(0));
+}
+
+test "nested speculative thunk failure retains its message and origin" {
+    const source =
+        \\rec {
+        \\  bad = outer;
+        \\  leaf = builtins.throw "deep speculative failure";
+        \\  middle = builtins.seq leaf null;
+        \\  outer = builtins.seq middle null;
+        \\}
+    ;
+
+    // Keep both Engines live so their trace views can be compared directly.
+    // workers=1 takes only the demand path; workers=8 first makes the entire
+    // nested chain terminal through forceValueSpeculative, then observes it.
+    var serial = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer serial.deinit();
+    const serial_attrs = try serial.evaluate(source);
+    const serial_bad = try serial.heap.getAttrValue(serial_attrs.asObjectId(), try serial.intern.intern("bad"));
+    try std.testing.expectError(error.NixThrow, serial.forceValue(serial_bad));
+    const serial_trace = serial.getTrace();
+    try std.testing.expectEqualStrings("deep speculative failure", serial_trace.message.?);
+
+    var parallel = try Engine.init(std.testing.allocator, .{ .worker_count = 8 });
+    defer parallel.deinit();
+    const parallel_attrs = try parallel.evaluate(source);
+    const parallel_bad = try parallel.heap.getAttrValue(parallel_attrs.asObjectId(), try parallel.intern.intern("bad"));
+    const parallel_leaf = try parallel.heap.getAttrValue(parallel_attrs.asObjectId(), try parallel.intern.intern("leaf"));
+    const parallel_middle = try parallel.heap.getAttrValue(parallel_attrs.asObjectId(), try parallel.intern.intern("middle"));
+    const parallel_outer = try parallel.heap.getAttrValue(parallel_attrs.asObjectId(), try parallel.intern.intern("outer"));
+    try std.testing.expectError(error.NixThrow, parallel.runWithVm(vm_force.forceValueSpeculative, .{parallel_bad}));
+
+    // Propagation through pass-through/ancestor thunks is pointer sharing,
+    // not a new diagnostic capture per level.
+    const bad_failure = parallel.heap.getThunkAssumeValid(parallel_bad.asObjectId()).cachedFailure();
+    const leaf_failure = parallel.heap.getThunkAssumeValid(parallel_leaf.asObjectId()).cachedFailure();
+    const middle_failure = parallel.heap.getThunkAssumeValid(parallel_middle.asObjectId()).cachedFailure();
+    const outer_failure = parallel.heap.getThunkAssumeValid(parallel_outer.asObjectId()).cachedFailure();
+    try std.testing.expect(bad_failure.eql(leaf_failure));
+    try std.testing.expect(bad_failure.eql(middle_failure));
+    try std.testing.expect(bad_failure.eql(outer_failure));
+
+    try std.testing.expectError(error.NixThrow, parallel.forceValue(parallel_bad));
+    const parallel_trace = parallel.getTrace();
+    try std.testing.expectEqualStrings("deep speculative failure", parallel_trace.message.?);
+
+    // Diagnostic parity is deliberately stronger than checking the message:
+    // cached observation must materialize the origin captured by the helper,
+    // not synthesize a new stack rooted at the later demander.
+    try std.testing.expectEqual(serial_trace.frames.items.len, parallel_trace.frames.items.len);
+    for (serial_trace.frames.items, parallel_trace.frames.items) |serial_frame, parallel_frame| {
+        try std.testing.expectEqual(serial_frame.kind, parallel_frame.kind);
+        try std.testing.expectEqualStrings(serial_frame.message, parallel_frame.message);
+        try std.testing.expectEqual(serial_frame.diagnostic != null, parallel_frame.diagnostic != null);
+        if (serial_frame.diagnostic) |serial_diag| {
+            const parallel_diag = parallel_frame.diagnostic.?;
+            try std.testing.expectEqual(serial_diag.line, parallel_diag.line);
+            try std.testing.expectEqual(serial_diag.column, parallel_diag.column);
+            try std.testing.expectEqual(serial_diag.offset, parallel_diag.offset);
+            try std.testing.expectEqual(serial_diag.len, parallel_diag.len);
+        }
+    }
+    var found_leaf_origin = false;
+    for (parallel_trace.frames.items) |frame| {
+        if (frame.diagnostic) |diag| {
+            if (diag.line == 3) found_leaf_origin = true;
+        }
+    }
+    try std.testing.expect(found_leaf_origin);
+}
+
+test "cached failure adds continuation only for genuine demand" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 8 });
+    defer ev.deinit();
+    const attrs = try ev.evaluate(
+        \\rec {
+        \\  leaf = builtins.throw "frozen helper origin";
+        \\  consume = x: builtins.seq x 0;
+        \\  speculativeObserver = consume leaf;
+        \\  demandObserver = (x: consume x) leaf;
+        \\}
+    );
+    const attrs_id = attrs.asObjectId();
+    const leaf = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("leaf"));
+    const speculative_observer = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("speculativeObserver"));
+    const demand_observer = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("demandObserver"));
+
+    // Freeze the origin first, as a helper would. A later speculative cached
+    // observer propagates only its identity: it must not materialize into the
+    // shared demand trace or mutate the immutable origin with its own frames.
+    try std.testing.expectError(error.NixThrow, ev.runWithVm(vm_force.forceValueSpeculative, .{leaf}));
+    const leaf_failure = ev.heap.getThunkAssumeValid(leaf.asObjectId()).cachedFailure();
+    ev.report.trace.clear();
+    try std.testing.expectError(error.NixThrow, ev.runWithVm(vm_force.forceValueSpeculative, .{speculative_observer}));
+    try std.testing.expect(ev.getTrace().message == null);
+    try std.testing.expectEqual(@as(usize, 0), ev.getTrace().frames.items.len);
+    const speculative_failure = ev.heap.getThunkAssumeValid(speculative_observer.asObjectId()).cachedFailure();
+    try std.testing.expect(leaf_failure.eql(speculative_failure));
+
+    // Genuine demand reaches the same cached leaf through frames that did not
+    // exist when the helper froze the origin. The rendered trace must contain
+    // both the immutable leaf location and at least one such continuation.
+    try std.testing.expectError(error.NixThrow, ev.forceValue(demand_observer));
+    try std.testing.expectEqualStrings("frozen helper origin", ev.getTrace().message.?);
+    var found_origin = false;
+    var found_demand_continuation = false;
+    for (ev.getTrace().frames.items) |frame| {
+        const diag = frame.diagnostic orelse continue;
+        if (diag.line == 2) found_origin = true;
+        if (diag.line == 3 or diag.line == 5) found_demand_continuation = true;
+    }
+    try std.testing.expect(found_origin);
+    try std.testing.expect(found_demand_continuation);
+}
+
+test "speculative error contexts preserve order and original cause" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 8 });
+    defer ev.deinit();
+    const attrs = try ev.evaluate(
+        \\{
+        \\  ordered = builtins.addErrorContext "outer context"
+        \\    (builtins.addErrorContext "inner context"
+        \\      (builtins.throw "ordered origin"));
+        \\  messageFailure = builtins.addErrorContext
+        \\    (builtins.throw "context construction failed")
+        \\    (builtins.throw "preserved origin");
+        \\}
+    );
+    const attrs_id = attrs.asObjectId();
+
+    const ordered = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("ordered"));
+    try std.testing.expectError(error.NixThrow, ev.runWithVm(vm_force.forceValueSpeculative, .{ordered}));
+    try std.testing.expectError(error.NixThrow, ev.forceValue(ordered));
+    try std.testing.expectEqualStrings("ordered origin", ev.getTrace().message.?);
+    var contexts: [2][]const u8 = undefined;
+    var context_count: usize = 0;
+    for (ev.getTrace().frames.items) |frame| {
+        if (frame.kind != .context) continue;
+        if (context_count < contexts.len) contexts[context_count] = frame.message;
+        context_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), context_count);
+    try std.testing.expectEqualStrings("inner context", contexts[0]);
+    try std.testing.expectEqualStrings("outer context", contexts[1]);
+
+    const message_failure = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("messageFailure"));
+    try std.testing.expectError(error.NixThrow, ev.runWithVm(vm_force.forceValueSpeculative, .{message_failure}));
+    try std.testing.expectError(error.NixThrow, ev.forceValue(message_failure));
+    try std.testing.expectEqualStrings("preserved origin", ev.getTrace().message.?);
+    for (ev.getTrace().frames.items) |frame| {
+        try std.testing.expect(std.mem.indexOf(u8, frame.message, "context construction failed") == null);
+    }
+}
+
+test "speculative nested import failure stays scoped and cached" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "failure.nix",
+        .data = "builtins.throw \"import failure\"\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "failure.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{
+        \\  handled = builtins.seq
+        \\    (builtins.tryEval (import {s}))
+        \\    (builtins.throw "failure after handled import");
+        \\  cached = import {s};
+        \\}}
+    , .{ file_path, file_path });
+    defer std.testing.allocator.free(source);
+
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 8 });
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    const attrs = try ev.evaluate(source);
+    const attrs_id = attrs.asObjectId();
+
+    // The imported throw is caught inside the speculative thunk. Its carrier
+    // must be cleared before the later, unrelated throw becomes sticky.
+    const handled = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("handled"));
+    try std.testing.expectError(error.NixThrow, ev.runWithVm(vm_force.forceValueSpeculative, .{handled}));
+    try std.testing.expectError(error.NixThrow, ev.forceValue(handled));
+    try std.testing.expectEqualStrings("failure after handled import", ev.getTrace().message.?);
+
+    // The same ImportEntry is now terminal. A second speculative thunk that
+    // observes it must borrow and publish the original imported failure.
+    const cached = try ev.heap.getAttrValue(attrs_id, try ev.intern.intern("cached"));
+    try std.testing.expectError(error.NixThrow, ev.runWithVm(vm_force.forceValueSpeculative, .{cached}));
+    try std.testing.expectError(error.NixThrow, ev.forceValue(cached));
+    try std.testing.expectEqualStrings("import failure", ev.getTrace().message.?);
+    var found_import_origin = false;
+    for (ev.getTrace().frames.items) |frame| {
+        if (frame.source_path) |path| {
+            if (std.mem.eql(u8, path, file_path)) found_import_origin = true;
+        }
+    }
+    try std.testing.expect(found_import_origin);
 }
 
 test {

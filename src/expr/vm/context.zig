@@ -178,7 +178,6 @@ pub const no_spec_budget: u64 = std.math.maxInt(u64);
 pub const VM = struct {
     const DebugState = struct {
         break_sink: ?BreakSink = null,
-        tryeval_depth: u32 = 0,
         breakpoints: ?*bytecode_mod.BreakpointTable = null,
         parent: ?*VM = null,
         import_replay: bool = false,
@@ -254,14 +253,17 @@ pub const VM = struct {
     /// Fiber-aware blocking capability supplied by the evaluator. Standalone
     /// VMs leave this null and execute blocking work inline.
     executor: ?FiberExecutor,
+    /// Standalone VMs own their execution context here. Evaluator fibers bind
+    /// `ctx` below to their stable fiber-owned context instead.
+    local_ctx: ExecutionContext = .{},
     /// Fiber-scoped execution identity: claim id and demand role.
     /// Points at the owning `WorkerFiber`'s context; nested VMs created on
     /// that fiber share the pointer (see `Engine.initVm`), so they cannot
     /// diverge from their fiber's identity. Standalone test VMs (no fiber)
-    /// point at the static neutral default. Read-only from the VM's side —
-    /// only the fiber's driving worker dresses/resets it, between resumes.
+    /// use `local_ctx`. Evaluator-bound VMs point at mutable fiber-owned state;
+    /// only code running that fiber mutates the carrier.
     /// See `eval/workers/context.zig`.
-    ctx: *const ExecutionContext = &ExecutionContext.default_instance,
+    ctx: ?*ExecutionContext = null,
     /// Optional VM execution tracer.
     vm_trace: ?*VmTrace,
     /// Optional per-thunk lifecycle event log (see `probe/thunk_trace.zig`).
@@ -390,11 +392,10 @@ pub const VM = struct {
             .thunk_trace = options.thunk_trace,
             .import_host = options.import_host,
             .builtins = options.builtins_value,
-            // `ctx` keeps its neutral default here; Worker.allocateFiber
-            // repoints it at the fiber's own context (with the fiber's
-            // claim id baked in) before the VM runs anything, and
-            // Engine.initVm repoints nested VMs at the surrounding
-            // fiber's context.
+            // `ctx` remains null here, selecting this VM's owned `local_ctx`.
+            // Worker.allocateFiber repoints evaluator VMs at the fiber's
+            // context before they run, and Engine.initVm does the same for
+            // nested VMs.
             .buffer_pool = options.buffer_pool,
             .stack = value_stack,
             .sp = 0,
@@ -415,6 +416,17 @@ pub const VM = struct {
     pub inline fn workerId(self: *const VM) u8 {
         _ = self;
         return worker_id_mod.currentId();
+    }
+
+    /// The authoritative execution context. Computing the standalone fallback
+    /// from `self` avoids a self-pointer that would be invalidated when a VM
+    /// value moves out of `init`.
+    pub inline fn executionContext(self: *VM) *ExecutionContext {
+        return self.ctx orelse &self.local_ctx;
+    }
+
+    pub inline fn executionContextConst(self: *const VM) *const ExecutionContext {
+        return self.ctx orelse &self.local_ctx;
     }
 
     /// Physical frames across the synchronous import-parent chain. Used only

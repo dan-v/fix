@@ -727,8 +727,8 @@ fn scanAttrs(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, range: h
 fn scanThunk(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, t: *const thunk_mod.Thunk) void {
     switch (@as(FutureState, @enumFromInt(t.future.state.load(.monotonic)))) {
         .resolved => sink.markValue(heap, t.payload.result),
-        // `.errored` reuses the result bits as a `*ErrorInfo` (heap-owned
-        // out-of-band, swept separately); `.blackhole` is terminal. Neither
+        // `.errored` reuses the result bits as a heap-owned `FailureRef` (or
+        // an inline degraded error code); `.blackhole` is terminal. Neither
         // holds a Value to follow.
         .errored, .blackhole => {},
         .unresolved, .evaluating => switch (t.targetKind()) {

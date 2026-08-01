@@ -35,7 +35,7 @@ pub const ValueType = @import("value.zig").ValueType;
 const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
 const DeferredThunk = @import("thunk.zig").DeferredThunk;
-const ErrorInfo = @import("thunk.zig").ErrorInfo;
+const FailureStore = @import("failure.zig").FailureStore;
 const inspection = @import("heap/inspection.zig");
 const reuse = @import("heap/reuse.zig");
 const RangeFreeList = reuse.RangeFreeList;
@@ -368,6 +368,9 @@ pub const HeapCollectionState = struct {
 
 pub const ObjectHeap = struct {
     allocator: std.mem.Allocator,
+    /// Unique owner for immutable failures borrowed by thunks, imports, and
+    /// fiber exception carriers. Lives exactly as long as this heap.
+    failures: FailureStore,
     objects: ObjectStore,
     values: ValueStore,
     attrs: AttrStore,
@@ -391,11 +394,6 @@ pub const ObjectHeap = struct {
     gc_shared_free_attr_pos: RangeFreeList,
     gc_shared_free_range_mu: sync.SpinMutex,
     gc_shared_free_range_max: [3]std.atomic.Value(u32),
-    /// All `ErrorInfo` allocations produced by `Thunk.errored`, recorded
-    /// at publish time so `deinit` can release them in O(errored_thunks)
-    /// rather than walking every object slot.
-    errored_infos: std.ArrayListUnmanaged(*ErrorInfo),
-    errored_infos_mu: sync.SpinMutex,
     /// Unique-per-init id for cache invalidation. Same trick as the
     /// intern table: thread-local caches outlive an Engine, and the
     /// allocator can reuse heap addresses, so a stale slot would match
@@ -446,6 +444,7 @@ pub const ObjectHeap = struct {
         for (locals) |*l| l.* = .{};
         return .{
             .allocator = allocator,
+            .failures = FailureStore.init(allocator),
             .objects = objects,
             .values = values,
             .attrs = attrs,
@@ -459,15 +458,13 @@ pub const ObjectHeap = struct {
             .gc_shared_free_attr_pos = .{},
             .gc_shared_free_range_mu = .{},
             .gc_shared_free_range_max = .{ .init(0), .init(0), .init(0) },
-            .errored_infos = .empty,
-            .errored_infos_mu = .{},
             .token = next_heap_token.fetchAdd(1, .monotonic),
             .collection = .{ .major_gate = gc_major_gate_floor },
         };
     }
 
     pub fn deinit(self: *ObjectHeap) void {
-        self.freeErroredInfos();
+        self.failures.deinit();
         self.discarded_object_tails.deinit(self.allocator);
         self.allocator.free(self.collection.alloc_bits);
         self.allocator.free(self.collection.old_bits);
@@ -481,24 +478,6 @@ pub const ObjectHeap = struct {
         self.attrs.deinit(self.allocator);
         self.values.deinit(self.allocator);
         self.objects.deinit(self.allocator);
-    }
-
-    /// Record a freshly-allocated `ErrorInfo` so `deinit` can release it
-    /// without scanning the object store. Called by `Thunk.errored` via
-    /// the heap's tracker — see `vm/force.zig`'s `publishThunkFailure`.
-    pub fn trackErroredInfo(self: *ObjectHeap, info: *ErrorInfo) !void {
-        self.errored_infos_mu.lock();
-        defer self.errored_infos_mu.unlock();
-        try self.errored_infos.append(self.allocator, info);
-    }
-
-    fn freeErroredInfos(self: *ObjectHeap) void {
-        // Single-threaded by the time deinit runs; no need to lock.
-        for (self.errored_infos.items) |info| {
-            if (info.message) |msg| self.allocator.free(msg);
-            self.allocator.destroy(info);
-        }
-        self.errored_infos.deinit(self.allocator);
     }
 
     pub const Counts = struct {
@@ -817,7 +796,7 @@ pub const ObjectHeap = struct {
         const state: ThunkState = @enumFromInt(@min(raw_state, @intFromEnum(ThunkState.errored)));
         const body: @TypeOf(@as(ThunkInfo, undefined).body) = switch (state) {
             .resolved => .{ .result = inspectValue(thunk.payload.result) },
-            .errored => .{ .error_name = @errorName(thunk.cachedErrorInfo().err) },
+            .errored => .{ .error_name = @errorName(thunk.cachedFailure().err()) },
             .unresolved, .evaluating, .blackhole => .{ .target = switch (thunk.targetKind()) {
                 .closure => .{ .closure = inspectValue(thunk.payload.target.closure) },
                 .bytecode => .{ .bytecode = .{
