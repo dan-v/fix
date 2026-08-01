@@ -97,9 +97,9 @@ build environment and dependencies:
 $ nix-shell --run 'zig build --release=fast'
 ```
 
-Nix is required to use `fix`: keep a working Nix installation and reachable
-Nix daemon on the system where it runs. Tagged releases publish optimized build
-archives for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
+Nix is required to use `fix`: keep a working Nix or Lix installation and a
+reachable daemon on the system where it runs. Tagged releases publish optimized
+build archives for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
 
 ```console
 $ ./zig-out/bin/fix eval -E '1 + 2'
@@ -111,6 +111,29 @@ $ ./zig-out/bin/fix repl
 ```
 
 The package also includes shell completions for Bash, Fish, and Zsh.
+
+### Nix and Lix runtime compatibility
+
+`fix` speaks the stable Nix worker protocol used by both CppNix and Lix. It
+accepts protocol versions 1.26 through 1.35 and advertises 1.35, so daemons older
+than Nix 2.4 are rejected with a protocol error instead of being used
+incorrectly. Lix's legacy-compatible socket is supported; an installation
+configured to expose only the experimental `lix-xp-1` protocol is not yet
+supported.
+
+The default local socket follows `NIX_STATE_DIR` (or `/nix/var/nix`), and
+`NIX_DAEMON_SOCKET_PATH` overrides it. `NIX_REMOTE`, `--store`, and the
+`nix.conf` `store` setting can select `daemon`, `unix://`, `ssh-ng://`, or
+`tcp://` transports. The in-process `local` store backend is not implemented;
+`fix` always needs a daemon. Like Nix, only user config, `$NIX_CONFIG`, and
+explicit CLI overrides are forwarded to the daemon; system `nix.conf` settings
+remain daemon-side policy. Direct GC-root paths and `fix switch`'s default
+system profile still assume the conventional `/nix/var/nix` state layout.
+
+`builtins.nixVersion` deliberately reports `2.18.3`: it is the evaluator
+compatibility baseline, not the version or brand of the connected daemon.
+Supported experimental and deprecated language switches are listed in
+[the CLI reference](docs/cli.md#evaluation--output).
 
 ## What it can do
 

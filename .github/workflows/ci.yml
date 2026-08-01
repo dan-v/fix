@@ -38,6 +38,10 @@ jobs:
         timeout-minutes: 20
         run: nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
 
+      - name: Build pinned Nix package
+        timeout-minutes: 20
+        run: nix-build default.nix -A fix --no-out-link
+
       - name: Static checks
         timeout-minutes: 10
         run: nix-shell --run 'zig build check-static --summary all'
@@ -101,3 +105,42 @@ jobs:
       - name: Language conformance
         timeout-minutes: 20
         run: nix-shell --run 'zig build test-lang -Doptimize=ReleaseFast --summary all'
+
+  daemon-compat:
+    name: daemon / ${{ matrix.implementation }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        implementation: [cppnix, lix]
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install CppNix
+        if: matrix.implementation == 'cppnix'
+        uses: cachix/install-nix-action@v31
+      - name: Install Lix
+        if: matrix.implementation == 'lix'
+        uses: samueldr/lix-gha-installer-action@8dc19fbd645d09dbcc66bf5f70d08a78bc17a499
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: daemon-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          restore-prefixes-first-match: daemon-${{ matrix.implementation }}-
+
+      - name: Configure pinned NIX_PATH
+        run: |
+          nixpkgs="$(nix eval --raw --impure --expr '(import ./npins).nixpkgs.outPath')"
+          echo "NIX_PATH=nixpkgs=$nixpkgs" >> "$GITHUB_ENV"
+
+      - name: Report daemon implementation
+        run: nix --version
+
+      - name: Build
+        timeout-minutes: 20
+        run: nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
+
+      - name: Real-daemon compatibility
+        timeout-minutes: 10
+        env:
+          FIX_REQUIRE_DAEMON: "1"
+        run: nix-shell --run 'zig build test-e2e --summary all -- daemon'
