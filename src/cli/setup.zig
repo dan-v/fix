@@ -147,10 +147,17 @@ pub fn configure(
     // taking precedence (as Nix does for this setting). Defaults to `/nix/store`.
     if (init.environ_map.get("NIX_STORE_DIR") orelse settings.get("store-dir")) |dir|
         try ev.setStoreDir(dir);
-    // Nix's `NIX_DAEMON_SOCKET_PATH` overrides the daemon socket location (empty
-    // = unset, as in Nix). Useful for pointing at an alternate/proxied daemon.
-    if (init.environ_map.get("NIX_DAEMON_SOCKET_PATH")) |sock|
+    // A nonstandard state directory moves the default daemon socket for both
+    // Nix and Lix. An explicit socket path still wins.
+    if (init.environ_map.get("NIX_DAEMON_SOCKET_PATH")) |sock| {
         if (sock.len != 0) try ev.setDaemonSocket(sock);
+    } else if (init.environ_map.get("NIX_STATE_DIR")) |state_dir| {
+        if (state_dir.len != 0) {
+            const socket = try std.fs.path.join(ev.hostAllocator(), &.{ state_dir, "daemon-socket", "socket" });
+            defer ev.hostAllocator().free(socket);
+            try ev.setDaemonSocket(socket);
+        }
+    }
     // The store URI (`store` from nix.conf / `--store`, or legacy `NIX_REMOTE`)
     // selects the daemon transport and wins over NIX_DAEMON_SOCKET_PATH. E.g.
     // `ssh-ng://host` speaks the worker protocol over `ssh host nix-daemon --stdio`.
@@ -241,52 +248,32 @@ fn foldFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, ref:
 }
 
 /// Send per-connection daemon settings via `set_options` when the store
-/// connects. Like Nix, this is always sent: the client's resolved config is
-/// authoritative for the connection. The fixed fields come from the merged
-/// `nix.conf` (system + user + `$NIX_CONFIG` + `--option`/build-setting flags),
-/// and the whole merged map is forwarded as the overrides map (so any set key —
-/// `timeout`, `substituters`, … — reaches the daemon). `fix` reads the same
-/// `/etc/nix/nix.conf` the daemon does, so unchanged values are no-ops; only
-/// user/CLI overrides differ. `set_options` is only emitted when the store
+/// connects. Both fixed fields and the overrides map use only user config,
+/// `$NIX_CONFIG`, flake `nixConfig`, and CLI settings. System nix.conf values
+/// are not forwarded: the daemon has already loaded its own system
+/// configuration. `set_options` is only emitted when the store
 /// actually connects (build/instantiate/run/shell), never for plain `eval`.
 fn applyDaemonSettings(ev: *Engine, options: *const args.Options, settings: *nix_conf.Settings) !void {
     const allocator = ev.hostAllocator();
     var overrides: std.ArrayListUnmanaged(store.daemon.Setting) = .empty;
     defer overrides.deinit(allocator);
-    // Owned `extra-<key>` names for keys with no explicit base; freed after the
-    // (duping) setDaemonBuildSettings call below.
-    var extra_names: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (extra_names.items) |n| allocator.free(n);
-        extra_names.deinit(allocator);
-    }
-    var it = settings.map.iterator();
+    var it = settings.daemon.iterator();
     while (it.next()) |e| {
-        const key = e.key_ptr.*;
-        // A key set only via `extra-<key>` (no explicit base) must forward as
-        // `extra-<key>` so the daemon *appends* to its own default rather than
-        // replacing it — otherwise fix, lacking Nix's compiled-in defaults (e.g.
-        // `sandbox-paths`'s `/bin/sh=<busybox>`), would strip them.
-        const name = if (settings.hasBase(key)) key else blk: {
-            const prefixed = try std.fmt.allocPrint(allocator, "extra-{s}", .{key});
-            try extra_names.append(allocator, prefixed);
-            break :blk prefixed;
-        };
-        try overrides.append(allocator, .{ .name = name, .value = e.value_ptr.* });
+        try overrides.append(allocator, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
     }
 
     // setDaemonBuildSettings dupes the overrides into owned storage, so this
     // borrowed slice need only live across the call.
     try ev.setDaemonBuildSettings(.{
-        .keep_failed = boolSetting(settings, "keep-failed", false),
-        .keep_going = boolSetting(settings, "keep-going", false),
-        .fallback = boolSetting(settings, "fallback", false),
+        .keep_failed = daemonBoolSetting(settings, "keep-failed", false),
+        .keep_going = daemonBoolSetting(settings, "keep-going", false),
+        .fallback = daemonBoolSetting(settings, "fallback", false),
         .verbosity = @min(7, options.verbose),
         .suppress_build_output = options.no_build_output,
-        .max_build_jobs = jobsSetting(settings, "max-jobs", 1),
-        .max_silent_time = settings.getUint("max-silent-time") orelse 0,
-        .build_cores = settings.getUint("cores") orelse 0,
-        .use_substitutes = boolSetting(settings, "substitute", true),
+        .max_build_jobs = daemonJobsSetting(settings, "max-jobs", 1),
+        .max_silent_time = daemonGetUint(settings, "max-silent-time") orelse 0,
+        .build_cores = daemonGetUint(settings, "cores") orelse 0,
+        .use_substitutes = daemonBoolSetting(settings, "substitute", true),
         .overrides = overrides.items,
     });
 }
@@ -316,9 +303,19 @@ fn boolSetting(settings: *nix_conf.Settings, key: []const u8, default: bool) boo
     return std.mem.eql(u8, t, "true") or std.mem.eql(u8, t, "1");
 }
 
-/// Read `max-jobs`, resolving `auto` to the CPU count (as in Nix).
-fn jobsSetting(settings: *nix_conf.Settings, key: []const u8, default: u64) u64 {
-    const v = settings.get(key) orelse return default;
+fn daemonGetUint(settings: *nix_conf.Settings, key: []const u8) ?u64 {
+    const v = settings.daemon.get(key) orelse return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, v, " \t"), 10) catch null;
+}
+
+fn daemonBoolSetting(settings: *nix_conf.Settings, key: []const u8, default: bool) bool {
+    const v = settings.daemon.get(key) orelse return default;
+    const t = std.mem.trim(u8, v, " \t");
+    return std.mem.eql(u8, t, "true") or std.mem.eql(u8, t, "1");
+}
+
+fn daemonJobsSetting(settings: *nix_conf.Settings, key: []const u8, default: u64) u64 {
+    const v = settings.daemon.get(key) orelse return default;
     const t = std.mem.trim(u8, v, " \t");
     if (std.mem.eql(u8, t, "auto")) return @intCast(std.Thread.getCpuCount() catch 1);
     return std.fmt.parseInt(u64, t, 10) catch default;

@@ -720,6 +720,15 @@ pub const RealizationStore = struct {
         return self.graph.recordFlat(store_path, handle, report_progress);
     }
 
+    /// Whether evaluation recorded a deferred producer for `store_path`.
+    /// Path-demand builtins use this to realize `toFile` and source recipes
+    /// that carry path context but no derivation-output descriptor.
+    pub fn hasRecipe(self: *RealizationStore, store_path: []const u8) bool {
+        self.graph.mu.lock();
+        defer self.graph.mu.unlock();
+        return self.graph.recipes.contains(store_path);
+    }
+
     pub fn releaseRecipePayloads(self: *RealizationStore) void {
         self.graph.releaseRecipePayloads();
     }

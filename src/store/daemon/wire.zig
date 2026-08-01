@@ -16,12 +16,21 @@ pub const worker_magic_2: u64 = 0x6478696f;
 /// Client protocol version we advertise: 1.35. The effective version is the
 /// minimum of this and the daemon's, read at handshake.
 pub const protocol_version: u64 = (1 << 8) | 35;
+/// The oldest daemon protocol fix can safely speak. Store ingestion uses the
+/// modern AddToStore request introduced in 1.25, and daemon errors use the
+/// structured serialization introduced in 1.26.
+pub const minimum_protocol_minor: u64 = 26;
 
 pub fn protocolMajor(v: u64) u64 {
     return v & 0xff00;
 }
 pub fn protocolMinor(v: u64) u64 {
     return v & 0x00ff;
+}
+
+pub fn protocolSupported(v: u64) bool {
+    return protocolMajor(v) == protocolMajor(protocol_version) and
+        protocolMinor(v) >= minimum_protocol_minor;
 }
 
 /// Worker operation opcodes (the subset fix uses).
@@ -126,6 +135,13 @@ test "int roundtrip is little-endian" {
     try std.testing.expectEqualSlices(u8, &.{ 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01 }, &buf);
     var r = std.Io.Reader.fixed(&buf);
     try std.testing.expectEqual(@as(u64, 0x0102_0304_0506_0708), try readInt(&r));
+}
+
+test "supported worker protocol has an explicit modern floor" {
+    try std.testing.expect(!protocolSupported((1 << 8) | 25));
+    try std.testing.expect(protocolSupported((1 << 8) | 26));
+    try std.testing.expect(protocolSupported((1 << 8) | 35));
+    try std.testing.expect(!protocolSupported((2 << 8) | 35));
 }
 
 test "string is length-prefixed and zero-padded to 8 bytes" {

@@ -498,11 +498,22 @@ fn completeHint(
         },
         .experimental_feature => {
             try w.writeAll("normal\n");
-            try writeListValueCandidates(w, value_prefix, expected.replacement, &.{ "fetch-tree", "flakes", "pipe-operators" });
+            try writeListValueCandidates(w, value_prefix, expected.replacement, &.{ "coerce-integers", "fetch-tree", "flakes", "pipe-operators" });
         },
         .deprecated_feature => {
             try w.writeAll("normal\n");
-            try writeListValueCandidates(w, value_prefix, expected.replacement, &.{ "floor-ceil-corrupt-integers", "nul-bytes" });
+            try writeListValueCandidates(w, value_prefix, expected.replacement, &.{
+                "cr-line-endings",
+                "floating-without-zero",
+                "floor-ceil-corrupt-integers",
+                "nix-path-shadow",
+                "nul-bytes",
+                "or-as-identifier",
+                "rec-set-dynamic-attrs",
+                "rec-set-merges",
+                "rec-set-overrides",
+                "tokens-no-whitespace",
+            });
         },
         .setting => {
             try w.writeAll("normal\n");

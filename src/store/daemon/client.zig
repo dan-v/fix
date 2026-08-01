@@ -330,6 +330,8 @@ pub const DaemonStore = struct {
         self.daemon_version = try wire.readInt(self.r());
         if (wire.protocolMajor(self.daemon_version) != wire.protocolMajor(wire.protocol_version))
             return error.ProtocolMajorMismatch;
+        if (wire.protocolMinor(self.daemon_version) < wire.minimum_protocol_minor)
+            return error.ProtocolTooOld;
 
         try wire.writeInt(self.w(), wire.protocol_version);
         const minor = wire.protocolMinor(self.daemon_version);

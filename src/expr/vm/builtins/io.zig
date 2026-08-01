@@ -78,6 +78,14 @@ pub fn demandPathArg(self: *VM, arg: Value) ![]const u8 {
     // uses never get here, so they stay offline.
     if (try fetch.materializePendingFetch(self, path)) return path;
 
+    // `builtins.toFile`, `builtins.path`, and related source producers carry
+    // their own store path as context, not a `.drv` output descriptor. Their
+    // recipe is nevertheless sufficient to materialize the demanded path.
+    if (self.realization.hasRecipe(path)) {
+        try self.realization.ensureClosure(path);
+        return path;
+    }
+
     const context = (try demandContext(self, value)) orelse return path;
     defer context.deinit(self.allocator);
     if (std.mem.eql(u8, path, context.drv_path)) {

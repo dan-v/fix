@@ -64,6 +64,58 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
     return struct {
         const Self = @This();
 
+        /// Atomic circular-slot transport. Zig's generic atomic API only
+        /// supports values up to 64 bits on baseline targets, while the GC's
+        /// range descriptor is a u128. Split that one wide payload into two
+        /// atomic words guarded by a sequence counter: readers retry if slot
+        /// reuse overlaps their snapshot. Every accessed field remains atomic,
+        /// so this is a race-free seqlock rather than a plain-data seqlock.
+        const Slot = if (@bitSizeOf(T) <= 64)
+            std.atomic.Value(T)
+        else
+            struct {
+                const WideSlot = @This();
+                comptime {
+                    const info = @typeInfo(T);
+                    if (info != .int or info.int.signedness != .unsigned or info.int.bits > 128)
+                        @compileError("GrowableDeque payloads wider than 64 bits must be unsigned integers of at most 128 bits");
+                }
+
+                sequence: std.atomic.Value(u64),
+                low: std.atomic.Value(u64),
+                high: std.atomic.Value(u64),
+
+                fn init(value: T) WideSlot {
+                    const bits: u128 = @intCast(value);
+                    return .{
+                        .sequence = .init(0),
+                        .low = .init(@truncate(bits)),
+                        .high = .init(@truncate(bits >> 64)),
+                    };
+                }
+
+                fn store(self: *WideSlot, value: T, _: std.builtin.AtomicOrder) void {
+                    const bits: u128 = @intCast(value);
+                    // The acq_rel RMW prevents the payload stores moving before the
+                    // odd marker; the release RMW publishes both words as one value.
+                    _ = self.sequence.fetchAdd(1, .acq_rel);
+                    self.low.store(@truncate(bits), .monotonic);
+                    self.high.store(@truncate(bits >> 64), .monotonic);
+                    _ = self.sequence.fetchAdd(1, .release);
+                }
+
+                fn load(self: *const WideSlot, _: std.builtin.AtomicOrder) T {
+                    while (true) {
+                        const before = self.sequence.load(.acquire);
+                        if (before & 1 != 0) continue;
+                        const low = self.low.load(.monotonic);
+                        const high = self.high.load(.monotonic);
+                        const after = self.sequence.load(.acquire);
+                        if (before == after) return @intCast(@as(u128, high) << 64 | low);
+                    }
+                }
+            };
+
         /// One generation of the growable circular backing store.
         /// `mask == capacity - 1` (capacity a power of two); indexing is
         /// always `i & mask`. Unused (zero-sized) when `!growable`.
@@ -71,15 +123,15 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             // A losing stealer reads before its top CAS. Once a winner moves
             // top, the owner may reuse that circular slot before the loser
             // attempts its CAS, so the slot access itself must be atomic.
-            items: []std.atomic.Value(T),
+            items: []Slot,
             mask: u64,
 
             fn create(allocator: std.mem.Allocator, capacity: u32) !*Buffer {
                 std.debug.assert(std.math.isPowerOfTwo(capacity));
                 const buf = try allocator.create(Buffer);
                 errdefer allocator.destroy(buf);
-                const items = try allocator.alloc(std.atomic.Value(T), capacity);
-                @memset(items, undefined);
+                const items = try allocator.alloc(Slot, capacity);
+                for (items) |*slot| slot.* = .init(0);
                 buf.* = .{ .items = items, .mask = @as(u64, capacity) - 1 };
                 return buf;
             }

@@ -492,9 +492,9 @@ const specs = [_]Spec{
     .{ .id = .read_write_mode, .long = "--read-write-mode", .help = "allow eval to register derivations and sources in\nthe store", .show_in = &.{.eval} },
     .{ .id = .impure, .long = "--impure", .help = "disable pure evaluation for flake installables\n(allow env, out-of-tree reads, unlocked fetches)", .show_in = selected_source_cmds },
 
-    .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)", .completion_help = "replace enabled experimental features", .complete = .{ .experimental_feature, .none } },
+    .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes, coerce-integers)", .completion_help = "replace enabled experimental features", .complete = .{ .experimental_feature, .none } },
     .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set", .complete = .{ .experimental_feature, .none } },
-    .{ .id = .deprecated_features, .long = "--deprecated-features", .arg = .req, .metavar = "FEATS", .help = "space-separated deprecated features to re-enable,\nreplacing the current set (available: nul-bytes,\nfloor-ceil-corrupt-integers)", .completion_help = "replace deprecated features to re-enable", .complete = .{ .deprecated_feature, .none } },
+    .{ .id = .deprecated_features, .long = "--deprecated-features", .arg = .req, .metavar = "FEATS", .help = "space-separated deprecated features to re-enable;\nsee docs/cli.md for the complete compatibility list", .completion_help = "replace deprecated features to re-enable", .complete = .{ .deprecated_feature, .none } },
     .{ .id = .extra_deprecated_features, .long = "--extra-deprecated-features", .arg = .req, .metavar = "FEATS", .help = "like --deprecated-features, but adds to the set", .complete = .{ .deprecated_feature, .none } },
     .{ .id = .option, .long = "--option", .arg = .req2, .metavar = "NAME VALUE", .help = "override a nix.conf setting", .complete = .{ .setting, .none } },
 
