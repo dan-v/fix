@@ -52,6 +52,73 @@ test "addErrorContext returns the value on success and rethrows the original err
     try std_testing.expectError(error.NixThrow, renderForTest("builtins.addErrorContext \"context\" (builtins.throw \"boom\")"));
 }
 
+test "nested addErrorContext records contexts from the failure outward" {
+    var ev = try Engine.init(std_testing.allocator, .{ .worker_count = 8 });
+    defer ev.deinit();
+
+    try std_testing.expectError(
+        error.NixThrow,
+        ev.evaluate(
+            \\builtins.addErrorContext "outer context"
+            \\  (builtins.addErrorContext "inner context"
+            \\    (builtins.throw "original failure"))
+        ),
+    );
+
+    const trace = ev.getTrace();
+    try std_testing.expectEqualStrings("original failure", trace.message.?);
+    var contexts: [2][]const u8 = undefined;
+    var context_count: usize = 0;
+    for (trace.frames.items) |frame| {
+        if (frame.kind != .context) continue;
+        if (context_count < contexts.len) contexts[context_count] = frame.message;
+        context_count += 1;
+    }
+    try std_testing.expectEqual(@as(usize, 2), context_count);
+    try std_testing.expectEqualStrings("inner context", contexts[0]);
+    try std_testing.expectEqualStrings("outer context", contexts[1]);
+}
+
+test "addErrorContext message failure does not replace the original failure" {
+    var ev = try Engine.init(std_testing.allocator, .{ .worker_count = 8 });
+    defer ev.deinit();
+
+    try std_testing.expectError(
+        error.NixThrow,
+        ev.evaluate(
+            \\builtins.addErrorContext
+            \\  (builtins.throw "context construction failed")
+            \\  (builtins.throw "original failure")
+        ),
+    );
+
+    const trace = ev.getTrace();
+    try std_testing.expectEqualStrings("original failure", trace.message.?);
+    for (trace.frames.items) |frame| {
+        try std_testing.expect(std.mem.indexOf(u8, frame.message, "context construction failed") == null);
+    }
+}
+
+test "tryEval clears a handled failure before a later unrelated error" {
+    var ev = try Engine.init(std_testing.allocator, .{ .worker_count = 8 });
+    defer ev.deinit();
+
+    try std_testing.expectError(
+        error.NixThrow,
+        ev.evaluate(
+            \\builtins.seq
+            \\  (builtins.tryEval (builtins.throw "handled failure"))
+            \\  (builtins.throw "visible failure")
+        ),
+    );
+
+    const trace = ev.getTrace();
+    try std_testing.expectEqualStrings("visible failure", trace.message.?);
+    for (trace.frames.items) |frame| {
+        try std_testing.expect(std.mem.indexOf(u8, frame.message, "handled failure") == null);
+    }
+}
+
 test "trace forces the message and returns the value unchanged" {
     const traced = try renderForTest("builtins.trace \"msg\" 42");
     defer std_testing.allocator.free(traced);

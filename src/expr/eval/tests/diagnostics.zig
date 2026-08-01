@@ -148,3 +148,45 @@ test "evaluate records imported file source trace" {
     try std.testing.expectEqual(@as(u32, 1), trace.frames.items[0].diagnostic.?.line);
     try std.testing.expectEqual(@as(u32, 9), trace.frames.items[0].diagnostic.?.column);
 }
+
+test "cached import failures retain their original diagnostics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "cached-failure.nix",
+        .data = "builtins.throw \"cached import failure\"\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "cached-failure.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(std.testing.allocator, "import {s}", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 8 });
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    // The second evaluation observes ImportEntry's terminal failure rather
+    // than evaluating the imported file again. Both observations must expose
+    // the same Nix message and imported origin, not the Zig error-set name.
+    for (0..2) |_| {
+        try std.testing.expectError(error.NixThrow, ev.evaluate(source));
+        const trace = ev.getTrace();
+        try std.testing.expectEqualStrings("cached import failure", trace.message.?);
+        var found_import_origin = false;
+        for (trace.frames.items) |frame| {
+            if (frame.source_path) |path| {
+                if (std.mem.eql(u8, path, file_path)) found_import_origin = true;
+            }
+        }
+        try std.testing.expect(found_import_origin);
+    }
+}

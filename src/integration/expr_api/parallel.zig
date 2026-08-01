@@ -136,3 +136,40 @@ test "parallel: forceDeep fans wide attrset out to helpers" {
     );
     try ev.forceDeep(value);
 }
+
+test "parallel: speculative import scheduling does not mask demanded failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "speculative-failure.nix",
+        .data = "builtins.throw \"speculative import failure\"\n",
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "speculative-failure.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(std.testing.allocator,
+        \\let
+        \\  imports = builtins.map import (builtins.genList (_: {s}) 64);
+        \\  submit = builtins.length imports;
+        \\  busy = builtins.foldl' (a: b: a + b) 0 (builtins.genList (i: i) 4096);
+        \\in builtins.seq submit (builtins.seq busy (builtins.throw "demanded failure"))
+    , .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 8 });
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    try std.testing.expectError(error.NixThrow, ev.evaluate(source));
+    try std.testing.expectEqualStrings("demanded failure", ev.getTrace().message.?);
+    const stats = ev.schedulerStats();
+    try std.testing.expect(stats.speculative_submitted > 0);
+}

@@ -199,6 +199,71 @@ test "throw enters the debugger, then the error still propagates" {
     try std.testing.expectEqualStrings("\"boom\"", probe.value());
 }
 
+test "caught debugger eval failure does not mask a later language error" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer ev.deinit();
+
+    const Ctl = struct {
+        ran: bool = false,
+
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.reason != .break_builtin or self.ran) return;
+            self.ran = true;
+
+            _ = s.eval("builtins.throw \"debugger-only failure\"", null) catch {};
+
+            // Attrset rendering probes `type` to recognize derivations. That
+            // nested force must remain on the debugger's ancillary trace.
+            const attrs = try s.eval(
+                "{ type = builtins.throw \"debugger render failure\"; }",
+                null,
+            );
+            var buffer: [256]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buffer);
+            s.writeValue(&writer, attrs) catch {};
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    try std.testing.expectError(
+        error.NixThrow,
+        ev.evaluate(
+            \\builtins.seq
+            \\  (builtins.break null)
+            \\  (builtins.throw "visible program failure")
+        ),
+    );
+    try std.testing.expect(ctl.ran);
+    try std.testing.expectEqualStrings("visible program failure", ev.getTrace().message.?);
+}
+
+test "caught debugger eval failure at error entry preserves the original failure" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
+    defer ev.deinit();
+
+    const Ctl = struct {
+        ran: bool = false,
+
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.reason != .eval_error or self.ran) return;
+            self.ran = true;
+            _ = s.eval("builtins.throw \"debugger-only failure\"", null) catch {};
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    try std.testing.expectError(
+        error.NixThrow,
+        ev.evaluate("builtins.throw \"original program failure\""),
+    );
+    try std.testing.expect(ctl.ran);
+    try std.testing.expectEqualStrings("original program failure", ev.getTrace().message.?);
+}
+
 test "tryEval suppresses debugger error-entry for caught errors" {
     var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 1 });
     defer ev.deinit();
