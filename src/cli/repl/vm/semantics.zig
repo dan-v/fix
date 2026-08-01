@@ -53,6 +53,7 @@ pub const debug_help_text =
     \\  Enter          open the selected frame / follow a reference
     \\  i / :          evaluate an expression / run a command
     \\  break F:L      set a source-line breakpoint
+    \\  :gc            collect garbage and refresh heap views
 ;
 
 pub fn debugPageOf(arena: std.mem.Allocator, page: *PageBuilder, title: []const u8) !Page {

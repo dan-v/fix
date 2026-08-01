@@ -25,6 +25,7 @@ pub const Command = union(enum) {
     breakpoint: []const u8,
     breakpoints,
     delete: []const u8,
+    gc,
     help,
     eval: []const u8,
 };
@@ -51,6 +52,7 @@ pub fn parse(line_raw: []const u8) Command {
         if (isWord(word, &.{ "l", "locals" })) return .locals;
         if (isWord(word, &.{ "v", "value" })) return .value;
         if (isWord(word, &.{ "breakpoints", "info" })) return .breakpoints;
+        if (isWord(word, &.{"gc"})) return .gc;
         if (isWord(word, &.{ "help", "h", "?" })) return .help;
     }
     if (explicit and isWord(word, &.{"frame"})) return .{ .frame = rest };
@@ -142,6 +144,24 @@ pub fn deleteBreakpoint(session: *DebugSession, writer: *std.Io.Writer, arg: []c
         try writer.print("no breakpoint {d}", .{id});
 }
 
+pub fn collectGarbage(session: *DebugSession, writer: *std.Io.Writer) !void {
+    const result = session.collectGarbage();
+    if (!result.ran) {
+        try writer.writeAll("gc: collector inactive");
+    } else if (result.collections == 0) {
+        try writer.print("gc: collector armed; heap capacity {d:.1} MiB retained for reuse", .{
+            @as(f64, @floatFromInt(result.capacity_bytes)) / (1 << 20),
+        });
+    } else {
+        try writer.print("gc: freed {d} object{s}; live {d:.1} MiB; heap capacity {d:.1} MiB retained for reuse", .{
+            result.objects_freed,
+            if (result.objects_freed == 1) "" else "s",
+            @as(f64, @floatFromInt(result.live_bytes)) / (1 << 20),
+            @as(f64, @floatFromInt(result.capacity_bytes)) / (1 << 20),
+        });
+    }
+}
+
 fn firstWord(s: []const u8) []const u8 {
     const end = std.mem.indexOfAny(u8, s, " \t") orelse s.len;
     return s[0..end];
@@ -161,6 +181,7 @@ test "debugger command ambiguity keeps expressions intact" {
     try std.testing.expectEqualStrings("2", parse(":frame 2").frame);
     try std.testing.expectEqualStrings("", parse(":frame").frame);
     try std.testing.expectEqualStrings("object 3", parse(":vm object 3").explore);
+    try std.testing.expect(parse(":gc") == .gc);
     try std.testing.expectEqualStrings("frame", parse("frame").eval);
     try std.testing.expectEqualStrings("frame 2", parse("frame 2").eval);
     try std.testing.expect(parse("break file.nix:12") == .breakpoint);

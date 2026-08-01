@@ -298,6 +298,17 @@ pub fn Methods(comptime Explorer: type) type {
                 .breakpoint => |arg| try Explorer.Ops.debug_view.debugAddBreakpoint(self, session, capture, arg),
                 .breakpoints => try Explorer.Ops.debug_view.debugListBreakpoints(self, session, capture),
                 .delete => |arg| try Explorer.Ops.debug_view.debugDeleteBreakpoint(self, session, capture, arg),
+                .gc => {
+                    // Object ids and liveness bitmaps become stale at sweep.
+                    // Drop them before collection, then rebuild the paused
+                    // projection from the surviving session-rooted graph.
+                    self.clearHeapSnapshots();
+                    self.clearReferenceGraph();
+                    try command_mod.collectGarbage(session, &capture.writer);
+                    self.refreshPausedTreeSnapshots();
+                    try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
+                    try Explorer.Ops.pages.refreshPage(self, Explorer.Ops.view_state.currentKind(self));
+                },
             }
             try Explorer.Ops.source_view.rebuildTranscriptLines(self, capture.written());
             return .running;

@@ -185,6 +185,12 @@ pub const Console = struct {
             .breakpoint => |arg| try self.addBreakpoint(s, arg),
             .breakpoints => try self.listBreakpoints(s),
             .delete => |arg| try self.deleteBreakpoint(s, arg),
+            .gc => {
+                var out = self.stderr();
+                defer out.interface.flush() catch {};
+                try command_mod.collectGarbage(s, &out.interface);
+                try out.interface.writeByte('\n');
+            },
             .help => try self.help(),
             .eval => |source| {
                 const result = s.eval(source, scope) catch |e| {
@@ -507,6 +513,7 @@ pub const Console = struct {
             \\  break FILE:LINE   set a source-line breakpoint (nearest code line)
             \\  breakpoints       list breakpoints
             \\  delete N          remove breakpoint N
+            \\  :gc               run a full garbage collection at the pause
             \\  n / next          step to the next line (over calls)
             \\  s / step          step to the next line (into calls)
             \\  finish            run until the current frame returns

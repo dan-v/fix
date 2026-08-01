@@ -524,7 +524,9 @@ out=$(
         printf ':vm\r'
         sleep 0.5
         printf ':d (import ./test/imported.nix).value\r'
-        sleep 0.6
+        sleep 1
+        printf ':gc\r'
+        sleep 0.8
         printf 's'
         sleep 0.5
         printf 'c'
@@ -540,6 +542,7 @@ out=$(
 )
 t "tty vm debug: debugger is integrated" "paused/entry" "$out"
 t "tty vm debug: explorer redraws" "fix vm" "$out"
+t "tty vm debug: gc runs inside the borrowed explorer" "gc:" "$out"
 vm_debug_enters=$(grep -o $'\x1b\[?1049h' <<<"$out" | wc -l)
 vm_debug_leaves=$(grep -o $'\x1b\[?1049l' <<<"$out" | wc -l)
 if ((vm_debug_enters == 1 && vm_debug_leaves == 1)); then
