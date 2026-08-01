@@ -14,6 +14,12 @@ const hugetlb = @import("base").hugetlb;
 const TextRef = @import("base").TextRef;
 
 const Engine = engine.Engine;
+pub const default_state_dir = "/nix/var/nix";
+
+pub fn stateDir(init: std.process.Init) []const u8 {
+    const value = init.environ_map.get("NIX_STATE_DIR") orelse return default_state_dir;
+    return if (value.len == 0) default_state_dir else value;
+}
 
 /// Resolve the worker-thread count: an explicit `--workers`, else
 /// `min(12, cpu_count)` (1 when single-threaded).
@@ -78,6 +84,10 @@ pub fn loadSettingsAndFlakeConfig(
 ) !nix_conf.Settings {
     var settings = try nix_conf.load(allocator, init.environ_map, init.io);
     errdefer settings.deinit();
+    // Environment store selection sits above nix.conf but below an explicit
+    // `--store`/`--option store` CLI override.
+    if (init.environ_map.get("NIX_REMOTE")) |remote|
+        if (remote.len != 0) try settings.setOrAppend("store", remote);
     for (options.option_overrides.items) |override|
         try settings.setOrAppend(override.name, override.value);
     applyFlakeNixConfig(allocator, init, options, &settings);
@@ -150,19 +160,37 @@ pub fn configure(
     // A nonstandard state directory moves the default daemon socket for both
     // Nix and Lix. An explicit socket path still wins.
     if (init.environ_map.get("NIX_DAEMON_SOCKET_PATH")) |sock| {
-        if (sock.len != 0) try ev.setDaemonSocket(sock);
-    } else if (init.environ_map.get("NIX_STATE_DIR")) |state_dir| {
-        if (state_dir.len != 0) {
-            const socket = try std.fs.path.join(ev.hostAllocator(), &.{ state_dir, "daemon-socket", "socket" });
-            defer ev.hostAllocator().free(socket);
-            try ev.setDaemonSocket(socket);
+        if (sock.len != 0) {
+            const uri = try std.fmt.allocPrint(ev.hostAllocator(), "unix://{s}", .{sock});
+            defer ev.hostAllocator().free(uri);
+            try ev.setDaemonSocket(uri);
         }
+    } else if (init.environ_map.get("NIX_STATE_DIR") != null) {
+        const socket = try std.fs.path.join(ev.hostAllocator(), &.{ stateDir(init), "daemon-socket", "socket" });
+        defer ev.hostAllocator().free(socket);
+        const uri = try std.fmt.allocPrint(ev.hostAllocator(), "unix://{s}", .{socket});
+        defer ev.hostAllocator().free(uri);
+        try ev.setDaemonSocket(uri);
     }
-    // The store URI (`store` from nix.conf / `--store`, or legacy `NIX_REMOTE`)
+    // The store URI (`store` from nix.conf / `NIX_REMOTE` / `--store`)
     // selects the daemon transport and wins over NIX_DAEMON_SOCKET_PATH. E.g.
     // `ssh-ng://host` speaks the worker protocol over `ssh host nix-daemon --stdio`.
-    if (settings.get("store") orelse init.environ_map.get("NIX_REMOTE")) |uri|
-        if (uri.len != 0) try ev.setDaemonSocket(uri);
+    if (settings.get("store")) |uri| {
+        if (uri.len != 0) {
+            if (std.fs.path.isAbsolute(uri)) {
+                // Preserve the distinction from NIX_DAEMON_SOCKET_PATH after
+                // setup hands the URI to the transport-agnostic store client.
+                // Older Nix/Lix environments also spell the standard daemon
+                // endpoint as a bare absolute `.../daemon-socket/socket` URI.
+                const prefix = if (std.mem.endsWith(u8, uri, "/daemon-socket/socket")) "unix://" else "local-root:";
+                const tagged = try std.fmt.allocPrint(ev.hostAllocator(), "{s}{s}", .{ prefix, uri });
+                defer ev.hostAllocator().free(tagged);
+                try ev.setDaemonSocket(tagged);
+            } else {
+                try ev.setDaemonSocket(uri);
+            }
+        }
+    }
     try applyDaemonSettings(ev, options, settings);
     try ev.setBasePathFromCurrentPath(init.io);
     try applyNixPath(ev, init, options);

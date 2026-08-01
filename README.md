@@ -97,9 +97,10 @@ build environment and dependencies:
 $ nix-shell --run 'zig build --release=fast'
 ```
 
-Nix is required to use `fix`: keep a working Nix or Lix installation and a
-reachable daemon on the system where it runs. Tagged releases publish optimized
-build archives for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
+Nix is required to use `fix`: keep a working Nix or Lix installation. Normal
+operation uses its daemon; `local`, `auto`, and chroot stores use the installed
+`nix-daemon --stdio` helper. Tagged releases publish optimized build archives
+for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
 
 ```console
 $ ./zig-out/bin/fix eval -E '1 + 2'
@@ -117,18 +118,21 @@ The package also includes shell completions for Bash, Fish, and Zsh.
 `fix` speaks the stable Nix worker protocol used by both CppNix and Lix. It
 accepts protocol versions 1.26 through 1.35 and advertises 1.35, so daemons older
 than Nix 2.4 are rejected with a protocol error instead of being used
-incorrectly. Lix's legacy-compatible socket is supported; an installation
-configured to expose only the experimental `lix-xp-1` protocol is not yet
-supported.
+incorrectly. Lix `protocol=any`, `legacy`, `legacy-combined`, and `lix-xp-1`
+socket URIs are supported. Stable worker sockets are used directly; an XP-only
+endpoint is bridged through the installed Lix `nix-daemon --stdio` helper, so
+the unstable RPC remains owned by the matching Lix installation.
 
 The default local socket follows `NIX_STATE_DIR` (or `/nix/var/nix`), and
 `NIX_DAEMON_SOCKET_PATH` overrides it. `NIX_REMOTE`, `--store`, and the
-`nix.conf` `store` setting can select `daemon`, `unix://`, `ssh-ng://`, or
-`tcp://` transports. The in-process `local` store backend is not implemented;
-`fix` always needs a daemon. Like Nix, only user config, `$NIX_CONFIG`, and
-explicit CLI overrides are forwarded to the daemon; system `nix.conf` settings
-remain daemon-side policy. Direct GC-root paths and `fix switch`'s default
-system profile still assume the conventional `/nix/var/nix` state layout.
+`nix.conf` `store` setting can select `daemon`, `unix://`, `local`, `auto`, an
+absolute chroot root, `ssh-ng://`, or `tcp://` transports. Direct and chroot
+stores are adapted to the worker protocol through `nix-daemon --stdio`, keeping
+store ownership and database logic in the installed Nix/Lix implementation.
+Like Nix, only user config, `$NIX_CONFIG`, and explicit CLI overrides are
+forwarded to the daemon; system `nix.conf` settings remain daemon-side policy.
+Direct GC-root checks and local/remote `fix switch` system profiles also follow
+`NIX_STATE_DIR`.
 
 `builtins.nixVersion` deliberately reports `2.18.3`: it is the evaluator
 compatibility baseline, not the version or brand of the connected daemon.
@@ -175,8 +179,8 @@ $ fix build -A fix
 ```
 
 Arguments can be supplied with `--arg` and `--argstr`. Evaluation can produce
-Nix, JSON, XML, or raw output, and can be made strict. Builds can target the
-local daemon or remote `ssh-ng://` and `tcp://` stores.
+Nix, JSON, XML, or raw output, and can be made strict. Builds can target daemon,
+direct/chroot, `ssh-ng://`, and `tcp://` stores.
 
 ### Run programs and open temporary shells
 

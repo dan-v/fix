@@ -82,7 +82,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const code = if (options.dry_run)
         try realization_workflow.dryRunMany(allocator, init.io, &ev, process.eval_release, term, &options, inputs)
     else
-        try realization_workflow.realizeMany(allocator, init.io, &ev, process.eval_release, term, &options, progress.renderer(), inputs);
+        try realization_workflow.realizeMany(allocator, init.io, &ev, process.eval_release, term, setup.stateDir(init), &options, progress.renderer(), inputs);
     ok = code == 0;
     return code;
 }

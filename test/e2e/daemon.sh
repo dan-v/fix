@@ -32,6 +32,54 @@ if ((code != 0)); then
 fi
 t "daemon: instantiate through commented store setting" "/nix/store/" "$out"
 
+# Lix's `protocol=any` URI treats the path as a socket directory. fix selects
+# the legacy socket within it, which also works against a CppNix daemon.
+daemon_base="${NIX_STATE_DIR:-/nix/var/nix}/daemon-socket"
+out=$("$FIX" instantiate --store "unix://${daemon_base}?protocol=any" -E "$drv_expr" 2>&1)
+code=$?
+if ((code == 0)); then
+    pass "daemon: Lix protocol=any legacy fallback"
+else
+    fail "daemon: Lix protocol=any legacy fallback"
+    echo "  got: $(printf '%q' "$out")" | head -c 2000
+    echo
+fi
+
+xp_uri="unix://${daemon_base}?protocol=lix-xp-1"
+if command -v nix >/dev/null 2>&1 && nix store ping --store "$xp_uri" >/dev/null 2>&1; then
+    out=$("$FIX" instantiate --store "$xp_uri" -E "$drv_expr" 2>&1)
+    if (($? == 0)); then
+        pass "daemon: Lix XP endpoint through stdio bridge"
+    else
+        fail "daemon: Lix XP endpoint through stdio bridge"
+        echo "  got: $(printf '%q' "$out")" | head -c 2000
+        echo
+    fi
+else
+    skip "daemon: Lix XP endpoint bridge" "endpoint not exposed"
+fi
+
+out=$("$FIX" instantiate --store auto -E "$drv_expr" 2>&1)
+if (($? == 0)); then
+    pass "store auto: installed implementation selects backend"
+else
+    fail "store auto: installed implementation selects backend"
+    echo "  got: $(printf '%q' "$out")" | head -c 2000
+    echo
+fi
+
+custom_state=$(e2e_mktemp)
+mkdir -p "$custom_state/daemon-socket"
+ln -s "$daemon_base/socket" "$custom_state/daemon-socket/socket"
+out=$(env NIX_STATE_DIR="$custom_state" "$FIX" instantiate -E "$drv_expr" 2>&1)
+if (($? == 0)); then
+    pass "daemon: NIX_STATE_DIR selects socket"
+else
+    fail "daemon: NIX_STATE_DIR selects socket"
+    echo "  got: $(printf '%q' "$out")" | head -c 2000
+    echo
+fi
+
 out=$("$FIX" build --no-out-link -E "$drv_expr" 2>&1)
 code=$?
 if ((code == 0)); then
@@ -54,5 +102,30 @@ else
     fail "daemon: realize toFile before readFile"
 fi
 t "daemon: read fresh text object" "text-via-daemon" "$out"
+
+# An absolute store URI is a Nix/Lix chroot store root. fix serves it through
+# the installed nix-daemon's stdio worker endpoint, without a persistent daemon.
+local_root=$(e2e_mktemp)
+local_expr='builtins.derivation {
+  name = "fix-local-e2e";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  args = [ "-c" "printf local-compatible > \"$out\"" ];
+}'
+out=$("$FIX" build --no-out-link --store "$local_root" -E "$local_expr" 2>&1)
+code=$?
+logical=$(printf '%s\n' "$out" | grep '^/nix/store/' | tail -1)
+if ((code == 0)); then
+    pass "local store: realize through stdio helper"
+else
+    fail "local store: realize through stdio helper"
+    echo "  got: $(printf '%q' "$out")" | head -c 2000
+    echo
+fi
+if [[ -n "$logical" && -f "$local_root$logical" && "$(<"$local_root$logical")" == local-compatible ]]; then
+    pass "local store: physical chroot output"
+else
+    fail "local store: physical chroot output"
+fi
 
 e2e_finish

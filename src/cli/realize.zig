@@ -122,6 +122,7 @@ const OrderedPrinter = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     ev: *Engine,
+    state_dir: []const u8,
     options: *const args.Options,
     slots: []BuildSlot,
     use_color: bool,
@@ -195,7 +196,7 @@ const OrderedPrinter = struct {
         const name = numberedName(self.allocator, base, index) catch return;
         defer self.allocator.free(name);
         const indirect = self.options.add_root == null or self.options.indirect;
-        linkRoot(self.io, self.allocator, self.ev, name, target, indirect);
+        linkRoot(self.io, self.allocator, self.ev, self.state_dir, name, target, indirect);
     }
 
     fn linkDrv(self: *OrderedPrinter, index: usize, target: []const u8) void {
@@ -224,7 +225,7 @@ pub fn makeLink(io: std.Io, name: []const u8, target: []const u8) !void {
     try cwd.symLink(io, target, name, .{});
 }
 
-pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Engine, name: []const u8, target: []const u8, indirect: bool) void {
+pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Engine, state_dir: []const u8, name: []const u8, target: []const u8, indirect: bool) void {
     makeLink(io, name, target) catch |err| {
         std.debug.print("warning: could not create {s}: {s}\n", .{ name, @errorName(err) });
         return;
@@ -235,13 +236,20 @@ pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Engine, name: []c
     };
     defer allocator.free(abs);
     if (!indirect) {
-        if (!std.mem.startsWith(u8, abs, "/nix/var/nix/gcroots/"))
+        if (!isDirectRootPath(state_dir, abs))
             std.debug.print("warning: {s} is not in the gcroots directory, so it will not be an effective GC root (pass --indirect)\n", .{abs});
         return;
     }
     ev.addIndirectRoot(abs, target) catch |err| {
         std.debug.print("warning: could not register GC root {s}: {s}\n", .{ abs, @errorName(err) });
     };
+}
+
+fn isDirectRootPath(state_dir: []const u8, path: []const u8) bool {
+    const state = std.mem.trimEnd(u8, state_dir, "/");
+    if (!std.mem.startsWith(u8, path, state)) return false;
+    const rest = path[state.len..];
+    return std.mem.startsWith(u8, rest, "/gcroots/");
 }
 
 fn absolutePath(io: std.Io, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -260,6 +268,7 @@ pub fn realizeMany(
     ev: *Engine,
     release_action: ?@import("expr").ReleaseAction,
     terminal: setup.Terminal,
+    state_dir: []const u8,
     options: *const args.Options,
     progress: *EvalProgress,
     inputs: []const BuildInput,
@@ -298,6 +307,7 @@ pub fn realizeMany(
         .allocator = allocator,
         .io = io,
         .ev = ev,
+        .state_dir = state_dir,
         .options = options,
         .slots = slots,
         .use_color = terminal.use_color,
@@ -526,6 +536,13 @@ test "build 1 starts before slow evaluation 2 finishes" {
 
 test "build 2 starts before slow evaluation 1 finishes" {
     try proveBuildStartsBeforeOtherEvaluationFinishes(0);
+}
+
+test "direct GC roots follow NIX_STATE_DIR with path boundaries" {
+    try std.testing.expect(isDirectRootPath("/custom/state", "/custom/state/gcroots/project/result"));
+    try std.testing.expect(isDirectRootPath("/custom/state/", "/custom/state/gcroots/result"));
+    try std.testing.expect(!isDirectRootPath("/custom/state", "/custom/state/gcroots-other/result"));
+    try std.testing.expect(!isDirectRootPath("/custom/state", "/custom/stateful/gcroots/result"));
 }
 
 pub fn realize(

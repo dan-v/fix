@@ -185,7 +185,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
 
     // `build`: just link ./result and print the path, like `fix build`.
     if (action == .build) {
-        build.linkRoot(init.io, allocator, &ev, "result", out_path, true);
+        build.linkRoot(init.io, allocator, &ev, setup.stateDir(init), "result", out_path, true);
         var stdout_buf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
         try w.interface.print("{s}\n", .{out_path});
@@ -197,7 +197,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
     // (which may block for seconds on a sudo password prompt) with an indirect
     // root, cleaned up once we're done.
     const gc_link = ".fix-switch-gcroot";
-    build.linkRoot(init.io, allocator, &ev, gc_link, out_path, true);
+    build.linkRoot(init.io, allocator, &ev, setup.stateDir(init), gc_link, out_path, true);
     defer std.Io.Dir.cwd().deleteFile(init.io, gc_link) catch {};
 
     // Remote deploy: copy the closure and activate on the target host over SSH.
@@ -238,8 +238,10 @@ fn deployRemote(allocator: std.mem.Allocator, init: std.process.Init, target: Ta
     // 2. Set the remote system profile (switch/boot). Done with the target's own
     // `nix-env` over SSH — the remote profile dir is root-owned there too.
     if (setsProfile(target, action)) {
+        const profile = try std.fs.path.join(allocator, &.{ setup.stateDir(init), "profiles", "system" });
+        defer allocator.free(profile);
         const code = try remoteRun(allocator, init, host, remote_sudo, &.{
-            "nix-env", "-p", "/nix/var/nix/profiles/system", "--set", top,
+            "nix-env", "-p", profile, "--set", top,
         });
         if (code != 0) return code;
     }
@@ -287,8 +289,11 @@ fn sudoReexec(allocator: std.mem.Allocator, init: std.process.Init, target: Targ
     };
     defer allocator.free(self);
 
+    const state_assignment = try std.fmt.allocPrint(allocator, "NIX_STATE_DIR={s}", .{setup.stateDir(init)});
+    defer allocator.free(state_assignment);
     const argv = [_][]const u8{
-        "sudo",             self,                  "switch", action.word(),
+        "sudo",             "env",                 state_assignment,
+        self,               "switch",              action.word(),
         targetFlag(target), "--activate-toplevel", top,
     };
     var child = std.process.spawn(init.io, .{ .argv = &argv, .environ_map = init.environ_map }) catch |err| {
@@ -304,7 +309,7 @@ fn sudoReexec(allocator: std.mem.Allocator, init: std.process.Init, target: Targ
 
 fn activate(allocator: std.mem.Allocator, init: std.process.Init, target: Target, action: Action, top: []const u8) !u8 {
     if (setsProfile(target, action)) {
-        setSystemProfile(init.io, top) catch |err| {
+        setSystemProfile(allocator, init.io, setup.stateDir(init), top) catch |err| {
             std.debug.print("error: setting the system profile: {s}\n", .{@errorName(err)});
             return 1;
         };
@@ -312,16 +317,15 @@ fn activate(allocator: std.mem.Allocator, init: std.process.Init, target: Target
     return runActivation(allocator, init, target, action, top);
 }
 
-/// The system profile all NixOS/nix-darwin generations hang off. The profiles
-/// directory is itself a GC-roots indirection (`/nix/var/nix/gcroots/profiles`),
-/// so a new generation link is a GC root the moment it exists.
-const profiles_dir = "/nix/var/nix/profiles";
 const profile_name = "system";
 
 /// Create a new generation of the system profile pointing at `top` and swap the
 /// `system` symlink onto it — the `nix-env -p …/system --set <top>` equivalent,
-/// done in-tree (no `nix-env`). Needs write access to `profiles_dir` (root).
-fn setSystemProfile(io: std.Io, top: []const u8) !void {
+/// done in-tree (no `nix-env`). The state directory's `profiles` tree is itself
+/// a GC-roots indirection, so each generation is protected immediately.
+fn setSystemProfile(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, top: []const u8) !void {
+    const profiles_dir = try std.fs.path.join(allocator, &.{ state_dir, "profiles" });
+    defer allocator.free(profiles_dir);
     var dir = try std.Io.Dir.openDirAbsolute(io, profiles_dir, .{ .iterate = true });
     defer dir.close(io);
 

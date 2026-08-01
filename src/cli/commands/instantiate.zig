@@ -149,7 +149,7 @@ fn instantiateOne(
     if (options.add_root) |root_path| {
         const name = try build.numberedName(allocator, root_path, index);
         defer allocator.free(name);
-        build.linkRoot(init.io, allocator, ev, name, drv_path, options.indirect);
+        build.linkRoot(init.io, allocator, ev, setup.stateDir(init), name, drv_path, options.indirect);
     }
     if (options.add_drv_link) {
         const name = try build.numberedName(allocator, options.drv_link orelse "derivation", index);

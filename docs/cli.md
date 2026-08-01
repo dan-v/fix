@@ -228,6 +228,7 @@ eval is just the "pin everything" caller of the same machinery.
 
 | Flag | Meaning |
 |---|---|
+| `--store STORE-URI` | select `daemon`/`unix://`, `local`/`auto`, an absolute chroot root, `ssh-ng://`, or `tcp://`; all Lix socket selectors are accepted, with XP-only endpoints bridged through the installed Lix helper |
 | `-o, --out-link NAME` | name of the result symlink (`build`; default `result`); `--no-out-link` (alias `--no-link`) skips it |
 | `--dry-run` | (`build`) report the daemon's build/substitution plan without realizing or linking it |
 | `-Q, --no-build-output` | suppress builder stdout/stderr |
