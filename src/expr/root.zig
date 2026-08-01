@@ -37,4 +37,5 @@ test {
     _ = evaluator;
     _ = @import("support.zig");
     _ = probe;
+    _ = @import("eval/concurrency_tests.zig");
 }

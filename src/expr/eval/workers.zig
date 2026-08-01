@@ -31,4 +31,5 @@ test {
     _ = fiber_executor;
     _ = daemon_executor;
     _ = @import("workers/tests/worker.zig");
+    _ = @import("workers/concurrency_tests.zig");
 }

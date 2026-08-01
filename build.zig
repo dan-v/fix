@@ -221,6 +221,30 @@ pub fn build(b: *std.Build) void {
     expr_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
     const run_expr_tests = b.addRunArtifact(expr_tests);
 
+    // Focused concurrency protocol suite. The tests live beside the modules
+    // whose invariants they exercise; filters keep this lane small enough for
+    // sanitizer and repeated stress runs without creating a second module
+    // graph or production-only test hooks.
+    const concurrency_runtime_tests = b.addTest(.{
+        .name = "concurrency-runtime-tests",
+        .root_module = runtime_mod,
+        .test_runner = simple_test_runner,
+        .filters = &.{"concurrency:"},
+        .use_llvm = true,
+    });
+    concurrency_runtime_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "2m", null });
+    const run_concurrency_runtime_tests = b.addRunArtifact(concurrency_runtime_tests);
+
+    const concurrency_expr_tests = b.addTest(.{
+        .name = "concurrency-expr-tests",
+        .root_module = expr_mod,
+        .test_runner = simple_test_runner,
+        .filters = &.{"concurrency:"},
+        .use_llvm = true,
+    });
+    concurrency_expr_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "2m", null });
+    const run_concurrency_expr_tests = b.addRunArtifact(concurrency_expr_tests);
+
     const integration_test_mod = b.createModule(.{
         .root_source_file = b.path("src/integration/expr_api.zig"),
         .target = target,
@@ -276,6 +300,9 @@ pub fn build(b: *std.Build) void {
     test_fetchers_step.dependOn(&run_fetchers_tests.step);
     const test_expr_step = b.step("test-expr", "Run evaluator unit tests");
     test_expr_step.dependOn(&run_expr_tests.step);
+    const test_concurrency_step = b.step("test-concurrency", "Run focused concurrency protocol tests");
+    test_concurrency_step.dependOn(&run_concurrency_runtime_tests.step);
+    test_concurrency_step.dependOn(&run_concurrency_expr_tests.step);
     const test_integration_step = b.step("test-integration", "Run integration tests");
     test_integration_step.dependOn(&run_integration_tests.step);
     const test_cli_step = b.step("test-cli", "Run CLI unit tests");

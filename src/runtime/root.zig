@@ -46,4 +46,5 @@ test {
     _ = gc;
     _ = builtins;
     _ = mem_tag;
+    _ = @import("concurrency_tests.zig");
 }
