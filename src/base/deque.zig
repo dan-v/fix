@@ -68,14 +68,17 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
         /// `mask == capacity - 1` (capacity a power of two); indexing is
         /// always `i & mask`. Unused (zero-sized) when `!growable`.
         const Buffer = struct {
-            items: []T,
+            // A losing stealer reads before its top CAS. Once a winner moves
+            // top, the owner may reuse that circular slot before the loser
+            // attempts its CAS, so the slot access itself must be atomic.
+            items: []std.atomic.Value(T),
             mask: u64,
 
             fn create(allocator: std.mem.Allocator, capacity: u32) !*Buffer {
                 std.debug.assert(std.math.isPowerOfTwo(capacity));
                 const buf = try allocator.create(Buffer);
                 errdefer allocator.destroy(buf);
-                const items = try allocator.alloc(T, capacity);
+                const items = try allocator.alloc(std.atomic.Value(T), capacity);
                 @memset(items, undefined);
                 buf.* = .{ .items = items, .mask = @as(u64, capacity) - 1 };
                 return buf;
@@ -145,16 +148,15 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             return if (growable) self.array.load(ord).mask else self.mask;
         }
 
-        /// Resolves slot `i` for reading/writing, in whichever backing
-        /// buffer this flavor uses. `ord` is the ordering for the growable
-        /// buffer-pointer load; unused (and comptime-dead) when
-        /// `!growable`.
-        inline fn bufferSlot(self: *Self, i: u64, comptime ord: std.builtin.AtomicOrder) *T {
+        /// Read logical slot `i`. `ord` orders the growable buffer-pointer
+        /// load; the slot load itself only needs atomicity because publication
+        /// is carried by `bottom` (or by the new buffer pointer during grow).
+        inline fn readSlot(self: *Self, i: u64, comptime ord: std.builtin.AtomicOrder) T {
             if (growable) {
                 const buf = self.array.load(ord);
-                return &buf.items[@intCast(i & buf.mask)];
+                return buf.items[@intCast(i & buf.mask)].load(.monotonic);
             } else {
-                return &self.items[@intCast(i & self.mask)];
+                return self.items[@intCast(i & self.mask)];
             }
         }
 
@@ -171,7 +173,10 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             // `new.items[i & new.mask]` therefore observe the same value.
             var i = t;
             while (i != b) : (i +%= 1) {
-                new.items[@intCast(i & new.mask)] = old.items[@intCast(i & old.mask)];
+                new.items[@intCast(i & new.mask)].store(
+                    old.items[@intCast(i & old.mask)].load(.monotonic),
+                    .monotonic,
+                );
             }
             // Retain the old buffer (a concurrent stealer may still read it),
             // reserving the slot before publishing so a post-store OOM can't
@@ -222,7 +227,7 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
                 // Full — grow to 2x and copy live elements at their logical index.
                 buf = try self.grow(allocator, buf, t, b);
             }
-            buf.items[@intCast(b & buf.mask)] = item;
+            buf.items[@intCast(b & buf.mask)].store(item, .monotonic);
             // Release: the slot write must be visible before stealers see the
             // updated bottom.
             self.bottom.v.store(b + 1, .release);
@@ -248,7 +253,7 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
                 self.bottom.v.store(t, .monotonic);
                 return null;
             }
-            const item = self.bufferSlot(b, .monotonic).*;
+            const item = self.readSlot(b, .monotonic);
             if (b != t) return item; // not the last element, no race
             // Last element: race a concurrent steal for it.
             if (self.top.v.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
@@ -284,7 +289,7 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             // Acquire (growable only): pair with the owner's release store
             // in `grow` so the copied slots are visible before we index
             // into a freshly-published buffer.
-            const item = self.bufferSlot(t, .acquire).*;
+            const item = self.readSlot(t, .acquire);
             if (self.top.v.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
                 return null; // lost the race
             }
@@ -331,7 +336,8 @@ pub fn Deque(comptime T: type) type {
 /// The ONE difference: instead of dropping on full, `push` GROWS the
 /// backing buffer to 2x capacity. This is required by the GC parallel
 /// marker, whose worklist must NEVER drop an element — a dropped mark is a
-/// swept live object (use-after-free).
+/// swept live object (use-after-free). `T` must support Zig atomic loads and
+/// stores: a losing stealer's slot read can overlap circular-slot reuse.
 pub fn GrowableDeque(comptime T: type) type {
     return DequeImpl(T, true);
 }

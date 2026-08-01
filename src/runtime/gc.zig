@@ -43,6 +43,42 @@ const RangeWork = union(enum) {
     values: heap_mod.ValueRange,
     attrs: heap_mod.AttrRange,
 };
+
+/// Atomic queue slots need a scalar representation. Keep that transport detail
+/// at the queue boundary instead of forcing the tracing domain union to adopt a
+/// memory layout or leak tags into its consumers.
+fn packRangeWork(work: RangeWork) u128 {
+    const Fields = struct { tag: u128, segment: u128, offset: u128, len: u128 };
+    const fields: Fields = switch (work) {
+        .values => |range| .{ .tag = 0, .segment = range.segment, .offset = range.offset, .len = range.len },
+        .attrs => |range| .{ .tag = 1, .segment = range.segment, .offset = range.offset, .len = range.len },
+    };
+    return fields.tag << 96 | fields.segment << 64 | fields.offset << 32 | fields.len;
+}
+
+fn unpackRangeWork(bits: u128) RangeWork {
+    const segment: u32 = @truncate(bits >> 64);
+    const offset: u32 = @truncate(bits >> 32);
+    const len: u32 = @truncate(bits);
+    return if (@as(u32, @truncate(bits >> 96)) == 0)
+        .{ .values = .{ .segment = segment, .offset = offset, .len = len } }
+    else
+        .{ .attrs = .{ .segment = segment, .offset = offset, .len = len } };
+}
+
+test "range work atomic transport round-trips both variants" {
+    const value_range: heap_mod.ValueRange = .{ .segment = 7, .offset = 11, .len = 13 };
+    const attr_range: heap_mod.AttrRange = .{ .segment = 17, .offset = 19, .len = 23 };
+    switch (unpackRangeWork(packRangeWork(.{ .values = value_range }))) {
+        .values => |range| try std.testing.expectEqual(value_range, range),
+        .attrs => return error.WrongRangeWorkTag,
+    }
+    switch (unpackRangeWork(packRangeWork(.{ .attrs = attr_range }))) {
+        .attrs => |range| try std.testing.expectEqual(attr_range, range),
+        .values => return error.WrongRangeWorkTag,
+    }
+}
+
 /// 256 sixteen-byte descriptors make a 4 KiB sorting window: large enough to
 /// expose physical locality without turning mark into a whole-live-set sort.
 const range_batch_size = 256;
@@ -130,7 +166,7 @@ fn atomicReleasePage(pending_pages: []u64, page: MarkPage) void {
 /// map lives — serial and parallel marking can never drift.
 pub const Marker = struct {
     deque: containers.GrowableDeque(MarkPage),
-    ranges: containers.GrowableDeque(RangeWork),
+    ranges: containers.GrowableDeque(u128),
     stats: LiveStats = .{},
     /// Shared with every other marker and the Tracer; set in `resetParallel`.
     mark_bits: []u64 = &.{},
@@ -159,10 +195,10 @@ pub const Marker = struct {
             self.deque.push(self.allocator, page) catch @panic("gc parallel mark worklist exhausted");
     }
     inline fn scanValues(self: *Marker, _: *const ObjectHeap, range: heap_mod.ValueRange) void {
-        self.ranges.push(self.allocator, .{ .values = range }) catch @panic("gc parallel range worklist exhausted");
+        self.ranges.push(self.allocator, packRangeWork(.{ .values = range })) catch @panic("gc parallel range worklist exhausted");
     }
     inline fn scanAttrs(self: *Marker, _: *const ObjectHeap, range: heap_mod.AttrRange) void {
-        self.ranges.push(self.allocator, .{ .attrs = range }) catch @panic("gc parallel range worklist exhausted");
+        self.ranges.push(self.allocator, packRangeWork(.{ .attrs = range })) catch @panic("gc parallel range worklist exhausted");
     }
     fn scanRange(self: *Marker, heap: *const ObjectHeap, work: RangeWork) void {
         scanRangeWork(Marker, self, heap, work);
@@ -439,7 +475,7 @@ pub const Tracer = struct {
             self.markers = try self.allocator.realloc(self.markers, marker_count);
             for (self.markers[old..]) |*m| m.* = .{
                 .deque = try containers.GrowableDeque(MarkPage).init(self.allocator, 1024),
-                .ranges = try containers.GrowableDeque(RangeWork).init(self.allocator, 1024),
+                .ranges = try containers.GrowableDeque(u128).init(self.allocator, 1024),
                 .allocator = self.allocator,
             };
         }
@@ -496,7 +532,7 @@ pub const Tracer = struct {
             var range_batch: [range_batch_size]RangeWork = undefined;
             var range_count: usize = 0;
             while (range_count < range_batch.len) : (range_count += 1) {
-                range_batch[range_count] = me.ranges.steal() orelse break;
+                range_batch[range_count] = unpackRangeWork(me.ranges.steal() orelse break);
             }
             if (range_count != 0) {
                 did_work = true;
@@ -551,7 +587,7 @@ pub const Tracer = struct {
                 return true;
             }
             if (self.markers[j].ranges.steal()) |work| {
-                self.markers[id].scanRange(heap, work);
+                self.markers[id].scanRange(heap, unpackRangeWork(work));
                 return true;
             }
         }
