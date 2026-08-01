@@ -35,6 +35,21 @@ const std = @import("std");
 const builtin = @import("builtin");
 const base_options = @import("base_options");
 
+const tsan_enabled = base_options.tsan_enabled;
+const TSanHandle = if (tsan_enabled) *anyopaque else void;
+
+const tsan = if (tsan_enabled) struct {
+    extern fn __tsan_get_current_fiber() ?*anyopaque;
+    extern fn __tsan_create_fiber(flags: u32) ?*anyopaque;
+    extern fn __tsan_destroy_fiber(fiber: *anyopaque) void;
+    extern fn __tsan_switch_to_fiber(fiber: *anyopaque, flags: u32) void;
+
+    /// Cooperative execution on one kernel thread is ordered. Migration still
+    /// depends on the scheduler's real queue synchronization; concurrent
+    /// fibers on different workers remain unordered and race-visible.
+    const switch_flags: u32 = 0;
+} else struct {};
+
 comptime {
     switch (builtin.cpu.arch) {
         .x86_64, .aarch64 => {},
@@ -314,8 +329,10 @@ inline fn contextSwitch(s: *const Switch) *const Switch {
 /// Save the running context into `from` and switch to `to`. `inline` so the
 /// vendored `contextSwitch` clobbers bind at the caller (`resume_`, `yield`, or
 /// `trampoline`).
-inline fn swap(from: *Context, to: *Context) void {
+inline fn swap(from: *Context, to: *Context, destination_tsan: TSanHandle) void {
     var s = Switch{ .old = from, .new = to };
+    if (comptime tsan_enabled)
+        tsan.__tsan_switch_to_fiber(destination_tsan, tsan.switch_flags);
     _ = contextSwitch(&s);
 }
 
@@ -388,6 +405,11 @@ pub const Fiber = struct {
     /// every switch to the fiber so a later resume from a different thread is
     /// safe.
     caller_ctx: ?*Context,
+    /// ThreadSanitizer's logical execution context travels with a migratable
+    /// fiber. The caller handle is replaced alongside `caller_ctx` on every
+    /// resume and intentionally retained across yields and stack recycling.
+    tsan_fiber: TSanHandle,
+    caller_tsan_fiber: if (tsan_enabled) ?*anyopaque else void,
 
     /// Per-fiber stack reservation. Provisioned as a virtual mapping
     /// (PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE) — the kernel
@@ -434,6 +456,8 @@ pub const Fiber = struct {
             .entry = entry,
             .entry_arg = arg,
             .caller_ctx = null,
+            .tsan_fiber = if (tsan_enabled) tsan.__tsan_create_fiber(0) orelse @panic("TSan failed to create fiber") else {},
+            .caller_tsan_fiber = if (tsan_enabled) null else {},
         };
 
         // Set up the new stack so the first swap into this fiber lands in
@@ -448,6 +472,7 @@ pub const Fiber = struct {
         // A live fiber whose stack is freed will crash on resume; the
         // caller must arrange shutdown semantics. RSS un-registration of the
         // stack is the owner's job (see src/expr/eval/workers/worker.zig).
+        if (comptime tsan_enabled) tsan.__tsan_destroy_fiber(self.tsan_fiber);
         std.posix.munmap(@alignCast(self.stack));
         self.* = undefined;
     }
@@ -490,6 +515,7 @@ pub const Fiber = struct {
         self.entry = entry;
         self.entry_arg = arg;
         self.caller_ctx = null;
+        if (comptime tsan_enabled) self.caller_tsan_fiber = null;
         self.state = .ready;
     }
 
@@ -501,8 +527,10 @@ pub const Fiber = struct {
         const prev = currentFiber();
         setCurrentFiber(self);
         self.caller_ctx = &here;
+        if (comptime tsan_enabled)
+            self.caller_tsan_fiber = tsan.__tsan_get_current_fiber() orelse @panic("TSan lost caller fiber");
         self.state = .running;
-        swap(&here, &self.ctx);
+        swap(&here, &self.ctx, if (tsan_enabled) self.tsan_fiber else {});
         // Back from the swap: the fiber either yielded (state == .suspended) or
         // completed (state == .finished).
         //
@@ -524,7 +552,7 @@ pub const Fiber = struct {
         const back = self.caller_ctx orelse @panic("running fiber has no caller_ctx");
         self.state = .suspended;
         if (comptime census_enabled) censusRecordExit(censusNow());
-        swap(&self.ctx, back);
+        swap(&self.ctx, back, if (tsan_enabled) self.caller_tsan_fiber orelse @panic("TSan lost yield caller") else {});
         if (comptime census_enabled) censusRecordEntry(censusNow());
         // Resumed: caller_ctx has been set to the new resumer.
         self.state = .running;
@@ -551,7 +579,7 @@ fn trampoline() callconv(.c) void {
     self.entry = null;
     self.entry_arg = null;
     if (comptime census_enabled) censusRecordExit(censusNow());
-    swap(&self.ctx, back);
+    swap(&self.ctx, back, if (tsan_enabled) self.caller_tsan_fiber orelse @panic("TSan lost finish caller") else {});
     // Should never get here — resuming a `.finished` fiber would re-run
     // the swap, which would land on whatever junk is below this point.
     @panic("trampoline reached unreachable after finish swap");

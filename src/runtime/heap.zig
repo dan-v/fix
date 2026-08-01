@@ -2376,10 +2376,13 @@ pub const ObjectHeap = struct {
 
     /// Skip the tagged-union dispatch when the caller has already
     /// observed `Value.discriminant == .thunk` and can therefore prove
-    /// the object slot is a thunk. The release build elides the
-    /// generated tag check; debug builds keep it.
+    /// the object slot is a thunk. Address the union payload directly: a
+    /// safety-mode `.thunk` projection emits a wide tag-check load which can
+    /// overlap the thunk's independently updated atomic fields. The payload of
+    /// every Zig union starts at the union address; the caller supplies the
+    /// otherwise-generated tag proof.
     pub fn getThunkAssumeValid(self: *ObjectHeap, id: ObjectId) *Thunk {
-        return &self.getMut(id).thunk;
+        return @ptrCast(@alignCast(self.getMut(id)));
     }
 
     pub fn addList(self: *ObjectHeap, items: []const Value) !ObjectId {

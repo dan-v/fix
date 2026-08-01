@@ -4,13 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const profile = b.option(bool, "profile", "Keep symbols and frame pointers for profiling") orelse false;
+    const tsan = b.option(bool, "tsan", "Instrument the focused concurrency graph with ThreadSanitizer") orelse false;
     const debug_checks_opt = b.option(bool, "debug-checks", "Enable VM dispatch invariant assertions (defaults to Debug builds)");
     const vm_trace = b.option(bool, "vm-trace", "Enable VM execution tracing (--vm-trace)") orelse false;
     const thunks_log = b.option(bool, "thunks-log", "Enable per-thunk lifecycle event log (--thunks-log)") orelse false;
     const prof_main = b.option(bool, "prof-main", "Time main thread's hot serial paths via rdtsc; print via --stats") orelse false;
     const prof_path = b.option(bool, "prof-path", "Record the force-call tree (workers=1) and report the critical path + source-attributed profile; print via --stats") orelse false;
-    const strip: ?bool = if (profile) false else null;
-    const omit_frame_pointer: ?bool = if (profile) false else null;
+    if (tsan and (target.result.cpu.arch != .x86_64 or target.result.os.tag != .linux))
+        @panic("-Dtsan currently supports only x86_64-linux");
+    const strip: ?bool = if (profile or tsan) false else null;
+    const omit_frame_pointer: ?bool = if (profile or tsan) false else null;
     const debug_checks = debug_checks_opt orelse (optimize == .Debug);
 
     const build_options = b.addOptions();
@@ -24,6 +27,7 @@ pub fn build(b: *std.Build) void {
 
     const base_options = b.addOptions();
     base_options.addOption(bool, "fiber_census", prof_main);
+    base_options.addOption(bool, "tsan_enabled", tsan);
     base_options.addOption(
         bool,
         "test_emulated",
@@ -41,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
+        .sanitize_thread = tsan,
     });
 
     // The LALR parser tables are expensive to construct at comptime, so a
@@ -70,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
+        .sanitize_thread = tsan,
     });
     base_mod.addImport("base_options", base_options_mod);
     syntax_mod.addImport("base", base_mod);
@@ -80,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
+        .sanitize_thread = tsan,
     });
     runtime_mod.addImport("build_options", build_options_mod);
     runtime_mod.addImport("base", base_mod);
@@ -90,6 +97,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
+        .sanitize_thread = tsan,
     });
     store_mod.addImport("runtime", runtime_mod);
     store_mod.addImport("base", base_mod);
@@ -100,6 +108,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
+        .sanitize_thread = tsan,
     });
     fetchers_mod.addImport("runtime", runtime_mod);
     fetchers_mod.addImport("base", base_mod);
@@ -114,6 +123,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
+        .sanitize_thread = tsan,
     });
     expr_mod.addImport("build_options", build_options_mod);
     expr_mod.addImport("syntax", syntax_mod);
@@ -128,6 +138,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
+        .sanitize_thread = tsan,
     });
     cli_mod.addImport("base", base_mod);
     cli_mod.addImport("expr", expr_mod);
@@ -139,6 +150,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/process_support.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = tsan,
         .imports = &.{
             .{ .name = "base", .module = base_mod },
             .{ .name = "runtime", .module = runtime_mod },
@@ -151,6 +163,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
+        .sanitize_thread = tsan,
         .imports = &.{
             .{ .name = "cli", .module = cli_mod },
             .{ .name = "process_support", .module = process_support_mod },

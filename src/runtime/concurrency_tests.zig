@@ -5,6 +5,7 @@
 //! the confidence machinery must not add branches to the production hot path.
 
 const std = @import("std");
+const base = @import("base");
 const future_mod = @import("future.zig");
 
 const Future = future_mod.Future;
@@ -56,12 +57,18 @@ test "concurrency: resolve between busy observation and waiter enrollment" {
     };
 
     var actor = try std.Thread.spawn(.{}, Actor.run, .{ &future, &waiter.waiter, &busy_seen, &may_enroll, &enrolled });
+    var actor_joined = false;
+    defer if (!actor_joined) {
+        may_enroll.store(1, .release);
+        actor.join();
+    };
     try waitFor(&busy_seen, 1);
     try std.testing.expectEqual(@as(u32, 2), enrolled.load(.acquire));
 
     future.publish();
     may_enroll.store(1, .release);
     actor.join();
+    actor_joined = true;
 
     try std.testing.expectEqual(@as(u32, 0), enrolled.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), wake_count.load(.acquire));
@@ -75,8 +82,15 @@ test "concurrency: publish after enrollment wakes every waiter exactly once" {
     var enrolled_count: std.atomic.Value(u32) = .init(0);
     var start: std.atomic.Value(u32) = .init(0);
     var failures: std.atomic.Value(u32) = .init(0);
+    var enrolled_sem = base.sync.Semaphore.init(0);
     var waiters: [waiter_count]CountingWaiter = undefined;
     var threads: [waiter_count]std.Thread = undefined;
+    var spawned: usize = 0;
+    var joined = false;
+    defer if (!joined) {
+        start.store(1, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+    };
 
     const Actor = struct {
         fn run(
@@ -85,8 +99,10 @@ test "concurrency: publish after enrollment wakes every waiter exactly once" {
             gate: *std.atomic.Value(u32),
             enrolled: *std.atomic.Value(u32),
             failed: *std.atomic.Value(u32),
+            ready: *base.sync.Semaphore,
         ) void {
             while (gate.load(.acquire) == 0) std.atomic.spinLoopHint();
+            defer ready.release();
             if (f.tryClaim(2) != .busy or !f.enrollWaiter(w)) {
                 _ = failed.fetchAdd(1, .acq_rel);
                 return;
@@ -97,15 +113,18 @@ test "concurrency: publish after enrollment wakes every waiter exactly once" {
 
     for (&waiters, &threads) |*waiter, *thread| {
         waiter.* = CountingWaiter.init(&wake_count);
-        thread.* = try std.Thread.spawn(.{}, Actor.run, .{ &future, &waiter.waiter, &start, &enrolled_count, &failures });
+        thread.* = try std.Thread.spawn(.{}, Actor.run, .{ &future, &waiter.waiter, &start, &enrolled_count, &failures, &enrolled_sem });
+        spawned += 1;
     }
     start.store(1, .release);
-    try waitFor(&enrolled_count, waiter_count);
+    for (0..waiter_count) |_| enrolled_sem.acquire();
+    try std.testing.expectEqual(@as(u32, 0), failures.load(.acquire));
 
     future.publish();
     for (threads) |thread| thread.join();
+    joined = true;
 
-    try std.testing.expectEqual(@as(u32, 0), failures.load(.acquire));
+    try std.testing.expectEqual(@as(u32, waiter_count), enrolled_count.load(.acquire));
     try std.testing.expectEqual(@as(u32, waiter_count), wake_count.load(.acquire));
     try std.testing.expect(future.waiters_head == null);
     for (waiters) |waiter| try std.testing.expect(waiter.waiter.next == null);
@@ -141,11 +160,17 @@ test "concurrency: release publication makes payload visible after wake" {
     var enrolled: std.atomic.Value(u32) = .init(0);
     var observed: std.atomic.Value(u64) = .init(0);
     var reader = try std.Thread.spawn(.{}, Reader.run, .{ &shared, &waiter, &enrolled, &observed });
+    var reader_joined = false;
+    defer if (!reader_joined) {
+        shared.future.publish();
+        reader.join();
+    };
     try waitFor(&enrolled, 1);
 
     shared.payload = 0xfeed_beef_dead_cafe;
     shared.future.publish();
     reader.join();
+    reader_joined = true;
 
     try std.testing.expectEqual(@as(u64, 0xfeed_beef_dead_cafe), observed.load(.acquire));
 }

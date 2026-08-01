@@ -71,6 +71,17 @@ jobs:
         timeout-minutes: 12
         run: nix-shell --run 'zig build test-expr --verbose --summary all'
 
+      - name: Focused concurrency tests
+        timeout-minutes: 12
+        run: nix-shell --run 'zig build test-concurrency --verbose --summary all'
+
+      - name: ThreadSanitizer concurrency tests
+        if: matrix.system == 'x86_64-linux'
+        timeout-minutes: 20
+        env:
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: nix-shell --run 'zig build test-concurrency -Dtsan --verbose --summary all'
+
       - name: Integration tests
         timeout-minutes: 12
         run: nix-shell --run 'zig build test-integration --verbose --summary all'
