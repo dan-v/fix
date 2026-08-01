@@ -329,12 +329,19 @@ pub fn build(b: *std.Build) void {
     const structure_check_step = b.step("structure-check", "Check durable module and ownership boundaries");
     structure_check_step.dependOn(&run_structure_check.step);
 
+    const run_model_check = b.addSystemCommand(&.{"bash"});
+    run_model_check.addFileArg(b.path("tools/check_models.sh"));
+    run_model_check.addArg(b.pathFromRoot("."));
+    const model_check_step = b.step("check-models", "Model-check concurrency protocols with TLC");
+    model_check_step.dependOn(&run_model_check.step);
+
     const static_check_step = b.step("check-static", "Check formatting and module boundaries");
     static_check_step.dependOn(&format_check.step);
     static_check_step.dependOn(structure_check_step);
 
     const check_step = b.step("check", "Check formatting and run unit tests");
     check_step.dependOn(static_check_step);
+    check_step.dependOn(model_check_step);
     check_step.dependOn(test_step);
 
     // Quick syntax-only tests. The parser imports the build-generated

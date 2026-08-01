@@ -42,6 +42,11 @@ jobs:
         timeout-minutes: 10
         run: nix-shell --run 'zig build check-static --summary all'
 
+      - name: Model-check concurrency protocols
+        if: matrix.system == 'x86_64-linux'
+        timeout-minutes: 10
+        run: nix-shell --run 'zig build check-models --summary all'
+
       - name: Base tests
         timeout-minutes: 12
         run: nix-shell --run 'zig build test-base --verbose --summary all'

@@ -26,7 +26,10 @@ in
       fileset = lib.fileset.unions [
         ../build.zig
         ../build.zig.zon
+        ../model
         ../src
+        ../test
+        ../tools
       ];
     };
 

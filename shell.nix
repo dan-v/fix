@@ -7,6 +7,7 @@ in
 
       packages = [
         pkgs.zig_0_16
+        pkgs.tlaplus
         pkgs.coreutils
         pkgs.pkg-config
         pkgs.ripgrep
