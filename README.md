@@ -39,11 +39,21 @@ Compatibility is a target backed by several kinds of tests:
 - The pinned Lix and snix language suites compare evaluation and parse results.
 - A separate differential test evaluates every benchmark fixture with `fix`
   and a reference Nix, then compares the strict JSON results structurally.
+- A whole-nixpkgs differential evaluates the entire nixpkgs CI job universe
+  (`ci/eval/outpaths.nix`, about 80,000 derivations) with `fix` and a
+  reference Nix and compares every `.drv` store path. A drvPath match
+  certifies the complete derivation that produced it — inputs, environment,
+  and builder, transitively.
 - `fix parse` emits the same JSON-shaped syntax tree used by
   `nix-instantiate --parse`.
 
-The current pinned language suites pass. See
-[the language-test documentation](test/lang/README.md) for exactly what is run.
+The current pinned language suites pass, and the pinned nixpkgs universe
+evaluates to identical derivation paths (80,586 of 80,586 attributes,
+including agreement on which attributes fail to evaluate). See
+[the language-test documentation](test/lang/README.md) for exactly what is
+run. The nixpkgs differential runs monolithically with
+`zig build test-nixpkgs` (it wants a large-memory machine and caches the
+reference results per pin) and as a sharded matrix in CI.
 
 ### An evaluator you can look inside
 
@@ -502,6 +512,7 @@ $ zig build test
 $ zig build check
 $ zig build test-lang
 $ zig build test-bench-fixtures
+$ zig build test-nixpkgs
 ```
 
 Start with [the developer documentation](docs/README.md) for the architecture,
