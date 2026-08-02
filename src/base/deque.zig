@@ -535,3 +535,97 @@ test "GrowableDeque multi-thread grow-during-steal: no loss, no duplication" {
         for (seen[1 .. n + 1]) |bit| try std.testing.expect(bit);
     }
 }
+
+test "GrowableDeque(u128) wide-slot transport: no loss, duplication, or tearing" {
+    // The GC marker's range worklist is the only u128 GrowableDeque, so the
+    // two-word seqlock slot transport gets no exercise from narrow payloads.
+    // Encode each index redundantly in both halves; a read that mixes two
+    // different writes' words fails the halves check.
+    const salt: u64 = 0x9e37_79b9_7f4a_7c15;
+    const codec = struct {
+        fn encode(i: u64) u128 {
+            return (@as(u128, i ^ salt) << 64) | i;
+        }
+        fn decode(v: u128) !u64 {
+            const low: u64 = @truncate(v);
+            const high: u64 = @truncate(v >> 64);
+            if (high != (low ^ salt)) return error.TornSlotRead;
+            return low;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const n: u64 = 100_000; // forces many grows from cap 4
+    const num_stealers = 4;
+    const iterations = 20;
+
+    const Worker = struct {
+        fn stealLoop(
+            q: *GrowableDeque(u128),
+            done: *std.atomic.Value(bool),
+            seen: []std.atomic.Value(u8),
+            taken: *std.atomic.Value(u64),
+            corrupt: *std.atomic.Value(u32),
+        ) void {
+            while (true) {
+                if (q.steal()) |v| {
+                    record(v, seen, taken, corrupt);
+                } else if (done.load(.acquire)) {
+                    if (q.steal()) |v| record(v, seen, taken, corrupt) else return;
+                }
+            }
+        }
+
+        fn record(
+            v: u128,
+            seen: []std.atomic.Value(u8),
+            taken: *std.atomic.Value(u64),
+            corrupt: *std.atomic.Value(u32),
+        ) void {
+            const index = codec.decode(v) catch {
+                _ = corrupt.fetchOr(1, .acq_rel);
+                return;
+            };
+            if (index >= seen.len) {
+                _ = corrupt.fetchOr(2, .acq_rel);
+                return;
+            }
+            if (seen[index].swap(1, .acq_rel) != 0) _ = corrupt.fetchOr(4, .acq_rel);
+            _ = taken.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var iter: usize = 0;
+    while (iter < iterations) : (iter += 1) {
+        var q = try GrowableDeque(u128).init(allocator, 4);
+        defer q.deinit(allocator);
+
+        const seen = try allocator.alloc(std.atomic.Value(u8), n);
+        defer allocator.free(seen);
+        for (seen) |*slot| slot.* = .init(0);
+
+        var done = std.atomic.Value(bool).init(false);
+        var taken = std.atomic.Value(u64).init(0);
+        var corrupt = std.atomic.Value(u32).init(0);
+
+        var threads: [num_stealers]std.Thread = undefined;
+        for (&threads) |*th| th.* = try std.Thread.spawn(.{}, Worker.stealLoop, .{
+            &q, &done, seen, &taken, &corrupt,
+        });
+
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            try q.push(allocator, codec.encode(i));
+            if (i % 3 == 0) {
+                if (q.pop()) |v| Worker.record(v, seen, &taken, &corrupt);
+            }
+        }
+        while (q.pop()) |v| Worker.record(v, seen, &taken, &corrupt);
+        done.store(true, .release);
+        for (&threads) |th| th.join();
+
+        try std.testing.expectEqual(@as(u32, 0), corrupt.load(.acquire));
+        try std.testing.expectEqual(n, taken.load(.acquire));
+        for (seen) |slot| try std.testing.expectEqual(@as(u8, 1), slot.load(.acquire));
+    }
+}

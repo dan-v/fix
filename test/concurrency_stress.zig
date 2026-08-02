@@ -6,7 +6,36 @@ const base = @import("base");
 const expr = @import("expr");
 
 const Engine = expr.Engine;
-const Queue = base.GrowableDeque(u32);
+
+/// Payload lanes for the queue stress. `NarrowLane` exercises the plain
+/// atomic slot transport; `WideLane` exercises the two-word seqlock slots
+/// that carry the GC marker's u128 range descriptors, encoding each index
+/// redundantly in both halves so a read that mixes two different writes'
+/// words is caught as tearing.
+const NarrowLane = struct {
+    const T = u32;
+    fn encode(index: u32) T {
+        return index;
+    }
+    fn decode(value: T) ?u32 {
+        return value;
+    }
+};
+
+const WideLane = struct {
+    const T = u128;
+    const salt: u64 = 0x9e37_79b9_7f4a_7c15;
+    fn encode(index: u32) T {
+        const i: u64 = index;
+        return (@as(u128, i ^ salt) << 64) | i;
+    }
+    fn decode(value: T) ?u32 {
+        const low: u64 = @truncate(value);
+        const high: u64 = @truncate(value >> 64);
+        if (high != (low ^ salt) or low > std.math.maxInt(u32)) return null;
+        return @intCast(low);
+    }
+};
 
 const Options = struct {
     seed: u64 = 0x6a09_e667_f3bc_c909,
@@ -57,7 +86,8 @@ fn runIteration(allocator: std.mem.Allocator, random: std.Random, iteration: usi
     const queue_workers = queue_worker_counts[random.uintLessThan(usize, queue_worker_counts.len)];
     const queue_items = random.intRangeAtMost(u32, 2_048, 8_192);
     const initial_capacity = @as(u32, 1) << random.intRangeAtMost(u3, 1, 4);
-    try stressQueue(allocator, random, queue_workers, queue_items, initial_capacity);
+    try stressQueue(NarrowLane, allocator, random, queue_workers, queue_items, initial_capacity);
+    try stressQueue(WideLane, allocator, random, queue_workers, queue_items, initial_capacity);
 
     const evaluator_workers = evaluator_worker_counts[random.uintLessThan(usize, evaluator_worker_counts.len)];
     const failure_case = iteration % 5 == 4;
@@ -139,12 +169,14 @@ fn differentialEval(
 }
 
 fn stressQueue(
+    comptime Lane: type,
     allocator: std.mem.Allocator,
     random: std.Random,
     worker_count: u8,
     item_count: u32,
     initial_capacity: u32,
 ) !void {
+    const Queue = base.GrowableDeque(Lane.T);
     var queue = try Queue.init(allocator, initial_capacity);
     defer queue.deinit(allocator);
 
@@ -170,13 +202,17 @@ fn stressQueue(
             slots: []std.atomic.Value(u8),
             count: *std.atomic.Value(u32),
             bad: *std.atomic.Value(u32),
-            value: u32,
+            value: Lane.T,
         ) void {
-            if (value >= slots.len) {
+            const index = Lane.decode(value) orelse {
+                _ = bad.fetchOr(4, .acq_rel); // torn wide-slot read
+                return;
+            };
+            if (index >= slots.len) {
                 _ = bad.fetchOr(1, .acq_rel);
                 return;
             }
-            if (slots[value].cmpxchgStrong(0, 1, .acq_rel, .acquire) != null)
+            if (slots[index].cmpxchgStrong(0, 1, .acq_rel, .acquire) != null)
                 _ = bad.fetchOr(2, .acq_rel);
             _ = count.fetchAdd(1, .acq_rel);
         }
@@ -210,7 +246,7 @@ fn stressQueue(
 
     const gated_prefix = @min(item_count, initial_capacity * 16);
     for (0..item_count) |index| {
-        try queue.push(allocator, @intCast(index));
+        try queue.push(allocator, Lane.encode(@intCast(index)));
         if (index + 1 == gated_prefix) start.store(true, .release);
         if (random.uintLessThan(u8, 4) == 0) {
             if (queue.pop()) |value| Stealer.record(seen, &taken, &invalid, value);
