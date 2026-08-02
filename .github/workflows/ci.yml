@@ -24,10 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
-      - uses: nix-community/cache-nix-action@v7
+      - uses: nix-community/cache-nix-action/restore@v7
         with:
           primary-key: nix-v3-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-          save: ${{ success() }}
 
 
       - name: Install pinned nixpkgs channel
@@ -115,6 +114,12 @@ jobs:
         timeout-minutes: 15
         run: nix-shell --run 'zig build test-bench-fixtures -Doptimize=ReleaseFast --summary all'
 
+      # Last step on purpose: it is skipped when anything above failed, so a
+      # broken job can never publish a poisoned store snapshot.
+      - uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: nix-v3-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+
   nixpkgs-eval:
     name: nixpkgs / chunk ${{ matrix.chunk }}
     runs-on: ubuntu-24.04
@@ -126,10 +131,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
-      - uses: nix-community/cache-nix-action@v7
+      - uses: nix-community/cache-nix-action/restore@v7
         with:
           primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-          save: ${{ success() }}
 
 
       - name: Install pinned nixpkgs channel
@@ -157,6 +161,12 @@ jobs:
         timeout-minutes: 25
         run: nix-shell --run 'zig build test-nixpkgs -Doptimize=ReleaseFast --summary all -- --chunk ${{ matrix.chunk }}/12 --gc-budget 1024'
 
+      # Last step on purpose: it is skipped when anything above failed, so a
+      # broken job can never publish a poisoned store snapshot.
+      - uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+
   daemon-compat:
     name: daemon / ${{ matrix.implementation }}
     runs-on: ubuntu-24.04
@@ -173,10 +183,9 @@ jobs:
       - name: Install Lix
         if: matrix.implementation == 'lix'
         uses: samueldr/lix-gha-installer-action@a0fee77b2a98bb7c5c0ed7ae6d6ad4903dbdad0d # v2026-06-15
-      - uses: nix-community/cache-nix-action@v7
+      - uses: nix-community/cache-nix-action/restore@v7
         with:
           primary-key: daemon-v3-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-          save: ${{ success() }}
 
 
       - name: Install pinned nixpkgs channel
@@ -196,3 +205,9 @@ jobs:
         env:
           FIX_REQUIRE_DAEMON: "1"
         run: nix-shell --run 'zig build test-e2e --summary all -- daemon'
+
+      # Last step on purpose: it is skipped when anything above failed, so a
+      # broken job can never publish a poisoned store snapshot.
+      - uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: daemon-v3-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
