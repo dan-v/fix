@@ -24,7 +24,8 @@ const types = @import("types.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const Value = value_mod.Value;
 const ObjectId = types.ObjectId;
-const FutureState = @import("future.zig").FutureState;
+const future_mod = @import("future.zig");
+const FutureState = future_mod.FutureState;
 
 /// The mark bitmap's natural locality unit: one word describes 64 adjacent
 /// fixed-size object slots. Marking records object discovery in `mark_bits`
@@ -761,7 +762,12 @@ fn scanAttrs(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, range: h
 }
 
 fn scanThunk(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, t: *const thunk_mod.Thunk) void {
-    switch (@as(FutureState, @enumFromInt(t.future.state.load(.monotonic)))) {
+    const raw_state = t.future.state.load(.monotonic);
+    if (comptime heap_mod.gc_debug) {
+        if (raw_state == future_mod.poisoned_state)
+            @panic("gc: tracing a swept thunk — a live object still references it (stale edge / missed root)");
+    }
+    switch (@as(FutureState, @enumFromInt(raw_state))) {
         .resolved => sink.markValue(heap, t.payload.result),
         // `.errored` reuses the result bits as a heap-owned `FailureRef` (or
         // an inline degraded error code); `.blackhole` is terminal. Neither
@@ -1082,6 +1088,38 @@ test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses the
     try std.testing.expectEqual(count_before, heap.objects.count()); // slot reused
     try std.testing.expectEqual(values_before, heap.values.count()); // value range reused
     try std.testing.expectEqual(@as(i64, 200), (try heap.getListItem(reused, 1)).asInt());
+}
+
+test "concurrency: detector poisons swept thunk state so stale claims trap" {
+    // Regression tripwire for the tight-budget w>1 SIGSEGV (2026-08-02): a
+    // speculative force_thunk task's root thunk was unrooted once slotEntry
+    // cleared `current_task`, so a fiber parked on a busy claim could resume
+    // holding a `*Thunk` into a swept slot and re-run `tryClaim` on recycled
+    // memory. The claim loop derefs the raw pointer captured before the park
+    // — no id-based `gcAssertLive` fires — so detector builds must stamp the
+    // swept slot's state word; `tryClaim`/`tryClaimSolo` panic on the stamp.
+    if (comptime !heap_mod.gc_debug) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const live_id = try heap.addThunk(thunk_mod.Thunk.init(Value.int(1)));
+    const dead_id = try heap.addThunk(thunk_mod.Thunk.init(Value.int(2)));
+    // The raw pointer a parked fiber would still hold across the collection.
+    const dead_ptr = heap.getThunkAssumeValid(dead_id);
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    tr.markObject(&heap, live_id);
+    tr.drain(&heap);
+    const st = heap_collector.sweep(&heap, tr.mark_bits);
+    try std.testing.expectEqual(@as(u64, 1), st.objects_freed);
+
+    const live_state = heap.getThunkAssumeValid(live_id).future.state.load(.monotonic);
+    try std.testing.expect(live_state != future_mod.poisoned_state);
+    try std.testing.expectEqual(future_mod.poisoned_state, dead_ptr.future.state.load(.monotonic));
 }
 
 test "gc range reuse splits a larger range and preserves the remainder" {

@@ -15,6 +15,19 @@ const ObjectId = heap_mod.ObjectId;
 const Value = @import("../value.zig").Value;
 
 const gc_debug = heap_mod.gc_debug;
+const future_mod = @import("../future.zig");
+
+/// Detector: stamp a swept thunk's future state with the poison sentinel.
+/// The alloc-bitmap assert (`gcAssertLive`) only fires on id-based reads;
+/// a claim loop that captured the `*Thunk` BEFORE parking re-derefs the raw
+/// pointer after resume with no id check — the poisoned state makes that
+/// `tryClaim` trap at the exact deref (see `future.poisoned_state`).
+fn poisonSweptObject(heap: *ObjectHeap, id: ObjectId) void {
+    switch (heap.objects.getMut(id).*) {
+        .thunk => |*t| t.future.state.store(future_mod.poisoned_state, .monotonic),
+        else => {},
+    }
+}
 
 pub const SweepStats = struct {
     objects_freed: u64 = 0,
@@ -106,6 +119,7 @@ pub fn sweep(heap: *ObjectHeap, mark_bits: []const u64) SweepStats {
         if (is_marked) continue;
         const local = &heap.worker_locals[shard];
         freeObjectRanges(heap, &ranges, heap.objects.get(id));
+        if (comptime gc_debug) poisonSweptObject(heap, id);
         heap.collection.alloc_bits[word] &= ~bit;
         local.gc_free_objects.append(heap.allocator, id) catch {};
         stats.objects_freed += 1;
@@ -353,6 +367,7 @@ fn sweepYoungListInto(heap: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLo
             // Detector builds retain the slot so stale reads trap reliably.
             freeObjectRanges(heap, ranges, heap.objects.get(id));
             if (comptime gc_debug) {
+                poisonSweptObject(heap, id);
                 if (word < heap.collection.alloc_bits.len) _ = @atomicRmw(u64, &heap.collection.alloc_bits[word], .And, ~bit, .monotonic);
             } else {
                 dst.gc_free_objects.append(heap.allocator, id) catch {};

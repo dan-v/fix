@@ -31,6 +31,12 @@ pub const FutureState = enum(u32) {
     errored = 4,
 };
 
+/// Detector sentinel (GC-debug builds): the sweep stamps a swept thunk's
+/// state word with this so a stale claim through a raw pointer — captured
+/// before a park and never re-checked against the alloc bitmap — traps at
+/// the exact deref instead of silently reading the retained slot.
+pub const poisoned_state: u32 = 0xDEAD_F00D;
+
 /// Identity of whoever is currently claiming a thunk. Each fiber is
 /// assigned a globally unique 32-bit id at allocation time (from the
 /// scheduler's `next_fiber_id` counter). The claimer is just that id.
@@ -157,7 +163,12 @@ pub const Future = struct {
     ///     should re-raise the cached error.
     pub fn tryClaim(self: *Future, claimer: ClaimerId) ClaimResult {
         while (true) {
-            const s: FutureState = @enumFromInt(self.state.load(.acquire));
+            const raw = self.state.load(.acquire);
+            if (comptime protocol_checks) {
+                if (raw == poisoned_state)
+                    @panic("Future.tryClaim on a GC-swept object — stale reference held across a collection (missing root)");
+            }
+            const s: FutureState = @enumFromInt(raw);
             switch (s) {
                 .resolved => return .already_resolved,
                 .blackhole => return .blackhole,
@@ -200,7 +211,12 @@ pub const Future = struct {
         // the CAS, not the atomic qualifier. Staying atomic keeps any
         // overlooked cross-thread observer (a future sampler, a debug
         // walker) merely stale instead of racy.
-        switch (@as(FutureState, @enumFromInt(self.state.load(.monotonic)))) {
+        const raw = self.state.load(.monotonic);
+        if (comptime protocol_checks) {
+            if (raw == poisoned_state)
+                @panic("Future.tryClaimSolo on a GC-swept object — stale reference held across a collection (missing root)");
+        }
+        switch (@as(FutureState, @enumFromInt(raw))) {
             .resolved => return .already_resolved,
             .blackhole => return .blackhole,
             .errored => return .errored,
