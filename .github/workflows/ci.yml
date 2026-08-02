@@ -32,11 +32,8 @@ jobs:
 
       - name: Install pinned nixpkgs channel
         run: |
-          nixpkgs="$(nix-build nix/pinned-nixpkgs.nix --out-link .pinned-nixpkgs)"
-          mkdir -p ~/.nix-defexpr/channels
-          ln -sfn "$nixpkgs" ~/.nix-defexpr/channels/nixpkgs
-          # fix has no channel fallback yet; give it the search path directly.
-          echo "NIX_PATH=nixpkgs=$nixpkgs" >> "$GITHUB_ENV"
+          nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
+          nix-channel --update nixpkgs
 
       - name: Build
         timeout-minutes: 20
@@ -137,11 +134,8 @@ jobs:
 
       - name: Install pinned nixpkgs channel
         run: |
-          nixpkgs="$(nix-build nix/pinned-nixpkgs.nix --out-link .pinned-nixpkgs)"
-          mkdir -p ~/.nix-defexpr/channels
-          ln -sfn "$nixpkgs" ~/.nix-defexpr/channels/nixpkgs
-          # fix has no channel fallback yet; give it the search path directly.
-          echo "NIX_PATH=nixpkgs=$nixpkgs" >> "$GITHUB_ENV"
+          nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
+          nix-channel --update nixpkgs
 
       # Oracle drvPaths only change when the nixpkgs pin moves, so cache them
       # keyed on the pin; a hit skips the nix-instantiate reference eval.
@@ -187,11 +181,8 @@ jobs:
 
       - name: Install pinned nixpkgs channel
         run: |
-          nixpkgs="$(nix-build nix/pinned-nixpkgs.nix --out-link .pinned-nixpkgs)"
-          mkdir -p ~/.nix-defexpr/channels
-          ln -sfn "$nixpkgs" ~/.nix-defexpr/channels/nixpkgs
-          # fix has no channel fallback yet; give it the search path directly.
-          echo "NIX_PATH=nixpkgs=$nixpkgs" >> "$GITHUB_ENV"
+          nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
+          nix-channel --update nixpkgs
 
       - name: Report daemon implementation
         run: nix --version

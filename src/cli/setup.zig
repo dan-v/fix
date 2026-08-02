@@ -359,10 +359,24 @@ fn daemonJobsSetting(settings: *nix_conf.Settings, key: []const u8, default: u64
 
 /// Build the evaluator's search path from `-I`/`--include` entries followed by
 /// `$NIX_PATH`. Command-line entries come first so they take precedence, as in
-/// Nix. A no-op when neither is present.
+/// Nix. With neither present, fall back to Nix's default search path — the
+/// user and root channel profiles — so `<nixpkgs>` resolves on a machine
+/// configured purely through `nix-channel`.
 fn applyNixPath(ev: *Engine, init: std.process.Init, options: *const args.Options) !void {
     const allocator = ev.hostAllocator();
     const env_path = init.environ_map.get("NIX_PATH");
+    if (options.include.items.len == 0 and env_path == null) {
+        if (init.environ_map.get("HOME")) |home| {
+            const fallback = try std.fmt.allocPrint(
+                allocator,
+                "{s}/.nix-defexpr/channels:nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixpkgs:/nix/var/nix/profiles/per-user/root/channels",
+                .{home},
+            );
+            defer allocator.free(fallback);
+            try ev.setNixPath(fallback);
+        }
+        return;
+    }
     if (options.include.items.len == 0) {
         if (env_path) |nix_path| try ev.setNixPath(nix_path);
         return;
