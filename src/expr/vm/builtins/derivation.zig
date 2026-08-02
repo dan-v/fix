@@ -60,6 +60,12 @@ pub fn builtinDerivation(self: *VM, arg: Value, mode: DerivationMode) !Value {
     return buildForcedDerivationValue(self, attrs.asObjectId(), .strict);
 }
 
+/// Internal thunk-name prefix: `<prefix><output>` requests the outPath of
+/// one named output (used by lazy per-output values, see
+/// `buildLazyOutputValue`). `\x00` keeps it out of the user-visible
+/// attr namespace.
+const lazy_output_path_prefix = "\x00derivationOutputPath:";
+
 pub fn builtinDerivationLazyAttr(self: *VM, attrs_arg: Value, name_arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, attrs_arg);
     const name = try vm_force.forceValue(self, name_arg);
@@ -67,30 +73,71 @@ pub fn builtinDerivationLazyAttr(self: *VM, attrs_arg: Value, name_arg: Value) !
 
     const name_id = try stringTextInternId(self, name);
     const attrs_id = attrs.asObjectId();
+    const name_text = self.intern.get(name_id);
 
-    // Reuse a previously-built lazy derivation value for the same
-    // input attrs. The naïve path rebuilt the whole derivation per
-    // per-attr access (drvPath, outPath, outputName, named outputs,
-    // ...) — `buildForcedDerivationValue` is the bulk of
-    // `derivationLazyAttr`'s wall time on workloads like the
-    // NixOS toplevel where one derivation is touched for several
-    // of its lazy attrs.
-    const cached_bits = self.realization.lookupLazyDerivation(attrs_id, self.heap.token);
-    const value: Value = if (cached_bits) |bits| .{ .bits = bits } else blk: {
-        const built = try buildForcedDerivationValue(self, attrs_id, .lazy);
-        // Best-effort cache; if the put fails (OOM) we still
-        // proceed — correctness doesn't depend on caching. Token-guarded so a
-        // GC that reuses `attrs_id` for a different attrs can't hit a stale entry.
-        self.realization.cacheLazyDerivation(attrs_id, self.heap.token, built.bits) catch {};
-        break :blk built;
-    };
+    if (std.mem.startsWith(u8, name_text, lazy_output_path_prefix)) {
+        const output_id = try self.intern.intern(name_text[lazy_output_path_prefix.len..]);
+        const forced = try forcedDerivationValueCached(self, attrs_id);
+        const output_value = try self.heap.getAttrValue(forced.asObjectId(), output_id);
+        if (!output_value.isAttrs()) return error.InvalidDerivationOutput;
+        return self.heap.getAttrValue(output_value.asObjectId(), try self.intern.intern("outPath"));
+    }
+
+    // Selecting a named output (`drv.out`, `drv.dev`, …) must NOT compute
+    // the derivation: in Nix's corelib `derivation`, each output value is an
+    // ordinary attrset whose outPath/drvPath alone defer to derivationStrict.
+    // (Real-world dependence: lib.extendDerivation inherits type/outputName
+    // through `drv.${outputName}`, so an eager compute here would make a
+    // mere `.type` check evaluate the full env — observably strict when an
+    // env attr throws, e.g. python packages disabled for the interpreter.)
+    {
+        const output_names = try derivationOutputNames(self, attrs_id);
+        defer self.allocator.free(output_names.names);
+        for (output_names.names) |output| {
+            if (output == name_id) return buildLazyOutputValue(self, attrs_id, name_id, output_names);
+        }
+    }
+
+    const value = try forcedDerivationValueCached(self, attrs_id);
     return self.heap.getAttrValue(value.asObjectId(), name_id);
+}
+
+/// Force-and-cache the fully-computed derivation value for `attrs_id`. The
+/// naïve path rebuilt the whole derivation per per-attr access (drvPath,
+/// outPath, ...) — `buildForcedDerivationValue` is the bulk of
+/// `derivationLazyAttr`'s wall time on workloads like the NixOS toplevel
+/// where one derivation is touched for several of its lazy attrs.
+fn forcedDerivationValueCached(self: *VM, attrs_id: ObjectId) !Value {
+    const cached_bits = self.realization.lookupLazyDerivation(attrs_id, self.heap.token);
+    if (cached_bits) |bits| return .{ .bits = bits };
+    const built = try buildForcedDerivationValue(self, attrs_id, .lazy);
+    // Best-effort cache; if the put fails (OOM) we still
+    // proceed — correctness doesn't depend on caching. Token-guarded so a
+    // GC that reuses `attrs_id` for a different attrs can't hit a stale entry.
+    self.realization.cacheLazyDerivation(attrs_id, self.heap.token, built.bits) catch {};
+    return built;
 }
 
 fn buildLazyDerivationValue(self: *VM, attrs_id: ObjectId) !Value {
     const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);
+    return buildLazyValueForOutput(self, attrs_id, output_names.names[0], output_names, false);
+}
 
+/// Lazy per-output value (`drv.out`, `drv.dev`, …): the root lazy shape with
+/// `outputName` fixed to the selected output and `outPath` resolving to that
+/// output's path. Selecting an output stays free of derivation computation.
+fn buildLazyOutputValue(self: *VM, attrs_id: ObjectId, output: InternId, output_names: DerivationOutputNames) !Value {
+    return buildLazyValueForOutput(self, attrs_id, output, output_names, true);
+}
+
+fn buildLazyValueForOutput(
+    self: *VM,
+    attrs_id: ObjectId,
+    selected: InternId,
+    output_names: DerivationOutputNames,
+    selected_out_path: bool,
+) !Value {
     const outputs = try self.allocator.alloc(derivation.ValueOutput, output_names.names.len);
     defer self.allocator.free(outputs);
     for (output_names.names, outputs) |output_name, *output| {
@@ -112,7 +159,7 @@ fn buildLazyDerivationValue(self: *VM, attrs_id: ObjectId) !Value {
     });
     try entries.append(self.allocator, .{
         .name = try self.intern.intern("outputName"),
-        .value = Value.string(output_names.names[0]),
+        .value = Value.string(selected),
     });
     if (output_names.explicit) {
         try entries.append(self.allocator, .{
@@ -126,7 +173,22 @@ fn buildLazyDerivationValue(self: *VM, attrs_id: ObjectId) !Value {
     });
 
     try appendLazyDerivationAttr(self, &entries, attrs_id, "drvPath");
-    try appendLazyDerivationAttr(self, &entries, attrs_id, "outPath");
+    if (selected_out_path) {
+        // Non-default output: `outPath` must resolve to the SELECTED output's
+        // path. Route through the internal `\x00`-prefixed thunk name.
+        const mangled = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{
+            lazy_output_path_prefix, self.intern.get(selected),
+        });
+        defer self.allocator.free(mangled);
+        const outpath_id = try self.intern.intern("outPath");
+        const args = [_]Value{ Value.attrs(attrs_id), Value.string(try self.intern.intern(mangled)) };
+        try entries.append(self.allocator, .{
+            .name = outpath_id,
+            .value = try makeBuiltinThunk(self, .derivationLazyAttr, &args),
+        });
+    } else {
+        try appendLazyDerivationAttr(self, &entries, attrs_id, "outPath");
+    }
     for (output_names.names) |output_name| {
         try appendLazyDerivationAttrId(self, &entries, attrs_id, output_name);
     }
