@@ -167,6 +167,43 @@ jobs:
         with:
           primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
 
+  # GC use-after-free tripwire: chunk 0 at a tight budget was the workload
+  # that exposed the w>1 collection races (2026-08: native-handoff result
+  # rooting; the swept force_thunk task root). ReleaseSafe is the detector
+  # build — reuse off, alloc-bitmap liveness asserts on every id read, and
+  # swept-slot poisoning that makes a stale claim panic at the deref instead
+  # of segfaulting one run in thirty. Peak RSS is ~11 GB (reuse-off trades
+  # memory for detection), comparable to the ReleaseFast matrix jobs.
+  nixpkgs-gc-detector:
+    name: nixpkgs / gc detector (chunk 0, tight budget)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action/restore@v7
+        with:
+          primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+
+      - name: Install pinned nixpkgs channel
+        run: |
+          nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
+          nix-channel --update nixpkgs
+
+      - name: Restore oracle cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fix-nixpkgs-eval
+          key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-chunk-0
+
+      - name: Build (ReleaseSafe detector)
+        timeout-minutes: 20
+        run: nix-shell --run 'zig build -Doptimize=ReleaseSafe --summary all'
+
+      - name: Tight-budget detector eval
+        timeout-minutes: 25
+        run: nix-shell --run 'zig build test-nixpkgs -Doptimize=ReleaseSafe --summary all -- --chunk 0/12 --gc-budget 512 --workers 4'
+
   daemon-compat:
     name: daemon / ${{ matrix.implementation }}
     runs-on: ubuntu-24.04
