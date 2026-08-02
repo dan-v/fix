@@ -13,8 +13,9 @@ a specific error instead of falling back to whatever is on `PATH`.
 | `unix://DIR?protocol=legacy`, `?protocol=any` | supported (`DIR/socket`) |
 | `tcp://HOST:PORT` | supported |
 | `ssh-ng://HOST` | supported (`port`, `ssh-key`, `compress`) |
+| bare `/…/daemon-socket/socket` path | supported (treated as `unix://`) |
 | `unix://DIR?protocol=lix-xp-1` | not implemented |
-| `local`, `auto`, chroot roots | not implemented |
+| `local`, `auto`, other absolute paths (chroot roots) | not implemented |
 
 Select a store with `--store`, `NIX_REMOTE`, or the `nix.conf` `store`
 setting. The daemon must speak worker protocol 1.26+ (Nix ≥ 2.4); CI
