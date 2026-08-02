@@ -6,15 +6,21 @@ const std = @import("std");
 /// How many worker threads to spawn for the evaluation pool.
 pub const default_worker_count: u8 = 4;
 
-/// Maximum value stack slots for a VM.
-pub const vm_stack_capacity: usize = 65_536;
+/// Maximum value stack slots for a VM. Sized so a call chain that is legal
+/// under `max-call-depth` (10k applications, each also pushing passthrough
+/// thunk-force frames with reserved locals) exhausts the logical depth cap
+/// before the value stack: real nixpkgs evals (lib.recursiveUpdate spines)
+/// overflowed the previous 65k slots on chains Nix/Lix evaluate fine.
+/// 8 bytes per slot — 4 MiB per pooled VM buffer.
+pub const vm_stack_capacity: usize = 524_288;
 
 /// Maximum physical call frame depth. Bounds non-tail recursion (tail
 /// calls reuse a frame). Kept comfortably above `default_max_call_depth`
 /// so the logical call-depth cap (which matches Nix's `max-call-depth`)
 /// fires with a proper "stack overflow" error before the physical frame
-/// array is exhausted on legitimate deep non-tail recursion.
-pub const max_frames: usize = 20_000;
+/// array is exhausted on legitimate deep non-tail recursion — including
+/// passthrough thunk-force frames, which do not count toward logical depth.
+pub const max_frames: usize = 65_536;
 
 /// Default logical call-depth limit, matching Nix/Lix's `max-call-depth`
 /// setting (10000). Incremented on every function application including
