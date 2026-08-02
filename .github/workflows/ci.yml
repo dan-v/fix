@@ -27,6 +27,7 @@ jobs:
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-v3-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          save: ${{ success() }}
 
 
       - name: Configure pinned NIX_PATH
@@ -128,6 +129,7 @@ jobs:
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          save: ${{ success() }}
 
 
       - name: Configure pinned NIX_PATH
@@ -174,6 +176,7 @@ jobs:
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: daemon-v3-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          save: ${{ success() }}
 
 
       - name: Configure pinned NIX_PATH
