@@ -414,14 +414,27 @@ pub const Thunk = struct {
     /// Callers gate on a racy `state == unresolved` load (target arm live),
     /// but a concurrent resolve can flip the payload to `.result` between that
     /// check and this read — so the result may be stale/garbage. Every caller
-    /// must bound-guard it (a torn chunk id → `registry.slot` returns null; a
-    /// torn closure Value → `getBuiltinClosure` bounds-guards). Reading the
+    /// must bound-guard it (a stale chunk id → `registry.slot` returns null; a
+    /// stale closure Value → `getBuiltinClosure` bounds-guards). Reading the
     /// raw storage is what release already does once the safety tag is elided;
     /// this makes Debug/ReleaseSafe match that intended semantics instead of
-    /// panicking on the torn union arm.
-    pub inline fn targetLeadingRacy(self: *const Thunk, comptime T: type) T {
-        const p: *const T = @ptrCast(@alignCast(&self.payload));
-        return p.*;
+    /// panicking on the stale union arm.
+    ///
+    /// The load is one monotonic atomic word, so it cannot tear; staleness is
+    /// the only hazard. This is the project's single sanctioned
+    /// unsynchronized reader: the conflicting `resolve` store is the hottest
+    /// publish in the interpreter and cannot become atomic without splitting
+    /// the safety-checked union write or growing the size-critical thunk, so
+    /// `test/tsan.supp` suppresses exactly this pair by this function's name.
+    /// Deliberately NOT inline, so the suppression stays scoped to this read.
+    pub fn targetLeadingRacy(self: *const Thunk, comptime T: type) T {
+        comptime std.debug.assert(@sizeOf(T) <= @sizeOf(u64));
+        comptime std.debug.assert(@import("builtin").cpu.arch.endian() == .little);
+        const word_ptr: *const u64 = @ptrCast(@alignCast(&self.payload));
+        const word = @atomicLoad(u64, word_ptr, .monotonic);
+        const bytes: *const [@sizeOf(u64)]u8 = @ptrCast(&word);
+        const leading: *const T = @ptrCast(@alignCast(bytes));
+        return leading.*;
     }
 
     /// Publish a binding cell's value (see `initBindingCell`). Writes

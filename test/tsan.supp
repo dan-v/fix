@@ -1,0 +1,11 @@
+# ThreadSanitizer suppressions for sanctioned, documented races only.
+# Wire with: TSAN_OPTIONS=...:suppressions=$PWD/test/tsan.supp
+#
+# Thunk.targetLeadingRacy is an advisory speculation peek: a tear-free
+# monotonic word load of a thunk's payload that may race the claimer's plain
+# `resolve` store by design. Staleness is bound-guarded at every caller, and
+# the store side cannot become atomic without splitting the safety-checked
+# union write or growing the size-critical thunk. See the doc comment on
+# `Thunk.targetLeadingRacy` (src/runtime/thunk.zig) before adding ANYTHING
+# to this file: every other race report is a real bug.
+race:*targetLeadingRacy*
