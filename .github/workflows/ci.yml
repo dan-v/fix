@@ -29,6 +29,14 @@ jobs:
           primary-key: nix-v3-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
           restore-prefixes-first-match: nix-v3-${{ matrix.system }}-
 
+      # A restored store snapshot can register paths whose files didn't
+      # survive the save/restore round-trip; nix then trusts the db and
+      # fails opening them ("No such file or directory" on a .drv).
+      # --verify drops registrations for missing paths, healing the
+      # mismatch whatever produced it.
+      - name: Verify restored store
+        run: nix-store --verify || true
+
       - name: Configure pinned NIX_PATH
         run: |
           nixpkgs="$(nix eval --raw --impure --expr '(import ./npins).nixpkgs.outPath')"
@@ -130,6 +138,14 @@ jobs:
           primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
           restore-prefixes-first-match: nix-eval-v1-x86_64-linux-
 
+      # A restored store snapshot can register paths whose files didn't
+      # survive the save/restore round-trip; nix then trusts the db and
+      # fails opening them ("No such file or directory" on a .drv).
+      # --verify drops registrations for missing paths, healing the
+      # mismatch whatever produced it.
+      - name: Verify restored store
+        run: nix-store --verify || true
+
       - name: Configure pinned NIX_PATH
         run: |
           nixpkgs="$(nix eval --raw --impure --expr '(import ./npins).nixpkgs.outPath')"
@@ -175,6 +191,14 @@ jobs:
         with:
           primary-key: daemon-v2-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
           restore-prefixes-first-match: daemon-v2-${{ matrix.implementation }}-
+
+      # A restored store snapshot can register paths whose files didn't
+      # survive the save/restore round-trip; nix then trusts the db and
+      # fails opening them ("No such file or directory" on a .drv).
+      # --verify drops registrations for missing paths, healing the
+      # mismatch whatever produced it.
+      - name: Verify restored store
+        run: nix-store --verify || true
 
       - name: Configure pinned NIX_PATH
         run: |
