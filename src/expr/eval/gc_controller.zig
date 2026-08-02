@@ -485,8 +485,12 @@ pub fn markRoots(ev: Context, tr: *gc.Tracer) void {
             // Precise, for every fiber: operand stack + frames + upvalues +
             // in-flight force chain + builtin temp-roots (see force.zig).
             markVm(tr, ev.heap, &f.vm);
-            // A task assigned to a fiber is out of the scheduler queue
-            // but still a live reference until the fiber processes it.
+            // A task assigned to a fiber is out of the scheduler queue but
+            // still a live reference. This covers only the pickTask →
+            // slotEntry window: slotEntry clears `current_task` before
+            // running, so each task runner must root its own ids for the
+            // task's duration (rootKeep in runForceThunkTask and the
+            // range/sweep runners).
             if (f.current_task) |task| switch (task) {
                 .force_thunk => |id| tr.markObject(ev.heap, id),
                 .force_list_range => |r| tr.markObject(ev.heap, r.list_id),

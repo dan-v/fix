@@ -1148,6 +1148,16 @@ fn runTask(f: *WorkerFiber, task: Task) void {
 }
 
 fn runForceThunkTask(f: *WorkerFiber, thunk_id: types.ObjectId) void {
+    // This scope is the thunk's only root once `slotEntry` clears
+    // `current_task`: the task already left the marked scheduler queue at
+    // pickTask, so without it a fiber parked on a busy claim (or any GC
+    // safepoint inside the force) can have the thunk swept under it when the
+    // claimer publishes and drops its force-chain root — the claim loop then
+    // re-derefs a stale `*Thunk` into a recycled slot (2026-08-02 SIGSEGV at
+    // tight gc budgets, w>1). Same pattern as the range/sweep runners below.
+    const roots = vm_force.rootsBegin(&f.vm);
+    defer vm_force.rootsEnd(&f.vm, roots);
+    vm_force.rootKeep(&f.vm, Value.thunk(thunk_id));
     // Limit cascades rooted at small speculative chunks. Urgent tasks and
     // larger roots remain unbounded.
     if (f.current_lane != .urgent) {
