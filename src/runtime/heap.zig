@@ -2901,6 +2901,54 @@ pub const ObjectHeap = struct {
         return range;
     }
 
+    /// Positions counterpart of the strict literal merge (`attrs_merge_strict`,
+    /// used when an attrset literal mixes static and dynamic entries): union of
+    /// both sides' tables by name, left winning duplicates (the merged attr's
+    /// first definition site). Every name from both sides survives a strict
+    /// merge, so the whole union applies; both tables are sorted by name
+    /// (heap invariant), so the union is emitted sorted.
+    pub fn mergeAttrPositionsStrict(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !AttrPosRange {
+        const l = self.attrPositionsSlice(left_id);
+        const r = self.attrPositionsSlice(right_id);
+        if (l.len == 0 and r.len == 0) return empty_attr_positions;
+
+        var merged = try std.ArrayListUnmanaged(AttrPosEntry).initCapacity(
+            self.allocator,
+            l.len + r.len,
+        );
+        defer merged.deinit(self.allocator);
+        var li: usize = 0;
+        var ri: usize = 0;
+        while (li < l.len and ri < r.len) {
+            if (l[li].name < r[ri].name) {
+                merged.appendAssumeCapacity(l[li]);
+                li += 1;
+            } else if (l[li].name > r[ri].name) {
+                merged.appendAssumeCapacity(r[ri]);
+                ri += 1;
+            } else {
+                merged.appendAssumeCapacity(l[li]);
+                li += 1;
+                ri += 1;
+            }
+        }
+        merged.appendSliceAssumeCapacity(l[li..]);
+        merged.appendSliceAssumeCapacity(r[ri..]);
+        return self.appendAttrPositions(merged.items);
+    }
+
+    /// `publishMergedAttrs` with a position table attached.
+    pub fn publishMergedAttrsWithPositions(self: *ObjectHeap, range: AttrRange, actual: u32, positions: AttrPosRange) !ObjectId {
+        self.releaseAttrsTail(range, actual);
+        if (actual == 0 and positions.len == 0) if (self.empty_attrs_id) |id| return id;
+        const trimmed: AttrRange = .{
+            .segment = range.segment,
+            .offset = range.offset,
+            .len = actual,
+        };
+        return self.add(.{ .attrs = .{ .range = trimmed, .positions = positions } });
+    }
+
     /// Borrow an attrset's source-position entries (empty slice when it
     /// has none or `id` is not an attrset).
     fn attrPositionsSlice(self: *const ObjectHeap, id: ObjectId) []const AttrPosEntry {

@@ -132,7 +132,11 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
         out += n;
     }
 
-    return self.heap.publishMergedAttrs(reserved, @intCast(out));
+    // Attach the merged position tables: without this, any attrset literal
+    // containing a dynamic entry (compiled as static-part + per-entry strict
+    // merges) silently loses unsafeGetAttrPos for ALL its attrs.
+    const positions = try self.heap.mergeAttrPositionsStrict(left_id, right_id);
+    return self.heap.publishMergedAttrsWithPositions(reserved, @intCast(out), positions);
 }
 
 pub fn mergeAttrLiteralValue(self: *VM, left: Value, right: Value) anyerror!Value {

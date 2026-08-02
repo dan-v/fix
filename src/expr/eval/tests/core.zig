@@ -723,6 +723,19 @@ test "unsafeGetAttrPos reports file positions for file-attributed sources" {
     try std.testing.expect(v.kind() == .null);
 }
 
+test "static attr positions survive a dynamic entry in the same literal" {
+    // A literal with a dynamic entry compiles as static-part + strict merges;
+    // the merge must carry the position tables (stdenvNoCC's meta.position
+    // reads the position of `name` from exactly such a set).
+    const merged = try helpers.renderPathForTest(
+        "builtins.unsafeGetAttrPos \"a\" { a = 1; ${if false then \"b\" else null} = 2; }",
+        "/test/pos.nix",
+    );
+    defer std.testing.allocator.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "file = \"/test/pos.nix\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "line = 1") != null);
+}
+
 test "unsafeGetAttrPos reads positions from the attrs_new_named_pos_srt side table" {
     // Multi-entry runtime-built attrset (non-constant values defeat the
     // closed-literal fold): the names AND positions ride the chunk's
