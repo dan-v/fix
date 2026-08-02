@@ -69,10 +69,8 @@ run fix "$fix" eval --strict --json "$expr" "${args[@]}"
 run lix "$lix/bin/nix-instantiate" --eval --strict --json --readonly-mode "$expr" "${args[@]}"
 run nix "$cppnix/bin/nix-instantiate" --eval --strict --json --readonly-mode "$expr" "${args[@]}"
 run detsys-1core "$detsys/bin/nix-instantiate" --eval --strict --json --readonly-mode "$expr" "${args[@]}"
-# The new CLI has no --readonly-mode; a scratch chroot store keeps the
-# logical /nix/store (identical hashing) while any .drv writes land in a
-# throwaway root. `nix eval --file` does not apply --arg, so inline the call.
-scratch="$(mktemp -d)"
-trap 'chmod -R u+w "$scratch" 2>/dev/null; rm -rf "$scratch"' EXIT
-call="import $expr { nixpkgs = $nixpkgs; ${subtree:+subtree = \"$subtree\";} }"
-run detsys-autocore "$detsys/bin/nix" eval --json --impure --store "local?root=$scratch" --eval-cores 0 --expr "$call"
+# eval-cores is an ordinary setting, so the legacy CLI takes it too — same
+# readonly invocation as every other row. Measured caveat: Determinate's
+# parallel eval shows no benefit on this workload under either CLI (and
+# `nix eval --eval-cores 0` was slower than its own serial run).
+run detsys-autocore "$detsys/bin/nix-instantiate" --eval --strict --json --readonly-mode --eval-cores 0 "$expr" "${args[@]}"
