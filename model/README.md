@@ -11,7 +11,10 @@ tests cover those layers.
 - `FiberDispatch`: lifecycle publication, ready tokens, popped contenders,
   run ownership, suspension, wake-before-yield, finish, and recycle. Queue
   membership and run ownership are separate because a wake may be queued
-  while another worker is still returning from `runFiber`.
+  while another worker is still returning from `runFiber`. Ownership is
+  modeled as a set per fiber so `ExclusiveRunOwner` can state — not assume —
+  that no two workers ever run the same fiber, and `ClaimedTokenRuns` checks
+  that a popped wake token always converts back into a run.
 - `Shutdown`: helper quiescence plus external callbacks that retain pointers
   into suspended fiber stacks. No worker or scheduler resource may be
   destroyed until those callbacks have published and returned.
@@ -24,6 +27,7 @@ Run all models with:
 zig build check-models
 ```
 
-The check also applies three deliberate mutations—removing the Future
-enrollment recheck, external-job drain, and GC releasing phase—and requires
-TLC to reject each weakened model.
+The check also applies one deliberate mutation per model—removing the Future
+enrollment recheck, the fiber run-ownership exclusivity guard, the
+external-job drain, and the GC releasing phase—and requires TLC to reject
+each weakened model.

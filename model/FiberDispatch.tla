@@ -1,17 +1,17 @@
 ---------------------------- MODULE FiberDispatch -----------------------------
 EXTENDS FiniteSets, Naturals
 
-CONSTANTS Fibers, Workers, NoWorker
+CONSTANTS Fibers, Workers
 
 Lifecycle == {"free", "running", "suspended"}
 
-VARIABLES lifecycle, runOwner, queued, claimed, wakeCredits
+VARIABLES lifecycle, runOwners, queued, claimed, wakeCredits
 
-vars == <<lifecycle, runOwner, queued, claimed, wakeCredits>>
+vars == <<lifecycle, runOwners, queued, claimed, wakeCredits>>
 
 Init ==
     /\ lifecycle = [f \in Fibers |-> "free"]
-    /\ runOwner = [f \in Fibers |-> NoWorker]
+    /\ runOwners = [f \in Fibers |-> {}]
     /\ queued = {}
     /\ claimed = {}
     /\ wakeCredits = [f \in Fibers |-> 0]
@@ -20,14 +20,14 @@ Start(f, w) ==
     /\ lifecycle[f] = "free"
     /\ f \notin queued \cup claimed
     /\ lifecycle' = [lifecycle EXCEPT ![f] = "running"]
-    /\ runOwner' = [runOwner EXCEPT ![f] = w]
+    /\ runOwners' = [runOwners EXCEPT ![f] = {w}]
     /\ UNCHANGED <<queued, claimed, wakeCredits>>
 
 Suspend(f) ==
     /\ lifecycle[f] = "running"
-    /\ runOwner[f] # NoWorker
+    /\ runOwners[f] # {}
     /\ lifecycle' = [lifecycle EXCEPT ![f] = "suspended"]
-    /\ runOwner' = [runOwner EXCEPT ![f] = NoWorker]
+    /\ runOwners' = [runOwners EXCEPT ![f] = {}]
     /\ UNCHANGED <<queued, claimed, wakeCredits>>
 
 Wake(f) ==
@@ -36,31 +36,31 @@ Wake(f) ==
     /\ wakeCredits[f] < 2
     /\ queued' = queued \cup {f}
     /\ wakeCredits' = [wakeCredits EXCEPT ![f] = @ + 1]
-    /\ UNCHANGED <<lifecycle, runOwner, claimed>>
+    /\ UNCHANGED <<lifecycle, runOwners, claimed>>
 
 Pop(f) ==
     /\ f \in queued
     /\ f \notin claimed
     /\ queued' = queued \ {f}
     /\ claimed' = claimed \cup {f}
-    /\ UNCHANGED <<lifecycle, runOwner, wakeCredits>>
+    /\ UNCHANGED <<lifecycle, runOwners, wakeCredits>>
 
 AcquireRun(f, w) ==
     /\ f \in claimed
-    /\ runOwner[f] = NoWorker
+    /\ runOwners[f] = {} \* MUTATION_ACQUIRE_EXCLUSIVE
     /\ lifecycle[f] # "free"
     /\ claimed' = claimed \ {f}
     /\ lifecycle' = [lifecycle EXCEPT ![f] = "running"]
-    /\ runOwner' = [runOwner EXCEPT ![f] = w]
+    /\ runOwners' = [runOwners EXCEPT ![f] = @ \cup {w}]
     /\ wakeCredits' = [wakeCredits EXCEPT ![f] = @ - 1]
     /\ UNCHANGED queued
 
 Finish(f) ==
     /\ lifecycle[f] = "running"
-    /\ runOwner[f] # NoWorker
+    /\ runOwners[f] # {}
     /\ wakeCredits[f] = 0
     /\ lifecycle' = [lifecycle EXCEPT ![f] = "free"]
-    /\ runOwner' = [runOwner EXCEPT ![f] = NoWorker]
+    /\ runOwners' = [runOwners EXCEPT ![f] = {}]
     /\ UNCHANGED <<queued, claimed, wakeCredits>>
 
 Next ==
@@ -71,29 +71,40 @@ Next ==
     \/ \E f \in Fibers, w \in Workers: AcquireRun(f, w)
     \/ \E f \in Fibers: Finish(f)
 
-Spec == Init /\ [][Next]_vars
+\* Fairness applies only to `AcquireRun`: workers always convert a popped wake
+\* token into a run once ownership is vacated. Whether the workload starts,
+\* suspends, wakes, or finishes fibers is its own business.
+Fairness == \A f \in Fibers: WF_vars(\E w \in Workers: AcquireRun(f, w))
+
+Spec == Init /\ [][Next]_vars /\ Fairness
 
 TypeOK ==
     /\ lifecycle \in [Fibers -> Lifecycle]
-    /\ runOwner \in [Fibers -> Workers \cup {NoWorker}]
+    /\ runOwners \in [Fibers -> SUBSET Workers]
     /\ queued \subseteq Fibers
     /\ claimed \subseteq Fibers
     /\ wakeCredits \in [Fibers -> 0..2]
 
+\* At most one worker ever runs a fiber — the double-run that a queued
+\* wake-before-yield would cause if `AcquireRun` did not insist on vacated
+\* ownership.
+ExclusiveRunOwner == \A f \in Fibers: Cardinality(runOwners[f]) <= 1
+
 FreeIsDetached == \A f \in Fibers:
     lifecycle[f] = "free" =>
-        /\ runOwner[f] = NoWorker
+        /\ runOwners[f] = {}
         /\ f \notin queued \cup claimed
         /\ wakeCredits[f] = 0
 
-RunningHasOwner == \A f \in Fibers:
-    (runOwner[f] # NoWorker) => lifecycle[f] = "running"
+OwnersOnlyWhileRunning == \A f \in Fibers:
+    runOwners[f] # {} => lifecycle[f] = "running"
 
 ReadyTokenAccounting == \A f \in Fibers:
     wakeCredits[f] = (IF f \in queued THEN 1 ELSE 0)
                      + (IF f \in claimed THEN 1 ELSE 0)
 
-NoDuplicateQueueEntry == queued \subseteq Fibers
-OneRunOwner == runOwner \in [Fibers -> Workers \cup {NoWorker}]
+\* A popped wake token is never lost: the suspended fiber it names runs again.
+ClaimedTokenRuns == \A f \in Fibers:
+    (f \in claimed /\ lifecycle[f] = "suspended") ~> (lifecycle[f] = "running")
 
 =============================================================================

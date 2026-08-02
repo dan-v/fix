@@ -43,10 +43,13 @@ expect_mutation_rejected() {
   echo "TLC mutation rejected: $spec"
 }
 
-# Prove the models are discriminating rather than tautological: remove three
-# load-bearing guards and require TLC to produce a counterexample for each.
+# Prove the models are discriminating rather than tautological: remove one
+# load-bearing guard per model and require TLC to produce a counterexample.
 expect_mutation_rejected FutureWait \
   'MUTATION_ENROLL_RECHECK' \
+  'TRUE'
+expect_mutation_rejected FiberDispatch \
+  'MUTATION_ACQUIRE_EXCLUSIVE' \
   'TRUE'
 expect_mutation_rejected Shutdown \
   'MUTATION_EXTERNAL_DRAIN' \
