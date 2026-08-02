@@ -30,9 +30,12 @@ jobs:
           save: ${{ success() }}
 
 
-      - name: Configure pinned NIX_PATH
+      - name: Install pinned nixpkgs channel
         run: |
-          nixpkgs="$(nix eval --raw --impure --expr '(import ./npins).nixpkgs.outPath')"
+          nixpkgs="$(nix-build nix/pinned-nixpkgs.nix --out-link .pinned-nixpkgs)"
+          mkdir -p ~/.nix-defexpr/channels
+          ln -sfn "$nixpkgs" ~/.nix-defexpr/channels/nixpkgs
+          # fix has no channel fallback yet; give it the search path directly.
           echo "NIX_PATH=nixpkgs=$nixpkgs" >> "$GITHUB_ENV"
 
       - name: Build
@@ -132,9 +135,12 @@ jobs:
           save: ${{ success() }}
 
 
-      - name: Configure pinned NIX_PATH
+      - name: Install pinned nixpkgs channel
         run: |
-          nixpkgs="$(nix eval --raw --impure --expr '(import ./npins).nixpkgs.outPath')"
+          nixpkgs="$(nix-build nix/pinned-nixpkgs.nix --out-link .pinned-nixpkgs)"
+          mkdir -p ~/.nix-defexpr/channels
+          ln -sfn "$nixpkgs" ~/.nix-defexpr/channels/nixpkgs
+          # fix has no channel fallback yet; give it the search path directly.
           echo "NIX_PATH=nixpkgs=$nixpkgs" >> "$GITHUB_ENV"
 
       # Oracle drvPaths only change when the nixpkgs pin moves, so cache them
@@ -179,9 +185,12 @@ jobs:
           save: ${{ success() }}
 
 
-      - name: Configure pinned NIX_PATH
+      - name: Install pinned nixpkgs channel
         run: |
-          nixpkgs="$(nix eval --raw --impure --expr '(import ./npins).nixpkgs.outPath')"
+          nixpkgs="$(nix-build nix/pinned-nixpkgs.nix --out-link .pinned-nixpkgs)"
+          mkdir -p ~/.nix-defexpr/channels
+          ln -sfn "$nixpkgs" ~/.nix-defexpr/channels/nixpkgs
+          # fix has no channel fallback yet; give it the search path directly.
           echo "NIX_PATH=nixpkgs=$nixpkgs" >> "$GITHUB_ENV"
 
       - name: Report daemon implementation
