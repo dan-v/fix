@@ -466,4 +466,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_e2e.addArgs(args);
     e2e_step.dependOn(&run_e2e.step);
     test_step.dependOn(&run_e2e.step);
+
+    // Whole-nixpkgs differential (test/nixpkgs/): evaluate the entire nixpkgs
+    // CI job universe (~80k attrs) under fix and a reference Nix and compare
+    // per-attr drvPaths. Monolithic by default (peaks ~51 GB; the oracle is
+    // cached per pin under ~/.cache/fix-nixpkgs-eval, first run pays ~2.5 min
+    // to generate it). Sharded for memory-constrained machines:
+    // `zig build test-nixpkgs -- --chunk 3/12 --gc-budget 1024`.
+    // NOT part of `zig build test` — run it directly.
+    const nixpkgs_step = b.step("test-nixpkgs", "Differentially eval the whole nixpkgs universe: fix vs reference Nix");
+    const run_nixpkgs = b.addSystemCommand(&.{"bash"});
+    run_nixpkgs.addFileArg(b.path("test/nixpkgs/run.sh"));
+    run_nixpkgs.step.dependOn(b.getInstallStep());
+    run_nixpkgs.has_side_effects = true;
+    if (b.args) |args| run_nixpkgs.addArgs(args);
+    nixpkgs_step.dependOn(&run_nixpkgs.step);
 }
