@@ -5,9 +5,12 @@ their state-machine joints. They deliberately do not model CPU registers,
 inline assembly, or C/Zig atomic lowering; sanitizer and architecture stress
 tests cover those layers.
 
-- `FutureWait`: one-shot claim, enroll-under-lock, terminal publication, and
-  waiter draining. It checks that every enrollment remains waiting or is
-  woken exactly once and that evaluation eventually leaves its busy state.
+- `FutureWait`: claim, enroll-under-lock, terminal publication, transient
+  reset, and waiter draining. Each waiter is a small state machine that may
+  re-enroll after a reset wake (the `reset()` retry path), so multi-cycle
+  behaviors are in the state space. It checks that enrollment only happens
+  under an active claim, that every enrolled waiter is eventually woken, and
+  that evaluation eventually leaves its busy state.
 - `FiberDispatch`: lifecycle publication, ready tokens, popped contenders,
   run ownership, suspension, wake-before-yield, finish, and recycle. Queue
   membership and run ownership are separate because a wake may be queued

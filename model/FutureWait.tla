@@ -5,67 +5,81 @@ CONSTANTS Waiters, Claimers, NoClaimer
 
 Terminal == {"resolved", "errored", "blackhole"}
 
-VARIABLES state, claimer, waiting, woken, enrolled
+\* Each waiter cycles idle -> waiting -> woken -> idle. The woken -> idle step
+\* models the fiber observing its wake and becoming free to re-enroll, which
+\* is exactly what happens after `reset()` drops a transient failure back to
+\* `.unresolved` and wakes the list so it can retry.
+WaiterState == {"idle", "waiting", "woken"}
 
-vars == <<state, claimer, waiting, woken, enrolled>>
+VARIABLES state, claimer, wstate
+
+vars == <<state, claimer, wstate>>
 
 Init ==
     /\ state = "unresolved"
     /\ claimer = NoClaimer
-    /\ waiting = {}
-    /\ woken = {}
-    /\ enrolled = {}
+    /\ wstate = [w \in Waiters |-> "idle"]
 
 Claim(c) ==
     /\ state = "unresolved"
     /\ c \in Claimers
     /\ state' = "evaluating"
     /\ claimer' = c
-    /\ UNCHANGED <<waiting, woken, enrolled>>
+    /\ UNCHANGED wstate
 
 Enroll(w) ==
     /\ state = "evaluating" \* MUTATION_ENROLL_RECHECK
-    /\ w \in Waiters \ enrolled
-    /\ waiting' = waiting \cup {w}
-    /\ enrolled' = enrolled \cup {w}
-    /\ UNCHANGED <<state, claimer, woken>>
+    /\ wstate[w] = "idle"
+    /\ wstate' = [wstate EXCEPT ![w] = "waiting"]
+    /\ UNCHANGED <<state, claimer>>
+
+WakeAll == [w \in Waiters |-> IF wstate[w] = "waiting" THEN "woken" ELSE wstate[w]]
 
 Publish(outcome) ==
     /\ state = "evaluating"
     /\ outcome \in Terminal
     /\ state' = outcome
     /\ claimer' = NoClaimer
-    /\ woken' = woken \cup waiting
-    /\ waiting' = {}
-    /\ UNCHANGED enrolled
+    /\ wstate' = WakeAll
 
 Reset ==
     /\ state = "evaluating"
     /\ state' = "unresolved"
     /\ claimer' = NoClaimer
-    /\ woken' = woken \cup waiting
-    /\ waiting' = {}
-    /\ UNCHANGED enrolled
+    /\ wstate' = WakeAll
+
+Observe(w) ==
+    /\ wstate[w] = "woken"
+    /\ wstate' = [wstate EXCEPT ![w] = "idle"]
+    /\ UNCHANGED <<state, claimer>>
 
 Next ==
     \/ \E c \in Claimers: Claim(c)
     \/ \E w \in Waiters: Enroll(w)
     \/ \E outcome \in Terminal: Publish(outcome)
     \/ Reset
+    \/ \E w \in Waiters: Observe(w)
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 TypeOK ==
     /\ state \in {"unresolved", "evaluating"} \cup Terminal
     /\ claimer \in Claimers \cup {NoClaimer}
-    /\ waiting \subseteq Waiters
-    /\ woken \subseteq Waiters
-    /\ enrolled \subseteq Waiters
+    /\ wstate \in [Waiters -> WaiterState]
 
 SingleClaimer == (state = "evaluating") <=> (claimer \in Claimers)
-TerminalDrained == state \in Terminal => waiting = {}
-NoLostEnrollment == enrolled = waiting \cup woken
-NoDoubleWake == waiting \cap woken = {}
-EventuallyLeavesEvaluation == [](state = "evaluating" ~> state # "evaluating")
+
+\* An enrolled waiter exists only while a claimer is evaluating. Enrollment
+\* against an unresolved or terminal future is the lost-wakeup bug the
+\* under-lock state recheck in `enrollWaiter` exists to prevent.
+WaitingImpliesEvaluating ==
+    \A w \in Waiters: wstate[w] = "waiting" => state = "evaluating"
+
+EventuallyLeavesEvaluation == (state = "evaluating") ~> (state # "evaluating")
+
+\* No waiter is ever stranded: every enrollment is drained by a publication
+\* or a reset.
+EveryWaiterWakes ==
+    \A w \in Waiters: (wstate[w] = "waiting") ~> (wstate[w] = "woken")
 
 =============================================================================
