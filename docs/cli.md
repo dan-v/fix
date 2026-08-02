@@ -83,6 +83,7 @@ The REPL also offers `:debug EXPR` / `:d EXPR` without requiring a persistent `-
 | `:vm QUERY` | the same bounded chunk, heap-store, object, span, reference, and breakpoint queries as REPL `:vm` |
 | `break FILE:LINE` | set a source-line breakpoint |
 | `breakpoints` / `delete N` | list / remove breakpoints |
+| `:gc` | run a full collection at the pause and refresh debugger heap views |
 | `n` / `next` | step to the next line, over calls |
 | `s` / `step` | step to the next line, into calls |
 | `finish` | run until the current frame returns |

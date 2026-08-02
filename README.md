@@ -254,7 +254,8 @@ $ fix eval --debugger ./expression.nix
 Inside the debugger, `break FILE:LINE` adds a source breakpoint. A breakpoint
 may remain pending until that source is compiled; it resolves automatically
 when the matching code appears. `breakpoints` lists breakpoints and `delete N`
-removes one.
+removes one. `:gc` runs a full collection while preserving the paused session's
+values and refreshes the heap views.
 
 Both tools also have bounded text output for non-interactive use. Start the REPL
 with `fix repl --no-tui` when an alternate-screen interface is undesirable.
