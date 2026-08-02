@@ -529,6 +529,10 @@ const CollectionState = struct {
     parallel_cap: u32 = gc_controller.default_parallel_cap,
     coordinator: gc_coordinator.Coordinator = .{},
     extra_roots: std.ArrayListUnmanaged(Value) = .empty,
+    /// Serializes `extra_roots` appends from concurrently-completing
+    /// top-level fibers. `markRoots` reads without it: collections are
+    /// stop-the-world, so no appender can be running then.
+    extra_roots_mu: SpinMutex = .{},
 };
 
 fn debugContext(session: *const DebugSession) debug_session.Context {
@@ -1810,6 +1814,10 @@ pub const Engine = struct {
                     return;
                 };
                 observation.finish(.{});
+                // The sink is native storage and this fiber unwinds now; pin
+                // the result before it becomes sweepable (see
+                // gcRootCrossingValue).
+                ctx.ev.gcRootCrossingValue(value);
                 ctx.sink.complete(ctx.index, value, null);
             }
         };
@@ -2346,6 +2354,19 @@ pub const Engine = struct {
     /// body's `.busy` thunks yield through the standard fiber machinery
     /// instead of blocking the thread. The body's payload type is
     /// inferred from its return signature; void payloads work too.
+    /// Any heap `Value` in `args` arrives through NATIVE memory (this frame /
+    /// the Ctx struct below), which the precise collector never scans. Between
+    /// evaluations nothing else roots such values (the repl guards its own via
+    /// `extra_roots`), so the body's first safepoint could sweep them — e.g.
+    /// the strict render's result attrset, with the collection budget already
+    /// exhausted by the evaluation that produced it. Pin them as temp-roots of
+    /// the body's VM for the duration.
+    fn rootValueArgs(vm: *vm_mod.VM, args: anytype) void {
+        inline for (args) |a| {
+            if (@TypeOf(a) == Value) vm_force.rootKeep(vm, a);
+        }
+    }
+
     fn runWithVm(self: *Engine, comptime body: anytype, args: anytype) !ReturnPayload(@TypeOf(body)) {
         try self.requireActiveEvaluation();
         if (fiber_mod.currentFiber() != null) {
@@ -2355,7 +2376,12 @@ pub const Engine = struct {
             defer vm.deinit();
             gc_controller.registerVm(gcContext(self), &vm);
             defer gc_controller.unregisterVm(gcContext(self), &vm);
-            return @call(.auto, body, .{&vm} ++ args);
+            const gc_scope = vm_force.rootsBegin(&vm);
+            defer vm_force.rootsEnd(&vm, gc_scope);
+            rootValueArgs(&vm, args);
+            const result = try @call(.auto, body, .{&vm} ++ args);
+            if (comptime ReturnPayload(@TypeOf(body)) == Value) self.gcRootCrossingValue(result);
+            return result;
         }
         const Args = @TypeOf(args);
         const Ret = ReturnPayload(@TypeOf(body));
@@ -2376,10 +2402,14 @@ pub const Engine = struct {
                 defer vm.deinit();
                 gc_controller.registerVm(gcContext(ctx.ev), &vm);
                 defer gc_controller.unregisterVm(gcContext(ctx.ev), &vm);
+                const gc_scope = vm_force.rootsBegin(&vm);
+                defer vm_force.rootsEnd(&vm, gc_scope);
+                rootValueArgs(&vm, ctx.body_args);
                 const result = @call(.auto, body, .{&vm} ++ ctx.body_args) catch |e| {
                     ctx.err = e;
                     return;
                 };
+                if (comptime Ret == Value) ctx.ev.gcRootCrossingValue(result);
                 ctx.result = result;
             }
         };
@@ -2453,9 +2483,28 @@ pub const Engine = struct {
     /// `collection.extra_roots`). The repl passes its scope attrset + loose values
     /// here whenever they change; they stay rooted until replaced.
     pub fn gcSetExternalRoots(self: *Engine, roots: []const Value) !void {
+        self.collection.extra_roots_mu.lock();
+        defer self.collection.extra_roots_mu.unlock();
         try self.collection.extra_roots.ensureTotalCapacity(self.allocator, roots.len);
         self.collection.extra_roots.clearRetainingCapacity();
         self.collection.extra_roots.appendSliceAssumeCapacity(roots);
+    }
+
+    /// Root a value that is about to cross into NATIVE storage (a result
+    /// sink, a runWithVm return) where the precise collector cannot see it.
+    /// The publishing fiber unwinds right after, and other workers' straggler
+    /// fibers can still park and run a pending collection — without this the
+    /// finished value is sweepable the moment its fiber's stack is gone.
+    /// Entries persist until the next `gcSetExternalRoots` (repl) replaces
+    /// the set; a driver doing many evaluations retains one Value per result.
+    fn gcRootCrossingValue(self: *Engine, value: Value) void {
+        if (ObjectHeap.gcHeapId(value) == null) return;
+        self.collection.extra_roots_mu.lock();
+        defer self.collection.extra_roots_mu.unlock();
+        // Like the remembered set, this is correctness metadata: failing to
+        // record it permits a sweep of a live value.
+        self.collection.extra_roots.append(self.allocator, value) catch
+            @panic("gc external root append failed");
     }
 
     pub const CollectNowResult = struct {

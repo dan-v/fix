@@ -77,6 +77,10 @@ test "parallel: automatic collector dispatches a major with 4 workers" {
     defer ev.gcSetExternalRoots(&.{}) catch {};
     const garbage = try ev.evaluate("{ discard = [ 1 2 3 4 ]; }");
     const garbage_id = garbage.asObjectId();
+    // Completed results are auto-rooted the moment they cross into native
+    // storage (gcRootCrossingValue) — a dropped result must be released by
+    // replacing the external root set, exactly as the repl does.
+    try ev.gcSetExternalRoots(&.{live});
 
     // Force the normal collection hook (not collectMajorNow's direct call) to
     // take its major branch. This is the policy state a sufficiently large
