@@ -98,9 +98,11 @@ $ nix-shell --run 'zig build --release=fast'
 ```
 
 Evaluation does not require a Nix or Lix executable. Store-writing commands need
-a reachable Nix or Lix daemon, but `fix` talks to it directly and never executes
-installed Nix/Lix programs. Tagged releases publish optimized build archives for
-x86_64 Linux, aarch64 Linux, and aarch64 macOS.
+a reachable Nix or Lix daemon. Local and TCP transports talk to it directly;
+`ssh-ng://` explicitly starts the remote host's daemon worker endpoint. `fix`
+never discovers or executes a locally installed Nix/Lix program. Tagged releases
+publish optimized build archives for x86_64 Linux, aarch64 Linux, and aarch64
+macOS.
 
 ```console
 $ ./zig-out/bin/fix eval -E '1 + 2'
@@ -125,10 +127,10 @@ has a native implementation of that protocol.
 
 The default local socket follows `NIX_STATE_DIR` (or `/nix/var/nix`), and
 `NIX_DAEMON_SOCKET_PATH` overrides it. `NIX_REMOTE`, `--store`, and the
-`nix.conf` `store` setting can select `daemon`, `unix://`, or `tcp://`
-transports. `local`, `auto`, absolute chroot roots, and `ssh-ng://` are rejected
-explicitly: supporting them requires native local-store and SSH transports, not
-delegation to an installed implementation.
+`nix.conf` `store` setting can select `daemon`, `unix://`, `ssh-ng://`, or
+`tcp://` transports. `local`, `auto`, and absolute chroot roots are rejected
+explicitly: supporting them requires a native local-store backend, not
+delegation to a locally installed implementation.
 Like Nix, only user config, `$NIX_CONFIG`, and explicit CLI overrides are
 forwarded to the daemon; system `nix.conf` settings remain daemon-side policy.
 Direct GC-root checks and local `fix switch` system profiles also follow
@@ -182,7 +184,7 @@ $ fix build -A fix
 
 Arguments can be supplied with `--arg` and `--argstr`. Evaluation can produce
 Nix, JSON, XML, or raw output, and can be made strict. Builds can target direct
-Unix-socket and TCP daemon endpoints.
+Unix-socket, SSH, and TCP daemon endpoints.
 
 ### Run programs and open temporary shells
 

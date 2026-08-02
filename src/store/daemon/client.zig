@@ -17,6 +17,52 @@ const settings = @import("settings.zig");
 pub const default_socket_path = "/nix/var/nix/daemon-socket/socket";
 const default_socket_dir = "/nix/var/nix/daemon-socket";
 
+const SshTarget = struct {
+    host: []const u8,
+    port: ?[]const u8 = null,
+    ssh_key: ?[]const u8 = null,
+    compress: bool = false,
+};
+
+/// Parse the transport-level settings of an `ssh-ng://` store. Store settings
+/// that change the remote command are rejected until they can be shell-escaped
+/// without ambiguity; silently ignoring a query would be worse.
+fn sshTarget(store: []const u8) !?SshTarget {
+    const prefix = "ssh-ng://";
+    if (!std.mem.startsWith(u8, store, prefix)) return null;
+    var rest = store[prefix.len..];
+    const query_at = std.mem.indexOfScalar(u8, rest, '?');
+    const authority = if (query_at) |q| rest[0..q] else rest;
+    if (authority.len == 0 or std.mem.indexOfScalar(u8, authority, '/') != null)
+        return error.InvalidStoreUri;
+    var target: SshTarget = .{ .host = authority };
+    if (query_at) |q| {
+        rest = rest[q + 1 ..];
+        var fields = std.mem.splitScalar(u8, rest, '&');
+        while (fields.next()) |field| {
+            if (field.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidStoreUri;
+            const name = field[0..eq];
+            const value = field[eq + 1 ..];
+            if (std.mem.eql(u8, name, "port")) {
+                _ = std.fmt.parseInt(u16, value, 10) catch return error.InvalidStoreUri;
+                target.port = value;
+            } else if (std.mem.eql(u8, name, "ssh-key")) {
+                if (value.len == 0) return error.InvalidStoreUri;
+                target.ssh_key = value;
+            } else if (std.mem.eql(u8, name, "compress")) {
+                if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"))
+                    target.compress = true
+                else if (!std.mem.eql(u8, value, "false") and !std.mem.eql(u8, value, "0"))
+                    return error.InvalidStoreUri;
+            } else {
+                return error.UnsupportedSshStoreSetting;
+            }
+        }
+    }
+    return target;
+}
+
 const TcpTarget = struct { host: []const u8, port: u16 };
 
 /// The host/port of a `tcp://host:port` store (bracketed IPv6 accepted), else null.
@@ -109,8 +155,10 @@ fn validateTransportUri(store: []const u8) !void {
         std.mem.startsWith(u8, store, "local://") or
         std.mem.startsWith(u8, store, "local-root:"))
         return error.NativeLocalStoreUnsupported;
-    if (std.mem.startsWith(u8, store, "ssh-ng://"))
-        return error.NativeSshStoreUnsupported;
+    if (std.mem.startsWith(u8, store, "ssh-ng://")) {
+        _ = try sshTarget(store);
+        return;
+    }
     if (std.mem.startsWith(u8, store, "tcp://")) {
         if (tcpTarget(store) == null) return error.InvalidStoreUri;
         return;
@@ -168,7 +216,14 @@ test "store uri parsing selects transport" {
     try std.testing.expectError(error.NativeLocalStoreUnsupported, validateStoreUri("auto"));
     try std.testing.expectError(error.NativeLocalStoreUnsupported, validateStoreUri("local?root=/tmp/store"));
     try std.testing.expectError(error.NativeLocalStoreUnsupported, validateStoreUri("/tmp/chroot"));
-    try std.testing.expectError(error.NativeSshStoreUnsupported, validateStoreUri("ssh-ng://build.example.com"));
+    const ssh = (try sshTarget("ssh-ng://user@host?port=2222&ssh-key=/tmp/key&compress=true")).?;
+    try std.testing.expectEqualStrings("user@host", ssh.host);
+    try std.testing.expectEqualStrings("2222", ssh.port.?);
+    try std.testing.expectEqualStrings("/tmp/key", ssh.ssh_key.?);
+    try std.testing.expect(ssh.compress);
+    try validateStoreUri("ssh-ng://build.example.com");
+    try std.testing.expectError(error.InvalidStoreUri, validateStoreUri("ssh-ng://"));
+    try std.testing.expectError(error.UnsupportedSshStoreSetting, validateStoreUri("ssh-ng://host?remote-store=local"));
     try std.testing.expectError(error.UnsupportedLixRpcProtocol, validateStoreUri("unix:///tmp/daemon?protocol=lix-xp-1"));
     try validateStoreUri("/tmp/daemon-socket/socket");
     try validateStoreUri("tcp://build.example.com:1234");
@@ -234,21 +289,46 @@ pub const MissingPlan = struct {
     }
 };
 
-/// A direct unix or TCP daemon connection. Store protocol support never falls
-/// back to an installed implementation binary.
-const Transport = struct {
-    stream: std.Io.net.Stream,
-    reader: std.Io.net.Stream.Reader,
-    writer: std.Io.net.Stream.Writer,
+/// A daemon connection over a direct socket or an explicit SSH remote. Store
+/// selection never falls back to a locally installed Nix/Lix implementation.
+const Transport = union(enum) {
+    socket: Socket,
+    command: Command,
+
+    const Socket = struct {
+        stream: std.Io.net.Stream,
+        reader: std.Io.net.Stream.Reader,
+        writer: std.Io.net.Stream.Writer,
+    };
+    const Command = struct {
+        child: std.process.Child,
+        reader: std.Io.File.Reader,
+        writer: std.Io.File.Writer,
+    };
 
     fn r(self: *Transport) *std.Io.Reader {
-        return &self.reader.interface;
+        return switch (self.*) {
+            .socket => |*s| &s.reader.interface,
+            .command => |*c| &c.reader.interface,
+        };
     }
     fn w(self: *Transport) *std.Io.Writer {
-        return &self.writer.interface;
+        return switch (self.*) {
+            .socket => |*s| &s.writer.interface,
+            .command => |*c| &c.writer.interface,
+        };
     }
     fn close(self: *Transport, io: std.Io) void {
-        self.stream.close(io);
+        switch (self.*) {
+            .socket => |*s| s.stream.close(io),
+            .command => |*c| {
+                if (c.child.stdin) |f| {
+                    f.close(io);
+                    c.child.stdin = null;
+                }
+                _ = c.child.wait(io) catch {};
+            },
+        }
     }
 };
 
@@ -273,7 +353,8 @@ pub const DaemonStore = struct {
     build_sink: ?BuildSink = null,
 
     /// Connect to a daemon and complete the handshake. `store` is a direct
-    /// `daemon`, `unix://PATH`, or `tcp://HOST:PORT` endpoint.
+    /// `daemon`, `unix://PATH`, or `tcp://HOST:PORT` endpoint, or an explicit
+    /// `ssh-ng://HOST` remote daemon.
     /// Heap-allocated so the framed reader/writer (which hold interior pointers
     /// via `@fieldParentPtr`) stay put.
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, store: []const u8) !*DaemonStore {
@@ -302,17 +383,53 @@ pub const DaemonStore = struct {
     fn openTransport(self: *DaemonStore, store: []const u8) !void {
         const io = self.io;
         try validateTransportUri(store);
+        if (try sshTarget(store)) |target| {
+            // The remote store explicitly owns the worker endpoint. No local
+            // Nix/Lix executable participates in selecting or adapting it.
+            var argv: [11][]const u8 = undefined;
+            var argc: usize = 0;
+            argv[argc] = "ssh";
+            argc += 1;
+            argv[argc] = "-o";
+            argc += 1;
+            argv[argc] = "BatchMode=yes";
+            argc += 1;
+            if (target.compress) {
+                argv[argc] = "-C";
+                argc += 1;
+            }
+            if (target.port) |port| {
+                argv[argc] = "-p";
+                argc += 1;
+                argv[argc] = port;
+                argc += 1;
+            }
+            if (target.ssh_key) |key| {
+                argv[argc] = "-i";
+                argc += 1;
+                argv[argc] = key;
+                argc += 1;
+            }
+            argv[argc] = target.host;
+            argc += 1;
+            argv[argc] = "nix-daemon";
+            argc += 1;
+            argv[argc] = "--stdio";
+            argc += 1;
+            try self.openCommand(argv[0..argc]);
+            return;
+        }
         if (tcpTarget(store)) |target| {
             // `tcp://host:port` — the worker protocol over a TCP daemon socket
             // (e.g. a `socat`/`nc` bridge to a unix socket, or a TCP-listening
             // daemon). Same framed transport as the unix socket.
             const addr = try std.Io.net.IpAddress.resolve(io, target.host, target.port);
             const stream = try addr.connect(io, .{ .mode = .stream });
-            self.transport = .{
+            self.transport = .{ .socket = .{
                 .stream = stream,
                 .reader = std.Io.net.Stream.Reader.init(stream, io, self.rbuf),
                 .writer = std.Io.net.Stream.Writer.init(stream, io, self.wbuf),
-            };
+            } };
             return;
         }
         const target = try unixTarget(store);
@@ -324,11 +441,31 @@ pub const DaemonStore = struct {
         const path = owned_path orelse target.path;
         const addr = try std.Io.net.UnixAddress.init(path);
         const stream = try addr.connect(io);
-        self.transport = .{
+        self.transport = .{ .socket = .{
             .stream = stream,
             .reader = std.Io.net.Stream.Reader.init(stream, io, self.rbuf),
             .writer = std.Io.net.Stream.Writer.init(stream, io, self.wbuf),
-        };
+        } };
+    }
+
+    fn openCommand(self: *DaemonStore, argv: []const []const u8) !void {
+        const io = self.io;
+        var child = try std.process.spawn(io, .{
+            .argv = argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+        });
+        errdefer {
+            if (child.stdin) |f| f.close(io);
+            _ = child.wait(io) catch {};
+        }
+        const out = child.stdout orelse return error.CommandPipeUnavailable;
+        const in = child.stdin orelse return error.CommandPipeUnavailable;
+        self.transport = .{ .command = .{
+            .child = child,
+            .reader = out.readerStreaming(io, self.rbuf),
+            .writer = in.writerStreaming(io, self.wbuf),
+        } };
     }
 
     pub fn deinit(self: *DaemonStore) void {

@@ -181,7 +181,7 @@ pub fn configure(
             store.daemon.validateStoreUri(uri) catch |err| {
                 switch (err) {
                     error.NativeLocalStoreUnsupported => std.debug.print("error: local, auto, and chroot stores need fix's native local-store backend, which is not implemented yet\n", .{}),
-                    error.NativeSshStoreUnsupported => std.debug.print("error: ssh-ng stores need fix's native SSH transport, which is not implemented yet\n", .{}),
+                    error.UnsupportedSshStoreSetting => std.debug.print("error: this ssh-ng store setting is not implemented; supported settings are port, ssh-key, and compress\n", .{}),
                     error.UnsupportedLixRpcProtocol => std.debug.print("error: this Lix endpoint only offers lix-xp-1, which fix does not implement yet\n", .{}),
                     error.UnsupportedDaemonProtocol => std.debug.print("error: the store URI requests an unsupported daemon protocol\n", .{}),
                     else => std.debug.print("error: invalid or unsupported store URI: {s}\n", .{uri}),
