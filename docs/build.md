@@ -27,7 +27,7 @@ The LALR parser tables are expensive to construct at comptime, so a standalone c
 
 ## Build options
 
-Engine-specific `-D` flags are folded into one shared `build_options` module and injected only where they are used. Generic `base` does not see that application-wide option surface. It receives a separate, narrow `base_options` module containing only the profiler-backed fiber census.
+Engine-specific `-D` flags are folded into one shared `build_options` module and injected only where they are used. Generic `base` does not see that application-wide option surface. It receives a separate, narrow `base_options` module containing the profiler-backed fiber census and the TSan fiber-switch hook gate.
 
 ### `-D` flag surface
 
@@ -41,6 +41,7 @@ All are `bool` and off unless noted. These are exactly the flags `build.zig` def
 | profiling | `prof-main` | rdtsc-time the main thread's hot serial paths; reported via `--stats` → [perf/probes.md](perf/probes.md) |
 | | `prof-path` | record the force-call tree + critical path (workers=1); reported via `--stats` → [perf/probes.md](perf/probes.md) |
 | compilation | `profile` | keep symbols + frame pointers (sets `strip=false`, `omit_frame_pointer=false`) |
+| verification | `tsan` | instrument the evaluator graph with ThreadSanitizer; x86_64 Linux only → [concurrency-testing.md](concurrency-testing.md) |
 
 Standard `zig build` options apply too: `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall` and `-Dtarget=…`. Perf numbers assume `ReleaseFast` (or `ReleaseSafe`); `-Dprofile` only flips symbol/frame-pointer stripping, it does not change the optimize mode.
 
@@ -54,7 +55,8 @@ The threaded VM dispatcher (`src/expr/vm/run.zig`) chains handlers with `@call(.
 
 `zig build test` runs one test artifact for each durable group and the
 end-to-end CLI shell suite. `zig build check` runs that suite, the structure
-check, and `zig fmt --check` over `build.zig`, `src/`, and `tools/`:
+check, `zig fmt --check` over `build.zig`, `src/`, and `tools/`, and the bounded
+TLA+ models:
 
 ```
 test → base_tests, syntax_tests, runtime_tests, store_tests, fetchers_tests,
@@ -62,6 +64,12 @@ test → base_tests, syntax_tests, runtime_tests, store_tests, fetchers_tests,
 ```
 
 Relative imports inside each durable root let its test artifact discover subsystem tests recursively. `zig build test-syntax` runs the front-end tests alone; `zig build bench-parse -- <file.nix>` runs the parse microbenchmark against `syntax`.
+
+`zig build test-concurrency` filters the runtime and evaluator artifacts to the
+deterministic concurrency protocol tests. `zig build check-models` runs the
+TLA+ specifications and mutation checks, while `zig build
+stress-concurrency -- --seed N --iterations N` drives the longer reproducible
+stress executable. See [concurrency verification](concurrency-testing.md).
 
 Expression-engine integration tests live under `src/integration/expr_api`; evaluator, compiler, and VM unit tests live with their `src/expr` subsystems, while the store realization facade owns its socket-backed tests and fake daemon. `test/*.nix` holds pathology and spec fixtures driven through evaluation.
 
