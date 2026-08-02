@@ -30,6 +30,13 @@ They do not fall back to a local implementation found on `PATH`.
 Unsupported SSH settings, including `remote-program` and `remote-store`, also
 fail explicitly instead of being ignored.
 
+SSH authority handling follows Lix's process boundary: the optional user and
+host are validated separately, and either component is rejected when empty or
+when it begins with `-`, before it can be interpreted as an OpenSSH option.
+The validated destination is passed with X11 forwarding disabled and a `--`
+boundary before the remote `nix-daemon --stdio` command. fix additionally uses
+OpenSSH batch mode so a store operation cannot hang on an interactive prompt.
+
 ## Why XP is separate
 
 Lix documents `lix-xp-1` as an experimental RPC protocol. Its current source

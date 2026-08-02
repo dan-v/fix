@@ -35,6 +35,16 @@ fn sshTarget(store: []const u8) !?SshTarget {
     const authority = if (query_at) |q| rest[0..q] else rest;
     if (authority.len == 0 or std.mem.indexOfScalar(u8, authority, '/') != null)
         return error.InvalidStoreUri;
+    // Match Lix's SSH authority boundary: user and host are validated
+    // independently because OpenSSH treats a leading dash in either position
+    // as an option even when the combined authority does not start with one.
+    const at = std.mem.lastIndexOfScalar(u8, authority, '@');
+    const user = if (at) |i| authority[0..i] else null;
+    const host = if (at) |i| authority[i + 1 ..] else authority;
+    if (user) |name| {
+        if (name.len == 0 or name[0] == '-') return error.InvalidStoreUri;
+    }
+    if (host.len == 0 or host[0] == '-') return error.InvalidStoreUri;
     var target: SshTarget = .{ .host = authority };
     if (query_at) |q| {
         rest = rest[q + 1 ..];
@@ -61,6 +71,49 @@ fn sshTarget(store: []const u8) !?SshTarget {
         }
     }
     return target;
+}
+
+const max_ssh_args = 13;
+
+/// Build the OpenSSH argv with the same security boundary as Lix's SSHMaster:
+/// a validated destination, `-x`, transport settings, then `--` before the
+/// remote program. fix additionally keeps BatchMode enabled so store commands
+/// never hang waiting for an interactive credential prompt.
+fn sshCommandArgs(target: SshTarget, argv: *[max_ssh_args][]const u8) []const []const u8 {
+    var argc: usize = 0;
+    argv[argc] = "ssh";
+    argc += 1;
+    argv[argc] = target.host;
+    argc += 1;
+    argv[argc] = "-x";
+    argc += 1;
+    argv[argc] = "-o";
+    argc += 1;
+    argv[argc] = "BatchMode=yes";
+    argc += 1;
+    if (target.compress) {
+        argv[argc] = "-C";
+        argc += 1;
+    }
+    if (target.port) |port| {
+        argv[argc] = "-p";
+        argc += 1;
+        argv[argc] = port;
+        argc += 1;
+    }
+    if (target.ssh_key) |key| {
+        argv[argc] = "-i";
+        argc += 1;
+        argv[argc] = key;
+        argc += 1;
+    }
+    argv[argc] = "--";
+    argc += 1;
+    argv[argc] = "nix-daemon";
+    argc += 1;
+    argv[argc] = "--stdio";
+    argc += 1;
+    return argv[0..argc];
 }
 
 const TcpTarget = struct { host: []const u8, port: u16 };
@@ -221,8 +274,31 @@ test "store uri parsing selects transport" {
     try std.testing.expectEqualStrings("2222", ssh.port.?);
     try std.testing.expectEqualStrings("/tmp/key", ssh.ssh_key.?);
     try std.testing.expect(ssh.compress);
+    var ssh_argv: [max_ssh_args][]const u8 = undefined;
+    const args = sshCommandArgs(ssh, &ssh_argv);
+    const expected_args = [_][]const u8{
+        "ssh",
+        "user@host",
+        "-x",
+        "-o",
+        "BatchMode=yes",
+        "-C",
+        "-p",
+        "2222",
+        "-i",
+        "/tmp/key",
+        "--",
+        "nix-daemon",
+        "--stdio",
+    };
+    try std.testing.expectEqual(expected_args.len, args.len);
+    for (expected_args, args) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
     try validateStoreUri("ssh-ng://build.example.com");
     try std.testing.expectError(error.InvalidStoreUri, validateStoreUri("ssh-ng://"));
+    try std.testing.expectError(error.InvalidStoreUri, validateStoreUri("ssh-ng://-oProxyCommand=id"));
+    try std.testing.expectError(error.InvalidStoreUri, validateStoreUri("ssh-ng://-user@host"));
+    try std.testing.expectError(error.InvalidStoreUri, validateStoreUri("ssh-ng://user@-oProxyCommand=id"));
     try std.testing.expectError(error.UnsupportedSshStoreSetting, validateStoreUri("ssh-ng://host?remote-store=local"));
     try std.testing.expectError(error.UnsupportedLixRpcProtocol, validateStoreUri("unix:///tmp/daemon?protocol=lix-xp-1"));
     try validateStoreUri("/tmp/daemon-socket/socket");
@@ -386,37 +462,8 @@ pub const DaemonStore = struct {
         if (try sshTarget(store)) |target| {
             // The remote store explicitly owns the worker endpoint. No local
             // Nix/Lix executable participates in selecting or adapting it.
-            var argv: [11][]const u8 = undefined;
-            var argc: usize = 0;
-            argv[argc] = "ssh";
-            argc += 1;
-            argv[argc] = "-o";
-            argc += 1;
-            argv[argc] = "BatchMode=yes";
-            argc += 1;
-            if (target.compress) {
-                argv[argc] = "-C";
-                argc += 1;
-            }
-            if (target.port) |port| {
-                argv[argc] = "-p";
-                argc += 1;
-                argv[argc] = port;
-                argc += 1;
-            }
-            if (target.ssh_key) |key| {
-                argv[argc] = "-i";
-                argc += 1;
-                argv[argc] = key;
-                argc += 1;
-            }
-            argv[argc] = target.host;
-            argc += 1;
-            argv[argc] = "nix-daemon";
-            argc += 1;
-            argv[argc] = "--stdio";
-            argc += 1;
-            try self.openCommand(argv[0..argc]);
+            var argv: [max_ssh_args][]const u8 = undefined;
+            try self.openCommand(sshCommandArgs(target, &argv));
             return;
         }
         if (tcpTarget(store)) |target| {
