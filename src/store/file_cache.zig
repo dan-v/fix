@@ -204,7 +204,10 @@ pub const FileCache = struct {
         entry.exists_known = true;
         entry.exists = true;
         entry.contents = handle;
-        entry.kind = .regular;
+        // Do NOT stamp `kind`: reading follows symlinks, but `kind` is the
+        // lstat kind (a symlink-to-regular must still serialize as a symlink
+        // node — stamping .regular here poisoned NAR hashing of any tree
+        // whose symlinked .nix files were imported first).
         return handle.bytes();
     }
 
@@ -229,7 +232,7 @@ pub const FileCache = struct {
         entry.dir_entries = null;
         entry.exists_known = true;
         entry.exists = true;
-        entry.kind = .regular;
+        // See readFile: writes follow a final symlink; `kind` stays lstat-only.
         entry.mu.unlock();
 
         self.invalidateParentListing(entry.path);
@@ -257,7 +260,7 @@ pub const FileCache = struct {
         entry.exists_known = true;
         entry.exists = true;
         entry.contents = handle;
-        entry.kind = .regular;
+        // See readFile: `kind` stays lstat-only.
         return handle.retain();
     }
 
@@ -362,7 +365,7 @@ pub const FileCache = struct {
 
         entry.exists_known = true;
         entry.exists = true;
-        entry.kind = .directory;
+        // See readFile: openDir follows symlinks; `kind` stays lstat-only.
         entry.dir_entries = try owned_entries.toOwnedSlice(self.allocator);
         return entry.dir_entries.?;
     }
