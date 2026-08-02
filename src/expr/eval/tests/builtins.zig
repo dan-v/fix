@@ -295,6 +295,28 @@ test "evaluate XML builtin" {
     try std.testing.expectEqualStrings("\"dev,out\"", xml_preserves_string_context);
 }
 
+test "toXML forces undemanded thunks instead of rendering unevaluated" {
+    // lazy_shells_visible wraps eager shapes in resolved-but-UNDEMANDED
+    // thunks — the same state speculation leaves behind. builtins.toXML is
+    // strict and must render through them; only the CLI's lazy --xml
+    // renderer may show `<unevaluated />`. (Regression: NixOS test drvs
+    // diverged because a speculatively-forced toXML baked `<unevaluated />`
+    // into grub-config.xml.)
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
+    defer ev.deinit();
+    ev.lazy_shells_visible = true;
+
+    const result = try ev.evaluate("builtins.toXML { a = { b = [ 1 ]; }; }");
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try ev.writeValue(&out.writer, result);
+    const xml = try out.toOwnedSlice();
+    defer std.testing.allocator.free(xml);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "unevaluated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<int value=\\\"1\\\" />") != null);
+}
+
 test "evaluate TOML builtin" {
     const parsed = try renderForTest(
         \\builtins.toJSON (let value = builtins.fromTOML ''

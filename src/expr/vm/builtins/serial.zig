@@ -236,7 +236,7 @@ pub fn builtinToXML(self: *VM, arg: Value) !Value {
     defer context.deinit(self.allocator);
 
     try vm_force.forceDeep(self, arg);
-    try writeXmlDocument(self, &out.writer, try vm_force.forceValue(self, arg), &context);
+    try writeXmlDocument(self, &out.writer, try vm_force.forceValue(self, arg), &context, .strict);
 
     const text = try out.toOwnedSlice();
     defer self.allocator.free(text);
@@ -246,17 +246,26 @@ pub fn builtinToXML(self: *VM, arg: Value) !Value {
 }
 
 pub fn writeLazyXmlValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
-    try writeXmlDocument(self, writer, try vm_force.forceValue(self, value), null);
+    try writeXmlDocument(self, writer, try vm_force.forceValue(self, value), null, .lazy);
 }
+
+/// `builtins.toXML` must render every value (Nix forces during traversal);
+/// only the CLI's lazy `--xml` renderer shows still-undemanded thunks as
+/// `<unevaluated />`. The distinction matters under speculation: a
+/// speculative force resolves thunks WITHOUT marking them demanded, so a
+/// demand-flag-sensitive strict render would bake `<unevaluated />` into a
+/// cached string that the real demander then observes.
+const XmlMode = enum { strict, lazy };
 
 fn writeXmlDocument(
     self: *VM,
     writer: *std.Io.Writer,
     value: Value,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+    mode: XmlMode,
 ) !void {
     try writer.writeAll("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n");
-    try writeXmlValue(self, writer, value, 1, context);
+    try writeXmlValue(self, writer, value, 1, context, mode);
     try writer.writeAll("</expr>\n");
 }
 
@@ -266,8 +275,12 @@ fn writeXmlValue(
     value: Value,
     depth: usize,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+    mode: XmlMode,
 ) anyerror!void {
-    const maybe_forced = try xmlVisibleValue(self, value);
+    const maybe_forced = switch (mode) {
+        .strict => try vm_force.forceValue(self, value),
+        .lazy => try xmlVisibleValue(self, value),
+    };
     const forced = maybe_forced orelse {
         try writeXmlIndent(writer, depth);
         try writer.writeAll("<unevaluated />\n");
@@ -302,8 +315,8 @@ fn writeXmlValue(
             try writeXmlEscaped(writer, self.intern.get(forced.asInternId()));
             try writer.writeAll("\" />\n");
         },
-        .list => try writeXmlList(self, writer, forced.asObjectId(), depth, context),
-        .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth, context),
+        .list => try writeXmlList(self, writer, forced.asObjectId(), depth, context, mode),
+        .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth, context, mode),
         .closure => try writeXmlFunction(self, writer, forced, depth),
         .builtin, .builtin_closure, .partial_app => try writer.writeAll("<function />\n"),
         .thunk => unreachable,
@@ -334,6 +347,7 @@ fn writeXmlList(
     id: ObjectId,
     depth: usize,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+    mode: XmlMode,
 ) !void {
     // GC: keep the bare list id live across the child force-walk below, plus the
     // accumulated `context` values (heap objects not on the VM stack).
@@ -345,7 +359,7 @@ fn writeXmlList(
     try writer.writeAll("<list>\n");
     const n = try self.heap.getListLen(id);
     var i: usize = 0;
-    while (i < n) : (i += 1) try writeXmlValue(self, writer, try self.heap.getListItem(id, i), depth + 1, context);
+    while (i < n) : (i += 1) try writeXmlValue(self, writer, try self.heap.getListItem(id, i), depth + 1, context, mode);
     try writeXmlIndent(writer, depth);
     try writer.writeAll("</list>\n");
 }
@@ -356,6 +370,7 @@ fn writeXmlAttrs(
     id: ObjectId,
     depth: usize,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+    mode: XmlMode,
 ) !void {
     // GC: `sorted` holds attr-entry values reachable only via the attrs object;
     // keep it live across the per-entry force-walk below, plus the accumulated
@@ -374,7 +389,7 @@ fn writeXmlAttrs(
         try writer.writeAll("<attr name=\"");
         try writeXmlEscaped(writer, self.intern.get(entry.name));
         try writer.writeAll("\">\n");
-        try writeXmlValue(self, writer, entry.value, depth + 2, context);
+        try writeXmlValue(self, writer, entry.value, depth + 2, context, mode);
         try writeXmlIndent(writer, depth + 1);
         try writer.writeAll("</attr>\n");
     }
