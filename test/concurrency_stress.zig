@@ -93,13 +93,29 @@ fn runIteration(allocator: std.mem.Allocator, random: std.Random, iteration: usi
     const failure_case = iteration % 5 == 4;
     const source = if (failure_case)
         try failureSource(allocator, iteration, random.intRangeAtMost(u32, 128, 512))
-    else
-        try successSource(
+    else switch (random.uintLessThan(u8, 4)) {
+        0 => try arithmeticSource(
             allocator,
             random.intRangeAtMost(u32, 400, 1_200),
             random.intRangeAtMost(u32, 512, 1_536),
             random.intRangeAtMost(u32, 16, 40),
-        );
+        ),
+        1 => try stringSource(
+            allocator,
+            random.intRangeAtMost(u32, 200, 600),
+            random.intRangeAtMost(u32, 3, 97),
+            random.intRangeAtMost(u32, 128, 512),
+        ),
+        2 => try attrsetSource(
+            allocator,
+            random.intRangeAtMost(u32, 200, 800),
+            random.intRangeAtMost(u32, 1, 9),
+        ),
+        else => try tryEvalSource(
+            allocator,
+            random.intRangeAtMost(u32, 128, 512),
+        ),
+    };
     defer allocator.free(source);
 
     try differentialEval(allocator, source, evaluator_workers, .{
@@ -113,7 +129,7 @@ const ParallelToggles = struct {
     disable_fanout: bool,
 };
 
-fn successSource(allocator: std.mem.Allocator, n: u32, fan: u32, garbage_width: u32) ![]u8 {
+fn arithmeticSource(allocator: std.mem.Allocator, n: u32, fan: u32, garbage_width: u32) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\let
         \\  n = {d};
@@ -122,6 +138,44 @@ fn successSource(allocator: std.mem.Allocator, n: u32, fan: u32, garbage_width: 
         \\  garbage = builtins.genList (i: builtins.genList (j: i + j) {d}) {d};
         \\in builtins.deepSeq garbage (builtins.deepSeq demands shared)
     , .{ n, fan, garbage_width, fan });
+}
+
+/// Shared interned string demanded from many fibers through slicing and
+/// re-concatenation — exercises string building and context machinery.
+fn stringSource(allocator: std.mem.Allocator, n: u32, stride: u32, fan: u32) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\let
+        \\  parts = builtins.genList (i: builtins.toString (i * i + {d})) {d};
+        \\  shared = builtins.concatStringsSep "-" parts;
+        \\  demands = builtins.genList (i: builtins.substring (i * {d}) 24 shared) {d};
+        \\in builtins.concatStringsSep "|" demands
+    , .{ stride, n, stride, fan });
+}
+
+/// Attribute-set construction and traversal rendered through toJSON, so the
+/// differential compares the full structure, ordering included.
+fn attrsetSource(allocator: std.mem.Allocator, n: u32, scale: u32) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\let
+        \\  base = builtins.listToAttrs (builtins.genList (i: {{
+        \\    name = "k${{builtins.toString i}}";
+        \\    value = i * {d};
+        \\  }}) {d});
+        \\  mapped = builtins.mapAttrs (name: value: value + builtins.stringLength name) base;
+        \\in builtins.toJSON (base // mapped)
+    , .{ scale, n });
+}
+
+/// Mixed success/failure fan-out under tryEval: sticky cached failures must
+/// recover identically no matter which worker computed or replayed them.
+fn tryEvalSource(allocator: std.mem.Allocator, fan: u32) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\let
+        \\  attempts = builtins.genList (i: builtins.tryEval (
+        \\    if builtins.bitAnd i 7 == 3 then throw "boom ${{builtins.toString i}}" else i * 2
+        \\  )) {d};
+        \\in builtins.toJSON (builtins.map (a: if a.success then a.value else -1) attempts)
+    , .{fan});
 }
 
 fn failureSource(allocator: std.mem.Allocator, iteration: usize, fan: u32) ![]u8 {
@@ -152,7 +206,11 @@ fn differentialEval(
     const parallel_result = parallel.evaluate(source);
     if (serial_result) |serial_value| {
         const parallel_value = parallel_result catch return error.ParallelUnexpectedFailure;
-        if (serial_value.asInt() != parallel_value.asInt()) return error.ValueMismatch;
+        const serial_text = try renderDeep(&serial, allocator, serial_value);
+        defer allocator.free(serial_text);
+        const parallel_text = try renderDeep(&parallel, allocator, parallel_value);
+        defer allocator.free(parallel_text);
+        if (!std.mem.eql(u8, serial_text, parallel_text)) return error.ValueMismatch;
     } else |serial_error| {
         if (parallel_result) |_| {
             return error.ParallelUnexpectedSuccess;
@@ -166,6 +224,16 @@ fn differentialEval(
             }
         }
     }
+}
+
+/// Deep-force and render a value so the differential compares the entire
+/// result structure — lists, attrsets, strings — not just an integer scalar.
+fn renderDeep(engine: *Engine, allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    try engine.forceDeep(value);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try engine.writeValue(&out.writer, value);
+    return allocator.dupe(u8, out.written());
 }
 
 fn stressQueue(

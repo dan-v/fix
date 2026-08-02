@@ -15,10 +15,14 @@ timing-sensitive test.
   switches use compiler-rt's fiber API so stacks remain attributed correctly
   when work migrates between kernel threads.
 - `zig build stress-concurrency -- --seed 123 --iterations 25` runs seeded
-  exact-once deque contention and serial/parallel evaluator differentials. It
-  varies queue growth, worker counts, scheduler toggles, error caching, low-GC
-  operation, and repeated startup/shutdown. Failures always print the seed and
-  iteration for replay.
+  exact-once deque contention (both the plain-atomic and the u128 wide-slot
+  transports, with tearing detection) and serial/parallel evaluator
+  differentials over arithmetic, string, attrset, tryEval-recovery, and
+  cached-failure workloads. Results are deep-forced and rendered so the
+  comparison covers whole structures, not one scalar. It varies queue growth,
+  worker counts, scheduler toggles, error caching, low-GC operation, and
+  repeated startup/shutdown. Failures always print the seed and iteration for
+  replay.
 
 The ordinary CI matrix runs the focused tests on every supported architecture,
 TLC and TSan on x86_64 Linux, and a scheduled workflow runs longer Debug and
