@@ -237,6 +237,17 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
         }
     }
 
+    // First binding index per slot: all members of a merged dotted group
+    // (`a.x = …; a.y = …`) are compiled together at the group's first
+    // index, so their RHS references must be credited to that index.
+    const slot_first = try self.allocator.alloc(u32, slot_count);
+    defer self.allocator.free(slot_first);
+    @memset(slot_first, std.math.maxInt(u32));
+    for (bindings, 0..) |binding, i| {
+        const slot = slots.get(attrs.attrSegmentSpan(self, binding.path[0])).?;
+        if (slot_first[slot] == std.math.maxInt(u32)) slot_first[slot] = @intCast(i);
+    }
+
     const body_hit = try self.allocator.alloc(bool, slot_count);
     defer self.allocator.free(body_hit);
     @memset(body_hit, false);
@@ -261,7 +272,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
         .stamp = 0,
         .index = 0,
     };
-    for (bindings, 0..) |binding, i| {
+    for (bindings) |binding| {
         if (binding.path.len > 1) {
             // Nested-path bindings synthesise an attr-set thunk
             // whose captures we don't statically track; conservative:
@@ -269,7 +280,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             any_path_nested = true;
         }
         rhs_marker.stamp += 1;
-        rhs_marker.index = @intCast(i);
+        rhs_marker.index = slot_first[slots.get(attrs.attrSegmentSpan(self, binding.path[0])).?];
         refs_mod.walkReferencedNames(self, binding.expr, &rhs_marker);
     }
 
@@ -332,7 +343,9 @@ const RhsMarker = struct {
         if (self.stamp_seen[slot] == self.stamp) return;
         self.stamp_seen[slot] = self.stamp;
         self.counts[slot] += 1;
-        if (self.counts[slot] == 1) self.first[slot] = self.index;
+        // Regions are visited in binding order but carry their group's first
+        // index, which is not monotone — keep the minimum, not the first seen.
+        if (self.counts[slot] == 1 or self.index < self.first[slot]) self.first[slot] = self.index;
     }
 };
 
