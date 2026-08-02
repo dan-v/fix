@@ -159,6 +159,32 @@ test "concurrency: helper teardown waits for external completion callbacks" {
     helper2.join();
 }
 
+test "concurrency: single-worker scheduler teardown waits for external completion callbacks" {
+    var scheduler = try Scheduler.init(std.testing.allocator, 1);
+    var entered: std.atomic.Value(bool) = .init(false);
+    var returned: std.atomic.Value(bool) = .init(false);
+
+    const Teardown = struct {
+        fn run(s: *Scheduler, started: *std.atomic.Value(bool), done: *std.atomic.Value(bool)) void {
+            started.store(true, .release);
+            s.deinit();
+            done.store(true, .release);
+        }
+    };
+
+    scheduler.externalJobBegin();
+    var teardown = try std.Thread.spawn(.{}, Teardown.run, .{ &scheduler, &entered, &returned });
+    while (!entered.load(.acquire)) std.atomic.spinLoopHint();
+    var probes: usize = 0;
+    while (probes < 10_000) : (probes += 1) std.Thread.yield() catch {};
+    const returned_early = returned.load(.acquire);
+
+    scheduler.externalJobEnd();
+    teardown.join();
+    try std.testing.expect(!returned_early);
+    try std.testing.expect(returned.load(.acquire));
+}
+
 test "concurrency: back-to-back GC generations wait for every peer release" {
     const worker_count = 3;
     const cycles = 100;

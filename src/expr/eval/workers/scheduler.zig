@@ -669,6 +669,12 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         self.shutdown();
+        // A completion callback publishes its Future before dropping this
+        // count. That publication can let worker 0 finish its fiber and return
+        // from evaluation while the callback still holds stack/scheduler
+        // pointers. Helper barriers normally drain the count, but a
+        // single-worker scheduler has no helper to cross one.
+        self.awaitExternalJobs();
         if (self.resources.fiber_rescue.len != 0) self.allocator.free(self.resources.fiber_rescue);
         self.allocator.free(self.resources.wake_words);
         for (self.resources.urgent_queues) |*q| q.deinit(self.allocator);
@@ -774,12 +780,17 @@ pub const Scheduler = struct {
     pub fn awaitHelpersQuiescent(self: *Scheduler) void {
         if (comptime scan_census_on) scanFlush();
         const helpers: u32 = self.worker_count - 1;
-        if (helpers == 0) return;
-        _ = self.controls.stopped_helpers.fetchAdd(1, .acq_rel);
-        while (self.controls.stopped_helpers.load(.acquire) < helpers) std.atomic.spinLoopHint();
+        if (helpers != 0) {
+            _ = self.controls.stopped_helpers.fetchAdd(1, .acq_rel);
+            while (self.controls.stopped_helpers.load(.acquire) < helpers) std.atomic.spinLoopHint();
+        }
         // Once every helper crossed the barrier, nobody can submit another
         // fiber-scoped external job. Wait for callbacks already holding stack
         // cells/Future pointers to publish and return before Worker.deinit.
+        self.awaitExternalJobs();
+    }
+
+    fn awaitExternalJobs(self: *Scheduler) void {
         while (self.controls.external_jobs.load(.acquire) != 0) std.atomic.spinLoopHint();
     }
 

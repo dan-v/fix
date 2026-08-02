@@ -81,7 +81,7 @@ This is why main is "just worker 0": the root computation is a fiber like any ot
 Tearing down workers while a stolen fiber is still running (on another thread, or mid-resume) would free a stack out from under live execution — a wake-after-free. Two mechanisms prevent it:
 
 - **`in_runfiber`** (per fiber slot, atomic): set while a fiber is actually being resumed. `Worker.deinit` **spins until `in_runfiber` is 0** for each slot, so a fiber that a thief is still inside is never reclaimed.
-- **`awaitHelpersQuiescent`**: a barrier each helper crosses **after** its drain loop exits and **before** it destroys its fibers, so all forcing has stopped before any fiber is freed. Otherwise a helper could free a still-enrolled speculative fiber while another helper, finishing its last quantum, resolves that fiber's thunk and wakes the freed memory.
+- **`awaitHelpersQuiescent`**: a barrier each helper crosses **after** its drain loop exits and **before** it destroys its fibers, so all forcing has stopped before any fiber is freed. Otherwise a helper could free a still-enrolled speculative fiber while another helper, finishing its last quantum, resolves that fiber's thunk and wakes the freed memory. Once no worker can submit more fiber-scoped blocking work, teardown must also drain `external_jobs`: a blocking-pool or daemon callback keeps stack-local work cells and a `Future` pointer until it returns, including in single-worker mode.
 
 Together: no fiber is reclaimed while owned, and no worker is torn down while another might wake it. On `deinit` each worker also reports its fiber/VM-stack high-water and its `idle_ns`/`busy_ns` to the scheduler for `--stats`.
 
@@ -93,6 +93,9 @@ The parallel path rests on a small set of invariants proven load-bearing by real
 - **Fiber resume:** `ReadyNode.queued` CAS + per-slot `run_mu` — a [fiber](fibers.md) is enqueued once and resumed by one thread at a time.
 - **Waiter wake:** a waiter re-checks thunk state under the [`Future`](../runtime/thunks.md) claim/wait protocol before parking.
 - **Fiber ownership returns home** to the allocator-worker's free-list.
+- **External callbacks return before teardown:** publishing their future can
+  resume and finish the parked fiber before the callback itself returns, so
+  callback quiescence—not publication alone—guards stack reclamation.
 - **Speculative cascades are bounded:** `speculation.active` blocks recursive creation-time speculation and sibling sweeps; queue caps and task budgets bound recursive fan-out and map-style submissions. See [speculation](speculation.md).
 
 For *why* all this parallelism buys a bounded speedup — the serial critical-path floor where helpers sit mostly idle — see [perf/model](../perf/model.md).

@@ -54,6 +54,11 @@ These span subsystems, so they're collected here. Violating one usually shows up
 
 - **Fiber resumption is deduplicated and serialized.** `ReadyNode.queued` (0→1 CAS) keeps a fiber on the ready queue at most once; a per-fiber `run_mu` serializes concurrent `resume_` from different threads. Both are load-bearing against real crashes. → [parallel/fibers](parallel/fibers.md)
 - **Stolen fibers return home.** A finished fiber goes back to its *allocator*-worker's free list, not the stealer's, so teardown ownership is unambiguous. → [parallel/workers](parallel/workers.md)
+- **External completion outlives publication.** Blocking and daemon callbacks
+  copy stack-cell fields before publishing their future, then drop the
+  scheduler's `external_jobs` count only after the callback no longer touches
+  them. Worker teardown must drain that count even when there are no helper
+  threads. → [parallel/workers](parallel/workers.md)
 - **Speculative cascades are bounded.** `speculation.active` blocks recursive creation-time speculation and sibling sweeps; queue caps and task budgets bound recursive fan-out and map-style submissions. `SpeculativeBail` triggers after demand completes or a task budget expires. → [parallel/speculation](parallel/speculation.md)
 - **Observation state is evaluator-scoped.** An evaluator owns a cheap, copyable `Observer` capability and passes it to its VMs and realization store. There is no process-global recorder and no single-writer stage stack: concurrent evaluators and helper fibers may emit spans independently, while the selected sink owns any synchronization. A disabled or verbosity-filtered span returns before a clock read, subject copy, lock, or indirect call.
 
