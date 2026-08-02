@@ -72,4 +72,8 @@ Nix. Unit and integration tests exercise the hashing and serialization rules;
 the language and benchmark-fixture differential suites are separate build
 steps. See [invariants.md](invariants.md).
 
+CI runs language conformance on every supported system and the complete
+benchmark-fixture differential on x86_64 Linux; the latter is correctness-only
+and does not run the timing harness.
+
 Code: `build.zig`
