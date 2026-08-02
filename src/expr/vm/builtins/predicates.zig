@@ -8,7 +8,9 @@ const vm_force = @import("../force.zig");
 
 pub fn builtinTypePredicate(self: *VM, arg: Value, expected: ValueType) !Value {
     const value = try vm_force.forceValue(self, arg);
-    return Value.boolVal(value.kind() == expected);
+    const k = value.kind();
+    // Boxed ints (outside the i48 inline range) are ints to the language.
+    return Value.boolVal(k == expected or (expected == .int and k == .boxed_int));
 }
 
 pub fn builtinIsString(self: *VM, arg: Value) !Value {

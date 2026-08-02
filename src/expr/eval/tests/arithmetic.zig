@@ -9,6 +9,14 @@ test "add evaluates simple integer arithmetic" {
     try std.testing.expectEqual(@as(i64, 3), result.asInt());
 }
 
+test "isInt recognizes boxed integers outside the inline range" {
+    // Values past i48 are heap-boxed; the language predicate must still see
+    // them as ints (sapling's SAPLING_VERSION_HASH env attr is one).
+    const result = try renderForTest("builtins.isInt 140737488355328");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("true", result);
+}
+
 test "add raises on integer overflow rather than wrapping" {
     var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
