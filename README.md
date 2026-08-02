@@ -138,6 +138,8 @@ Direct GC-root checks and local `fix switch` system profiles also follow
 compatibility baseline, not the version or brand of the connected daemon.
 Supported experimental and deprecated language switches are listed in
 [the CLI reference](docs/cli.md#evaluation--output).
+The complete selector matrix and native-backend boundaries are in
+[Nix/Lix store compatibility](docs/store-compatibility.md).
 
 ## What it can do
 
