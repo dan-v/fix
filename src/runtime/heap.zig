@@ -173,15 +173,13 @@ const ContextStringObject = struct {
 
 /// Sorted attr entries plus optional source positions for diagnostics.
 /// `positions.len == 0` means no positions and is never sliced.
+///
+/// Immutable after publication: readers copy the containing union by value
+/// on every lookup, so no mutable byte may live here. The sibling-sweep
+/// dedup mark that once did sits in `ObjectHeap.sweep_filter` instead.
 pub const AttrsObject = struct {
     range: AttrRange,
     positions: AttrPosRange = empty_attr_positions,
-    /// Demand-sibling prefetch (`FIX_SIBLING`): has this set already been
-    /// swept? Once-per-attrset dedup for `force_attrs_sweep` submission.
-    /// Plain bool in existing union padding (the thunk variant sizes the
-    /// union); racy-benign — a lost race means one duplicate sweep task,
-    /// which the per-thunk claim CAS makes idempotent.
-    sibling_swept: bool = false,
 };
 
 /// A lazy, layered `//` (update) result: `base // overlay`, both attrset
@@ -378,6 +376,14 @@ pub const ObjectHeap = struct {
     /// One entry per worker (including the main thread). Indexed by
     /// `worker_id_mod.currentId()`.
     worker_locals: []HeapLocal,
+    /// Demand-sibling sweep dedup (`FIX_SIBLING`): one atomic bit per hashed
+    /// ObjectId. This lives OUTSIDE the object store because attrs objects
+    /// are copied by value on every lookup — a mutable byte inside the union
+    /// is a data race with those plain reads (caught by TSan on real
+    /// workloads). The filter is approximate by design: a hash collision or
+    /// a GC-recycled id can skip one prefetch or admit one duplicate sweep,
+    /// both benign (sweep tasks are idempotent via the per-thunk claim CAS).
+    sweep_filter: []std.atomic.Value(u64),
     /// Cross-worker overflow for reclaimed object ids. Mutators refill their
     /// lock-free local stack in large batches, so imbalance costs one lock per
     /// thousands of allocations rather than one lock (plus peer probes) per
@@ -441,7 +447,10 @@ pub const ObjectHeap = struct {
         var attr_positions: AttrPosStore = .empty;
         attr_positions.setHugePolicy(huge_policy);
         const locals = try allocator.alloc(HeapLocal, @max(worker_count, 1));
+        errdefer allocator.free(locals);
         for (locals) |*l| l.* = .{};
+        const sweep_filter = try allocator.alloc(std.atomic.Value(u64), sweep_filter_words);
+        for (sweep_filter) |*word| word.* = .init(0);
         return .{
             .allocator = allocator,
             .failures = FailureStore.init(allocator),
@@ -450,6 +459,7 @@ pub const ObjectHeap = struct {
             .attrs = attrs,
             .attr_positions = attr_positions,
             .worker_locals = locals,
+            .sweep_filter = sweep_filter,
             .gc_shared_free_objects = .empty,
             .gc_shared_free_mu = .{},
             .gc_shared_free_count = .init(0),
@@ -470,6 +480,7 @@ pub const ObjectHeap = struct {
         self.allocator.free(self.collection.old_bits);
         for (self.worker_locals) |*l| l.deinit(self.allocator);
         self.allocator.free(self.worker_locals);
+        self.allocator.free(self.sweep_filter);
         self.gc_shared_free_objects.deinit(self.allocator);
         self.gc_shared_free_values.deinit(self.allocator);
         self.gc_shared_free_attrs.deinit(self.allocator);
@@ -671,7 +682,7 @@ pub const ObjectHeap = struct {
             .attrs => |attrs| .{ .attrs = .{
                 .len = attrs.range.len,
                 .positions = attrs.positions.len,
-                .sibling_swept = attrs.sibling_swept,
+                .sibling_swept = self.siblingSweepMarked(id),
             } },
             .merge_attrs => |merge| .{ .merge_attrs = .{
                 .base = merge.base,
@@ -1270,32 +1281,47 @@ pub const ObjectHeap = struct {
         self.currentLocal().spec_ctx = spec;
     }
 
+    /// `sweep_filter` geometry: 2^22 bits (512 KiB) — comfortably above the
+    /// count of size-gated sweep candidates in a large eval, so collisions
+    /// stay rare. Fibonacci hashing spreads the sequential store ids.
+    const sweep_filter_bits_log2 = 22;
+    const sweep_filter_words = (1 << sweep_filter_bits_log2) / 64;
+
+    inline fn sweepFilterBit(id: ObjectId) struct { usize, u64 } {
+        const h = (@as(u64, id) *% 0x9e37_79b9_7f4a_7c15) >> (64 - sweep_filter_bits_log2);
+        return .{ @intCast(h >> 6), @as(u64, 1) << @intCast(h & 63) };
+    }
+
+    /// Whether `id`'s sweep-filter bit is set (inspection only).
+    pub fn siblingSweepMarked(self: *const ObjectHeap, id: ObjectId) bool {
+        const word, const mask = sweepFilterBit(id);
+        return self.sweep_filter[word].load(.monotonic) & mask != 0;
+    }
+
     /// Demand-sibling prefetch admission (`FIX_SIBLING`): true iff `id`
-    /// is a plain attrset with entry count in `[min, max)` that has not
-    /// been swept yet — and marks it swept. Racy-benign (see
-    /// `AttrsObject.sibling_swept`). `attrs_merge` layers are excluded:
-    /// sweeping them would force a flatten on the demand path.
+    /// is a plain attrset with entry count in `[min, max)` whose filter
+    /// bit was not yet set — and claims that bit, so each set's sweep is
+    /// submitted once. `attrs_merge` layers are excluded: sweeping them
+    /// would force a flatten on the demand path.
     pub fn trySiblingSweep(self: *ObjectHeap, id: ObjectId, min: u32, max: u32) bool {
-        switch (self.objects.getMut(id).*) {
-            .attrs => |*a| {
+        switch (self.get(id).*) {
+            .attrs => |a| {
                 if (a.range.len < min or a.range.len >= max) return false;
-                if (a.sibling_swept) return false;
-                a.sibling_swept = true;
-                return true;
+                const word, const mask = sweepFilterBit(id);
+                if (self.sweep_filter[word].load(.monotonic) & mask != 0) return false;
+                return self.sweep_filter[word].fetchOr(mask, .monotonic) & mask == 0;
             },
             else => return false,
         }
     }
 
-    /// Undo `trySiblingSweep`'s mark when the sweep task could not be
+    /// Undo `trySiblingSweep`'s claim when the sweep task could not be
     /// submitted (queue full / no helpers) — otherwise the set becomes
-    /// permanently unsweepable on a transient rejection. Racy-benign
-    /// like the mark.
+    /// permanently unsweepable on a transient rejection. May clear a
+    /// colliding set's bit, which only re-admits an idempotent sweep.
     pub fn clearSiblingSwept(self: *ObjectHeap, id: ObjectId) void {
-        switch (self.objects.getMut(id).*) {
-            .attrs => |*a| a.sibling_swept = false,
-            else => {},
-        }
+        const word, const mask = sweepFilterBit(id);
+        _ = self.sweep_filter[word].fetchAnd(~mask, .monotonic);
     }
 
     /// TLAB reserve shared by the three range stores. Callers first try an
@@ -2102,8 +2128,11 @@ pub const ObjectHeap = struct {
     /// memoized heap object; callers that only need one name should use
     /// `getAttrValueOpt` to keep the operation read-only.
     pub fn materializeAttrs(self: *ObjectHeap, id: ObjectId) ![]const AttrEntry {
+        // Pointer captures here and below: a by-value union read would
+        // memcpy the whole arm storage, racing the atomic `flattened`
+        // memoization CAS embedded in live merge nodes.
         return switch (self.get(id).*) {
-            .attrs => |a| self.attrs.slice(a.range),
+            .attrs => |*a| self.attrs.slice(a.range),
             .merge_attrs => self.attrs.slice(self.get(try self.flattenMerge(id)).attrs.range),
             else => error.InvalidObjectType,
         };
@@ -2119,8 +2148,8 @@ pub const ObjectHeap = struct {
     /// been flattened it delegates to the flat object's binary search.
     pub fn getAttrValueOpt(self: *const ObjectHeap, id: ObjectId, name: InternId) anyerror!?Value {
         return switch (self.get(id).*) {
-            .attrs => |a| binarySearchAttr(self.attrs.slice(a.range), name),
-            .merge_attrs => |m| {
+            .attrs => |*a| binarySearchAttr(self.attrs.slice(a.range), name),
+            .merge_attrs => |*m| {
                 const flat = m.flattened.load(.acquire);
                 if (flat != no_flattened_attrs) {
                     return binarySearchAttr(self.attrs.slice(self.get(flat).attrs.range), name);
@@ -2134,11 +2163,11 @@ pub const ObjectHeap = struct {
 
     pub fn getAttrPos(self: *const ObjectHeap, id: ObjectId, name: InternId) ?SourcePos {
         return switch (self.get(id).*) {
-            .attrs => |a| if (a.positions.len == 0) null else self.findAttrPos(a.positions, name),
+            .attrs => |*a| if (a.positions.len == 0) null else self.findAttrPos(a.positions, name),
             // `//` is right-biased; report the overlay's position if it
             // defines the name, else the base's. Walks the chain rather
             // than flattening (flattening drops positions).
-            .merge_attrs => |m| if (self.attrContains(m.overlay, name))
+            .merge_attrs => |*m| if (self.attrContains(m.overlay, name))
                 self.getAttrPos(m.overlay, name)
             else
                 self.getAttrPos(m.base, name),
@@ -2148,8 +2177,8 @@ pub const ObjectHeap = struct {
 
     fn attrContains(self: *const ObjectHeap, id: ObjectId, name: InternId) bool {
         return switch (self.get(id).*) {
-            .attrs => |a| binarySearchAttrIndex(self.attrs.slice(a.range), name) != null,
-            .merge_attrs => |m| self.attrContains(m.overlay, name) or self.attrContains(m.base, name),
+            .attrs => |*a| binarySearchAttrIndex(self.attrs.slice(a.range), name) != null,
+            .merge_attrs => |*m| self.attrContains(m.overlay, name) or self.attrContains(m.base, name),
             else => false,
         };
     }
@@ -2163,14 +2192,14 @@ pub const ObjectHeap = struct {
         // building a merge node or copying. An empty attrset is always a
         // plain `.attrs` of range.len 0 (merges of non-empties are never
         // empty). `{} // x` in the module fixpoint is common — see census.
-        const l = self.get(left_id).*;
-        if (l == .attrs and l.attrs.range.len == 0) return right_id;
-        const r = self.get(right_id).*;
-        if (r == .attrs and r.attrs.range.len == 0) return left_id;
+        const l = self.get(left_id);
+        if (l.* == .attrs and l.attrs.range.len == 0) return right_id;
+        const r = self.get(right_id);
+        if (r.* == .attrs and r.attrs.range.len == 0) return left_id;
 
-        const next_depth: u16 = switch (self.get(left_id).*) {
-            .attrs => |a| if (a.range.len < merge_layer_min_size) 0 else 1,
-            .merge_attrs => |m| if (m.depth + 1 > merge_flatten_depth) 0 else m.depth + 1,
+        const next_depth: u16 = switch (l.*) {
+            .attrs => |*a| if (a.range.len < merge_layer_min_size) 0 else 1,
+            .merge_attrs => |*m| if (m.depth + 1 > merge_flatten_depth) 0 else m.depth + 1,
             else => 0,
         };
         if (next_depth == 0) return self.addMergedAttrs(left_id, right_id);
@@ -2209,7 +2238,7 @@ pub const ObjectHeap = struct {
     fn collectMergeLeaves(self: *ObjectHeap, id: ObjectId, out: *std.ArrayListUnmanaged(ObjectId)) anyerror!void {
         switch (self.get(id).*) {
             .attrs => try out.append(self.allocator, id),
-            .merge_attrs => |m| {
+            .merge_attrs => |*m| {
                 const f = m.flattened.load(.acquire);
                 if (f != no_flattened_attrs) {
                     try out.append(self.allocator, f);

@@ -129,7 +129,7 @@ pub const Task = union(enum) {
     force_list_range: ForceListRange,
     /// Demand-sibling prefetch (`FIX_SIBLING`): speculatively force every
     /// still-unresolved thunk member of one attrset. Submitted (once per
-    /// attrset — see `AttrsObject.sibling_swept`) when a DEMAND fiber's
+    /// attrset — see `ObjectHeap.sweep_filter`) when a DEMAND fiber's
     /// attr lookup misses the inline cache and lands on an unresolved
     /// member of a mid-sized attrset. The size gate limits wasted work on
     /// large sets where one lookup says little about sibling demand.
