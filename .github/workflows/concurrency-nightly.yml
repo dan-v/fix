@@ -28,8 +28,8 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: concurrency-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-          restore-prefixes-first-match: concurrency-${{ matrix.system }}-
+          primary-key: concurrency-v2-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          restore-prefixes-first-match: concurrency-v2-${{ matrix.system }}-
 
       - name: Debug stress
         timeout-minutes: 30
