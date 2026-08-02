@@ -34,7 +34,7 @@ the harness without creating a `result` link. Useful environment variables are:
   run. The harness obtains credentials once with `sudo -v`; explicit hugetlb
   pages remain in the configured pool and are reused after each evaluator exits.
 - With no `TOOLS` selector, the harness runs 1-core and automatic profiles for
-  Fix and Determinate, plus the available Nix, Lix, and snix rows.
+  Fix and Determinate, plus the available Nix and Lix rows.
   `TOOLS=nix,lix,fix-1core` selects exact evaluator rows. `fix` and `detsys`
   select their complete 1, 2, 8, 16, and automatic parameterized groups for a
   deliberate scaling sweep; individual rows can still be excluded, as in

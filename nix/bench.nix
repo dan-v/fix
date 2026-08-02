@@ -23,7 +23,6 @@
   detsys ? (builtins.getFlake (builtins.unsafeDiscardStringContext (toString sources.determinate-nix)))
     .packages.${pkgs.stdenv.hostPlatform.system}.nix-cli,
   lix ? pkgs.lix,
-  snix ? (import sources.snix {}).snix.cli.eval,
 }: let
   inherit (lib) optional optionals;
 
@@ -89,16 +88,14 @@
     fixTools false
     ++ optional (nix != null) "nix|nix|${nix}/bin/nix-instantiate --eval --strict"
     ++ optional (lix != null) "lix|lix|${lix}/bin/nix-instantiate --eval --strict"
-    ++ detsysTools {scaling = true;}
-    ++ optional (snix != null) "snix|snix|${snix}/bin/snix-eval -qqqq --no-warnings --strict";
+    ++ detsysTools {scaling = true;};
 
   tortureTools = scalarTools;
 
   realworldTools = scalarTools;
 
   # JSON workloads return wide trees of independent values. `nix eval --json`
-  # is the path on which Determinate performs parallel deep forcing. Snix is
-  # omitted because snix-eval currently has no JSON output mode.
+  # is the path on which Determinate performs parallel deep forcing.
   jsonTools =
     fixTools true
     ++ optional (nix != null) "nix|nix|${nix}/bin/nix eval --json --file"
@@ -160,7 +157,7 @@ in
                             Examples: TOOLS=fix,lix
                                       TOOLS=fix,-fix-16core
                                       TOOLS='/fix-.*/,-/fix-..core/'
-                                      TOOLS=-snix
+                                      TOOLS=-lix
         WORKLOADS=a,b,c     include only these workload names
         BENCH_NIX_PATH=...  override the pinned benchmark NIX_PATH
       EOF
