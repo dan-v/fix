@@ -131,6 +131,11 @@ implemented and fail explicitly — nothing falls back to an installed Nix.
 The selector matrix and configuration details are in
 [Nix/Lix store compatibility](docs/store-compatibility.md).
 
+`<nixpkgs>` and other lookup paths resolve like Nix's: from `-I`, then
+`$NIX_PATH`, and — when neither is set — from the user and root channel
+profiles, so a machine configured purely through `nix-channel` works without
+any environment setup.
+
 `builtins.nixVersion` deliberately reports `2.18.3`: it is the evaluator
 compatibility baseline, not the version of the connected daemon. Supported
 experimental and deprecated language switches are listed in
