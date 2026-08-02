@@ -1,71 +1,39 @@
 # Nix/Lix store compatibility
 
-`fix` implements the store protocol itself. At runtime it never discovers or
-executes a locally installed `nix`, `lix`, `nix-daemon`, `nix-store`, `nix-env`,
-or `nix-copy-closure`. A local daemon is a protocol peer, not a helper
-executable. An explicit `ssh-ng://` selector asks SSH to start the remote host's
-`nix-daemon --stdio` worker endpoint, which is the remote store itself.
+`fix` speaks the stable Nix worker protocol itself; it never discovers or
+executes an installed Nix or Lix. Unsupported selectors and settings fail with
+a specific error instead of falling back to whatever is on `PATH`.
 
-## Compatibility matrix
+## Selectors
 
-| Store selector | Status | Transport |
-|---|---|---|
-| `daemon` | supported | stable worker protocol over the default Unix socket |
-| `unix://PATH` | supported | stable worker protocol over `PATH` |
-| `unix://PATH?protocol=legacy-combined` | supported | stable worker protocol over `PATH` |
-| `unix://DIR?protocol=legacy` | supported | stable worker protocol over `DIR/socket` |
-| `unix://DIR?protocol=any` | supported | stable worker protocol over `DIR/socket` |
-| `tcp://HOST:PORT` | supported | stable worker protocol over TCP |
-| `ssh-ng://HOST` | supported | stable worker protocol over SSH to the remote daemon; `port`, `ssh-key`, and `compress` query settings are supported |
-| `unix://DIR?protocol=lix-xp-1` | not implemented | native Lix RPC client required |
-| `local`, `auto`, absolute chroot roots | not implemented | native local-store backend required |
+| Store selector | Status |
+|---|---|
+| `daemon` | supported (default Unix socket) |
+| `unix://PATH`, `?protocol=legacy-combined` | supported |
+| `unix://DIR?protocol=legacy`, `?protocol=any` | supported (`DIR/socket`) |
+| `tcp://HOST:PORT` | supported |
+| `ssh-ng://HOST` | supported (`port`, `ssh-key`, `compress`) |
+| `unix://DIR?protocol=lix-xp-1` | not implemented |
+| `local`, `auto`, chroot roots | not implemented |
 
-The stable worker client requires a daemon of at least protocol 1.26 and
-advertises 1.35, so the negotiated protocol is in the 1.26–1.35 range even
-when a newer daemon advertises a later version. It is exercised in CI against
-both CppNix and Lix daemons. The default
-socket, direct GC-root checks, and local system-profile updates follow
-`NIX_STATE_DIR`; `NIX_DAEMON_SOCKET_PATH` remains an explicit socket override.
+Select a store with `--store`, `NIX_REMOTE`, or the `nix.conf` `store`
+setting. The daemon must speak worker protocol 1.26+ (Nix ≥ 2.4); CI
+exercises both CppNix and Lix daemons. The default socket, GC-root checks,
+and system-profile updates follow `NIX_STATE_DIR`; `NIX_DAEMON_SOCKET_PATH`
+overrides the socket. As with Nix, only user config, `$NIX_CONFIG`, and CLI
+overrides are forwarded to the daemon — system `nix.conf` stays daemon-side
+policy. `ssh-ng://` starts the remote `nix-daemon --stdio` in SSH batch mode,
+so hosts that require an interactive prompt fail rather than hang.
 
-Unsupported selectors fail during CLI setup with a selector-specific message.
-They do not fall back to a local implementation found on `PATH`.
-Unsupported SSH settings, including `remote-program` and `remote-store`, also
-fail explicitly instead of being ignored.
+## Not implemented
 
-SSH authority handling follows Lix's process boundary: the optional user and
-host are validated separately, and either component is rejected when empty or
-when it begins with `-`, before it can be interpreted as an OpenSSH option.
-The validated destination is passed with X11 forwarding disabled and a `--`
-boundary before the remote `nix-daemon --stdio` command. fix additionally uses
-OpenSSH batch mode so a store operation cannot hang on an interactive prompt.
+- `lix-xp-1` is Lix's experimental Cap'n Proto RPC protocol with no stability
+  guarantee — a different protocol, not another framing of the worker
+  protocol. Use `protocol=any` for Lix; it reaches the stable worker socket
+  on any release. ([selectors][lix-stores], [schema][lix-capnp])
+- `local`, `auto`, and chroot roots need a native local-store backend
+  (filesystem layout, locking, GC roots, build orchestration), which does not
+  exist yet.
 
-## Why XP is separate
-
-Lix documents `lix-xp-1` as an experimental RPC protocol. Its current source
-implements it with Cap'n Proto RPC, labels the schema as having no stability
-guarantee, and negotiates a tunneled-legacy protocol identifier containing the
-exact Lix package version. Supporting it responsibly therefore means owning a
-Cap'n Proto RPC client and version adapters; it is not another worker-protocol
-framing mode.
-
-- [Lix store URL protocol selection](https://docs.lix.systems/manual/lix/nightly/command-ref/new-cli/nix3-help-stores.html)
-- [Lix experimental daemon RPC schema](https://git.lix.systems/lix-project/lix/src/branch/main/lix/libstore/daemon.capnp)
-
-Until that protocol stabilizes, `protocol=any` is the preferred Lix selector:
-it reaches the stable worker socket without coupling `fix` to one Lix release.
-
-## Native backend order
-
-1. Keep the stable daemon backend as the compatibility baseline.
-2. Introduce a separate local-store backend for `local` and chroot roots. It
-   must own filesystem layout, validity metadata, locking, GC-root handling,
-   and build orchestration; routing these selectors through a daemon adapter is
-   not local-store support.
-3. Implement remote `fix switch` closure copying through store operations. Do
-   not restore the old local `nix-copy-closure` or remote `nix-env` calls.
-4. Revisit `lix-xp-1` when its stability/versioning story can support an
-   independent client, or deliberately add Cap'n Proto and versioned adapters.
-
-These are separate backends. They should share the realization-facing store
-operation interface, not transport conditionals inside the stable worker
-client.
+[lix-stores]: https://docs.lix.systems/manual/lix/nightly/command-ref/new-cli/nix3-help-stores.html
+[lix-capnp]: https://git.lix.systems/lix-project/lix/src/branch/main/lix/libstore/daemon.capnp

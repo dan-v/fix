@@ -97,12 +97,9 @@ build environment and dependencies:
 $ nix-shell --run 'zig build --release=fast'
 ```
 
-Evaluation does not require a Nix or Lix executable. Store-writing commands need
-a reachable Nix or Lix daemon. Local and TCP transports talk to it directly;
-`ssh-ng://` explicitly starts the remote host's daemon worker endpoint. `fix`
-never discovers or executes a locally installed Nix/Lix program. Tagged releases
-publish optimized build archives for x86_64 Linux, aarch64 Linux, and aarch64
-macOS.
+Evaluation does not require a Nix or Lix executable; store-writing commands
+need a reachable Nix or Lix daemon. Tagged releases publish optimized build
+archives for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
 
 ```console
 $ ./zig-out/bin/fix eval -E '1 + 2'
@@ -117,32 +114,17 @@ The package also includes shell completions for Bash, Fish, and Zsh.
 
 ### Nix and Lix runtime compatibility
 
-`fix` speaks the stable Nix worker protocol used by both CppNix and Lix. It
-requires a daemon protocol of at least 1.26 and advertises 1.35, so the
-negotiated version is in that range and daemons older than Nix 2.4 are rejected
-with a protocol error instead of being used incorrectly. Lix `protocol=any`,
-`legacy`, and `legacy-combined` socket URIs are
-supported wherever they expose the stable worker protocol. XP-only
-`protocol=lix-xp-1` endpoints are rejected with a specific diagnostic until fix
-has a native implementation of that protocol.
-
-The default local socket follows `NIX_STATE_DIR` (or `/nix/var/nix`), and
-`NIX_DAEMON_SOCKET_PATH` overrides it. `NIX_REMOTE`, `--store`, and the
-`nix.conf` `store` setting can select `daemon`, `unix://`, `ssh-ng://`, or
-`tcp://` transports. `local`, `auto`, and absolute chroot roots are rejected
-explicitly: supporting them requires a native local-store backend, not
-delegation to a locally installed implementation.
-Like Nix, only user config, `$NIX_CONFIG`, and explicit CLI overrides are
-forwarded to the daemon; system `nix.conf` settings remain daemon-side policy.
-Direct GC-root checks and local `fix switch` system profiles also follow
-`NIX_STATE_DIR`.
+`fix` speaks the stable Nix worker protocol to CppNix and Lix daemons
+(Nix ≥ 2.4) over `daemon`, `unix://`, `tcp://`, and `ssh-ng://` stores.
+`local`/`auto` stores and Lix's experimental `lix-xp-1` protocol are not
+implemented and fail explicitly — nothing falls back to an installed Nix.
+The selector matrix and configuration details are in
+[Nix/Lix store compatibility](docs/store-compatibility.md).
 
 `builtins.nixVersion` deliberately reports `2.18.3`: it is the evaluator
-compatibility baseline, not the version or brand of the connected daemon.
-Supported experimental and deprecated language switches are listed in
+compatibility baseline, not the version of the connected daemon. Supported
+experimental and deprecated language switches are listed in
 [the CLI reference](docs/cli.md#evaluation--output).
-The complete selector matrix and native-backend boundaries are in
-[Nix/Lix store compatibility](docs/store-compatibility.md).
 
 ## What it can do
 
