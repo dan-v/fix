@@ -188,13 +188,6 @@ pub const Options = struct {
     /// eval+build phase is skipped and the given store path is activated. This
     /// is how the non-root run re-execs its privileged half under `sudo`.
     activate_toplevel: ?[]const u8 = null,
-    /// `fix switch --target-host [user@]host`: build locally, copy the closure
-    /// (`nix-copy-closure`), and activate on that remote host over SSH. Borrowed
-    /// from argv.
-    target_host: ?[]const u8 = null,
-    /// `fix switch --use-remote-sudo`: prefix the remote profile-set/activation
-    /// commands with `sudo` (when the SSH user is not root).
-    use_remote_sudo: bool = false,
     /// `fix shell -p <names>`: package attr-paths in `<nixpkgs>`. Borrowed from
     /// argv; the list backing is owned (caller frees via `deinit`).
     packages: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -374,8 +367,6 @@ pub const Opt = enum {
     darwin,
     home_manager,
     activate_toplevel,
-    target_host,
-    use_remote_sudo,
     // Disasm.
     chunk,
     no_recurse,
@@ -517,7 +508,7 @@ const specs = [_]Spec{
     .{ .id = .keep_going, .short = "-k", .long = "--keep-going", .help = "keep building other derivations if one fails", .show_in = daemon_setting_cmds },
     .{ .id = .max_silent_time, .long = "--max-silent-time", .arg = .req, .metavar = "SECS", .help = "abort a build silent for SECS seconds (0 = no limit)", .show_in = daemon_setting_cmds },
     .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = daemon_setting_cmds },
-    .{ .id = .store, .long = "--store", .arg = .req, .metavar = "STORE-URI", .help = "store: daemon/unix, local/chroot path, ssh-ng,\nor tcp URI", .show_in = daemon_setting_cmds },
+    .{ .id = .store, .long = "--store", .arg = .req, .metavar = "STORE-URI", .help = "store: daemon/unix or tcp URI\n(native local/SSH/XP backends are pending)", .show_in = daemon_setting_cmds },
     .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase progress detail and daemon build verbosity (repeatable)", .completion_help = "increase progress and build verbosity", .repeatable = true, .show_in = verbose_cmds },
     .{ .id = .no_build_output, .short = "-Q", .long = "--no-build-output", .help = "suppress builder output", .show_in = daemon_setting_cmds },
 
@@ -543,8 +534,6 @@ const specs = [_]Spec{
     .{ .id = .darwin, .long = "--darwin", .help = "build/activate a nix-darwin configuration", .show_in = &.{.@"switch"} },
     .{ .id = .home_manager, .long = "--home-manager", .help = "build/activate a home-manager configuration", .show_in = &.{.@"switch"} },
     .{ .id = .home_manager, .long = "--hm", .show_in = &.{.@"switch"}, .hidden = true }, // alias for --home-manager
-    .{ .id = .target_host, .long = "--target-host", .arg = .req, .metavar = "[USER@]HOST", .help = "build locally, then copy the closure and activate on\nthis remote host over SSH", .show_in = &.{.@"switch"} },
-    .{ .id = .use_remote_sudo, .long = "--use-remote-sudo", .help = "run the remote profile-set/activation under sudo", .show_in = &.{.@"switch"} },
     .{ .id = .activate_toplevel, .long = "--activate-toplevel", .arg = .req, .metavar = "PATH", .hidden = true },
 
     // Disasm.

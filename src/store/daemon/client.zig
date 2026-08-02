@@ -17,16 +17,6 @@ const settings = @import("settings.zig");
 pub const default_socket_path = "/nix/var/nix/daemon-socket/socket";
 const default_socket_dir = "/nix/var/nix/daemon-socket";
 
-/// The ssh host of an `ssh-ng://[user@]host[?params]` store, else null.
-fn sshHost(store: []const u8) ?[]const u8 {
-    const prefix = "ssh-ng://";
-    if (!std.mem.startsWith(u8, store, prefix)) return null;
-    var rest = store[prefix.len..];
-    if (std.mem.indexOfScalar(u8, rest, '?')) |q| rest = rest[0..q];
-    if (std.mem.indexOfScalar(u8, rest, '/')) |s| rest = rest[0..s];
-    return if (rest.len == 0) null else rest;
-}
-
 const TcpTarget = struct { host: []const u8, port: u16 };
 
 /// The host/port of a `tcp://host:port` store (bracketed IPv6 accepted), else null.
@@ -55,9 +45,9 @@ const UnixTarget = struct {
     append_legacy_socket: bool = false,
 };
 
-/// Parse Lix's protocol-selecting unix store URI. We can connect directly when
-/// a legacy worker socket is available. `lix-xp-1` alone returns a routing
-/// signal so `openTransport` can bridge it through the installed Lix helper.
+/// Parse Lix's protocol-selecting unix store URI. We connect directly when a
+/// stable worker-protocol socket is available. XP-only endpoints are rejected
+/// until fix has its own `lix-xp-1` implementation.
 fn unixTarget(store: []const u8) !UnixTarget {
     if (store.len == 0 or std.mem.eql(u8, store, "daemon"))
         return .{ .path = default_socket_path };
@@ -99,16 +89,38 @@ fn unixTarget(store: []const u8) !UnixTarget {
     return .{ .path = path };
 }
 
-fn usesLocalHelper(store: []const u8) bool {
-    return std.mem.eql(u8, store, "auto") or
-        std.mem.eql(u8, store, "local") or
-        std.mem.startsWith(u8, store, "local?") or
-        std.mem.startsWith(u8, store, "local-root:");
+/// Reject selectors that would require us to execute an installed Nix/Lix
+/// implementation. fix only speaks protocols it implements itself.
+pub fn validateStoreUri(store: []const u8) !void {
+    if (std.fs.path.isAbsolute(store) and
+        !std.mem.endsWith(u8, store, "/daemon-socket/socket"))
+        return error.NativeLocalStoreUnsupported;
+    return validateTransportUri(store);
 }
 
-fn localHelperUri(store: []const u8) []const u8 {
-    const prefix = "local-root:";
-    return if (std.mem.startsWith(u8, store, prefix)) store[prefix.len..] else store;
+/// Validate the normalized endpoint stored by RealizationStore. Unlike a Nix
+/// store selector, an absolute value here is an explicit Unix socket (including
+/// NIX_DAEMON_SOCKET_PATH and test sockets).
+fn validateTransportUri(store: []const u8) !void {
+    if (store.len == 0 or std.mem.eql(u8, store, "daemon")) return;
+    if (std.mem.eql(u8, store, "auto") or
+        std.mem.eql(u8, store, "local") or
+        std.mem.startsWith(u8, store, "local?") or
+        std.mem.startsWith(u8, store, "local://") or
+        std.mem.startsWith(u8, store, "local-root:"))
+        return error.NativeLocalStoreUnsupported;
+    if (std.mem.startsWith(u8, store, "ssh-ng://"))
+        return error.NativeSshStoreUnsupported;
+    if (std.mem.startsWith(u8, store, "tcp://")) {
+        if (tcpTarget(store) == null) return error.InvalidStoreUri;
+        return;
+    }
+    if (std.mem.startsWith(u8, store, "unix://")) {
+        _ = try unixTarget(store);
+        return;
+    }
+    if (std.mem.indexOf(u8, store, "://") != null)
+        return error.UnsupportedStoreUri;
 }
 
 /// Parse a `nix-archive-1` NAR containing a single regular file, returning its
@@ -144,9 +156,6 @@ fn expectNarToken(allocator: std.mem.Allocator, r: *std.Io.Reader, want: []const
 }
 
 test "store uri parsing selects transport" {
-    try std.testing.expect(sshHost("ssh-ng://build.example.com") != null);
-    try std.testing.expectEqualStrings("user@host", sshHost("ssh-ng://user@host?compress=true").?);
-    try std.testing.expect(sshHost("unix:///tmp/sock") == null);
     try std.testing.expectEqualStrings(default_socket_path, (try unixTarget("")).path);
     try std.testing.expectEqualStrings("/tmp/sock", (try unixTarget("unix:///tmp/sock")).path);
     const legacy = try unixTarget("unix:///tmp/daemon?protocol=lix-xp-1,legacy");
@@ -156,11 +165,13 @@ test "store uri parsing selects transport" {
     try std.testing.expectEqualStrings("/tmp/socket", combined.path);
     try std.testing.expect(!combined.append_legacy_socket);
     try std.testing.expectError(error.UnsupportedLixRpcProtocol, unixTarget("unix:///tmp/daemon?protocol=lix-xp-1"));
-    try std.testing.expect(usesLocalHelper("auto"));
-    try std.testing.expect(usesLocalHelper("local?root=/tmp/store"));
-    try std.testing.expect(!usesLocalHelper("/tmp/daemon.sock"));
-    try std.testing.expect(usesLocalHelper("local-root:/tmp/chroot"));
-    try std.testing.expectEqualStrings("/tmp/chroot", localHelperUri("local-root:/tmp/chroot"));
+    try std.testing.expectError(error.NativeLocalStoreUnsupported, validateStoreUri("auto"));
+    try std.testing.expectError(error.NativeLocalStoreUnsupported, validateStoreUri("local?root=/tmp/store"));
+    try std.testing.expectError(error.NativeLocalStoreUnsupported, validateStoreUri("/tmp/chroot"));
+    try std.testing.expectError(error.NativeSshStoreUnsupported, validateStoreUri("ssh-ng://build.example.com"));
+    try std.testing.expectError(error.UnsupportedLixRpcProtocol, validateStoreUri("unix:///tmp/daemon?protocol=lix-xp-1"));
+    try validateStoreUri("/tmp/daemon-socket/socket");
+    try validateStoreUri("tcp://build.example.com:1234");
     try std.testing.expect(tcpTarget("unix:///s") == null);
     const t = tcpTarget("tcp://build.example.com:1234").?;
     try std.testing.expectEqualStrings("build.example.com", t.host);
@@ -223,52 +234,21 @@ pub const MissingPlan = struct {
     }
 };
 
-/// How we're connected to the daemon. The worker protocol is identical over any
-/// of these — only the framed reader/writer differ, so every op is transport
-/// agnostic (it goes through `w()`/`r()`).
-///
-///   * `socket`  — a local unix (or tcp) daemon socket (the default).
-///   * `command` — a subprocess whose stdio speaks the worker protocol. This is
-///     either `ssh-ng://host` or a local `nix-daemon --stdio --store ...`
-///     adapter for direct/chroot stores.
-const Transport = union(enum) {
-    socket: Socket,
-    command: Command,
-
-    const Socket = struct {
-        stream: std.Io.net.Stream,
-        reader: std.Io.net.Stream.Reader,
-        writer: std.Io.net.Stream.Writer,
-    };
-    const Command = struct {
-        child: std.process.Child,
-        reader: std.Io.File.Reader,
-        writer: std.Io.File.Writer,
-    };
+/// A direct unix or TCP daemon connection. Store protocol support never falls
+/// back to an installed implementation binary.
+const Transport = struct {
+    stream: std.Io.net.Stream,
+    reader: std.Io.net.Stream.Reader,
+    writer: std.Io.net.Stream.Writer,
 
     fn r(self: *Transport) *std.Io.Reader {
-        return switch (self.*) {
-            .socket => |*s| &s.reader.interface,
-            .command => |*c| &c.reader.interface,
-        };
+        return &self.reader.interface;
     }
     fn w(self: *Transport) *std.Io.Writer {
-        return switch (self.*) {
-            .socket => |*s| &s.writer.interface,
-            .command => |*c| &c.writer.interface,
-        };
+        return &self.writer.interface;
     }
     fn close(self: *Transport, io: std.Io) void {
-        switch (self.*) {
-            .socket => |*s| s.stream.close(io),
-            .command => |*c| {
-                if (c.child.stdin) |f| {
-                    f.close(io);
-                    c.child.stdin = null;
-                }
-                _ = c.child.wait(io) catch {};
-            },
-        }
+        self.stream.close(io);
     }
 };
 
@@ -292,10 +272,8 @@ pub const DaemonStore = struct {
     /// When set, logs go to the sink instead of directly to stderr.
     build_sink: ?BuildSink = null,
 
-    /// Connect to the daemon and complete the handshake. `store` is a store URI:
-    /// `""`/`daemon`/`unix://PATH` → a local socket; `local`, `auto`, and an
-    /// absolute chroot root use an installed `nix-daemon --stdio` helper;
-    /// `ssh-ng://[user@]host` runs that helper over the user's SSH client.
+    /// Connect to a daemon and complete the handshake. `store` is a direct
+    /// `daemon`, `unix://PATH`, or `tcp://HOST:PORT` endpoint.
     /// Heap-allocated so the framed reader/writer (which hold interior pointers
     /// via `@fieldParentPtr`) stay put.
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, store: []const u8) !*DaemonStore {
@@ -323,37 +301,21 @@ pub const DaemonStore = struct {
 
     fn openTransport(self: *DaemonStore, store: []const u8) !void {
         const io = self.io;
-        if (usesLocalHelper(store)) {
-            try self.openStoreHelper(store);
-            return;
-        }
-        if (sshHost(store)) |host| {
-            // `ssh <opts> host nix-daemon --stdio` — the worker protocol over the
-            // ssh subprocess's stdio. We rely entirely on the user's ssh client.
-            const argv = [_][]const u8{ "ssh", "-o", "BatchMode=yes", host, "nix-daemon", "--stdio" };
-            try self.openCommand(&argv);
-            return;
-        }
+        try validateTransportUri(store);
         if (tcpTarget(store)) |target| {
             // `tcp://host:port` — the worker protocol over a TCP daemon socket
             // (e.g. a `socat`/`nc` bridge to a unix socket, or a TCP-listening
             // daemon). Same framed transport as the unix socket.
             const addr = try std.Io.net.IpAddress.resolve(io, target.host, target.port);
             const stream = try addr.connect(io, .{ .mode = .stream });
-            self.transport = .{ .socket = .{
+            self.transport = .{
                 .stream = stream,
                 .reader = std.Io.net.Stream.Reader.init(stream, io, self.rbuf),
                 .writer = std.Io.net.Stream.Writer.init(stream, io, self.wbuf),
-            } };
+            };
             return;
         }
-        const target = unixTarget(store) catch |err| switch (err) {
-            error.UnsupportedLixRpcProtocol => {
-                try self.openStoreHelper(store);
-                return;
-            },
-            else => return err,
-        };
+        const target = try unixTarget(store);
         const owned_path = if (target.append_legacy_socket)
             try std.fs.path.join(self.allocator, &.{ target.path, "socket" })
         else
@@ -361,44 +323,12 @@ pub const DaemonStore = struct {
         defer if (owned_path) |path| self.allocator.free(path);
         const path = owned_path orelse target.path;
         const addr = try std.Io.net.UnixAddress.init(path);
-        const stream = addr.connect(io) catch {
-            // Lix may expose only lix-xp-1, or `protocol=any` may have no
-            // legacy socket. Let the installed implementation speak its own
-            // RPC and re-export the stable worker protocol over stdio.
-            const helper_store = if (store.len == 0 or std.mem.eql(u8, store, default_socket_path)) "daemon" else store;
-            try self.openStoreHelper(helper_store);
-            return;
-        };
-        self.transport = .{ .socket = .{
+        const stream = try addr.connect(io);
+        self.transport = .{
             .stream = stream,
             .reader = std.Io.net.Stream.Reader.init(stream, io, self.rbuf),
             .writer = std.Io.net.Stream.Writer.init(stream, io, self.wbuf),
-        } };
-    }
-
-    fn openCommand(self: *DaemonStore, argv: []const []const u8) !void {
-        const io = self.io;
-        var child = try std.process.spawn(io, .{
-            .argv = argv,
-            .stdin = .pipe,
-            .stdout = .pipe,
-        });
-        errdefer {
-            if (child.stdin) |f| f.close(io);
-            _ = child.wait(io) catch {};
-        }
-        const out = child.stdout orelse return error.CommandPipeUnavailable;
-        const in = child.stdin orelse return error.CommandPipeUnavailable;
-        self.transport = .{ .command = .{
-            .child = child,
-            .reader = out.readerStreaming(io, self.rbuf),
-            .writer = in.writerStreaming(io, self.wbuf),
-        } };
-    }
-
-    fn openStoreHelper(self: *DaemonStore, store: []const u8) !void {
-        const argv = [_][]const u8{ "nix-daemon", "--stdio", "--store", localHelperUri(store) };
-        try self.openCommand(&argv);
+        };
     }
 
     pub fn deinit(self: *DaemonStore) void {

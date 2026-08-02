@@ -90,8 +90,6 @@ pub fn apply(
         .darwin => options.switch_target = .darwin,
         .home_manager => options.switch_target = .home_manager,
         .activate_toplevel => options.activate_toplevel = v0.?,
-        .target_host => options.target_host = v0.?,
-        .use_remote_sudo => options.use_remote_sudo = true,
         .chunk => options.disasm_chunk = std.fmt.parseInt(u32, v0.?, 0) catch return error.InvalidChunkId,
         .no_recurse => options.disasm_no_recurse = true,
         .no_source => options.disasm_no_source = true,

@@ -15,6 +15,7 @@ pub const BuildSettings = settings.Settings;
 pub const Setting = settings.Setting;
 pub const MissingPlan = client.MissingPlan;
 pub const default_socket_path = client.default_socket_path;
+pub const validateStoreUri = client.validateStoreUri;
 pub const DaemonPool = pool.DaemonPool;
 
 test {

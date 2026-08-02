@@ -46,24 +46,20 @@ else
 fi
 
 xp_uri="unix://${daemon_base}?protocol=lix-xp-1"
-if command -v nix >/dev/null 2>&1 && nix store ping --store "$xp_uri" >/dev/null 2>&1; then
-    out=$("$FIX" instantiate --store "$xp_uri" -E "$drv_expr" 2>&1)
-    if (($? == 0)); then
-        pass "daemon: Lix XP endpoint through stdio bridge"
-    else
-        fail "daemon: Lix XP endpoint through stdio bridge"
-        echo "  got: $(printf '%q' "$out")" | head -c 2000
-        echo
-    fi
+out=$("$FIX" instantiate --store "$xp_uri" -E "$drv_expr" 2>&1)
+if (($? != 0)) && [[ "$out" == *"only offers lix-xp-1"* ]]; then
+    pass "daemon: XP-only endpoint fails without implementation delegation"
 else
-    skip "daemon: Lix XP endpoint bridge" "endpoint not exposed"
+    fail "daemon: XP-only endpoint fails without implementation delegation"
+    echo "  got: $(printf '%q' "$out")" | head -c 2000
+    echo
 fi
 
 out=$("$FIX" instantiate --store auto -E "$drv_expr" 2>&1)
-if (($? == 0)); then
-    pass "store auto: installed implementation selects backend"
+if (($? != 0)) && [[ "$out" == *"native local-store backend"* ]]; then
+    pass "store auto: fails without implementation delegation"
 else
-    fail "store auto: installed implementation selects backend"
+    fail "store auto: fails without implementation delegation"
     echo "  got: $(printf '%q' "$out")" | head -c 2000
     echo
 fi
@@ -103,29 +99,16 @@ else
 fi
 t "daemon: read fresh text object" "text-via-daemon" "$out"
 
-# An absolute store URI is a Nix/Lix chroot store root. fix serves it through
-# the installed nix-daemon's stdio worker endpoint, without a persistent daemon.
+# An absolute store URI is a Nix/Lix chroot store root. It must not silently
+# delegate to an installed implementation while the native backend is pending.
 local_root=$(e2e_mktemp)
-local_expr='builtins.derivation {
-  name = "fix-local-e2e";
-  system = builtins.currentSystem;
-  builder = "/bin/sh";
-  args = [ "-c" "printf local-compatible > \"$out\"" ];
-}'
-out=$("$FIX" build --no-out-link --store "$local_root" -E "$local_expr" 2>&1)
-code=$?
-logical=$(printf '%s\n' "$out" | grep '^/nix/store/' | tail -1)
-if ((code == 0)); then
-    pass "local store: realize through stdio helper"
+out=$("$FIX" instantiate --store "$local_root" -E "$drv_expr" 2>&1)
+if (($? != 0)) && [[ "$out" == *"native local-store backend"* ]]; then
+    pass "local store: fails without implementation delegation"
 else
-    fail "local store: realize through stdio helper"
+    fail "local store: fails without implementation delegation"
     echo "  got: $(printf '%q' "$out")" | head -c 2000
     echo
-fi
-if [[ -n "$logical" && -f "$local_root$logical" && "$(<"$local_root$logical")" == local-compatible ]]; then
-    pass "local store: physical chroot output"
-else
-    fail "local store: physical chroot output"
 fi
 
 e2e_finish

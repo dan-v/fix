@@ -97,10 +97,10 @@ build environment and dependencies:
 $ nix-shell --run 'zig build --release=fast'
 ```
 
-Nix is required to use `fix`: keep a working Nix or Lix installation. Normal
-operation uses its daemon; `local`, `auto`, and chroot stores use the installed
-`nix-daemon --stdio` helper. Tagged releases publish optimized build archives
-for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
+Evaluation does not require a Nix or Lix executable. Store-writing commands need
+a reachable Nix or Lix daemon, but `fix` talks to it directly and never executes
+installed Nix/Lix programs. Tagged releases publish optimized build archives for
+x86_64 Linux, aarch64 Linux, and aarch64 macOS.
 
 ```console
 $ ./zig-out/bin/fix eval -E '1 + 2'
@@ -118,20 +118,20 @@ The package also includes shell completions for Bash, Fish, and Zsh.
 `fix` speaks the stable Nix worker protocol used by both CppNix and Lix. It
 accepts protocol versions 1.26 through 1.35 and advertises 1.35, so daemons older
 than Nix 2.4 are rejected with a protocol error instead of being used
-incorrectly. Lix `protocol=any`, `legacy`, `legacy-combined`, and `lix-xp-1`
-socket URIs are supported. Stable worker sockets are used directly; an XP-only
-endpoint is bridged through the installed Lix `nix-daemon --stdio` helper, so
-the unstable RPC remains owned by the matching Lix installation.
+incorrectly. Lix `protocol=any`, `legacy`, and `legacy-combined` socket URIs are
+supported wherever they expose the stable worker protocol. XP-only
+`protocol=lix-xp-1` endpoints are rejected with a specific diagnostic until fix
+has a native implementation of that protocol.
 
 The default local socket follows `NIX_STATE_DIR` (or `/nix/var/nix`), and
 `NIX_DAEMON_SOCKET_PATH` overrides it. `NIX_REMOTE`, `--store`, and the
-`nix.conf` `store` setting can select `daemon`, `unix://`, `local`, `auto`, an
-absolute chroot root, `ssh-ng://`, or `tcp://` transports. Direct and chroot
-stores are adapted to the worker protocol through `nix-daemon --stdio`, keeping
-store ownership and database logic in the installed Nix/Lix implementation.
+`nix.conf` `store` setting can select `daemon`, `unix://`, or `tcp://`
+transports. `local`, `auto`, absolute chroot roots, and `ssh-ng://` are rejected
+explicitly: supporting them requires native local-store and SSH transports, not
+delegation to an installed implementation.
 Like Nix, only user config, `$NIX_CONFIG`, and explicit CLI overrides are
 forwarded to the daemon; system `nix.conf` settings remain daemon-side policy.
-Direct GC-root checks and local/remote `fix switch` system profiles also follow
+Direct GC-root checks and local `fix switch` system profiles also follow
 `NIX_STATE_DIR`.
 
 `builtins.nixVersion` deliberately reports `2.18.3`: it is the evaluator
@@ -179,8 +179,8 @@ $ fix build -A fix
 ```
 
 Arguments can be supplied with `--arg` and `--argstr`. Evaluation can produce
-Nix, JSON, XML, or raw output, and can be made strict. Builds can target daemon,
-direct/chroot, `ssh-ng://`, and `tcp://` stores.
+Nix, JSON, XML, or raw output, and can be made strict. Builds can target direct
+Unix-socket and TCP daemon endpoints.
 
 ### Run programs and open temporary shells
 
@@ -219,16 +219,13 @@ options.
 `fix switch` can build and activate NixOS configurations. It also implements
 the conventional nix-darwin and Home Manager activation paths, although those
 two have not been verified locally. It supports `switch`, `boot`, `test`,
-`build`, and `dry-activate` actions, as well as remote activation with
-`--target-host`. When supplied, the action must be the first argument after
-`fix switch`.
+`build`, and `dry-activate` actions. When supplied, the action must be the first
+argument after `fix switch`.
 
 ```console
 $ fix switch --nixos
 
 $ fix switch build --home-manager --flake .#me
-
-$ fix switch --nixos --target-host host.example
 ```
 
 This command is intentionally experimental. I am still thinking about what

@@ -228,7 +228,7 @@ eval is just the "pin everything" caller of the same machinery.
 
 | Flag | Meaning |
 |---|---|
-| `--store STORE-URI` | select `daemon`/`unix://`, `local`/`auto`, an absolute chroot root, `ssh-ng://`, or `tcp://`; all Lix socket selectors are accepted, with XP-only endpoints bridged through the installed Lix helper |
+| `--store STORE-URI` | select a direct `daemon`/`unix://` or `tcp://` endpoint. Lix `any`, `legacy`, and `legacy-combined` selectors use its stable worker socket. Native `local`/`auto`/chroot, `ssh-ng://`, and XP-only endpoints are not implemented and fail explicitly; fix never delegates them to installed Nix/Lix programs. |
 | `-o, --out-link NAME` | name of the result symlink (`build`; default `result`); `--no-out-link` (alias `--no-link`) skips it |
 | `--dry-run` | (`build`) report the daemon's build/substitution plan without realizing or linking it |
 | `-Q, --no-build-output` | suppress builder stdout/stderr |
@@ -244,7 +244,7 @@ eval is just the "pin everything" caller of the same machinery.
 
 ### System activation (`switch`)
 
-The optional action is `switch` (default), `boot`, `test`, `build`, or `dry-activate`. Select the platform with `--nixos`, `--darwin`, or `--home-manager`; `--target-host [USER@]HOST` copies and activates remotely, and `--use-remote-sudo` runs the remote activation under `sudo`.
+The optional action is `switch` (default), `boot`, `test`, `build`, or `dry-activate`. Select the platform with `--nixos`, `--darwin`, or `--home-manager`. Remote activation is pending a native closure-transfer transport; fix does not call `nix-copy-closure` or `nix-env`.
 
 The action, when present, must be the first argument after `fix switch`, for
 example `fix switch build --nixos`. This command is experimental: its scope and

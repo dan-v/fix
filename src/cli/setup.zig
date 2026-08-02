@@ -173,17 +173,25 @@ pub fn configure(
         try ev.setDaemonSocket(uri);
     }
     // The store URI (`store` from nix.conf / `NIX_REMOTE` / `--store`)
-    // selects the daemon transport and wins over NIX_DAEMON_SOCKET_PATH. E.g.
-    // `ssh-ng://host` speaks the worker protocol over `ssh host nix-daemon --stdio`.
+    // selects the daemon transport and wins over NIX_DAEMON_SOCKET_PATH.
+    // Validate it here so unsupported native backends get a useful diagnostic
+    // instead of being flattened into StoreUnavailable by the connection pool.
     if (settings.get("store")) |uri| {
         if (uri.len != 0) {
+            store.daemon.validateStoreUri(uri) catch |err| {
+                switch (err) {
+                    error.NativeLocalStoreUnsupported => std.debug.print("error: local, auto, and chroot stores need fix's native local-store backend, which is not implemented yet\n", .{}),
+                    error.NativeSshStoreUnsupported => std.debug.print("error: ssh-ng stores need fix's native SSH transport, which is not implemented yet\n", .{}),
+                    error.UnsupportedLixRpcProtocol => std.debug.print("error: this Lix endpoint only offers lix-xp-1, which fix does not implement yet\n", .{}),
+                    error.UnsupportedDaemonProtocol => std.debug.print("error: the store URI requests an unsupported daemon protocol\n", .{}),
+                    else => std.debug.print("error: invalid or unsupported store URI: {s}\n", .{uri}),
+                }
+                return error.ConfigError;
+            };
             if (std.fs.path.isAbsolute(uri)) {
-                // Preserve the distinction from NIX_DAEMON_SOCKET_PATH after
-                // setup hands the URI to the transport-agnostic store client.
                 // Older Nix/Lix environments also spell the standard daemon
                 // endpoint as a bare absolute `.../daemon-socket/socket` URI.
-                const prefix = if (std.mem.endsWith(u8, uri, "/daemon-socket/socket")) "unix://" else "local-root:";
-                const tagged = try std.fmt.allocPrint(ev.hostAllocator(), "{s}{s}", .{ prefix, uri });
+                const tagged = try std.fmt.allocPrint(ev.hostAllocator(), "unix://{s}", .{uri});
                 defer ev.hostAllocator().free(tagged);
                 try ev.setDaemonSocket(tagged);
             } else {
