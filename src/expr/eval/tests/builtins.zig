@@ -323,6 +323,28 @@ test "evaluate TOML builtin" {
     try std.testing.expectEqualStrings("\"[\\\"hammer\\\",\\\"nail\\\"]\"", array_table);
 }
 
+test "TOML multi-line strings trim the opening newline and line-ending backslash" {
+    const joined = try renderForTest(
+        \\(builtins.fromTOML ''
+        \\  s = """
+        \\  line \
+        \\  joined"""
+        \\'').s
+    );
+    defer std.testing.allocator.free(joined);
+    try std.testing.expectEqualStrings("\"line joined\"", joined);
+
+    const kept = try renderForTest(
+        \\(builtins.fromTOML ''
+        \\  t = """
+        \\  keep
+        \\  lines"""
+        \\'').t
+    );
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings("\"keep\\nlines\"", kept);
+}
+
 test "evaluate version parsing builtins" {
     const split = try renderForTest("builtins.splitVersion \"1.0-beta2\"");
     defer std.testing.allocator.free(split);

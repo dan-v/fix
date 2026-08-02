@@ -190,6 +190,12 @@ const Parser = struct {
 
     fn parseDelimitedString(self: *Parser, delimiter: []const u8, escapes: bool) ![]const u8 {
         self.pos += delimiter.len;
+        const multiline = delimiter.len == 3;
+        // A newline immediately following the opening delimiter is trimmed.
+        if (multiline) {
+            if (self.startsWith("\r\n")) self.pos += 2 //
+            else if (self.peekOrZero() == '\n') self.pos += 1;
+        }
         var out: std.ArrayListUnmanaged(u8) = .empty;
         while (!self.eof()) {
             if (self.startsWith(delimiter)) {
@@ -202,6 +208,7 @@ const Parser = struct {
                 continue;
             }
             if (self.eof()) return error.InvalidToml;
+            if (multiline and self.consumeLineEndingBackslash()) continue;
             switch (self.advance()) {
                 'b' => try out.append(self.allocator, 0x08),
                 't' => try out.append(self.allocator, '\t'),
@@ -216,6 +223,23 @@ const Parser = struct {
             }
         }
         return error.InvalidToml;
+    }
+
+    /// Multi-line "line-ending backslash": a `\` whose line ends in optional
+    /// inline whitespace trims everything through the next non-whitespace
+    /// character. Called with `pos` on the char after the backslash; consumes
+    /// nothing and returns false when this is an ordinary escape instead.
+    fn consumeLineEndingBackslash(self: *Parser) bool {
+        var i = self.pos;
+        while (i < self.text.len and (self.text[i] == ' ' or self.text[i] == '\t')) i += 1;
+        if (i < self.text.len and self.text[i] == '\r') i += 1;
+        if (i >= self.text.len or self.text[i] != '\n') return false;
+        while (i < self.text.len) : (i += 1) {
+            const c = self.text[i];
+            if (c != ' ' and c != '\t' and c != '\r' and c != '\n') break;
+        }
+        self.pos = i;
+        return true;
     }
 
     fn appendCodepoint(self: *Parser, out: *std.ArrayListUnmanaged(u8), digits: usize) !void {
