@@ -17,7 +17,7 @@ in
   stdenv.mkDerivation
   {
     pname = "fix";
-    version = "0.1.0";
+    version = "0.2.0";
     # Only the files the build actually consumes (mirrors build.zig.zon's
     # `.paths`), so unrelated churn — .git, .zig-cache, zig-out, result*,
     # bench/, docs/ — does not invalidate the build or bloat the src copy.
