@@ -39,9 +39,30 @@ jobs:
         timeout-minutes: 30
         run: nix-shell --run "zig build stress-concurrency -Doptimize=ReleaseFast --summary all -- --seed $STRESS_SEED --iterations 100"
 
+      # TSan lanes build ReleaseSafe: safety checks stay on, and the optimizer
+      # elides the dead whole-union operand copies that safe-Debug lowering
+      # materializes for tag dispatch — those alias embedded atomics (e.g. the
+      # merge-flatten memo) and would report as races on reads no source-level
+      # access performs.
       - name: ThreadSanitizer stress
         if: matrix.system == 'x86_64-linux'
         timeout-minutes: 30
         env:
-          TSAN_OPTIONS: halt_on_error=1:exitcode=66
-        run: nix-shell --run "zig build stress-concurrency -Dtsan --summary all -- --seed $STRESS_SEED --iterations 5"
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66:suppressions=${{ github.workspace }}/test/tsan.supp
+        run: nix-shell --run "zig build stress-concurrency -Dtsan -Doptimize=ReleaseSafe --summary all -- --seed $STRESS_SEED --iterations 20"
+
+      # The synthetic stress workloads cannot reproduce the module-fixpoint
+      # shapes where past real races surfaced; run the real-world bench
+      # fixtures as a parallel-eval differential against reference Nix. On
+      # aarch64 this is also the only weak-memory coverage of a real eval —
+      # TSan on x86 cannot see ordering bugs that TSO hides.
+      - name: Real-eval differential (w=8)
+        timeout-minutes: 45
+        run: nix-shell --run 'zig build test-bench-fixtures -Doptimize=ReleaseFast --summary all -- realworld --workers 8'
+
+      - name: ThreadSanitizer real-eval differential (w=8)
+        if: matrix.system == 'x86_64-linux'
+        timeout-minutes: 90
+        env:
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66:suppressions=${{ github.workspace }}/test/tsan.supp
+        run: nix-shell --run 'zig build test-bench-fixtures -Dtsan -Doptimize=ReleaseSafe --summary all -- realworld --workers 8'

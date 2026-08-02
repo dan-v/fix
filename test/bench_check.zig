@@ -19,6 +19,10 @@ const Options = struct {
     fix: []const u8 = "zig-out/bin/fix",
     repo: []const u8 = ".",
     nix: []const u8 = "nix-instantiate",
+    /// Fix-side worker count. The default keeps the ordinary differential
+    /// deterministic; the nightly concurrency lanes pass a real worker count
+    /// so the same fixtures double as a parallel-eval differential.
+    workers: []const u8 = "1",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -37,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, a, "--fix")) opts.fix = args.next() orelse fatal("--fix needs an argument") //
         else if (std.mem.eql(u8, a, "--repo")) opts.repo = args.next() orelse fatal("--repo needs an argument") //
         else if (std.mem.eql(u8, a, "--nix")) opts.nix = args.next() orelse fatal("--nix needs an argument") //
+        else if (std.mem.eql(u8, a, "--workers")) opts.workers = args.next() orelse fatal("--workers needs an argument") //
         else try filters.append(arena, a); // substring selectors, e.g. `torture`
     }
 
@@ -73,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     for (workloads.items) |w| {
         const rel = w[root.len + 1 ..];
         const leaf = node.start(rel, 0);
-        if (try check(gpa, io, arena, fix, opts.nix, &env, w, rel)) |detail| {
+        if (try check(gpa, io, arena, fix, opts.nix, opts.workers, &env, w, rel)) |detail| {
             std.debug.print("  FAIL {s}\n{s}\n", .{ rel, detail });
             fails += 1;
         } else {
@@ -90,9 +95,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Returns null on agreement, else a failure detail.
-fn check(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, fix: []const u8, nix: []const u8, env: *const std.process.Environ.Map, workload: []const u8, rel: []const u8) !?[]const u8 {
+fn check(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, fix: []const u8, nix: []const u8, workers: []const u8, env: *const std.process.Environ.Map, workload: []const u8, rel: []const u8) !?[]const u8 {
     _ = rel;
-    var fout = try proc.run(gpa, io, &.{ fix, "eval", "--json", "--strict", "--workers", "1", "--file", workload }, null, env, eval_timeout_ns);
+    var fout = try proc.run(gpa, io, &.{ fix, "eval", "--json", "--strict", "--workers", workers, "--file", workload }, null, env, eval_timeout_ns);
     defer fout.deinit(gpa);
     var nout = try proc.run(gpa, io, &.{ nix, "--eval", "--strict", "--json", workload }, null, env, eval_timeout_ns);
     defer nout.deinit(gpa);

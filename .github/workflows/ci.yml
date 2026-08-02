@@ -79,12 +79,15 @@ jobs:
         timeout-minutes: 12
         run: nix-shell --run 'zig build test-concurrency --verbose --summary all'
 
+      # ReleaseSafe: safety checks stay on while the optimizer elides the
+      # dead union operand copies that safe-Debug lowering materializes,
+      # which alias embedded atomics and would report as artifact races.
       - name: ThreadSanitizer concurrency tests
         if: matrix.system == 'x86_64-linux'
         timeout-minutes: 20
         env:
-          TSAN_OPTIONS: halt_on_error=1:exitcode=66
-        run: nix-shell --run 'zig build test-concurrency -Dtsan --verbose --summary all'
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66:suppressions=${{ github.workspace }}/test/tsan.supp
+        run: nix-shell --run 'zig build test-concurrency -Dtsan -Doptimize=ReleaseSafe --verbose --summary all'
 
       - name: Integration tests
         timeout-minutes: 12
