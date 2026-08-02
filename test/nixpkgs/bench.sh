@@ -8,9 +8,9 @@
 #   test/nixpkgs/bench.sh --subtree haskellPackages
 #
 # All reference evaluators run `nix-instantiate --eval --strict --json
-# --readonly-mode` (single-threaded, no store writes); fix runs with default
-# workers. detsys-autocore additionally exercises Determinate's parallel
-# `nix eval --eval-cores 0`.
+# --readonly-mode` (no store writes); fix runs with default workers.
+# detsys-autocore additionally enables Determinate's parallel evaluator
+# (`--eval-cores 0`).
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -69,8 +69,5 @@ run fix "$fix" eval --strict --json "$expr" "${args[@]}"
 run lix "$lix/bin/nix-instantiate" --eval --strict --json --readonly-mode "$expr" "${args[@]}"
 run nix "$cppnix/bin/nix-instantiate" --eval --strict --json --readonly-mode "$expr" "${args[@]}"
 run detsys-1core "$detsys/bin/nix-instantiate" --eval --strict --json --readonly-mode "$expr" "${args[@]}"
-# eval-cores is an ordinary setting, so the legacy CLI takes it too — same
-# readonly invocation as every other row. Measured caveat: Determinate's
-# parallel eval shows no benefit on this workload under either CLI (and
-# `nix eval --eval-cores 0` was slower than its own serial run).
+# eval-cores is an ordinary setting, so nix-instantiate takes it directly.
 run detsys-autocore "$detsys/bin/nix-instantiate" --eval --strict --json --readonly-mode --eval-cores 0 "$expr" "${args[@]}"
