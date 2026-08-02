@@ -26,8 +26,8 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-v2-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-          restore-prefixes-first-match: nix-v2-${{ matrix.system }}-
+          primary-key: nix-v3-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          restore-prefixes-first-match: nix-v3-${{ matrix.system }}-
 
       - name: Configure pinned NIX_PATH
         run: |
@@ -127,8 +127,8 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-v2-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-          restore-prefixes-first-match: nix-v2-x86_64-linux-
+          primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          restore-prefixes-first-match: nix-eval-v1-x86_64-linux-
 
       - name: Configure pinned NIX_PATH
         run: |
