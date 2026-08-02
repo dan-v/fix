@@ -859,12 +859,28 @@ fn normalizeDerivationString(
     for (try contextEntriesForValue(self, value)) |entry| {
         const path = self.intern.get(entry.name);
         if (std.mem.endsWith(u8, path, ".drv")) {
-            // `path` is interned — stable, no dupe (see normalizeDerivation).
-            const outputs = try contextOutputs(self, path, entry.value);
-            errdefer self.allocator.free(outputs);
-            try inputs.owned_output_lists.append(self.allocator, outputs);
-            try appendInputDrv(self, inputs, path, outputs);
-            if (std.mem.indexOf(u8, text, path) != null) try appendInputSrc(self, inputs, path);
+            // Marker-aware: `unsafeDiscardOutputDependency` leaves a plain
+            // `path` marker on a `.drv`-named entry — that contributes the
+            // drv FILE as an input source only, NOT an output dependency
+            // (Nix parity; nixpkgs' cabalSdist tests grep drvPaths for
+            // exactly this). Any output/allOutputs marker — or an unknown
+            // marker shape, conservatively — keeps the input-drv edge.
+            const marker = try vm_force.forceValue(self, entry.value);
+            if (!marker.isAttrs()) return error.TypeError;
+            const marker_id = marker.asObjectId();
+            const has_path_marker = try contextMarkerHasAttr(self, marker_id, "path");
+            const pure_path_marker = has_path_marker and
+                !(try contextMarkerHasAttr(self, marker_id, "allOutputs")) and
+                !(try contextMarkerHasAttr(self, marker_id, "outputs"));
+            if (!pure_path_marker) {
+                // `path` is interned — stable, no dupe (see normalizeDerivation).
+                const outputs = try contextOutputs(self, path, entry.value);
+                errdefer self.allocator.free(outputs);
+                try inputs.owned_output_lists.append(self.allocator, outputs);
+                try appendInputDrv(self, inputs, path, outputs);
+            }
+            if (has_path_marker or std.mem.indexOf(u8, text, path) != null)
+                try appendInputSrc(self, inputs, path);
         } else {
             const store_path = try sourceStorePathForContext(self, path, owned_strings);
             try appendInputSrc(self, inputs, store_path);
@@ -892,6 +908,14 @@ fn sourceStorePathForContext(self: *VM, path: []const u8, owned_strings: *std.Ar
     errdefer self.allocator.free(store_path);
     try owned_strings.append(self.allocator, store_path);
     return store_path;
+}
+
+fn contextMarkerHasAttr(self: *VM, marker_id: ObjectId, name: []const u8) !bool {
+    _ = self.heap.getAttrValue(marker_id, try self.intern.intern(name)) catch |err| switch (err) {
+        error.MissingAttribute => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn contextOutputs(
