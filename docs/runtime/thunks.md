@@ -28,7 +28,7 @@ Thunk
     state:        atomic u32   // FutureState FSM (the discriminant)
     claimer:      atomic u32   // ClaimerId of the evaluating fiber
     waiters_head: ?*Waiter     // parked fibers (null when uncontended)
-    waiters_mu:   SpinMutex
+    waiters_mu:   BlockingMutex
   demanded:       atomic u8    // observed by a real caller? (vs speculation)
   target_kind:    TargetKind
   profiling:      zero-sized unless its build probe is enabled

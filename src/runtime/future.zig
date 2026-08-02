@@ -98,7 +98,7 @@ pub const Future = struct {
     /// only under `waiters_mu`. Empty in the common (uncontended) case
     /// where the claimer resolves before any other fiber tries to force.
     waiters_head: ?*Waiter,
-    waiters_mu: sync.SpinMutex,
+    waiters_mu: sync.BlockingMutex,
     pub fn init() Future {
         return .{
             .state = .init(@intFromEnum(FutureState.unresolved)),
