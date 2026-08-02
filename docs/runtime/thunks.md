@@ -20,7 +20,7 @@ They are required to preserve the value produced by ordinary demand.
 Large evaluations can keep millions of thunks live, so thunk-only metadata stays on `Thunk` while the reusable synchronization primitive remains small. On the current 64-bit layout a `Future` is 24 bytes. A production `Thunk` is at most 56 bytes, while safety builds retain an active-union tag and allow up to 80; a size test enforces the `Thunk` bounds. Two ideas keep unrelated future users from paying for evaluator state and keep the thunk payload bounded:
 
 - **Separated responsibilities.** `Future` owns only state, claimer identity, and waiters. `Thunk` adds `demanded`, the `TargetKind` discriminant, and optional profiling fields. Imports, realization claims, and I/O futures therefore do not carry thunk scheduling metadata.
-- **`target` XOR `result` overlap.** The `Payload` is a bare 24-byte union: `.target` (what to evaluate) is the live arm while unresolved/evaluating; `.result` (the resolved `Value`, or an `*ErrorInfo`'s bits) is live once terminal. They are *never both live* — the body reads `target`, then the resolver overwrites the same bytes with `result`. So resolving costs no growth. `future.state` is the discriminant that says which arm is live.
+- **`target` XOR `result` overlap.** The `Payload` is a bare 24-byte union: `.target` (what to evaluate) is the live arm while unresolved/evaluating; `.result` (the resolved `Value`, or a `FailureRef`'s bits) is live once terminal. They are *never both live* — the body reads `target`, then the resolver overwrites the same bytes with `result`. So resolving costs no growth. `future.state` is the discriminant that says which arm is live.
 
 ```
 Thunk
@@ -38,7 +38,13 @@ Thunk
   }
 ```
 
-`ErrorInfo` (`{err, message}`) is stored out-of-band and pointed at from the `result` slot only in the errored state, so uncommon failures do not widen every thunk.
+`FailureRef` is a one-word handle into the engine-owned immutable failure
+store. An origin retains the error, message, and compact frame identities;
+context records share that origin rather than copying it. If retaining those
+diagnostics runs out of memory, the same word carries an inline error code, so
+the deterministic failure remains terminal instead of being recomputed. The
+handle occupies the `result` slot only in the errored state, so uncommon
+failures do not widen every thunk.
 
 ## `ThunkTarget` kinds
 
@@ -143,7 +149,7 @@ Checked on the freshly-claimed path before running the body; a hit resolves the 
 
 ## Invariants & gotchas
 
-- **`reset()` is transient-only.** It drops to `.unresolved` and wakes waiters to retry — used *only* for `error.OutOfMemory`, `error.StackOverflow`, and `error.SpeculativeBail` (the target arm is untouched; a transient failure never wrote a result). It is not a general retry mechanism; deterministic failures instead go **sticky** via `.errored`, replaying the cached `ErrorInfo` on every later force.
+- **`reset()` is transient-only.** It drops to `.unresolved` and wakes waiters to retry — used *only* for `error.OutOfMemory`, `error.StackOverflow`, and `error.SpeculativeBail` (the target arm is untouched; a transient failure never wrote a result). It is not a general retry mechanism; deterministic failures instead go **sticky** via `.errored`, replaying the cached `FailureRef` on every later force.
 - **Terminal states never revert** — except the binding-cell's deliberate `.evaluating → .unresolved` publish.
 - **Claim is per-fiber**, not per-worker. Never key blackhole/claim decisions on the OS thread.
 - **Thunks are GC-rooted through the in-flight force chain** (`vm.gc_roots.force_chain` roots the `.evaluating` thunk's target closure / upvalues / attr-access base). See [gc](../gc.md).

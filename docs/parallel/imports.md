@@ -22,9 +22,9 @@ A path-keyed table (`StringHashMapUnmanaged(path → *ImportEntry)`). A brief `S
 
 ```
 ImportEntry {
-    future     : Future          # claim/wait/wake state machine
-    result     : Value           # Future is value-less → entry owns the slot
-    error_info : ?*ErrorInfo     # sidecar for a cached deterministic failure
+    future  : Future          # claim/wait/wake state machine
+    result  : Value           # Future is value-less → entry owns the slot
+    failure : ?FailureRef     # borrowed from the engine's immutable store
 }
 ```
 
@@ -42,7 +42,8 @@ loop:
 
       .already_resolved → return entry.result             # someone finished it
       .blackhole        → return error.ImportCycle        # same-claimer recursion
-      .errored          → return entry.error_info.err     # deterministic replay
+      .errored          → install entry.failure; return failure.err
+                                                           # deterministic replay
       .busy:                                              # another fiber owns it
           enrollWaiter(&wf.waiter)                         # onto future.waiters_head
           fiber.state = suspended; yield()                # park, don't spin
@@ -60,7 +61,16 @@ loop:
 - **Cycles** come for free: a `ClaimerId` is stable across [fiber migration](fibers.md), so `A imports B imports A` reaches a slot the *same claimer* already owns → `Future` returns `.blackhole` → `error.ImportCycle`.
 
 ### Failure caching
-A failed compile publishes an `ErrorInfo` sidecar via `publishErrored`, so the same error replays on every later force — imports that fail (file-not-found, parse error) fail deterministically. `OutOfMemory`, `StackOverflow`, and `SpeculativeBail` are the exceptions: they are not cached, and the future is reset so a later caller may retry. If even the `ErrorInfo` allocation fails, the future is likewise reset.
+A failed compile publishes an immutable `FailureRef` via `publishErrored`, so
+the same error, message, and origin frames replay on every later force —
+imports that fail (file-not-found, parse error) fail deterministically. The
+fiber's `ExecutionContext` carries the currently propagating ref across nested
+import VMs; genuine demand renders it into that caller's trace, while
+speculative observation remains private. `OutOfMemory`, `StackOverflow`, and
+`SpeculativeBail` from the computation itself are transient and reset the
+future so a later caller may retry. Failure-retention allocation is different:
+if the detailed record cannot be retained, `FailureRef` degrades to an inline
+error code and the entry still reaches the terminal errored state.
 
 ### Directories & corepkgs
 `import <dir>` redirects to `<dir>/default.nix`. `<nix/fetchurl.nix>` resolves to the synthetic source in `eval/imports/corepkgs.zig`, so no corepkgs store path is needed on disk. Both flow back through the same registry.
@@ -103,7 +113,9 @@ measured contribution for one NixOS workload is in
 - The claimer runs compile **inline**; waiters **park**, never spin — same protocol as [thunks](../runtime/thunks.md).
 - Cycle = same-claimer recursion (non-scoped) or fiber-scoped frame hit (scoped) ⇒ `error.ImportCycle`.
 - `result` is written **before** `publish()`; waiters read it after wake.
-- Deterministic failures cache (`ErrorInfo`); resource-pressure failures fall back to transient `reset`.
+- Deterministic failures cache an engine-owned `FailureRef`; transient
+  computation failures use `reset`, while diagnostic-retention OOM degrades to
+  an inline error without reopening the computation.
 - Scoped imports never touch the registry (distinct scope Value).
 
 File & path caching is shared via the evaluator's `files` reader. See [workers](workers.md).
