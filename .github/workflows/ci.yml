@@ -129,7 +129,7 @@ jobs:
         uses: cachix/install-nix-action@v31
       - name: Install Lix
         if: matrix.implementation == 'lix'
-        uses: samueldr/lix-gha-installer-action@8dc19fbd645d09dbcc66bf5f70d08a78bc17a499
+        uses: samueldr/lix-gha-installer-action@a0fee77b2a98bb7c5c0ed7ae6d6ad4903dbdad0d # v2026-06-15
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: daemon-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
