@@ -20,8 +20,10 @@ executable. An explicit `ssh-ng://` selector asks SSH to start the remote host's
 | `unix://DIR?protocol=lix-xp-1` | not implemented | native Lix RPC client required |
 | `local`, `auto`, absolute chroot roots | not implemented | native local-store backend required |
 
-The stable worker client accepts protocol 1.26 through 1.35 and advertises
-1.35. It is exercised in CI against both CppNix and Lix daemons. The default
+The stable worker client requires a daemon of at least protocol 1.26 and
+advertises 1.35, so the negotiated protocol is in the 1.26–1.35 range even
+when a newer daemon advertises a later version. It is exercised in CI against
+both CppNix and Lix daemons. The default
 socket, direct GC-root checks, and local system-profile updates follow
 `NIX_STATE_DIR`; `NIX_DAEMON_SOCKET_PATH` remains an explicit socket override.
 

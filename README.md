@@ -118,9 +118,10 @@ The package also includes shell completions for Bash, Fish, and Zsh.
 ### Nix and Lix runtime compatibility
 
 `fix` speaks the stable Nix worker protocol used by both CppNix and Lix. It
-accepts protocol versions 1.26 through 1.35 and advertises 1.35, so daemons older
-than Nix 2.4 are rejected with a protocol error instead of being used
-incorrectly. Lix `protocol=any`, `legacy`, and `legacy-combined` socket URIs are
+requires a daemon protocol of at least 1.26 and advertises 1.35, so the
+negotiated version is in that range and daemons older than Nix 2.4 are rejected
+with a protocol error instead of being used incorrectly. Lix `protocol=any`,
+`legacy`, and `legacy-combined` socket URIs are
 supported wherever they expose the stable worker protocol. XP-only
 `protocol=lix-xp-1` endpoints are rejected with a specific diagnostic until fix
 has a native implementation of that protocol.
