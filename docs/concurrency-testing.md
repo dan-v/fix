@@ -6,8 +6,10 @@ timing-sensitive test.
 - `zig build test-concurrency` runs deterministic protocol tests for Future
   enrollment/publication, ready-queue deduplication, wake-before-park, external
   completion teardown, repeated GC barriers, and serial/parallel semantics.
-- `zig build check-models` runs the bounded TLA+ models in `model/` and verifies
-  that deliberate protocol mutations are rejected.
+- `zig build check-models` runs the bounded TLA+ models in `model/` with
+  deadlock detection enabled, checks liveness (waiters are woken, collections
+  complete, shutdown finishes) alongside the safety invariants, and verifies
+  that a deliberate protocol mutation per model is rejected.
 - `TSAN_OPTIONS=halt_on_error=1:exitcode=66 zig build test-concurrency -Dtsan`
   instruments the complete evaluator module graph on x86_64 Linux. Fiber
   switches use compiler-rt's fiber API so stacks remain attributed correctly

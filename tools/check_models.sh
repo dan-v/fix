@@ -10,7 +10,6 @@ for spec in FutureWait FiberDispatch Shutdown GcBarrier; do
   echo "TLC $spec"
   tlc \
     -workers 1 \
-    -deadlock \
     -cleanup \
     -metadir "$meta_root/$spec" \
     -config "$model_dir/$spec.cfg" \
@@ -28,7 +27,7 @@ expect_mutation_rejected() {
     'index($0, marker) { printf "    /%c %s %c* %s\n", 92, expression, 92, marker; next } { print }' \
     "$mutation_dir/$spec.tla" >"$mutation_dir/$spec.next"
   mv "$mutation_dir/$spec.next" "$mutation_dir/$spec.tla"
-  if tlc -workers 1 -deadlock -cleanup \
+  if tlc -workers 1 -cleanup \
       -metadir "$mutation_dir/states" \
       -config "$mutation_dir/$spec.cfg" \
       "$mutation_dir/$spec.tla" >"$mutation_dir/output" 2>&1; then

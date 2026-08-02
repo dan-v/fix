@@ -30,6 +30,10 @@ OpenMark ==
     /\ phase = "collecting"
     /\ parked = Peers
     /\ ~markOpen
+    \* The collector opens the mark window once per generation; without this
+    \* guard the model would admit an unreal open/close oscillation after all
+    \* peers have helped, which no fairness assumption could get past.
+    /\ helped # Peers
     /\ markOpen' = TRUE
     /\ UNCHANGED <<phase, parked, helped>>
 
@@ -78,7 +82,7 @@ Next ==
     \/ \E w \in Peers: Leave(w)
     \/ EndRelease
 
-Spec == Init /\ [][Next]_vars
+Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 TypeOK ==
     /\ phase \in {"idle", "collecting", "releasing"}
@@ -93,5 +97,10 @@ IdleIsClean == phase = "idle" =>
 ReleaseClosesMark == phase = "releasing" => ~markOpen
 HelpOnlyWhileParked == phase = "collecting" => helped \subseteq parked
 NoGenerationOverlap == phase # "idle" => ~ENABLED TryBegin
+
+\* A begun collection always finishes: every generation parks, marks, drains,
+\* and releases back to idle. This is the livelock class safety invariants
+\* cannot see — a barrier that wedges with every peer parked forever.
+CollectionCompletes == (phase # "idle") ~> (phase = "idle")
 
 =============================================================================

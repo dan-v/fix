@@ -53,12 +53,19 @@ Observe(w) ==
     /\ wstate' = [wstate EXCEPT ![w] = "idle"]
     /\ UNCHANGED <<state, claimer>>
 
+\* Terminal outcomes are sticky; the explicit stutter step keeps TLC's
+\* deadlock check enabled by distinguishing *resolved* from *stuck*.
+Done ==
+    /\ state \in Terminal
+    /\ UNCHANGED vars
+
 Next ==
     \/ \E c \in Claimers: Claim(c)
     \/ \E w \in Waiters: Enroll(w)
     \/ \E outcome \in Terminal: Publish(outcome)
     \/ Reset
     \/ \E w \in Waiters: Observe(w)
+    \/ Done
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 

@@ -20,9 +20,21 @@ tests cover those layers.
   that a popped wake token always converts back into a run.
 - `Shutdown`: helper quiescence plus external callbacks that retain pointers
   into suspended fiber stacks. No worker or scheduler resource may be
-  destroyed until those callbacks have published and returned.
+  destroyed until those callbacks have published and returned, and
+  `ShutdownCompletes` checks teardown actually finishes even while new
+  callbacks keep arriving.
 - `GcBarrier`: collecting, parallel mark, releasing, and the peer-flag drain
-  that prevents generation overlap.
+  that prevents generation overlap. `CollectionCompletes` checks every begun
+  generation releases back to idle — the livelock class safety invariants
+  cannot see.
+
+TLC runs with deadlock detection enabled: models whose protocols terminate
+(`FutureWait`, `Shutdown`) carry an explicit `Done` stutter step so a
+*finished* system is distinguishable from a *stuck* one, and any other state
+with no successor is an error. Liveness properties state their fairness
+assumptions in each `Spec`; fairness is deliberately withheld from workload
+actions (job arrival, fiber starts) so progress may not depend on the
+workload behaving nicely.
 
 Run all models with:
 
