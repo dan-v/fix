@@ -39,17 +39,22 @@ const FreeRange = struct {
     len: u32,
 };
 
+/// Comptime `heap_mod.range_stores` row indices, so `freeObjectRanges` arms
+/// name stores without restating field strings.
+const si_values = heap_mod.rangeStoreIndex("values");
+const si_attrs = heap_mod.rangeStoreIndex("attrs");
+const si_attr_pos = heap_mod.rangeStoreIndex("attr_pos");
+
 /// Collection-local streaming coalescer. Sweep order follows allocation order
 /// closely (exactly on one worker, per-worker for a parallel minor), so adjacent
 /// dead owners normally arrive consecutively. Holding one interval per store
-/// merges those runs with no per-range allocation, sorting, or address hash.
+/// (indexed by `heap_mod.range_stores` row) merges those runs with no
+/// per-range allocation, sorting, or address hash.
 const RangeBatch = struct {
     heap: *ObjectHeap,
     fixed_dst: ?*HeapLocal,
     shard: usize = 0,
-    values: ?FreeRange = null,
-    attrs: ?FreeRange = null,
-    attr_pos: ?FreeRange = null,
+    pending: [heap_mod.range_stores.len]?FreeRange = @splat(null),
 
     fn global(heap: *ObjectHeap) RangeBatch {
         return .{ .heap = heap, .fixed_dst = null };
@@ -59,8 +64,8 @@ const RangeBatch = struct {
         return .{ .heap = heap, .fixed_dst = dst };
     }
 
-    fn add(self: *RangeBatch, comptime pending_field: []const u8, comptime free_field: []const u8, range: FreeRange) void {
-        const pending = &@field(self, pending_field);
+    fn add(self: *RangeBatch, comptime si: usize, range: FreeRange) void {
+        const pending = &self.pending[si];
         if (pending.*) |*last| {
             if (last.segment == range.segment and last.offset + last.len == range.offset) {
                 last.len += range.len;
@@ -71,31 +76,26 @@ const RangeBatch = struct {
                 last.len += range.len;
                 return;
             }
-            self.emit(free_field, last.*);
+            self.emit(si, last.*);
         }
         pending.* = range;
     }
 
-    fn emit(self: *RangeBatch, comptime free_field: []const u8, range: FreeRange) void {
+    fn emit(self: *RangeBatch, comptime si: usize, range: FreeRange) void {
         const dst = self.fixed_dst orelse blk: {
             const selected = &self.heap.worker_locals[self.shard];
             self.shard += 1;
             if (self.shard == self.heap.worker_locals.len) self.shard = 0;
             break :blk selected;
         };
-        @field(dst, free_field).push(self.heap.allocator, range.segment, range.offset, range.len);
-    }
-
-    fn flushOne(self: *RangeBatch, comptime pending_field: []const u8, comptime free_field: []const u8) void {
-        const pending = &@field(self, pending_field);
-        if (pending.*) |range| self.emit(free_field, range);
-        pending.* = null;
+        @field(dst, heap_mod.range_stores[si].free).push(self.heap.allocator, range.segment, range.offset, range.len);
     }
 
     fn flush(self: *RangeBatch) void {
-        self.flushOne("values", "gc_free_values");
-        self.flushOne("attrs", "gc_free_attrs");
-        self.flushOne("attr_pos", "gc_free_attr_pos");
+        inline for (0..heap_mod.range_stores.len) |si| {
+            if (self.pending[si]) |range| self.emit(si, range);
+            self.pending[si] = null;
+        }
     }
 };
 
@@ -524,16 +524,16 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
         }
     }
     switch (obj.*) {
-        .list => |r| if (r.len > 0) ranges.add("values", "gc_free_values", .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
-        .closure => |c| if (c.upvalues.len > 0) ranges.add("values", "gc_free_values", .{ .segment = c.upvalues.segment, .offset = c.upvalues.offset, .len = c.upvalues.len }),
+        .list => |r| if (r.len > 0) ranges.add(si_values, .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
+        .closure => |c| if (c.upvalues.len > 0) ranges.add(si_values, .{ .segment = c.upvalues.segment, .offset = c.upvalues.offset, .len = c.upvalues.len }),
         .attrs => |a| {
-            if (a.range.len > 0) ranges.add("attrs", "gc_free_attrs", .{ .segment = a.range.segment, .offset = a.range.offset, .len = a.range.len });
-            if (a.positions.len > 0) ranges.add("attr_pos", "gc_free_attr_pos", .{ .segment = a.positions.segment, .offset = a.positions.offset, .len = a.positions.len });
+            if (a.range.len > 0) ranges.add(si_attrs, .{ .segment = a.range.segment, .offset = a.range.offset, .len = a.range.len });
+            if (a.positions.len > 0) ranges.add(si_attr_pos, .{ .segment = a.positions.segment, .offset = a.positions.offset, .len = a.positions.len });
         },
-        .builtin_closure => |c| if (c.args.len > 0) ranges.add("values", "gc_free_values", .{ .segment = c.args.segment, .offset = c.args.offset, .len = c.args.len }),
-        .partial_app => |p| if (p.args.len > 0) ranges.add("values", "gc_free_values", .{ .segment = p.args.segment, .offset = p.args.offset, .len = p.args.len }),
-        .context_string => |c| if (c.context.len > 0) ranges.add("attrs", "gc_free_attrs", .{ .segment = c.context.segment, .offset = c.context.offset, .len = c.context.len }),
-        .thunk => |t| if (t.targetSpillRange()) |r| ranges.add("values", "gc_free_values", .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
+        .builtin_closure => |c| if (c.args.len > 0) ranges.add(si_values, .{ .segment = c.args.segment, .offset = c.args.offset, .len = c.args.len }),
+        .partial_app => |p| if (p.args.len > 0) ranges.add(si_values, .{ .segment = p.args.segment, .offset = p.args.offset, .len = p.args.len }),
+        .context_string => |c| if (c.context.len > 0) ranges.add(si_attrs, .{ .segment = c.context.segment, .offset = c.context.offset, .len = c.context.len }),
+        .thunk => |t| if (t.targetSpillRange()) |r| ranges.add(si_values, .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
         .merge_attrs, .boxed_int => {},
     }
 }
