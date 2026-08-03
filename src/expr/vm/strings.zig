@@ -109,15 +109,25 @@ pub fn makeString(self: *VM, bytes: []const u8) !Value {
     return Value.string(try self.intern.intern(bytes));
 }
 
-/// Construct a string value from text the CALLER KNOWS is unique by
-/// construction — number formatting, counters, freshly-generated ids.
-/// Unique text has zero dedup value, so interning it only grows the
-/// immortal table (a fold over `toString i` was 33% intern+rehash);
-/// it goes to the GC heap regardless of length whenever collection is
-/// on. `heap_string_min` still acts as the master off-switch so
-/// `FIX_HEAP_STR_MIN=<huge>` restores the everything-interns world.
+/// Construct a string value from DERIVED text whose global uniqueness the
+/// caller can't rule out but whose unbounded instances are unique —
+/// number formatting is the canonical producer. Two regimes:
+///
+/// - SHORT text (≤ 5 bytes) interns: small numbers (versions, ports,
+///   priorities, list indices) repeat millions of times across a real
+///   eval, and losing their dedup turned each occurrence into a live
+///   48-byte heap object — inflating the live set that every full mark
+///   walks (a measured +33% on the whole-nixpkgs eval). The possible
+///   short-numeric universe bounds the intern-table pollution at ~110k
+///   entries ever, so the churn fixture's unbounded-growth property is
+///   preserved.
+/// - LONGER text goes to the GC heap: real counters and timestamps are
+///   unique in practice, and interning a fold's worth of them was 33% of
+///   churn wall in table growth + rehash.
+///
+/// `heap_string_min` at maxInt remains the master off-switch.
 pub fn makeUniqueString(self: *VM, bytes: []const u8) !Value {
-    if (heap_string_min == std.math.maxInt(usize))
+    if (bytes.len <= 5 or heap_string_min == std.math.maxInt(usize))
         return Value.string(try self.intern.intern(bytes));
     return Value.heapString(try self.heap.addHeapString(bytes));
 }
