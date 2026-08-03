@@ -2,6 +2,48 @@
 
 All notable changes to `fix` are documented in this file.
 
+## [0.3.0] - 2026-08-02
+
+### Added
+
+- A whole-nixpkgs differential harness (`test/nixpkgs/`, `zig build
+  test-nixpkgs`): evaluates the entire nixpkgs CI job universe (about 80,000
+  derivations) with `fix` and a reference Nix and compares every `.drv` store
+  path. The pinned universe currently evaluates to identical derivation paths
+  (80,586 of 80,586 attributes, including agreement on which attributes fail
+  to evaluate). CI runs it as a sharded chunk matrix.
+- Channel resolution: when neither `-I` nor `$NIX_PATH` provides a lookup
+  path, `<nixpkgs>` and friends resolve from the user and root channel
+  profiles, as Nix does.
+- GC detector builds: swept thunk state is poisoned so a stale reference
+  traps at the point of use instead of silently reading recycled memory. CI
+  runs a tight-budget detector lane on a nixpkgs chunk.
+
+### Fixed
+
+- `builtins.toXML` forces its argument strictly, as Nix does. A
+  speculatively resolved but undemanded thunk could previously bake
+  `<unevaluated />` into a cached string; the demand-sensitive rendering is
+  now exclusive to the CLI's lazy `--xml` output.
+- Two parallel-evaluation GC rooting bugs found by the detector: evaluation
+  results are rooted across the native handoff, and a speculative force
+  task's thunk is rooted for the task's whole duration.
+- Merged dotted `let` groups (`let a.b = …; a.c = …;`) get their own binding
+  cells instead of miscompiling.
+- `fromTOML` handles escape sequences in multi-line strings.
+- Type predicates (`isInt` and friends) recognize boxed integers.
+- The strict attribute-literal merge carries attribute positions, so
+  `unsafeGetAttrPos` and error messages keep their locations.
+- Selecting a derivation output (`drv.out`) no longer computes the
+  derivation eagerly.
+- `FileCache` records lstat-accurate file kinds, fixing NAR hashes for
+  symlinks.
+- Discarded output dependencies (`builtins.unsafeDiscardOutputDependency`)
+  are honored in derivation contexts.
+- The VM value and frame stacks are sized so call chains that are legal
+  under `max-call-depth` no longer overflow (deep nixpkgs
+  `lib.recursiveUpdate` spines evaluate where Nix and Lix already did).
+
 ## [0.2.0] - 2026-08-02
 
 ### Added

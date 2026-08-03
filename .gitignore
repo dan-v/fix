@@ -19,6 +19,9 @@ out.txt
 *.tmp
 perf.data*
 
+# Local demo recordings (the README embeds uploaded copies)
+demo/*.mp4
+
 # Generated Perfetto/Chrome traces (fix --timeline=...)
 *.perfetto.json
 .claude/

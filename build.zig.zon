@@ -1,6 +1,6 @@
 .{
     .name = .fix,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0x59fa47602c959ada, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
