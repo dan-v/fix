@@ -161,22 +161,34 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     armTracking(heap);
 }
 
-/// Lazy variant (the production collection-line policy, see
+/// Bytes of reserved growth at which the lazy path arms tracking+rooting:
+/// a QUARTER of the line (floored at 512 MiB, capped at line/2 so tiny
+/// budgets still arm before they collect). Everything allocated before
+/// arming stays pinned, so a lower arm line shrinks the unreclaimable
+/// floor — measured on whole-nixpkgs: arming at line/2 (16 GiB) left
+/// collections 13 GiB less effective than early rooting. A run that
+/// never reaches the arm line pays ZERO tracking or rooting cost, which
+/// is what keeps small evals exactly as fast under any budget form.
+pub fn armLineBytes(budget: u64) u64 {
+    const floor: u64 = 512 << 20;
+    return @min(@max(budget / 4, floor), budget / 2);
+}
+
+/// Lazy collection-line policy (the production default, see
 /// `gc_controller.memoryBudget`): don't start any per-allocation tracking yet — just
-/// watch the reserved-bytes cursor. At half the line the safepoint driver arms
+/// watch the reserved-bytes cursor. At `armLineBytes` the safepoint driver arms
 /// tracking (STW, `armTracking`); at the line it collects. A run that never
-/// reaches line/2 pays ZERO tracking cost (no young-slot appends, no write
-/// barrier, no free-list probes) — below the line the evaluator stays at
-/// rooting-tax-only. The price: objects allocated before arming are permanently
-/// old (unreclaimable floor ≈ reserved at line/2 — half the line, by
-/// construction) UNLESS `root_always` (constrained mode): then a major also
-/// reclaims that pre-arming region, paid for by keeping the transient-root
-/// gates live from here. `collection.bootstrap_end` is captured now
-/// as the reclaim boundary (bootstrap below it stays pinned).
+/// reaches the arm line pays ZERO tracking cost (no young-slot appends, no write
+/// barrier, no free-list probes). The price: objects allocated before arming are
+/// permanently old (unreclaimable floor ≈ reserved at the arm line)
+/// UNLESS `root_always` (`FIX_GC_ROOTS=1` / the step validation path): then a
+/// major also reclaims that pre-arming region, paid for by keeping the
+/// transient-root gates live from here. `collection.bootstrap_end` is captured
+/// now as the reclaim boundary (bootstrap below it stays pinned).
 pub fn enableBudget(heap: *ObjectHeap, budget: u64, root_always: bool) void {
     heap.collection.step_bytes = 0;
     heap.collection.budget_bytes = budget;
-    heap.collection.threshold_bytes = budget / 2;
+    heap.collection.threshold_bytes = armLineBytes(budget);
     heap.collection.bootstrap_end = heap.objects.count();
     heap.collection.root_always = root_always;
     heap.collection.root_active = root_always;

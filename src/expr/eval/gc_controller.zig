@@ -356,32 +356,20 @@ pub fn memoryBudget(ev: Context) u64 {
 /// (a RAM-limited box). A roomy auto machine (line clamped to the ceiling) never
 /// arms, so pre-arming reclaim stays off.
 pub fn constrainedMode(ev: Context, budget: u64) bool {
-    const explicit = ev.gc_budget_bytes != null;
-    const ceiling = envSize(ev, "FIX_GC_CEILING") orelse gc_limit_ceiling;
-    return constrainedFor(budget, explicit, ceiling);
+    // From-start precise rooting costs 2-7% wall on small evals and is
+    // NOT how big evals get their reclaim any more: the lazy path arms
+    // tracking+rooting at `collector.armLineBytes` (budget/4, floored),
+    // so only the sub-arm-line prefix stays pinned. The old heuristic —
+    // constrained iff the budget was EXPLICIT — coupled mechanism to flag
+    // spelling: it taxed every small eval run under `--gc-budget` and
+    // denied ceiling-form users productive collection entirely.
+    // `FIX_GC_ROOTS=1` remains as the measurement/override knob.
+    _ = budget;
+    if (ev.env_map) |em| if (em.get("FIX_GC_ROOTS")) |s|
+        return !std.mem.eql(u8, s, "0");
+    return false;
 }
 
-/// Pure core of `constrainedMode`, so the policy is testable. Constrained iff a
-/// collection line is set (`budget != 0`) AND either the user asked for a limit
-/// (`explicit`) or the auto line came in under the ceiling (a RAM-limited box).
-/// The roomy-auto case (line clamped to the ceiling) is the ONLY non-constrained
-/// collecting case — it never arms, so the reclaim is moot and stays off.
-fn constrainedFor(budget: u64, explicit: bool, ceiling: u64) bool {
-    if (budget == 0) return false; // never-collect override
-    return explicit or budget < ceiling;
-}
-
-test "constrained mode: explicit limit or sub-ceiling auto line" {
-    const c = gc_limit_ceiling;
-    try std.testing.expect(!constrainedFor(0, false, c)); // never-collect override
-    try std.testing.expect(!constrainedFor(0, true, c)); // even explicit 0 = never
-    try std.testing.expect(!constrainedFor(c, false, c)); // roomy auto (line == ceiling)
-    try std.testing.expect(constrainedFor(c, true, c)); // explicit at the ceiling
-    try std.testing.expect(constrainedFor(2 << 30, false, c)); // RAM-limited auto (< ceiling)
-    try std.testing.expect(constrainedFor(800 << 20, false, c)); // small auto line
-    try std.testing.expect(!constrainedFor(64 << 30, false, c)); // auto above ceiling (defensive)
-    try std.testing.expect(constrainedFor(64 << 30, true, c)); // explicit big limit still opts in
-}
 
 /// The automatic line: a fraction of physical RAM, clamped. MemTotal (not the
 /// fluctuating MemAvailable) so it's stable and read exactly once. The clamp
