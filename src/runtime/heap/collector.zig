@@ -562,7 +562,11 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
         .closure => |c| if (c.upvalues.len > 0) ranges.add(si_values, .{ .segment = c.upvalues.segment, .offset = c.upvalues.offset, .len = c.upvalues.len }),
         .attrs => |a| {
             if (a.range.len > 0) ranges.add(si_attrs, .{ .segment = a.range.segment, .offset = a.range.offset, .len = a.range.len });
-            if (a.positions.len > 0) ranges.add(si_attr_pos, .{ .segment = a.positions.segment, .offset = a.positions.offset, .len = a.positions.len });
+            // Chunk-ref positions are immortal chunk data — nothing to free.
+            if (a.positions.heapLen() > 0) {
+                const pr = a.positions.heapRange();
+                ranges.add(si_attr_pos, .{ .segment = pr.segment, .offset = pr.offset, .len = pr.len });
+            }
         },
         .builtin_closure => |c| if (c.args.len > 0) ranges.add(si_values, .{ .segment = c.args.segment, .offset = c.args.offset, .len = c.args.len }),
         .partial_app => |p| if (p.args.len > 0) ranges.add(si_values, .{ .segment = p.args.segment, .offset = p.args.offset, .len = p.args.len }),

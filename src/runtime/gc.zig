@@ -733,7 +733,7 @@ fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: Obj
         .list => |r| scanValues(Sink, sink, heap, r),
         .attrs => |a| {
             scanAttrs(Sink, sink, heap, a.range);
-            sink.countAttrPos(a.positions.len);
+            sink.countAttrPos(a.positions.heapLen());
         },
         .merge_attrs => |m| {
             sink.markObject(heap, m.base);

@@ -489,7 +489,7 @@ fn opBuildAttrsNamedSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usize, 
     const names_start = readU32(code, ip + 2);
     const names = frame.chunk_ptr.attr_names;
     if (names_start + count > names.len) return error.InvalidBytecode;
-    try objects.buildAttrsNamedSorted(vm, names[names_start .. names_start + count], count, &.{});
+    try objects.buildAttrsNamedSorted(vm, names[names_start .. names_start + count], count, .none);
     return dispatch(vm, frame, code, ip + 6, stop_depth);
 }
 
@@ -502,7 +502,8 @@ fn opBuildAttrsNamedPosSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usiz
     const names = frame.chunk_ptr.attr_names;
     const table = frame.chunk_ptr.attr_pos;
     if (names_start + count > names.len or pos_start + pos_count > table.len) return error.InvalidBytecode;
-    try objects.buildAttrsNamedSorted(vm, names[names_start .. names_start + count], count, table[pos_start .. pos_start + pos_count]);
+    // Positions stay in the chunk's baked table; the attrset stores a ref.
+    try objects.buildAttrsNamedSorted(vm, names[names_start .. names_start + count], count, heap_mod.AttrPositions.fromChunk(frame.chunk_id, pos_start, pos_count));
     return dispatch(vm, frame, code, ip + 12, stop_depth);
 }
 

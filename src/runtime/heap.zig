@@ -128,6 +128,60 @@ pub const ByteRange = ByteStore.Range;
 /// segment-less) store is never indexed.
 pub const empty_attr_positions: AttrPosRange = .{ .segment = 0, .offset = 0, .len = 0 };
 
+/// Where an attrset's source positions live: nowhere (`len == 0`), in the
+/// heap's attr-position store (dynamic builders — `listToAttrs`, `//`
+/// merges), or in a bytecode chunk's immortal baked table (literal
+/// attrsets — the dominant population; every instance of a literal
+/// SHARES the chunk's sorted table instead of copying it into the heap,
+/// which was ~200M copied entries / 2.4GB on a whole-nixpkgs eval).
+/// 12 bytes in all forms; bit 31 of `tag_and_start` marks a chunk ref.
+pub const AttrPositions = extern struct {
+    /// Chunk ref: `chunk_ref_tag | table_start`. Heap range: segment.
+    tag_and_start: u32,
+    /// Chunk ref: the ChunkId. Heap range: offset.
+    id_or_offset: u32,
+    len: u32,
+
+    const chunk_ref_tag: u32 = 1 << 31;
+
+    pub const none: AttrPositions = .{ .tag_and_start = 0, .id_or_offset = 0, .len = 0 };
+
+    pub fn fromRange(r: AttrPosRange) AttrPositions {
+        std.debug.assert(r.segment & chunk_ref_tag == 0);
+        if (r.len == 0) return none;
+        return .{ .tag_and_start = r.segment, .id_or_offset = r.offset, .len = r.len };
+    }
+
+    pub fn fromChunk(chunk_id: u32, table_start: u32, count: u32) AttrPositions {
+        std.debug.assert(table_start < chunk_ref_tag);
+        if (count == 0) return none;
+        return .{ .tag_and_start = chunk_ref_tag | table_start, .id_or_offset = chunk_id, .len = count };
+    }
+
+    pub fn isChunkRef(self: AttrPositions) bool {
+        return self.tag_and_start & chunk_ref_tag != 0;
+    }
+
+    /// Entries resident in the heap store (0 for chunk refs) — the store
+    /// accounting/sweep quantity.
+    pub fn heapLen(self: AttrPositions) u32 {
+        return if (self.isChunkRef()) 0 else self.len;
+    }
+
+    pub fn heapRange(self: AttrPositions) AttrPosRange {
+        std.debug.assert(!self.isChunkRef());
+        return .{ .segment = self.tag_and_start, .offset = self.id_or_offset, .len = self.len };
+    }
+};
+
+/// Resolves a chunk's baked attr-position table for `AttrPositions` chunk
+/// refs. Type-erased: the chunk registry lives in the expression engine
+/// and the heap must not import it (same pattern as `GcHook`).
+pub const ChunkAttrPosResolver = struct {
+    ctx: *anyopaque,
+    resolve: *const fn (ctx: *anyopaque, chunk_id: u32) []const AttrPosEntry,
+};
+
 pub const Closure = struct {
     chunk_id: ChunkId,
     upvalues: []const Value,
@@ -185,7 +239,7 @@ const ContextStringObject = struct {
 /// dedup mark that once did sits in `ObjectHeap.sweep_filter` instead.
 pub const AttrsObject = struct {
     range: AttrRange,
-    positions: AttrPosRange = empty_attr_positions,
+    positions: AttrPositions = .none,
 };
 
 /// A lazy, layered `//` (update) result: `base // overlay`, both attrset
@@ -544,6 +598,10 @@ pub const ObjectHeap = struct {
     /// allocator can reuse heap addresses, so a stale slot would match
     /// pointer equality even though it refers to a freed heap.
     token: u64,
+    /// Resolves `AttrPositions` chunk refs to the chunk's baked table.
+    /// Set once by the engine after the chunk registry exists; null only
+    /// in standalone heap tests, where chunk refs are never created.
+    chunk_attr_pos: ?ChunkAttrPosResolver = null,
     /// Collection policy, barriers, bitmaps, and parallel minor-sweep state.
     collection: HeapCollectionState,
     /// Shared immutable singletons for `[]` and `{}`: every empty list/attrs
@@ -2358,9 +2416,27 @@ pub const ObjectHeap = struct {
         };
     }
 
+    pub fn setChunkAttrPosResolver(self: *ObjectHeap, resolver: ChunkAttrPosResolver) void {
+        self.chunk_attr_pos = resolver;
+    }
+
+    /// The position entries an `AttrPositions` names — a chunk's baked
+    /// table slice (immortal, shared) or a heap-store slice.
+    pub fn attrPositionsEntries(self: *const ObjectHeap, p: AttrPositions) []const AttrPosEntry {
+        if (p.len == 0) return &.{};
+        if (p.isChunkRef()) {
+            const r = self.chunk_attr_pos orelse return &.{};
+            const table = r.resolve(r.ctx, p.id_or_offset);
+            const start = p.tag_and_start & ~AttrPositions.chunk_ref_tag;
+            if (start + p.len > table.len) return &.{};
+            return table[start .. start + p.len];
+        }
+        return self.attr_positions.slice(p.heapRange());
+    }
+
     pub fn getAttrPos(self: *const ObjectHeap, id: ObjectId, name: InternId) ?SourcePos {
         return switch (self.get(id).*) {
-            .attrs => |*a| if (a.positions.len == 0) null else self.findAttrPos(a.positions, name),
+            .attrs => |*a| if (a.positions.len == 0) null else findAttrPos(self.attrPositionsEntries(a.positions), name),
             // `//` is right-biased; report the overlay's position if it
             // defines the name, else the base's. Walks the chain rather
             // than flattening (flattening drops positions).
@@ -2713,7 +2789,7 @@ pub const ObjectHeap = struct {
         const pos_range = try self.appendAttrPositions(positions);
         errdefer self.attr_positions.rollback(pos_range);
         self.sortAttrPositions(pos_range);
-        return self.add(.{ .attrs = .{ .range = range, .positions = pos_range } });
+        return self.add(.{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
 
     pub fn addContextString(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
@@ -2782,7 +2858,7 @@ pub const ObjectHeap = struct {
         // Both operands empty (`{} // {}` strict): the tail release above
         // already returned the reserved storage; hand back the shared `{ }`.
         if (range.len == 0 and positions.len == 0) if (self.empty_attrs_id) |id| return id;
-        return self.add(.{ .attrs = .{ .range = range, .positions = positions } });
+        return self.add(.{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(positions) } });
     }
 
     pub fn addAttrsFromStackPairs(self: *ObjectHeap, pairs: []const Value) !ObjectId {
@@ -2796,7 +2872,7 @@ pub const ObjectHeap = struct {
         self: *ObjectHeap,
         names: []const InternId,
         values: []const Value,
-        positions: []const AttrPosEntry,
+        positions: AttrPositions,
     ) !ObjectId {
         std.debug.assert(names.len == values.len);
         if (names.len == 0) if (self.empty_attrs_id) |id| return id;
@@ -2804,11 +2880,11 @@ pub const ObjectHeap = struct {
         const entries = self.attrs.sliceMut(range);
         for (entries, names, values) |*e, n, v| e.* = .{ .name = n, .value = v };
         std.debug.assert(attrEntriesSortedUnique(entries));
-        if (positions.len == 0) return self.add(.{ .attrs = .{ .range = range } });
-        std.debug.assert(positionsSortedByName(positions));
-        const pos_range = try self.appendAttrPositions(positions);
-        errdefer self.attr_positions.rollback(pos_range);
-        return self.add(.{ .attrs = .{ .range = range, .positions = pos_range } });
+        // A chunk-ref position table is stored AS the reference — every
+        // instance of the literal shares the chunk's baked table; nothing
+        // is copied into the heap store.
+        std.debug.assert(positionsSortedByName(self.attrPositionsEntries(positions)));
+        return self.add(.{ .attrs = .{ .range = range, .positions = positions } });
     }
 
     /// `attrs_new_srt` fast path: the compiler guarantees the pairs
@@ -2872,7 +2948,7 @@ pub const ObjectHeap = struct {
         std.debug.assert(positionsSortedByName(positions));
         const pos_range = try self.appendAttrPositions(positions);
         errdefer self.attr_positions.rollback(pos_range);
-        return self.add(.{ .attrs = .{ .range = range, .positions = pos_range } });
+        return self.add(.{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
 
     fn attrEntriesSortedUnique(entries: []const AttrEntry) bool {
@@ -3105,8 +3181,7 @@ pub const ObjectHeap = struct {
         }
     }
 
-    fn findAttrPos(self: *const ObjectHeap, range: AttrPosRange, name: InternId) ?SourcePos {
-        const entries = self.attr_positions.slice(range);
+    fn findAttrPos(entries: []const AttrPosEntry, name: InternId) ?SourcePos {
         var lo: usize = 0;
         var hi: usize = entries.len;
 
@@ -3206,14 +3281,14 @@ pub const ObjectHeap = struct {
             .offset = range.offset,
             .len = actual,
         };
-        return self.add(.{ .attrs = .{ .range = trimmed, .positions = positions } });
+        return self.add(.{ .attrs = .{ .range = trimmed, .positions = AttrPositions.fromRange(positions) } });
     }
 
     /// Borrow an attrset's source-position entries (empty slice when it
     /// has none or `id` is not an attrset).
     fn attrPositionsSlice(self: *const ObjectHeap, id: ObjectId) []const AttrPosEntry {
         return switch (self.get(id).*) {
-            .attrs => |a| if (a.positions.len == 0) &.{} else self.attr_positions.slice(a.positions),
+            .attrs => |a| self.attrPositionsEntries(a.positions),
             else => &.{},
         };
     }

@@ -36,7 +36,7 @@ pub fn buildAttrs(self: *VM, count: u16) !void {
 /// `attrs_new_named*`: entries are compile-time sorted by interned name and
 /// duplicate-free — skip the construction sort. Names come from the chunk
 /// side table, values are the top `count` stack slots.
-pub fn buildAttrsNamedSorted(self: *VM, names: []const u32, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
+pub fn buildAttrsNamedSorted(self: *VM, names: []const u32, count: u16, positions: heap_mod.AttrPositions) !void {
     const start = self.sp - count;
     const id = try self.heap.addAttrsFromValuesSorted(names, self.stack[start..self.sp], positions);
     self.sp = start;
