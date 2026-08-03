@@ -28,7 +28,13 @@ Speculative forcing and strict-demand fan-out provide work for otherwise idle
 workers; both can be disabled when diagnosing parallel behavior.
 
 The worker count is configurable, including a single-worker mode when
-repeatability or debugging matters more than throughput.
+repeatability or debugging matters more than throughput. Memory is managed by
+a parallel generational garbage collector.
+
+The core concurrency protocols — future wait, fiber dispatch, shutdown, and
+the GC barrier — are [modeled in TLA+](model/README.md) and checked for
+safety, deadlock freedom, and liveness. A nightly CI lane evaluates real
+configurations in parallel against a reference Nix under ThreadSanitizer.
 
 ### Compatibility you can measure
 
@@ -500,7 +506,8 @@ Keep Nix installed: it is a runtime requirement because `fix` uses the Nix
 daemon for store operations and builds.
 
 If `fix` produces a different value, derivation, or store path from Nix for
-supported input, that is a bug.
+supported input, that is a bug. Releases are documented in
+[the changelog](CHANGELOG.md).
 
 ## Development
 
