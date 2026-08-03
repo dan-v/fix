@@ -25,6 +25,10 @@ const future_mod = @import("../future.zig");
 fn poisonSweptObject(heap: *ObjectHeap, id: ObjectId) void {
     switch (heap.objects.getMut(id).*) {
         .thunk => |*t| t.future.state.store(future_mod.poisoned_state, .monotonic),
+        // Inline string text lives in the slot itself; memset it so a
+        // dangling borrow reads visible garbage (the range-store analogue
+        // is in freeObjectRanges).
+        .heap_string_inline => |*is| @memset(&is.text, 0xAA),
         else => {},
     }
 }
@@ -328,7 +332,7 @@ pub fn verifyMinorClosure(heap: *ObjectHeap, mark_bits: []const u64) void {
                     },
                 }
             },
-            .boxed_int, .heap_string => {},
+            .boxed_int, .heap_string, .heap_string_inline => {},
         }
     }
     if (shown > 0) @panic("gc: minor mark not closed — missed edge (see MISSED EDGE lines)");
@@ -553,6 +557,6 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
         .context_string => |c| if (c.context.len > 0) ranges.add(si_attrs, .{ .segment = c.context.segment, .offset = c.context.offset, .len = c.context.len }),
         .thunk => |t| if (t.targetSpillRange()) |r| ranges.add(si_values, .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
         .heap_string => |hs| if (hs.bytes.len > 0) ranges.add(si_bytes, .{ .segment = hs.bytes.segment, .offset = hs.bytes.offset, .len = hs.bytes.len }),
-        .merge_attrs, .boxed_int => {},
+        .merge_attrs, .boxed_int, .heap_string_inline => {},
     }
 }

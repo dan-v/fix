@@ -331,17 +331,17 @@ pub fn coerceToStringValue(self: *VM, arg: Value) !Value {
         .string, .string_context, .heap_string => return value,
         .path => return Value.string(value.asInternId()),
         .int, .boxed_int => {
-            const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(value, self.heap)});
-            defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            var buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{}", .{int_mod.get(value, self.heap)}) catch unreachable;
+            return vm_strings.makeUniqueString(self, s);
         },
         .float => {
             // Nix coerces a float with C++ `std::to_string` — fixed-point with
             // 6 fractional digits (`1.0` → "1.000000", `1.5e-6` → "0.000002"),
             // NOT the shortest `%g` form used to *print* a value.
-            const s = try std.fmt.allocPrint(self.allocator, "{d:.6}", .{value.asFloat()});
-            defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            var buf: [400]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d:.6}", .{value.asFloat()}) catch unreachable;
+            return vm_strings.makeUniqueString(self, s);
         },
         .bool_false, .null => return Value.string(try self.intern.intern("")),
         .bool_true => return Value.string(try self.intern.intern("1")),
@@ -433,17 +433,17 @@ pub fn coerceDerivationStringValue(self: *VM, arg: Value) !Value {
         .string, .string_context, .heap_string => return value,
         .path => return sourcePathStringValue(self, value.asInternId()),
         .int, .boxed_int => {
-            const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(value, self.heap)});
-            defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            var buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{}", .{int_mod.get(value, self.heap)}) catch unreachable;
+            return vm_strings.makeUniqueString(self, s);
         },
         .float => {
             // Nix coerces a float with C++ `std::to_string` — fixed-point with
             // 6 fractional digits (`1.0` → "1.000000", `1.5e-6` → "0.000002"),
             // NOT the shortest `%g` form used to *print* a value.
-            const s = try std.fmt.allocPrint(self.allocator, "{d:.6}", .{value.asFloat()});
-            defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            var buf: [400]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d:.6}", .{value.asFloat()}) catch unreachable;
+            return vm_strings.makeUniqueString(self, s);
         },
         .bool_false, .null => return Value.string(try self.intern.intern("")),
         .bool_true => return Value.string(try self.intern.intern("1")),

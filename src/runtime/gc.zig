@@ -748,9 +748,9 @@ fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: Obj
             scanValues(Sink, sink, heap, p.args);
         },
         .context_string => |c| scanAttrs(Sink, sink, heap, c.context),
-        // Leaf: byte payload has no Value edges; marking the object keeps
-        // its byte range from being swept (`collector.freeObjectRanges`).
-        .heap_string => {},
+        // Leaves: byte payloads have no Value edges; marking the object
+        // keeps its byte range (if any) from being swept.
+        .heap_string, .heap_string_inline => {},
         .boxed_int => {},
         .thunk => scanThunk(Sink, sink, heap, &obj.thunk),
     }

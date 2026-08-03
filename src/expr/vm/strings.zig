@@ -109,6 +109,19 @@ pub fn makeString(self: *VM, bytes: []const u8) !Value {
     return Value.string(try self.intern.intern(bytes));
 }
 
+/// Construct a string value from text the CALLER KNOWS is unique by
+/// construction — number formatting, counters, freshly-generated ids.
+/// Unique text has zero dedup value, so interning it only grows the
+/// immortal table (a fold over `toString i` was 33% intern+rehash);
+/// it goes to the GC heap regardless of length whenever collection is
+/// on. `heap_string_min` still acts as the master off-switch so
+/// `FIX_HEAP_STR_MIN=<huge>` restores the everything-interns world.
+pub fn makeUniqueString(self: *VM, bytes: []const u8) !Value {
+    if (heap_string_min == std.math.maxInt(usize))
+        return Value.string(try self.intern.intern(bytes));
+    return Value.heapString(try self.heap.addHeapString(bytes));
+}
+
 /// `makeString` over pre-sliced parts (the concat producers), carrying
 /// the -Dprof concat census that previously lived in
 /// `concatInternedString`. Contexted results must NOT come here — their
@@ -143,7 +156,7 @@ pub fn makeConcatString(self: *VM, parts: []const []const u8, total: usize) !Val
 /// slice is immortal; for a heap string it follows the
 /// `ObjectHeap.getHeapString` contract — valid while `value` stays rooted
 /// and only until the next GC safepoint. Copy or intern to retain.
-pub fn stringBytes(self: *VM, value: Value) ![]const u8 {
+pub inline fn stringBytes(self: *VM, value: Value) ![]const u8 {
     return switch (value.kind()) {
         .string, .path => self.intern.get(value.asInternId()),
         .string_context => self.intern.get((try self.heap.getContextString(value.asObjectId())).text),
@@ -405,9 +418,10 @@ pub fn coerceLanguageStringValueOpt(self: *VM, value: Value, allow_int: bool) !V
         .string, .string_context, .heap_string => forced,
         .path => try sourcePathStringValue(self, forced.asInternId()),
         .int, .boxed_int => if (allow_int and self.policy.coerce_integers_enabled) blk: {
-            const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(forced, self.heap)});
-            defer self.allocator.free(s);
-            break :blk Value.string(try self.intern.intern(s));
+            // Stack-format + unique-string: number text never dedups.
+            var buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{}", .{int_mod.get(forced, self.heap)}) catch unreachable;
+            break :blk try makeUniqueString(self, s);
         } else trace.coercionError(self, forced),
         .attrs => blk: {
             const to_string_id = try self.intern.intern("__toString");

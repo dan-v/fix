@@ -236,7 +236,19 @@ pub const Object = union(enum) {
     /// so it must be interned before use as an attr name or any other
     /// id-compared role.
     heap_string: HeapStringObject,
+    /// Short GC-able string text stored inline in the slot (same
+    /// `Value.heap_string` kind at the VM layer — `getHeapString`
+    /// dispatches on the union arm). A GC leaf owning no ranges.
+    heap_string_inline: InlineStringObject,
 };
+
+comptime {
+    // The inline-string arm must ride the union's existing size (set by
+    // the largest prior arm); growing every object to fit it would tax
+    // all allocation for a short-string optimization.
+    const Probe = union(enum) { a: Thunk, b: AttrsObject, c: MergeAttrsObject, d: PartialAppObject };
+    std.debug.assert(@sizeOf(Object) == @sizeOf(Probe));
+}
 
 /// `bytes.len` is the size-class-padded allocation (`byteAllocSize`) so
 /// churn recycles exact-fit instead of shredding the free pool with split
@@ -244,6 +256,21 @@ pub const Object = union(enum) {
 pub const HeapStringObject = struct {
     bytes: ByteRange,
     text_len: u32,
+};
+
+/// Text short enough to live INSIDE the object slot: no byte-range
+/// reserve, no size-class, no free-list traffic — allocation is one slot,
+/// sweep is one slot. Sized to the union's existing arm budget (asserted
+/// below the union) so it costs nothing; number formatting and other
+/// short derived text land here.
+pub const InlineStringObject = struct {
+    pub const capacity = 30;
+    len: u8,
+    text: [capacity]u8,
+
+    pub fn slice(self: *const InlineStringObject) []const u8 {
+        return self.text[0..self.len];
+    }
 };
 
 /// Size-class rounding for heap-string byte allocations. Near-uniform
@@ -817,6 +844,7 @@ pub const ObjectHeap = struct {
             .boxed_int => |value| .{ .boxed_int = value },
             .partial_app => |partial| .{ .partial_app = .{ .function = inspectValue(partial.func), .args = partial.args.len } },
             .heap_string => |hs| .{ .heap_string = .{ .len = hs.text_len } },
+            .heap_string_inline => |s| .{ .heap_string = .{ .len = s.len } },
         };
     }
 
@@ -854,7 +882,7 @@ pub const ObjectHeap = struct {
                 try collectValueReference(partial.func, allocator, out);
                 try self.collectValueRangeReferences(partial.args, allocator, out);
             },
-            .boxed_int, .heap_string => {},
+            .boxed_int, .heap_string, .heap_string_inline => {},
             .thunk => |*thunk| try collectThunkReferences(thunk, allocator, out),
         }
     }
@@ -1137,7 +1165,7 @@ pub const ObjectHeap = struct {
                 .boxed_int => 6,
                 .merge_attrs => 7,
                 .partial_app => 8,
-                .heap_string => 9,
+                .heap_string, .heap_string_inline => 9,
             };
             result.variant_counts[v_index] += 1;
         }
@@ -2913,6 +2941,16 @@ pub const ObjectHeap = struct {
     /// existing segments and allocation is not a GC safepoint, so the
     /// input slices stay valid throughout.
     pub fn addHeapStringParts(self: *ObjectHeap, parts: []const []const u8, total: u32) !ObjectId {
+        // Short text lives inline in the slot: one allocation, no range.
+        if (total <= InlineStringObject.capacity) {
+            var obj: InlineStringObject = .{ .len = @intCast(total), .text = undefined };
+            var off: usize = 0;
+            for (parts) |s| {
+                @memcpy(obj.text[off..][0..s.len], s);
+                off += s.len;
+            }
+            return self.add(.{ .heap_string_inline = obj });
+        }
         const range = try self.reserveStoreLocal(comptime rangeStoreIndex("bytes"), byteAllocSize(total));
         errdefer self.bytes.rollback(range);
         const dst = self.bytes.sliceMut(range);
@@ -2929,8 +2967,13 @@ pub const ObjectHeap = struct {
     /// until the next GC safepoint — code that forces/allocates while
     /// holding the slice must re-fetch (or copy/intern for retention).
     pub fn getHeapString(self: *const ObjectHeap, id: ObjectId) ![]const u8 {
-        return switch (self.get(id).*) {
+        // Inline text is sliced through the STORE pointer (stable
+        // addresses), never a by-value union copy — same contract as
+        // thunk inline upvalues.
+        const obj = self.get(id);
+        return switch (obj.*) {
             .heap_string => |hs| self.bytes.slice(hs.bytes)[0..hs.text_len],
+            .heap_string_inline => obj.heap_string_inline.slice(),
             else => error.InvalidObjectType,
         };
     }
