@@ -13,6 +13,8 @@ const int_mod = @import("runtime").int;
 const version = @import("runtime").version;
 const regex = @import("../../support.zig").regex;
 const toml = @import("../../support.zig").toml;
+const prof = @import("../../probe.zig").prof;
+const prof_census = @import("../../probe.zig").prof_census;
 const FutureState = @import("runtime").future.FutureState;
 const attrsets = @import("attrsets.zig");
 const shared = @import("shared.zig");
@@ -40,6 +42,8 @@ pub fn builtinToJSON(self: *VM, arg: Value) !Value {
     try writeJsonValueWithPathMode(self, &out.writer, arg, .source, &context);
     const text = try out.toOwnedSlice();
     defer self.allocator.free(text);
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(text.len, context.items.len != 0);
     const text_id = try self.intern.intern(text);
     if (context.items.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, context.items));
@@ -240,6 +244,8 @@ pub fn builtinToXML(self: *VM, arg: Value) !Value {
 
     const text = try out.toOwnedSlice();
     defer self.allocator.free(text);
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(text.len, context.items.len != 0);
     const text_id = try self.intern.intern(text);
     if (context.items.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, context.items));

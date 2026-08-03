@@ -129,6 +129,8 @@ pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
     defer context.deinit(self.allocator);
     try appendStringContext(self, &context, left_like);
     try appendStringContext(self, &context, right_like);
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(self.intern.get(text_id).len, context.items.len != 0);
     if (context.items.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
@@ -161,16 +163,9 @@ pub fn concatStackStrings(self: *VM, count: u32) !Value {
         if (v.isContextString()) any_context = true;
     }
 
-    const buf = try self.allocator.alloc(u8, total);
-    defer self.allocator.free(buf);
-    var off: usize = 0;
-    i = 0;
-    while (i < count) : (i += 1) {
-        const s = self.intern.get(try stringTextInternId(self, self.stack[base + i]));
-        @memcpy(buf[off..][0..s.len], s);
-        off += s.len;
-    }
-    const text_id = try self.intern.intern(buf);
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(total, any_context);
+    const text_id = try internConcatParts(self, slices, total);
     if (!any_context) return Value.string(text_id);
 
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;

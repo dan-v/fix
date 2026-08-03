@@ -11,6 +11,8 @@ const path_ops = @import("runtime").paths;
 const FileCache = @import("store").FileCache;
 const strings = @import("strings.zig");
 const fetch = @import("fetch.zig");
+const prof = @import("../../probe.zig").prof;
+const prof_census = @import("../../probe.zig").prof_census;
 const purity = @import("purity.zig");
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
@@ -34,6 +36,8 @@ pub fn builtinPathExists(self: *VM, arg: Value) !Value {
 
 pub fn builtinReadFile(self: *VM, arg: Value) !Value {
     const contents = try self.files.readFile(try demandPathArg(self, arg));
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(contents.len, false);
     return Value.string(try self.intern.intern(contents));
 }
 

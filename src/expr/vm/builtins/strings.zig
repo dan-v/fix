@@ -17,6 +17,8 @@ const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
+const prof = @import("../../probe.zig").prof;
+const prof_census = @import("../../probe.zig").prof_census;
 
 pub fn firstReplacementIdAt(self: *VM, input: []const u8, needles: []const InternId) ?usize {
     for (needles, 0..) |needle_id, i| {
@@ -98,6 +100,8 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
     }
     std.debug.assert(out_at == out.len);
 
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(out.len, ctx.items.len != 0);
     const text_id = try self.intern.intern(out);
     if (ctx.items.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
@@ -174,6 +178,8 @@ pub fn builtinSubstring(self: *VM, start_arg: Value, len_arg: Value, string_arg:
 }
 
 fn substringResult(self: *VM, text: []const u8, source: Value) !Value {
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(text.len, source.isContextString());
     const text_id = try self.intern.intern(text);
     const ctx = try string_context.contextEntriesForValue(self, source);
     if (ctx.len == 0) return Value.string(text_id);
@@ -233,6 +239,8 @@ pub fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_a
         }
     }
 
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(out.items.len, ctx.items.len != 0);
     const text_id = try self.intern.intern(out.items);
     if (ctx.items.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, ctx.items));

@@ -218,8 +218,33 @@ pub const StrCensus = struct {
     /// bytes stay in the intern table forever.
     concat_new: u64 = 0,
     concat_new_bytes: u64 = 0,
+    /// Long-string producer attribution for the GC-able-strings census:
+    /// results of at least `long_string_threshold` bytes, split by whether
+    /// the result carries string context. Contexted text must stay
+    /// interned in heap-strings v1 (context_string.text is an InternId),
+    /// so only the PLAIN volume is reclaimable — the GO/NO-GO number.
+    long_plain_calls: u64 = 0,
+    long_plain_bytes: u64 = 0,
+    long_ctx_calls: u64 = 0,
+    long_ctx_bytes: u64 = 0,
 };
 pub var str: StrCensus = .{};
+
+pub const long_string_threshold: usize = 64;
+
+/// Census a produced string of `len` bytes (any producer: concat,
+/// substring, readFile, serializers) with its context-ness. Worker-0-only
+/// like the rest of StrCensus; callers gate on `prof.enabled`.
+pub inline fn recordLongString(len: usize, has_context: bool) void {
+    if (len < long_string_threshold) return;
+    if (has_context) {
+        str.long_ctx_calls += 1;
+        str.long_ctx_bytes += len;
+    } else {
+        str.long_plain_calls += 1;
+        str.long_plain_bytes += len;
+    }
+}
 
 /// String-machinery census.
 pub fn reportStrConcat() void {
@@ -231,6 +256,17 @@ pub fn reportStrConcat() void {
                 str.concat_cycles / str.concat_calls, str.concat_bytes,
                 str.concat_new,                       pct(str.concat_new, str.concat_calls),
                 str.concat_new_bytes,
+            },
+        );
+    }
+    if (str.long_plain_calls != 0 or str.long_ctx_calls != 0) {
+        std.debug.print(
+            "prof str-long(>={d}B): plain={d}/{d}B ctx={d}/{d}B (plain share {d:.1}% of long bytes)\n",
+            .{
+                long_string_threshold,
+                str.long_plain_calls, str.long_plain_bytes,
+                str.long_ctx_calls,   str.long_ctx_bytes,
+                pct(str.long_plain_bytes, str.long_plain_bytes + str.long_ctx_bytes),
             },
         );
     }
