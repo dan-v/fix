@@ -2142,6 +2142,7 @@ pub const Engine = struct {
         const program = switch (forced_prog.kind()) {
             .string, .path => self.intern.get(forced_prog.asInternId()),
             .string_context => self.intern.get((try self.heap.getContextString(forced_prog.asObjectId())).text),
+            .heap_string => try self.heap.getHeapString(forced_prog.asObjectId()),
             else => return null,
         };
         var drv_path: ?[]const u8 = null;
@@ -2166,6 +2167,7 @@ pub const Engine = struct {
         const text_id = switch (forced.kind()) {
             .string, .path => forced.asInternId(),
             .string_context => (try self.heap.getContextString(forced.asObjectId())).text,
+            .heap_string => try self.intern.intern(try self.heap.getHeapString(forced.asObjectId())),
             else => return null,
         };
         return self.intern.get(text_id);
@@ -2318,6 +2320,7 @@ pub const Engine = struct {
         return switch (forced.kind()) {
             .string, .path => self.intern.get(forced.asInternId()),
             .string_context => self.intern.get((try self.heap.getContextString(forced.asObjectId())).text),
+            .heap_string => try self.heap.getHeapString(forced.asObjectId()),
             else => null,
         };
     }
@@ -2936,8 +2939,7 @@ fn writeValueBody(_: *VM, ev: *Engine, writer: *std.Io.Writer, value: Value) !vo
 
 fn writeRawValueBody(vm: *VM, writer: *std.Io.Writer, value: Value) !void {
     const string_value = try vm_strings.coerceLanguageStringValue(vm, value);
-    const text_id = try vm_strings.stringTextInternId(vm, string_value);
-    try writer.writeAll(vm.intern.get(text_id));
+    try writer.writeAll(try vm_strings.stringBytes(vm, string_value));
 }
 
 fn valuePrintHost(ev: *Engine) eval_print.Host {

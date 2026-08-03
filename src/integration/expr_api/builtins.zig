@@ -17,24 +17,24 @@ test "end-to-end: ambient builtins" {
     try std.testing.expectEqual(@as(i64, 7), shadowed.asInt());
 
     const fetchurl_shadowed = try ev.evaluate("with { fetchurl = \"pkg\"; }; fetchurl");
-    try std.testing.expectEqualStrings("pkg", ev.intern.get(fetchurl_shadowed.asInternId()));
+    try std.testing.expectEqualStrings("pkg", (try ev.stringValue(fetchurl_shadowed)).?);
 
     try std.testing.expectError(error.UndefinedVariable, ev.evaluate("all"));
     try std.testing.expectError(error.UndefinedVariable, ev.evaluate("elem"));
 
     const all_from_with = try ev.evaluate("with { all = [ 1 ]; }; builtins.typeOf all");
-    try std.testing.expectEqualStrings("list", ev.intern.get(all_from_with.asInternId()));
+    try std.testing.expectEqualStrings("list", (try ev.stringValue(all_from_with)).?);
 
     const inner_with_shadows_outer_with = try ev.evaluate(
         "let outer = { all = x: x; platforms = { all = [ 1 ]; }; }; in with outer; with platforms; builtins.typeOf all",
     );
-    try std.testing.expectEqualStrings("list", ev.intern.get(inner_with_shadows_outer_with.asInternId()));
+    try std.testing.expectEqualStrings("list", (try ev.stringValue(inner_with_shadows_outer_with)).?);
 
     const version = try ev.evaluate("nixVersion");
     try std.testing.expectEqual(value.ValueType.string, version.kind());
 
     const missing_env = try ev.evaluate("builtins.getEnv \"FIX_TEST_UNSET\"");
-    try std.testing.expectEqualStrings("", ev.intern.get(missing_env.asInternId()));
+    try std.testing.expectEqualStrings("", (try ev.stringValue(missing_env)).?);
 
     const context = try ev.evaluate("builtins.hasContext \"x\"");
     try std.testing.expect(!context.asBool());
@@ -90,28 +90,28 @@ test "end-to-end: builtins.toString" {
     defer ev.deinit();
 
     const int_string = try ev.evaluate("builtins.toString 42");
-    try std.testing.expectEqualStrings("42", ev.intern.get(int_string.asInternId()));
+    try std.testing.expectEqualStrings("42", (try ev.stringValue(int_string)).?);
 
     const bool_string = try ev.evaluate("builtins.toString true");
-    try std.testing.expectEqualStrings("1", ev.intern.get(bool_string.asInternId()));
+    try std.testing.expectEqualStrings("1", (try ev.stringValue(bool_string)).?);
 
     const false_string = try ev.evaluate("builtins.toString false");
-    try std.testing.expectEqualStrings("", ev.intern.get(false_string.asInternId()));
+    try std.testing.expectEqualStrings("", (try ev.stringValue(false_string)).?);
 
     const string_passthrough = try ev.evaluate("builtins.toString \"x\"");
-    try std.testing.expectEqualStrings("x", ev.intern.get(string_passthrough.asInternId()));
+    try std.testing.expectEqualStrings("x", (try ev.stringValue(string_passthrough)).?);
 
     const shadowed = try ev.evaluate("let builtins = { toString = x: \"shadow\"; }; in builtins.toString 1");
-    try std.testing.expectEqualStrings("shadow", ev.intern.get(shadowed.asInternId()));
+    try std.testing.expectEqualStrings("shadow", (try ev.stringValue(shadowed)).?);
 
     const list_string = try ev.evaluate("builtins.toString [ 1 \"a\" false null ]");
-    try std.testing.expectEqualStrings("1 a  ", ev.intern.get(list_string.asInternId()));
+    try std.testing.expectEqualStrings("1 a  ", (try ev.stringValue(list_string)).?);
 
     const attr_string = try ev.evaluate("builtins.toString { __toString = self: self.name; name = \"pkg\"; }");
-    try std.testing.expectEqualStrings("pkg", ev.intern.get(attr_string.asInternId()));
+    try std.testing.expectEqualStrings("pkg", (try ev.stringValue(attr_string)).?);
 
     const out_path_string = try ev.evaluate("builtins.toString { outPath = \"/nix/store/example\"; }");
-    try std.testing.expectEqualStrings("/nix/store/example", ev.intern.get(out_path_string.asInternId()));
+    try std.testing.expectEqualStrings("/nix/store/example", (try ev.stringValue(out_path_string)).?);
 
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.toString {}"));
 }
