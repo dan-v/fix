@@ -41,11 +41,14 @@ pub fn evaluateAndWrite(
         try render.evalFailure(io, use_color, show_trace, ev, source.slice(), err);
         return false;
     };
-
     writeResult(io, mode, ev, result) catch |err| {
         try render.evaluationError(io, use_color, show_trace, ev, source.slice(), err);
         return false;
     };
+    // Strict/result rendering can force deferred bodies and imports, which may
+    // add warnings after the top-level parse. Emit only once all evaluation
+    // work for this input is complete.
+    try render.evalDiagnostics(io, use_color, ev, source.slice());
     return true;
 }
 

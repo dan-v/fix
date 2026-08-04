@@ -69,6 +69,30 @@ pub const EvaluationReport = struct {
         defer self.mu.unlock();
 
         self.clearLocked();
+        try self.appendDiagnosticsLocked(incoming, fallback_source, fallback_source_path);
+    }
+
+    /// Add diagnostics from another successfully parsed source unit. Imports
+    /// can compile concurrently, so warning accumulation uses the same lock as
+    /// replacement and owns every message/path before the parser goes away.
+    pub fn appendDiagnostics(
+        self: *EvaluationReport,
+        incoming: []const Diagnostic,
+        fallback_source: []const u8,
+        fallback_source_path: ?[]const u8,
+    ) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        try self.appendDiagnosticsLocked(incoming, fallback_source, fallback_source_path);
+    }
+
+    fn appendDiagnosticsLocked(
+        self: *EvaluationReport,
+        incoming: []const Diagnostic,
+        fallback_source: []const u8,
+        fallback_source_path: ?[]const u8,
+    ) !void {
         try self.diagnostics.ensureUnusedCapacity(self.allocator, incoming.len);
 
         const arena_alloc = self.string_arena.allocator();

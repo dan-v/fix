@@ -178,7 +178,21 @@ pub fn evaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Engin
     var stderr_buffer: [4096]u8 = undefined;
     var stderr = try presentation.lockStderr(io, &stderr_buffer);
     defer stderr.deinit();
+    if (ev.getDiagnostics().len > 0)
+        try ev.writeDiagnostics(stderr.writer(), source, use_color);
     try writeEvaluationError(stderr.writer(), use_color, show_trace, ev, source, err, ev.getTrace());
+    try stderr.flush();
+}
+
+/// Render non-fatal diagnostics retained by a successful evaluation (currently
+/// parser deprecations). Error paths use `evalFailure`, which already renders
+/// the report and must not call this as well.
+pub fn evalDiagnostics(io: std.Io, use_color: bool, ev: *Engine, source: []const u8) !void {
+    if (ev.getDiagnostics().len == 0) return;
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr = try presentation.lockStderr(io, &stderr_buffer);
+    defer stderr.deinit();
+    try ev.writeDiagnostics(stderr.writer(), source, use_color);
     try stderr.flush();
 }
 
@@ -229,10 +243,15 @@ fn writeEvalFailure(
     trace: *const EvalTrace,
     diagnostics: bool,
 ) !void {
-    if (diagnostics and ev.getDiagnostics().len > 0)
-        try ev.writeDiagnostics(writer, source, use_color)
-    else
-        try writeEvaluationError(writer, use_color, show_trace, ev, source, err, trace);
+    if (diagnostics) {
+        const items = ev.getDiagnostics();
+        const has_error = for (items) |item| {
+            if (item.severity == .err) break true;
+        } else false;
+        if (has_error) return ev.writeDiagnostics(writer, source, use_color);
+        if (items.len > 0) try ev.writeDiagnostics(writer, source, use_color);
+    }
+    try writeEvaluationError(writer, use_color, show_trace, ev, source, err, trace);
 }
 
 fn writeEvaluationError(
@@ -382,6 +401,20 @@ test "trace contexts render their complete prose once" {
         "  while evaluating definitions from `module.nix`\n",
         output.written(),
     );
+}
+
+test "parser warnings do not hide a later runtime error" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
+    defer ev.deinit();
+
+    const source = ".5 + \"x\"";
+    try std.testing.expectError(error.TypeError, ev.evaluate(source));
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeEvalFailure(&output.writer, false, false, &ev, source, error.TypeError, ev.getTrace(), true);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "warning: floating point literal without a leading zero") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "error: type error") != null);
 }
 
 test "message errors use the diagnostic error-label style" {

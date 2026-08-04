@@ -1070,6 +1070,10 @@ pub const Engine = struct {
         try self.report.replaceDiagnostics(diagnostics, source, source_path);
     }
 
+    fn appendDiagnostics(self: *Engine, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
+        try self.report.appendDiagnostics(diagnostics, source, source_path);
+    }
+
     /// Parse and compile source text into a registered chunk id. Used by
     /// debugging tools that want to inspect bytecode without running it.
     pub fn compileSource(
@@ -1288,6 +1292,13 @@ pub const Engine = struct {
                 }}, source, source_path);
                 return error.CrLineEndingsDisabled;
             }
+            try self.appendParserWarning(
+                source,
+                source_path,
+                offset,
+                1,
+                parser_mod.DeprecationWarning.message(.cr_line_endings),
+            );
         }
         if (parser.first_tokens_no_ws_offset) |offset| {
             if (!self.policy.allow_tokens_no_whitespace) {
@@ -1304,6 +1315,42 @@ pub const Engine = struct {
                 return error.TokensNoWhitespaceDisabled;
             }
         }
+        for (parser.warnings.items) |warning| {
+            const silenced = switch (warning.kind) {
+                .or_as_identifier => self.policy.allow_or_as_identifier,
+                .floating_without_zero => self.policy.allow_floating_without_zero,
+                .rec_set_dynamic_attrs => self.policy.allow_rec_set_dynamic_attrs,
+                .cr_line_endings => self.policy.allow_cr_line_endings,
+            };
+            if (silenced) continue;
+            try self.appendParserWarning(
+                source,
+                source_path,
+                warning.offset,
+                warning.len,
+                parser_mod.DeprecationWarning.message(warning.kind),
+            );
+        }
+    }
+
+    fn appendParserWarning(
+        self: *Engine,
+        source: []const u8,
+        source_path: ?[]const u8,
+        offset: u32,
+        len: u32,
+        message: []const u8,
+    ) !void {
+        try self.appendDiagnostics(&.{.{
+            .severity = .warning,
+            .kind = .parse,
+            .line = diagnostic.lineForOffset(source, offset),
+            .column = diagnostic.columnForOffset(source, offset),
+            .offset = offset,
+            .len = len,
+            .token_type = null,
+            .message = message,
+        }}, source, source_path);
     }
 
     fn registerTopLevelChunk(
