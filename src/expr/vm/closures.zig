@@ -562,7 +562,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
         .upvalue_owner = upvalue_owner,
         .call_depth = new_depth,
     };
-    debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrame");
+    debug.checkFrameSync(self, frame, self.executableCode(chunk_id, ch), "replaceCurrentFrame");
     trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
 }
 
@@ -601,7 +601,7 @@ fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId
         .upvalue_owner = upvalue_owner,
         .call_depth = new_depth,
     };
-    debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrameMulti");
+    debug.checkFrameSync(self, frame, self.executableCode(chunk_id, ch), "replaceCurrentFrameMulti");
     trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
 }
 

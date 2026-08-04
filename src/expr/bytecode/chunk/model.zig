@@ -48,7 +48,7 @@ pub const Chunk = struct {
     };
 
     /// Bytecode stream.
-    code: []u8,
+    code: []const u8,
     /// Constant pool.
     constants: []Value,
     /// Number of stack slots reserved for locals in each frame.

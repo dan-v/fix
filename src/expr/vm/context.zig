@@ -419,6 +419,17 @@ pub const VM = struct {
         return worker_id_mod.currentId();
     }
 
+    /// Select debugger-owned executable bytecode at a frame boundary. The
+    /// ordinary path returns the immutable chunk slice after one null check;
+    /// dispatch itself performs no breakpoint lookup per opcode.
+    pub inline fn executableCode(self: *const VM, chunk_id: ChunkId, chunk_ptr: *const Chunk) []const u8 {
+        if (self.debug.breakpoints) |breakpoints| {
+            @branchHint(.unlikely);
+            return breakpoints.executableCode(chunk_id, chunk_ptr);
+        }
+        return chunk_ptr.code;
+    }
+
     /// The authoritative execution context. Computing the standalone fallback
     /// from `self` avoids a self-pointer that would be invalidated when a VM
     /// value moves out of `init`.

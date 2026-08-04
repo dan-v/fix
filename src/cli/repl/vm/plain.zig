@@ -118,10 +118,8 @@ pub const Context = struct {
         const chunk = self.ev.getChunk(id) orelse return self.fail("chunk[0x{x}] not found", .{id});
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        var inspected = chunk.*;
-        inspected.code = try self.ev.unpatchedChunkCode(arena.allocator(), id, chunk);
         const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
-        try disasm.writeChunk(arena.allocator(), self.writer, id, &inspected, symbols, .{
+        try disasm.writeChunk(arena.allocator(), self.writer, id, chunk, symbols, .{
             .show_constants = true,
             .show_source = true,
             .show_bytes = true,

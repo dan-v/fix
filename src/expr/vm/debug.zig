@@ -49,16 +49,17 @@ fn checkFrameSyncSlow(
             .{ @intFromPtr(frame), @intFromPtr(current), site, self.frames_len },
         );
     }
-    if (code.ptr != current.chunk_ptr.code.ptr or code.len != current.chunk_ptr.code.len) {
+    const expected = self.executableCode(current.chunk_id, current.chunk_ptr);
+    if (code.ptr != expected.ptr or code.len != expected.len) {
         std.debug.panic(
-            "VM invariant: cached code [{x}+{d}] != frame.chunk_ptr.code [{x}+{d}] at {s}",
-            .{ @intFromPtr(code.ptr), code.len, @intFromPtr(current.chunk_ptr.code.ptr), current.chunk_ptr.code.len, site },
+            "VM invariant: cached code [{x}+{d}] != executable code [{x}+{d}] at {s}",
+            .{ @intFromPtr(code.ptr), code.len, @intFromPtr(expected.ptr), expected.len, site },
         );
     }
-    if (current.ip > current.chunk_ptr.code.len) {
+    if (current.ip > expected.len) {
         std.debug.panic(
             "VM invariant: ip {d} past end of code (len={d}) at {s}",
-            .{ current.ip, current.chunk_ptr.code.len, site },
+            .{ current.ip, expected.len, site },
         );
     }
 }

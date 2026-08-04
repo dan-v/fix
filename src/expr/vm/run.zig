@@ -62,7 +62,7 @@ pub fn run(vm: *VM) anyerror!Value {
 
 pub fn runUntil(vm: *VM, stop_depth: usize) anyerror!Value {
     const frame = stack.currentFrame(vm);
-    try dispatchEntry(vm, frame, frame.chunk_ptr.code, frame.ip, stop_depth);
+    try dispatchEntry(vm, frame, vm.executableCode(frame.chunk_id, frame.chunk_ptr), frame.ip, stop_depth);
     return stack.pop(vm);
 }
 
@@ -439,7 +439,7 @@ fn opBreakpoint(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
     frame.ip = ip;
     const Hit = bytecode_mod.breakpoints.BreakpointTable.Hit;
     const h: Hit = if (vm.debug.breakpoints) |bps|
-        bps.hit(frame.chunk_id, off, vm.debugFrameDepth())
+        bps.hit(frame.chunk_id, frame.chunk_ptr, off, vm.debugFrameDepth())
     else
         .{ .original = @intFromEnum(OpCode.halt), .pause = false, .kind = .none };
     if (h.pause) {
@@ -732,7 +732,7 @@ fn opCall(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize
     const callee = stack.pop(vm);
     try closures.doCall(vm, callee, arg);
     const new_frame = stack.currentFrame(vm);
-    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+    return dispatch(vm, new_frame, vm.executableCode(new_frame.chunk_id, new_frame.chunk_ptr), new_frame.ip, stop_depth);
 }
 
 fn opTailCall(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -742,7 +742,7 @@ fn opTailCall(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     const callee = stack.pop(vm);
     try closures.doTailCall(vm, callee, arg);
     const new_frame = stack.currentFrame(vm);
-    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+    return dispatch(vm, new_frame, vm.executableCode(new_frame.chunk_id, new_frame.chunk_ptr), new_frame.ip, stop_depth);
 }
 
 fn opCallN(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -752,7 +752,7 @@ fn opCallN(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usiz
     frame.ip = ip + 1;
     try closures.doCallN(vm, n);
     const new_frame = stack.currentFrame(vm);
-    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+    return dispatch(vm, new_frame, vm.executableCode(new_frame.chunk_id, new_frame.chunk_ptr), new_frame.ip, stop_depth);
 }
 
 fn opTailCallN(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -760,7 +760,7 @@ fn opTailCallN(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: 
     frame.ip = ip + 1;
     try closures.doTailCallN(vm, n);
     const new_frame = stack.currentFrame(vm);
-    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+    return dispatch(vm, new_frame, vm.executableCode(new_frame.chunk_id, new_frame.chunk_ptr), new_frame.ip, stop_depth);
 }
 
 // ---- handlers: thunks ----
@@ -1140,7 +1140,7 @@ inline fn retEpilogue(vm: *VM, stop_depth: usize, result: Value) anyerror!void {
     }
     if (vm.frames_len == stop_depth) return;
     const new_frame = stack.currentFrame(vm);
-    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+    return dispatch(vm, new_frame, vm.executableCode(new_frame.chunk_id, new_frame.chunk_ptr), new_frame.ip, stop_depth);
 }
 
 /// A debugger-only virtual instruction after frame teardown. Keeping the slow

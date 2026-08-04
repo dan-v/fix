@@ -121,9 +121,9 @@ Lambda bodies (`compileLambda` / `compileLambdaAttrs`) enter `compileTailExpress
 - **Emit never re-reads the AST.** `emit` sees only opcodes/operands; all tree knowledge is in the domain modules.
 - **Stamp before finish; classify at finish**, both over the frozen straight-line body.
 - **Persistent vs scratch.** Bytecode/constants/source-map are duped and outlive the unit; locals/captures/diagnostics/strictness maps die with the arena.
-- **ChunkIds do not change after registration.** Normal evaluation treats a
-  registered chunk as read-only. Debugger breakpoints are the explicit
-  exception: `BreakpointTable` patches and restores opcode bytes.
+- **Registered chunks are immutable.** ChunkIds and canonical bytes never
+  change after registration. Debugger traps live in `BreakpointTable`
+  execution overlays, preserving structural-dedup identity.
 
 Out of scope: how opcodes execute → [vm/dispatch.md](../vm/dispatch.md); name resolution → [scopes.md](scopes.md); strictness masks → [strictness.md](strictness.md); deferral/trivial short-circuits → [lazy-compile.md](lazy-compile.md).
 

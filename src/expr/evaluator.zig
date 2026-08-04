@@ -210,14 +210,11 @@ pub const DebugSession = struct {
         const frame_ref = debug_session.frameRef(self.vm, i);
         const vm_frame = frame_ref.frame();
         const chunk = self.ev.registry.get(vm_frame.chunk_id) orelse return;
-        var inspected = chunk.*;
-        inspected.code = try self.ev.unpatchedChunkCode(allocator, vm_frame.chunk_id, chunk);
-        defer allocator.free(inspected.code);
         try bytecode_disasm.writeChunk(
             allocator,
             writer,
             vm_frame.chunk_id,
-            &inspected,
+            chunk,
             .{ .intern = &self.ev.intern, .registry = &self.ev.registry },
             .{
                 .show_header = false,
@@ -1479,7 +1476,7 @@ pub const Engine = struct {
 
     /// Breakpoint tooling is also available to the VM explorer, before a
     /// debugger UI is attached. A later `:debug`/`--debugger` session reuses
-    /// the same requests and patched sites.
+    /// the same requests and execution-overlay sites.
     pub fn setBreakpoint(self: *Engine, file: []const u8, line: u32) !bytecode.BreakpointTable.SetResult {
         self.ensureBreakpointTable();
         return self.debugger.breakpoints.?.set(&self.registry, file, line);
@@ -1516,20 +1513,6 @@ pub const Engine = struct {
     pub fn breakpointSpan(self: *const Engine, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) bool {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.hasSpan(chunk_id, span);
         return false;
-    }
-
-    /// A presentation-safe copy of chunk code with debugger trap patches
-    /// replaced by their original opcodes.
-    pub fn unpatchedChunkCode(
-        self: *const Engine,
-        allocator: std.mem.Allocator,
-        chunk_id: ChunkId,
-        chunk: *const bytecode.Chunk,
-    ) ![]u8 {
-        const code = try allocator.dupe(u8, chunk.code);
-        if (self.debugger.breakpoints) |*breakpoints|
-            breakpoints.restoreOriginalCode(chunk_id, code);
-        return code;
     }
 
     pub fn listBreakpoints(self: *const Engine) []const bytecode.BreakpointTable.Request {
@@ -2776,7 +2759,7 @@ pub const Engine = struct {
 
     /// Explicit post-registration phase: compiler code reports the canonical
     /// chunk selected for a compiled body here, after registry mutation has
-    /// completed. Import discovery and debugger patching are evaluator
+    /// completed. Import discovery and debugger overlay placement are evaluator
     /// orchestration, not hidden side effects of `ChunkRegistry.register`.
     fn chunkRegistered(self: *Engine, chunk_id: ChunkId) void {
         const chunk = self.registry.get(chunk_id) orelse return;
@@ -2784,7 +2767,7 @@ pub const Engine = struct {
             if (value.isPath()) prefetchPathConst(self, value.asInternId());
         }
         if (self.debugger.breakpoints) |*breakpoints| {
-            breakpoints.placeRegisteredChunk(chunk_id, @constCast(chunk));
+            breakpoints.placeRegisteredChunk(chunk_id, chunk);
         }
     }
 
