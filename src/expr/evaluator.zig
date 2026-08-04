@@ -978,7 +978,7 @@ pub const Engine = struct {
     fn fetchTarball(self: *Engine, url: []const u8) !@import("fetchers").FetchService.TarballResult {
         var span = self.observer.begin(&fetch_observation, .{ .subject = .{ .url = url } });
         defer span.cancel();
-        const result = try self.sources.fetchers.urls().fetchTarball(
+        const result = try self.sources.fetchers.fetchTarball(
             &self.sources.files,
             .{ .url = url, .name = "source" },
             null,
