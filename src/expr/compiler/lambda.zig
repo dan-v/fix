@@ -413,7 +413,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
             const pos = try diagnostics.sourcePositionForOffset(self, param.name.offset);
             try function_arg_pos.append(self.allocator, .{
                 .name = name_id,
-                .pos = .{ .file = try attrs_mod.sourceFileId(self), .line = pos.line, .column = pos.column },
+                .pos = .{ .file = try diagnostics.sourceFileId(self), .line = pos.line, .column = pos.column },
             });
         }
     }

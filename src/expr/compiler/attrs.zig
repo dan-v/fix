@@ -911,19 +911,11 @@ pub fn appendAttrPosition(
     try positions.append(self.allocator, .{
         .name = name_id,
         .pos = .{
-            .file = try sourceFileId(self),
+            .file = try diagnostics.sourceFileId(self),
             .line = position.line,
             .column = position.column,
         },
     });
-}
-
-pub fn sourceFileId(self: *Compiler) !InternId {
-    if (self.source_file_id) |id| return id;
-    const path = self.source_path orelse return error.MissingSourcePath;
-    const id = try self.intern.intern(path);
-    self.source_file_id = id;
-    return id;
 }
 
 pub fn attrSegmentSpan(self: *const Compiler, atom: Node.Atom) []const u8 {

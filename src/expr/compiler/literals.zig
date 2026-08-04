@@ -375,7 +375,7 @@ pub fn compileCurPos(self: *Compiler, atom: Node.Atom) !void {
     const file_id = try self.intern.intern("file");
     const line_id = try self.intern.intern("line");
     const column_id = try self.intern.intern("column");
-    const source_path_id = try attrs.sourceFileId(self);
+    const source_path_id = try diagnostics.sourceFileId(self);
     const position = try diagnostics.sourcePositionForOffset(self, atom.offset);
 
     // Fully compile-time-known: materialize the { file, line, column } attrset
