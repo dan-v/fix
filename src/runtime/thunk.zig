@@ -24,7 +24,7 @@
 //!     state == resolved.
 //!   - `Thunk.target` is set at construction and never mutated
 //!     (except by `publishCellBinding` under EVALUATING claim).
-//!   - Waiter list manipulation is protected by `waiters_mu`. Resolvers
+//!   - Waiter list manipulation is protected by the tagged waiters word (`Future.waiters`). Resolvers
 //!     re-acquire the lock after the state store so any concurrent
 //!     `enrollWaiter` either sees the new state (and refuses) or its
 //!     waiter is drained.

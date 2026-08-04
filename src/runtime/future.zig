@@ -100,17 +100,20 @@ pub const ClaimResult = enum { already_resolved, claimed, blackhole, busy, error
 pub const Future = struct {
     state: std.atomic.Value(u32),
     claimer: std.atomic.Value(ClaimerId),
-    /// Singly-linked list of fibers parked on this future. Manipulated
-    /// only under `waiters_mu`. Empty in the common (uncontended) case
-    /// where the claimer resolves before any other fiber tries to force.
-    waiters_head: ?*Waiter,
-    waiters_mu: sync.BlockingMutex,
+    /// Singly-linked list of fibers parked on this future, packed with
+    /// its lock into ONE word (8 bytes instead of pointer + mutex — the
+    /// Future rides in every thunk, so the word is worth 2.3GB on a
+    /// whole-nixpkgs eval): 0 = empty/unlocked, LSB set = locked (Waiter
+    /// is 8-aligned, so the bit is free), else the head pointer. The
+    /// critical sections serialize exactly as the mutex version did;
+    /// empty in the common (uncontended) case where the claimer resolves
+    /// before any other fiber tries to force.
+    waiters: std.atomic.Value(usize),
     pub fn init() Future {
         return .{
             .state = .init(@intFromEnum(FutureState.unresolved)),
             .claimer = .init(invalid_claimer),
-            .waiters_head = null,
-            .waiters_mu = .{},
+            .waiters = .init(0),
         };
     }
 
@@ -120,8 +123,7 @@ pub const Future = struct {
         return .{
             .state = .init(@intFromEnum(FutureState.resolved)),
             .claimer = .init(invalid_claimer),
-            .waiters_head = null,
-            .waiters_mu = .{},
+            .waiters = .init(0),
         };
     }
 
@@ -132,8 +134,7 @@ pub const Future = struct {
         return .{
             .state = .init(@intFromEnum(FutureState.evaluating)),
             .claimer = .init(claimer),
-            .waiters_head = null,
-            .waiters_mu = .{},
+            .waiters = .init(0),
         };
     }
 
@@ -237,7 +238,7 @@ pub const Future = struct {
     pub fn publishSolo(self: *Future) void {
         self.claimer.store(invalid_claimer, .monotonic);
         self.state.store(@intFromEnum(FutureState.resolved), .monotonic);
-        if (self.waiters_head != null) self.wakeFiberWaiters();
+        if (self.waiters.load(.monotonic) != 0) self.wakeFiberWaiters();
     }
 
     /// `reset` for a single-worker process — see `publishSolo` for the
@@ -246,7 +247,7 @@ pub const Future = struct {
     pub fn resetSolo(self: *Future) void {
         self.claimer.store(invalid_claimer, .monotonic);
         self.state.store(@intFromEnum(FutureState.unresolved), .monotonic);
-        if (self.waiters_head != null) self.wakeFiberWaiters();
+        if (self.waiters.load(.monotonic) != 0) self.wakeFiberWaiters();
     }
 
     /// Enroll a fiber waiter on this future. Returns true if the waiter
@@ -259,16 +260,36 @@ pub const Future = struct {
     /// by the resolver, which takes the same lock after publishing the
     /// new state.
     pub fn enrollWaiter(self: *Future, waiter: *Waiter) bool {
-        self.waiters_mu.lock();
-        defer self.waiters_mu.unlock();
-        const s: FutureState = @enumFromInt(self.state.load(.acquire));
-        if (s != .evaluating) return false;
+        comptime std.debug.assert(@alignOf(Waiter) >= 2); // LSB is the lock bit
+        // Lock the waiters word (spin: enroll and wake critical sections
+        // are a few instructions).
+        var head: usize = undefined;
+        while (true) {
+            head = self.waiters.load(.monotonic);
+            if (head & 1 != 0) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            if (self.waiters.cmpxchgWeak(head, head | 1, .seq_cst, .monotonic) == null) break;
+        }
+        // Re-check under the lock, exactly as the mutex version: any
+        // caller that observes `.evaluating` here is guaranteed to be
+        // drained by the resolver, whose wake performs a seq_cst RMW on
+        // the same word after publishing the new state — the two RMWs are
+        // totally ordered, so either the resolver sees our lock bit (and
+        // waits for the push) or we see its published state here (seq_cst
+        // pairs with the resolver's barrier; see wakeFiberWaiters).
+        const s: FutureState = @enumFromInt(self.state.load(.seq_cst));
+        if (s != .evaluating) {
+            self.waiters.store(head, .release); // unlock, list unchanged
+            return false;
+        }
         if (comptime protocol_checks) {
             if (waiter.enrolled.swap(1, .acq_rel) != 0)
                 @panic("Future waiter enrolled more than once");
         }
-        waiter.next = self.waiters_head;
-        self.waiters_head = waiter;
+        waiter.next = if (head == 0) null else @ptrFromInt(head);
+        self.waiters.store(@intFromPtr(waiter), .release); // push + unlock
         return true;
     }
 
@@ -314,10 +335,31 @@ pub const Future = struct {
     /// `wake_fn` outside the lock so a slow wake doesn't block other
     /// resolvers waiting to drain their own (different) futures' lists.
     fn wakeFiberWaiters(self: *Future) void {
-        self.waiters_mu.lock();
-        var head = self.waiters_head;
-        self.waiters_head = null;
-        self.waiters_mu.unlock();
+        // The empty-check MUST be an RMW, not a plain load: the caller
+        // just release-stored the new `state`, and a plain load may
+        // execute while that store still sits in the store buffer — an
+        // enroller then locks the word, re-checks `state`, reads the
+        // STALE value, and parks forever (the mutex version was immune
+        // because even its empty wake performed lock+unlock, giving the
+        // next enroller a synchronizes-with edge). A seq_cst no-op RMW is
+        // a full barrier AND totally ordered against the enroller's
+        // seq_cst lock CAS on this same word; it still costs less than
+        // the old mutex's lock+unlock pair.
+        var stolen: usize = self.waiters.fetchOr(0, .seq_cst);
+        while (true) {
+            if (stolen & 1 != 0) {
+                std.atomic.spinLoopHint();
+                stolen = self.waiters.load(.monotonic);
+                continue;
+            }
+            if (stolen == 0) return;
+            if (self.waiters.cmpxchgWeak(stolen, 0, .acquire, .monotonic)) |actual| {
+                stolen = actual;
+                continue;
+            }
+            break;
+        }
+        var head: ?*Waiter = @ptrFromInt(stolen);
         while (head) |w| {
             const next = w.next;
             w.next = null;

@@ -126,7 +126,7 @@ test "concurrency: publish after enrollment wakes every waiter exactly once" {
 
     try std.testing.expectEqual(@as(u32, waiter_count), enrolled_count.load(.acquire));
     try std.testing.expectEqual(@as(u32, waiter_count), wake_count.load(.acquire));
-    try std.testing.expect(future.waiters_head == null);
+    try std.testing.expect(future.waiters.load(.monotonic) == 0);
     for (waiters) |waiter| try std.testing.expect(waiter.waiter.next == null);
 }
 
