@@ -48,11 +48,11 @@ fn writeTopUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll("\nrun `fix <command> -h` for command-specific help.\n");
 }
 
-/// Render the top-level usage into a heap buffer for one-shot printing.
-fn topUsage(allocator: std.mem.Allocator) []const u8 {
-    var buf: std.Io.Writer.Allocating = .init(allocator);
-    writeTopUsage(&buf.writer) catch return "usage: fix <command> [options]\n";
-    return buf.toOwnedSlice() catch "usage: fix <command> [options]\n";
+fn printTopUsage(io: std.Io) void {
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    writeTopUsage(&stdout.interface) catch return;
+    stdout.interface.flush() catch {};
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -81,26 +81,27 @@ pub fn main(init: std.process.Init) !void {
     // print to stderr and exit nonzero (2). `-h`/`--help` prints to stdout and
     // exits 0 (POSIX).
     const command = args_iter.next() orelse {
-        usageFailure(init, allocator, "missing command", .{});
+        usageFailure(init, "missing command", .{});
     };
 
     if (cli.presentation.isHelpFlag(command)) {
-        cli.presentation.printHelp(init.io, topUsage(allocator));
+        printTopUsage(init.io);
         std.process.exit(0);
     }
 
     const subcommand = switch (command_match.resolve(&subcommand_names, command)) {
         .match => |index| &subcommands[index],
         .ambiguous => {
-            var candidates: std.Io.Writer.Allocating = .init(allocator);
+            var candidate_buffer: [512]u8 = undefined;
+            var candidates = std.Io.Writer.fixed(&candidate_buffer);
             for (subcommands) |candidate| {
                 if (std.mem.startsWith(u8, candidate.meta.name, command))
-                    candidates.writer.print(" {s}", .{candidate.meta.name}) catch {};
+                    candidates.print(" {s}", .{candidate.meta.name}) catch {};
             }
-            usageFailure(init, allocator, "ambiguous command '{s}' (could be:{s})", .{ command, candidates.written() });
+            usageFailure(init, "ambiguous command '{s}' (could be:{s})", .{ command, candidates.buffered() });
         },
         .none => {
-            usageFailure(init, allocator, "unknown command '{s}'", .{command});
+            usageFailure(init, "unknown command '{s}'", .{command});
         },
     };
     std.process.exit(runSubcommand(subcommand, process, init, &args_iter));
@@ -108,14 +109,15 @@ pub fn main(init: std.process.Init) !void {
 
 /// Report a top-level usage error with the shared colored `error:` label,
 /// follow with the command list, and exit 2.
-fn usageFailure(init: std.process.Init, allocator: std.mem.Allocator, comptime format: []const u8, format_args: anytype) noreturn {
+fn usageFailure(init: std.process.Init, comptime format: []const u8, format_args: anytype) noreturn {
     const use_color = cli.presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
     failure: {
         var stderr_buffer: [4096]u8 = undefined;
         var stderr = cli.presentation.lockStderr(init.io, &stderr_buffer) catch break :failure;
         defer stderr.deinit();
         cli.render.messageErrorTo(stderr.writer(), use_color, format, format_args) catch break :failure;
-        stderr.writer().print("\n{s}", .{topUsage(allocator)}) catch break :failure;
+        stderr.writer().writeByte('\n') catch break :failure;
+        writeTopUsage(stderr.writer()) catch break :failure;
         stderr.flush() catch {};
     }
     std.process.exit(2);
