@@ -25,6 +25,27 @@ fn expectJson(source: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, out);
 }
 
+fn renderWithFailingAllocator(allocator: std.mem.Allocator) !void {
+    const source = "{ \"quoted name\" = ''${\"value\"}''; dynamic = \"a${1 + 2}b\"; nested.path = [ true false ]; }";
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = parser_mod.Parser.init(std.testing.allocator, &arena, source);
+    defer parser.deinit();
+    const node = try parser.parse();
+
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    try json.write(&output, allocator, source, node);
+}
+
+test "AST JSON serialization propagates every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        renderWithFailingAllocator,
+        .{},
+    );
+}
+
 test "integer literal" {
     try expectJson("42",
         \\{

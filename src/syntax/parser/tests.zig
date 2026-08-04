@@ -5,6 +5,38 @@ const parser_mod = @import("../parser.zig");
 const NodeTag = ast.NodeTag;
 const Parser = parser_mod.Parser;
 
+fn parseWarningWithFailingAllocator(allocator: std.mem.Allocator) !void {
+    var arena = ast.AstArena.init(allocator);
+    defer arena.deinit();
+    var parser = Parser.init(allocator, &arena, ".5");
+    defer parser.deinit();
+    _ = try parser.parse();
+}
+
+fn parseDiagnosticWithFailingAllocator(allocator: std.mem.Allocator) !void {
+    var arena = ast.AstArena.init(allocator);
+    defer arena.deinit();
+    var parser = Parser.init(allocator, &arena, "$ $ 1");
+    defer parser.deinit();
+    _ = parser.parse() catch |err| switch (err) {
+        error.ParseError => return,
+        else => return err,
+    };
+}
+
+test "parser warnings and diagnostics propagate every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseWarningWithFailingAllocator,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseDiagnosticWithFailingAllocator,
+        .{},
+    );
+}
+
 test "parser applies boolean operator precedence" {
     var arena = ast.AstArena.init(std.testing.allocator);
     defer arena.deinit();

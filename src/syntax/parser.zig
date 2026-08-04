@@ -218,13 +218,12 @@ pub const Parser = struct {
         self.warnings.deinit(self.allocator);
     }
 
-    fn noteWarning(self: *Parser, kind: DeprecationWarning.Kind, tok: Token) void {
-        self.noteWarningAt(kind, tok.offset, tok.len);
+    fn noteWarning(self: *Parser, kind: DeprecationWarning.Kind, tok: Token) !void {
+        try self.noteWarningAt(kind, tok.offset, tok.len);
     }
 
-    fn noteWarningAt(self: *Parser, kind: DeprecationWarning.Kind, offset: u32, len: u32) void {
-        self.warnings.append(self.allocator, .{ .kind = kind, .offset = offset, .len = len }) catch
-            @panic("out of memory recording parser warning");
+    fn noteWarningAt(self: *Parser, kind: DeprecationWarning.Kind, offset: u32, len: u32) !void {
+        try self.warnings.append(self.allocator, .{ .kind = kind, .offset = offset, .len = len });
     }
 
     pub fn span(self: *const Parser, tok: Token) []const u8 {
@@ -255,34 +254,34 @@ pub const Parser = struct {
         return diagnostic.lineForOffset(source, target);
     }
 
-    fn report(self: *Parser, tok: Token, msg: []const u8) void {
+    fn report(self: *Parser, tok: Token, msg: []const u8) !void {
         self.had_error = true;
-        self.diagnostics.append(self.allocator, .{
+        try self.diagnostics.append(self.allocator, .{
             .line = tokenLine(self.source, tok),
             .column = diagnostic.columnForOffset(self.source, tok.offset),
             .offset = tok.offset,
             .len = tok.len,
             .token_type = tok.type,
             .message = msg,
-        }) catch @panic("out of memory recording parser diagnostic");
+        });
     }
 
     /// Report a semantic parse error anchored at an AST atom (an attribute or
     /// formal name), rather than a live token — the position Nix points at for
     /// duplicate-attribute / duplicate-formal errors.
-    fn reportAtom(self: *Parser, at: Node.Atom, msg: []const u8) void {
+    fn reportAtom(self: *Parser, at: Node.Atom, msg: []const u8) !void {
         self.had_error = true;
-        self.appendAtomDiagnostic(.err, at, msg);
+        try self.appendAtomDiagnostic(.err, at, msg);
     }
 
     /// A follow-up note (e.g. "first attribute defined here"); does not itself
     /// mark the parse failed — the paired error already did.
-    fn noteAtom(self: *Parser, at: Node.Atom, msg: []const u8) void {
-        self.appendAtomDiagnostic(.note, at, msg);
+    fn noteAtom(self: *Parser, at: Node.Atom, msg: []const u8) !void {
+        try self.appendAtomDiagnostic(.note, at, msg);
     }
 
-    fn appendAtomDiagnostic(self: *Parser, severity: Diagnostic.Severity, at: Node.Atom, msg: []const u8) void {
-        self.diagnostics.append(self.allocator, .{
+    fn appendAtomDiagnostic(self: *Parser, severity: Diagnostic.Severity, at: Node.Atom, msg: []const u8) !void {
+        try self.diagnostics.append(self.allocator, .{
             .severity = severity,
             .line = diagnostic.lineForOffset(self.source, at.offset),
             .column = diagnostic.columnForOffset(self.source, at.offset),
@@ -290,7 +289,7 @@ pub const Parser = struct {
             .len = at.len,
             .token_type = null,
             .message = msg,
-        }) catch @panic("out of memory recording parser diagnostic");
+        });
     }
 
     fn atomText(self: *Parser, at: Node.Atom) []const u8 {
@@ -366,11 +365,11 @@ pub const Parser = struct {
     /// Report a duplicate definition: an error at the later occurrence plus a
     /// note at the first. `is_binding` selects `let`-binding vs attribute
     /// wording, matching Nix.
-    fn dupConflict(self: *Parser, dup: Node.Atom, first: Node.Atom, full: []const u8, is_binding: bool) error{ParseError} {
+    fn dupConflict(self: *Parser, dup: Node.Atom, first: Node.Atom, full: []const u8, is_binding: bool) !void {
         const noun = if (is_binding) "variable" else "attribute";
-        const msg = std.fmt.allocPrint(self.arenaAllocator(), "{s} '{s}' already defined", .{ noun, full }) catch "duplicate definition";
-        self.reportAtom(dup, msg);
-        self.noteAtom(first, if (is_binding) "first binding defined here" else "first attribute defined here");
+        const msg = try std.fmt.allocPrint(self.arenaAllocator(), "{s} '{s}' already defined", .{ noun, full });
+        try self.reportAtom(dup, msg);
+        try self.noteAtom(first, if (is_binding) "first binding defined here" else "first attribute defined here");
         return error.ParseError;
     }
 
@@ -387,8 +386,7 @@ pub const Parser = struct {
         self.first_cr_offset = scanner.first_cr;
         self.first_tokens_no_ws_offset = scanner.first_tokens_no_ws;
         if (scanner.first_float_no_zero) |f| {
-            self.warnings.append(self.allocator, .{ .kind = .floating_without_zero, .offset = f.offset, .len = f.len }) catch
-                @panic("out of memory recording parser warning");
+            try self.noteWarningAt(.floating_without_zero, f.offset, f.len);
         }
 
         if (self.had_error) return error.ParseError;
@@ -398,11 +396,11 @@ pub const Parser = struct {
     // ---- the shift/reduce driver ----
 
     /// Pull the next parseable token, reporting (and skipping) invalid ones.
-    fn nextToken(self: *Parser, scanner: *Scanner) Token {
+    fn nextToken(self: *Parser, scanner: *Scanner) !Token {
         while (true) {
             const tk = scanner.next();
             if (tk.type == .error_token) {
-                self.report(tk, "Invalid token.");
+                try self.report(tk, "Invalid token.");
                 continue;
             }
             return tk;
@@ -443,7 +441,7 @@ pub const Parser = struct {
         defer ctx_stack.deinit(gpa);
         var last_shifted: TokenType = .eof;
 
-        var tok = self.nextToken(scanner);
+        var tok = try self.nextToken(scanner);
         var error_count: usize = 0;
         const max_errors = 32;
         // Error cooldown: after reporting an error, stay quiet until the parser
@@ -522,7 +520,7 @@ pub const Parser = struct {
                         }
                         last_shifted = tok.type;
                     }
-                    tok = self.nextToken(scanner);
+                    tok = try self.nextToken(scanner);
                     if (quiet_shifts < cooldown) quiet_shifts += 1;
                 },
                 lr.action_reduce => {
@@ -533,7 +531,7 @@ pub const Parser = struct {
                     sp = base;
                     const g = Tab.goto_table[states[sp - 1] * Tab.num_nonterminals + Tab.prod_lhs[p]];
                     if (g < 0) {
-                        self.report(tok, "Internal parser error (no goto).");
+                        try self.report(tok, "Internal parser error (no goto).");
                         return null;
                     }
                     if (sp == cap) { // only epsilon productions grow the stack here
@@ -550,14 +548,14 @@ pub const Parser = struct {
                 },
                 else => {
                     if (quiet_shifts >= cooldown) {
-                        self.reportUnexpected(state, tok);
+                        try self.reportUnexpected(state, tok);
                         error_count += 1;
                         if (error_count >= max_errors) return null;
                     } else {
                         self.had_error = true;
                     }
                     quiet_shifts = 0;
-                    if (!self.recover(states[sp - 1], scanner, &tok)) return null;
+                    if (!try self.recover(states[sp - 1], scanner, &tok)) return null;
                 },
             }
         }
@@ -571,11 +569,11 @@ pub const Parser = struct {
     /// running safely; the recovered tree is discarded anyway, since the
     /// recorded error forces `parse` to return `ParseError`. Returns false at
     /// EOF (nothing left to resynchronize on).
-    fn recover(self: *Parser, top_state: u32, scanner: *Scanner, tok: *Token) bool {
+    fn recover(self: *Parser, top_state: u32, scanner: *Scanner, tok: *Token) !bool {
         const terminal_count = Tab.num_terminals;
         while (true) {
             if (tok.type == .eof) return false;
-            tok.* = self.nextToken(scanner); // discard a token (starting with the offending one)
+            tok.* = try self.nextToken(scanner); // discard a token (starting with the offending one)
             const la = @intFromEnum(tok.type);
             if (lr.cellKind(Tab.action[top_state * terminal_count + la]) != lr.action_error) return true;
         }
@@ -699,7 +697,7 @@ pub const Parser = struct {
         };
     }
 
-    fn reportUnexpected(self: *Parser, state: u32, tok: Token) void {
+    fn reportUnexpected(self: *Parser, state: u32, tok: Token) !void {
         _ = state;
         var buf: [256]u8 = undefined;
         const written = if (tok.type == .eof)
@@ -709,8 +707,8 @@ pub const Parser = struct {
                 self.source[tok.offset .. tok.offset + tok.len],
             }) catch "Syntax error.";
         // Persist the message in the arena so it outlives `buf`.
-        const msg = self.arenaAllocator().dupe(u8, written) catch "Syntax error.";
-        self.report(tok, msg);
+        const msg = try self.arenaAllocator().dupe(u8, written);
+        try self.report(tok, msg);
     }
 
     // ---- semantic actions ----
@@ -807,7 +805,7 @@ pub const Parser = struct {
 
             // ---- application of the bare `or` identifier (`f or` → `f (or)`) ----
             .apply_or => {
-                self.noteWarning(.or_as_identifier, rhs[1].tok);
+                try self.noteWarning(.or_as_identifier, rhs[1].tok);
                 const or_var = try self.atom(.identifier, rhs[1].tok);
                 return .{ .node = try self.arena.createNode(.apply, .{ .apply = .{
                     .func = rhs[0].node,
@@ -837,7 +835,7 @@ pub const Parser = struct {
                 // path token ending in `/` is a genuine trailing slash.
                 const tok = rhs[0].tok;
                 if (tok.len >= 1 and self.source[tok.offset + tok.len - 1] == '/') {
-                    self.report(tok, "path has a trailing slash");
+                    try self.report(tok, "path has a trailing slash");
                     return error.ParseError;
                 }
                 return self.atom(.path, tok);
@@ -876,7 +874,7 @@ pub const Parser = struct {
             .attr_static => {
                 // `or` used as an attribute name (`let or = 1;`, `x.or`) is the
                 // deprecated `or`-as-identifier syntax.
-                if (rhs[0].tok.type == .kw_or) self.noteWarning(.or_as_identifier, rhs[0].tok);
+                if (rhs[0].tok.type == .kw_or) try self.noteWarning(.or_as_identifier, rhs[0].tok);
                 return .{ .seg = .{ .static = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len } } };
             },
             .attr_dynamic => return .{ .seg = .{ .dynamic = rhs[1].node } },
@@ -984,8 +982,8 @@ pub const Parser = struct {
             if (path.len == 0) {
                 // Constant dynamic keys become static bindings; other dynamic
                 // keys are not valid in a let.
-                const folded = self.constStringAttrAtom(entry.dynamic_name) orelse {
-                    self.report(rhs[2].tok, "Dynamic attributes are not allowed in let bindings.");
+                const folded = try self.constStringAttrAtom(entry.dynamic_name) orelse {
+                    try self.report(rhs[2].tok, "Dynamic attributes are not allowed in let bindings.");
                     return error.ParseError;
                 };
                 const single = try a.alloc(Node.Atom, 1);
@@ -1014,7 +1012,7 @@ pub const Parser = struct {
         // Dynamic attributes in a recursive set are evaluated outside its scope.
         for (entries.items) |entry| {
             if (entry.dynamic_name) |dynamic| {
-                if (dynamic.span) |source_span| self.noteWarningAt(.rec_set_dynamic_attrs, source_span.offset, source_span.len);
+                if (dynamic.span) |source_span| try self.noteWarningAt(.rec_set_dynamic_attrs, source_span.offset, source_span.len);
             }
         }
         return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
@@ -1042,7 +1040,7 @@ pub const Parser = struct {
             }
         }
         const selected = body_name orelse {
-            self.report(rhs[0].tok, "'let { ... }' requires a 'body' attribute");
+            try self.report(rhs[0].tok, "'let { ... }' requires a 'body' attribute");
             return error.ParseError;
         };
         var segments: SegAccum = .{};
@@ -1076,7 +1074,7 @@ pub const Parser = struct {
                 .formal => |p| try params.append(a, p),
                 .ellipsis => allow_extra = true,
                 .bind, .inherit => {
-                    self.report(brace.lbrace, "Function argument pattern cannot contain attribute assignments.");
+                    try self.report(brace.lbrace, "Function argument pattern cannot contain attribute assignments.");
                     return error.ParseError;
                 },
             }
@@ -1095,7 +1093,7 @@ pub const Parser = struct {
             };
             if (dup) {
                 const msg = try std.fmt.allocPrint(a, "duplicate formal function argument '{s}'", .{name});
-                self.reportAtom(p.name, msg);
+                try self.reportAtom(p.name, msg);
                 return error.ParseError;
             }
         }
@@ -1121,7 +1119,7 @@ pub const Parser = struct {
                 .bind => |e| try entries.append(a, e),
                 .inherit => |es| try entries.appendSlice(a, es),
                 .formal, .ellipsis => {
-                    self.report(brace.lbrace, "Expected '=' after attribute name.");
+                    try self.report(brace.lbrace, "Expected '=' after attribute name.");
                     return error.ParseError;
                 },
             }
@@ -1264,14 +1262,17 @@ pub const Parser = struct {
     /// same way a plain `"x" = ...;` binding stores it. Otherwise null (a
     /// genuine dynamic key). Drives Nix's `${"x"}` → static fold for let
     /// bindings, where a real dynamic attribute is rejected.
-    fn constStringAttrAtom(self: *Parser, node: ?*Node) ?Node.Atom {
+    fn constStringAttrAtom(self: *Parser, node: ?*Node) !?Node.Atom {
         const n = node orelse return null;
         if (n.tag != .string) return null;
         const str_atom = n.data.atom;
         const parsed = string_syntax.parseLiteral(self.allocator, self.source, .{
             .start = str_atom.offset,
             .end = str_atom.offset + str_atom.len,
-        }) catch return null;
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
         defer parsed.deinit();
         for (parsed.parts) |part| {
             if (part == .interpolation) return null;

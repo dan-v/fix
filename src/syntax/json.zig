@@ -48,12 +48,12 @@ const Serializer = struct {
     fn node(self: *Serializer, n_in: *const Node) anyerror!JsonValue {
         const n = ast.unwrapParens(n_in);
         return switch (n.tag) {
-            .integer => self.literal("Int", .{ .int = try self.parseInt(n.data.atom) }),
-            .float_val => self.literal("Float", .{ .float = try self.parseFloat(n.data.atom) }),
+            .integer => try self.literal("Int", .{ .int = try self.parseInt(n.data.atom) }),
+            .float_val => try self.literal("Float", .{ .float = try self.parseFloat(n.data.atom) }),
             .string => try self.stringNode(n.data.atom),
-            .path => self.literal("Path", .{ .str = self.atomText(n.data.atom) }),
+            .path => try self.literal("Path", .{ .str = self.atomText(n.data.atom) }),
             // URL literals are ordinary strings in Nix.
-            .uri => self.literal("String", .{ .str = self.atomText(n.data.atom) }),
+            .uri => try self.literal("String", .{ .str = self.atomText(n.data.atom) }),
             .search_path => try self.searchPath(n.data.atom),
             .identifier => try self.identifier(self.atomText(n.data.atom)),
             .bool_true => try self.exprVar("true"),
@@ -64,7 +64,7 @@ const Serializer = struct {
             .binary_op => try self.binary(n.data.binary),
             .apply => try self.call(n),
 
-            .lambda => self.obj(&.{
+            .lambda => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprLambda" } },
                 .{ .key = "arg", .val = .{ .str = self.atomText(.{ .offset = n.data.lambda.param_offset, .len = n.data.lambda.param_len }) } },
                 .{ .key = "body", .val = try self.node(n.data.lambda.body) },
@@ -72,18 +72,18 @@ const Serializer = struct {
             .lambda_attrs => try self.lambdaAttrs(n.data.lambda_attrs),
 
             .let_in => try self.letIn(n.data.let_in),
-            .if_else => self.obj(&.{
+            .if_else => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprIf" } },
                 .{ .key = "cond", .val = try self.node(n.data.if_else.cond) },
                 .{ .key = "then", .val = try self.node(n.data.if_else.then_branch) },
                 .{ .key = "else", .val = try self.node(n.data.if_else.else_branch) },
             }),
-            .assert => self.obj(&.{
+            .assert => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprAssert" } },
                 .{ .key = "cond", .val = try self.node(n.data.assert.cond) },
                 .{ .key = "body", .val = try self.node(n.data.assert.body) },
             }),
-            .with_expr => self.obj(&.{
+            .with_expr => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprWith" } },
                 .{ .key = "attrs", .val = try self.node(n.data.with_expr.attr_set) },
                 .{ .key = "body", .val = try self.node(n.data.with_expr.body) },
@@ -115,7 +115,7 @@ const Serializer = struct {
         return std.fmt.parseFloat(f64, self.atomText(atom)) catch error.InvalidFloat;
     }
 
-    fn literal(self: *Serializer, value_type: []const u8, value: JsonValue) JsonValue {
+    fn literal(self: *Serializer, value_type: []const u8, value: JsonValue) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprLiteral" } },
             .{ .key = "value", .val = value },
@@ -158,9 +158,9 @@ const Serializer = struct {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprCall" } },
             .{ .key = "fun", .val = try self.exprVar("__findFile") },
-            .{ .key = "args", .val = self.arr(&.{
+            .{ .key = "args", .val = try self.arr(&.{
                 try self.exprVar("__nixPath"),
-                self.literal("String", .{ .str = inner }),
+                try self.literal("String", .{ .str = inner }),
             }) },
         });
     }
@@ -173,7 +173,10 @@ const Serializer = struct {
         const parsed = string_syntax.parseLiteral(self.gpa, self.source, .{
             .start = atom.offset,
             .end = atom.offset + atom.len,
-        }) catch return error.InvalidStringLiteral;
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidStringLiteral,
+        };
         defer parsed.deinit();
 
         var has_interp = false;
@@ -193,7 +196,7 @@ const Serializer = struct {
             // `nul-bytes` feature only decides whether that is also an error).
             const bytes = buf.items;
             const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
-            return self.literal("String", try self.strOrBytes(bytes[0..end]));
+            return try self.literal("String", try self.strOrBytes(bytes[0..end]));
         }
 
         // An indented string (`''...''`) whose only content is a single
@@ -205,7 +208,7 @@ const Serializer = struct {
             if (singleInterpolationSpan(parsed.parts)) |span| {
                 if (try self.constInterpolation(span)) |bytes| {
                     const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
-                    return self.literal("String", try self.strOrBytes(bytes[0..end]));
+                    return try self.literal("String", try self.strOrBytes(bytes[0..end]));
                 }
             }
         }
@@ -215,14 +218,14 @@ const Serializer = struct {
             switch (part) {
                 .text => |t| {
                     if (t.slice().len == 0) continue; // drop empty text chunks
-                    try es.append(self.arena, self.literal("String", try self.strOrBytes(try self.arena.dupe(u8, t.slice()))));
+                    try es.append(self.arena, try self.literal("String", try self.strOrBytes(try self.arena.dupe(u8, t.slice()))));
                 },
                 .interpolation => |span| try es.append(self.arena, try self.interpolation(span)),
             }
         }
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprConcatStrings" } },
-            .{ .key = "es", .val = self.arr(try es.toOwnedSlice(self.arena)) },
+            .{ .key = "es", .val = try self.arr(try es.toOwnedSlice(self.arena)) },
             .{ .key = "isInterpolation", .val = .{ .boolean = true } },
         });
     }
@@ -249,12 +252,18 @@ const Serializer = struct {
         defer arena.deinit();
         var parser = parser_mod.Parser.init(self.gpa, &arena, sub);
         defer parser.deinit();
-        const n = ast.unwrapParens(parser.parse() catch return null);
+        const n = ast.unwrapParens(parser.parse() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        });
         if (n.tag != .string) return null;
         const lit = string_syntax.parseLiteral(self.gpa, sub, .{
             .start = n.data.atom.offset,
             .end = n.data.atom.offset + n.data.atom.len,
-        }) catch return null;
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
         defer lit.deinit();
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         for (lit.parts) |p| switch (p) {
@@ -273,7 +282,10 @@ const Serializer = struct {
         defer arena.deinit();
         var parser = parser_mod.Parser.init(self.gpa, &arena, sub);
         defer parser.deinit();
-        const n = parser.parse() catch return error.InterpolationParseError;
+        const n = parser.parse() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InterpolationParseError,
+        };
         var sub_ser: Serializer = .{ .arena = self.arena, .gpa = self.gpa, .source = sub };
         return sub_ser.node(n);
     }
@@ -282,13 +294,13 @@ const Serializer = struct {
 
     fn unary(self: *Serializer, u: Node.Unary) !JsonValue {
         return switch (u.op) {
-            .not => self.obj(&.{
+            .not => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprOpNot" } },
                 .{ .key = "e", .val = try self.node(u.expr) },
             }),
             // -x  →  __sub 0 x
             .negate => try self.primopCall("__sub", &.{
-                self.literal("Int", .{ .int = 0 }),
+                try self.literal("Int", .{ .int = 0 }),
                 try self.node(u.expr),
             }),
         };
@@ -299,25 +311,25 @@ const Serializer = struct {
         const r = try self.node(b.right);
         return switch (b.op) {
             // `+` is string/path/int concat → ExprConcatStrings
-            .add => self.concatStrings(&.{ l, r }, false),
+            .add => try self.concatStrings(&.{ l, r }, false),
             .sub => try self.primopCall("__sub", &.{ l, r }),
             .mul => try self.primopCall("__mul", &.{ l, r }),
             .div => try self.primopCall("__div", &.{ l, r }),
             .lt => try self.primopCall("__lessThan", &.{ l, r }),
             .gt => try self.primopCall("__lessThan", &.{ r, l }), // a > b → __lessThan b a
-            .lte => self.opNot(try self.primopCall("__lessThan", &.{ r, l })), // a <= b → !(b < a)
-            .gte => self.opNot(try self.primopCall("__lessThan", &.{ l, r })), // a >= b → !(a < b)
-            .eq => self.binOp("ExprOpEq", l, r),
-            .neq => self.binOp("ExprOpNEq", l, r),
-            .and_ => self.binOp("ExprOpAnd", l, r),
-            .or_ => self.binOp("ExprOpOr", l, r),
-            .impl => self.binOp("ExprOpImpl", l, r),
-            .update => self.binOp("ExprOpUpdate", l, r),
-            .concat => self.binOp("ExprOpConcatLists", l, r), // `++`
+            .lte => try self.opNot(try self.primopCall("__lessThan", &.{ r, l })), // a <= b → !(b < a)
+            .gte => try self.opNot(try self.primopCall("__lessThan", &.{ l, r })), // a >= b → !(a < b)
+            .eq => try self.binOp("ExprOpEq", l, r),
+            .neq => try self.binOp("ExprOpNEq", l, r),
+            .and_ => try self.binOp("ExprOpAnd", l, r),
+            .or_ => try self.binOp("ExprOpOr", l, r),
+            .impl => try self.binOp("ExprOpImpl", l, r),
+            .update => try self.binOp("ExprOpUpdate", l, r),
+            .concat => try self.binOp("ExprOpConcatLists", l, r), // `++`
         };
     }
 
-    fn binOp(self: *Serializer, type_name: []const u8, e1: JsonValue, e2: JsonValue) JsonValue {
+    fn binOp(self: *Serializer, type_name: []const u8, e1: JsonValue, e2: JsonValue) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = type_name } },
             .{ .key = "e1", .val = e1 },
@@ -325,7 +337,7 @@ const Serializer = struct {
         });
     }
 
-    fn opNot(self: *Serializer, e: JsonValue) JsonValue {
+    fn opNot(self: *Serializer, e: JsonValue) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprOpNot" } },
             .{ .key = "e", .val = e },
@@ -336,14 +348,14 @@ const Serializer = struct {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprCall" } },
             .{ .key = "fun", .val = try self.exprVar(name) },
-            .{ .key = "args", .val = self.arr(args) },
+            .{ .key = "args", .val = try self.arr(args) },
         });
     }
 
-    fn concatStrings(self: *Serializer, es: []const JsonValue, is_interp: bool) JsonValue {
+    fn concatStrings(self: *Serializer, es: []const JsonValue, is_interp: bool) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprConcatStrings" } },
-            .{ .key = "es", .val = self.arr(es) },
+            .{ .key = "es", .val = try self.arr(es) },
             .{ .key = "isInterpolation", .val = .{ .boolean = is_interp } },
         });
     }
@@ -358,7 +370,7 @@ const Serializer = struct {
             return self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprCall" } },
                 .{ .key = "fun", .val = try self.node(app.func) },
-                .{ .key = "args", .val = self.arr(&.{try self.node(app.arg)}) },
+                .{ .key = "args", .val = try self.arr(&.{try self.node(app.arg)}) },
             });
         }
         // Flatten the left spine of plain applies: apply(apply(f,a),b) → f [a,b].
@@ -393,7 +405,7 @@ const Serializer = struct {
             var formals: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
             for (la.params) |p| {
                 const dflt: JsonValue = if (p.default) |d| try self.node(d) else .nul;
-                try formals.append(self.arena, .{ .key = self.attrNameText(p.name), .val = dflt });
+                try formals.append(self.arena, .{ .key = try self.attrNameText(p.name), .val = dflt });
             }
             try fields.append(self.arena, .{ .key = "formals", .val = .{ .object = try formals.toOwnedSlice(self.arena) } });
         }
@@ -412,7 +424,7 @@ const Serializer = struct {
         const base = try self.collectSelect(chain, &attrs);
         var fields: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
         try fields.append(self.arena, .{ .key = "_type", .val = .{ .str = "ExprSelect" } });
-        try fields.append(self.arena, .{ .key = "attrs", .val = self.arr(try attrs.toOwnedSlice(self.arena)) });
+        try fields.append(self.arena, .{ .key = "attrs", .val = try self.arr(try attrs.toOwnedSlice(self.arena)) });
         if (default) |d| try fields.append(self.arena, .{ .key = "default", .val = try self.node(d) });
         try fields.append(self.arena, .{ .key = "e", .val = try self.node(base) });
         return .{ .object = try fields.toOwnedSlice(self.arena) };
@@ -424,7 +436,7 @@ const Serializer = struct {
             .attr_path => {
                 const base = try self.collectSelect(n.data.attr_path.root, attrs);
                 for (n.data.attr_path.segments) |seg| {
-                    try attrs.append(self.arena, try self.strOrBytes(self.attrNameText(seg)));
+                    try attrs.append(self.arena, try self.strOrBytes(try self.attrNameText(seg)));
                 }
                 return base;
             },
@@ -440,7 +452,7 @@ const Serializer = struct {
     fn hasAttr(self: *Serializer, n: *const Node) !JsonValue {
         const ha = n.data.has_attr;
         const attrs = try self.arena.alloc(JsonValue, ha.segments.len);
-        for (ha.segments, attrs) |seg, *out| out.* = try self.strOrBytes(self.attrNameText(seg));
+        for (ha.segments, attrs) |seg, *out| out.* = try self.strOrBytes(try self.attrNameText(seg));
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprOpHasAttr" } },
             .{ .key = "attrs", .val = .{ .array = attrs } },
@@ -453,7 +465,7 @@ const Serializer = struct {
         const attrs = try self.arena.alloc(JsonValue, ha.segments.len);
         for (ha.segments, attrs) |seg, *out| {
             out.* = switch (seg) {
-                .static => |a| try self.strOrBytes(self.attrNameText(a)),
+                .static => |a| try self.strOrBytes(try self.attrNameText(a)),
                 .dynamic => |d| try self.node(d),
             };
         }
@@ -511,7 +523,7 @@ const Serializer = struct {
     ) !void {
         // `inherit name;` — outer inherit.
         if (inherit_outer) {
-            try set.inherits.append(self.arena, self.attrNameText(path[0]));
+            try set.inherits.append(self.arena, try self.attrNameText(path[0]));
             return;
         }
         // `inherit (src) name;` — fix clones `src` per name as attr_path(src,
@@ -523,7 +535,7 @@ const Serializer = struct {
             if (e.tag == .attr_path and e.data.attr_path.segments.len == 1) {
                 const seg = e.data.attr_path.segments[0];
                 if (seg.offset == path[0].offset and seg.len == path[0].len) {
-                    try self.addInheritFrom(set, e.data.attr_path.root, self.attrNameText(path[0]));
+                    try self.addInheritFrom(set, e.data.attr_path.root, try self.attrNameText(path[0]));
                     return;
                 }
             }
@@ -532,7 +544,7 @@ const Serializer = struct {
         // Descend the static path.
         var cur = set;
         if (dynamic_name) |dyn| {
-            for (path) |seg| cur = try self.descend(cur, self.attrNameText(seg));
+            for (path) |seg| cur = try self.descend(cur, try self.attrNameText(seg));
             // Constant-string dynamic key folds into a static attr.
             if (try self.constString(dyn)) |name| {
                 try self.setLeaf(cur, name, expr);
@@ -543,8 +555,8 @@ const Serializer = struct {
         }
         // Static path (len >= 1): descend all but the last, assign the last.
         var i: usize = 0;
-        while (i + 1 < path.len) : (i += 1) cur = try self.descend(cur, self.attrNameText(path[i]));
-        try self.setLeaf(cur, self.attrNameText(path[path.len - 1]), expr);
+        while (i + 1 < path.len) : (i += 1) cur = try self.descend(cur, try self.attrNameText(path[i]));
+        try self.setLeaf(cur, try self.attrNameText(path[path.len - 1]), expr);
     }
 
     fn addInheritFrom(self: *Serializer, set: *BindingSet, from: *const Node, name: []const u8) !void {
@@ -647,7 +659,7 @@ const Serializer = struct {
                 if (std.unicode.utf8ValidateSlice(kv.key_ptr.*)) {
                     try attr_fields.append(self.arena, .{ .key = kv.key_ptr.*, .val = val });
                 } else {
-                    try bin_list.append(self.arena, self.obj(&.{
+                    try bin_list.append(self.arena, try self.obj(&.{
                         .{ .key = "name", .val = try self.strOrBytes(kv.key_ptr.*) },
                         .{ .key = "value", .val = val },
                     }));
@@ -656,7 +668,7 @@ const Serializer = struct {
             if (attr_fields.items.len != 0)
                 try fields.append(self.arena, .{ .key = "attrs", .val = .{ .object = try attr_fields.toOwnedSlice(self.arena) } });
             if (bin_list.items.len != 0)
-                try fields.append(self.arena, .{ .key = "binary_attrs", .val = self.obj(&.{
+                try fields.append(self.arena, .{ .key = "binary_attrs", .val = try self.obj(&.{
                     .{ .key = "attrs", .val = .{ .array = try bin_list.toOwnedSlice(self.arena) } },
                 }) });
         }
@@ -664,7 +676,7 @@ const Serializer = struct {
         if (set.dynamic.items.len != 0) {
             const dyn = try self.arena.alloc(JsonValue, set.dynamic.items.len);
             for (set.dynamic.items, dyn) |d, *out| {
-                out.* = self.obj(&.{
+                out.* = try self.obj(&.{
                     .{ .key = "name", .val = try self.node(d.name) },
                     .{ .key = "value", .val = try self.emitValue(d.value) },
                 });
@@ -679,7 +691,7 @@ const Serializer = struct {
                 if (std.unicode.utf8ValidateSlice(name)) {
                     try inh.append(self.arena, .{ .key = name, .val = try self.exprVar(name) });
                 } else {
-                    try bin_list.append(self.arena, self.obj(&.{
+                    try bin_list.append(self.arena, try self.obj(&.{
                         .{ .key = "name", .val = try self.strOrBytes(name) },
                         .{ .key = "value", .val = try self.exprVar(name) },
                     }));
@@ -688,7 +700,7 @@ const Serializer = struct {
             if (inh.items.len != 0)
                 try fields.append(self.arena, .{ .key = "inherit", .val = .{ .object = try inh.toOwnedSlice(self.arena) } });
             if (bin_list.items.len != 0)
-                try fields.append(self.arena, .{ .key = "binary_inherit", .val = self.obj(&.{
+                try fields.append(self.arena, .{ .key = "binary_inherit", .val = try self.obj(&.{
                     .{ .key = "inherit", .val = .{ .array = try bin_list.toOwnedSlice(self.arena) } },
                 }) });
         }
@@ -698,7 +710,7 @@ const Serializer = struct {
             for (set.inherit_from.items, groups) |g, *out| {
                 const names = try self.arena.alloc(JsonValue, g.names.items.len);
                 for (g.names.items, names) |name, *nn| nn.* = try self.strOrBytes(name);
-                out.* = self.obj(&.{
+                out.* = try self.obj(&.{
                     .{ .key = "attrs", .val = .{ .array = names } },
                     .{ .key = "from", .val = try self.node(g.from) },
                 });
@@ -720,22 +732,25 @@ const Serializer = struct {
 
     /// The textual name of a static attr/formal atom. A quoted-string atom is
     /// decoded (`"a b"` → `a b`); a bare identifier/keyword is taken verbatim.
-    fn attrNameText(self: *Serializer, atom: Node.Atom) []const u8 {
+    fn attrNameText(self: *Serializer, atom: Node.Atom) ![]const u8 {
         const text = self.atomText(atom);
         if (string_syntax.kindAt(text, 0) == null) return text;
         const parsed = string_syntax.parseLiteral(self.gpa, self.source, .{
             .start = atom.offset,
             .end = atom.offset + atom.len,
-        }) catch return text;
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return text,
+        };
         defer parsed.deinit();
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         for (parsed.parts) |part| {
             switch (part) {
-                .text => |t| buf.appendSlice(self.arena, t.slice()) catch return text,
+                .text => |t| try buf.appendSlice(self.arena, t.slice()),
                 .interpolation => {}, // constant names only; ignore any dynamics
             }
         }
-        return buf.toOwnedSlice(self.arena) catch text;
+        return try buf.toOwnedSlice(self.arena);
     }
 
     /// If `n` is a constant (non-interpolating) string literal, its decoded
@@ -747,7 +762,10 @@ const Serializer = struct {
         const parsed = string_syntax.parseLiteral(self.gpa, self.source, .{
             .start = atom.offset,
             .end = atom.offset + atom.len,
-        }) catch return null;
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
         defer parsed.deinit();
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         for (parsed.parts) |part| {
@@ -761,12 +779,12 @@ const Serializer = struct {
 
     // ---- JsonValue builders ----
 
-    fn obj(self: *Serializer, fields: []const JsonValue.Field) JsonValue {
-        return .{ .object = self.arena.dupe(JsonValue.Field, fields) catch unreachable };
+    fn obj(self: *Serializer, fields: []const JsonValue.Field) !JsonValue {
+        return .{ .object = try self.arena.dupe(JsonValue.Field, fields) };
     }
 
-    fn arr(self: *Serializer, items: []const JsonValue) JsonValue {
-        return .{ .array = self.arena.dupe(JsonValue, items) catch unreachable };
+    fn arr(self: *Serializer, items: []const JsonValue) !JsonValue {
+        return .{ .array = try self.arena.dupe(JsonValue, items) };
     }
 };
 
