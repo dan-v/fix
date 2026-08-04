@@ -21,7 +21,6 @@ const vm_builtins = @import("builtins.zig");
 const prof = @import("../probe.zig").prof;
 const prof_census = @import("../probe.zig").prof_census;
 const gc = @import("runtime").gc;
-const sched_mod = @import("../eval/workers/scheduler.zig");
 const heap_mod = @import("runtime").heap;
 const thread_caches = @import("thread_caches.zig");
 
@@ -127,7 +126,7 @@ inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId)
     // the trigger point for sweeping the member's siblings. One dead
     // branch here when the flag is off; everything else lives in the
     // cold helper.
-    if (self.scheduler.config.sibling_prefetch) maybeSiblingSweep(self, obj_id, raw);
+    if (self.workers.siblingPrefetchEnabled()) maybeSiblingSweep(self, obj_id, raw);
     return raw;
 }
 
@@ -146,21 +145,17 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
     if (!member.isThunk()) return;
     const th = self.heap.getThunkAssumeValid(member.asObjectId());
     if (th.future.state.load(.monotonic) != @intFromEnum(future_mod.FutureState.unresolved)) return;
-    const sched = self.scheduler;
-    if (!self.heap.trySiblingSweep(obj_id, sched.config.sibling_min, sched.config.sibling_max)) return;
-    const task: sched_mod.Task = .{ .force_attrs_sweep = obj_id };
-    const ok = if (sched.config.sibling_urgent)
-        sched.submitUrgent(task, self.workerId())
-    else
-        sched.submit(task, self.workerId());
+    const workers = self.workers;
+    if (!self.heap.trySiblingSweep(obj_id, workers.siblingMin(), workers.siblingMax())) return;
+    const ok = workers.submitSiblingSweep(obj_id, workers.siblingUrgent(), self.workerId());
     if (ok)
-        sched.bumpSweeps(self.workerId())
+        workers.noteSiblingSweep(self.workerId())
     else
         // Rejected (queue full / no helpers): unmark so a later miss can
         // retry — a set must not become permanently unsweepable because
         // one submit lost a race to a full queue.
         self.heap.clearSiblingSwept(obj_id);
-    if (sched.config.sibling_log) {
+    if (workers.siblingLog()) {
         // Diagnostics only: submit timestamp + submitter, so a run log
         // shows per-sweep submit->run latency and lost submits.
         std.debug.print("sweep-submit attrs={d} t_us={d} worker={d} ok={}\n", .{

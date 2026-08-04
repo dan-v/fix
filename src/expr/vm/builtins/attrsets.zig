@@ -196,7 +196,7 @@ pub fn builtinMapAttrs(self: *VM, fn_arg: Value, attrs_arg: Value) !Value {
     const speculatable = shared.isSpeculatableUserFunc(self, fn_arg);
     for (attr_entries, out) |entry, *mapped| {
         const tid = try self.heap.addBytecodeThunk(apply_chunk_id, &.{ fn_arg, Value.string(entry.name), entry.value });
-        if (speculatable) _ = self.scheduler.submit(.{ .force_thunk = tid }, self.workerId());
+        if (speculatable) _ = self.workers.submitSpeculativeThunk(tid, self.workerId());
         mapped.* = .{ .name = entry.name, .value = Value.thunk(tid) };
     }
     // Sorted+unique by construction (see the thunk-path note above).

@@ -448,11 +448,7 @@ pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) voi
             offset += this_len;
             continue;
         }
-        if (!self.scheduler.submitUrgent(.{ .force_list_range = .{
-            .list_id = list_id,
-            .offset = offset,
-            .len = this_len,
-        } }, self.workerId())) break;
+        if (!self.workers.submitUrgentListRange(list_id, offset, this_len, self.workerId())) break;
         offset += this_len;
     }
 }
@@ -479,11 +475,7 @@ pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const heap_m
             offset += this_len;
             continue;
         }
-        if (!self.scheduler.submitUrgent(.{ .force_attrs_range = .{
-            .attrs_id = attrs_id,
-            .offset = offset,
-            .len = this_len,
-        } }, self.workerId())) break;
+        if (!self.workers.submitUrgentAttrsRange(attrs_id, offset, this_len, self.workerId())) break;
         offset += this_len;
     }
 }
@@ -535,7 +527,7 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
 /// demand path entirely (`speculation.active` short-circuits).
 pub inline fn specBailRequested(self: *VM) bool {
     if (!self.speculation.active) return false;
-    if (self.scheduler.backgroundSuppressed() or self.speculation.claim_budget == 0) return true;
+    if (self.workers.backgroundSuppressed() or self.speculation.claim_budget == 0) return true;
     return self.speculation.create_left != vm_mod.no_spec_budget and specCreateExhausted(self);
 }
 
@@ -784,7 +776,7 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
 
 fn enforceSpeculationBudget(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId) !void {
     if (!self.speculation.active or self.speculation.demand_rescue.load(.monotonic) != 0) return;
-    if (self.scheduler.backgroundSuppressed()) {
+    if (self.workers.backgroundSuppressed()) {
         publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
         return error.SpeculativeBail;
     }
@@ -865,12 +857,12 @@ fn waitForBusyThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, demand: 
     };
 
     // Demand priority propagates through chains of speculatively owned thunks.
-    if (self.scheduler.config.spec_rescue and
+    if (self.workers.rescueSpeculationEnabled() and
         (self.executionContextConst().is_demand or self.speculation.demand_rescue.load(.monotonic) != 0) and
         !thunk.isDemanded())
     {
         thunk.markDemanded();
-        self.scheduler.promoteFiber(thunk.future.claimer.load(.monotonic));
+        self.workers.promoteFiber(thunk.future.claimer.load(.monotonic));
     }
 
     var spins: u32 = 0;
@@ -901,26 +893,26 @@ fn waitForBusyThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, demand: 
 /// Respond to or lead a collection at the force boundary. `thunk_val` may be
 /// off the VM stack, so `gc_roots.extra` keeps it visible while the world stops.
 fn pollForCollection(self: *VM, thunk_val: Value, demand: bool) void {
-    if (self.native_depth == 0 and self.scheduler.gcStopRequested()) {
+    if (self.native_depth == 0 and self.workers.gcStopRequested()) {
         self.gc_roots.extra = thunk_val;
-        self.scheduler.gcSafepointPark(self.workerId());
+        self.workers.gcSafepointPark(self.workerId());
         self.gc_roots.extra = Value.null_val;
     }
     if (!demand or !self.heap.gcCollectRequested()) return;
 
     self.gc_roots.extra = thunk_val;
     defer self.gc_roots.extra = Value.null_val;
-    if (!self.scheduler.gcTryBeginCollection()) {
-        self.scheduler.gcSafepointPark(self.workerId());
+    if (!self.workers.gcTryBeginCollection()) {
+        self.workers.gcSafepointPark(self.workerId());
         return;
     }
 
     const barrier_start = gc.nowNs();
-    self.scheduler.gcWaitAllParked(self.workerId());
+    self.workers.gcWaitAllParked(self.workerId());
     const collection_start = gc.nowNs();
     @import("runtime").heap_collector.runCollect(self.heap, self.workerId());
     const collection_end = gc.nowNs();
-    self.scheduler.gcEndCollection(self.workerId());
+    self.workers.gcEndCollection(self.workerId());
     gc.recordBarrier(
         &self.heap.collection.report,
         (collection_start - barrier_start) + (gc.nowNs() - collection_end),
@@ -1014,10 +1006,10 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
         // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
         // instance of a chunk goes to the high-priority novel lane.
         // builtin_closure thunks carry no chunk of their own — bulk lane.
-        const ok = if (self.scheduler.config.spec_novel and speculate.isNovelClosureChunk(self, closure))
-            self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
+        const ok = if (self.workers.novelSpeculationEnabled() and speculate.isNovelClosureChunk(self, closure))
+            self.workers.submitNovelThunk(id, self.workerId())
         else
-            self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
+            self.workers.submitSpeculativeThunk(id, self.workerId());
         // Coverage census (`-Dprof-main`): stamp whether this thunk was
         // aimed at by speculation (and admitted), so the `claimed_by_main`
         // site can tell a targeting miss from a lost race.

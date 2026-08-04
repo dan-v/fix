@@ -214,14 +214,14 @@ fn maybePrefetchChildDirs(
     dir_path: []const u8,
     dir_entries: []const FileCache.DirEntry,
 ) void {
-    const min = self.scheduler.config.readdir_prefetch_min;
+    const min = self.workers.readDirPrefetchMin();
     if (min == 0) return; // off (w=1 / FIX_READDIR_PREFETCH=0)
     var ndirs: u32 = 0;
     for (dir_entries) |e| {
         if (e.kind == .directory) ndirs += 1;
     }
     if (ndirs < min) return;
-    const granted = self.scheduler.readDirPrefetchTake(ndirs);
+    const granted = self.workers.takeReadDirPrefetch(ndirs);
     if (granted == 0) return;
     // The task carries (parent intern id, child index range); the helper
     // re-reads the parent listing — a warm FileCache hit — and joins the
@@ -240,11 +240,7 @@ fn maybePrefetchChildDirs(
         if (dirs_in_batch != 0) {
             // This work is demand-adjacent, so use the urgent lane. A full
             // queue simply leaves the remaining reads to demand.
-            if (!self.scheduler.submitUrgent(.{ .readdir_prefetch = .{
-                .dir = dir_id,
-                .offset = offset,
-                .len = len,
-            } }, self.workerId())) break;
+            if (!self.workers.submitUrgentReadDir(dir_id, offset, len, self.workerId())) break;
             covered += dirs_in_batch;
         }
         offset += len;

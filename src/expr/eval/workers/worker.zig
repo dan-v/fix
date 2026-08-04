@@ -677,7 +677,7 @@ pub const Worker = struct {
         // Scheduler: live task backlog (the speculation flood as it happens) +
         // cumulative speculation submitted/rejected and steals. Together with
         // rss_mb this is the spec-flood-vs-RSS "money chart".
-        const s = f.vm.scheduler;
+        const s = f.worker.scheduler;
         f.vm.observer.counter(&backlog_counter, &.{.{
             .name = "pending",
             .value = .{ .unsigned = s.pending_tasks.v.load(.monotonic) },
@@ -1161,7 +1161,7 @@ fn runForceThunkTask(f: *WorkerFiber, thunk_id: types.ObjectId) void {
     // Limit cascades rooted at small speculative chunks. Urgent tasks and
     // larger roots remain unbounded.
     if (f.current_lane != .urgent) {
-        const budget = f.vm.scheduler.config.spec_band_budget;
+        const budget = f.worker.scheduler.config.spec_band_budget;
         if (budget != 0 and specRootBandSmall(f, thunk_id))
             vm_force.specCreateArm(&f.vm, budget);
     }
@@ -1171,7 +1171,7 @@ fn runForceThunkTask(f: *WorkerFiber, thunk_id: types.ObjectId) void {
     }
     _ = vm_force.forceValueSpeculative(&f.vm, Value.thunk(thunk_id)) catch |err| {
         if (err == error.SpeculativeBail)
-            f.vm.scheduler.noteSpecBail(worker_id_mod.currentId());
+            f.worker.scheduler.noteSpecBail(worker_id_mod.currentId());
     };
 }
 
@@ -1214,7 +1214,7 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
     defer vm_force.rootsEnd(&f.vm, roots);
     vm_force.rootKeep(&f.vm, Value.attrs(attrs_id));
     const entries = f.vm.heap.materializeAttrs(attrs_id) catch return;
-    const log = f.vm.scheduler.config.sibling_log;
+    const log = f.worker.scheduler.config.sibling_log;
     const objects_before: u32 = if (log) f.vm.heap.objects.count() else 0;
     var label_buf: [160]u8 = undefined;
     var rendered_buf: [224]u8 = undefined;
@@ -1227,8 +1227,8 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
     for (entries) |entry| {
         if (!entry.value.isThunk()) continue;
         if (!vm_force.sweepMemberAdmissible(&f.vm, entry.value.asObjectId())) continue;
-        f.vm.speculation.claim_budget = f.vm.scheduler.config.sibling_claim_budget;
-        vm_force.specCreateArm(&f.vm, f.vm.scheduler.config.sibling_budget);
+        f.vm.speculation.claim_budget = f.worker.scheduler.config.sibling_claim_budget;
+        vm_force.specCreateArm(&f.vm, f.worker.scheduler.config.sibling_budget);
         if (log) {
             logAttrsSweepMember(f, attrs_id, entry, &label_buf, &rendered_buf);
         } else {

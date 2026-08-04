@@ -177,13 +177,13 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
         // lane so idle workers help clear the critical subtree instead of it
         // sitting in the spec backlog behind junk.
         const ok = if (self.speculation.demand_rescue.load(.monotonic) != 0)
-            self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId())
+            self.workers.submitUrgentThunk(id, self.workerId())
             // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
             // instance of this chunk goes to the high-priority novel lane.
-        else if (self.scheduler.config.spec_novel and self.registry.markSpecSubmitted(chunk_id))
-            self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
+        else if (self.workers.novelSpeculationEnabled() and self.registry.markSpecSubmitted(chunk_id))
+            self.workers.submitNovelThunk(id, self.workerId())
         else
-            self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
+            self.workers.submitSpeculativeThunk(id, self.workerId());
         // Coverage census (`-Dprof-main`): this bytecode-thunk submit path is
         // ON (gated on body_is_substantial, not eager) — stamp it so the
         // `claimed_by_main` disposition split isn't mis-attributed as

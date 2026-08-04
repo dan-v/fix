@@ -2001,7 +2001,7 @@ pub const Engine = struct {
             .files = &self.sources.files,
             .fetchers = &self.sources.fetchers,
             .realization = &self.store.realization,
-            .scheduler = &self.execution.scheduler,
+            .workers = execution.VmRuntime.init(&self.execution.scheduler),
             // Helpers (worker_id != 0) don't write to the shared trace —
             // it's a side effect of *real* evaluation, so speculative force
             // stays invisible to it.

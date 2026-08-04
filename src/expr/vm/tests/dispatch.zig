@@ -63,7 +63,7 @@ const Harness = struct {
             .files = &ev.sources.files,
             .fetchers = &ev.sources.fetchers,
             .realization = &ev.store.realization,
-            .scheduler = &ev.execution.scheduler,
+            .workers = @import("../../eval/workers/vm_runtime.zig").Runtime.init(&ev.execution.scheduler),
             .builtins_value = ev.builtins_value.?,
         });
         return .{ .ev = ev, .scratch = scratch, .vm = vm };
