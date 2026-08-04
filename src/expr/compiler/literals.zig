@@ -18,7 +18,6 @@ const OpCode = bytecode.OpCode;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const diagnostics = @import("diagnostics.zig");
-const attrs = @import("attrs.zig");
 const int_ops = @import("runtime").int;
 const parser_mod = @import("syntax").parser;
 const TextRef = @import("base").TextRef;

@@ -11,7 +11,7 @@ const types = @import("runtime").types;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const diagnostics = @import("diagnostics.zig");
-const attrs = @import("attrs.zig");
+const attr_names = @import("attr_names.zig");
 const access = @import("access.zig");
 const strictness = @import("strictness.zig");
 const refs_mod = @import("refs.zig");
@@ -77,7 +77,7 @@ const LetPlan = struct {
         const name_ids = try self.allocator.alloc(InternId, bindings.len);
         errdefer self.allocator.free(name_ids);
         for (bindings, name_ids) |binding, *name_id| {
-            name_id.* = try self.intern.intern(attrs.attrSegmentSpan(self, binding.path[0]));
+            name_id.* = try self.intern.intern(attr_names.span(self, binding.path[0]));
         }
 
         var earliest_index: std.AutoHashMapUnmanaged(InternId, usize) = .empty;
@@ -124,7 +124,7 @@ fn declareBindingSlots(self: *Compiler, bindings: []const Node.Binding, plan: Le
     for (bindings, plan.kinds, 0..) |binding, kind, index| {
         if (bindingRootSeen(self, bindings[0..index], binding.path[0])) continue;
         if (kind == .unreferenced) continue;
-        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        const name = attr_names.span(self, binding.path[0]);
         const name_id = plan.name_ids[index];
         const slot = try scope.declareLocal(self, name, name_id);
         switch (kind) {
@@ -166,7 +166,7 @@ fn emitBindingInitializers(
     for (bindings, plan.kinds, 0..) |binding, kind, index| {
         if (bindingRootSeen(self, bindings[0..index], binding.path[0])) continue;
         if (kind == .literal or kind == .unreferenced) continue;
-        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        const name = attr_names.span(self, binding.path[0]);
         const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
 
         if (binding.inherit_group == 0 and kind == .uncaptured and plan.must_force[index] and
@@ -229,7 +229,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
     try slots.ensureTotalCapacity(self.allocator, @intCast(bindings.len));
     var slot_count: u32 = 0;
     for (bindings) |binding| {
-        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        const name = attr_names.span(self, binding.path[0]);
         const gop = slots.getOrPutAssumeCapacity(name);
         if (!gop.found_existing) {
             gop.value_ptr.* = slot_count;
@@ -244,7 +244,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
     defer self.allocator.free(slot_first);
     @memset(slot_first, std.math.maxInt(u32));
     for (bindings, 0..) |binding, i| {
-        const slot = slots.get(attrs.attrSegmentSpan(self, binding.path[0])).?;
+        const slot = slots.get(attr_names.span(self, binding.path[0])).?;
         if (slot_first[slot] == std.math.maxInt(u32)) slot_first[slot] = @intCast(i);
     }
 
@@ -280,7 +280,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             any_path_nested = true;
         }
         rhs_marker.stamp += 1;
-        rhs_marker.index = slot_first[slots.get(attrs.attrSegmentSpan(self, binding.path[0])).?];
+        rhs_marker.index = slot_first[slots.get(attr_names.span(self, binding.path[0])).?];
         refs_mod.walkReferencedNames(self, binding.expr, &rhs_marker);
     }
 
@@ -289,7 +289,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             kinds[i] = .needs_cell;
             continue;
         }
-        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        const name = attr_names.span(self, binding.path[0]);
         const slot = slots.get(name).?;
 
         const referenced_by_other_rhs = rhs_counts[slot] > 1 or
@@ -361,7 +361,7 @@ fn isLiteralLeafBinding(self: *Compiler, bindings: []const Node.Binding, root: N
 fn singleLeafBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom) ?Node.Binding {
     var found: ?Node.Binding = null;
     for (bindings) |binding| {
-        if (!attrs.attrSegmentsEqual(self, binding.path[0], root)) continue;
+        if (!attr_names.equal(self, binding.path[0], root)) continue;
         if (binding.path.len != 1) return null;
         if (binding.inherit_outer) return null;
         if (found != null) return null;
@@ -375,7 +375,7 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
     var tail_count: usize = 0;
 
     for (bindings) |binding| {
-        if (!attrs.attrSegmentsEqual(self, binding.path[0], root)) continue;
+        if (!attr_names.equal(self, binding.path[0], root)) continue;
         if (binding.path.len == 1) {
             if (leaf) |previous| {
                 const span = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
@@ -399,7 +399,7 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
                 .name_id = try self.intern.intern("\x00inherit-source"),
                 .kind = .local,
                 .index = source_slot,
-            }, try attrs.attrSegmentNameId(self, binding.path[0]));
+            }, try attr_names.intern(self, binding.path[0]));
             return;
         }
         const previous_skip = self.skip_local_slot;
@@ -413,7 +413,7 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
     defer self.allocator.free(tails);
     var i: usize = 0;
     for (bindings) |binding| {
-        if (!attrs.attrSegmentsEqual(self, binding.path[0], root) or binding.path.len == 1) continue;
+        if (!attr_names.equal(self, binding.path[0], root) or binding.path.len == 1) continue;
         tails[i] = .{
             .path = binding.path[1..],
             .expr = binding.expr,
@@ -496,7 +496,7 @@ fn rhsHasForwardRef(
 
 fn bindingRootSeen(self: *const Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {
     for (bindings) |binding| {
-        if (binding.path.len > 0 and attrs.attrSegmentsEqual(self, binding.path[0], root)) return true;
+        if (binding.path.len > 0 and attr_names.equal(self, binding.path[0], root)) return true;
     }
     return false;
 }

@@ -10,7 +10,7 @@ const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
-const attrs = @import("attrs.zig");
+const attr_names = @import("attr_names.zig");
 const literals = @import("literals.zig");
 const lambda = @import("lambda.zig");
 const fold = @import("fold.zig");
@@ -33,11 +33,11 @@ pub fn compileAttrPath(self: *Compiler, node: *const Node) !void {
     try self.compileNode(apath.root);
 
     for (apath.segments) |seg| {
-        if (attrs.attrSegmentHasInterpolation(self, seg)) {
+        if (attr_names.hasInterpolation(self, seg)) {
             try literals.compileStringAtom(self, seg);
             try emit.emitOp(self, .attr_get_dyn);
         } else {
-            const name_id = try attrs.attrSegmentNameId(self, seg);
+            const name_id = try attr_names.intern(self, seg);
             try emit.emitGetAttr(self, name_id);
         }
     }
@@ -65,7 +65,7 @@ pub fn compileAttrOr(self: *Compiler, node: *const Node) !void {
     var dynamic_count: usize = 0;
     for (segments.items) |segment| {
         switch (segment) {
-            .static => |seg| if (attrs.attrSegmentHasInterpolation(self, seg)) {
+            .static => |seg| if (attr_names.hasInterpolation(self, seg)) {
                 dynamic_count += 1;
             },
             .dynamic => dynamic_count += 1,
@@ -118,7 +118,7 @@ pub fn compileAttrOr(self: *Compiler, node: *const Node) !void {
     try self.compileNode(base);
     for (segments.items) |segment| {
         switch (segment) {
-            .static => |seg| if (attrs.attrSegmentHasInterpolation(self, seg)) try thunks.compileStringAtomThunk(self, seg),
+            .static => |seg| if (attr_names.hasInterpolation(self, seg)) try thunks.compileStringAtomThunk(self, seg),
             .dynamic => |name| try thunks.compileThunk(self, name),
         }
     }
@@ -162,7 +162,7 @@ pub fn compileHasAttr(self: *Compiler, node: *const Node) !void {
     if (hasInterpolatedAttrSegment(self, has_attr.segments)) {
         var dynamic_count: usize = 0;
         for (has_attr.segments) |seg| {
-            if (attrs.attrSegmentHasInterpolation(self, seg)) {
+            if (attr_names.hasInterpolation(self, seg)) {
                 try thunks.compileStringAtomThunk(self, seg);
                 dynamic_count += 1;
             }
@@ -184,7 +184,7 @@ pub fn compileHasAttrMixed(self: *Compiler, node: *const Node) !void {
     for (has_attr.segments) |segment| {
         switch (segment) {
             .static => |atom| {
-                if (attrs.attrSegmentHasInterpolation(self, atom)) {
+                if (attr_names.hasInterpolation(self, atom)) {
                     try thunks.compileStringAtomThunk(self, atom);
                     dynamic_count += 1;
                 }
@@ -202,7 +202,7 @@ pub fn compileHasAttrMixed(self: *Compiler, node: *const Node) !void {
 
 fn hasInterpolatedAttrSegment(self: *Compiler, segments: []const Node.Atom) bool {
     for (segments) |segment| {
-        if (attrs.attrSegmentHasInterpolation(self, segment)) return true;
+        if (attr_names.hasInterpolation(self, segment)) return true;
     }
     return false;
 }
@@ -219,10 +219,10 @@ fn compileLiteralAttrSelection(self: *Compiler, root_raw: *const Node, segments:
     const entries = root.data.attr_set.entries;
     if (!try literalSetHasSimpleStaticShape(self, root.data.attr_set)) return false;
 
-    const wanted = try attrs.attrSegmentNameId(self, segments[0]);
+    const wanted = try attr_names.intern(self, segments[0]);
     var selected: ?*const Node = null;
     for (entries) |entry| {
-        if (try attrs.attrSegmentNameId(self, entry.path[0]) == wanted) {
+        if (try attr_names.intern(self, entry.path[0]) == wanted) {
             selected = entry.expr;
             break;
         }
@@ -232,7 +232,7 @@ fn compileLiteralAttrSelection(self: *Compiler, root_raw: *const Node, segments:
 
     try self.compileNode(expr);
     for (segments[1..]) |segment| {
-        const name_id = try attrs.attrSegmentNameId(self, segment);
+        const name_id = try attr_names.intern(self, segment);
         try emit.emitGetAttr(self, name_id);
     }
     return true;
@@ -245,9 +245,9 @@ fn literalHasAttrPath(self: *Compiler, root_raw: *const Node, segments: []const 
     if (segments.len == 0) return null;
     const root = unwrapParens(root_raw);
     if (root.tag != .attr_set or !try literalSetHasSimpleStaticShape(self, root.data.attr_set)) return null;
-    const wanted = try attrs.attrSegmentNameId(self, segments[0]);
+    const wanted = try attr_names.intern(self, segments[0]);
     for (root.data.attr_set.entries) |entry| {
-        if (try attrs.attrSegmentNameId(self, entry.path[0]) != wanted) continue;
+        if (try attr_names.intern(self, entry.path[0]) != wanted) continue;
         if (segments.len == 1) return true;
         return literalHasAttrPath(self, entry.expr, segments[1..]);
     }
@@ -259,8 +259,8 @@ fn literalSetHasSimpleStaticShape(self: *Compiler, set: Node.AttrSet) !bool {
     var names: std.AutoHashMapUnmanaged(InternId, void) = .empty;
     defer names.deinit(self.allocator);
     for (set.entries) |entry| {
-        if (entry.dynamic_name != null or entry.path.len != 1 or attrs.attrSegmentHasInterpolation(self, entry.path[0])) return false;
-        const result = try names.getOrPut(self.allocator, try attrs.attrSegmentNameId(self, entry.path[0]));
+        if (entry.dynamic_name != null or entry.path.len != 1 or attr_names.hasInterpolation(self, entry.path[0])) return false;
+        const result = try names.getOrPut(self.allocator, try attr_names.intern(self, entry.path[0]));
         // Repeated leaf names may merge attrset literals or diagnose a
         // duplicate; either way the selected value is not this one RHS.
         if (result.found_existing) return false;
@@ -419,7 +419,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             if (!options.eager) return false;
             if (unwrapped.data.attr_set.recursive) return false;
             self.name_hint = null; // composite value: see the .list note above
-            try attrs.compileAttrSet(self, unwrapped);
+            try self.compileNode(unwrapped);
             try emit.emitOp(self, .thunk_shell);
         },
         .lambda => {
