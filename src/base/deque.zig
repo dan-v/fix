@@ -4,6 +4,10 @@
 //! `seqCstFence` StoreLoad barriers are load-bearing. The `top`/`bottom`
 //! counters are wrapped in the `Isolated` cache-line pad (see
 //! `cache_line.zig`).
+//!
+//! `model/DequeTSO.tla` machine-checks the fence/CAS obligations under a
+//! store-buffer memory model: removing `pop`'s fence (or either CAS) is
+//! mutation-proven to admit a double-take (`tools/check_models.sh`).
 
 const std = @import("std");
 const builtin = @import("builtin");

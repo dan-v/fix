@@ -6,7 +6,7 @@ model_dir="$repo/model"
 meta_root=$(mktemp -d "${TMPDIR:-/tmp}/fix-tlc.XXXXXX")
 trap 'rm -rf "$meta_root"' EXIT
 
-for spec in FutureWait FutureWaitTSO FiberDispatch Shutdown GcBarrier; do
+for spec in FutureWait FutureWaitTSO DequeTSO FiberDispatch Shutdown GcBarrier; do
   echo "TLC $spec"
   tlc \
     -workers 1 \
@@ -49,6 +49,15 @@ expect_mutation_rejected FutureWait \
   'TRUE'
 expect_mutation_rejected FutureWaitTSO \
   'MUTATION_WAKE_FENCE' \
+  'TRUE'
+expect_mutation_rejected DequeTSO \
+  'MUTATION_POP_FENCE' \
+  'TRUE'
+expect_mutation_rejected DequeTSO \
+  'MUTATION_POP_CAS' \
+  'TRUE'
+expect_mutation_rejected DequeTSO \
+  'MUTATION_STEAL_CAS' \
   'TRUE'
 expect_mutation_rejected FiberDispatch \
   'MUTATION_ACQUIRE_EXCLUSIVE' \
