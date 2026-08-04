@@ -34,12 +34,12 @@ inline fn seqCstFence() void {
 /// happens when `push` finds the deque full.
 ///
 ///   - `growable == false` (`Deque(T)`): fixed power-of-two capacity backed
-///     by a plain `items: []T` slice + `mask`. Full push returns `false` and
-///     the caller drops the item (speculation is best-effort). This is the
-///     scheduler's `TaskQueue`; growable-only branches are comptime-dead. The scheduler also reaches
-///     into `items`/`mask`/`top`/`bottom` directly (see
-///     `taskQueueGcMark`), so those fields keep their names and plain types
-///     for the fixed instantiation.
+///     by an `items: []WordSlot` slice + `mask` (see `WordSlot` for why the
+///     slots are atomic). Full push returns `false` and the caller drops the
+///     item (speculation is best-effort). This is the scheduler's
+///     `TaskQueue`; growable-only branches are comptime-dead. The scheduler
+///     also reaches into `items`/`mask`/`top`/`bottom` directly (see
+///     `taskQueueGcMark`, STW-only), going through `WordSlot.load`.
 ///
 ///   - `growable == true` (`GrowableDeque(T)`): backed by an atomically
 ///     swapped pointer to a `Buffer { items, mask }`. On full, `push` GROWS
@@ -142,11 +142,42 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             }
         };
 
+        /// Fixed-flavor slot: the payload split into per-word monotonic
+        /// atomics — NOT a seqlock, deliberately. The Chase-Lev protocol
+        /// makes a torn multi-word read harmless here: the owner reuses
+        /// circular slot `t & mask` for a new push only after `top` has
+        /// advanced past `t` (the full check admits `b = t' + mask` at
+        /// most), so any stealer whose `readSlot(t)` overlapped that write
+        /// holds a stale `t` and its `top` CAS fails — the torn value is
+        /// discarded, never returned. The atomics exist to make the
+        /// overlapping access defined (a plain `[]T` slot here is a data
+        /// race: owner `pushFixed` write vs. losing-stealer read — TSan
+        /// caught exactly this at w=16), not to make wide reads atomic.
+        /// Monotonic is free on x86_64/aarch64 (plain mov/ldr); publication
+        /// ordering is carried by `bottom`, as for the growable `Slot`.
+        const WordSlot = struct {
+            words: [(@sizeOf(T) + 7) / 8]std.atomic.Value(u64),
+
+            pub inline fn store(slot: *WordSlot, item: T) void {
+                var raw: [(@sizeOf(T) + 7) / 8]u64 = @splat(0);
+                @memcpy(std.mem.asBytes(&raw)[0..@sizeOf(T)], std.mem.asBytes(&item));
+                for (&slot.words, raw) |*w, r| w.store(r, .monotonic);
+            }
+
+            pub inline fn load(slot: *const WordSlot) T {
+                var raw: [(@sizeOf(T) + 7) / 8]u64 = undefined;
+                for (&slot.words, &raw) |*w, *r| r.* = w.load(.monotonic);
+                var item: T = undefined;
+                @memcpy(std.mem.asBytes(&item), std.mem.asBytes(&raw)[0..@sizeOf(T)]);
+                return item;
+            }
+        };
+
         // Backing-store representation: the ONLY structural fork between
-        // the two flavors. Fixed keeps the plain `items`/`mask` fields the
+        // the two flavors. Fixed keeps the `items`/`mask` fields the
         // scheduler already reaches into directly; growable swaps in an
         // atomically-swapped buffer pointer + a retired-buffers list.
-        items: if (!growable) []T else void = if (!growable) undefined else {},
+        items: if (!growable) []WordSlot else void = if (!growable) undefined else {},
         mask: if (!growable) u64 else void = if (!growable) undefined else {},
         /// Atomically-swapped current backing buffer (growable only).
         /// Owner publishes new generations with `.release`; stealers load
@@ -176,8 +207,9 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
                 return .{ .array = .init(buf), .bottom = .init(0), .top = .init(0) };
             } else {
                 std.debug.assert(std.math.isPowerOfTwo(capacity));
-                const items = try allocator.alloc(T, capacity);
-                @memset(items, undefined);
+                // Slots are written before their first read (readSlot is
+                // reachable only for indices in [top, bottom)), so no init.
+                const items = try allocator.alloc(WordSlot, capacity);
                 return .{ .items = items, .mask = @as(u64, capacity) - 1, .bottom = .init(0), .top = .init(0) };
             }
         }
@@ -208,7 +240,7 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
                 const buf = self.array.load(ord);
                 return buf.items[@intCast(i & buf.mask)].load(.monotonic);
             } else {
-                return self.items[@intCast(i & self.mask)];
+                return self.items[@intCast(i & self.mask)].load();
             }
         }
 
@@ -260,7 +292,7 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             const b = self.bottom.v.load(.monotonic);
             const t = self.top.v.load(.acquire);
             if (b -% t > self.mask) return false; // full
-            self.items[@intCast(b & self.mask)] = item;
+            self.items[@intCast(b & self.mask)].store(item);
             // Release: the slot write must be visible before stealers
             // see the updated bottom.
             self.bottom.v.store(b + 1, .release);

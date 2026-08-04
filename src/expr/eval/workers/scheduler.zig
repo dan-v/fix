@@ -231,7 +231,7 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
     const b = q.bottom.v.load(.monotonic);
     var i = t;
     while (i != b) : (i +%= 1) {
-        switch (q.items[@intCast(i & q.mask)].task) {
+        switch (q.items[@intCast(i & q.mask)].load().task) {
             .force_thunk => |id| tr.markObject(heap, id),
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
