@@ -174,6 +174,9 @@ pub const WorkerFiber = struct {
     /// and consumed under `run_mu` (runFiber's state switch), reset before
     /// the fiber is recycled.
     census_suspends: if (census_on) u32 else void = if (census_on) 0 else {},
+    /// Main-path profiler nesting follows the resumable execution context,
+    /// not the OS thread. Compiled out entirely unless `-Dprof-main` is on.
+    prof_stack: if (prof.enabled) prof.Stack else void = if (prof.enabled) .{} else {},
     /// Task census: submission class of `current_task`/`current_cont`
     /// (spec/novel/urgent force_thunk, range, sweep, cont).
     /// Set alongside the task assignment; read by the fiber entry.
@@ -719,7 +722,9 @@ pub const Worker = struct {
         if (f.vm.speculation.create_left != vm_mod.no_spec_budget)
             vm_force.specCreateArm(&f.vm, f.vm.speculation.create_left);
         f.in_runfiber.store(1, .release);
+        if (comptime prof.enabled) prof.enterFiber(&f.prof_stack);
         f.inner.resume_();
+        if (comptime prof.enabled) prof.leaveFiber();
         f.in_runfiber.store(0, .release);
         quantumFinish(f, &run_span);
         const t1 = nanoMonotonic();
@@ -887,6 +892,7 @@ pub const Worker = struct {
             // release it again.
             head.stack_released = false;
             self.free_mu.unlock();
+            if (comptime prof.enabled) prof.resetFiber(&head.prof_stack);
             if (comptime census_on) self.census.free_hits += 1;
             return head;
         }
