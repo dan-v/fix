@@ -9,43 +9,15 @@ const command_match = cli.command_match;
 const command_meta = cli.command_meta;
 
 const ArgsIterator = std.process.Args.Iterator;
-const SubcommandRun = *const fn (cli.ProcessContext, std.process.Init, *ArgsIterator) anyerror!u8;
 const Subcommand = struct {
     meta: command_meta.Command,
-    run: SubcommandRun,
+    run: commands.Runner,
 };
-
-fn commandEnabled(comptime kind: command_meta.Kind) bool {
-    return switch (kind) {
-        .thunks => cli.thunks_log_enabled,
-        .trace => cli.vm_trace_enabled,
-        else => true,
-    };
-}
-
-fn commandRun(comptime kind: command_meta.Kind) SubcommandRun {
-    return switch (kind) {
-        .build => commands.build.run,
-        .completions => commands.completions.run,
-        .disasm => commands.disasm.run,
-        .eval => commands.eval.run,
-        .flake => commands.flake.run,
-        .instantiate => commands.instantiate.run,
-        .parse => commands.parse.run,
-        .print_dev_env => commands.print_dev_env.run,
-        .repl => commands.repl.run,
-        .run => commands.run.run,
-        .shell => commands.shell.run,
-        .@"switch" => commands.@"switch".run,
-        .thunks => commands.thunks.run,
-        .trace => commands.trace.run,
-    };
-}
 
 const subcommand_count = blk: {
     var count = 0;
     for (command_meta.table) |command| {
-        if (commandEnabled(command.kind)) count += 1;
+        if (command_meta.enabled(command.kind)) count += 1;
     }
     break :blk count;
 };
@@ -54,8 +26,8 @@ const subcommands = blk: {
     var result: [subcommand_count]Subcommand = undefined;
     var index = 0;
     for (command_meta.table) |command| {
-        if (commandEnabled(command.kind)) {
-            result[index] = .{ .meta = command, .run = commandRun(command.kind) };
+        if (command_meta.enabled(command.kind)) {
+            result[index] = .{ .meta = command, .run = commands.runner(command.kind) };
             index += 1;
         }
     }
