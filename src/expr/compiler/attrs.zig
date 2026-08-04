@@ -454,7 +454,7 @@ fn compilePlainAttrGroup(
         const lead = group.leaves[0];
         const duplicate = duplicateExtendedLeaf(group, lead);
         if (duplicate) |entry| {
-            try reportDuplicateAttribute(self, entry.path[0], lead.path[0]);
+            try diagnostics.reportDuplicateAttribute(self, entry.path[0], lead.path[0]);
             return error.DuplicateAttribute;
         }
         self.armName(group.name_id);
@@ -531,7 +531,7 @@ fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) an
         if (group.leaves.len > 1 or group.tails.len > 0) {
             const duplicate = duplicateExtendedLeaf(group, leaf.?);
             if (duplicate) |entry| {
-                try reportDuplicateAttribute(self, entry.path[0], leaf.?.path[0]);
+                try diagnostics.reportDuplicateAttribute(self, entry.path[0], leaf.?.path[0]);
                 return error.DuplicateAttribute;
             }
             try compileExtendedAttrSetLiteralThunk(self, group.leaves, group.tails);
@@ -884,11 +884,6 @@ fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGr
 
     self.allocator.free(name_ids);
     return .{ .groups = groups, .leaves = leaves, .tails = tails };
-}
-
-pub fn reportDuplicateAttribute(self: *Compiler, duplicate: Node.Atom, original: Node.Atom) !void {
-    try diagnostics.reportCompileError(self, duplicate.offset, duplicate.len, "duplicate attribute");
-    try diagnostics.reportCompileNote(self, original.offset, original.len, "first attribute defined here");
 }
 
 pub fn emitAttrNameId(self: *Compiler, name_id: InternId) !void {

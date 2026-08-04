@@ -11,6 +11,7 @@ const types = @import("runtime").types;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const diagnostics = @import("diagnostics.zig");
+const attrs = @import("attrs.zig");
 const attr_names = @import("attr_names.zig");
 const access = @import("access.zig");
 const strictness = @import("strictness.zig");
@@ -425,7 +426,7 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
 
     if (leaf) |root_leaf| {
         if (root_leaf.expr.tag != .attr_set) {
-            try attrs.reportDuplicateAttribute(self, tails[0].path[0], root_leaf.path[0]);
+            try diagnostics.reportDuplicateAttribute(self, tails[0].path[0], root_leaf.path[0]);
             return error.DuplicateAttribute;
         }
         const leaves = [_]AttrEntryView{.{

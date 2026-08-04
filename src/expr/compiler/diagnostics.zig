@@ -24,6 +24,11 @@ pub fn reportCompileNote(self: *Compiler, offset: u32, len: u32, message: []cons
     try reportDiagnostic(self, .note, offset, len, message);
 }
 
+pub fn reportDuplicateAttribute(self: *Compiler, duplicate: Node.Atom, original: Node.Atom) !void {
+    try reportCompileError(self, duplicate.offset, duplicate.len, "duplicate attribute");
+    try reportCompileNote(self, original.offset, original.len, "first attribute defined here");
+}
+
 pub fn reportDiagnostic(self: *Compiler, severity: Diagnostic.Severity, offset: u32, len: u32, message: []const u8) !void {
     const position = try sourcePositionForOffset(self, offset);
     try self.diagnostics.append(self.allocator, .{
