@@ -9,6 +9,7 @@ const nix_hash = @import("runtime").hash;
 const store = @import("store");
 const nar = store.nar;
 const FileCache = store.FileCache;
+const clock = @import("base").clock;
 const sync = @import("base").sync;
 const curl_transport = @import("curl_transport.zig");
 const git_transport = @import("git_transport.zig");
@@ -1248,25 +1249,7 @@ fn expandRevisionTemplate(allocator: std.mem.Allocator, template: []const u8, re
 }
 
 fn formatTimestamp(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
-    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
-    const epoch_day = epoch_seconds.getEpochDay();
-    const year_day = epoch_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_seconds = epoch_seconds.getDaySeconds();
-    return std.fmt.allocPrint(allocator, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}", .{
-        year_day.year,
-        month_day.month.numeric(),
-        month_day.day_index + 1,
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-        day_seconds.getSecondsIntoMinute(),
-    });
-}
-
-test "forge timestamps render in UTC" {
-    const rendered = try formatTimestamp(std.testing.allocator, 1_331_075_210);
-    defer std.testing.allocator.free(rendered);
-    try std.testing.expectEqualStrings("20120306230650", rendered);
+    return allocator.dupe(u8, &clock.formatUtc(timestamp));
 }
 
 test "forge archive revision templates pin every ref occurrence" {

@@ -1,6 +1,7 @@
 //! libgit2 adapter for evaluator-owned Git sources.
 
 const std = @import("std");
+const clock = @import("base").clock;
 const sync = @import("base").sync;
 
 const c = @cImport({
@@ -286,7 +287,7 @@ fn resultFromCommit(repo: *c.git_repository, commit: *c.git_commit) !Result {
     @memcpy(&result.rev, rev_z[0..result.rev.len]);
     result.rev_count = try revisionCount(repo, oid);
     result.last_modified = @intCast(c.git_commit_time(commit));
-    result.last_modified_date = formatUtc(result.last_modified);
+    result.last_modified_date = clock.formatUtc(result.last_modified);
     return result;
 }
 
@@ -501,17 +502,6 @@ fn updateSubmodules(repo: *c.git_repository, context: *CallbackContext) !void {
     var state = State{ .context = context };
     const code = c.git_submodule_foreach(repo, State.each, &state);
     if (code < 0 or state.failed) return gitError();
-}
-
-fn formatUtc(timestamp: i64) [14]u8 {
-    var raw: c.time_t = @intCast(timestamp);
-    var tm: c.struct_tm = undefined;
-    var result: [14]u8 = @splat('0');
-    if (c.gmtime_r(&raw, &tm) == null) return result;
-    var terminated: [15]u8 = undefined;
-    if (c.strftime(&terminated, terminated.len, "%Y%m%d%H%M%S", &tm) == 14)
-        @memcpy(&result, terminated[0..14]);
-    return result;
 }
 
 fn createTestCommit(allocator: std.mem.Allocator, repository_path: []const u8, message: []const u8) !void {
