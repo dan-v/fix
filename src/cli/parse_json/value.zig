@@ -1,4 +1,4 @@
-//! Immutable arena-backed JSON value model used between lowering and output.
+//! Immutable arena-backed compatibility JSON model used during CLI output.
 
 pub const Value = union(enum) {
     int: i64,

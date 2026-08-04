@@ -1,4 +1,4 @@
-//! Deterministic nlohmann-style JSON rendering.
+//! Deterministic nlohmann-style compatibility JSON rendering.
 
 const std = @import("std");
 const Value = @import("value.zig").Value;

@@ -14,12 +14,13 @@
 //! Scope is parse-OKAY only: this assumes a well-formed tree from `Parser`.
 
 const std = @import("std");
-const ast = @import("ast.zig");
+const syntax = @import("syntax");
+const ast = syntax.ast;
 const Node = ast.Node;
-const string_syntax = @import("string_syntax.zig");
-const parser_mod = @import("parser.zig");
-const JsonValue = @import("json/value.zig").Value;
-const emitter = @import("json/emitter.zig");
+const string_syntax = syntax.string_syntax;
+const parser_mod = syntax.parser;
+const JsonValue = @import("parse_json/value.zig").Value;
+const emitter = @import("parse_json/emitter.zig");
 
 /// Serialize `node` (a parse-OKAY AST rooted in `source`) as JSON to `writer`.
 /// `gpa` backs a scratch arena for the JSON tree, decoded strings, and the
@@ -812,6 +813,6 @@ const BInheritFrom = struct {
 };
 
 test {
-    _ = @import("json/tests.zig");
+    _ = @import("parse_json/tests.zig");
     _ = emitter;
 }

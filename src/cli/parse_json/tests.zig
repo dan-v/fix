@@ -1,9 +1,10 @@
 //! Representative-node tests for the AST → JSON serializer.
 
 const std = @import("std");
-const ast = @import("../ast.zig");
-const parser_mod = @import("../parser.zig");
-const json = @import("../json.zig");
+const syntax = @import("syntax");
+const ast = syntax.ast;
+const parser_mod = syntax.parser;
+const json = @import("../parse_json.zig");
 
 /// Parse `source` and render its AST as JSON into an owned buffer.
 fn render(allocator: std.mem.Allocator, source: []const u8) ![]u8 {

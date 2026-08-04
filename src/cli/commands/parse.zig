@@ -132,7 +132,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // 3. Emit the AST as JSON.
     var buf: [64 * 1024]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(init.io, &buf);
-    syntax.json.write(&w.interface, allocator, source, node) catch |err| {
+    parse_json.write(&w.interface, allocator, source, node) catch |err| {
         render.caughtError(init.io, use_color, err, "writing JSON", .{});
         return 1;
     };
