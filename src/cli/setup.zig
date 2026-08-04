@@ -13,6 +13,7 @@ const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
 const hugetlb = @import("base").hugetlb;
 const TextRef = @import("base").TextRef;
+const effect_output = @import("effect_output.zig");
 
 const Engine = engine.Engine;
 pub const default_state_dir = "/nix/var/nix";
@@ -53,9 +54,14 @@ pub const Terminal = struct {
     use_color: bool,
     color_depth: presentation.ColorDepth,
     log_progress: bool,
+    effects: *effect_output.StderrSink,
 
     pub fn progressEnabled(self: Terminal) bool {
         return self.log_progress;
+    }
+
+    pub fn deinit(self: Terminal, allocator: std.mem.Allocator) void {
+        self.effects.destroy(allocator);
     }
 };
 
@@ -104,11 +110,6 @@ pub fn configure(
     options: *const args.Options,
     settings: *nix_conf.Settings,
 ) !Terminal {
-    // Language effects are durable stderr records, independent of progress
-    // verbosity. The evaluator sink synchronizes and flushes each one.
-    // Interactive terminals additionally get ANSI sync-wrapped records so a
-    // streamed frame can't tear mid-repaint.
-    ev.setEffectStderr(init.io, presentation.isStderrInteractive(init.io, init.environ_map));
     // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap is
     // pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.setLazyShellsVisible(options.output == .xml);
@@ -209,10 +210,17 @@ pub fn configure(
     const use_color = color_depth.enabled();
     const progress = presentation.progressPolicy(options.progress);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
+    const effects = try effect_output.StderrSink.create(
+        ev.hostAllocator(),
+        init.io,
+        presentation.isStderrInteractive(init.io, init.environ_map),
+    );
+    ev.setEffectSink(effects.effectSink());
     return .{
         .use_color = use_color,
         .color_depth = color_depth,
         .log_progress = progress.log,
+        .effects = effects,
     };
 }
 

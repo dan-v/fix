@@ -61,10 +61,11 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, memory_backing));
     defer ev.deinit();
-    _ = setup.configure(&ev, init, &options, &settings) catch |err| {
+    const term = setup.configure(&ev, init, &options, &settings) catch |err| {
         render.caughtError(init.io, use_color, err, "", .{});
         return 1;
     };
+    defer term.deinit(ev.hostAllocator());
 
     const source_arg = options.source orelse options.defaultSource();
     var loaded = loadSource(&ev, init.io, source_arg) catch |err| {

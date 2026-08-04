@@ -50,6 +50,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // embedders/tests and for reports emitted by Engine.deinit().
     defer if (!process.exits_after_command or options.mem_report != null or options.gc_report) ev.deinit();
     const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
     if (options.read_write_mode) {
         // Store writes are observable. Keep them on the demand path so helper
         // speculation cannot instantiate derivations the user never demanded.

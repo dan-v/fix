@@ -60,6 +60,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
     const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
     ev.enableStoreWrites();
 
     var progress = progress_ui.EvalProgress.init(init.io, ev.basePath() orelse "", term.log_progress, term.color_depth, options.verbose);

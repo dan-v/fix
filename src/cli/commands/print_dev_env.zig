@@ -88,6 +88,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();
     const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
     ev.enableStoreWrites();
     // Retain each forced derivation's full recipe so we can build a get-env
     // variant of it (the normal eval path discards the Drv).

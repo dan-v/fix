@@ -47,8 +47,6 @@ pub const Store = struct {
     /// GroupId is index + 1. Group backing slices are immutable after they are
     /// published, so readers only need the mutex while copying the descriptor.
     groups: std.ArrayListUnmanaged([]*Record) = .empty,
-    stderr_io: ?std.Io = null,
-    stderr_sync: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -67,18 +65,6 @@ pub const Store = struct {
     pub fn setSink(self: *Store, sink: Sink) void {
         // Configuration is changed only while the evaluator is quiescent.
         self.sink = sink;
-    }
-
-    /// Install the ordinary CLI stderr sink. Keeping the `std.Io` value in the
-    /// evaluator avoids a callback context pointing into a command's stack.
-    /// `sync_updates` (pass only when stderr is a terminal) wraps each record
-    /// in ANSI synchronized-update markers so the terminal repaints only
-    /// between whole records.
-    pub fn setStderr(self: *Store, io: std.Io, sync_updates: bool) void {
-        self.stderr_io = io;
-        self.stderr_sync = sync_updates;
-        self.sink = .{ .context = self, .emit_fn = emitStderr };
-        if (sync_updates) installSyncCleanup();
     }
 
     pub fn emitNow(self: *Store, kind: Kind, message: []const u8) void {
@@ -176,75 +162,6 @@ pub const Store = struct {
             }
         }
         return touched;
-    }
-
-    fn emitStderr(raw: ?*anyopaque, kind: Kind, message: []const u8) void {
-        const self: *Store = @ptrCast(@alignCast(raw.?));
-        const io = self.stderr_io orelse return;
-        var buffer: [4096]u8 = undefined;
-        var locked = io.lockStderr(&buffer, null) catch return;
-        defer io.unlockStderr();
-        const writer = &locked.file_writer.interface;
-        const label: []const u8 = switch (kind) {
-            .trace => "trace",
-            .warning => "warning",
-        };
-        // Emit the whole record as one gather: it exceeds the buffer, the
-        // writer drains buffered header + all slices in a single writev, so a
-        // reader (terminal or pipe consumer) never observes half a record.
-        // With sync updates the terminal additionally holds its repaint
-        // between sync_begin and sync_end, making even a chunked delivery
-        // tear-free; being killed mid-record is covered by the fatal-signal
-        // cleanup installed with the sink.
-        if (self.stderr_sync) {
-            var parts = [_][]const u8{ sync_begin, label, ": ", message, "\n", sync_end };
-            writer.writeSplatAll(&parts, 1) catch return;
-        } else {
-            var parts = [_][]const u8{ label, ": ", message, "\n" };
-            writer.writeSplatAll(&parts, 1) catch return;
-        }
-        writer.flush() catch {};
-    }
-
-    /// ANSI synchronized output (DCS-independent private mode 2026): the
-    /// terminal defers repainting between begin and end.
-    const sync_begin = "\x1b[?2026h";
-    const sync_end = "\x1b[?2026l";
-
-    /// If the process dies between sync_begin and sync_end the terminal would
-    /// stay in synchronized mode (appearing frozen). Fatal signals therefore
-    /// emit sync_end before chaining to the previous disposition. Installed
-    /// once, only when the CLI opted into sync updates; SIGKILL remains
-    /// uncoverable by construction.
-    const sync_cleanup = struct {
-        const hooked = [_]std.posix.SIG{ .INT, .TERM, .HUP, .QUIT };
-        var installed = false;
-        var prev: [hooked.len]std.posix.Sigaction = undefined;
-
-        fn handler(sig: std.posix.SIG) callconv(.c) void {
-            // Raw syscall: async-signal-safe, and valid in any Io backend.
-            _ = std.posix.system.write(std.posix.STDERR_FILENO, sync_end.ptr, sync_end.len);
-            for (hooked, 0..) |s, i| {
-                if (s == sig) {
-                    std.posix.sigaction(sig, &prev[i], null);
-                    break;
-                }
-            }
-            _ = std.posix.raise(sig) catch {};
-        }
-    };
-
-    fn installSyncCleanup() void {
-        if (sync_cleanup.installed) return;
-        sync_cleanup.installed = true;
-        const action: std.posix.Sigaction = .{
-            .handler = .{ .handler = sync_cleanup.handler },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        for (sync_cleanup.hooked, 0..) |sig, i| {
-            std.posix.sigaction(sig, &action, &sync_cleanup.prev[i]);
-        }
     }
 };
 

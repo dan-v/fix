@@ -69,6 +69,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     );
     defer ev.deinit();
     const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
     if (!ev.languagePolicy().flakes_enabled) {
         render.messageError(init.io, term.use_color, "{s}", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;

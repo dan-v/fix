@@ -29,7 +29,8 @@ pub fn completeSourceAttrs(
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    _ = try setup.configure(&ev, init, &options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
     var source = try eval_support.getCompletionSource(&ev, init.io, source_arg, options.sourceOptions());
     defer source.deinit(ev.hostAllocator());
     const value = try ev.evaluatePathAt(source.slice(), source.base_path, source.abs_path);
@@ -53,7 +54,8 @@ pub fn completePackageAttrs(
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    _ = try setup.configure(&ev, init, &options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
     const value = try ev.evaluate("import <nixpkgs> { }");
     try writeAttrCandidates(allocator, writer, &ev, value, prefix, replacement);
 }
@@ -81,7 +83,8 @@ pub fn completeFlakeAttrs(
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    _ = try setup.configure(&ev, init, &options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
 
     const source = try eval_support.lowerFlakeCompletion(&ev, flake_ref, parts.parent);
     defer ev.hostAllocator().free(source);
