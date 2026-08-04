@@ -4,10 +4,10 @@ const std = @import("std");
 const Value = @import("value.zig").Value;
 
 pub fn write(writer: *std.Io.Writer, scratch: std.mem.Allocator, value: Value) !void {
-    try emit(writer, scratch, value, 0);
+    try writeIndented(writer, scratch, value, 0);
 }
 
-fn emit(writer: *std.Io.Writer, scratch: std.mem.Allocator, value: Value, indent: usize) !void {
+pub fn writeIndented(writer: *std.Io.Writer, scratch: std.mem.Allocator, value: Value, indent: usize) !void {
     switch (value) {
         .int => |v| try writer.print("{d}", .{v}),
         .float => |v| try emitFloat(writer, v),
@@ -19,7 +19,7 @@ fn emit(writer: *std.Io.Writer, scratch: std.mem.Allocator, value: Value, indent
             try writer.writeAll("[\n");
             for (items, 0..) |item, i| {
                 try indentBy(writer, indent + 2);
-                try emit(writer, scratch, item, indent + 2);
+                try writeIndented(writer, scratch, item, indent + 2);
                 if (i + 1 != items.len) try writer.writeByte(',');
                 try writer.writeByte('\n');
             }
@@ -35,13 +35,20 @@ fn emit(writer: *std.Io.Writer, scratch: std.mem.Allocator, value: Value, indent
                 try indentBy(writer, indent + 2);
                 try emitString(writer, field.key);
                 try writer.writeAll(": ");
-                try emit(writer, scratch, field.val, indent + 2);
+                try writeIndented(writer, scratch, field.val, indent + 2);
                 if (i + 1 != sorted.len) try writer.writeByte(',');
                 try writer.writeByte('\n');
             }
             try indentBy(writer, indent);
             try writer.writeByte('}');
         },
+        .deferred => |child| try child.write_fn(
+            child.context,
+            child.gpa,
+            child.source,
+            writer,
+            indent,
+        ),
     }
 }
 
