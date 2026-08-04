@@ -12,6 +12,7 @@ const std = @import("std");
 const VM = @import("../context.zig").VM;
 const Value = @import("runtime").value.Value;
 const vm_trace = @import("../trace.zig");
+const corepkgs = @import("../../eval/imports/corepkgs.zig");
 
 pub inline fn pure(self: *const VM) bool {
     return self.policy.pure_eval;
@@ -28,10 +29,13 @@ fn under(path: []const u8, root: []const u8) bool {
 }
 
 /// In pure eval, confine filesystem reads (`readFile`/`readDir`/`pathExists`/
-/// `import`/…) to the store and the flake's own source tree(s).
+/// `import`/…) to the store, the flake's own source tree(s), and the synthetic
+/// corepkgs sources (`import <nix/fetchurl.nix>` is pure — there is no on-disk
+/// file to confine).
 pub fn enforceReadPath(self: *VM, path: []const u8) !void {
     if (!self.policy.pure_eval) return;
     if (under(path, self.realization.store_dir)) return;
+    if (corepkgs.source(path) != null) return;
     for (self.policy.allowed_path_roots) |root| if (under(path, root)) return;
     return restrict(self, "access to absolute path '{s}' is forbidden in pure evaluation mode (use --impure to allow)", .{path});
 }

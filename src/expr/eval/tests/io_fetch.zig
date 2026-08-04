@@ -898,8 +898,12 @@ test "pure evaluation sandboxes env, out-of-tree reads, search paths, and unlock
     try std.testing.expectError(error.RestrictedInPureEval, ev.evaluate("builtins.currentSystem"));
     try std.testing.expectError(error.RestrictedInPureEval, ev.evaluate("builtins.currentTime"));
 
-    // Search-path lookups and unlocked fetches are forbidden.
+    // Search-path lookups and unlocked fetches are forbidden — but the
+    // synthetic corepkgs `<nix/fetchurl.nix>` stays importable (it resolves to
+    // embedded source, not a search-path entry or an on-disk read).
     try std.testing.expectError(error.RestrictedInPureEval, ev.evaluate("builtins.findFile builtins.nixPath \"nixpkgs\""));
+    const fetchurl_fn = try ev.evaluate("builtins.isFunction (import <nix/fetchurl.nix>)");
+    try std.testing.expect(fetchurl_fn.asBool());
     try std.testing.expectError(
         error.RestrictedInPureEval,
         ev.evaluate("builtins.fetchTree { type = \"github\"; owner = \"o\"; repo = \"r\"; }"),
