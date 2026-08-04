@@ -642,6 +642,8 @@ test "evaluate getFlake builtin for local path ref" {
     defer std.testing.allocator.free(output_source);
     const self_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").source", .{flake_dir});
     defer std.testing.allocator.free(self_source);
+    const modified_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").lastModified", .{flake_dir});
+    defer std.testing.allocator.free(modified_source);
 
     var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
@@ -652,6 +654,10 @@ test "evaluate getFlake builtin for local path ref" {
     try std.testing.expectEqual(@as(i64, 7), (try ev.evaluate(output_source)).asInt());
     const self_path = try ev.evaluate(self_source);
     try std.testing.expectEqualStrings(flake_dir, ev.intern.get(self_path.asInternId()));
+    // A local path flake's `lastModified` is the tree's mtime (the dir was
+    // just written), not the hardcoded epoch — nixpkgs derives its version
+    // suffix from this.
+    try std.testing.expect((try ev.evaluate(modified_source)).asInt() > 0);
 }
 
 test "getFlake ties self into the outputs fixpoint" {
@@ -733,7 +739,7 @@ test "getFlake resolves inputs from flake.lock (transitive + follows + diamond)"
         \\{{ "nodes": {{
         \\  "root": {{ "inputs": {{ "b": "b", "c": "c" }} }},
         \\  "b": {{ "inputs": {{ "c": ["c"] }}, "locked": {{ "type": "path", "path": "{s}" }}, "original": {{ "type": "path", "path": "{s}" }} }},
-        \\  "c": {{ "locked": {{ "type": "path", "path": "{s}" }}, "original": {{ "type": "path", "path": "{s}" }} }}
+        \\  "c": {{ "locked": {{ "type": "path", "path": "{s}", "lastModified": 1650000000 }}, "original": {{ "type": "path", "path": "{s}" }} }}
         \\}}, "root": "root", "version": 7 }}
     , .{ dir_b, dir_b, dir_c, dir_c });
     defer std.testing.allocator.free(lock);
@@ -749,6 +755,15 @@ test "getFlake resolves inputs from flake.lock (transitive + follows + diamond)"
         defer std.testing.allocator.free(src);
         try std.testing.expectEqual(@as(i64, q[1]), (try ev.evaluate(src)).asInt());
     }
+
+    // The locked `lastModified` pin is threaded through the fetch into the
+    // input's source info (and its formatted date), not reset to the epoch.
+    const lm_src = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").inputs.c.lastModified", .{dir_r});
+    defer std.testing.allocator.free(lm_src);
+    try std.testing.expectEqual(@as(i64, 1650000000), (try ev.evaluate(lm_src)).asInt());
+    const lmd_src = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").inputs.c.lastModifiedDate", .{dir_r});
+    defer std.testing.allocator.free(lmd_src);
+    try std.testing.expectEqualStrings("20220415052000", ev.intern.get((try ev.evaluate(lmd_src)).asInternId()));
 }
 
 test "getFlake resolves inputs from flake.nix when there is no lock" {

@@ -75,7 +75,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
         const path = self.intern.get(attrs.asInternId());
         const out = try ingestFetchedTree(self, path, path_ops.baseName(path), "", null);
         defer out.deinit(self.allocator);
-        return pathTreeValue(self, out.out_path, out.nar_hash);
+        return pathTreeValue(self, out.out_path, out.nar_hash, fetch.sourceLastModified(self, path));
     }
     if (attrs.isString()) {
         const parsed = try builtinParseFlakeRef(self, attrs);
@@ -98,7 +98,10 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
         defer self.allocator.free(path);
         const out = try ingestFetchedTree(self, path, path_ops.baseName(path), "", null);
         defer out.deinit(self.allocator);
-        return pathTreeValue(self, out.out_path, out.nar_hash);
+        // A locked pin wins (deterministic across hosts); a bare local path
+        // reports the tree's own mtime, as Nix's path fetcher does.
+        const last_modified = (try optionalIntAttr(self, attrs_id, "lastModified")) orelse fetch.sourceLastModified(self, path);
+        return pathTreeValue(self, out.out_path, out.nar_hash, last_modified);
     }
 
     if (std.mem.eql(u8, type_value, "file")) {
@@ -118,7 +121,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
         defer result.deinit(self.fetchers.allocator);
         const out = try ingestFetchedTree(self, result.path, spec.name, "", null);
         defer out.deinit(self.allocator);
-        return pathTreeValue(self, out.out_path, out.nar_hash);
+        return pathTreeValue(self, out.out_path, out.nar_hash, (try optionalIntAttr(self, attrs_id, "lastModified")) orelse 0);
     }
 
     if (std.mem.eql(u8, type_value, "git")) {
@@ -153,7 +156,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
         defer result.deinit(self.fetchers.allocator);
         const out = try ingestFetchedTree(self, result.path, spec.name, spec.rev orelse "", null);
         defer out.deinit(self.allocator);
-        return githubTreeValue(self, out.out_path, out.nar_hash, spec.rev, result.forge_metadata);
+        return githubTreeValue(self, out.out_path, out.nar_hash, spec.rev, result.forge_metadata, (try optionalIntAttr(self, attrs_id, "lastModified")) orelse 0);
     }
 
     if (std.mem.eql(u8, type_value, "mercurial")) {
@@ -1107,12 +1110,15 @@ fn flakeInputFromStore(self: *VM, attrs: Value) !?Value {
     defer self.allocator.free(store_path);
     if (!try self.realization.pathIsValid(store_path)) return null;
 
+    // No fetch happens here, so the locked `lastModified` pin is the only
+    // timestamp source.
+    const last_modified = (try optionalIntAttr(self, id, "lastModified")) orelse 0;
     if (is_forge) {
         const rev = try optionalStringAttr(self, id, "rev");
         defer if (rev) |r| self.allocator.free(r);
-        return try githubTreeValue(self, store_path, nar_hash, rev, null);
+        return try githubTreeValue(self, store_path, nar_hash, rev, null, last_modified);
     }
-    return try pathTreeValue(self, store_path, nar_hash);
+    return try pathTreeValue(self, store_path, nar_hash, last_modified);
 }
 
 /// Build a Nix attrset from a flake.lock `locked` node's JSON (string + integer
