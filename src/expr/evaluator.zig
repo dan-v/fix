@@ -66,7 +66,6 @@ const VmTrace = @import("vm.zig").trace_log.VmTrace;
 const ThunkTrace = @import("probe.zig").thunk_trace.ThunkTrace;
 const SpinMutex = @import("base").sync.SpinMutex;
 const owned_strings = @import("base").owned_strings;
-const capability = @import("engine/capabilities.zig");
 
 const parse_observation: observ.SpanSpec = .{
     .category = "eval",
@@ -602,14 +601,6 @@ pub const Engine = struct {
     /// outlive it, but no language operation is valid after `.finished`.
     evaluation_phase: enum { active, releasing, finished } = .active,
 
-    pub const Evaluation = capability.Evaluation(Engine);
-    pub const Values = capability.Values(Engine);
-    pub const Sources = capability.Sources(Engine);
-    pub const Debugger = capability.Debugger(Engine);
-    pub const Inspection = capability.Inspection(Engine);
-    pub const Builds = capability.Builds(Engine);
-    pub const Instrumentation = capability.Instrumentation(Engine);
-
     pub fn init(allocator: std.mem.Allocator, config: Config) !Engine {
         // Always run at least one worker — the main evaluator thread itself
         // owns worker id 0 even when no scheduler helpers are requested.
@@ -683,34 +674,6 @@ pub const Engine = struct {
         if (config.io) |io| ev.setFileIo(io);
         if (config.environment) |env_map| try ev.setEnvironment(env_map);
         return ev;
-    }
-
-    pub fn evaluation(self: *Engine) Evaluation {
-        return .{ .engine = self };
-    }
-
-    pub fn values(self: *Engine) Values {
-        return .{ .engine = self };
-    }
-
-    pub fn sourceAccess(self: *Engine) Sources {
-        return .{ .engine = self };
-    }
-
-    pub fn debugging(self: *Engine) Debugger {
-        return .{ .engine = self };
-    }
-
-    pub fn inspection(self: *const Engine) Inspection {
-        return .{ .engine = self };
-    }
-
-    pub fn builds(self: *Engine) Builds {
-        return .{ .engine = self };
-    }
-
-    pub fn instrumentation(self: *Engine) Instrumentation {
-        return .{ .engine = self };
     }
 
     pub fn deinit(self: *Engine) void {
