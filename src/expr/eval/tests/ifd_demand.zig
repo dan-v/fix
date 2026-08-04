@@ -53,7 +53,7 @@ const DemandFixture = struct {
         errdefer ev.deinit();
         ev.setFileIo(std.testing.io);
         ev.store.realization.store_dir = store_dir;
-        ev.store.realization.setDaemonSocketBorrowedForTest(fake.socketPath());
+        ev.store.realization.testAccess().useBorrowedDaemonSocket(fake.socketPath());
 
         return .{
             .allocator = allocator,

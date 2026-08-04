@@ -9,14 +9,13 @@ const derivation = @import("store").derivation;
 const FakeDaemon = @import("store").realization.testing.FakeDaemon;
 
 fn recipeInspectionAvailable() bool {
-    return @hasDecl(RealizationStore, "RecipeVariantForTest") and
-        @hasDecl(RealizationStore, "recipeCountForTest") and
-        @hasDecl(RealizationStore, "recipeVariantForTest") and
-        @hasDecl(RealizationStore, "recipePayloadPointerForTest") and
-        @hasDecl(RealizationStore, "recipePayloadBytesForTest") and
-        @hasDecl(RealizationStore, "recipeReferencesForTest") and
-        @hasDecl(RealizationStore, "noteProducerPayloadForTest") and
-        @hasDecl(RealizationStore, "producerPayloadPointerForTest");
+    return @hasDecl(RealizationStore.TestAccess, "RecipeKind") and
+        @hasDecl(RealizationStore.TestAccess, "recipeCount") and
+        @hasDecl(RealizationStore.TestAccess, "recipeKind") and
+        @hasDecl(RealizationStore.TestAccess, "recipePayloadPointer") and
+        @hasDecl(RealizationStore.TestAccess, "recipePayloadBytes") and
+        @hasDecl(RealizationStore.TestAccess, "recipeReferences") and
+        @hasDecl(RealizationStore.TestAccess, "producerPayloadPointer");
 }
 
 const Fixture = struct {
@@ -43,7 +42,7 @@ const Fixture = struct {
         errdefer ev.deinit();
         ev.setFileIo(std.testing.io);
         ev.store.realization.store_dir = store_dir;
-        ev.store.realization.setDaemonSocketBorrowedForTest(fake.socketPath());
+        ev.store.realization.testAccess().useBorrowedDaemonSocket(fake.socketPath());
         if (enable_store_writes) ev.enableStoreWrites();
 
         return .{
@@ -99,28 +98,28 @@ fn storePathSubject(path: []const u8) []const u8 {
 
 fn expectRecipeText(store: *RealizationStore, store_path: []const u8, payload: []const u8, refs: []const []const u8) !void {
     if (comptime recipeInspectionAvailable()) {
-        try std.testing.expectEqual(RealizationStore.RecipeVariantForTest.text, store.recipeVariantForTest(store_path).?);
-        try std.testing.expectEqual(store.producerPayloadPointerForTest(store_path).?, store.recipePayloadPointerForTest(store_path).?);
-        try std.testing.expectEqualStrings(payload, store.recipePayloadBytesForTest(store_path).?);
-        try expectRefsEqual(store.recipeReferencesForTest(store_path).?, refs);
+        try std.testing.expectEqual(RealizationStore.TestAccess.RecipeKind.text, store.testAccess().recipeKind(store_path).?);
+        try std.testing.expectEqual(store.testAccess().producerPayloadPointer(store_path).?, store.testAccess().recipePayloadPointer(store_path).?);
+        try std.testing.expectEqualStrings(payload, store.testAccess().recipePayloadBytes(store_path).?);
+        try expectRefsEqual(store.testAccess().recipeReferences(store_path).?, refs);
     } else unreachable;
 }
 
 fn expectRecipeNar(store: *RealizationStore, store_path: []const u8, payload: []const u8) !void {
     if (comptime recipeInspectionAvailable()) {
-        try std.testing.expectEqual(RealizationStore.RecipeVariantForTest.nar, store.recipeVariantForTest(store_path).?);
-        try std.testing.expectEqual(store.producerPayloadPointerForTest(store_path).?, store.recipePayloadPointerForTest(store_path).?);
-        try std.testing.expectEqualStrings(payload, store.recipePayloadBytesForTest(store_path).?);
-        try expectRefsEqual(store.recipeReferencesForTest(store_path).?, &.{});
+        try std.testing.expectEqual(RealizationStore.TestAccess.RecipeKind.nar, store.testAccess().recipeKind(store_path).?);
+        try std.testing.expectEqual(store.testAccess().producerPayloadPointer(store_path).?, store.testAccess().recipePayloadPointer(store_path).?);
+        try std.testing.expectEqualStrings(payload, store.testAccess().recipePayloadBytes(store_path).?);
+        try expectRefsEqual(store.testAccess().recipeReferences(store_path).?, &.{});
     } else unreachable;
 }
 
 fn expectRecipeFlat(store: *RealizationStore, store_path: []const u8, expected_ptr: usize, payload: []const u8) !void {
     if (comptime recipeInspectionAvailable()) {
-        try std.testing.expectEqual(RealizationStore.RecipeVariantForTest.flat, store.recipeVariantForTest(store_path).?);
-        try std.testing.expectEqual(expected_ptr, store.recipePayloadPointerForTest(store_path).?);
-        try std.testing.expectEqualStrings(payload, store.recipePayloadBytesForTest(store_path).?);
-        try expectRefsEqual(store.recipeReferencesForTest(store_path).?, &.{});
+        try std.testing.expectEqual(RealizationStore.TestAccess.RecipeKind.flat, store.testAccess().recipeKind(store_path).?);
+        try std.testing.expectEqual(expected_ptr, store.testAccess().recipePayloadPointer(store_path).?);
+        try std.testing.expectEqualStrings(payload, store.testAccess().recipePayloadBytes(store_path).?);
+        try expectRefsEqual(store.testAccess().recipeReferences(store_path).?, &.{});
     } else unreachable;
 }
 
@@ -147,13 +146,13 @@ test "storeless derivation normalization records the exact drv text recipe" {
         const drv_path = try fixture.forceAttrText(attrs_id, "drv");
         const records = fixture.ev.derivationDebugRecords();
         try std.testing.expectEqual(@as(usize, 1), records.len);
-        try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.testAccess().recipeCount());
         try expectRecipeText(&fixture.ev.store.realization, drv_path, records[0].drv_aterm, records[0].drv_text_references);
 
         try fixture.ev.store.realization.ensureClosure(drv_path);
         try std.testing.expectEqual(@as(usize, 1), fixture.fake.effectCount());
         try expectEffect(fixture.fake, 0, .text, storePathSubject(drv_path), records[0].drv_aterm, records[0].drv_text_references);
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.testAccess().recipeCount());
     } else return error.MissingRecipeInspectionApi;
 }
 
@@ -175,7 +174,7 @@ test "builtins.toFile records owned text and exact references" {
         const root_path = try fixture.forceAttrText(attrs_id, "root");
         const root_contents = try fixture.forceAttrText(attrs_id, "contents");
 
-        try std.testing.expectEqual(@as(usize, 2), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 2), fixture.ev.store.realization.testAccess().recipeCount());
         try expectRecipeText(&fixture.ev.store.realization, dep_path, "dep payload", &.{});
         try expectRecipeText(&fixture.ev.store.realization, root_path, root_contents, &.{dep_path});
 
@@ -183,7 +182,7 @@ test "builtins.toFile records owned text and exact references" {
         try std.testing.expectEqual(@as(usize, 2), fixture.fake.effectCount());
         try expectEffect(fixture.fake, 0, .text, storePathSubject(dep_path), "dep payload", &.{});
         try expectEffect(fixture.fake, 1, .text, storePathSubject(root_path), root_contents, &.{dep_path});
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.testAccess().recipeCount());
     } else return error.MissingRecipeInspectionApi;
 }
 
@@ -209,13 +208,13 @@ test "storeless builtins.path recursive source records the serialized NAR" {
         const nar_bytes = try nar.serialize(fixture.allocator, &fixture.ev.sources.files, tree_path, null);
         defer fixture.allocator.free(nar_bytes);
 
-        try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.testAccess().recipeCount());
         try expectRecipeNar(&fixture.ev.store.realization, store_path, nar_bytes);
 
         try fixture.ev.store.realization.ensureClosure(store_path);
         try std.testing.expectEqual(@as(usize, 1), fixture.fake.effectCount());
         try expectEffect(fixture.fake, 0, .nar, storePathSubject(store_path), nar_bytes, &.{});
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.testAccess().recipeCount());
     } else return error.MissingRecipeInspectionApi;
 }
 
@@ -240,13 +239,13 @@ test "storeless builtins.path recursive false records retained flat file identit
         var retained = try fixture.ev.sources.files.retainFile(flat_path);
         defer retained.release();
 
-        try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.testAccess().recipeCount());
         try expectRecipeFlat(&fixture.ev.store.realization, store_path, @intFromPtr(retained.bytes().ptr), "flat source payload");
 
         try fixture.ev.store.realization.ensureClosure(store_path);
         try std.testing.expectEqual(@as(usize, 1), fixture.fake.effectCount());
         try expectEffect(fixture.fake, 0, .flat, storePathSubject(store_path), "flat source payload", &.{});
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.testAccess().recipeCount());
     } else return error.MissingRecipeInspectionApi;
 }
 
@@ -271,13 +270,13 @@ test "storeless fetchurl records retained flat file identity" {
         var retained = try fixture.ev.sources.files.retainFile(store_path);
         defer retained.release();
 
-        try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 1), fixture.ev.store.realization.testAccess().recipeCount());
         try expectRecipeFlat(&fixture.ev.store.realization, store_path, @intFromPtr(retained.bytes().ptr), "fetch payload");
 
         try fixture.ev.store.realization.ensureClosure(store_path);
         try std.testing.expectEqual(@as(usize, 1), fixture.fake.effectCount());
         try expectEffect(fixture.fake, 0, .flat, storePathSubject(store_path), "fetch payload", &.{});
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.testAccess().recipeCount());
     } else return error.MissingRecipeInspectionApi;
 }
 
@@ -350,7 +349,7 @@ test "realizeOutput realizes a mixed producer closure before the root derivation
         var retained = try fixture.ev.sources.files.retainFile(flat_path);
         defer retained.release();
 
-        try std.testing.expectEqual(@as(usize, 4), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 4), fixture.ev.store.realization.testAccess().recipeCount());
         try expectRecipeText(&fixture.ev.store.realization, text_path, "text dep payload", &.{});
         try expectRecipeNar(&fixture.ev.store.realization, src_store_path, nar_bytes);
         try expectRecipeFlat(&fixture.ev.store.realization, flat_store_path, @intFromPtr(retained.bytes().ptr), "flat dep payload");
@@ -373,7 +372,7 @@ test "realizeOutput realizes a mixed producer closure before the root derivation
         }
         try expectEffect(fixture.fake, refs.len, .text, storePathSubject(drv_path), records[0].drv_aterm, refs);
         try expectEffect(fixture.fake, refs.len + 1, .build, build_subject, "", &.{});
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.testAccess().recipeCount());
     } else return error.MissingRecipeInspectionApi;
 }
 
@@ -424,14 +423,14 @@ test "store-writing mode defers writes; ensureClosure materializes the drv closu
         _ = try fixture.forceAttrText(attrs_id, "fetched");
         const drv_path = try fixture.forceAttrText(attrs_id, "drv");
         try std.testing.expectEqual(@as(usize, 0), fixture.fake.effectCount());
-        const recipes = fixture.ev.store.realization.recipeCountForTest();
+        const recipes = fixture.ev.store.realization.testAccess().recipeCount();
         try std.testing.expect(recipes >= 5); // text, src, flat, fetched, drv (+ any transitive)
 
         // Demanding the drv closure materializes it deps-first: every referenced
         // input source is written before the `.drv`, and the recipes are released
         // as they are consumed.
         try fixture.ev.ensureDerivationClosure(drv_path);
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.recipeCountForTest());
+        try std.testing.expectEqual(@as(usize, 0), fixture.ev.store.realization.testAccess().recipeCount());
         try std.testing.expectEqual(recipes, fixture.fake.effectCount());
 
         // The `.drv` itself is written LAST (after its whole reference closure).

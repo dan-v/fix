@@ -101,110 +101,87 @@ pub const RealizationStore = struct {
     /// materialize only their requested terminal closure.
     eager_evaluation_writes: bool = false,
 
-    pub const RootClaimHook = recipe_graph.RootClaimHook;
+    /// The deliberately narrow test capability. Production users see one
+    /// inert declaration instead of a family of `ForTest` methods mixed into
+    /// the store API; test builds receive controlled graph and daemon access.
+    pub const TestAccess = if (builtin.is_test) struct {
+        store: *RealizationStore,
 
-    pub fn setRootClaimHookForTest(self: *RealizationStore, hook: ?RootClaimHook) void {
-        if (comptime builtin.is_test) {
-            self.graph.test_root_claim_hook = hook;
-        } else unreachable;
-    }
+        pub const RecipeKind = recipe_graph.RecipeKind;
+        pub const RootClaimHook = recipe_graph.RootClaimHook;
 
-    /// Test-only producer-boundary seam. Producers call this after the owned
-    /// allocation is created, independently of whether registration succeeds.
-    pub fn noteProducerPayloadForTest(self: *RealizationStore, store_path: []const u8, payload: []const u8) !void {
-        if (comptime builtin.is_test) {
-            self.graph.mu.lock();
-            defer self.graph.mu.unlock();
-            const owned_path = try self.allocator.dupe(u8, store_path);
-            const result = self.graph.test_producer_payload_pointers.getOrPut(self.allocator, owned_path) catch |err| {
-                self.allocator.free(owned_path);
-                return err;
-            };
-            if (result.found_existing) {
-                self.allocator.free(owned_path);
-            } else {
-                result.value_ptr.* = .empty;
-            }
-            const pointer = @intFromPtr(payload.ptr);
-            for (result.value_ptr.items) |observed| if (observed == pointer) return;
-            result.value_ptr.append(self.allocator, pointer) catch |err| {
-                if (!result.found_existing) {
-                    const removed = self.graph.test_producer_payload_pointers.fetchRemove(store_path).?;
-                    self.allocator.free(removed.key);
-                }
-                return err;
-            };
+        pub fn setRootClaimHook(self: TestAccess, hook: ?RootClaimHook) void {
+            self.store.graph.test_root_claim_hook = hook;
         }
-    }
 
-    /// Consume the allocation observations for `store_path`, returning the one
-    /// actually retained by the recipe. A non-matching first observation keeps
-    /// identity failures visible. Consumption prevents stale-map false passes.
-    pub fn producerPayloadPointerForTest(self: *RealizationStore, store_path: []const u8) ?usize {
-        if (comptime builtin.is_test) {
-            self.graph.mu.lock();
-            defer self.graph.mu.unlock();
-            var removed = self.graph.test_producer_payload_pointers.fetchRemove(store_path) orelse return null;
-            defer self.allocator.free(removed.key);
-            defer removed.value.deinit(self.allocator);
-            const retained = if (self.graph.recipes.get(store_path)) |recipe| recipe.payloadPointer() else null;
+        /// Consume producer allocation observations and return the one retained
+        /// by the recipe. Consumption prevents stale-map false positives.
+        pub fn producerPayloadPointer(self: TestAccess, store_path: []const u8) ?usize {
+            const store = self.store;
+            store.graph.mu.lock();
+            defer store.graph.mu.unlock();
+            var removed = store.graph.test_producer_payload_pointers.fetchRemove(store_path) orelse return null;
+            defer store.allocator.free(removed.key);
+            defer removed.value.deinit(store.allocator);
+            const retained = if (store.graph.recipes.get(store_path)) |recipe| recipe.payloadPointer() else null;
             if (retained) |pointer| {
                 for (removed.value.items) |observed| if (observed == pointer) return observed;
             }
             return if (removed.value.items.len == 0) null else removed.value.items[0];
-        } else return null;
-    }
+        }
 
-    pub const RecipeVariantForTest = recipe_graph.RecipeVariantForTest;
+        pub fn recipeCount(self: TestAccess) usize {
+            self.store.graph.mu.lock();
+            defer self.store.graph.mu.unlock();
+            return self.store.graph.recipes.count();
+        }
 
-    pub fn recipeCountForTest(self: *RealizationStore) usize {
-        if (comptime builtin.is_test) {
-            self.graph.mu.lock();
-            defer self.graph.mu.unlock();
-            return self.graph.recipes.count();
-        } else return 0;
-    }
-
-    pub fn recipeVariantForTest(self: *RealizationStore, store_path: []const u8) ?RecipeVariantForTest {
-        if (comptime builtin.is_test) {
-            self.graph.mu.lock();
-            defer self.graph.mu.unlock();
-            const recipe = self.graph.recipes.get(store_path) orelse return null;
+        pub fn recipeKind(self: TestAccess, store_path: []const u8) ?RecipeKind {
+            self.store.graph.mu.lock();
+            defer self.store.graph.mu.unlock();
+            const recipe = self.store.graph.recipes.get(store_path) orelse return null;
             return switch (recipe.payload) {
                 .text => .text,
                 .nar => .nar,
                 .flat => .flat,
             };
-        } else return null;
-    }
+        }
 
-    pub fn recipePayloadPointerForTest(self: *RealizationStore, store_path: []const u8) ?usize {
-        if (comptime builtin.is_test) {
-            self.graph.mu.lock();
-            defer self.graph.mu.unlock();
-            return (self.graph.recipes.get(store_path) orelse return null).payloadPointer();
-        } else return null;
-    }
+        pub fn recipePayloadPointer(self: TestAccess, store_path: []const u8) ?usize {
+            self.store.graph.mu.lock();
+            defer self.store.graph.mu.unlock();
+            return (self.store.graph.recipes.get(store_path) orelse return null).payloadPointer();
+        }
 
-    pub fn recipePayloadBytesForTest(self: *RealizationStore, store_path: []const u8) ?[]const u8 {
-        if (comptime builtin.is_test) {
-            self.graph.mu.lock();
-            defer self.graph.mu.unlock();
-            const recipe = self.graph.recipes.get(store_path) orelse return null;
+        pub fn recipePayloadBytes(self: TestAccess, store_path: []const u8) ?[]const u8 {
+            self.store.graph.mu.lock();
+            defer self.store.graph.mu.unlock();
+            const recipe = self.store.graph.recipes.get(store_path) orelse return null;
             return switch (recipe.payload) {
                 .text => |text| text.bytes,
                 .nar => |bytes| bytes,
                 .flat => |bytes| bytes.bytes(),
             };
-        } else return null;
-    }
+        }
 
-    pub fn recipeReferencesForTest(self: *RealizationStore, store_path: []const u8) ?[]const []const u8 {
-        if (comptime builtin.is_test) {
-            self.graph.mu.lock();
-            defer self.graph.mu.unlock();
-            return (self.graph.recipes.get(store_path) orelse return null).references();
-        } else return null;
+        pub fn recipeReferences(self: TestAccess, store_path: []const u8) ?[]const []const u8 {
+            self.store.graph.mu.lock();
+            defer self.store.graph.mu.unlock();
+            return (self.store.graph.recipes.get(store_path) orelse return null).references();
+        }
+
+        pub fn useBorrowedDaemonSocket(self: TestAccess, path: []const u8) void {
+            self.store.daemon.setBorrowedSocket(path);
+        }
+
+        pub fn takeDaemonRuntime(self: TestAccess, daemon_runtime: *DaemonRuntime) void {
+            self.store.daemon.takeRuntime(daemon_runtime);
+        }
+    } else struct {};
+
+    pub fn testAccess(self: *RealizationStore) TestAccess {
+        if (comptime builtin.is_test) return .{ .store = self };
+        return .{};
     }
 
     /// A source-memo hit, with slices duplicated into the *caller's* allocator
@@ -273,10 +250,6 @@ pub const RealizationStore = struct {
         return self.daemon.setSocket(path);
     }
 
-    pub fn setDaemonSocketBorrowedForTest(self: *RealizationStore, path: []const u8) void {
-        self.daemon.setBorrowedSocketForTest(path);
-    }
-
     pub fn daemonSocket(self: *const RealizationStore) []const u8 {
         return self.daemon.socketPath();
     }
@@ -320,13 +293,6 @@ pub const RealizationStore = struct {
 
     pub fn clearExecution(self: *RealizationStore) void {
         self.daemon.clearExecution();
-    }
-
-    /// Test-only: hand this store a `DaemonRuntime` to use (as its pool source)
-    /// and own (torn down in `deinit`). No `offload_run`, so ops go through the
-    /// pool's blocking submit. See `recipe_tests`.
-    pub fn setTestRuntime(self: *RealizationStore, rt: *DaemonRuntime) void {
-        self.daemon.setTestRuntime(rt);
     }
 
     /// Recover the concrete daemon connection handed to a pool callback. Keep
@@ -709,15 +675,52 @@ pub const RealizationStore = struct {
     }
 
     pub fn recordOwnedTextRecipe(self: *RealizationStore, store_path: []const u8, text: []u8, references: []const []const u8) !void {
+        self.noteProducerPayload(store_path, text) catch |err| {
+            self.allocator.free(text);
+            return err;
+        };
         return self.graph.recordOwnedText(store_path, text, references);
     }
 
     pub fn recordOwnedNarRecipe(self: *RealizationStore, store_path: []const u8, nar_bytes: []u8) !void {
+        self.noteProducerPayload(store_path, nar_bytes) catch |err| {
+            self.allocator.free(nar_bytes);
+            return err;
+        };
         return self.graph.recordOwnedNar(store_path, nar_bytes);
     }
 
     pub fn recordFlatRecipe(self: *RealizationStore, store_path: []const u8, handle: FileCache.ImmutableBytes, report_progress: bool) !void {
         return self.graph.recordFlat(store_path, handle, report_progress);
+    }
+
+    /// Test-build observation at the ownership-transfer boundary. Keeping this
+    /// inside the store means producers only perform the real domain operation;
+    /// they do not know that allocation identity is under test.
+    fn noteProducerPayload(self: *RealizationStore, store_path: []const u8, payload: []const u8) !void {
+        if (comptime builtin.is_test) {
+            self.graph.mu.lock();
+            defer self.graph.mu.unlock();
+            const owned_path = try self.allocator.dupe(u8, store_path);
+            const result = self.graph.test_producer_payload_pointers.getOrPut(self.allocator, owned_path) catch |err| {
+                self.allocator.free(owned_path);
+                return err;
+            };
+            if (result.found_existing) {
+                self.allocator.free(owned_path);
+            } else {
+                result.value_ptr.* = .empty;
+            }
+            const pointer = @intFromPtr(payload.ptr);
+            for (result.value_ptr.items) |observed| if (observed == pointer) return;
+            result.value_ptr.append(self.allocator, pointer) catch |err| {
+                if (!result.found_existing) {
+                    const removed = self.graph.test_producer_payload_pointers.fetchRemove(store_path).?;
+                    self.allocator.free(removed.key);
+                }
+                return err;
+            };
+        }
     }
 
     /// Whether evaluation recorded a deferred producer for `store_path`.

@@ -135,7 +135,6 @@ pub fn ingestReport(
     errdefer allocator.free(store_path);
     const nar_hash = try sriHash(allocator, &digest);
     errdefer allocator.free(nar_hash);
-    try realization.noteProducerPayloadForTest(store_path, nar_bytes);
     nar_owned = false; // recordOwnedNarRecipe consumes on success and error.
     try realization.recordOwnedNarRecipe(store_path, nar_bytes);
     // Memoize the result so later coercions of this source skip the serialize +

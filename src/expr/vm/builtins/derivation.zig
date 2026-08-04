@@ -348,7 +348,6 @@ fn recordDerivationArtifact(self: *VM, artifact: *DerivationArtifact) !void {
     // the `.drv` is written to the store on demand (see `ensureClosure`), and
     // the `.store` progress span is reported there, at the actual write — not
     // here, where every instantiated derivation (demanded or not) passes.
-    try self.realization.noteProducerPayloadForTest(computed.drv_path, computed.drv_aterm);
     // recordOwnedTextRecipe consumes drv_aterm on success and error.
     artifact.aterm_owned = false;
     try self.realization.recordOwnedTextRecipe(

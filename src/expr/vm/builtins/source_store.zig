@@ -73,10 +73,6 @@ pub fn builtinToFile(self: *VM, name_arg: Value, contents_arg: Value) !Value {
         return err;
     };
     defer self.allocator.free(path);
-    self.realization.noteProducerPayloadForTest(path, contents) catch |err| {
-        self.realization.allocator.free(contents);
-        return err;
-    };
     // recordOwnedTextRecipe consumes contents on success and error.
     try self.realization.recordOwnedTextRecipe(path, contents, refs);
     return contextStringWithPath(self, try self.intern.intern(path));
