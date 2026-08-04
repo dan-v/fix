@@ -507,9 +507,11 @@ pub const CodeDedupCensus = struct {
     }
 };
 
-/// Measure duplicate inline capture descriptor lists within one chunk.
+/// Measure capture descriptor lists within one chunk. Inline thunk/closure
+/// lists and `thunk_defer` side-table ranges are normalized to descriptor
+/// bytes, so the census measures the same payload regardless of encoding.
 pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk) !CaptureCensus {
-    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(allocator);
 
     var out: CaptureCensus = .{};
@@ -522,23 +524,37 @@ pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk) !Capture
         }
         const op: opcode.OpCode = @enumFromInt(op_byte);
         ip += 1;
-        const list_start: ?usize = switch (op) {
+        const inline_count_at: ?usize = switch (op) {
             .thunk, .closure_cap => ip + 2,
             .thunk_w, .closure_cap_w, .thunk_arg => ip + 4,
             else => null,
         };
         const next = ip + opcode.operandLen(op, chunk.code, ip);
-        if (list_start) |start| if (start < next) {
-            const region = chunk.code[start..next];
+        const descriptors: ?[]const u8 = if (inline_count_at) |count_at| blk: {
+            if (count_at + 2 > next) break :blk null;
+            const count = encoding.readU16(chunk.code, count_at);
+            const start = count_at + 2;
+            const end = start + @as(usize, count) * 3;
+            break :blk if (end <= next) chunk.code[start..end] else null;
+        } else if (op == .thunk_defer and ip + 10 <= next) blk: {
+            const start = encoding.readU32(chunk.code, ip + 4);
+            const count = encoding.readU16(chunk.code, ip + 8);
+            const end = @as(usize, start) + @as(usize, count) * 3;
+            break :blk if (end <= chunk.capture_bytes.len)
+                chunk.captureList(start, count)
+            else
+                null;
+        } else null;
+        if (descriptors) |region| if (region.len != 0) {
             out.total += region.len;
             out.ops += 1;
-            const count = if (region.len >= 2) (region.len - 2) / 3 else 0;
+            const count = region.len / 3;
             const ge2 = count >= 2;
             if (ge2) {
                 out.total_ge2 += region.len;
                 out.ops_ge2 += 1;
             }
-            if ((try seen.getOrPut(allocator, std.hash.Wyhash.hash(0, region))).found_existing) {
+            if ((try seen.getOrPut(allocator, region)).found_existing) {
                 out.duplicated += region.len;
                 if (ge2) out.dup_ge2 += region.len;
                 switch (op) {
@@ -636,6 +652,32 @@ test "reference graph uses compact ranges for both directions" {
     try testing.expectEqualSlices(ChunkId, &.{ left, right }, graph.outgoing(source));
     try testing.expectEqualSlices(ChunkId, &.{source}, graph.incoming(left));
     try testing.expectEqualSlices(ChunkId, &.{source}, graph.incoming(right));
+}
+
+test "capture census includes shared thunk_defer side-table lists" {
+    const testing = std.testing;
+    var builder = try chunk_mod.ChunkBuilder.init(testing.allocator);
+    defer builder.deinit(testing.allocator);
+    const descriptors = [_]u8{ 0, 1, 0, 1, 2, 0 };
+    const start = try builder.internCaptureList(testing.allocator, &descriptors);
+    for (0..2) |id| {
+        try builder.writeOp(testing.allocator, .thunk_defer);
+        try builder.writeU32(testing.allocator, @intCast(id));
+        try builder.writeU32(testing.allocator, start);
+        try builder.writeU16(testing.allocator, 2);
+    }
+    try builder.writeOp(testing.allocator, .ret);
+    try builder.writeOp(testing.allocator, .halt);
+    var chunk = try builder.finish(testing.allocator, 0);
+    defer chunk.deinit(testing.allocator);
+
+    const census = try captureCensus(testing.allocator, &chunk);
+    try testing.expectEqual(@as(usize, 12), census.total);
+    try testing.expectEqual(@as(usize, 2), census.ops);
+    try testing.expectEqual(@as(usize, 6), census.duplicated);
+    try testing.expectEqual(@as(usize, 6), census.dup_defer);
+    try testing.expectEqual(@as(usize, 12), census.total_ge2);
+    try testing.expectEqual(@as(usize, 6), census.dup_ge2);
 }
 
 test "name index builds compact child and chunk ranges with subtree totals" {
