@@ -4,6 +4,7 @@ const std = @import("std");
 const args = @import("../args.zig");
 const eval_support = @import("../eval_support.zig");
 const setup = @import("../setup.zig");
+const config_discovery = @import("../config_discovery.zig");
 const context = @import("context.zig");
 const engine = @import("expr");
 const Value = @import("runtime").Value;
@@ -24,7 +25,8 @@ pub fn completeSourceAttrs(
     const source_arg = options.source orelse options.defaultSource();
     if (source_arg == .flake) options.experimental_features.insert(.flakes);
 
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
+    var settings = try config_discovery.loadLocal(allocator, init, &options);
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
@@ -49,7 +51,8 @@ pub fn completePackageAttrs(
 ) !void {
     var options = try context.parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
+    var settings = try config_discovery.loadLocal(allocator, init, &options);
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
@@ -78,7 +81,8 @@ pub fn completeFlakeAttrs(
     var options = try context.parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
     options.experimental_features.insert(.flakes);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
+    var settings = try config_discovery.loadLocal(allocator, init, &options);
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();

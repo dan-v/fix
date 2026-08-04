@@ -14,6 +14,7 @@ const presentation = @import("../presentation.zig");
 const args = @import("../args.zig");
 const render = @import("../render.zig");
 const setup = @import("../setup.zig");
+const config_discovery = @import("../config_discovery.zig");
 const runner = @import("../eval_support.zig");
 
 const Engine = engine.Engine;
@@ -60,7 +61,8 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // Resolve heap backing before the evaluator maps its stores
     // (`--hugetlb`, otherwise auto).
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
+    var settings = try config_discovery.loadLocal(allocator, init, &options);
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     defer ev.deinit();

@@ -18,6 +18,8 @@ const fileish = @import("../fileish.zig");
 const presentation = @import("../presentation.zig");
 const render = @import("../render.zig");
 const setup = @import("../setup.zig");
+const config_discovery = @import("../config_discovery.zig");
+const parse_json = @import("../parse_json.zig");
 
 const Engine = engine.Engine;
 const Parser = syntax.parser.Parser;
@@ -54,11 +56,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const use_color = presentation.colorDepth(options.color, init.io, init.environ_map).enabled();
 
     const memory_backing = setup.applyMemoryBacking(process, null);
-    var settings = setup.loadSettingsAndFlakeConfig(allocator, init, &options) catch |err| {
+    var settings = config_discovery.loadLocal(allocator, init, &options) catch |err| {
         if (err != error.ConfigError) return err;
         return 1;
     };
     defer settings.deinit();
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, memory_backing));
     defer ev.deinit();
     const term = setup.configure(&ev, init, &options, &settings) catch |err| {
