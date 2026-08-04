@@ -157,7 +157,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         return eval_support.buildFailure(init.io, term.use_color, ev.lastStoreError(), err);
     };
     defer build_session.deinit();
-    build_session.buildPaths(&[_][]const u8{derived}, null, eval_support.buildMode(&options)) catch |err| {
+    build_session.buildPaths(&[_][]const u8{derived}, term.output.buildSink(), eval_support.buildMode(&options)) catch |err| {
         return eval_support.buildFailure(init.io, term.use_color, build_session.lastStoreError(), err);
     };
 

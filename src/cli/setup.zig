@@ -53,14 +53,14 @@ pub const Terminal = struct {
     use_color: bool,
     color_depth: presentation.ColorDepth,
     log_progress: bool,
-    effects: *effect_output.StderrSink,
+    output: *effect_output.StderrSink,
 
     pub fn progressEnabled(self: Terminal) bool {
         return self.log_progress;
     }
 
     pub fn deinit(self: Terminal, allocator: std.mem.Allocator) void {
-        self.effects.destroy(allocator);
+        self.output.destroy(allocator);
     }
 };
 
@@ -189,17 +189,17 @@ pub fn configure(
     const use_color = color_depth.enabled();
     const progress = presentation.progressPolicy(options.progress);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
-    const effects = try effect_output.StderrSink.create(
+    const output = try effect_output.StderrSink.create(
         ev.hostAllocator(),
         init.io,
         presentation.isStderrInteractive(init.io, init.environ_map),
     );
-    ev.setEffectSink(effects.effectSink());
+    ev.setEffectSink(output.effectSink());
     return .{
         .use_color = use_color,
         .color_depth = color_depth,
         .log_progress = progress.log,
-        .effects = effects,
+        .output = output,
     };
 }
 

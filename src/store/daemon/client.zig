@@ -124,12 +124,9 @@ pub const DaemonStore = struct {
     /// Last daemon-reported error message (owned), surfaced with
     /// `error.DaemonError`. Freed on deinit / overwritten on the next error.
     last_error: ?[]u8 = null,
-    /// While true, daemon and structured build-log lines are forwarded to our
-    /// stderr (set during `buildPaths`) instead of being discarded.
-    log_build: bool = false,
     suppress_build_output: bool = false,
     /// Set during `buildPaths` to forward typed activities and logs to the CLI.
-    /// When set, logs go to the sink instead of directly to stderr.
+    /// The protocol layer never writes presentation output itself.
     build_sink: ?BuildSink = null,
 
     /// Connect to a daemon and complete the handshake. `store` is a direct
@@ -365,19 +362,15 @@ pub const DaemonStore = struct {
     }
 
     /// Realize `derived_paths` (each a legacy `<drvpath>!<outputs>` string, e.g.
-    /// `/nix/store/xxx.drv!*` for all outputs). The daemon builds or substitutes
-    /// the outputs; build logs are forwarded to our stderr while this runs.
-    /// Errors (with the daemon's message) are surfaced on failure.
+    /// `/nix/store/xxx.drv!*` for all outputs). When supplied, `sink` receives
+    /// typed build activity and log events. Errors (with the daemon's message)
+    /// are surfaced on failure.
     pub fn buildPaths(self: *DaemonStore, derived_paths: []const []const u8, sink: ?BuildSink, mode: BuildMode) !void {
         try self.beginOp(.build_paths);
         try wire.writeStrings(self.w(), derived_paths);
         try wire.writeInt(self.w(), @intFromEnum(mode));
         self.build_sink = sink;
-        self.log_build = sink == null and !self.suppress_build_output; // sink consumes logs itself
-        defer {
-            self.build_sink = null;
-            self.log_build = false;
-        }
+        defer self.build_sink = null;
         try self.flushAndDrain();
         _ = try wire.readInt(self.r()); // dummy result int
     }
@@ -467,18 +460,14 @@ pub const DaemonStore = struct {
                 wire.stderr_last => return,
                 wire.stderr_error => return self.readError(),
                 wire.stderr_next => {
-                    if (self.build_sink == null and !self.log_build) {
+                    if (self.build_sink == null) {
                         try wire.skipString(self.r());
                         continue;
                     }
                     const line = try wire.readString(self.allocator, self.r());
                     defer self.allocator.free(line);
                     const clean = terminal_text.stripAnsiInPlace(line);
-                    if (self.build_sink) |s| {
-                        s.emit(.{ .log = .{ .activity_id = null, .kind = .daemon, .text = clean } });
-                    } else if (self.log_build) {
-                        std.debug.print("{s}", .{clean});
-                    }
+                    self.build_sink.?.emit(.{ .log = .{ .activity_id = null, .kind = .daemon, .text = clean } });
                 },
                 wire.stderr_start_activity => try self.readStartActivity(),
                 wire.stderr_stop_activity => {
@@ -617,8 +606,6 @@ pub const DaemonStore = struct {
                         .kind = if (result_type == .build_log_line) .build else .post_build,
                         .text = line,
                     } });
-                } else if (self.log_build) {
-                    std.debug.print("{s}", .{line});
                 }
             },
             else => {},
