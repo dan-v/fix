@@ -11,6 +11,7 @@ const keys_mod = @import("../keys.zig");
 const editor_mod = @import("../editor.zig");
 const render_mod = @import("../render.zig");
 const transcript_mod = @import("../transcript.zig");
+const cli_render = @import("../../render.zig");
 const vm_model = @import("model.zig");
 const vm_helpers = @import("semantics.zig");
 const history_mod = @import("../history.zig");
@@ -208,7 +209,7 @@ pub fn Methods(comptime Explorer: type) type {
 
         pub fn debugStep(self: *Explorer, session: *DebugSession, kind: DebugSession.StepKind) DebugOutcome {
             session.step(kind) catch |err| {
-                self.status_msg = std.fmt.bufPrint(&self.status_buf, "step failed: {s}", .{@errorName(err)}) catch "step failed";
+                self.status_msg = std.fmt.bufPrint(&self.status_buf, "step failed: {f}", .{cli_render.friendly(err)}) catch "step failed";
                 return .running;
             };
             self.pending_step_focus = self.navigation.focus;
@@ -283,7 +284,7 @@ pub fn Methods(comptime Explorer: type) type {
                 .eval => |source| {
                     const scope = session.scopeAttrs() catch session.bindValueScope("it") catch null;
                     const value = session.eval(source, scope) catch |err| {
-                        try Explorer.Ops.debug_view.debugSetCaptureFmt(self, capture, "error: {s}", .{@errorName(err)});
+                        try Explorer.Ops.debug_view.debugSetCaptureFmt(self, capture, "error: {f}", .{cli_render.friendly(err)});
                         return .running;
                     };
                     // Debugger evaluation may allocate or resolve objects without
@@ -329,7 +330,7 @@ pub fn Methods(comptime Explorer: type) type {
         pub fn debugRenderValue(self: *Explorer, session: *DebugSession, capture: *transcript_mod.Capture, value: runtime.Value) !void {
             _ = self;
             command_mod.writeValue(session, &capture.writer, value) catch |err| {
-                try capture.writer.print("error: {s}", .{@errorName(err)});
+                try capture.writer.print("error: {f}", .{cli_render.friendly(err)});
             };
             try capture.writer.writeByte('\n');
         }

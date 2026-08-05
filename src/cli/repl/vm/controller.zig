@@ -8,6 +8,7 @@ const engine = @import("expr");
 const runtime = @import("runtime");
 const keys_mod = @import("../keys.zig");
 const width_mod = @import("../width.zig");
+const cli_render = @import("../../render.zig");
 const vm_navigation = @import("navigation.zig");
 const vm_model = @import("model.zig");
 const vm_source = @import("source.zig");
@@ -291,7 +292,7 @@ pub fn Methods(comptime Explorer: type) type {
                 self.ev.setBreakpointSpan(location.chunk_id, span)
             else
                 self.ev.setBreakpointAt(location.chunk_id, location.offset)) catch |err| {
-                self.status_msg = std.fmt.bufPrint(&self.status_buf, "breakpoint failed: {s}", .{@errorName(err)}) catch "breakpoint failed";
+                self.status_msg = std.fmt.bufPrint(&self.status_buf, "breakpoint failed: {f}", .{cli_render.friendly(err)}) catch "breakpoint failed";
                 return;
             };
             if (result.sites == 0) {

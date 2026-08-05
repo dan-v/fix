@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const engine = @import("expr");
+const render = @import("render.zig");
 const Engine = engine.Engine;
 const Options = @import("args.zig").Options;
 const vm_trace_mod = engine.vm.trace_log;
@@ -34,14 +35,17 @@ pub const ThunkTraceSetup = struct {
 pub fn setupThunkTrace(
     allocator: std.mem.Allocator,
     io: std.Io,
+    use_color: bool,
     ev: *Engine,
     options: *const Options,
 ) !ThunkTraceSetup {
     var setup: ThunkTraceSetup = .{};
     const path = options.thunks_log_path orelse return setup;
     if (comptime !thunks_log_enabled) {
-        std.debug.print(
-            "warning: --thunks-log requested but binary was built without -Dthunks-log; the log will be empty\n",
+        render.messageWarning(
+            io,
+            use_color,
+            "--thunks-log requested but binary was built without -Dthunks-log; the log will be empty",
             .{},
         );
         return setup;
@@ -85,12 +89,12 @@ pub const VmTraceSetup = struct {
     }
 };
 
-pub fn setupVmTrace(allocator: std.mem.Allocator, io: std.Io, options: *const Options) !VmTraceSetup {
+pub fn setupVmTrace(allocator: std.mem.Allocator, io: std.Io, use_color: bool, options: *const Options) !VmTraceSetup {
     var setup: VmTraceSetup = .{};
     const path = options.vm_trace_path orelse return setup;
 
     if (!vm_trace_mod.enabled) {
-        std.debug.print("warning: --vm-trace requested but binary was built without -Dvm-trace=true\n", .{});
+        render.messageWarning(io, use_color, "--vm-trace requested but binary was built without -Dvm-trace=true", .{});
         return setup;
     }
 

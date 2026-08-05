@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const engine = @import("expr");
 const store = @import("store");
 const presentation = @import("presentation.zig");
+const render = @import("render.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
 const hugetlb = @import("base").hugetlb;
@@ -179,12 +180,13 @@ pub fn configure(
     if (settings.get("store")) |uri| {
         if (uri.len != 0) {
             store.daemon.validateStoreUri(uri) catch |err| {
+                const use_color = presentation.colorDepth(options.color, init.io, init.environ_map).enabled();
                 switch (err) {
-                    error.NativeLocalStoreUnsupported => std.debug.print("error: local, auto, and chroot stores need fix's native local-store backend, which is not implemented yet\n", .{}),
-                    error.UnsupportedSshStoreSetting => std.debug.print("error: this ssh-ng store setting is not implemented; supported settings are port, ssh-key, and compress\n", .{}),
-                    error.UnsupportedLixRpcProtocol => std.debug.print("error: this Lix endpoint only offers lix-xp-1, which fix does not implement yet\n", .{}),
-                    error.UnsupportedDaemonProtocol => std.debug.print("error: the store URI requests an unsupported daemon protocol\n", .{}),
-                    else => std.debug.print("error: invalid or unsupported store URI: {s}\n", .{uri}),
+                    error.NativeLocalStoreUnsupported => render.messageError(init.io, use_color, "local, auto, and chroot stores need fix's native local-store backend, which is not implemented yet", .{}),
+                    error.UnsupportedSshStoreSetting => render.messageError(init.io, use_color, "this ssh-ng store setting is not implemented; supported settings are port, ssh-key, and compress", .{}),
+                    error.UnsupportedLixRpcProtocol => render.messageError(init.io, use_color, "this Lix endpoint only offers lix-xp-1, which fix does not implement yet", .{}),
+                    error.UnsupportedDaemonProtocol => render.messageError(init.io, use_color, "the store URI requests an unsupported daemon protocol", .{}),
+                    else => render.messageError(init.io, use_color, "invalid or unsupported store URI: {s}", .{uri}),
                 }
                 return error.ConfigError;
             };

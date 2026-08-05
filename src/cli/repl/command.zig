@@ -58,19 +58,20 @@ const prompt_cont = "...> ";
 /// `fix repl` subcommand entry point.
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null, .repl) catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, null, .repl, &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .repl);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render_err.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
     defer options.deinit(allocator);
     if (options.source != null) {
-        std.debug.print("error: repl takes no expression, file, or flake\n\n{s}\n", .{synopsis});
+        render_err.usageError(init.io, init.environ_map, "repl takes no expression, file, or flake", null, synopsis);
         return 2;
     }
 
@@ -955,20 +956,13 @@ const Repl = struct {
 
     fn printError(self: *Repl, comptime fmt: []const u8, fmt_args: anytype) !void {
         if (self.output_capture) |w| {
-            try presentation.style(w, self.use_color, .error_label);
-            try w.writeAll("error");
-            try presentation.reset(w, self.use_color);
-            try w.print(": " ++ fmt ++ "\n", fmt_args);
+            try render_err.messageErrorTo(w, self.use_color, fmt, fmt_args);
             return;
         }
         var stderr_buffer: [1024]u8 = undefined;
         var stderr = try presentation.lockStderr(self.io, &stderr_buffer);
         defer stderr.deinit();
-        const w = stderr.writer();
-        try presentation.style(w, self.use_color, .error_label);
-        try w.writeAll("error");
-        try presentation.reset(w, self.use_color);
-        try w.print(": " ++ fmt ++ "\n", fmt_args);
+        try render_err.messageErrorTo(stderr.writer(), self.use_color, fmt, fmt_args);
         try stderr.flush();
     }
 };
