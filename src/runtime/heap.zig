@@ -36,6 +36,8 @@ const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
 const DeferredThunk = @import("thunk.zig").DeferredThunk;
 const FailureStore = @import("failure.zig").FailureStore;
+const FailureFrame = @import("failure.zig").FailureFrame;
+const FailureRef = @import("failure.zig").FailureRef;
 pub const inspection = @import("heap/inspection.zig");
 const reuse = @import("heap/reuse.zig");
 const RangeFreeList = reuse.RangeFreeList;
@@ -582,7 +584,7 @@ pub const ObjectHeap = struct {
     allocator: std.mem.Allocator,
     /// Unique owner for immutable failures borrowed by thunks, imports, and
     /// fiber exception carriers. Lives exactly as long as this heap.
-    failures: FailureStore,
+    failure_store: FailureStore,
     objects: ObjectStore,
     values: ValueStore,
     attrs: AttrStore,
@@ -675,7 +677,7 @@ pub const ObjectHeap = struct {
         for (sweep_filter) |*word| word.* = .init(0);
         return .{
             .allocator = allocator,
-            .failures = FailureStore.init(allocator),
+            .failure_store = FailureStore.init(allocator),
             .objects = objects,
             .values = values,
             .attrs = attrs,
@@ -698,7 +700,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn deinit(self: *ObjectHeap) void {
-        self.failures.deinit();
+        self.failure_store.deinit();
         self.discarded_object_tails.deinit(self.allocator);
         self.allocator.free(self.collection.alloc_bits);
         self.allocator.free(self.collection.old_bits);
@@ -713,6 +715,21 @@ pub const ObjectHeap = struct {
         self.attrs.deinit(self.allocator);
         self.values.deinit(self.allocator);
         self.objects.deinit(self.allocator);
+    }
+
+    /// Retain a terminal runtime failure for as long as the heap lives.
+    pub fn captureFailure(
+        self: *ObjectHeap,
+        err_value: anyerror,
+        message: []const u8,
+        frames: []const FailureFrame,
+    ) FailureRef {
+        return self.failure_store.captureOrigin(err_value, message, frames);
+    }
+
+    /// Retain one immutable context layer without exposing the backing store.
+    pub fn addFailureContext(self: *ObjectHeap, cause: FailureRef, message: []const u8) FailureRef {
+        return self.failure_store.addContext(cause, message);
     }
 
     /// Append the discarded-TLAB tails to an object-store `SkipSet` (from

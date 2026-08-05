@@ -36,7 +36,7 @@ pub fn captureErrorTrace(self: *VM, err: anyerror) !void {
                 len += 1;
             }
         }
-        ctx.capture(self.heap.failures.captureOrigin(err, message, captured[0..len]));
+        ctx.capture(self.heap.captureFailure(err, message, captured[0..len]));
     }
 
     // A speculative observer of an already-frozen failure carries identity
