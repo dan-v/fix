@@ -2873,8 +2873,9 @@ pub const ObjectHeap = struct {
     /// Positions counterpart of the strict literal merge (`attrs_merge_strict`,
     /// used when an attrset literal mixes static and dynamic entries): union of
     /// both sides' tables by name, left winning duplicates (the merged attr's
-    /// first definition site). Both tables are sorted by name (heap invariant),
-    /// so the union is emitted sorted into a fresh, heap-owned range.
+    /// first definition site). A borrowed literal table can be retained when
+    /// the other side has no positions; otherwise, the sorted union is
+    /// materialized into a fresh, heap-owned range.
     pub fn mergeAttrPositionsStrict(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !AttrPositions {
         const left_positions = switch (self.get(left_id).*) {
             .attrs => |a| a.positions,
@@ -2884,6 +2885,9 @@ pub const ObjectHeap = struct {
             .attrs => |a| a.positions,
             else => AttrPositions.none,
         };
+        if (right_positions.len == 0 and left_positions.isBorrowed()) return left_positions;
+        if (left_positions.len == 0 and right_positions.isBorrowed()) return right_positions;
+
         const l = self.attrPositionsEntries(left_positions);
         const r = self.attrPositionsEntries(right_positions);
         if (l.len == 0 and r.len == 0) return .none;

@@ -276,6 +276,26 @@ test "object heap rejects duplicate attrs" {
     try std.testing.expectEqual(@as(i64, 1), (try heap.getAttrValue(attrs_id, 10)).asInt());
 }
 
+test "strict attr merge shares borrowed positions with an unpositioned dynamic side" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const position_table = [_]heap_mod.AttrPosEntry{.{
+        .name = 10,
+        .pos = .{ .file = 1, .line = 2, .column = 3 },
+    }};
+    const borrowed = heap_mod.AttrPositions.borrowed(&position_table);
+    const static_id = try heap.addAttrsFromValuesSorted(&.{10}, &.{Value.int(1)}, borrowed);
+    try std.testing.expectEqual(@as(u32, 0), heap.stats().attr_positions);
+    try std.testing.expectEqual(position_table[0].pos, heap.getAttrPos(static_id, 10).?);
+    const dynamic_id = try heap.addAttrs(&.{.{ .name = 20, .value = Value.int(2) }});
+    const merged = try heap.mergeAttrPositionsStrict(static_id, dynamic_id);
+
+    try std.testing.expect(merged.isBorrowed());
+    try std.testing.expectEqual(borrowed.storage.borrowed, merged.storage.borrowed);
+    try std.testing.expectEqual(borrowed.len, merged.len);
+}
+
 test "multi-store attr construction rolls back when positions allocation fails" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var heap = try ObjectHeap.init(failing.allocator(), 1);
