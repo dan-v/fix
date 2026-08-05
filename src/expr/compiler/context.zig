@@ -23,6 +23,7 @@ const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const InternTable = @import("runtime").intern.InternTable;
 const DeferredTable = @import("deferred_table.zig").Table;
 const UnitAnalysis = @import("let_analysis/model.zig").UnitAnalysis;
+const LetFloatUnitState = @import("let_float/model.zig").UnitState;
 
 const InternId = types.InternId;
 
@@ -137,6 +138,9 @@ pub const Compiler = struct {
     /// ROOT compiler only (children route through the parent chain);
     /// scratch-lifetime like everything else on `allocator`.
     let_units: ?*UnitAnalysis = null,
+    /// Optimizer-only plans and flattened AST overlays layered over the
+    /// immutable `let_units` analysis. ROOT compiler only; scratch-lifetime.
+    let_float_state: ?*LetFloatUnitState = null,
     /// Arena that `.elided` bodies are sub-parsed into (body-span elision;
     /// see `literals.materializeElided`). Set on the ROOT compiler:
     /// `parseAndCompile` points it at the file's (possibly retained) AST
