@@ -22,6 +22,7 @@ const Value = @import("runtime").value.Value;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const InternTable = @import("runtime").intern.InternTable;
 const DeferredTable = @import("deferred_table.zig").Table;
+const UnitAnalysis = @import("let_analysis/model.zig").UnitAnalysis;
 
 const InternId = types.InternId;
 
@@ -130,6 +131,12 @@ pub const Compiler = struct {
     /// chunk; recycling the buffers avoids paying the builder's initial
     /// code/constants capacity allocation ~once per chunk.
     builder_pool: std.ArrayListUnmanaged(ChunkBuilder) = .empty,
+    /// Per-unit `let` cluster registry (see `compiler/let_analysis/`): the
+    /// single-walk binding-placement analysis, populated at unit start by
+    /// `let_float.analyzeUnit` and extended on demand for post-pass AST.
+    /// ROOT compiler only (children route through the parent chain);
+    /// scratch-lifetime like everything else on `allocator`.
+    let_units: ?*UnitAnalysis = null,
     /// Arena that `.elided` bodies are sub-parsed into (body-span elision;
     /// see `literals.materializeElided`). Set on the ROOT compiler:
     /// `parseAndCompile` points it at the file's (possibly retained) AST
