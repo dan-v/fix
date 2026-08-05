@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const compiler_mod = @import("context.zig");
-const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const chunk = bytecode.chunk;
 const heap_mod = @import("runtime").heap;
@@ -13,11 +12,9 @@ const Value = @import("runtime").value.Value;
 const types = @import("runtime").types;
 const OpCode = bytecode.OpCode;
 const operand = @import("operand.zig");
-const attrs = @import("attrs.zig");
 const diagnostics = @import("diagnostics.zig");
 
 const Compiler = compiler_mod.Compiler;
-const Node = compiler_mod.Node;
 const Capture = compiler_mod.Capture;
 const InternId = types.InternId;
 const captureCount = operand.captureCount;
@@ -349,53 +346,6 @@ pub fn emitThunkAttr(self: *Compiler, base: Capture, name: InternId) !void {
     try emitOp(self, if (wide) .thunk_attr_w else .thunk_attr);
     try emitCaptureDescriptors(self, &.{base});
     try writeInternId(self, name, wide);
-}
-
-pub fn attrSegmentsWide(self: *Compiler, segments: []const Node.Atom) !bool {
-    var wide = false;
-    for (segments) |seg| {
-        if (try attrs.attrSegmentNameId(self, seg) > std.math.maxInt(u16)) wide = true;
-    }
-    return wide;
-}
-
-pub fn writeStaticAttrPathOperand(self: *Compiler, segments: []const Node.Atom, atom: Node.Atom, wide: bool) !void {
-    try self.builder.writeByte(self.allocator, try diagnostics.requireU8At(self, segments.len, atom, "attribute path has too many segments"));
-    for (segments) |seg| {
-        const name_id = try attrs.attrSegmentNameId(self, seg);
-        try writeInternId(self, name_id, wide);
-    }
-}
-
-pub fn writeMixedAttrPathOperand(self: *Compiler, segments: []const Node.Atom, dynamic_count: usize, atom: Node.Atom) !void {
-    try self.builder.writeByte(self.allocator, try diagnostics.requireU8At(self, segments.len, atom, "attribute path has too many segments"));
-    try self.builder.writeByte(self.allocator, try diagnostics.requireU8At(self, dynamic_count, atom, "attribute path has too many dynamic segments"));
-    for (segments) |seg| {
-        if (attrs.attrSegmentHasInterpolation(self, seg)) {
-            try self.builder.writeByte(self.allocator, @intFromEnum(bytecode.MixedAttrSegmentTag.dynamic));
-        } else {
-            try self.builder.writeByte(self.allocator, @intFromEnum(bytecode.MixedAttrSegmentTag.static));
-            try self.builder.writeU32(self.allocator, try attrs.attrSegmentNameId(self, seg));
-        }
-    }
-}
-
-pub fn writeHasAttrMixedOperand(self: *Compiler, segments: []const Node.HasAttrMixedSegment, dynamic_count: usize, atom: Node.Atom) !void {
-    try self.builder.writeByte(self.allocator, try diagnostics.requireU8At(self, segments.len, atom, "attribute path has too many segments"));
-    try self.builder.writeByte(self.allocator, try diagnostics.requireU8At(self, dynamic_count, atom, "attribute path has too many dynamic segments"));
-    for (segments) |segment| {
-        switch (segment) {
-            .static => |static_atom| {
-                if (attrs.attrSegmentHasInterpolation(self, static_atom)) {
-                    try self.builder.writeByte(self.allocator, @intFromEnum(bytecode.MixedAttrSegmentTag.dynamic));
-                } else {
-                    try self.builder.writeByte(self.allocator, @intFromEnum(bytecode.MixedAttrSegmentTag.static));
-                    try self.builder.writeU32(self.allocator, try attrs.attrSegmentNameId(self, static_atom));
-                }
-            },
-            .dynamic => try self.builder.writeByte(self.allocator, @intFromEnum(bytecode.MixedAttrSegmentTag.dynamic)),
-        }
-    }
 }
 
 pub fn patchJump(self: *Compiler, instruction_offset: usize, target_offset: usize) void {

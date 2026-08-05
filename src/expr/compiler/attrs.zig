@@ -12,7 +12,6 @@ const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const chunk = bytecode.chunk;
 const heap_mod = @import("runtime").heap;
-const string_syntax = @import("syntax").string_syntax;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const emit = @import("emit.zig");
@@ -22,6 +21,7 @@ const diagnostics = @import("diagnostics.zig");
 const literals = @import("literals.zig");
 const access = @import("access.zig");
 const deferred_table = @import("deferred_table.zig");
+const attr_names = @import("attr_names.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -140,12 +140,12 @@ fn staticAttrEntryViewCount(self: *const Compiler, entries: []const AttrEntryVie
 
 fn isDynamicAttrEntryView(self: *const Compiler, entry: AttrEntryView) bool {
     return entry.dynamic_name != null or
-        (entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0]));
+        (entry.path.len > 0 and attr_names.hasInterpolation(self, entry.path[0]));
 }
 
 fn compileDynamicAttrViewName(self: *Compiler, entry: AttrEntryView) !void {
     if (entry.dynamic_name) |name| return self.compileNode(name);
-    if (entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0])) {
+    if (entry.path.len > 0 and attr_names.hasInterpolation(self, entry.path[0])) {
         return literals.compileStringAtom(self, entry.path[0]);
     }
     return error.InvalidAttributePath;
@@ -440,7 +440,7 @@ fn compilePlainAttrGroup(
         // which the binding name `a` describes.
         self.armName(group.name_id);
         try compileAttrEntriesThunk(self, group.tails, false);
-        try appendAttrPosition(self, positions, group.first, group.name_id);
+        try attr_names.appendPosition(self, positions, group.first, group.name_id);
         return;
     }
 
@@ -454,12 +454,12 @@ fn compilePlainAttrGroup(
         const lead = group.leaves[0];
         const duplicate = duplicateExtendedLeaf(group, lead);
         if (duplicate) |entry| {
-            try reportDuplicateAttribute(self, entry.path[0], lead.path[0]);
+            try diagnostics.reportDuplicateAttribute(self, entry.path[0], lead.path[0]);
             return error.DuplicateAttribute;
         }
         self.armName(group.name_id);
         try compileExtendedAttrSetLiteralThunk(self, group.leaves, group.tails);
-        try appendAttrPosition(self, positions, group.first, group.name_id);
+        try attr_names.appendPosition(self, positions, group.first, group.name_id);
         return;
     }
 
@@ -472,7 +472,7 @@ fn compilePlainAttrGroup(
     if (defer_scope) |dscope| {
         if (leafDeferrable(leaf.?)) {
             try deferLeaf(self, leaf.?.expr, group.name_id, dscope);
-            try appendAttrPosition(self, positions, group.first, group.name_id);
+            try attr_names.appendPosition(self, positions, group.first, group.name_id);
             return;
         }
     }
@@ -485,7 +485,7 @@ fn compilePlainAttrGroup(
     self.armName(group.name_id);
     if (!try compileInheritedLeaf(self, leaf.?))
         try access.compileContainerValue(self, body, .{ .raw_identifier = true });
-    try appendAttrPosition(self, positions, group.first, group.name_id);
+    try attr_names.appendPosition(self, positions, group.first, group.name_id);
 }
 
 /// If this recursive set statically declares a top-level `__overrides`
@@ -531,7 +531,7 @@ fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) an
         if (group.leaves.len > 1 or group.tails.len > 0) {
             const duplicate = duplicateExtendedLeaf(group, leaf.?);
             if (duplicate) |entry| {
-                try reportDuplicateAttribute(self, entry.path[0], leaf.?.path[0]);
+                try diagnostics.reportDuplicateAttribute(self, entry.path[0], leaf.?.path[0]);
                 return error.DuplicateAttribute;
             }
             try compileExtendedAttrSetLiteralThunk(self, group.leaves, group.tails);
@@ -568,7 +568,7 @@ fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anye
 
         const slot = scope.resolveLocalId(self, group.name_id) orelse return error.UndefinedVariable;
         try emit.emitCaptureLocal(self, slot);
-        try appendAttrPosition(self, &positions, group.first, group.name_id);
+        try attr_names.appendPosition(self, &positions, group.first, group.name_id);
     }
 
     const count = try diagnostics.requireU16At(self, groups.len, attrGroupsDiagnosticAtom(groups), "too many attributes in set");
@@ -761,7 +761,7 @@ fn inheritSource(expr_raw: *const Node) !*const Node {
 fn compileInheritedLeaf(self: *Compiler, leaf: AttrEntryView) !bool {
     const source_slot = leaf.inherit_slot orelse return false;
     if (leaf.path.len != 1) return error.InvalidAttributePath;
-    const name_id = try attrSegmentNameId(self, leaf.path[0]);
+    const name_id = try attr_names.intern(self, leaf.path[0]);
     try emit.emitThunkAttr(self, .{
         .name = "\x00inherit-source",
         .name_id = try self.intern.intern("\x00inherit-source"),
@@ -799,14 +799,14 @@ fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGr
     for (entries, name_ids) |entry, *entry_name_id| {
         if (entry.path.len == 0) return error.InvalidAttributePath;
 
-        const name_id = try attrSegmentNameId(self, entry.path[0]);
+        const name_id = try attr_names.intern(self, entry.path[0]);
         entry_name_id.* = name_id;
         const gop = try group_index.getOrPut(self.allocator, name_id);
         if (!gop.found_existing) {
             gop.value_ptr.* = builds.items.len;
             try builds.append(self.allocator, .{ .group = .{
                 .first = entry.origin orelse entry.path[0],
-                .name = try attrSegmentNameAlloc(self, entry.path[0]),
+                .name = try attr_names.alloc(self, entry.path[0]),
                 .name_id = name_id,
             } });
         }
@@ -886,114 +886,7 @@ fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGr
     return .{ .groups = groups, .leaves = leaves, .tails = tails };
 }
 
-pub fn reportDuplicateAttribute(self: *Compiler, duplicate: Node.Atom, original: Node.Atom) !void {
-    try diagnostics.reportCompileError(self, duplicate.offset, duplicate.len, "duplicate attribute");
-    try diagnostics.reportCompileNote(self, original.offset, original.len, "first attribute defined here");
-}
-
-pub fn attrSegmentsEqual(self: *const Compiler, a: Node.Atom, b: Node.Atom) bool {
-    return std.mem.eql(u8, attrSegmentSpan(self, a), attrSegmentSpan(self, b));
-}
-
 pub fn emitAttrNameId(self: *Compiler, name_id: InternId) !void {
     const name_val = Value.string(name_id);
     try self.builder.emitConstant(self.allocator, name_val);
-}
-
-pub fn appendAttrPosition(
-    self: *Compiler,
-    positions: *std.ArrayListUnmanaged(heap_mod.AttrPosEntry),
-    atom: Node.Atom,
-    name_id: InternId,
-) !void {
-    _ = self.source_path orelse return;
-    const position = try diagnostics.sourcePositionForOffset(self, atom.offset);
-    try positions.append(self.allocator, .{
-        .name = name_id,
-        .pos = .{
-            .file = try sourceFileId(self),
-            .line = position.line,
-            .column = position.column,
-        },
-    });
-}
-
-pub fn sourceFileId(self: *Compiler) !InternId {
-    if (self.source_file_id) |id| return id;
-    const path = self.source_path orelse return error.MissingSourcePath;
-    const id = try self.intern.intern(path);
-    self.source_file_id = id;
-    return id;
-}
-
-pub fn attrSegmentSpan(self: *const Compiler, atom: Node.Atom) []const u8 {
-    const span = self.source[atom.offset .. atom.offset + atom.len];
-    if (span.len >= 2 and span[0] == '"' and span[span.len - 1] == '"') {
-        return span[1 .. span.len - 1];
-    }
-    return span;
-}
-
-/// A double-quoted name whose body has no escapes or interpolation
-/// decodes to exactly its inner bytes — the common shape of generated
-/// package sets (`"pkg-name" = ...`). Returns that inner slice, or null
-/// when the segment needs the full `parseLiteral` decode.
-fn simpleQuotedInner(self: *const Compiler, atom: Node.Atom) ?[]const u8 {
-    const span = self.source[atom.offset .. atom.offset + atom.len];
-    if (span.len < 2 or span[0] != '"' or span[span.len - 1] != '"') return null;
-    const inner = span[1 .. span.len - 1];
-    if (std.mem.indexOfAny(u8, inner, "\\$\"") != null) return null;
-    return inner;
-}
-
-pub fn attrSegmentNameId(self: *Compiler, atom: Node.Atom) !InternId {
-    // Fast path: an unquoted identifier segment is a verbatim slice of
-    // source. `intern` copies the bytes into its own table, so the
-    // dupe+free that `attrSegmentNameAlloc` performs for this case is
-    // pure churn — intern the source span directly. Produces the exact
-    // same InternId, so the emitted bytecode is byte-identical.
-    if (string_syntax.kindAt(self.source, atom.offset) == null) {
-        return self.intern.intern(self.source[atom.offset .. atom.offset + atom.len]);
-    }
-    // Same idea for simple quoted names: decode is the identity on the
-    // inner bytes, so intern them without the parseLiteral round-trip.
-    if (simpleQuotedInner(self, atom)) |inner| {
-        return self.intern.intern(inner);
-    }
-    const name = try attrSegmentNameAlloc(self, atom);
-    defer self.allocator.free(name);
-    return self.intern.intern(name);
-}
-
-pub fn attrSegmentNameAlloc(self: *Compiler, atom: Node.Atom) ![]u8 {
-    const span = self.source[atom.offset .. atom.offset + atom.len];
-    if (string_syntax.kindAt(self.source, atom.offset) == null) {
-        return self.allocator.dupe(u8, span);
-    }
-    if (simpleQuotedInner(self, atom)) |inner| {
-        return self.allocator.dupe(u8, inner);
-    }
-
-    const parsed = try string_syntax.parseLiteral(self.allocator, self.source, .{
-        .start = atom.offset,
-        .end = atom.offset + atom.len,
-    });
-    defer parsed.deinit();
-
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(self.allocator);
-
-    for (parsed.parts) |part| {
-        switch (part) {
-            .text => |text| try out.appendSlice(self.allocator, text.slice()),
-            .interpolation => return error.InvalidAttributePath,
-        }
-    }
-
-    return out.toOwnedSlice(self.allocator);
-}
-
-pub fn attrSegmentHasInterpolation(self: *const Compiler, atom: Node.Atom) bool {
-    const span = self.source[atom.offset .. atom.offset + atom.len];
-    return string_syntax.kindAt(self.source, atom.offset) != null and std.mem.indexOf(u8, span, "${") != null;
 }

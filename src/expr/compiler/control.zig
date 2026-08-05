@@ -9,7 +9,6 @@ const bytecode = @import("../bytecode.zig");
 const builtins = @import("runtime").builtins;
 const chunk = bytecode.chunk;
 const diagnostic = @import("syntax").diagnostic;
-const heap_mod = @import("runtime").heap;
 const string_syntax = @import("syntax").string_syntax;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;

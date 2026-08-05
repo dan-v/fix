@@ -18,7 +18,7 @@ const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
-const attrs_mod = @import("attrs.zig");
+const attr_names = @import("attr_names.zig");
 const access = @import("access.zig");
 const control = @import("control.zig");
 const strictness = @import("strictness.zig");
@@ -161,8 +161,8 @@ fn inlineBuiltinHead(self: *Compiler, head_raw: *const Node) !?InlineBuiltin {
     }
 
     const segment = head.data.attr_path.segments[0];
-    if (attrs_mod.attrSegmentHasInterpolation(self, segment)) return null;
-    const name = self.intern.get(try attrs_mod.attrSegmentNameId(self, segment));
+    if (attr_names.hasInterpolation(self, segment)) return null;
+    const name = self.intern.get(try attr_names.intern(self, segment));
     if (std.mem.eql(u8, name, "sub")) return .sub;
     if (std.mem.eql(u8, name, "mul")) return .mul;
     if (std.mem.eql(u8, name, "div")) return .div;
@@ -413,7 +413,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
             const pos = try diagnostics.sourcePositionForOffset(self, param.name.offset);
             try function_arg_pos.append(self.allocator, .{
                 .name = name_id,
-                .pos = .{ .file = try attrs_mod.sourceFileId(self), .line = pos.line, .column = pos.column },
+                .pos = .{ .file = try diagnostics.sourceFileId(self), .line = pos.line, .column = pos.column },
             });
         }
     }

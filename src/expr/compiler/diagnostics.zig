@@ -10,7 +10,6 @@ const ast = @import("syntax").ast;
 const chunk = @import("../bytecode.zig").chunk;
 const diagnostic = @import("syntax").diagnostic;
 const types = @import("runtime").types;
-const attrs = @import("attrs.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -23,6 +22,11 @@ pub fn reportCompileError(self: *Compiler, offset: u32, len: u32, message: []con
 
 pub fn reportCompileNote(self: *Compiler, offset: u32, len: u32, message: []const u8) !void {
     try reportDiagnostic(self, .note, offset, len, message);
+}
+
+pub fn reportDuplicateAttribute(self: *Compiler, duplicate: Node.Atom, original: Node.Atom) !void {
+    try reportCompileError(self, duplicate.offset, duplicate.len, "duplicate attribute");
+    try reportCompileNote(self, original.offset, original.len, "first attribute defined here");
 }
 
 pub fn reportDiagnostic(self: *Compiler, severity: Diagnostic.Severity, offset: u32, len: u32, message: []const u8) !void {
@@ -110,7 +114,17 @@ pub fn optionalSourceFileId(self: *Compiler) !?InternId {
     // which the timeline (and error traces) can't name.
     if (self.source_file_id) |id| return id;
     if (self.source_path == null) return null;
-    return try attrs.sourceFileId(self);
+    return try sourceFileId(self);
+}
+
+/// Intern the source path once and share its id with every child compiler.
+/// Source identity belongs to diagnostics/source maps, not attribute lowering.
+pub fn sourceFileId(self: *Compiler) !InternId {
+    if (self.source_file_id) |id| return id;
+    const path = self.source_path orelse return error.MissingSourcePath;
+    const id = try self.intern.intern(path);
+    self.source_file_id = id;
+    return id;
 }
 
 /// Like `sourceSpanForNode`, but from a bare source atom (offset/len) — used to

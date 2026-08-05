@@ -12,7 +12,7 @@ const emit = @import("emit.zig");
 const int_ops = @import("runtime").int;
 const heap_mod = @import("runtime").heap;
 const string_syntax = @import("syntax").string_syntax;
-const attrs_mod = @import("attrs.zig");
+const attr_names = @import("attr_names.zig");
 const literals_mod = @import("literals.zig");
 const types = @import("runtime").types;
 const scope = @import("scope.zig");
@@ -237,11 +237,11 @@ fn tryFoldAttrSet(self: *Compiler, n: *const Node) anyerror!?Value {
         if (entry.dynamic_name != null) return null;
         if (entry.path.len != 1) return null; // nested paths carry grouping semantics
         if (entry.inherit_outer) return null;
-        if (attrs_mod.attrSegmentHasInterpolation(self, entry.path[0])) return null;
-        const name_id = try attrs_mod.attrSegmentNameId(self, entry.path[0]);
+        if (attr_names.hasInterpolation(self, entry.path[0])) return null;
+        const name_id = try attr_names.intern(self, entry.path[0]);
         const v = (try tryFoldNode(self, entry.expr)) orelse return null;
         try entries.append(self.allocator, .{ .name = name_id, .value = v });
-        try attrs_mod.appendAttrPosition(self, &positions, entry.path[0], name_id);
+        try attr_names.appendPosition(self, &positions, entry.path[0], name_id);
     }
     const id = self.heap.addAttrsWithPositions(entries.items, positions.items) catch |err| switch (err) {
         error.DuplicateAttribute => return null,
