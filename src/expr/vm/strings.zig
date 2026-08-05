@@ -97,6 +97,31 @@ pub fn stringTextInternIdsEqual(self: *VM, left: Value, right: Value) !bool {
 /// everything-interns behavior, 0 is the everything-heap stress lane.
 pub var heap_string_min: usize = 64;
 
+/// Speculative strings are useful only if demand eventually observes their
+/// thunk. Before GC tracking arms, putting each one in its own heap object
+/// cannot reclaim anything and magnifies undemanded NixOS work. Intern those
+/// early speculative results instead; demand work keeps bounded heap strings,
+/// and once collection is active speculative strings become reclaimable too.
+inline fn useHeapString(self: *VM, len: usize) bool {
+    return useHeapStringAt(
+        heap_string_min,
+        len,
+        self.speculation.active,
+        self.heap.collectionEnabled(),
+    );
+}
+
+fn useHeapStringAt(threshold: usize, len: usize, speculative: bool, collection_enabled: bool) bool {
+    return len >= threshold and (!speculative or collection_enabled);
+}
+
+test "speculative assembled strings wait for collection tracking" {
+    try std.testing.expect(useHeapStringAt(64, 64, false, false));
+    try std.testing.expect(!useHeapStringAt(64, 64, true, false));
+    try std.testing.expect(useHeapStringAt(64, 64, true, true));
+    try std.testing.expect(!useHeapStringAt(64, 63, false, true));
+}
+
 /// Construct a string value from freshly-assembled bytes. Short text
 /// interns (dedup pays: attr names, keys, repeated fragments); text of at
 /// least `heap_string_min` bytes becomes a GC-able heap string, so churn —
@@ -104,7 +129,7 @@ pub var heap_string_min: usize = 64;
 /// NEVER route text bound for a context string or an attr name through
 /// this: those stay id-keyed (`addContextString` asserts it).
 pub fn makeString(self: *VM, bytes: []const u8) !Value {
-    if (bytes.len >= heap_string_min)
+    if (useHeapString(self, bytes.len))
         return Value.heapString(try self.heap.addHeapString(bytes));
     return Value.string(try self.intern.intern(bytes));
 }
@@ -139,7 +164,7 @@ pub fn makeUniqueString(self: *VM, bytes: []const u8) !Value {
 /// `internConcatParts`.
 pub fn makeConcatString(self: *VM, parts: []const []const u8, total: usize) !Value {
     const t_start = prof.tscMainOnly();
-    if (total >= heap_string_min) {
+    if (useHeapString(self, total)) {
         const id = try self.heap.addHeapStringParts(parts, @intCast(total));
         if (prof.enabled and t_start != 0) {
             prof_census.str.concat_calls += 1;

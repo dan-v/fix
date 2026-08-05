@@ -22,15 +22,6 @@ pub fn report(ev: *Engine) void {
         "intern: entries={d} data_bytes={d} shard_imbalance={d:.2}x\n",
         .{ intern.entries, intern.data_bytes, intern.shardImbalance() },
     );
-    // First-intern length census: one "len<2^k: count/bytes" cell per
-    // populated bucket. The long tail quantifies what a GC-able string
-    // representation would take off the immortal table.
-    std.debug.print("intern-new-len:", .{});
-    for (intern.new_len_counts, intern.new_len_bytes, 0..) |count, bytes, k| {
-        if (count == 0) continue;
-        std.debug.print(" <2^{d}:{d}/{d}", .{ k + 1, count, bytes });
-    }
-    std.debug.print("\n", .{});
     const chunks = ev.chunkStats();
     std.debug.print(
         "chunks: count={d} code_bytes={d} constants={d} source_spans={d} max_code_bytes={d}\n",
