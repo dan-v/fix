@@ -251,6 +251,15 @@ fn writeValueInner(
             try writeEscaped(writer, intern.get(value.asInternId()));
             try writer.writeByte('"');
         },
+        .heap_string => {
+            const text = heap.getHeapString(value.asObjectId()) catch {
+                try writer.writeAll("hs_err");
+                return;
+            };
+            try writer.writeByte('"');
+            try writeEscaped(writer, text);
+            try writer.writeByte('"');
+        },
         .path => {
             try writer.writeAll("p\"");
             try writeEscaped(writer, intern.get(value.asInternId()));
