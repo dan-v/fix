@@ -79,6 +79,17 @@ SingleClaimer == (state = "evaluating") <=> (claimer \in Claimers)
 \* An enrolled waiter exists only while a claimer is evaluating. Enrollment
 \* against an unresolved or terminal future is the lost-wakeup bug the
 \* under-lock state recheck in `enrollWaiter` exists to prevent.
+\*
+\* REFINEMENT OBLIGATION (below TLC's semantics — TLA+ actions are
+\* sequentially consistent, so TLC cannot check this): the implementation
+\* must make Enroll and Publish genuinely atomic w.r.t. each other. Both
+\* serialize on the tagged `Future.waiters` word (LSB = lock), and —
+\* the trap actually hit in 2026-08 — Publish's EMPTY-list fast path must
+\* still synchronize on that word (a seq_cst RMW, `fetchOr 0`), not a
+\* plain load: with a plain load the resolver's `state` store can sit in
+\* its store buffer while it reads waiters == 0, a concurrent enroller
+\* re-checks `state`, reads the stale value, and parks forever —
+\* violating EveryWaiterWakes in an execution this spec cannot express.
 WaitingImpliesEvaluating ==
     \A w \in Waiters: wstate[w] = "waiting" => state = "evaluating"
 
