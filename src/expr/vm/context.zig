@@ -331,6 +331,8 @@ pub const VM = struct {
 
     /// Compatibility policy applied while parsing and compiling this code.
     policy: LanguagePolicy,
+    /// Engine-local threshold for routing derived strings to the GC heap.
+    heap_string_min: usize,
     /// Nix's `trace-verbose` setting gates `builtins.traceVerbose`.
     trace_verbose: bool,
 
@@ -362,6 +364,7 @@ pub const VM = struct {
         break_sink: ?BreakSink = null,
         breakpoints: ?*bytecode_mod.BreakpointTable = null,
         policy: LanguagePolicy = .{},
+        heap_string_min: usize = 64,
         trace_verbose: bool = false,
         lazy_shells_visible: bool = false,
     };
@@ -414,6 +417,7 @@ pub const VM = struct {
             .solo = options.workers.isSolo(),
             .lazy_shells_visible = options.lazy_shells_visible,
             .policy = options.policy,
+            .heap_string_min = options.heap_string_min,
             .trace_verbose = options.trace_verbose,
         };
     }

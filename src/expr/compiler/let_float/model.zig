@@ -30,6 +30,14 @@ pub const Stats = struct {
     prefix_members: std.atomic.Value(u64) = .init(0),
 };
 
+/// Engine-owned optimizer capability inherited unchanged by every compiler in
+/// a unit. `stats` is null only in isolated compiler harnesses; production
+/// Engines always supply their own counter set.
+pub const Context = struct {
+    enabled: bool = true,
+    stats: ?*Stats = null,
+};
+
 pub const Plan = struct {
     /// Per-binding: emit this group in the residual let?
     keep: []bool,

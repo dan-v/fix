@@ -22,6 +22,7 @@ const sync = @import("base").sync;
 const diagnostic = @import("syntax").diagnostic;
 const Parser = @import("syntax").parser.Parser;
 const LanguagePolicy = @import("../policy.zig").LanguagePolicy;
+const LetFloatContext = @import("let_float/model.zig").Context;
 
 const InternId = types.InternId;
 const NameId = @import("../bytecode.zig").NameId;
@@ -109,6 +110,8 @@ pub const Table = struct {
     const Store = segments.StableSegments(*Entry, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
     allocator: std.mem.Allocator,
+    /// Engine-owned compile policy used by every force-time deferred body.
+    let_float: LetFloatContext = .{},
     entries: Store = .empty,
     /// Per-source line-index cache (keyed by source pointer). Force-time
     /// compiles of bodies from the same file share one line index instead

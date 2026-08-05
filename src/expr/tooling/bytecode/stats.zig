@@ -59,7 +59,12 @@ fn isThunkFamilyOp(op: OpCode) bool {
 /// breakdowns, mnemonic histogram, position-table share, duplicate-body reuse,
 /// and deflate compressibility of the concatenated code — the measurement
 /// harness for codegen-size work.
-pub fn write(allocator: std.mem.Allocator, writer: *std.Io.Writer, registry: *const ChunkRegistry) !void {
+pub fn write(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    registry: *const ChunkRegistry,
+    let_float_stats: *const let_float.Stats,
+) !void {
     const a = allocator;
     const n = registry.count();
 
@@ -225,8 +230,8 @@ pub fn write(allocator: std.mem.Allocator, writer: *std.Io.Writer, registry: *co
         try writer.print("duplicate bodies ({s}): members {d}   distinct {d}   duplicates {d}   wasted bytes {d}\n", .{ pair[0], members, distinct, members - distinct, wasted });
     }
 
-    // Binding-placement census (whole-process counters; nonzero only when
-    // the corpus was compiled in this process, e.g. `disasm --stats --eval`).
+    // Binding-placement census for this Engine (nonzero only when the corpus
+    // was compiled by it, e.g. `disasm --stats --eval`).
     try writer.print("\nlet-float census:\n", .{});
-    try let_float.writeReport(writer);
+    try let_float.writeReport(writer, let_float_stats);
 }

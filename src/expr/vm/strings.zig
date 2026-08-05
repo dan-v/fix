@@ -88,15 +88,6 @@ pub fn stringTextInternIdsEqual(self: *VM, left: Value, right: Value) !bool {
     return (try stringTextInternId(self, left)) == (try stringTextInternId(self, right));
 }
 
-/// Threshold at which derived-string producers allocate GC-able heap
-/// strings (`Value.heap_string`) instead of interning. Default 64: the
-/// phase-0 census put the churn class (unique fold/interpolation
-/// intermediates — the unbounded-growth case) at 64+ bytes, while
-/// shorter strings keep interning for dedup. Overridden once at engine
-/// init from `FIX_HEAP_STR_MIN`: a huge value restores the
-/// everything-interns behavior, 0 is the everything-heap stress lane.
-pub var heap_string_min: usize = 64;
-
 /// Speculative strings are useful only if demand eventually observes their
 /// thunk. Before GC tracking arms, putting each one in its own heap object
 /// cannot reclaim anything and magnifies undemanded NixOS work. Intern those
@@ -104,7 +95,7 @@ pub var heap_string_min: usize = 64;
 /// and once collection is active speculative strings become reclaimable too.
 inline fn useHeapString(self: *VM, len: usize) bool {
     return useHeapStringAt(
-        heap_string_min,
+        self.heap_string_min,
         len,
         self.speculation.active,
         self.heap.collectionEnabled(),
@@ -124,7 +115,7 @@ test "speculative assembled strings wait for collection tracking" {
 
 /// Construct a string value from freshly-assembled bytes. Short text
 /// interns (dedup pays: attr names, keys, repeated fragments); text of at
-/// least `heap_string_min` bytes becomes a GC-able heap string, so churn —
+/// least this VM's `heap_string_min` bytes becomes a GC-able heap string, so churn —
 /// unique intermediates nothing ever looks at again — can be collected.
 /// NEVER route text bound for a context string or an attr name through
 /// this: those stay id-keyed (`addContextString` asserts it).
@@ -150,9 +141,9 @@ pub fn makeString(self: *VM, bytes: []const u8) !Value {
 ///   unique in practice, and interning a fold's worth of them was 33% of
 ///   churn wall in table growth + rehash.
 ///
-/// `heap_string_min` at maxInt remains the master off-switch.
+/// The Engine's `heap_string_min` at maxInt remains the master off-switch.
 pub fn makeUniqueString(self: *VM, bytes: []const u8) !Value {
-    if (bytes.len <= 5 or heap_string_min == std.math.maxInt(usize))
+    if (bytes.len <= 5 or self.heap_string_min == std.math.maxInt(usize))
         return Value.string(try self.intern.intern(bytes));
     return Value.heapString(try self.heap.addHeapString(bytes));
 }

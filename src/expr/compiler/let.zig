@@ -168,7 +168,7 @@ const LetPlan = struct {
         errdefer self.allocator.free(in_prefix);
         @memset(in_prefix, false);
         for (prefix.items) |i| in_prefix[i] = true;
-        let_float.bumpPrefixMembers(prefix.items.len);
+        let_float.bumpPrefixMembers(self.let_float.stats, prefix.items.len);
 
         // Validate the prefix against sibling references: a member may only
         // be referenced by LATER members (their pass-3 evaluations read its

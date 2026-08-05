@@ -511,6 +511,10 @@ const SourceState = struct {
 
 const CompilationState = struct {
     deferred_table: deferred_mod.Table,
+    /// Per-Engine rewrite census. Compilers receive an explicit pointer when
+    /// the immutable tuning policy is resolved; no process-global state is
+    /// shared by sequential or concurrent Engines.
+    let_float_stats: compiler_mod.let_float.Stats = .{},
     retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena) = .empty,
     retained_arenas_mu: SpinMutex = .{},
     /// Persistent chunk-cache configuration, resolved once at
@@ -586,6 +590,10 @@ pub const Engine = struct {
     /// Feature gates and deprecated compatibility behavior shared unchanged by
     /// parsing, every nested compiler, and every VM.
     policy: LanguagePolicy = .{},
+    /// Immutable performance policy, resolved at the first compile/evaluate
+    /// operation after callers have configured this Engine's environment and
+    /// scheduler. It is fixed before any worker starts.
+    tuning_policy: ?tuning.Policy = null,
     /// Owns the backing strings for `policy.allowed_path_roots` (the flake
     /// source tree(s) readable under pure eval). Set via `setPureEval`.
     pure_eval_roots: [][]u8 = &.{},
@@ -689,8 +697,32 @@ pub const Engine = struct {
     /// Whether `FIX_LET_FLOAT_STATS` asked for the rewrite census at
     /// teardown — fast-exit paths keep explicit `deinit` alive for it.
     pub fn letFloatCensusEnabled(self: *const Engine) bool {
-        _ = self;
-        return compiler_mod.let_float.report_on_deinit;
+        return if (self.tuning_policy) |policy| policy.let_float_report else false;
+    }
+
+    /// Engine-owned let-rewrite statistics for tooling reports.
+    pub fn letFloatStats(self: *const Engine) *const compiler_mod.let_float.Stats {
+        return &self.compilation.let_float_stats;
+    }
+
+    /// Freeze every environment-driven performance choice into one Engine-
+    /// owned value. This is the single entrance for compile-only and evaluate
+    /// paths, so deferred compilation, cache identity, workers, and VMs all
+    /// observe exactly the same policy.
+    fn ensureTuningPolicy(self: *Engine) *const tuning.Policy {
+        if (self.tuning_policy == null) {
+            self.tuning_policy = tuning.resolve(
+                self.execution.scheduler.configuration(),
+                self.sources.env_map,
+                self.execution.worker_count,
+            );
+            const policy = &self.tuning_policy.?;
+            self.compilation.deferred_table.let_float = .{
+                .enabled = policy.let_float_enabled,
+                .stats = &self.compilation.let_float_stats,
+            };
+        }
+        return &self.tuning_policy.?;
     }
 
     pub fn deinit(self: *Engine) void {
@@ -700,12 +732,12 @@ pub const Engine = struct {
         // Publish queued cache writes before the census reads the `writes`
         // counter and before the cache dir path is freed.
         self.flushChunkCacheWrites();
-        // Rewrite census (`FIX_LET_FLOAT_STATS=1`) — whole-process counters,
+        // Rewrite census (`FIX_LET_FLOAT_STATS=1`) — Engine-owned counters,
         // reported once at teardown, entirely off the evaluation path.
-        if (compiler_mod.let_float.report_on_deinit) {
+        if (self.letFloatCensusEnabled()) {
             var buf: [4096]u8 = undefined;
             var w: std.Io.Writer = .fixed(&buf);
-            compiler_mod.let_float.writeReport(&w) catch {};
+            compiler_mod.let_float.writeReport(&w, &self.compilation.let_float_stats) catch {};
             std.debug.print("let-float census:\n{s}", .{buf[0..w.end]});
             std.debug.print(
                 "chunk-cache census:\n  hits: {d}\n  misses: {d}\n  writes: {d}\n  rejects: {d}\n",
@@ -1101,6 +1133,7 @@ pub const Engine = struct {
         scope: ?Value,
     ) !ChunkId {
         try self.requireActiveEvaluation();
+        _ = self.ensureTuningPolicy();
         // Persistent chunk cache: an unchanged unit (same source bytes, path,
         // binary, policy, codegen flags) skips parse+compile entirely. Debug
         // and name-capture sessions bypass in both directions (see
@@ -1214,6 +1247,11 @@ pub const Engine = struct {
         compiler.source_path = source_path;
         compiler.home_dir = if (self.sources.env_map) |env| env.get("HOME") else null;
         compiler.policy = self.policy;
+        const compile_tuning = self.ensureTuningPolicy();
+        compiler.let_float = .{
+            .enabled = compile_tuning.let_float_enabled,
+            .stats = &self.compilation.let_float_stats,
+        };
         compiler.registration_sink = chunkRegistrationSink(self);
         // Set eagerly (not lazily on first position record, see sourceFileId):
         // chunks registered before any position record would otherwise miss
@@ -1400,10 +1438,11 @@ pub const Engine = struct {
     /// Resolve the persistent chunk-cache configuration once per engine —
     /// env knobs, cache directory, and the identity context every unit key
     /// embeds (exe fingerprint, policy fingerprint, codegen-affecting
-    /// flags). Must run AFTER `tuning.resolve` (the key snapshots
-    /// `let_float.enabled`). Failure to resolve leaves the cache disabled.
+    /// flags). Must run AFTER the tuning policy is frozen (the key snapshots
+    /// `let_float_enabled`). Failure to resolve leaves the cache disabled.
     fn resolveChunkCache(self: *Engine) void {
         if (self.compilation.chunk_cache != null) return;
+        const eval_tuning = self.ensureTuningPolicy();
         const env = self.sources.env_map orelse return;
         if (env.get("FIX_NO_CHUNK_CACHE")) |v| {
             if (!std.mem.eql(u8, v, "0")) return;
@@ -1447,7 +1486,7 @@ pub const Engine = struct {
             .generation = fingerprint,
             .home = env.get("HOME"),
             .policy_fp = policyFingerprint(&self.policy),
-            .let_float_enabled = compiler_mod.let_float.enabled,
+            .let_float_enabled = eval_tuning.let_float_enabled,
         }) catch return;
     }
 
@@ -1524,7 +1563,7 @@ pub const Engine = struct {
         }) catch |err| {
             arena.deinit();
             _ = self.compilation.cache_rejects.fetchAdd(1, .monotonic);
-            if (compiler_mod.let_float.report_on_deinit)
+            if (self.letFloatCensusEnabled())
                 std.debug.print("chunk-cache reject: {s} {s}\n", .{ @errorName(err), source_path orelse "?" });
             return null;
         };
@@ -1960,17 +1999,17 @@ pub const Engine = struct {
         // the self-reference `builtins.builtins`; that prediction is only
         // safe when no other thread is allocating objects.
         _ = try self.ensureBuiltins();
+        const eval_tuning = self.ensureTuningPolicy();
         if (!self.execution.scheduler.isStarted()) {
-            self.execution.scheduler.configure(tuning.resolve(self.execution.scheduler.configuration(), self.sources.env_map, self.execution.worker_count));
+            self.execution.scheduler.configure(eval_tuning.scheduler);
         }
         // Prefetch work is deduplicated by the import and file registries, and
         // bounded so speculative tasks cannot grow without limit.
         // After tuning: the cache key snapshots codegen-affecting knobs
-        // (`let_float.enabled`) that tuning just resolved.
+        // (`let_float_enabled`) that tuning just resolved.
         self.resolveChunkCache();
-        const prefetch = tuning.resolvePrefetch(self.sources.env_map, self.execution.worker_count);
-        self.sources.prefetch.budget = prefetch.import_budget;
-        self.execution.scheduler.setReadDirPrefetch(prefetch.read_dir_min, prefetch.read_dir_budget);
+        self.sources.prefetch.budget = eval_tuning.prefetch.import_budget;
+        self.execution.scheduler.setReadDirPrefetch(eval_tuning.prefetch.read_dir_min, eval_tuning.prefetch.read_dir_budget);
         try self.execution.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.store.realization.clearDebugRecords();
@@ -2204,6 +2243,7 @@ pub const Engine = struct {
             .policy = self.policy,
             .trace_verbose = self.trace_verbose,
             .lazy_shells_visible = self.lazy_shells_visible,
+            .heap_string_min = self.ensureTuningPolicy().heap_string_min,
         });
         // A nested VM runs on the surrounding fiber, so it borrows that
         // fiber's execution identity wholesale: claim id (any thunk it
