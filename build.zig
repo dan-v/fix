@@ -1,5 +1,25 @@
 const std = @import("std");
 
+const UnitTest = struct {
+    name: []const u8,
+    root_module: *std.Build.Module,
+    runner: std.Build.Step.Compile.TestRunner,
+    timeout: []const u8 = "10m",
+    filters: []const []const u8 = &.{},
+};
+
+fn addUnitTest(b: *std.Build, options: UnitTest) *std.Build.Step.Run {
+    const compile = b.addTest(.{
+        .name = options.name,
+        .root_module = options.root_module,
+        .test_runner = options.runner,
+        .filters = options.filters,
+        .use_llvm = true,
+    });
+    compile.setExecCmd(&.{ "timeout", "--kill-after=5s", options.timeout, null });
+    return b.addRunArtifact(compile);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -203,65 +223,49 @@ pub fn build(b: *std.Build) void {
         .mode = .simple,
     };
 
-    const base_tests = b.addTest(.{
+    const run_base_tests = addUnitTest(b, .{
         .name = "base-tests",
         .root_module = base_mod,
-        .test_runner = simple_test_runner,
-        .use_llvm = true,
+        .runner = simple_test_runner,
     });
-    base_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
-    const run_base_tests = b.addRunArtifact(base_tests);
 
-    const runtime_tests = b.addTest(.{
+    const run_runtime_tests = addUnitTest(b, .{
         .name = "runtime-tests",
         .root_module = runtime_mod,
-        .test_runner = simple_test_runner,
-        .use_llvm = true,
+        .runner = simple_test_runner,
     });
-    runtime_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
-    const run_runtime_tests = b.addRunArtifact(runtime_tests);
 
-    const syntax_tests = b.addTest(.{
+    const run_syntax_tests = addUnitTest(b, .{
         .name = "syntax-tests",
         .root_module = syntax_mod,
-        .test_runner = simple_test_runner,
-        .use_llvm = true,
+        .runner = simple_test_runner,
     });
-    syntax_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
-    const run_syntax_tests = b.addRunArtifact(syntax_tests);
 
-    const expr_tests = b.addTest(.{
+    const run_expr_tests = addUnitTest(b, .{
         .name = "expr-tests",
         .root_module = expr_mod,
-        .test_runner = simple_test_runner,
-        .use_llvm = true,
+        .runner = simple_test_runner,
     });
-    expr_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
-    const run_expr_tests = b.addRunArtifact(expr_tests);
 
     // Focused concurrency protocol suite. The tests live beside the modules
     // whose invariants they exercise; filters keep this lane small enough for
     // sanitizer and repeated stress runs without creating a second module
     // graph or production-only test hooks.
-    const concurrency_runtime_tests = b.addTest(.{
+    const run_concurrency_runtime_tests = addUnitTest(b, .{
         .name = "concurrency-runtime-tests",
         .root_module = runtime_mod,
-        .test_runner = simple_test_runner,
+        .runner = simple_test_runner,
         .filters = &.{"concurrency:"},
-        .use_llvm = true,
+        .timeout = "2m",
     });
-    concurrency_runtime_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "2m", null });
-    const run_concurrency_runtime_tests = b.addRunArtifact(concurrency_runtime_tests);
 
-    const concurrency_expr_tests = b.addTest(.{
+    const run_concurrency_expr_tests = addUnitTest(b, .{
         .name = "concurrency-expr-tests",
         .root_module = expr_mod,
-        .test_runner = simple_test_runner,
+        .runner = simple_test_runner,
         .filters = &.{"concurrency:"},
-        .use_llvm = true,
+        .timeout = "2m",
     });
-    concurrency_expr_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "2m", null });
-    const run_concurrency_expr_tests = b.addRunArtifact(concurrency_expr_tests);
 
     const integration_test_mod = b.createModule(.{
         .root_source_file = b.path("src/integration/expr_api.zig"),
@@ -272,41 +276,29 @@ pub fn build(b: *std.Build) void {
             .{ .name = "runtime", .module = runtime_mod },
         },
     });
-    const integration_tests = b.addTest(.{
+    const run_integration_tests = addUnitTest(b, .{
         .name = "integration-tests",
         .root_module = integration_test_mod,
-        .test_runner = simple_test_runner,
-        .use_llvm = true,
+        .runner = simple_test_runner,
     });
-    integration_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
-    const run_integration_tests = b.addRunArtifact(integration_tests);
 
-    const fetchers_tests = b.addTest(.{
+    const run_fetchers_tests = addUnitTest(b, .{
         .name = "fetchers-tests",
         .root_module = fetchers_mod,
-        .test_runner = simple_test_runner,
-        .use_llvm = true,
+        .runner = simple_test_runner,
     });
-    fetchers_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
-    const run_fetchers_tests = b.addRunArtifact(fetchers_tests);
 
-    const store_tests = b.addTest(.{
+    const run_store_tests = addUnitTest(b, .{
         .name = "store-tests",
         .root_module = store_mod,
-        .test_runner = simple_test_runner,
-        .use_llvm = true,
+        .runner = simple_test_runner,
     });
-    store_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
-    const run_store_tests = b.addRunArtifact(store_tests);
 
-    const cli_tests = b.addTest(.{
+    const run_cli_tests = addUnitTest(b, .{
         .name = "cli-tests",
         .root_module = cli_mod,
-        .test_runner = simple_test_runner,
-        .use_llvm = true,
+        .runner = simple_test_runner,
     });
-    cli_tests.setExecCmd(&.{ "timeout", "--kill-after=5s", "10m", null });
-    const run_cli_tests = b.addRunArtifact(cli_tests);
 
     const test_base_step = b.step("test-base", "Run base unit tests");
     test_base_step.dependOn(&run_base_tests.step);

@@ -11,6 +11,14 @@ tests cover those layers.
   behaviors are in the state space. It checks that enrollment only happens
   under an active claim, that every enrolled waiter is eventually woken, and
   that evaluation eventually leaves its busy state.
+- `FutureWaitTSO`: the same enroll-versus-publish race at the memory-ordering
+  level. Store buffers and the no-op waiter-word RMW model the fence that keeps
+  an enroller from observing stale `.evaluating` state after a resolver saw an
+  empty list.
+- `DequeTSO`: Chase-Lev owner pop and thief steal under TSO store buffers. It
+  checks that the last item cannot be lost or returned twice, including the
+  last-item CAS race and the full fence between the owner's bottom update and
+  top load.
 - `FiberDispatch`: lifecycle publication, ready tokens, popped contenders,
   run ownership, suspension, wake-before-yield, finish, and recycle. Queue
   membership and run ownership are separate because a wake may be queued
@@ -42,7 +50,7 @@ Run all models with:
 zig build check-models
 ```
 
-The check also applies one deliberate mutation per model—removing the Future
-enrollment recheck, the fiber run-ownership exclusivity guard, the
-external-job drain, and the GC releasing phase—and requires TLC to reject
-each weakened model.
+The check also applies deliberate mutations at each load-bearing joint—the
+Future enrollment recheck and wake fence; deque pop fence and owner/thief
+CASes; fiber run-ownership exclusivity; external-job drain; and GC releasing
+phase—and requires TLC to reject every weakened model.
