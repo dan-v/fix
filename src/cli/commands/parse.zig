@@ -18,6 +18,8 @@ const fileish = @import("../fileish.zig");
 const presentation = @import("../presentation.zig");
 const render = @import("../render.zig");
 const setup = @import("../setup.zig");
+const config_discovery = @import("../config_discovery.zig");
+const parse_json = @import("../parse_json.zig");
 
 const Engine = engine.Engine;
 const Parser = syntax.parser.Parser;
@@ -54,17 +56,19 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const use_color = presentation.colorDepth(options.color, init.io, init.environ_map).enabled();
 
     const memory_backing = setup.applyMemoryBacking(process, null);
-    var settings = setup.loadSettingsAndFlakeConfig(allocator, init, &options) catch |err| {
+    var settings = config_discovery.loadLocal(allocator, init, &options) catch |err| {
         if (err != error.ConfigError) return err;
         return 1;
     };
     defer settings.deinit();
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, memory_backing));
     defer ev.deinit();
-    _ = setup.configure(&ev, init, &options, &settings) catch |err| {
+    const term = setup.configure(&ev, init, &options, &settings) catch |err| {
         render.caughtError(init.io, use_color, err, "", .{});
         return 1;
     };
+    defer term.deinit(ev.hostAllocator());
 
     const source_arg = options.source orelse options.defaultSource();
     var loaded = loadSource(&ev, init.io, source_arg) catch |err| {
@@ -128,7 +132,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // 3. Emit the AST as JSON.
     var buf: [64 * 1024]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(init.io, &buf);
-    syntax.json.write(&w.interface, allocator, source, node) catch |err| {
+    parse_json.write(&w.interface, allocator, source, node) catch |err| {
         render.caughtError(init.io, use_color, err, "writing JSON", .{});
         return 1;
     };

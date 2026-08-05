@@ -10,6 +10,7 @@ const engine = @import("expr");
 const args = @import("../args.zig");
 const render = @import("../render.zig");
 const setup = @import("../setup.zig");
+const config_discovery = @import("../config_discovery.zig");
 
 const Engine = engine.Engine;
 const Value = @import("runtime").Value;
@@ -61,7 +62,8 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer options.deinit(allocator);
 
     const memory_backing = setup.applyMemoryBacking(process, options.hugetlb);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
+    var settings = try config_discovery.loadLocal(allocator, init, &options);
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(
         allocator,
@@ -69,6 +71,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     );
     defer ev.deinit();
     const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
     if (!ev.languagePolicy().flakes_enabled) {
         render.messageError(init.io, term.use_color, "{s}", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;

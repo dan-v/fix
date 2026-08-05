@@ -12,7 +12,7 @@ const render = @import("render.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
 const hugetlb = @import("base").hugetlb;
-const TextRef = @import("base").TextRef;
+const effect_output = @import("effect_output.zig");
 
 const Engine = engine.Engine;
 pub const default_state_dir = "/nix/var/nix";
@@ -53,9 +53,14 @@ pub const Terminal = struct {
     use_color: bool,
     color_depth: presentation.ColorDepth,
     log_progress: bool,
+    effects: *effect_output.StderrSink,
 
     pub fn progressEnabled(self: Terminal) bool {
         return self.log_progress;
+    }
+
+    pub fn deinit(self: Terminal, allocator: std.mem.Allocator) void {
+        self.effects.destroy(allocator);
     }
 };
 
@@ -75,26 +80,6 @@ pub fn applyMemoryBacking(
     return policy;
 }
 
-/// Load nix.conf, apply CLI overrides, then explicitly fetch and fold each
-/// flake input's `nixConfig`. This is the pre-engine phase because flake config
-/// may perform network I/O and construct a short-lived evaluator.
-pub fn loadSettingsAndFlakeConfig(
-    allocator: std.mem.Allocator,
-    init: std.process.Init,
-    options: *const args.Options,
-) !nix_conf.Settings {
-    var settings = try nix_conf.load(allocator, init.environ_map, init.io);
-    errdefer settings.deinit();
-    // Environment store selection sits above nix.conf but below an explicit
-    // `--store`/`--option store` CLI override.
-    if (init.environ_map.get("NIX_REMOTE")) |remote|
-        if (remote.len != 0) try settings.setOrAppend("store", remote);
-    for (options.option_overrides.items) |override|
-        try settings.setOrAppend(override.name, override.value);
-    applyFlakeNixConfig(allocator, init, options, &settings);
-    return settings;
-}
-
 /// Apply already-resolved settings and CLI policy to an Engine, then derive
 /// terminal presentation. This phase performs no configuration discovery and
 /// does not construct a hidden evaluator.
@@ -104,11 +89,6 @@ pub fn configure(
     options: *const args.Options,
     settings: *nix_conf.Settings,
 ) !Terminal {
-    // Language effects are durable stderr records, independent of progress
-    // verbosity. The evaluator sink synchronizes and flushes each one.
-    // Interactive terminals additionally get ANSI sync-wrapped records so a
-    // streamed frame can't tear mid-repaint.
-    ev.setEffectStderr(init.io, presentation.isStderrInteractive(init.io, init.environ_map));
     // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap is
     // pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.setLazyShellsVisible(options.output == .xml);
@@ -209,80 +189,18 @@ pub fn configure(
     const use_color = color_depth.enabled();
     const progress = presentation.progressPolicy(options.progress);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
+    const effects = try effect_output.StderrSink.create(
+        ev.hostAllocator(),
+        init.io,
+        presentation.isStderrInteractive(init.io, init.environ_map),
+    );
+    ev.setEffectSink(effects.effectSink());
     return .{
         .use_color = use_color,
         .color_depth = color_depth,
         .log_progress = progress.log,
+        .effects = effects,
     };
-}
-
-/// Fold each flake installable's `nixConfig` into `settings`, exactly like
-/// `--option` overrides (config < `--option` < `nixConfig`). Read via a
-/// throwaway evaluator that fetches the flake source and imports only its
-/// `flake.nix` `nixConfig` — no outputs, inputs, or store access — so it runs
-/// before any daemon connection. Remote flakes are fetched (disk-cached, so the
-/// real evaluation reuses it); a private/custom-registry flake may not resolve
-/// with the throwaway evaluator's minimal config. Best-effort: any failure
-/// leaves settings untouched.
-fn applyFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, options: *const args.Options, settings: *nix_conf.Settings) void {
-    for (options.sources.items) |src| {
-        if (src != .flake) continue;
-        const inst = src.flake;
-        const ref = if (std.mem.indexOfScalar(u8, inst, '#')) |h| inst[0..h] else inst;
-        // A local `.`/`./` ref becomes an absolute path parseFlakeRef accepts.
-        var resolved = resolveNixConfigRef(allocator, init.io, ref);
-        defer resolved.deinit(allocator);
-        foldFlakeNixConfig(allocator, init, resolved.slice(), settings);
-    }
-}
-
-const ResolvedNixConfigRef = TextRef;
-
-fn resolveNixConfigRef(allocator: std.mem.Allocator, io: std.Io, ref: []const u8) ResolvedNixConfigRef {
-    if (std.mem.eql(u8, ref, ".") or std.mem.startsWith(u8, ref, "./") or std.mem.startsWith(u8, ref, "../")) {
-        const cwd = std.process.currentPathAlloc(io, allocator) catch return .{ .borrowed = ref };
-        defer allocator.free(cwd);
-        const abs = std.fs.path.resolve(allocator, &.{ cwd, ref }) catch return .{ .borrowed = ref };
-        return .{ .owned = abs };
-    }
-    return .{ .borrowed = ref };
-}
-
-fn foldFlakeNixConfig(allocator: std.mem.Allocator, init: std.process.Init, ref: []const u8, settings: *nix_conf.Settings) void {
-    // A ref with quotes/backslashes is invalid; skip rather than mis-escape it.
-    if (std.mem.indexOfAny(u8, ref, "\"\\\n") != null) return;
-    var ev = Engine.init(allocator, engineConfig(init, 1, null)) catch return;
-    defer ev.deinit();
-    // fetchTree / parseFlakeRef need the flakes feature (which implies fetch-tree).
-    var feats: args.ExperimentalFeatures = .{};
-    feats.insert(.flakes);
-    var policy = ev.languagePolicy();
-    policy.applyFeatureSets(feats, .{});
-    ev.configureLanguage(policy);
-    ev.setFlakeRegistryUrl(settings.get("flake-registry") orelse "https://channels.nixos.org/flake-registry.json") catch {};
-    if (settings.get("access-tokens")) |t| ev.setAccessTokens(t) catch {};
-    // Fetch the flake source, then coerce its nixConfig to `name value` lines:
-    // lists join with spaces (as nix.conf expects), bools become true/false.
-    const expr = std.fmt.allocPrint(allocator,
-        \\let r = builtins.parseFlakeRef "{s}";
-        \\    src = builtins.fetchTree r;
-        \\    d = if r ? dir then "/" + r.dir else "";
-        \\    nc = (import (src.outPath + d + "/flake.nix")).nixConfig or {{}};
-        \\    c = v: if builtins.isList v then builtins.concatStringsSep " " (map toString v)
-        \\           else if builtins.isBool v then (if v then "true" else "false") else toString v;
-        \\in builtins.concatStringsSep "\n" (map (n: n + " " + c nc.${{n}}) (builtins.attrNames nc))
-    , .{ref}) catch return;
-    defer allocator.free(expr);
-    const val = ev.evaluate(expr) catch return;
-    var buf: [16384]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    ev.writeRawValue(&w, val) catch return;
-    var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
-        settings.setOrAppend(line[0..sp], line[sp + 1 ..]) catch {};
-    }
 }
 
 /// Send per-connection daemon settings via `set_options` when the store

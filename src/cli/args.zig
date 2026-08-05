@@ -10,6 +10,7 @@ const engine = @import("expr");
 const hugetlb = @import("base").hugetlb;
 const feature_lists = @import("args/features.zig");
 const option_apply = @import("args/apply.zig");
+const command_meta = @import("command_meta.zig");
 
 pub const OutputFormat = enum {
     nix,
@@ -79,7 +80,7 @@ pub const OptionOverride = struct {
 
 /// Which subcommand is asking. The shared parser uses this to reject options
 /// outside their command and to scope help and completions.
-pub const Cmd = enum { eval, parse, instantiate, build, run, shell, repl, disasm, @"switch", print_dev_env };
+pub const Cmd = command_meta.Kind;
 
 /// Semantic value classes consumed by the live shell completer. The parser's
 /// option table owns these hints so help, parsing, and completion cannot drift.

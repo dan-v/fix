@@ -1,9 +1,10 @@
 //! Representative-node tests for the AST → JSON serializer.
 
 const std = @import("std");
-const ast = @import("../ast.zig");
-const parser_mod = @import("../parser.zig");
-const json = @import("../json.zig");
+const syntax = @import("syntax");
+const ast = syntax.ast;
+const parser_mod = syntax.parser;
+const json = @import("../parse_json.zig");
 
 /// Parse `source` and render its AST as JSON into an owned buffer.
 fn render(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
@@ -284,4 +285,82 @@ test "inherit and inherit-from regroup" {
         \\}
         \\
     );
+}
+
+const PeakAllocator = struct {
+    child: std.mem.Allocator,
+    active: usize = 0,
+    peak: usize = 0,
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn allocator(self: *PeakAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn add(self: *PeakAllocator, len: usize) void {
+        self.active += len;
+        self.peak = @max(self.peak, self.active);
+    }
+
+    fn adjust(self: *PeakAllocator, old_len: usize, new_len: usize) void {
+        self.active -= old_len;
+        self.add(new_len);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.add(len);
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.adjust(memory.len, new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.adjust(memory.len, new_len);
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+        self.active -= memory.len;
+    }
+};
+
+test "wide lists stream with bounded serializer memory" {
+    var source_buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source_buffer.deinit();
+    try source_buffer.writer.writeByte('[');
+    for (0..4096) |_| try source_buffer.writer.writeAll(" 1");
+    try source_buffer.writer.writeAll(" ]");
+    const source = source_buffer.written();
+
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = parser_mod.Parser.init(std.testing.allocator, &arena, source);
+    defer parser.deinit();
+    const node = try parser.parse();
+
+    var measured: PeakAllocator = .{ .child = std.testing.allocator };
+    var discard_buffer: [1024]u8 = undefined;
+    var output: std.Io.Writer.Discarding = .init(&discard_buffer);
+    try json.write(&output.writer, measured.allocator(), source, node);
+
+    try std.testing.expect(output.fullCount() > 256 * 1024);
+    try std.testing.expect(measured.peak < 64 * 1024);
+    try std.testing.expectEqual(@as(usize, 0), measured.active);
 }

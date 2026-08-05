@@ -1,7 +1,5 @@
 //! User-facing top-level command metadata, kept in display/completion order.
 
-const args = @import("args.zig");
-
 pub const Kind = enum {
     build,
     completions,
@@ -23,8 +21,17 @@ pub const Command = struct {
     kind: Kind,
     name: []const u8,
     summary: []const u8,
-    args_cmd: ?args.Cmd,
+    args_cmd: ?Kind,
 };
+
+/// Build-time availability policy shared by dispatch, help, and completion.
+pub fn enabled(kind: Kind) bool {
+    return switch (kind) {
+        .thunks => @import("expr").vm.thunks_log_enabled,
+        .trace => @import("expr").vm.trace_log.enabled,
+        else => true,
+    };
+}
 
 pub const table = [_]Command{
     .{ .kind = .build, .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .args_cmd = .build },

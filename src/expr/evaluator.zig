@@ -979,13 +979,6 @@ pub const Engine = struct {
         self.effects.setSink(sink);
     }
 
-    /// Stream language effects to synchronized stderr, flushing each record.
-    /// `sync_updates` wraps records in ANSI synchronized-output markers; pass
-    /// true only when stderr is an interactive terminal.
-    pub fn setEffectStderr(self: *Engine, io: std.Io, sync_updates: bool) void {
-        self.effects.setStderr(io, sync_updates);
-    }
-
     pub fn setTraceVerbose(self: *Engine, enabled: bool) void {
         self.trace_verbose = enabled;
     }

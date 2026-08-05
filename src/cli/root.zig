@@ -18,6 +18,9 @@ test {
     _ = @import("debugger.zig");
     _ = @import("debugger_command.zig");
     _ = @import("eval_support.zig");
+    _ = @import("effect_output.zig");
+    _ = @import("config_discovery.zig");
+    _ = @import("parse_json.zig");
     _ = @import("fileish.zig");
     _ = @import("nix_conf.zig");
     _ = presentation;

@@ -4,6 +4,7 @@ const std = @import("std");
 const args = @import("../args.zig");
 const eval_support = @import("../eval_support.zig");
 const setup = @import("../setup.zig");
+const config_discovery = @import("../config_discovery.zig");
 const context = @import("context.zig");
 const engine = @import("expr");
 const Value = @import("runtime").Value;
@@ -24,12 +25,14 @@ pub fn completeSourceAttrs(
     const source_arg = options.source orelse options.defaultSource();
     if (source_arg == .flake) options.experimental_features.insert(.flakes);
 
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
+    var settings = try config_discovery.loadLocal(allocator, init, &options);
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    _ = try setup.configure(&ev, init, &options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
     var source = try eval_support.getCompletionSource(&ev, init.io, source_arg, options.sourceOptions());
     defer source.deinit(ev.hostAllocator());
     const value = try ev.evaluatePathAt(source.slice(), source.base_path, source.abs_path);
@@ -48,12 +51,14 @@ pub fn completePackageAttrs(
 ) !void {
     var options = try context.parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
+    var settings = try config_discovery.loadLocal(allocator, init, &options);
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    _ = try setup.configure(&ev, init, &options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
     const value = try ev.evaluate("import <nixpkgs> { }");
     try writeAttrCandidates(allocator, writer, &ev, value, prefix, replacement);
 }
@@ -76,12 +81,14 @@ pub fn completeFlakeAttrs(
     var options = try context.parseOptionsBefore(allocator, words, cmd, stop);
     defer options.deinit(allocator);
     options.experimental_features.insert(.flakes);
-    var settings = try setup.loadSettingsAndFlakeConfig(allocator, init, &options);
+    var settings = try config_discovery.loadLocal(allocator, init, &options);
+    config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
-    _ = try setup.configure(&ev, init, &options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
+    defer term.deinit(ev.hostAllocator());
 
     const source = try eval_support.lowerFlakeCompletion(&ev, flake_ref, parts.parent);
     defer ev.hostAllocator().free(source);

@@ -278,13 +278,13 @@ fn writeFishScript(io: std.Io) !void {
 fn writeFishScriptInner(w: *std.Io.Writer) !void {
     try w.writeAll(fish_script_prefix);
     for (&command_meta.table) |*command| {
-        if (commandEnabled(command.kind)) try w.print(" {s}", .{command.name});
+        if (command_meta.enabled(command.kind)) try w.print(" {s}", .{command.name});
     }
     try w.writeByte('\n');
     try w.writeAll(fish_script_suffix);
     try w.writeByte('\n');
     for (&command_meta.table) |*command| {
-        if (!commandEnabled(command.kind)) continue;
+        if (!command_meta.enabled(command.kind)) continue;
         if (command.args_cmd) |cmd| try args.writeFishOptionDeclarations(w, cmd, command.name);
     }
 }
@@ -315,14 +315,6 @@ fn runLive(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     return 0;
 }
 
-fn commandEnabled(kind: command_meta.Kind) bool {
-    return switch (kind) {
-        .thunks => @import("expr").vm.thunks_log_enabled,
-        .trace => @import("expr").vm.trace_log.enabled,
-        else => true,
-    };
-}
-
 const AvailableCommands = struct {
     metas: std.ArrayListUnmanaged(*const command_meta.Command) = .empty,
     names: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -331,7 +323,7 @@ const AvailableCommands = struct {
         var result: AvailableCommands = .{};
         errdefer result.deinit(allocator);
         for (&command_meta.table) |*command| {
-            if (!commandEnabled(command.kind)) continue;
+            if (!command_meta.enabled(command.kind)) continue;
             try result.metas.append(allocator, command);
             try result.names.append(allocator, command.name);
         }
