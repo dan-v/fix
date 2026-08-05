@@ -441,7 +441,7 @@ fn proveBuildStartsBeforeOtherEvaluationFinishes(slow_index: usize) !void {
     defer ev.deinit();
     ev.setFileIo(testing.io);
     ev.store.realization.store_dir = store_dir;
-    ev.store.realization.setDaemonSocketBorrowedForTest(fake.socketPath());
+    ev.store.realization.testAccess().useBorrowedDaemonSocket(fake.socketPath());
     ev.store.daemon_runtime.pool_workers = 2;
     ev.enableStoreWrites();
 

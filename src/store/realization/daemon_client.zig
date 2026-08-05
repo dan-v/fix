@@ -75,7 +75,7 @@ pub const Client = struct {
         self.socket = owned;
     }
 
-    pub fn setBorrowedSocketForTest(self: *Client, path: []const u8) void {
+    pub fn setBorrowedSocket(self: *Client, path: []const u8) void {
         if (comptime !builtin.is_test) unreachable;
         if (self.socket_owned) |owned| self.allocator.free(owned);
         self.socket_owned = null;
@@ -110,7 +110,7 @@ pub const Client = struct {
         self.pool = null;
     }
 
-    pub fn setTestRuntime(self: *Client, runtime: *DaemonRuntime) void {
+    pub fn takeRuntime(self: *Client, runtime: *DaemonRuntime) void {
         if (comptime !builtin.is_test) unreachable;
         self.runtime = runtime;
         self.test_owned_runtime = runtime;

@@ -131,7 +131,7 @@ pub const Claim = struct {
     }
 };
 
-pub const RecipeVariantForTest = enum { text, nar, flat };
+pub const RecipeKind = enum { text, nar, flat };
 
 pub const Graph = struct {
     allocator: std.mem.Allocator,

@@ -30,11 +30,11 @@ fn realizationApiAvailable() bool {
 /// `fake.deinit()` (declared first, so it runs last).
 fn attachFake(store: *RealizationStore, fake: *FakeDaemon) void {
     store.setIo(std.testing.io);
-    store.setDaemonSocketBorrowedForTest(fake.socketPath());
+    store.testAccess().useBorrowedDaemonSocket(fake.socketPath());
     const rt = std.testing.allocator.create(DaemonRuntime) catch @panic("OOM");
     rt.* = DaemonRuntime.init();
     rt.pool_workers = 2;
-    store.setTestRuntime(rt);
+    store.testAccess().takeDaemonRuntime(rt);
 }
 
 const ProgressRecorder = struct {
@@ -584,8 +584,8 @@ test "concurrent cross-root cyclic demands return RecipeCycle without deadlock" 
         try store.recordOwnedTextRecipe(dep_text_path, try owned(std.testing.allocator, "cross cycle b"), &.{root_path});
 
         var barrier: RootClaimBarrier = .{};
-        store.setRootClaimHookForTest(.{ .ctx = &barrier, .observe = RootClaimBarrier.hook });
-        defer store.setRootClaimHookForTest(null);
+        store.testAccess().setRootClaimHook(.{ .ctx = &barrier, .observe = RootClaimBarrier.hook });
+        defer store.testAccess().setRootClaimHook(null);
         var demands = [_]ConcurrentPathDemand{
             .{ .store = &store, .path = root_path },
             .{ .store = &store, .path = dep_text_path },
@@ -648,11 +648,11 @@ test "transient connection failure resets claim state and permits retry" {
         var store = RealizationStore.init(std.testing.allocator);
         defer store.deinit();
         store.setIo(std.testing.io);
-        store.setDaemonSocketBorrowedForTest(socket_path);
+        store.testAccess().useBorrowedDaemonSocket(socket_path);
         const rt = std.testing.allocator.create(DaemonRuntime) catch @panic("OOM");
         rt.* = DaemonRuntime.init();
         rt.pool_workers = 2;
-        store.setTestRuntime(rt);
+        store.testAccess().takeDaemonRuntime(rt);
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "retry succeeds"), &.{});
 
         // No daemon yet: the pool can't open a connection, surfaced as

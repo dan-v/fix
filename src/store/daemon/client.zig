@@ -13,304 +13,8 @@ const terminal_text = @import("base").terminal_text;
 const wire = @import("wire.zig");
 const build_events = @import("build_events.zig");
 const settings = @import("settings.zig");
-
-pub const default_socket_path = "/nix/var/nix/daemon-socket/socket";
-const default_socket_dir = "/nix/var/nix/daemon-socket";
-
-const SshTarget = struct {
-    host: []const u8,
-    port: ?[]const u8 = null,
-    ssh_key: ?[]const u8 = null,
-    compress: bool = false,
-};
-
-/// Parse the transport-level settings of an `ssh-ng://` store. Store settings
-/// that change the remote command are rejected until they can be shell-escaped
-/// without ambiguity; silently ignoring a query would be worse.
-fn sshTarget(store: []const u8) !?SshTarget {
-    const prefix = "ssh-ng://";
-    if (!std.mem.startsWith(u8, store, prefix)) return null;
-    var rest = store[prefix.len..];
-    const query_at = std.mem.indexOfScalar(u8, rest, '?');
-    const authority = if (query_at) |q| rest[0..q] else rest;
-    if (authority.len == 0 or std.mem.indexOfScalar(u8, authority, '/') != null)
-        return error.InvalidStoreUri;
-    // Match Lix's SSH authority boundary: user and host are validated
-    // independently because OpenSSH treats a leading dash in either position
-    // as an option even when the combined authority does not start with one.
-    const at = std.mem.lastIndexOfScalar(u8, authority, '@');
-    const user = if (at) |i| authority[0..i] else null;
-    const host = if (at) |i| authority[i + 1 ..] else authority;
-    if (user) |name| {
-        if (name.len == 0 or name[0] == '-') return error.InvalidStoreUri;
-    }
-    if (host.len == 0 or host[0] == '-') return error.InvalidStoreUri;
-    var target: SshTarget = .{ .host = authority };
-    if (query_at) |q| {
-        rest = rest[q + 1 ..];
-        var fields = std.mem.splitScalar(u8, rest, '&');
-        while (fields.next()) |field| {
-            if (field.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidStoreUri;
-            const name = field[0..eq];
-            const value = field[eq + 1 ..];
-            if (std.mem.eql(u8, name, "port")) {
-                _ = std.fmt.parseInt(u16, value, 10) catch return error.InvalidStoreUri;
-                target.port = value;
-            } else if (std.mem.eql(u8, name, "ssh-key")) {
-                if (value.len == 0) return error.InvalidStoreUri;
-                target.ssh_key = value;
-            } else if (std.mem.eql(u8, name, "compress")) {
-                if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"))
-                    target.compress = true
-                else if (!std.mem.eql(u8, value, "false") and !std.mem.eql(u8, value, "0"))
-                    return error.InvalidStoreUri;
-            } else {
-                return error.UnsupportedSshStoreSetting;
-            }
-        }
-    }
-    return target;
-}
-
-const max_ssh_args = 13;
-
-/// Build the OpenSSH argv with the same security boundary as Lix's SSHMaster:
-/// a validated destination, `-x`, transport settings, then `--` before the
-/// remote program. fix additionally keeps BatchMode enabled so store commands
-/// never hang waiting for an interactive credential prompt.
-fn sshCommandArgs(target: SshTarget, argv: *[max_ssh_args][]const u8) []const []const u8 {
-    var argc: usize = 0;
-    argv[argc] = "ssh";
-    argc += 1;
-    argv[argc] = target.host;
-    argc += 1;
-    argv[argc] = "-x";
-    argc += 1;
-    argv[argc] = "-o";
-    argc += 1;
-    argv[argc] = "BatchMode=yes";
-    argc += 1;
-    if (target.compress) {
-        argv[argc] = "-C";
-        argc += 1;
-    }
-    if (target.port) |port| {
-        argv[argc] = "-p";
-        argc += 1;
-        argv[argc] = port;
-        argc += 1;
-    }
-    if (target.ssh_key) |key| {
-        argv[argc] = "-i";
-        argc += 1;
-        argv[argc] = key;
-        argc += 1;
-    }
-    argv[argc] = "--";
-    argc += 1;
-    argv[argc] = "nix-daemon";
-    argc += 1;
-    argv[argc] = "--stdio";
-    argc += 1;
-    return argv[0..argc];
-}
-
-const TcpTarget = struct { host: []const u8, port: u16 };
-
-/// The host/port of a `tcp://host:port` store (bracketed IPv6 accepted), else null.
-fn tcpTarget(store: []const u8) ?TcpTarget {
-    const prefix = "tcp://";
-    if (!std.mem.startsWith(u8, store, prefix)) return null;
-    var rest = store[prefix.len..];
-    if (std.mem.indexOfScalar(u8, rest, '?')) |q| rest = rest[0..q];
-    if (std.mem.indexOfScalar(u8, rest, '/')) |s| rest = rest[0..s];
-    if (rest.len != 0 and rest[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return null;
-        const host = rest[1..close];
-        const after = rest[close + 1 ..];
-        if (after.len < 2 or after[0] != ':') return null;
-        const port = std.fmt.parseInt(u16, after[1..], 10) catch return null;
-        return if (host.len == 0) null else .{ .host = host, .port = port };
-    }
-    const colon = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return null;
-    const host = rest[0..colon];
-    const port = std.fmt.parseInt(u16, rest[colon + 1 ..], 10) catch return null;
-    return if (host.len == 0) null else .{ .host = host, .port = port };
-}
-
-const UnixTarget = struct {
-    path: []const u8,
-    append_legacy_socket: bool = false,
-};
-
-/// Parse Lix's protocol-selecting unix store URI. We connect directly when a
-/// stable worker-protocol socket is available. XP-only endpoints are rejected
-/// until fix has its own `lix-xp-1` implementation.
-fn unixTarget(store: []const u8) !UnixTarget {
-    if (store.len == 0 or std.mem.eql(u8, store, "daemon"))
-        return .{ .path = default_socket_path };
-    if (!std.mem.startsWith(u8, store, "unix://"))
-        return .{ .path = store };
-
-    const body = store["unix://".len..];
-    const query_at = std.mem.indexOfScalar(u8, body, '?');
-    const raw_path = if (query_at) |at| body[0..at] else body;
-    const path = if (raw_path.len == 0) default_socket_path else raw_path;
-    const query = if (query_at) |at| body[at + 1 ..] else return .{ .path = path };
-
-    var fields = std.mem.splitScalar(u8, query, '&');
-    while (fields.next()) |field| {
-        if (!std.mem.startsWith(u8, field, "protocol=")) continue;
-        const protocols = field["protocol=".len..];
-        var has_legacy = false;
-        var has_combined = false;
-        var has_xp = false;
-        var names = std.mem.tokenizeAny(u8, protocols, ", ");
-        while (names.next()) |name| {
-            if (std.mem.eql(u8, name, "any") or std.mem.eql(u8, name, "legacy"))
-                has_legacy = true
-            else if (std.mem.eql(u8, name, "legacy-combined"))
-                has_combined = true
-            else if (std.mem.eql(u8, name, "lix-xp-1"))
-                has_xp = true
-            else
-                return error.UnsupportedDaemonProtocol;
-        }
-        if (has_legacy) return .{
-            .path = if (raw_path.len == 0) default_socket_dir else raw_path,
-            .append_legacy_socket = true,
-        };
-        if (has_combined) return .{ .path = path };
-        if (has_xp) return error.UnsupportedLixRpcProtocol;
-        return error.UnsupportedDaemonProtocol;
-    }
-    return .{ .path = path };
-}
-
-/// Reject selectors that would require us to execute an installed Nix/Lix
-/// implementation. fix only speaks protocols it implements itself.
-pub fn validateStoreUri(store: []const u8) !void {
-    if (std.fs.path.isAbsolute(store) and
-        !std.mem.endsWith(u8, store, "/daemon-socket/socket"))
-        return error.NativeLocalStoreUnsupported;
-    return validateTransportUri(store);
-}
-
-/// Validate the normalized endpoint stored by RealizationStore. Unlike a Nix
-/// store selector, an absolute value here is an explicit Unix socket (including
-/// NIX_DAEMON_SOCKET_PATH and test sockets).
-fn validateTransportUri(store: []const u8) !void {
-    if (store.len == 0 or std.mem.eql(u8, store, "daemon")) return;
-    if (std.mem.eql(u8, store, "auto") or
-        std.mem.eql(u8, store, "local") or
-        std.mem.startsWith(u8, store, "local?") or
-        std.mem.startsWith(u8, store, "local://") or
-        std.mem.startsWith(u8, store, "local-root:"))
-        return error.NativeLocalStoreUnsupported;
-    if (std.mem.startsWith(u8, store, "ssh-ng://")) {
-        _ = try sshTarget(store);
-        return;
-    }
-    if (std.mem.startsWith(u8, store, "tcp://")) {
-        if (tcpTarget(store) == null) return error.InvalidStoreUri;
-        return;
-    }
-    if (std.mem.startsWith(u8, store, "unix://")) {
-        _ = try unixTarget(store);
-        return;
-    }
-    if (std.mem.indexOf(u8, store, "://") != null)
-        return error.UnsupportedStoreUri;
-}
-
-/// Parse a `nix-archive-1` NAR containing a single regular file, returning its
-/// contents (owned). NAR tokens are length-prefixed 8-padded strings — the same
-/// framing as `wire.readString`. Errors on a directory/symlink NAR.
-fn readSingleFileNar(allocator: std.mem.Allocator, r: *std.Io.Reader) ![]u8 {
-    try expectNarToken(allocator, r, "nix-archive-1");
-    try expectNarToken(allocator, r, "(");
-    try expectNarToken(allocator, r, "type");
-    try expectNarToken(allocator, r, "regular");
-
-    var tok = try wire.readString(allocator, r);
-    if (std.mem.eql(u8, tok, "executable")) {
-        allocator.free(tok);
-        const empty = try wire.readString(allocator, r);
-        allocator.free(empty);
-        tok = try wire.readString(allocator, r);
-    }
-    defer allocator.free(tok);
-    if (!std.mem.eql(u8, tok, "contents")) return error.UnexpectedNar;
-
-    const contents = try wire.readString(allocator, r);
-    errdefer allocator.free(contents);
-    const close = try wire.readString(allocator, r);
-    allocator.free(close);
-    return contents;
-}
-
-fn expectNarToken(allocator: std.mem.Allocator, r: *std.Io.Reader, want: []const u8) !void {
-    const tok = try wire.readString(allocator, r);
-    defer allocator.free(tok);
-    if (!std.mem.eql(u8, tok, want)) return error.UnexpectedNar;
-}
-
-test "store uri parsing selects transport" {
-    try std.testing.expectEqualStrings(default_socket_path, (try unixTarget("")).path);
-    try std.testing.expectEqualStrings("/tmp/sock", (try unixTarget("unix:///tmp/sock")).path);
-    const legacy = try unixTarget("unix:///tmp/daemon?protocol=lix-xp-1,legacy");
-    try std.testing.expectEqualStrings("/tmp/daemon", legacy.path);
-    try std.testing.expect(legacy.append_legacy_socket);
-    const combined = try unixTarget("unix:///tmp/socket?protocol=legacy-combined");
-    try std.testing.expectEqualStrings("/tmp/socket", combined.path);
-    try std.testing.expect(!combined.append_legacy_socket);
-    try std.testing.expectError(error.UnsupportedLixRpcProtocol, unixTarget("unix:///tmp/daemon?protocol=lix-xp-1"));
-    try std.testing.expectError(error.NativeLocalStoreUnsupported, validateStoreUri("auto"));
-    try std.testing.expectError(error.NativeLocalStoreUnsupported, validateStoreUri("local?root=/tmp/store"));
-    try std.testing.expectError(error.NativeLocalStoreUnsupported, validateStoreUri("/tmp/chroot"));
-    const ssh = (try sshTarget("ssh-ng://user@host?port=2222&ssh-key=/tmp/key&compress=true")).?;
-    try std.testing.expectEqualStrings("user@host", ssh.host);
-    try std.testing.expectEqualStrings("2222", ssh.port.?);
-    try std.testing.expectEqualStrings("/tmp/key", ssh.ssh_key.?);
-    try std.testing.expect(ssh.compress);
-    var ssh_argv: [max_ssh_args][]const u8 = undefined;
-    const args = sshCommandArgs(ssh, &ssh_argv);
-    const expected_args = [_][]const u8{
-        "ssh",
-        "user@host",
-        "-x",
-        "-o",
-        "BatchMode=yes",
-        "-C",
-        "-p",
-        "2222",
-        "-i",
-        "/tmp/key",
-        "--",
-        "nix-daemon",
-        "--stdio",
-    };
-    try std.testing.expectEqual(expected_args.len, args.len);
-    for (expected_args, args) |expected, actual|
-        try std.testing.expectEqualStrings(expected, actual);
-    try validateStoreUri("ssh-ng://build.example.com");
-    try std.testing.expectError(error.InvalidStoreUri, validateStoreUri("ssh-ng://"));
-    try std.testing.expectError(error.InvalidStoreUri, validateStoreUri("ssh-ng://-oProxyCommand=id"));
-    try std.testing.expectError(error.InvalidStoreUri, validateStoreUri("ssh-ng://-user@host"));
-    try std.testing.expectError(error.InvalidStoreUri, validateStoreUri("ssh-ng://user@-oProxyCommand=id"));
-    try std.testing.expectError(error.UnsupportedSshStoreSetting, validateStoreUri("ssh-ng://host?remote-store=local"));
-    try std.testing.expectError(error.UnsupportedLixRpcProtocol, validateStoreUri("unix:///tmp/daemon?protocol=lix-xp-1"));
-    try validateStoreUri("/tmp/daemon-socket/socket");
-    try validateStoreUri("tcp://build.example.com:1234");
-    try std.testing.expect(tcpTarget("unix:///s") == null);
-    const t = tcpTarget("tcp://build.example.com:1234").?;
-    try std.testing.expectEqualStrings("build.example.com", t.host);
-    try std.testing.expectEqual(@as(u16, 1234), t.port);
-    const t6 = tcpTarget("tcp://[::1]:9999").?;
-    try std.testing.expectEqualStrings("::1", t6.host);
-    try std.testing.expectEqual(@as(u16, 9999), t6.port);
-}
+const endpoint = @import("endpoint.zig");
+const nar_reader = @import("nar_reader.zig");
 
 const ActivityType = enum(u64) {
     build = 105,
@@ -420,12 +124,9 @@ pub const DaemonStore = struct {
     /// Last daemon-reported error message (owned), surfaced with
     /// `error.DaemonError`. Freed on deinit / overwritten on the next error.
     last_error: ?[]u8 = null,
-    /// While true, daemon and structured build-log lines are forwarded to our
-    /// stderr (set during `buildPaths`) instead of being discarded.
-    log_build: bool = false,
     suppress_build_output: bool = false,
     /// Set during `buildPaths` to forward typed activities and logs to the CLI.
-    /// When set, logs go to the sink instead of directly to stderr.
+    /// The protocol layer never writes presentation output itself.
     build_sink: ?BuildSink = null,
 
     /// Connect to a daemon and complete the handshake. `store` is a direct
@@ -458,40 +159,35 @@ pub const DaemonStore = struct {
 
     fn openTransport(self: *DaemonStore, store: []const u8) !void {
         const io = self.io;
-        try validateTransportUri(store);
-        if (try sshTarget(store)) |target| {
-            // The remote store explicitly owns the worker endpoint. No local
-            // Nix/Lix executable participates in selecting or adapting it.
-            var argv: [max_ssh_args][]const u8 = undefined;
-            try self.openCommand(sshCommandArgs(target, &argv));
-            return;
+        switch (try endpoint.parse(store)) {
+            .ssh => |target| {
+                // The remote store explicitly owns the worker endpoint. No
+                // local Nix/Lix executable participates in adapting it.
+                var argv: [endpoint.Ssh.max_command_args][]const u8 = undefined;
+                try self.openCommand(target.commandArgs(&argv));
+            },
+            .tcp => |target| {
+                const addr = try std.Io.net.IpAddress.resolve(io, target.host, target.port);
+                const stream = try addr.connect(io, .{ .mode = .stream });
+                self.initSocketTransport(stream);
+            },
+            .unix => |target| {
+                const owned_path = if (target.append_legacy_socket)
+                    try std.fs.path.join(self.allocator, &.{ target.path, "socket" })
+                else
+                    null;
+                defer if (owned_path) |path| self.allocator.free(path);
+                const addr = try std.Io.net.UnixAddress.init(owned_path orelse target.path);
+                self.initSocketTransport(try addr.connect(io));
+            },
         }
-        if (tcpTarget(store)) |target| {
-            // `tcp://host:port` — the worker protocol over a TCP daemon socket
-            // (e.g. a `socat`/`nc` bridge to a unix socket, or a TCP-listening
-            // daemon). Same framed transport as the unix socket.
-            const addr = try std.Io.net.IpAddress.resolve(io, target.host, target.port);
-            const stream = try addr.connect(io, .{ .mode = .stream });
-            self.transport = .{ .socket = .{
-                .stream = stream,
-                .reader = std.Io.net.Stream.Reader.init(stream, io, self.rbuf),
-                .writer = std.Io.net.Stream.Writer.init(stream, io, self.wbuf),
-            } };
-            return;
-        }
-        const target = try unixTarget(store);
-        const owned_path = if (target.append_legacy_socket)
-            try std.fs.path.join(self.allocator, &.{ target.path, "socket" })
-        else
-            null;
-        defer if (owned_path) |path| self.allocator.free(path);
-        const path = owned_path orelse target.path;
-        const addr = try std.Io.net.UnixAddress.init(path);
-        const stream = try addr.connect(io);
+    }
+
+    fn initSocketTransport(self: *DaemonStore, stream: std.Io.net.Stream) void {
         self.transport = .{ .socket = .{
             .stream = stream,
-            .reader = std.Io.net.Stream.Reader.init(stream, io, self.rbuf),
-            .writer = std.Io.net.Stream.Writer.init(stream, io, self.wbuf),
+            .reader = std.Io.net.Stream.Reader.init(stream, self.io, self.rbuf),
+            .writer = std.Io.net.Stream.Writer.init(stream, self.io, self.wbuf),
         } };
     }
 
@@ -577,7 +273,7 @@ pub const DaemonStore = struct {
         try self.beginOp(.nar_from_path);
         try wire.writeString(self.w(), path);
         try self.flushAndDrain();
-        return try readSingleFileNar(allocator, self.r());
+        return try nar_reader.readSingleFile(allocator, self.r());
     }
 
     /// Add `text` to the store as a text-addressed object named `name`
@@ -666,19 +362,15 @@ pub const DaemonStore = struct {
     }
 
     /// Realize `derived_paths` (each a legacy `<drvpath>!<outputs>` string, e.g.
-    /// `/nix/store/xxx.drv!*` for all outputs). The daemon builds or substitutes
-    /// the outputs; build logs are forwarded to our stderr while this runs.
-    /// Errors (with the daemon's message) are surfaced on failure.
+    /// `/nix/store/xxx.drv!*` for all outputs). When supplied, `sink` receives
+    /// typed build activity and log events. Errors (with the daemon's message)
+    /// are surfaced on failure.
     pub fn buildPaths(self: *DaemonStore, derived_paths: []const []const u8, sink: ?BuildSink, mode: BuildMode) !void {
         try self.beginOp(.build_paths);
         try wire.writeStrings(self.w(), derived_paths);
         try wire.writeInt(self.w(), @intFromEnum(mode));
         self.build_sink = sink;
-        self.log_build = sink == null and !self.suppress_build_output; // sink consumes logs itself
-        defer {
-            self.build_sink = null;
-            self.log_build = false;
-        }
+        defer self.build_sink = null;
         try self.flushAndDrain();
         _ = try wire.readInt(self.r()); // dummy result int
     }
@@ -768,18 +460,14 @@ pub const DaemonStore = struct {
                 wire.stderr_last => return,
                 wire.stderr_error => return self.readError(),
                 wire.stderr_next => {
-                    if (self.build_sink == null and !self.log_build) {
+                    if (self.build_sink == null) {
                         try wire.skipString(self.r());
                         continue;
                     }
                     const line = try wire.readString(self.allocator, self.r());
                     defer self.allocator.free(line);
                     const clean = terminal_text.stripAnsiInPlace(line);
-                    if (self.build_sink) |s| {
-                        s.emit(.{ .log = .{ .activity_id = null, .kind = .daemon, .text = clean } });
-                    } else if (self.log_build) {
-                        std.debug.print("{s}", .{clean});
-                    }
+                    self.build_sink.?.emit(.{ .log = .{ .activity_id = null, .kind = .daemon, .text = clean } });
                 },
                 wire.stderr_start_activity => try self.readStartActivity(),
                 wire.stderr_stop_activity => {
@@ -918,8 +606,6 @@ pub const DaemonStore = struct {
                         .kind = if (result_type == .build_log_line) .build else .post_build,
                         .text = line,
                     } });
-                } else if (self.log_build) {
-                    std.debug.print("{s}", .{line});
                 }
             },
             else => {},

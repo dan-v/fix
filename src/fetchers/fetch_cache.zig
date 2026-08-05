@@ -16,7 +16,6 @@ const git_transport = @import("git_transport.zig");
 const BlockingPool = @import("base").BlockingPool;
 const fetch_types = @import("fetch/types.zig");
 const fetch_config = @import("fetch/config.zig");
-const service_api = @import("fetch/service.zig");
 const auth_mod = @import("fetch/auth.zig");
 
 /// Download-staging cache under `$XDG_CACHE_HOME/fix` (default `~/.cache/fix`,
@@ -85,9 +84,6 @@ pub const FetchCache = struct {
     pub const GitResult = fetch_types.GitResult;
     pub const MercurialResult = fetch_types.MercurialResult;
     pub const Config = fetch_config.Config;
-    pub const UrlFetcher = service_api.UrlFetcher(FetchCache);
-    pub const GitFetcher = service_api.GitFetcher(FetchCache);
-    pub const MercurialFetcher = service_api.MercurialFetcher(FetchCache);
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !FetchCache {
         var service: FetchCache = .{
@@ -110,18 +106,6 @@ pub const FetchCache = struct {
         if (config.netrc) |netrc| try service.setNetrc(netrc);
         try service.setMaxConnections(config.max_connections);
         return service;
-    }
-
-    pub fn urls(self: *FetchCache) UrlFetcher {
-        return .{ .service = self };
-    }
-
-    pub fn git(self: *FetchCache) GitFetcher {
-        return .{ .service = self };
-    }
-
-    pub fn mercurial(self: *FetchCache) MercurialFetcher {
-        return .{ .service = self };
     }
 
     pub fn deinit(self: *FetchCache) void {

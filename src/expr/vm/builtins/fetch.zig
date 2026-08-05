@@ -202,10 +202,10 @@ pub fn offloadFetch(self: *VM, comptime operation: FetchOperation, spec: anytype
                 break :blk .{ .ctx = &report_store, .report = FetchReport.report };
             } else null;
             c.res = switch (operation) {
-                .url => c.fetchers.urls().fetch(c.files, c.spec, reporter),
-                .tarball => c.fetchers.urls().fetchTarball(c.files, c.spec, reporter),
-                .git => c.fetchers.git().fetch(c.files, c.spec, reporter),
-                .mercurial => c.fetchers.mercurial().fetch(c.files, c.spec, reporter),
+                .url => c.fetchers.fetchUrl(c.files, c.spec, reporter),
+                .tarball => c.fetchers.fetchTarball(c.files, c.spec, reporter),
+                .git => c.fetchers.fetchGit(c.files, c.spec, reporter),
+                .mercurial => c.fetchers.fetchMercurial(c.files, c.spec, reporter),
             } catch |e| {
                 c.err = e;
                 return;

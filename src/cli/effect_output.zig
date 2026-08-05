@@ -1,11 +1,14 @@
-//! CLI presentation sink for evaluator language effects.
+//! CLI stderr sink for evaluator effects and unadorned daemon build logs.
 //!
-//! The expression engine owns demand-commit semantics; this module owns the
-//! process-facing decision to write records to stderr, synchronize terminal
-//! repaint, and restore terminal state after fatal signals.
+//! Engines and protocol clients emit semantic records; this module owns the
+//! process-facing decision to write them, synchronize terminal repaint, and
+//! restore terminal state after fatal signals. Interactive build commands use
+//! `build_progress.zig` instead; this raw sink serves commands whose stdout is
+//! machine-consumable.
 
 const std = @import("std");
 const expr = @import("expr");
+const daemon = @import("store").daemon;
 
 pub const StderrSink = struct {
     io: std.Io,
@@ -26,6 +29,10 @@ pub const StderrSink = struct {
         return .{ .context = self, .emit_fn = emit };
     }
 
+    pub fn buildSink(self: *StderrSink) daemon.BuildSink {
+        return .{ .context = self, .emit_fn = emitBuild };
+    }
+
     fn emit(raw: ?*anyopaque, kind: expr.EffectKind, message: []const u8) void {
         const self: *StderrSink = @ptrCast(@alignCast(raw.?));
         var buffer: [4096]u8 = undefined;
@@ -43,6 +50,23 @@ pub const StderrSink = struct {
             var parts = [_][]const u8{ label, ": ", message, "\n" };
             writer.writeSplatAll(&parts, 1) catch return;
         }
+        writer.flush() catch {};
+    }
+
+    fn emitBuild(raw: *anyopaque, event: daemon.BuildEvent) void {
+        const log = switch (event) {
+            .log => |value| value,
+            else => return,
+        };
+        const self: *StderrSink = @ptrCast(@alignCast(raw));
+        var buffer: [4096]u8 = undefined;
+        var locked = self.io.lockStderr(&buffer, null) catch return;
+        defer self.io.unlockStderr();
+        const writer = &locked.file_writer.interface;
+        if (self.sync_updates) writer.writeAll(sync_begin) catch return;
+        defer if (self.sync_updates) writer.writeAll(sync_end) catch {};
+        writer.writeAll(log.text) catch return;
+        if (!std.mem.endsWith(u8, log.text, "\n")) writer.writeByte('\n') catch return;
         writer.flush() catch {};
     }
 };
