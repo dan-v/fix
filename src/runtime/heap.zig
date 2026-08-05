@@ -1289,6 +1289,68 @@ pub const ObjectHeap = struct {
         _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
     }
 
+    /// Detector-only byte-store ownership audit: every live `heap_string`'s
+    /// byte range must be (a) disjoint from every other live range and (b)
+    /// absent from every free list and TLAB tail. Catches a bad free (or
+    /// double free) at the collection that commits it, instead of as silent
+    /// text corruption when the range is re-handed to a second owner.
+    /// Serial; call at a quiescent point (end of collection).
+    pub fn gcVerifyByteRanges(self: *ObjectHeap) void {
+        if (comptime !gc_debug) return;
+        if (!self.collection.collect_enabled) return;
+        const high_water: usize = self.bytes.count();
+        if (high_water == 0) return;
+        const words = (high_water + 63) >> 6;
+        const free_bits = self.allocator.alloc(u64, words) catch return;
+        defer self.allocator.free(free_bits);
+        @memset(free_bits, 0);
+        self.gc_shared_free_bytes.markBitmap(ByteStore, free_bits, @intCast(high_water));
+        for (self.worker_locals) |*local| local.gc_free_bytes.markBitmap(ByteStore, free_bits, @intCast(high_water));
+        // Unfilled TLAB tails count as free.
+        for (self.worker_locals) |*local| {
+            const chunk = local.byte;
+            if (chunk.cursor >= chunk.end) continue;
+            const start: usize = ByteStore.globalIdOf(chunk.segment, chunk.cursor);
+            const end: usize = @min(@as(usize, ByteStore.globalIdOf(chunk.segment, chunk.end - 1)) + 1, high_water);
+            var i = start;
+            while (i < end) : (i += 1) free_bits[i >> 6] |= @as(u64, 1) << @intCast(i & 63);
+        }
+        const live_bits = self.allocator.alloc(u64, words) catch return;
+        defer self.allocator.free(live_bits);
+        @memset(live_bits, 0);
+
+        var shown: u32 = 0;
+        var id: ObjectId = 0;
+        const n = self.objects.count();
+        while (id < n and shown < 8) : (id += 1) {
+            if (!self.gcAllocBitSet(id)) continue;
+            const hs = switch (self.objects.get(id).*) {
+                .heap_string => |hs| hs,
+                else => continue,
+            };
+            if (hs.bytes.len == 0) continue;
+            const start: usize = ByteStore.globalIdOf(hs.bytes.segment, hs.bytes.offset);
+            const end: usize = @min(start + hs.bytes.len, high_water);
+            var i = start;
+            while (i < end) : (i += 1) {
+                const w = i >> 6;
+                const bit = @as(u64, 1) << @intCast(i & 63);
+                if (free_bits[w] & bit != 0) {
+                    std.debug.print("GC BYTE-RANGE AUDIT: live heap_string {d} range seg={d} off={d} len={d} overlaps FREE storage at byte {d}\n", .{ id, hs.bytes.segment, hs.bytes.offset, hs.bytes.len, i });
+                    shown += 1;
+                    break;
+                }
+                if (live_bits[w] & bit != 0) {
+                    std.debug.print("GC BYTE-RANGE AUDIT: live heap_string {d} range seg={d} off={d} len={d} OVERLAPS another live range at byte {d}\n", .{ id, hs.bytes.segment, hs.bytes.offset, hs.bytes.len, i });
+                    shown += 1;
+                    break;
+                }
+                live_bits[w] |= bit;
+            }
+        }
+        if (shown > 0) @panic("gc: byte-range ownership violated (see AUDIT lines)");
+    }
+
     /// Stop-the-world publication for worker-owned free lists. With one worker,
     /// preserve the original local-only path. With multiple workers, unused
     /// local cache contents become central overflow so future demand, rather
@@ -1695,8 +1757,69 @@ pub const ObjectHeap = struct {
             // Reuse is off in the detector, so the slot still holds its real
             // payload — print the kind so we know which root is missing.
             std.debug.print("GC use-after-free: object {d} (kind={s}) read after sweep\n", .{ id, @tagName(self.objects.get(id).*) });
+            self.gcDumpDeadObjectContext(id);
             @panic("gc use-after-free");
         }
+    }
+
+    /// Crash-time forensics for the detector's use-after-free trap: the dead
+    /// object's generation boundaries and every LIVE referrer (the parent
+    /// whose trace should have marked it — its liveness state tells us which
+    /// root/edge went missing). Racy (the world is running), best-effort.
+    fn gcDumpDeadObjectContext(self: *const ObjectHeap, dead: ObjectId) void {
+        std.debug.print("  boundaries: bootstrap_end={d} track_from={d} count={d} (dead {s} arming)\n", .{
+            self.collection.bootstrap_end,
+            self.collection.track_from,
+            self.objects.count(),
+            if (dead < self.collection.track_from) "PRE" else "POST",
+        });
+        const dead_old = blk: {
+            const word = dead >> 6;
+            if (word >= self.collection.old_bits.len) break :blk false;
+            break :blk self.collection.old_bits[word] & (@as(u64, 1) << @intCast(dead & 63)) != 0;
+        };
+        std.debug.print("  dead gen: {s}\n", .{if (dead_old) "OLD" else "YOUNG"});
+        var shown: u32 = 0;
+        var id: ObjectId = 0;
+        const n = self.objects.count();
+        while (id < n and shown < 12) : (id += 1) {
+            if (id >= self.gcSweepFloor() and !self.gcAllocBitSet(id)) continue; // dead parents don't constrain
+            const referred = switch (self.objects.get(id).*) {
+                .list => |r| rangeHasId(self.values.slice(r), dead),
+                .closure => |c| rangeHasId(self.values.slice(c.upvalues), dead),
+                .builtin_closure => |c| rangeHasId(self.values.slice(c.args), dead),
+                .partial_app => |p| (gcHeapId(p.func) orelse std.math.maxInt(ObjectId)) == dead or
+                    rangeHasId(self.values.slice(p.args), dead),
+                .attrs => |a| blk: {
+                    for (self.attrs.slice(a.range)) |e|
+                        if ((gcHeapId(e.value) orelse std.math.maxInt(ObjectId)) == dead) break :blk true;
+                    break :blk false;
+                },
+                .thunk => |t| t.future.state.load(.monotonic) == 2 and // resolved
+                    (gcHeapId(.{ .bits = t.payload.result.bits }) orelse std.math.maxInt(ObjectId)) == dead,
+                else => false,
+            };
+            if (referred) {
+                const old = blk: {
+                    const word = id >> 6;
+                    if (word >= self.collection.old_bits.len) break :blk false;
+                    break :blk self.collection.old_bits[word] & (@as(u64, 1) << @intCast(id & 63)) != 0;
+                };
+                std.debug.print("  referrer {d} kind={s} gen={s} {s}-arming\n", .{
+                    id,
+                    @tagName(self.objects.get(id).*),
+                    if (old) "OLD" else "YOUNG",
+                    if (id < self.collection.track_from) "PRE" else "POST",
+                });
+                shown += 1;
+            }
+        }
+        if (shown == 0) std.debug.print("  no live heap referrer found (native-only reference)\n", .{});
+    }
+
+    fn rangeHasId(values: []const Value, dead: ObjectId) bool {
+        for (values) |v| if ((gcHeapId(v) orelse std.math.maxInt(ObjectId)) == dead) return true;
+        return false;
     }
 
     /// Total bytes ever reserved across every backing store — the committed-RSS

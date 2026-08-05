@@ -251,6 +251,7 @@ pub fn runCollect(heap: *ObjectHeap, collector_id: u8) void {
 /// (livelock). `live_bytes` is accepted for stats only.
 pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
     _ = live_bytes;
+    if (comptime gc_debug) heap.gcVerifyByteRanges();
     heap.collection.collect_requested.store(false, .monotonic);
     // Post-collect headroom scales with the budget (an eighth, clamped to
     // [64 MB, gc_headroom]): a small-RAM budget must not grant itself a
@@ -356,14 +357,25 @@ pub fn verifyMinorClosure(heap: *ObjectHeap, mark_bits: []const u64) void {
     // Include pinned objects because they may point into the young generation.
     var id: ObjectId = 0;
     const n = heap.objects.count();
+    const pinned_floor = if (heap.collection.root_always)
+        heap.collection.bootstrap_end
+    else
+        heap.collection.track_from;
     while (id < n and shown < 8) : (id += 1) {
-        const word = id >> 6;
-        if (word >= heap.collection.alloc_bits.len) break;
-        if (heap.collection.alloc_bits[word] & (@as(u64, 1) << @intCast(id & 63)) == 0) continue;
-        // Only LIVE parents constrain the mark: a dead young object
-        // (unmarked, about to be swept) may freely reference dead young
-        // children. Old and marked-young parents are live.
-        if (heap.gcIsYoung(id) and !bitSet(mark_bits, id)) continue;
+        // Pinned pre-arming ids have no alloc bits (per-fill bit setting is
+        // gated on root tracking) but are permanently live — and they are
+        // exactly the OLD parents whose young referents depend entirely on
+        // the remembered set. Verify their edges too, or a missed pinned→
+        // young edge surfaces only later as a read-after-sweep.
+        if (id >= pinned_floor) {
+            const word = id >> 6;
+            if (word >= heap.collection.alloc_bits.len) break;
+            if (heap.collection.alloc_bits[word] & (@as(u64, 1) << @intCast(id & 63)) == 0) continue;
+            // Only LIVE parents constrain the mark: a dead young object
+            // (unmarked, about to be swept) may freely reference dead young
+            // children. Old and marked-young parents are live.
+            if (heap.gcIsYoung(id) and !bitSet(mark_bits, id)) continue;
+        }
         var sink = ClosureSink{ .heap = heap, .mark_bits = mark_bits, .parent = id, .shown = &shown, .check = .minor };
         heap_edges.walkObject(ClosureSink, &sink, heap, id) catch unreachable;
     }
