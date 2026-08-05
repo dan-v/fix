@@ -137,6 +137,12 @@ pub const ChunkRegistry = struct {
     /// one-shot CLI eval may disable this: its chunks cannot be observed by a
     /// later evaluation, and almost every registration is unique.
     dedup_compiler_chunks: bool = true,
+    /// Cached-unit batches briefly close this gate while exact ids are known.
+    /// Ordinary registration remains concurrent outside that uncommon window;
+    /// the active census closes the see-open/enter race without a global lock.
+    batch_mu: sync.BlockingMutex = .{},
+    batch_gate: std.atomic.Value(u8) = .init(0),
+    active_registrations: std.atomic.Value(u32) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
@@ -529,10 +535,11 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(stored);
         }
         stored.* = chunk;
-        // Lock-free registration: many workers compile (deferred bodies +
-        // speculative imports) concurrently; the writer-mutex append serialized
-        // them per-chunk. `appendAtomic` CAS-bumps the cursor instead. In
-        // solo mode (single-worker evaluator) the serial append drops the CAS.
+        self.enterRegistration();
+        defer self.leaveRegistration();
+        // Initialize the complete slot before the registry count exposes it.
+        // Concurrent compilers serialize only this short publication step; in
+        // solo mode the append can omit the writer lock as well.
         const new_slot: ChunkSlot = .{
             .ptr = stored,
             .name = name,
@@ -545,8 +552,105 @@ pub const ChunkRegistry = struct {
         const id = if (self.solo)
             try self.chunks.appendSerial(self.allocator, new_slot)
         else
-            try self.chunks.appendAtomic(self.allocator, new_slot);
+            try self.chunks.append(self.allocator, new_slot);
         return id;
+    }
+
+    fn enterRegistration(self: *ChunkRegistry) void {
+        if (self.solo) return;
+        while (true) {
+            while (self.batch_gate.load(.acquire) != 0) std.atomic.spinLoopHint();
+            _ = self.active_registrations.fetchAdd(1, .acquire);
+            if (self.batch_gate.load(.acquire) == 0) return;
+            _ = self.active_registrations.fetchSub(1, .release);
+        }
+    }
+
+    fn leaveRegistration(self: *ChunkRegistry) void {
+        if (!self.solo) _ = self.active_registrations.fetchSub(1, .release);
+    }
+
+    pub const BatchPrepareFn = *const fn (context: *anyopaque, ids: []const ChunkId) anyerror!void;
+
+    const BatchInitialize = struct {
+        store: *Store,
+        chunks: []const Chunk,
+        names: []const name_tree_mod.NameId,
+        ids: []ChunkId,
+        stored: []*Chunk,
+        prepare_context: *anyopaque,
+        prepare: BatchPrepareFn,
+
+        fn run(raw: *anyopaque, first_id: u32, len: u32) anyerror!void {
+            const self: *BatchInitialize = @ptrCast(@alignCast(raw));
+            std.debug.assert(len == self.chunks.len);
+            for (self.ids, 0..) |*id, i|
+                id.* = first_id + @as(u32, @intCast(i));
+            try self.prepare(self.prepare_context, self.ids);
+            for (self.chunks, self.names, self.stored, 0..) |chunk, name, ptr, i| {
+                ptr.* = chunk;
+                self.store.getMut(first_id + @as(u32, @intCast(i))).* = .{
+                    .ptr = ptr,
+                    .name = name,
+                    .trivial = chunk.scheduling.trivial,
+                    .body_is_substantial = chunk.scheduling.body_is_substantial,
+                    .spec_band_small = chunk.scheduling.spec_band_small,
+                    .strict_param = chunk.scheduling.strict_param,
+                    .strict_via_upvalue = chunk.scheduling.strict_via_upvalue,
+                };
+            }
+        }
+    };
+
+    /// Publish an owned compile unit as one registry operation. `chunks`,
+    /// `names`, and `out_ids` are parallel. `prepare` runs while registration
+    /// is excluded and after the exact ids are known, but before any slot is
+    /// initialized; an error rolls the reservation back and leaves every
+    /// chunk owned by the caller. Success transfers every chunk at once.
+    pub fn registerNamedBatch(
+        self: *ChunkRegistry,
+        chunks: []const Chunk,
+        names: []const name_tree_mod.NameId,
+        out_ids: []ChunkId,
+        context: *anyopaque,
+        prepare: BatchPrepareFn,
+    ) !void {
+        if (chunks.len == 0 or names.len != chunks.len or out_ids.len != chunks.len)
+            return error.InvalidBatch;
+
+        const stored = try self.allocator.alloc(*Chunk, chunks.len);
+        defer self.allocator.free(stored);
+        var allocated: usize = 0;
+        errdefer for (stored[0..allocated]) |ptr| self.allocator.destroy(ptr);
+        for (stored) |*stored_ptr| {
+            stored_ptr.* = try self.allocator.create(Chunk);
+            allocated += 1;
+        }
+
+        self.batch_mu.lock();
+        defer self.batch_mu.unlock();
+        if (!self.solo) {
+            self.batch_gate.store(1, .release);
+            while (self.active_registrations.load(.acquire) != 0) std.atomic.spinLoopHint();
+        }
+        defer if (!self.solo) self.batch_gate.store(0, .release);
+        var initialize: BatchInitialize = .{
+            .store = &self.chunks,
+            .chunks = chunks,
+            .names = names,
+            .ids = out_ids,
+            .stored = stored,
+            .prepare_context = context,
+            .prepare = prepare,
+        };
+        _ = try self.chunks.appendDenseInitialized(
+            self.allocator,
+            @intCast(chunks.len),
+            &initialize,
+            BatchInitialize.run,
+        );
+        // Stored pointers and chunk fields are registry-owned from here.
+        allocated = 0;
     }
 
     pub fn get(self: *const ChunkRegistry, id: ChunkId) ?*const Chunk {
@@ -831,6 +935,92 @@ test "chunk registry get returns null for an out-of-range id" {
     defer registry.deinit();
 
     try std.testing.expect(registry.get(std.math.maxInt(ChunkId)) == null);
+}
+
+test "chunk registry batch prepare failure publishes nothing and preserves caller ownership" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+    const before = registry.count();
+    var chunk = try buildDedupTestChunk(allocator, 17, 1);
+    defer chunk.deinit(allocator);
+    const chunks = [_]Chunk{chunk};
+    const names = [_]name_tree_mod.NameId{name_tree_mod.root_name_id};
+    var ids: [1]ChunkId = undefined;
+    const Failure = struct {
+        fn prepare(_: *anyopaque, _: []const ChunkId) anyerror!void {
+            return error.InjectedPrepareFailure;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(
+        error.InjectedPrepareFailure,
+        registry.registerNamedBatch(&chunks, &names, &ids, &context, Failure.prepare),
+    );
+    try std.testing.expectEqual(before, registry.count());
+}
+
+test "chunk registry batch ids stay invisible until every slot is initialized" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+    const before = registry.count();
+
+    const chunks = [_]Chunk{try buildDedupTestChunk(allocator, 23, 1)};
+    const names = [_]name_tree_mod.NameId{name_tree_mod.root_name_id};
+    var ids: [1]ChunkId = undefined;
+    const Gate = struct {
+        entered: std.atomic.Value(u8) = .init(0),
+        release: std.atomic.Value(u8) = .init(0),
+
+        fn prepare(raw: *anyopaque, _: []const ChunkId) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.store(1, .release);
+            while (self.release.load(.acquire) == 0) std.atomic.spinLoopHint();
+        }
+    };
+    var gate: Gate = .{};
+    const Batch = struct {
+        registry: *ChunkRegistry,
+        chunks: []const Chunk,
+        names: []const name_tree_mod.NameId,
+        ids: []ChunkId,
+        gate: *Gate,
+
+        fn run(self: *@This()) void {
+            self.registry.registerNamedBatch(
+                self.chunks,
+                self.names,
+                self.ids,
+                self.gate,
+                Gate.prepare,
+            ) catch @panic("batch registration failed");
+        }
+    };
+    var batch: Batch = .{
+        .registry = &registry,
+        .chunks = &chunks,
+        .names = &names,
+        .ids = &ids,
+        .gate = &gate,
+    };
+    const thread = try std.Thread.spawn(.{}, Batch.run, .{&batch});
+    var joined = false;
+    defer if (!joined) {
+        gate.release.store(1, .release);
+        thread.join();
+    };
+    while (gate.entered.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+    try std.testing.expectEqual(before, registry.count());
+    try std.testing.expect(registry.get(before) == null);
+
+    gate.release.store(1, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(before + 1, registry.count());
+    try std.testing.expectEqual(ids[0], before);
+    try std.testing.expect(registry.get(ids[0]) != null);
 }
 
 /// Small chunk for the dedup tests: `push_const <const_val>; ret; halt` with

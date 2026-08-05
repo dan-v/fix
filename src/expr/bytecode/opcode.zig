@@ -93,9 +93,16 @@ pub const OpCode = enum(u8) {
     /// dispatch, and constant-pool slot per entry.
     /// Operand: count:u16 + names_start:u32.
     attrs_new_named_srt,
+    /// `attrs_new_named_srt` WITHOUT the sorted-names guarantee: the
+    /// persistent chunk cache rewrites a `_srt` site to this when intern-id
+    /// remapping breaks the baked ascending order. Sorts at build time.
+    attrs_new_named,
     /// `attrs_new_named_srt` carrying source positions too.
     /// Operand: count:u16 + names_start:u32 + pos_count:u16 + pos_start:u32.
     attrs_new_named_pos_srt,
+    /// `attrs_new_named_pos_srt` without the sorted-names guarantee (cache
+    /// loader rewrite target, like `attrs_new_named`).
+    attrs_new_named_pos,
     /// Build a list from items on the stack.
     /// Operand: 2-byte count of items.
     list_new,
@@ -413,10 +420,12 @@ pub const Width = enum {
 /// One typed operand field. The disassembler renders each variant uniformly and
 /// `operandLen` sizes it; variable-length variants read their count from `code`.
 pub const Operand = union(enum) {
-    /// Uninterpreted scalar → shown as `#value`.
-    raw: Width,
     /// Internal side-table offset (names_start, cap_start, …): advances, unshown.
     skip: Width,
+    /// Deferred-compilation table id. Persistent bytecode rewrites this to a
+    /// unit-local ordinal and back; keeping it distinct makes that obligation
+    /// exhaustive instead of hiding it in an untyped scalar.
+    deferred_id: Width,
     /// u16 constant-pool index → `#idx` + value digest.
     const_idx,
     /// Frame slot / upvalue index → `role[idx]`.
@@ -476,8 +485,8 @@ pub fn layout(op: OpCode) []const Operand {
 
         // Collection builders.
         .attrs_new, .attrs_new_srt => comptime &[_]Operand{cnt(.b2, "entries")},
-        .attrs_new_named_srt => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 } },
-        .attrs_new_named_pos_srt => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 }, cnt(.b2, "positions"), .{ .skip = .b4 } },
+        .attrs_new_named_srt, .attrs_new_named => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 } },
+        .attrs_new_named_pos_srt, .attrs_new_named_pos => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 }, cnt(.b2, "positions"), .{ .skip = .b4 } },
         .list_new => comptime &[_]Operand{cnt(.b2, "items")},
         .list_cat_n => comptime &[_]Operand{cnt(.b2, "lists")},
         .str_cat, .path_cat => comptime &[_]Operand{cnt(.b2, "parts")},
@@ -514,7 +523,7 @@ pub fn layout(op: OpCode) []const Operand {
         .attr_bind_w => comptime &[_]Operand{.{ .bind = .b4 }},
         .with_lookup => comptime &[_]Operand{ .{ .intern = .b2 }, cnt(.b1, "scopes") },
         .with_lookup_w => comptime &[_]Operand{ .{ .intern = .b4 }, cnt(.b1, "scopes") },
-        .thunk_defer => comptime &[_]Operand{ .{ .raw = .b4 }, .{ .skip = .b4 }, cnt(.b2, "env") },
+        .thunk_defer => comptime &[_]Operand{ .{ .deferred_id = .b4 }, .{ .skip = .b4 }, cnt(.b2, "env") },
         .attrs_apply_overrides => comptime &[_]Operand{.{ .intern = .b4 }},
     };
 }
@@ -539,7 +548,7 @@ fn mixLen(code: []const u8, at: usize) usize {
 /// stepping shares one source with `operandLen`.
 pub fn fieldLen(f: Operand, code: []const u8, at: usize) usize {
     return switch (f) {
-        .raw, .skip, .chunk_id, .intern => |w| w.bytes(),
+        .skip, .deferred_id, .chunk_id, .intern => |w| w.bytes(),
         .const_idx => 2,
         .slot => |s| s.w.bytes(),
         .cap1 => 3,
@@ -552,6 +561,112 @@ pub fn fieldLen(f: Operand, code: []const u8, at: usize) usize {
         .mix => mixLen(code, at),
     };
 }
+
+pub const DecodeError = error{MalformedInstruction};
+
+fn checkedEnd(at: usize, len: usize, code_len: usize) DecodeError!usize {
+    const end = std.math.add(usize, at, len) catch return error.MalformedInstruction;
+    if (end > code_len) return error.MalformedInstruction;
+    return end;
+}
+
+/// Fallible twin of `fieldLen` for bytes that have not yet been trusted.
+/// Besides bounding every fixed/count-derived read it validates descriptor
+/// tags, so consumers never need to speculatively index malformed bytecode.
+pub fn checkedFieldLen(f: Operand, code: []const u8, at: usize) DecodeError!usize {
+    const fixed = switch (f) {
+        .skip, .deferred_id, .chunk_id, .intern => |w| w.bytes(),
+        .const_idx => 2,
+        .slot => |s| s.w.bytes(),
+        .cap1 => 3,
+        .count => |c| c.w.bytes(),
+        .jump => 4,
+        else => 0,
+    };
+    if (fixed != 0) {
+        _ = try checkedEnd(at, fixed, code.len);
+        if (f == .cap1 and code[at] > 1) return error.MalformedInstruction;
+        return fixed;
+    }
+
+    return switch (f) {
+        .captures, .captures_slot => blk: {
+            _ = try checkedEnd(at, 2, code.len);
+            const descriptor_count: usize = rdU16(code, at);
+            const payload = std.math.mul(usize, descriptor_count, 3) catch return error.MalformedInstruction;
+            const len = std.math.add(usize, 2, payload + @intFromBool(f == .captures_slot)) catch return error.MalformedInstruction;
+            _ = try checkedEnd(at, len, code.len);
+            var p = at + 2;
+            var i: usize = 0;
+            while (i < descriptor_count) : (i += 1) {
+                if (code[p] > 1) return error.MalformedInstruction;
+                p += 3;
+            }
+            break :blk len;
+        },
+        .attr_path => |w| blk: {
+            _ = try checkedEnd(at, 1, code.len);
+            const payload = std.math.mul(usize, code[at], w.bytes()) catch return error.MalformedInstruction;
+            const len = std.math.add(usize, 1, payload) catch return error.MalformedInstruction;
+            _ = try checkedEnd(at, len, code.len);
+            break :blk len;
+        },
+        .bind => |w| blk: {
+            _ = try checkedEnd(at, 4, code.len);
+            if (code[at] > 1 or code[at + 1] > 1) return error.MalformedInstruction;
+            const pair_len = std.math.add(usize, w.bytes(), 2) catch return error.MalformedInstruction;
+            const payload = std.math.mul(usize, rdU16(code, at + 2), pair_len) catch return error.MalformedInstruction;
+            const len = std.math.add(usize, 4, payload) catch return error.MalformedInstruction;
+            _ = try checkedEnd(at, len, code.len);
+            break :blk len;
+        },
+        .mix => blk: {
+            _ = try checkedEnd(at, 2, code.len);
+            const segments = code[at];
+            const expected_dynamic = code[at + 1];
+            var dynamic: u8 = 0;
+            var p = at + 2;
+            var i: usize = 0;
+            while (i < segments) : (i += 1) {
+                _ = try checkedEnd(p, 1, code.len);
+                const tag = code[p];
+                p += 1;
+                switch (tag) {
+                    0 => p = try checkedEnd(p, 4, code.len),
+                    1 => dynamic +|= 1,
+                    else => return error.MalformedInstruction,
+                }
+            }
+            if (dynamic != expected_dynamic) return error.MalformedInstruction;
+            break :blk p - at;
+        },
+        else => unreachable,
+    };
+}
+
+pub const Instruction = struct {
+    op: OpCode,
+    ip: usize,
+    end: usize,
+};
+
+/// Single bounded cursor for untrusted bytecode. All cache validation and
+/// load-side rewrites step through this cursor before reading operands.
+pub const InstructionCursor = struct {
+    code: []const u8,
+    ip: usize = 0,
+
+    pub fn next(self: *InstructionCursor) DecodeError!?Instruction {
+        if (self.ip == self.code.len) return null;
+        if (self.code[self.ip] >= count) return error.MalformedInstruction;
+        const start = self.ip;
+        const op: OpCode = @enumFromInt(self.code[start]);
+        var off = start + 1;
+        for (layout(op)) |f| off = try checkedEnd(off, try checkedFieldLen(f, self.code, off), self.code.len);
+        self.ip = off;
+        return .{ .op = op, .ip = start, .end = off };
+    }
+};
 
 /// Total operand byte length of the instruction at `ip` (excludes the opcode
 /// byte itself), derived from `layout`. Reads counts from `code` for the

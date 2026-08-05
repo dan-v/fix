@@ -43,6 +43,17 @@ pub fn buildAttrsNamedSorted(self: *VM, names: []const u32, count: u16, position
     try stack.push(self, Value.attrs(id));
 }
 
+/// Unsorted twin of `buildAttrsNamedSorted`, dispatched by the
+/// `attrs_new_named`/`attrs_new_named_pos` ops the persistent chunk cache
+/// rewrites `_srt` sites to when intern-id remapping breaks their baked
+/// name order (see `bytecode/chunk/cache.zig`).
+pub fn buildAttrsNamed(self: *VM, names: []const u32, count: u16, positions: heap_mod.AttrPositions) !void {
+    const start = self.sp - count;
+    const id = try self.heap.addAttrsFromValues(names, self.stack[start..self.sp], positions);
+    self.sp = start;
+    try stack.push(self, Value.attrs(id));
+}
+
 pub fn buildAttrsSorted(self: *VM, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
     const value_count: u32 = @as(u32, count) * 2;
     const start = self.sp - value_count;

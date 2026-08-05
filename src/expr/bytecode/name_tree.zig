@@ -10,8 +10,8 @@
 //! The naming hierarchy is built top-down as the compiler descends (a parent's
 //! node exists before its children), so — unlike the chunk registration graph,
 //! which is bottom-up — a child can point at its parent node at creation. Nodes
-//! are append-only and never mutated, so lock-free `appendAtomic` makes this
-//! safe across the concurrent (deferred / speculative) compiles.
+//! are append-only and never mutated. Writers serialize the short append so a
+//! node is initialized before its id becomes visible to concurrent readers.
 
 const std = @import("std");
 const types = @import("runtime").types;
@@ -48,9 +48,9 @@ pub const NameTree = struct {
         self.nodes.deinit(allocator);
     }
 
-    /// Intern a child name `parent`/`segment`. Returns its `NameId`. Lock-free.
+    /// Intern a child name `parent`/`segment`. Returns its `NameId`.
     pub fn child(self: *NameTree, allocator: std.mem.Allocator, parent: NameId, segment: types.InternId, synthetic: bool) !NameId {
-        const idx = try self.nodes.appendAtomic(allocator, .{ .parent = parent, .segment = segment, .synthetic = synthetic });
+        const idx = try self.nodes.append(allocator, .{ .parent = parent, .segment = segment, .synthetic = synthetic });
         return idx + 1; // bias: index 0 → NameId 1, keeping NameId 0 = root
     }
 

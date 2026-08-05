@@ -334,6 +334,7 @@ fn deferLeaf(self: *Compiler, body: *const Node, name: InternId, snapshot: Defer
         // by the attr it binds. Always on (real binding), like eager bodies.
         .name_id = self.registry.childName(self.name_id, name, false) catch self.name_id,
     });
+    try self.recordUnitDeferred(id);
     try emit.emitDeferAttrValue(self, id, snapshot.caps);
     root.deferred_count += 1;
 }

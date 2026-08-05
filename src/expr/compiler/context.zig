@@ -145,6 +145,14 @@ pub const Compiler = struct {
     /// Optimizer-only plans and flattened AST overlays layered over the
     /// immutable `let_units` analysis. ROOT compiler only; scratch-lifetime.
     let_float_state: ?*LetFloatUnitState = null,
+    /// Chunk ids this unit registered, in registration order (children
+    /// before parents — a chunk's code only references already-listed
+    /// chunks). ROOT compiler only; feeds the persistent chunk cache's
+    /// unit record (`bytecode/chunk/cache.zig`). Scratch-lifetime.
+    unit_chunks: std.ArrayListUnmanaged(types.ChunkId) = .empty,
+    /// Deferred-table ids this unit registered, in registration order.
+    /// ROOT compiler only; same consumer as `unit_chunks`.
+    unit_deferred: std.ArrayListUnmanaged(u32) = .empty,
     /// Arena that `.elided` bodies are sub-parsed into (body-span elision;
     /// see `literals.materializeElided`). Set on the ROOT compiler:
     /// `parseAndCompile` points it at the file's (possibly retained) AST
@@ -330,6 +338,7 @@ pub const Compiler = struct {
             // candidate, costs more than the vanishingly rare reuse saves.
             const id = try self.registry.registerNamed(ch, self.name_id);
             try self.recordChunkSidecar(id, &ch);
+            try self.recordUnitChunk(id);
             if (self.registration_sink) |sink| sink.notify(id);
             return id;
         }
@@ -343,8 +352,25 @@ pub const Compiler = struct {
         } else {
             try self.recordChunkSidecar(r.id, &ch);
         }
+        // Reused (cross-unit) ids are recorded too: the cache serializer
+        // rejects units whose code references chunks outside the unit list,
+        // and a deduped id NOT in the list would be exactly that.
+        try self.recordUnitChunk(r.id);
         if (self.registration_sink) |sink| sink.notify(r.id);
         return r.id;
+    }
+
+    /// Track a unit-registered chunk id on the ROOT compiler (children
+    /// route up), in registration order.
+    pub fn recordUnitChunk(self: *Compiler, id: types.ChunkId) !void {
+        const root = self.rootCompiler();
+        try root.unit_chunks.append(root.allocator, id);
+    }
+
+    /// Track a unit-registered deferred-table id on the ROOT compiler.
+    pub fn recordUnitDeferred(self: *Compiler, id: u32) !void {
+        const root = self.rootCompiler();
+        try root.unit_deferred.append(root.allocator, id);
     }
 
     /// Record disassembly-only slot names and source-file metadata. Qualified
@@ -371,6 +397,8 @@ pub const Compiler = struct {
     pub fn deinit(self: *Compiler) void {
         for (self.builder_pool.items) |*builder| builder.deinit(self.allocator);
         self.builder_pool.deinit(self.allocator);
+        self.unit_chunks.deinit(self.allocator);
+        self.unit_deferred.deinit(self.allocator);
         for (self.owned_diagnostic_messages.items) |message| {
             self.allocator.free(message);
         }

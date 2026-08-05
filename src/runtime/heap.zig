@@ -2499,7 +2499,12 @@ pub const ObjectHeap = struct {
         return self.addAttrsFromValuesImpl(names, values, positions, .presorted_unique);
     }
 
-    /// `attrs_new_named`: names carry no ordering guarantee.
+    /// `attrs_new_named` (unsorted) variant: like `addAttrsFromValuesSorted`
+    /// but the names carry no order guarantee — a persistently-cached chunk
+    /// loads with remapped intern ids, and remapping does not preserve the
+    /// compile-time id order its `_srt` twin baked in. Sorts (and
+    /// duplicate-rejects) the entries; the shared position table reference
+    /// is still required sorted (the cache loader re-sorts each range).
     pub fn addAttrsFromValues(
         self: *ObjectHeap,
         names: []const InternId,

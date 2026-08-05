@@ -22,6 +22,7 @@ thunk evaluation across a pool of worker threads.
 - [strictness](compiler/strictness.md) — compile-time must-force analysis
 - [let-float](compiler/let-float.md) — demand-driven `let` binding placement rewrite
 - [lazy-compile](compiler/lazy-compile.md) — deferred compilation + trivial-body elision
+- [chunk-cache](compiler/chunk-cache.md) — persistent per-unit compiled-bytecode cache
 
 **Runtime** — [`runtime/`](runtime/)
 - [values](runtime/values.md) — NaN-boxed `Value` + numeric semantics
