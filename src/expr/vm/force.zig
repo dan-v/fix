@@ -283,19 +283,18 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     return forceThunkImpl(self, value, demand);
 }
 
-/// Follow a chain of *forwarding* thunks (a resolved thunk whose payload is
-/// itself a thunk) to the WHNF at its end. Only ALREADY-RESOLVED links are
-/// followed, reading each published value behind the acquire-load of its state
-/// — the same read `Thunk.tryForce` does on its `.already_resolved` path. An
-/// unresolved/busy forwardee is returned as-is rather than forced: forcing it
-/// here would evaluate a thunk (often a fixpoint binding cell) out of order and
-/// race the fiber that owns it. Cold: reached only when a resolved thunk's
-/// payload is unexpectedly another thunk.
+/// Follow a chain of forwarding thunks to the WHNF at its end. Resolved links
+/// can be read directly behind their state acquire; an unresolved or busy link
+/// goes through the normal force protocol. In particular, a helper that reaches
+/// a not-yet-published recursive binding cell parks until the constructing
+/// fiber installs the binding instead of leaking that cell as a result.
+/// Cold: reached only when a thunk evaluation returns another thunk.
 fn derefForwarder(self: *VM, start: Value, demand: bool) anyerror!Value {
     var r = start;
     while (r.isThunk()) {
         const t = self.heap.getThunkAssumeValid(r.asObjectId());
-        if (t.future.state.load(.acquire) != @intFromEnum(future_mod.FutureState.resolved)) return r;
+        if (t.future.state.load(.acquire) != @intFromEnum(future_mod.FutureState.resolved))
+            return forceValueImpl(self, r, demand);
         try observeEffectGroup(self, t.effect_group, demand and !self.speculation.active);
         if (demand) t.markDemanded();
         r = t.payload.result;
@@ -729,24 +728,29 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     }
 
     // Checked at the recursion point so resolved/busy/memo paths stay lean.
-    if (@frameAddress() < self.executionContextConst().stack_limit) return vm_trace.stackOverflow(self);
-    const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {
-        if (self.speculation.active and !isTransientThunkError(err)) {
-            attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |effect_err| {
-                self.executionContext().clearFailure();
-                publishThunkFailure(self, thunk, thunk_id, effect_err);
-                trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
-                return effect_err;
-            };
-        }
-        publishThunkFailure(self, thunk, thunk_id, err);
-        trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
-        return err;
-    };
+    if (@frameAddress() < self.executionContextConst().stack_limit)
+        return finishClaimedThunkFailure(
+            self,
+            thunk,
+            thunk_id,
+            effect_checkpoint,
+            vm_trace.stackOverflow(self),
+        );
+    const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err|
+        return finishClaimedThunkFailure(self, thunk, thunk_id, effect_checkpoint, err);
 
-    // A tail call may leave a forwarding thunk; peek through already-resolved
-    // links before publishing while retaining the original result as the edge.
-    const whnf = if (result.isThunk()) try derefForwarder(self, result, real_demand) else result;
+    // A tail call may leave a forwarding thunk. Force through it before
+    // publishing. The outer thunk still contains its evaluation target, so the
+    // returned value needs an explicit native root across the nested force.
+    const result_roots = rootsBegin(self);
+    defer rootsEnd(self, result_roots);
+    rootKeep(self, result);
+    const whnf = if (result.isThunk())
+        derefForwarder(self, result, real_demand) catch |err|
+            return finishClaimedThunkFailure(self, thunk, thunk_id, effect_checkpoint, err)
+    else
+        result;
+    rootKeep(self, whnf);
     if (self.speculation.active) attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |err| {
         publishThunkFailure(self, thunk, thunk_id, err);
         trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
@@ -754,8 +758,8 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     };
 
     self.heap.gcReleaseThunkSpill(thunk);
-    resolveDispatch(self, thunk, result);
-    self.heap.gcRecordEdge(thunk_id, result);
+    resolveDispatch(self, thunk, whnf);
+    self.heap.gcRecordEdge(thunk_id, whnf);
     if (memo_key) |key| {
         if (self.effect_epoch == effect_epoch) {
             thread_caches.get().thunk_memo[key.idx] = .{
@@ -772,6 +776,28 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, true);
     if (real_demand) thunk.markDemanded();
     return whnf;
+}
+
+/// Finish a claimed thunk whose body or forwarded result failed. Speculative
+/// effects and the terminal/reset transition must be identical for both paths.
+fn finishClaimedThunkFailure(
+    self: *VM,
+    thunk: *Thunk,
+    thunk_id: types.ObjectId,
+    effect_checkpoint: usize,
+    err: anyerror,
+) anyerror {
+    if (self.speculation.active and !isTransientThunkError(err)) {
+        attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |effect_err| {
+            self.executionContext().clearFailure();
+            publishThunkFailure(self, thunk, thunk_id, effect_err);
+            trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
+            return effect_err;
+        };
+    }
+    publishThunkFailure(self, thunk, thunk_id, err);
+    trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
+    return err;
 }
 
 fn enforceSpeculationBudget(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId) !void {
