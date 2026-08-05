@@ -1573,7 +1573,12 @@ pub const ObjectHeap = struct {
                     break :blk .{ .id = rid, .reused = true };
                 }
                 local.object_reuse_misses += 1;
-                if (self.collection.object_miss_collect_armed.swap(false, .acq_rel)) {
+                // Disarmed is overwhelmingly the common case. Avoid a locked
+                // RMW on every fresh object allocation; only contenders that
+                // observe an armed trigger pay for the one-winner transition.
+                if (self.collection.object_miss_collect_armed.load(.monotonic) and
+                    self.collection.object_miss_collect_armed.cmpxchgStrong(true, false, .acq_rel, .monotonic) == null)
+                {
                     self.collection.collect_requested.store(true, .monotonic);
                     _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
                 }
