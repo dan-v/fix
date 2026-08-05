@@ -1,8 +1,10 @@
-//! Named VM-explorer subsystem capabilities.
+//! Named VM-explorer subsystem implementation registry.
 //!
 //! The generic `Methods` pattern breaks import cycles without flattening every
-//! operation into one mega namespace. Call sites retain the owning subsystem
-//! in their spelling (`Ops.controller.open`, `Ops.pages.refreshPage`, ...).
+//! operation into one mega namespace. A subsystem calls its own helpers
+//! directly; `Ops.controller.open`, `Ops.pages.refreshPage`, and similar names
+//! therefore mark real cross-subsystem coordination. `Explorer` is the private
+//! UI state type, not a claimed capability boundary.
 
 const pages_mod = @import("pages.zig");
 const source_view_mod = @import("source_view.zig");

@@ -40,26 +40,8 @@ const HeapIndexState = vm_model.HeapIndexState;
 const ReferenceIndexState = vm_model.ReferenceIndexState;
 const Viewport = vm_model.Viewport;
 
-const disasm_options: disasm.Options = .{
-    .show_constants = true,
-    .show_source = true,
-    .show_bytes = true,
-    .recurse = false,
-};
-
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.pages.RenderedValue;
-        const Layout = Explorer.Ops.view_state.Layout;
-        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
-        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
-        const TreeCell = Explorer.Ops.tree_render.TreeCell;
-        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
-        const range_leaf = Explorer.range_leaf;
-        const range_branch = Explorer.range_branch;
-        const preview_line_cap = Explorer.preview_line_cap;
-
         /// Escape unwinds one interaction layer. It leaves an in-place source
         /// session first, then the inspector, then nested/expanded tree rows. Only
         /// an Escape at the tree root asks the caller to leave the explorer.
@@ -71,7 +53,7 @@ pub fn Methods(comptime Explorer: type) type {
                 .tree_can_move_up = Explorer.Ops.tree_projection.treeSelectionCanMoveUp(self),
             })) {
                 .leave_source => {
-                    try Explorer.Ops.controller.leaveSourceSession(self, self.source_session.?);
+                    try leaveSourceSession(self, self.source_session.?);
                     self.status_msg = "";
                     return true;
                 },
@@ -102,7 +84,7 @@ pub fn Methods(comptime Explorer: type) type {
         pub const OpenMode = enum { push, replace };
 
         pub fn open(self: *Explorer, kind: Visit.Kind) !void {
-            return Explorer.Ops.controller.openMode(self, kind, .push);
+            return openMode(self, kind, .push);
         }
 
         pub fn openMode(self: *Explorer, kind: Visit.Kind, mode: OpenMode) !void {
@@ -125,7 +107,7 @@ pub fn Methods(comptime Explorer: type) type {
             self.preview.reset();
             try Explorer.Ops.pages.refreshPage(self, kind);
             self.navigation.scroll = 0;
-            self.navigation.detail_selection = Explorer.Ops.controller.firstActionableRow(self) orelse 0;
+            self.navigation.detail_selection = firstActionableRow(self) orelse 0;
             try Explorer.Ops.source_view.selectedSourceChanged(self);
             // A tree row is already visible, so opening it must not rebuild or
             // re-project the tree. Only subjects reached from outside the tree
@@ -221,12 +203,12 @@ pub fn Methods(comptime Explorer: type) type {
         }
 
         pub fn maxScroll(self: *const Explorer) usize {
-            const rows = Explorer.Ops.controller.contentRows(self);
+            const rows = contentRows(self);
             return if (self.page.lines.len > rows) self.page.lines.len - rows else 0;
         }
 
         pub fn clampScroll(self: *Explorer) void {
-            if (self.navigation.scroll > Explorer.Ops.controller.maxScroll(self)) self.navigation.scroll = Explorer.Ops.controller.maxScroll(self);
+            if (self.navigation.scroll > maxScroll(self)) self.navigation.scroll = maxScroll(self);
         }
 
         pub fn maxXScroll(self: *const Explorer) usize {
@@ -332,7 +314,7 @@ pub fn Methods(comptime Explorer: type) type {
                             const next_span = next.span orelse continue;
                             if (next.chunk_id == location.chunk_id and vm_source.eql(next_span, span)) {
                                 self.navigation.detail_selection = i;
-                                Explorer.Ops.controller.ensureDetailVisible(self);
+                                ensureDetailVisible(self);
                                 break;
                             }
                         }
@@ -349,9 +331,9 @@ pub fn Methods(comptime Explorer: type) type {
                     if (cursor == 0) return;
                     cursor -= 1;
                 }
-                if (Explorer.Ops.controller.rowActionable(self, cursor)) {
+                if (rowActionable(self, cursor)) {
                     self.navigation.detail_selection = cursor;
-                    Explorer.Ops.controller.ensureDetailVisible(self);
+                    ensureDetailVisible(self);
                     Explorer.Ops.source_view.selectedSourceChanged(self) catch {
                         self.status_msg = "(source preview unavailable)";
                     };
@@ -361,20 +343,20 @@ pub fn Methods(comptime Explorer: type) type {
         }
 
         pub fn ensureDetailVisible(self: *Explorer) void {
-            const rows = Explorer.Ops.controller.contentRows(self);
+            const rows = contentRows(self);
             if (rows == 0) return;
             if (self.navigation.detail_selection < self.navigation.scroll) self.navigation.scroll = self.navigation.detail_selection;
             if (self.navigation.detail_selection >= self.navigation.scroll + rows) self.navigation.scroll = self.navigation.detail_selection - rows + 1;
-            Explorer.Ops.controller.clampScroll(self);
+            clampScroll(self);
         }
 
         pub fn activateDetailRow(self: *Explorer) !void {
             if (self.navigation.detail_selection >= self.page.actions.len) return;
             switch (self.page.actions[self.navigation.detail_selection]) {
-                .chunk => |id| try Explorer.Ops.controller.open(self, .{ .chunk = id }),
-                .object => |id| try Explorer.Ops.controller.open(self, .{ .object = id }),
-                .store_record => |record| try Explorer.Ops.controller.open(self, .{ .store_record = .{ .view = record.view, .id = record.id } }),
-                .source => |id| try Explorer.Ops.controller.enterSourceSession(self, id),
+                .chunk => |id| try open(self, .{ .chunk = id }),
+                .object => |id| try open(self, .{ .object = id }),
+                .store_record => |record| try open(self, .{ .store_record = .{ .view = record.view, .id = record.id } }),
+                .source => |id| try enterSourceSession(self, id),
                 .instruction, .none, .section => {},
             }
         }
@@ -399,7 +381,7 @@ pub fn Methods(comptime Explorer: type) type {
                 const candidate_span = location.span orelse continue;
                 if (location.chunk_id == chunk_id and vm_source.eql(candidate_span, selected_span)) {
                     self.navigation.detail_selection = i;
-                    Explorer.Ops.controller.ensureDetailVisible(self);
+                    ensureDetailVisible(self);
                     return;
                 }
             }
@@ -411,7 +393,7 @@ pub fn Methods(comptime Explorer: type) type {
             for (self.page.actions, 0..) |action, i| switch (action) {
                 .source => |id| if (id == chunk_id) {
                     self.navigation.detail_selection = i;
-                    Explorer.Ops.controller.ensureDetailVisible(self);
+                    ensureDetailVisible(self);
                     return;
                 },
                 else => {},
@@ -420,9 +402,9 @@ pub fn Methods(comptime Explorer: type) type {
 
         pub fn toggleHelp(self: *Explorer) !void {
             if (Explorer.Ops.view_state.currentKind(self) == .help and self.navigation.back.items.len > 1) {
-                try Explorer.Ops.controller.back(self);
+                try back(self);
             } else if (Explorer.Ops.view_state.currentKind(self) != .help) {
-                try Explorer.Ops.controller.open(self, .help);
+                try open(self, .help);
             }
         }
 
@@ -458,28 +440,28 @@ pub fn Methods(comptime Explorer: type) type {
                         if (self.navigation.focus == .tree) {
                             Explorer.Ops.tree_projection.moveTree(self, true);
                         } else {
-                            Explorer.Ops.controller.moveDetail(self, true);
+                            moveDetail(self, true);
                         }
                     },
                     'k' => {
                         if (self.navigation.focus == .tree) {
                             Explorer.Ops.tree_projection.moveTree(self, false);
                         } else {
-                            Explorer.Ops.controller.moveDetail(self, false);
+                            moveDetail(self, false);
                         }
                     },
                     'd' => {
-                        if (self.navigation.focus == .subject) self.navigation.scroll = @min(self.navigation.scroll + Explorer.Ops.controller.contentRows(self) / 2, Explorer.Ops.controller.maxScroll(self));
+                        if (self.navigation.focus == .subject) self.navigation.scroll = @min(self.navigation.scroll + contentRows(self) / 2, maxScroll(self));
                     },
                     'u' => {
-                        if (self.navigation.focus == .subject) self.navigation.scroll -|= Explorer.Ops.controller.contentRows(self) / 2;
+                        if (self.navigation.focus == .subject) self.navigation.scroll -|= contentRows(self) / 2;
                     },
                     'g' => {
                         if (self.navigation.focus == .tree) {
                             self.navigation.tree_selection = 0;
                         } else {
-                            self.navigation.detail_selection = Explorer.Ops.controller.firstActionableRow(self) orelse 0;
-                            Explorer.Ops.controller.ensureDetailVisible(self);
+                            self.navigation.detail_selection = firstActionableRow(self) orelse 0;
+                            ensureDetailVisible(self);
                             try Explorer.Ops.source_view.selectedSourceChanged(self);
                         }
                     },
@@ -490,12 +472,12 @@ pub fn Methods(comptime Explorer: type) type {
                             var row = self.page.actions.len;
                             while (row > 0) {
                                 row -= 1;
-                                if (Explorer.Ops.controller.rowActionable(self, row)) {
+                                if (rowActionable(self, row)) {
                                     self.navigation.detail_selection = row;
                                     break;
                                 }
                             }
-                            Explorer.Ops.controller.ensureDetailVisible(self);
+                            ensureDetailVisible(self);
                             try Explorer.Ops.source_view.selectedSourceChanged(self);
                         }
                     },
@@ -503,32 +485,32 @@ pub fn Methods(comptime Explorer: type) type {
                         if (self.navigation.focus == .subject) self.navigation.x_scroll -|= 4;
                     },
                     'l' => {
-                        if (self.navigation.focus == .subject) self.navigation.x_scroll = @min(self.navigation.x_scroll + 4, Explorer.Ops.controller.maxXScroll(self));
+                        if (self.navigation.focus == .subject) self.navigation.x_scroll = @min(self.navigation.x_scroll + 4, maxXScroll(self));
                     },
-                    'b' => try Explorer.Ops.controller.back(self),
-                    'f' => try Explorer.Ops.controller.goForward(self),
-                    'p' => try Explorer.Ops.controller.toggleSelectedBreakpoint(self),
-                    'F' => try Explorer.Ops.controller.filterPrompt(self),
-                    '?' => try Explorer.Ops.controller.toggleHelp(self),
+                    'b' => try back(self),
+                    'f' => try goForward(self),
+                    'p' => try toggleSelectedBreakpoint(self),
+                    'F' => try filterPrompt(self),
+                    '?' => try toggleHelp(self),
                     '/' => {
-                        if (self.navigation.focus == .subject) try Explorer.Ops.controller.searchPrompt(self);
+                        if (self.navigation.focus == .subject) try searchPrompt(self);
                     },
                     'n' => {
-                        Explorer.Ops.controller.findNext(self, 1);
+                        findNext(self, 1);
                     },
                     'N' => {
-                        Explorer.Ops.controller.findNext(self, -1);
+                        findNext(self, -1);
                     },
                     else => {},
                 },
                 .up => {
-                    if (self.navigation.focus == .tree) Explorer.Ops.tree_projection.moveTree(self, false) else Explorer.Ops.controller.moveDetail(self, false);
+                    if (self.navigation.focus == .tree) Explorer.Ops.tree_projection.moveTree(self, false) else moveDetail(self, false);
                 },
                 .down => {
                     if (self.navigation.focus == .tree) {
                         Explorer.Ops.tree_projection.moveTree(self, true);
                     } else {
-                        Explorer.Ops.controller.moveDetail(self, true);
+                        moveDetail(self, true);
                     }
                 },
                 .left => {
@@ -538,24 +520,24 @@ pub fn Methods(comptime Explorer: type) type {
                     if (self.navigation.focus == .tree) {
                         try Explorer.Ops.tree_projection.activateTreeRow(self);
                     } else {
-                        self.navigation.x_scroll = @min(self.navigation.x_scroll + 4, Explorer.Ops.controller.maxXScroll(self));
+                        self.navigation.x_scroll = @min(self.navigation.x_scroll + 4, maxXScroll(self));
                     }
                 },
                 .page_up => {
-                    if (self.navigation.focus == .subject) self.navigation.scroll -|= Explorer.Ops.controller.contentRows(self);
+                    if (self.navigation.focus == .subject) self.navigation.scroll -|= contentRows(self);
                 },
                 .page_down => {
-                    if (self.navigation.focus == .subject) self.navigation.scroll = @min(self.navigation.scroll + Explorer.Ops.controller.contentRows(self), Explorer.Ops.controller.maxScroll(self));
+                    if (self.navigation.focus == .subject) self.navigation.scroll = @min(self.navigation.scroll + contentRows(self), maxScroll(self));
                 },
                 .home => {
                     if (self.navigation.focus == .tree) self.navigation.tree_selection = 0 else {
-                        self.navigation.detail_selection = Explorer.Ops.controller.firstActionableRow(self) orelse 0;
-                        Explorer.Ops.controller.ensureDetailVisible(self);
+                        self.navigation.detail_selection = firstActionableRow(self) orelse 0;
+                        ensureDetailVisible(self);
                         try Explorer.Ops.source_view.selectedSourceChanged(self);
                     }
                 },
                 .end => {
-                    if (self.navigation.focus == .tree) self.navigation.tree_selection = self.tree.rows.items.len -| 1 else self.navigation.scroll = Explorer.Ops.controller.maxScroll(self);
+                    if (self.navigation.focus == .tree) self.navigation.tree_selection = self.tree.rows.items.len -| 1 else self.navigation.scroll = maxScroll(self);
                 },
                 .tab, .backtab => {
                     if (self.navigation.focus == .tree) {
@@ -565,7 +547,7 @@ pub fn Methods(comptime Explorer: type) type {
                     }
                 },
                 .enter => {
-                    if (self.navigation.focus == .tree) try Explorer.Ops.tree_projection.activateTreeRow(self) else try Explorer.Ops.controller.activateDetailRow(self);
+                    if (self.navigation.focus == .tree) try Explorer.Ops.tree_projection.activateTreeRow(self) else try activateDetailRow(self);
                 },
                 .escape => return true,
                 else => {},
@@ -577,7 +559,7 @@ pub fn Methods(comptime Explorer: type) type {
         pub fn searchPrompt(self: *Explorer) !void {
             self.navigation.search.clearRetainingCapacity();
             if (try prompt.read(self.allocator, self.io, self.color_depth, "/", &self.navigation.search) == .submitted)
-                Explorer.Ops.controller.findNext(self, 1);
+                findNext(self, 1);
         }
 
         /// Modal filter input on the status row. Enter applies the substring filter
@@ -612,7 +594,7 @@ pub fn Methods(comptime Explorer: type) type {
                 else
                     (self.navigation.scroll + n - (offset % n)) % n;
                 if (std.mem.indexOf(u8, self.page.lines[line_idx], self.navigation.search.items) != null) {
-                    self.navigation.scroll = @min(line_idx, Explorer.Ops.controller.maxScroll(self));
+                    self.navigation.scroll = @min(line_idx, maxScroll(self));
                     return;
                 }
             }

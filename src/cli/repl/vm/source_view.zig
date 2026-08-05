@@ -40,27 +40,8 @@ const HeapIndexState = vm_model.HeapIndexState;
 const ReferenceIndexState = vm_model.ReferenceIndexState;
 const Viewport = vm_model.Viewport;
 
-const disasm_options: disasm.Options = .{
-    .show_constants = true,
-    .show_source = true,
-    .show_bytes = true,
-    .recurse = false,
-};
-
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.pages.RenderedValue;
-        const Layout = Explorer.Ops.view_state.Layout;
-        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
-        const OpenMode = Explorer.Ops.controller.OpenMode;
-        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
-        const TreeCell = Explorer.Ops.tree_render.TreeCell;
-        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
-        const range_leaf = Explorer.range_leaf;
-        const range_branch = Explorer.range_branch;
-        const preview_line_cap = Explorer.preview_line_cap;
-
         pub fn sessionPromptView(self: *Explorer, editor: *editor_mod.Editor, arena: std.mem.Allocator) !render_mod.View {
             _ = self;
             var view: render_mod.View = .{
@@ -125,13 +106,13 @@ pub fn Methods(comptime Explorer: type) type {
                 break :blk .{ "<repl expression>", direct };
             };
 
-            try Explorer.Ops.source_view.appendSourceHeading(self, document, id, chunk, shown_span);
+            try appendSourceHeading(self, document, id, chunk, shown_span);
             try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{ label, shown_span.line, shown_span.column }), .none);
             const bytes = source orelse {
                 try document.line("(source text is unavailable)", .none);
                 return;
             };
-            try Explorer.Ops.source_view.appendSourceExcerpt(
+            try appendSourceExcerpt(
                 self,
                 document,
                 bytes,
@@ -157,13 +138,13 @@ pub fn Methods(comptime Explorer: type) type {
                 suggested_span
             else
                 vm_source.first(chunk) orelse suggested_span;
-            try Explorer.Ops.source_view.appendSourceHeading(self, document, id, chunk, span);
+            try appendSourceHeading(self, document, id, chunk, span);
             try document.line(try std.fmt.allocPrint(document.arena, "{s}:{d}:{d}", .{
                 if (span.file) |file| self.ev.internTable().get(file) else "<repl expression>",
                 span.line,
                 span.column,
             }), .none);
-            try Explorer.Ops.source_view.appendSourceExcerpt(
+            try appendSourceExcerpt(
                 self,
                 document,
                 source,
@@ -209,7 +190,7 @@ pub fn Methods(comptime Explorer: type) type {
         /// jump when the excerpt's line count changes.
         pub fn selectedSourceChanged(self: *Explorer) !void {
             const source_session = self.source_session orelse return;
-            const selected = Explorer.Ops.source_view.selectedSourceLocation(self) orelse return;
+            const selected = selectedSourceLocation(self) orelse return;
             if (selected.chunk_id != source_session) return;
             self.source_focus = .{ .chunk_id = selected.chunk_id, .span = selected.span.? };
 
@@ -299,7 +280,7 @@ pub fn Methods(comptime Explorer: type) type {
                     break :blk .{ .start = selected_start - cursor, .end = selected_end - cursor };
                 } else null;
                 const breakpoints = if (chunk_id) |target|
-                    try Explorer.Ops.source_view.sourceBreakpointRanges(self, document.arena, target, cursor, shown_end)
+                    try sourceBreakpointRanges(self, document.arena, target, cursor, shown_end)
                 else
                     &.{};
                 try source_render.writeLine(&rendered.writer, source[cursor..shown_end], .{
@@ -312,7 +293,7 @@ pub fn Methods(comptime Explorer: type) type {
                 const result_here = active and returned_value != null and focus_end <= line_end;
                 if (result_here) {
                     var annotation: std.Io.Writer.Allocating = .init(document.arena);
-                    try Explorer.Ops.source_view.writeReturnAnnotation(
+                    try writeReturnAnnotation(
                         self,
                         document.arena,
                         &annotation.writer,

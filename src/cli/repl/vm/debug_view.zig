@@ -43,25 +43,8 @@ const HeapIndexState = vm_model.HeapIndexState;
 const ReferenceIndexState = vm_model.ReferenceIndexState;
 const Viewport = vm_model.Viewport;
 
-const disasm_options: disasm.Options = .{
-    .show_constants = true,
-    .show_source = true,
-    .show_bytes = true,
-    .recurse = false,
-};
-
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.pages.RenderedValue;
-        const Layout = Explorer.Ops.view_state.Layout;
-        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
-        const OpenMode = Explorer.Ops.controller.OpenMode;
-        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
-        const TreeCell = Explorer.Ops.tree_render.TreeCell;
-        const range_leaf = Explorer.range_leaf;
-        const range_branch = Explorer.range_branch;
-        const preview_line_cap = Explorer.preview_line_cap;
-
         // -- debug pause ------------------------------------------------------------
 
         pub const DebugOutcome = enum { running, resume_keep, resume_close, abort };
@@ -92,7 +75,7 @@ pub fn Methods(comptime Explorer: type) type {
             self.debug_nav_mark = self.navigation.back.items.len;
             defer {
                 self.return_flash = false;
-                Explorer.Ops.debug_view.exitDebugView(self);
+                exitDebugView(self);
             }
             try Explorer.Ops.controller.open(self, .{ .debug_frame = session.frameCount() -| 1 });
             if (session.reason == .return_step) Explorer.Ops.pages.focusValueRow(self, session.value);
@@ -156,9 +139,9 @@ pub fn Methods(comptime Explorer: type) type {
 
                 for (events.items) |key| {
                     const outcome = if (prompt_active)
-                        try Explorer.Ops.debug_view.debugPromptKey(self, session, &editor, &capture, &prompt_active, w, &prompt_renderer, key)
+                        try debugPromptKey(self, session, &editor, &capture, &prompt_active, w, &prompt_renderer, key)
                     else
-                        try Explorer.Ops.debug_view.debugKey(self, session, &editor, &prompt_active, key);
+                        try debugKey(self, session, &editor, &prompt_active, key);
                     switch (outcome) {
                         .running => {},
                         .resume_keep => return .keep,
@@ -180,9 +163,9 @@ pub fn Methods(comptime Explorer: type) type {
                         return .running;
                     }
                     switch (cp) {
-                        's' => return Explorer.Ops.debug_view.debugStep(self, session, .into),
-                        'n' => return Explorer.Ops.debug_view.debugStep(self, session, .over),
-                        'f' => return Explorer.Ops.debug_view.debugStep(self, session, .out),
+                        's' => return debugStep(self, session, .into),
+                        'n' => return debugStep(self, session, .over),
+                        'f' => return debugStep(self, session, .out),
                         'c' => return .resume_close,
                         'q' => return .abort,
                         ':' => {
@@ -237,7 +220,7 @@ pub fn Methods(comptime Explorer: type) type {
                     const input = try editor.takeText();
                     defer self.allocator.free(input);
                     prompt_active.* = false;
-                    return Explorer.Ops.debug_view.debugExecute(self, session, capture, std.mem.trim(u8, input, " \t\r\n"));
+                    return debugExecute(self, session, capture, std.mem.trim(u8, input, " \t\r\n"));
                 },
                 .eof => return .abort,
                 .cancel => {
@@ -258,33 +241,33 @@ pub fn Methods(comptime Explorer: type) type {
                 .none => {},
                 .proceed => return .resume_close,
                 .abort => return .abort,
-                .step => |kind| return Explorer.Ops.debug_view.debugStep(self, session, switch (kind) {
+                .step => |kind| return debugStep(self, session, switch (kind) {
                     .over => .over,
                     .into => .into,
                     .out => .out,
                 }),
-                .help => try Explorer.Ops.debug_view.debugSetCapture(self, capture, vm_helpers.debug_help_text),
-                .backtrace, .locals => try Explorer.Ops.debug_view.debugSetCapture(self, capture, "The tree shows the paused stack; select a frame to inspect its source, locals, and code."),
+                .help => try debugSetCapture(self, capture, vm_helpers.debug_help_text),
+                .backtrace, .locals => try debugSetCapture(self, capture, "The tree shows the paused stack; select a frame to inspect its source, locals, and code."),
                 .frame => |arg| {
                     const depth = if (arg.len == 0)
                         0
                     else
                         std.fmt.parseInt(usize, arg, 10) catch {
-                            try Explorer.Ops.debug_view.debugSetCapture(self, capture, "usage: :frame [DEPTH]");
+                            try debugSetCapture(self, capture, "usage: :frame [DEPTH]");
                             return .running;
                         };
                     if (depth >= session.frameCount()) {
-                        try Explorer.Ops.debug_view.debugSetCaptureFmt(self, capture, "no frame #{d}", .{depth});
+                        try debugSetCaptureFmt(self, capture, "no frame #{d}", .{depth});
                     } else {
                         try Explorer.Ops.controller.open(self, .{ .debug_frame = session.frameCount() - 1 - depth });
                     }
                 },
-                .value => try Explorer.Ops.debug_view.debugRenderValue(self, session, capture, session.value),
-                .explore => try Explorer.Ops.debug_view.debugSetCapture(self, capture, "Use the VM tree to browse chunks, heap stores, objects, and references."),
+                .value => try debugRenderValue(self, session, capture, session.value),
+                .explore => try debugSetCapture(self, capture, "Use the VM tree to browse chunks, heap stores, objects, and references."),
                 .eval => |source| {
                     const scope = session.scopeAttrs() catch session.bindValueScope("it") catch null;
                     const value = session.eval(source, scope) catch |err| {
-                        try Explorer.Ops.debug_view.debugSetCaptureFmt(self, capture, "error: {f}", .{cli_render.friendly(err)});
+                        try debugSetCaptureFmt(self, capture, "error: {f}", .{cli_render.friendly(err)});
                         return .running;
                     };
                     // Debugger evaluation may allocate or resolve objects without
@@ -293,12 +276,12 @@ pub fn Methods(comptime Explorer: type) type {
                     self.clearReferenceGraph();
                     self.refreshPausedTreeSnapshots();
                     try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
-                    try Explorer.Ops.debug_view.debugRenderValue(self, session, capture, value);
+                    try debugRenderValue(self, session, capture, value);
                     try Explorer.Ops.pages.refreshPage(self, Explorer.Ops.view_state.currentKind(self));
                 },
-                .breakpoint => |arg| try Explorer.Ops.debug_view.debugAddBreakpoint(self, session, capture, arg),
-                .breakpoints => try Explorer.Ops.debug_view.debugListBreakpoints(self, session, capture),
-                .delete => |arg| try Explorer.Ops.debug_view.debugDeleteBreakpoint(self, session, capture, arg),
+                .breakpoint => |arg| try debugAddBreakpoint(self, session, capture, arg),
+                .breakpoints => try debugListBreakpoints(self, session, capture),
+                .delete => |arg| try debugDeleteBreakpoint(self, session, capture, arg),
                 .gc => {
                     // Object ids and liveness bitmaps become stale at sweep.
                     // Drop them before collection, then rebuild the paused

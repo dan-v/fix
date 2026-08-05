@@ -39,25 +39,8 @@ const HeapIndexState = vm_model.HeapIndexState;
 const ReferenceIndexState = vm_model.ReferenceIndexState;
 const Viewport = vm_model.Viewport;
 
-const disasm_options: disasm.Options = .{
-    .show_constants = true,
-    .show_source = true,
-    .show_bytes = true,
-    .recurse = false,
-};
-
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.pages.RenderedValue;
-        const Layout = Explorer.Ops.view_state.Layout;
-        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
-        const OpenMode = Explorer.Ops.controller.OpenMode;
-        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
-        const range_leaf = Explorer.range_leaf;
-        const range_branch = Explorer.range_branch;
-        const preview_line_cap = Explorer.preview_line_cap;
-
         pub fn drawFocusDivider(self: *Explorer, frame: *tui.Frame, row: usize, col: usize, focused: bool) !void {
             _ = self;
             try frame.at(row, col);
@@ -82,12 +65,12 @@ pub fn Methods(comptime Explorer: type) type {
             const idx = self.navigation.scroll + row;
             if (idx < self.page.lines.len) {
                 const selected = idx == self.navigation.detail_selection and self.navigation.focus == .subject and Explorer.Ops.controller.rowActionable(self, idx);
-                const breakpoint = idx < self.page.locations.len and if (self.page.locations[idx]) |location| Explorer.Ops.tree_render.hasBreakpoint(self, location) else false;
+                const breakpoint = idx < self.page.locations.len and if (self.page.locations[idx]) |location| hasBreakpoint(self, location) else false;
                 if ((selected or breakpoint) and width >= 2) {
                     try frame.text(if (selected and breakpoint) "◆ " else if (selected) "› " else "● ", 0, 2, if (selected) .selection_marker else .current);
-                    try frame.text(self.page.lines[idx], self.navigation.x_scroll, width - 2, Explorer.Ops.tree_render.detailRole(self, idx));
+                    try frame.text(self.page.lines[idx], self.navigation.x_scroll, width - 2, detailRole(self, idx));
                 } else {
-                    try frame.text(self.page.lines[idx], self.navigation.x_scroll, width, Explorer.Ops.tree_render.detailRole(self, idx));
+                    try frame.text(self.page.lines[idx], self.navigation.x_scroll, width, detailRole(self, idx));
                 }
             } else if (idx == self.page.lines.len and self.page.lines.len != 0) {
                 try frame.text("(end)", 0, width, .muted);
@@ -145,7 +128,7 @@ pub fn Methods(comptime Explorer: type) type {
             while (pass < 2) : (pass += 1) {
                 result.start = @min(self.navigation.tree_selection -| (normal_slots / 2), count -| normal_slots);
                 var hidden_nearest: [64]usize = undefined;
-                const hidden_count = Explorer.Ops.tree_render.hiddenTreeAncestors(self, result.start, &hidden_nearest);
+                const hidden_count = hiddenTreeAncestors(self, result.start, &hidden_nearest);
                 result.pin_count = @min(@min(hidden_count, hidden_nearest.len), slots -| 1);
                 var i: usize = 0;
                 while (i < result.pin_count) : (i += 1) {
@@ -188,13 +171,13 @@ pub fn Methods(comptime Explorer: type) type {
         /// pinned breadcrumbs may consume several rows; ordinary rows stay one
         /// line and are middle-ellipsized by the renderer below.
         pub fn treeCell(self: *const Explorer, slot: usize, width: usize, slots: usize) ?TreeCell {
-            const viewport = Explorer.Ops.tree_render.treeViewport(self, slots);
+            const viewport = treeViewport(self, slots);
             var pin_start: usize = 0;
             var pin_height: usize = 0;
-            for (viewport.pinned[0..viewport.pin_count]) |index| pin_height += Explorer.Ops.tree_render.treeDisplayHeight(self, index, width, slots, true);
-            const selected_height = Explorer.Ops.tree_render.treeDisplayHeight(self, self.navigation.tree_selection, width, slots, false);
+            for (viewport.pinned[0..viewport.pin_count]) |index| pin_height += treeDisplayHeight(self, index, width, slots, true);
+            const selected_height = treeDisplayHeight(self, self.navigation.tree_selection, width, slots, false);
             while (pin_start < viewport.pin_count and pin_height + selected_height > slots) : (pin_start += 1) {
-                pin_height -|= Explorer.Ops.tree_render.treeDisplayHeight(self, viewport.pinned[pin_start], width, slots, true);
+                pin_height -|= treeDisplayHeight(self, viewport.pinned[pin_start], width, slots, true);
             }
 
             var normal_start = viewport.start;
@@ -206,7 +189,7 @@ pub fn Methods(comptime Explorer: type) type {
 
             var physical: usize = 0;
             for (viewport.pinned[pin_start..viewport.pin_count]) |index| {
-                const height = Explorer.Ops.tree_render.treeDisplayHeight(self, index, width, slots, true);
+                const height = treeDisplayHeight(self, index, width, slots, true);
                 if (slot < physical + height) return .{
                     .index = index,
                     .segment = slot - physical,
@@ -218,7 +201,7 @@ pub fn Methods(comptime Explorer: type) type {
 
             var index = normal_start;
             while (index < self.tree.rows.items.len and physical < slots) : (index += 1) {
-                const height = Explorer.Ops.tree_render.treeDisplayHeight(self, index, width, slots, false);
+                const height = treeDisplayHeight(self, index, width, slots, false);
                 if (slot < physical + height) return .{
                     .index = index,
                     .segment = slot - physical,
@@ -232,7 +215,7 @@ pub fn Methods(comptime Explorer: type) type {
 
         pub fn treeSelectionSlot(self: *const Explorer, width: usize, slots: usize) ?usize {
             for (0..slots) |slot| {
-                const cell = Explorer.Ops.tree_render.treeCell(self, slot, width, slots) orelse continue;
+                const cell = treeCell(self, slot, width, slots) orelse continue;
                 if (cell.index == self.navigation.tree_selection and cell.segment == 0)
                     return slot;
             }
@@ -243,7 +226,7 @@ pub fn Methods(comptime Explorer: type) type {
             if (index >= self.tree.rows.items.len or width < 8) return 1;
             const selected = index == self.navigation.tree_selection and self.navigation.focus == .tree;
             if (!pinned and !selected) return 1;
-            const content_width = Explorer.Ops.tree_render.longTreeContentWidth(self, self.tree.rows.items[index]) orelse return 1;
+            const content_width = longTreeContentWidth(self, self.tree.rows.items[index]) orelse return 1;
             const prefix = @min(1 + @as(usize, treeRowDepth(self.tree.rows.items[index])) * 2 + 2, width - 1);
             const available = width - prefix;
             const height = @max(@as(usize, 1), (content_width + available - 1) / available);
@@ -323,7 +306,7 @@ pub fn Methods(comptime Explorer: type) type {
 
         pub fn drawChunkRow(self: *Explorer, arena: std.mem.Allocator, frame: *tui.Frame, row: usize, width: usize, rows: usize) !void {
             var line_buf: [512]u8 = undefined;
-            if (try Explorer.Ops.tree_render.drawTreeHeader(self, frame, row, width)) return;
+            if (try drawTreeHeader(self, frame, row, width)) return;
 
             const count = self.tree.rows.items.len;
             if (count == 0) {
@@ -333,7 +316,7 @@ pub fn Methods(comptime Explorer: type) type {
             const slots = rows -| 3;
             if (slots == 0) return;
             const slot = row - 3;
-            const cell = Explorer.Ops.tree_render.treeCell(self, slot, width, slots) orelse return;
+            const cell = treeCell(self, slot, width, slots) orelse return;
             const index = cell.index;
             if (index >= count) return;
             const pinned = cell.pinned;

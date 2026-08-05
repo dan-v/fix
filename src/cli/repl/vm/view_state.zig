@@ -34,36 +34,19 @@ const HeapIndexState = vm_model.HeapIndexState;
 const ReferenceIndexState = vm_model.ReferenceIndexState;
 const Viewport = vm_model.Viewport;
 
-const disasm_options: disasm.Options = .{
-    .show_constants = true,
-    .show_source = true,
-    .show_bytes = true,
-    .recurse = false,
+pub const Layout = struct {
+    cols: usize,
+    rows: usize,
+    body_rows: usize,
+    split: bool,
+    sidebar_width: usize,
+    main_col: usize,
+    main_width: usize,
 };
 
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.pages.RenderedValue;
-        const OpenMode = Explorer.Ops.controller.OpenMode;
-        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
-        const TreeCell = Explorer.Ops.tree_render.TreeCell;
-        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
-        const range_leaf = Explorer.range_leaf;
-        const range_branch = Explorer.range_branch;
-        const preview_line_cap = Explorer.preview_line_cap;
-
         // -- navigation ------------------------------------------------------------
-
-        pub const Layout = struct {
-            cols: usize,
-            rows: usize,
-            body_rows: usize,
-            split: bool,
-            sidebar_width: usize,
-            main_col: usize,
-            main_width: usize,
-        };
 
         pub fn layout(self: *const Explorer) Layout {
             const cols = @max(@as(usize, 1), self.viewport.cols);
@@ -87,7 +70,7 @@ pub fn Methods(comptime Explorer: type) type {
         /// right-hand preview), or null when there's nothing to peek into.
         pub fn detailPreviewAction(self: *const Explorer) ?RowAction {
             if (self.navigation.focus != .subject) return null;
-            const kind = Explorer.Ops.view_state.currentKind(self);
+            const kind = currentKind(self);
             const is_value_subject = switch (kind) {
                 .object, .store_record, .debug_value, .debug_frame => true,
                 else => false,
@@ -106,7 +89,7 @@ pub fn Methods(comptime Explorer: type) type {
         }
 
         pub fn currentChunk(self: *const Explorer) ?ChunkId {
-            return switch (Explorer.Ops.view_state.currentKind(self)) {
+            return switch (currentKind(self)) {
                 .chunk => |id| id,
                 .heap, .object, .store_record, .debug_frame, .debug_value, .help => null,
             };
@@ -114,21 +97,21 @@ pub fn Methods(comptime Explorer: type) type {
 
         /// The paused stack frame currently open in the inspector, if any.
         pub fn currentDebugFrame(self: *const Explorer) ?usize {
-            return switch (Explorer.Ops.view_state.currentKind(self)) {
+            return switch (currentKind(self)) {
                 .debug_frame => |i| i,
                 else => null,
             };
         }
 
         pub fn currentHeap(self: *const Explorer) ?HeapView {
-            return switch (Explorer.Ops.view_state.currentKind(self)) {
+            return switch (currentKind(self)) {
                 .heap => |view| view,
                 else => null,
             };
         }
 
         pub fn currentObject(self: *const Explorer) ?runtime.types.ObjectId {
-            return switch (Explorer.Ops.view_state.currentKind(self)) {
+            return switch (currentKind(self)) {
                 .object => |id| id,
                 else => null,
             };
@@ -137,7 +120,7 @@ pub fn Methods(comptime Explorer: type) type {
         pub const StoreRecord = struct { view: HeapView, id: u32 };
 
         pub fn currentStoreRecord(self: *const Explorer) ?StoreRecord {
-            return switch (Explorer.Ops.view_state.currentKind(self)) {
+            return switch (currentKind(self)) {
                 .store_record => |r| .{ .view = r.view, .id = r.id },
                 else => null,
             };
@@ -164,10 +147,10 @@ pub fn Methods(comptime Explorer: type) type {
         /// The number of LIVE records in a store (via its snapshot), falling back to
         /// the raw reserved count if the snapshot can't be built.
         pub fn liveStoreCount(self: *Explorer, view: HeapView) u32 {
-            if (view == .intern or view == .builtin) return Explorer.Ops.view_state.storeCount(self, view);
+            if (view == .intern or view == .builtin) return storeCount(self, view);
             if (view == .objects or view == .overview)
                 return if (self.heap_index.objects) |*s| s.live_count else if (self.heap_index.stats) |stats| liveObjectCount(stats) else 0;
-            return if (Explorer.Ops.view_state.ensureStoreSnapshot(self, view)) |s| s.live_count else Explorer.Ops.view_state.storeCount(self, view);
+            return if (ensureStoreSnapshot(self, view)) |s| s.live_count else storeCount(self, view);
         }
 
         /// The live-slot snapshot for a store, (re)built lazily when its slot count
@@ -179,7 +162,7 @@ pub fn Methods(comptime Explorer: type) type {
                 .attr_positions => .{ &self.heap_index.attr_positions, &self.heap_index.attr_positions_count },
                 .overview, .objects, .intern, .builtin => return null,
             };
-            const current = Explorer.Ops.view_state.storeCount(self, view);
+            const current = storeCount(self, view);
             if (slot.* == null or cnt.* != current) {
                 if (slot.*) |*s| s.deinit();
                 slot.* = (switch (view) {

@@ -75,6 +75,11 @@ Within `expr` the layering mirrors the [pipeline](#the-evaluation-pipeline): `co
 
 Callbacks mark real ownership, policy, or execution-domain changes: CLI debugger/progress/build sinks, heap/scheduler GC dispatch, fiber wakeups, blocking execution, and leaf policies such as NAR filters. File extraction alone is not a boundary. Engine helper files therefore receive concrete state views (for example debugger `Context`) or remain engine-owned instead of back-calling through opaque “host” bundles. Concurrent progress `Span` handles retain the sink that created them, so a sink replacement cannot misroute an in-flight token.
 
+The VM explorer is one private UI state machine split into focused implementation
+modules. Calls within a module are direct; `Explorer.Ops.<subsystem>` spelling is
+reserved for cross-subsystem coordination and import-cycle breaking. The
+registry is deliberately not presented as a capability boundary.
+
 ## Ownership and state changes
 
 Ownership is represented in types, not parallel flags. Text that may be
