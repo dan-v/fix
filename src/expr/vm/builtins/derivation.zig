@@ -493,7 +493,7 @@ fn normalizeDerivation(self: *VM, attrs_id: ObjectId, drv_name: []const u8, outp
         // the queues are full; main just forces those itself inline.
         for (original_attrs) |entry| {
             if (!entry.value.isThunk()) continue;
-            const ok = self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.workerId());
+            const ok = self.workers.submitUrgentThunk(entry.value.asObjectId(), self.workerId());
             if (!ok) break;
         }
         const attrs_len = original_attrs.len;

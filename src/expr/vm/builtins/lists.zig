@@ -307,7 +307,7 @@ pub fn builtinMap(self: *VM, fn_arg: Value, list_arg: Value) !Value {
     const speculatable = shared.isSpeculatableUserFunc(self, func);
     for (items, out) |item, *mapped| {
         const tid = try self.heap.addBytecodeThunk(apply_chunk_id, &.{ func, item });
-        if (speculatable) _ = self.scheduler.submit(.{ .force_thunk = tid }, self.workerId());
+        if (speculatable) _ = self.workers.submitSpeculativeThunk(tid, self.workerId());
         mapped.* = Value.thunk(tid);
     }
     return Value.list(try self.heap.addList(out));
@@ -365,7 +365,7 @@ pub fn builtinGenList(self: *VM, fn_arg: Value, count_arg: Value) !Value {
         // than allocate the whole list (see force.specBailRequested).
         if (i & 8191 == 0 and vm_force.specBailRequested(self)) return error.SpeculativeBail;
         const tid = try self.heap.addBytecodeThunk(apply_chunk_id, &.{ func, Value.int(@intCast(i)) });
-        if (speculatable) _ = self.scheduler.submit(.{ .force_thunk = tid }, self.workerId());
+        if (speculatable) _ = self.workers.submitSpeculativeThunk(tid, self.workerId());
         value.* = Value.thunk(tid);
     }
     return Value.list(try self.heap.addList(out));

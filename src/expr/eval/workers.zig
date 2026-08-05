@@ -7,6 +7,7 @@ pub const port = @import("workers/port.zig");
 pub const worker = @import("workers/worker.zig");
 pub const fiber_executor = @import("workers/fiber_executor.zig").fiber_executor;
 pub const daemon_executor = @import("workers/daemon_executor.zig").executor;
+pub const VmRuntime = @import("workers/vm_runtime.zig").Runtime;
 
 pub const Config = scheduler.Config;
 pub const GcMarkHook = scheduler.GcMarkHook;

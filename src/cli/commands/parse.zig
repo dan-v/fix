@@ -159,7 +159,7 @@ fn emitWarnings(init: std.process.Init, use_color: bool, allocator: std.mem.Allo
         if (args.DeprecatedFeature.fromName(DeprecationWarning.feature(wn.kind))) |feat| {
             if (options.deprecated_features.contains(feat)) continue;
         }
-        warns.append(allocator, .{
+        try warns.append(allocator, .{
             .severity = .warning,
             .line = syntax.diagnostic.lineForOffset(source, wn.offset),
             .column = syntax.diagnostic.columnForOffset(source, wn.offset),
@@ -169,7 +169,7 @@ fn emitWarnings(init: std.process.Init, use_color: bool, allocator: std.mem.Allo
             .message = DeprecationWarning.message(wn.kind),
             .source = source,
             .source_path = source_path,
-        }) catch break;
+        });
     }
     if (warns.items.len != 0) try writeDiagnostics(init, use_color, source, warns.items);
 }

@@ -283,19 +283,18 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     return forceThunkImpl(self, value, demand);
 }
 
-/// Follow a chain of *forwarding* thunks (a resolved thunk whose payload is
-/// itself a thunk) to the WHNF at its end. Only ALREADY-RESOLVED links are
-/// followed, reading each published value behind the acquire-load of its state
-/// — the same read `Thunk.tryForce` does on its `.already_resolved` path. An
-/// unresolved/busy forwardee is returned as-is rather than forced: forcing it
-/// here would evaluate a thunk (often a fixpoint binding cell) out of order and
-/// race the fiber that owns it. Cold: reached only when a resolved thunk's
-/// payload is unexpectedly another thunk.
+/// Follow a chain of forwarding thunks to the WHNF at its end. Resolved links
+/// can be read directly behind their state acquire; an unresolved or busy link
+/// goes through the normal force protocol. In particular, a helper that reaches
+/// a not-yet-published recursive binding cell parks until the constructing
+/// fiber installs the binding instead of leaking that cell as a result.
+/// Cold: reached only when a thunk evaluation returns another thunk.
 fn derefForwarder(self: *VM, start: Value, demand: bool) anyerror!Value {
     var r = start;
     while (r.isThunk()) {
         const t = self.heap.getThunkAssumeValid(r.asObjectId());
-        if (t.future.state.load(.acquire) != @intFromEnum(future_mod.FutureState.resolved)) return r;
+        if (t.future.state.load(.acquire) != @intFromEnum(future_mod.FutureState.resolved))
+            return forceValueImpl(self, r, demand);
         try observeEffectGroup(self, t.effect_group, demand and !self.speculation.active);
         if (demand) t.markDemanded();
         r = t.payload.result;
@@ -448,11 +447,7 @@ pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) voi
             offset += this_len;
             continue;
         }
-        if (!self.scheduler.submitUrgent(.{ .force_list_range = .{
-            .list_id = list_id,
-            .offset = offset,
-            .len = this_len,
-        } }, self.workerId())) break;
+        if (!self.workers.submitUrgentListRange(list_id, offset, this_len, self.workerId())) break;
         offset += this_len;
     }
 }
@@ -479,11 +474,7 @@ pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const heap_m
             offset += this_len;
             continue;
         }
-        if (!self.scheduler.submitUrgent(.{ .force_attrs_range = .{
-            .attrs_id = attrs_id,
-            .offset = offset,
-            .len = this_len,
-        } }, self.workerId())) break;
+        if (!self.workers.submitUrgentAttrsRange(attrs_id, offset, this_len, self.workerId())) break;
         offset += this_len;
     }
 }
@@ -535,7 +526,7 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
 /// demand path entirely (`speculation.active` short-circuits).
 pub inline fn specBailRequested(self: *VM) bool {
     if (!self.speculation.active) return false;
-    if (self.scheduler.backgroundSuppressed() or self.speculation.claim_budget == 0) return true;
+    if (self.workers.backgroundSuppressed() or self.speculation.claim_budget == 0) return true;
     return self.speculation.create_left != vm_mod.no_spec_budget and specCreateExhausted(self);
 }
 
@@ -737,24 +728,29 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     }
 
     // Checked at the recursion point so resolved/busy/memo paths stay lean.
-    if (@frameAddress() < self.executionContextConst().stack_limit) return vm_trace.stackOverflow(self);
-    const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {
-        if (self.speculation.active and !isTransientThunkError(err)) {
-            attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |effect_err| {
-                self.executionContext().clearFailure();
-                publishThunkFailure(self, thunk, thunk_id, effect_err);
-                trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
-                return effect_err;
-            };
-        }
-        publishThunkFailure(self, thunk, thunk_id, err);
-        trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
-        return err;
-    };
+    if (@frameAddress() < self.executionContextConst().stack_limit)
+        return finishClaimedThunkFailure(
+            self,
+            thunk,
+            thunk_id,
+            effect_checkpoint,
+            vm_trace.stackOverflow(self),
+        );
+    const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err|
+        return finishClaimedThunkFailure(self, thunk, thunk_id, effect_checkpoint, err);
 
-    // A tail call may leave a forwarding thunk; peek through already-resolved
-    // links before publishing while retaining the original result as the edge.
-    const whnf = if (result.isThunk()) try derefForwarder(self, result, real_demand) else result;
+    // A tail call may leave a forwarding thunk. Force through it before
+    // publishing. The outer thunk still contains its evaluation target, so the
+    // returned value needs an explicit native root across the nested force.
+    const result_roots = rootsBegin(self);
+    defer rootsEnd(self, result_roots);
+    rootKeep(self, result);
+    const whnf = if (result.isThunk())
+        derefForwarder(self, result, real_demand) catch |err|
+            return finishClaimedThunkFailure(self, thunk, thunk_id, effect_checkpoint, err)
+    else
+        result;
+    rootKeep(self, whnf);
     if (self.speculation.active) attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |err| {
         publishThunkFailure(self, thunk, thunk_id, err);
         trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
@@ -762,8 +758,8 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     };
 
     self.heap.gcReleaseThunkSpill(thunk);
-    resolveDispatch(self, thunk, result);
-    self.heap.gcRecordEdge(thunk_id, result);
+    resolveDispatch(self, thunk, whnf);
+    self.heap.gcRecordEdge(thunk_id, whnf);
     if (memo_key) |key| {
         if (self.effect_epoch == effect_epoch) {
             thread_caches.get().thunk_memo[key.idx] = .{
@@ -782,9 +778,31 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     return whnf;
 }
 
+/// Finish a claimed thunk whose body or forwarded result failed. Speculative
+/// effects and the terminal/reset transition must be identical for both paths.
+fn finishClaimedThunkFailure(
+    self: *VM,
+    thunk: *Thunk,
+    thunk_id: types.ObjectId,
+    effect_checkpoint: usize,
+    err: anyerror,
+) anyerror {
+    if (self.speculation.active and !isTransientThunkError(err)) {
+        attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |effect_err| {
+            self.executionContext().clearFailure();
+            publishThunkFailure(self, thunk, thunk_id, effect_err);
+            trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
+            return effect_err;
+        };
+    }
+    publishThunkFailure(self, thunk, thunk_id, err);
+    trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
+    return err;
+}
+
 fn enforceSpeculationBudget(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId) !void {
     if (!self.speculation.active or self.speculation.demand_rescue.load(.monotonic) != 0) return;
-    if (self.scheduler.backgroundSuppressed()) {
+    if (self.workers.backgroundSuppressed()) {
         publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
         return error.SpeculativeBail;
     }
@@ -865,12 +883,12 @@ fn waitForBusyThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, demand: 
     };
 
     // Demand priority propagates through chains of speculatively owned thunks.
-    if (self.scheduler.config.spec_rescue and
+    if (self.workers.rescueSpeculationEnabled() and
         (self.executionContextConst().is_demand or self.speculation.demand_rescue.load(.monotonic) != 0) and
         !thunk.isDemanded())
     {
         thunk.markDemanded();
-        self.scheduler.promoteFiber(thunk.future.claimer.load(.monotonic));
+        self.workers.promoteFiber(thunk.future.claimer.load(.monotonic));
     }
 
     var spins: u32 = 0;
@@ -901,26 +919,26 @@ fn waitForBusyThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, demand: 
 /// Respond to or lead a collection at the force boundary. `thunk_val` may be
 /// off the VM stack, so `gc_roots.extra` keeps it visible while the world stops.
 fn pollForCollection(self: *VM, thunk_val: Value, demand: bool) void {
-    if (self.native_depth == 0 and self.scheduler.gcStopRequested()) {
+    if (self.native_depth == 0 and self.workers.gcStopRequested()) {
         self.gc_roots.extra = thunk_val;
-        self.scheduler.gcSafepointPark(self.workerId());
+        self.workers.gcSafepointPark(self.workerId());
         self.gc_roots.extra = Value.null_val;
     }
     if (!demand or !self.heap.gcCollectRequested()) return;
 
     self.gc_roots.extra = thunk_val;
     defer self.gc_roots.extra = Value.null_val;
-    if (!self.scheduler.gcTryBeginCollection()) {
-        self.scheduler.gcSafepointPark(self.workerId());
+    if (!self.workers.gcTryBeginCollection()) {
+        self.workers.gcSafepointPark(self.workerId());
         return;
     }
 
     const barrier_start = gc.nowNs();
-    self.scheduler.gcWaitAllParked(self.workerId());
+    self.workers.gcWaitAllParked(self.workerId());
     const collection_start = gc.nowNs();
     @import("runtime").heap_collector.runCollect(self.heap, self.workerId());
     const collection_end = gc.nowNs();
-    self.scheduler.gcEndCollection(self.workerId());
+    self.workers.gcEndCollection(self.workerId());
     gc.recordBarrier(
         &self.heap.collection.report,
         (collection_start - barrier_start) + (gc.nowNs() - collection_end),
@@ -1014,10 +1032,10 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
         // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
         // instance of a chunk goes to the high-priority novel lane.
         // builtin_closure thunks carry no chunk of their own — bulk lane.
-        const ok = if (self.scheduler.config.spec_novel and speculate.isNovelClosureChunk(self, closure))
-            self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
+        const ok = if (self.workers.novelSpeculationEnabled() and speculate.isNovelClosureChunk(self, closure))
+            self.workers.submitNovelThunk(id, self.workerId())
         else
-            self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
+            self.workers.submitSpeculativeThunk(id, self.workerId());
         // Coverage census (`-Dprof-main`): stamp whether this thunk was
         // aimed at by speculation (and admitted), so the `claimed_by_main`
         // site can tell a targeting miss from a lost race.

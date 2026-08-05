@@ -35,7 +35,7 @@ test "Worker basic init/deinit" {
                 .files = &self.files,
                 .fetchers = &self.fetchers,
                 .realization = &self.realization,
-                .scheduler = self.sched,
+                .workers = @import("../vm_runtime.zig").Runtime.init(self.sched),
             });
         }
     };

@@ -66,7 +66,6 @@ const VmTrace = @import("vm.zig").trace_log.VmTrace;
 const ThunkTrace = @import("probe.zig").thunk_trace.ThunkTrace;
 const SpinMutex = @import("base").sync.SpinMutex;
 const owned_strings = @import("base").owned_strings;
-const capability = @import("engine/capabilities.zig");
 
 const parse_observation: observ.SpanSpec = .{
     .category = "eval",
@@ -210,14 +209,11 @@ pub const DebugSession = struct {
         const frame_ref = debug_session.frameRef(self.vm, i);
         const vm_frame = frame_ref.frame();
         const chunk = self.ev.registry.get(vm_frame.chunk_id) orelse return;
-        var inspected = chunk.*;
-        inspected.code = try self.ev.unpatchedChunkCode(allocator, vm_frame.chunk_id, chunk);
-        defer allocator.free(inspected.code);
         try bytecode_disasm.writeChunk(
             allocator,
             writer,
             vm_frame.chunk_id,
-            &inspected,
+            chunk,
             .{ .intern = &self.ev.intern, .registry = &self.ev.registry },
             .{
                 .show_header = false,
@@ -605,14 +601,6 @@ pub const Engine = struct {
     /// outlive it, but no language operation is valid after `.finished`.
     evaluation_phase: enum { active, releasing, finished } = .active,
 
-    pub const Evaluation = capability.Evaluation(Engine);
-    pub const Values = capability.Values(Engine);
-    pub const Sources = capability.Sources(Engine);
-    pub const Debugger = capability.Debugger(Engine);
-    pub const Inspection = capability.Inspection(Engine);
-    pub const Builds = capability.Builds(Engine);
-    pub const Instrumentation = capability.Instrumentation(Engine);
-
     pub fn init(allocator: std.mem.Allocator, config: Config) !Engine {
         // Always run at least one worker — the main evaluator thread itself
         // owns worker id 0 even when no scheduler helpers are requested.
@@ -686,34 +674,6 @@ pub const Engine = struct {
         if (config.io) |io| ev.setFileIo(io);
         if (config.environment) |env_map| try ev.setEnvironment(env_map);
         return ev;
-    }
-
-    pub fn evaluation(self: *Engine) Evaluation {
-        return .{ .engine = self };
-    }
-
-    pub fn values(self: *Engine) Values {
-        return .{ .engine = self };
-    }
-
-    pub fn sourceAccess(self: *Engine) Sources {
-        return .{ .engine = self };
-    }
-
-    pub fn debugging(self: *Engine) Debugger {
-        return .{ .engine = self };
-    }
-
-    pub fn inspection(self: *const Engine) Inspection {
-        return .{ .engine = self };
-    }
-
-    pub fn builds(self: *Engine) Builds {
-        return .{ .engine = self };
-    }
-
-    pub fn instrumentation(self: *Engine) Instrumentation {
-        return .{ .engine = self };
     }
 
     pub fn deinit(self: *Engine) void {
@@ -1063,6 +1023,10 @@ pub const Engine = struct {
         try self.report.replaceDiagnostics(diagnostics, source, source_path);
     }
 
+    fn appendDiagnostics(self: *Engine, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
+        try self.report.appendDiagnostics(diagnostics, source, source_path);
+    }
+
     /// Parse and compile source text into a registered chunk id. Used by
     /// debugging tools that want to inspect bytecode without running it.
     pub fn compileSource(
@@ -1281,6 +1245,13 @@ pub const Engine = struct {
                 }}, source, source_path);
                 return error.CrLineEndingsDisabled;
             }
+            try self.appendParserWarning(
+                source,
+                source_path,
+                offset,
+                1,
+                parser_mod.DeprecationWarning.message(.cr_line_endings),
+            );
         }
         if (parser.first_tokens_no_ws_offset) |offset| {
             if (!self.policy.allow_tokens_no_whitespace) {
@@ -1297,6 +1268,42 @@ pub const Engine = struct {
                 return error.TokensNoWhitespaceDisabled;
             }
         }
+        for (parser.warnings.items) |warning| {
+            const silenced = switch (warning.kind) {
+                .or_as_identifier => self.policy.allow_or_as_identifier,
+                .floating_without_zero => self.policy.allow_floating_without_zero,
+                .rec_set_dynamic_attrs => self.policy.allow_rec_set_dynamic_attrs,
+                .cr_line_endings => self.policy.allow_cr_line_endings,
+            };
+            if (silenced) continue;
+            try self.appendParserWarning(
+                source,
+                source_path,
+                warning.offset,
+                warning.len,
+                parser_mod.DeprecationWarning.message(warning.kind),
+            );
+        }
+    }
+
+    fn appendParserWarning(
+        self: *Engine,
+        source: []const u8,
+        source_path: ?[]const u8,
+        offset: u32,
+        len: u32,
+        message: []const u8,
+    ) !void {
+        try self.appendDiagnostics(&.{.{
+            .severity = .warning,
+            .kind = .parse,
+            .line = diagnostic.lineForOffset(source, offset),
+            .column = diagnostic.columnForOffset(source, offset),
+            .offset = offset,
+            .len = len,
+            .token_type = null,
+            .message = message,
+        }}, source, source_path);
     }
 
     fn registerTopLevelChunk(
@@ -1425,7 +1432,7 @@ pub const Engine = struct {
 
     /// Breakpoint tooling is also available to the VM explorer, before a
     /// debugger UI is attached. A later `:debug`/`--debugger` session reuses
-    /// the same requests and patched sites.
+    /// the same requests and execution-overlay sites.
     pub fn setBreakpoint(self: *Engine, file: []const u8, line: u32) !bytecode.BreakpointTable.SetResult {
         self.ensureBreakpointTable();
         return self.debugger.breakpoints.?.set(&self.registry, file, line);
@@ -1462,20 +1469,6 @@ pub const Engine = struct {
     pub fn breakpointSpan(self: *const Engine, chunk_id: ChunkId, span: bytecode.Chunk.SourceSpan) bool {
         if (self.debugger.breakpoints) |*breakpoints| return breakpoints.hasSpan(chunk_id, span);
         return false;
-    }
-
-    /// A presentation-safe copy of chunk code with debugger trap patches
-    /// replaced by their original opcodes.
-    pub fn unpatchedChunkCode(
-        self: *const Engine,
-        allocator: std.mem.Allocator,
-        chunk_id: ChunkId,
-        chunk: *const bytecode.Chunk,
-    ) ![]u8 {
-        const code = try allocator.dupe(u8, chunk.code);
-        if (self.debugger.breakpoints) |*breakpoints|
-            breakpoints.restoreOriginalCode(chunk_id, code);
-        return code;
     }
 
     pub fn listBreakpoints(self: *const Engine) []const bytecode.BreakpointTable.Request {
@@ -1947,7 +1940,7 @@ pub const Engine = struct {
             .files = &self.sources.files,
             .fetchers = &self.sources.fetchers,
             .realization = &self.store.realization,
-            .scheduler = &self.execution.scheduler,
+            .workers = execution.VmRuntime.init(&self.execution.scheduler),
             // Helpers (worker_id != 0) don't write to the shared trace —
             // it's a side effect of *real* evaluation, so speculative force
             // stays invisible to it.
@@ -2734,7 +2727,7 @@ pub const Engine = struct {
 
     /// Explicit post-registration phase: compiler code reports the canonical
     /// chunk selected for a compiled body here, after registry mutation has
-    /// completed. Import discovery and debugger patching are evaluator
+    /// completed. Import discovery and debugger overlay placement are evaluator
     /// orchestration, not hidden side effects of `ChunkRegistry.register`.
     fn chunkRegistered(self: *Engine, chunk_id: ChunkId) void {
         const chunk = self.registry.get(chunk_id) orelse return;
@@ -2742,7 +2735,7 @@ pub const Engine = struct {
             if (value.isPath()) prefetchPathConst(self, value.asInternId());
         }
         if (self.debugger.breakpoints) |*breakpoints| {
-            breakpoints.placeRegisteredChunk(chunk_id, @constCast(chunk));
+            breakpoints.placeRegisteredChunk(chunk_id, chunk);
         }
     }
 

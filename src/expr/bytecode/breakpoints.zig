@@ -1,20 +1,20 @@
-//! Source-line, exact-source-span, and instruction breakpoints by bytecode
-//! patching.
+//! Source-line, exact-source-span, and instruction breakpoints through mutable
+//! execution overlays.
 //!
-//! A breakpoint replaces the single opcode byte at a line's first instruction
-//! with the `breakpoint` opcode, saving the original byte. Execution then hits
-//! the `breakpoint` handler, which pauses into the debugger and chains to the
-//! saved original opcode (its operands are untouched). Clearing restores the
-//! byte. This needs no change to the hot dispatch loop — the cost is paid only
-//! when a patched instruction actually runs.
+//! Registry chunks are immutable and participate in structural deduplication,
+//! so debugger state never modifies `Chunk.code`. The first trap in a chunk
+//! creates a private code copy in `overlays`; breakpoint operations patch that
+//! copy while the VM selects it only at frame entry/resume. Execution then hits
+//! the `breakpoint` handler, which pauses and chains to the canonical opcode
+//! (operands are untouched). This needs no check in the hot dispatch loop.
 //!
 //! Instruction boundaries come from the chunk's `source_map`: each entry keys a
 //! `SourceSpan` by the code offset where that construct's first instruction was
 //! emitted, so `entry.start` is always a safe patch point.
 //!
 //! Because bodies compile lazily (imports, deferred attrs register
-//! mid-evaluation), the registry calls `sink()` for every newly registered
-//! chunk so pending breakpoints land there too.
+//! mid-evaluation), the evaluator explicitly reports each canonical
+//! registration so pending breakpoints land in its overlay too.
 
 const std = @import("std");
 const types = @import("runtime").types;
@@ -24,6 +24,7 @@ const chunk_mod = @import("chunk.zig");
 const Chunk = chunk_mod.Chunk;
 const ChunkRegistry = chunk_mod.ChunkRegistry;
 const opcode = @import("opcode.zig");
+const name_tree = @import("name_tree.zig");
 
 const ChunkId = types.ChunkId;
 const InternId = types.InternId;
@@ -35,15 +36,18 @@ pub const BreakpointTable = struct {
     intern: *const InternTable,
     requests: std.ArrayListUnmanaged(Request) = .empty,
     placements: std.ArrayListUnmanaged(Placement) = .empty,
+    /// Mutable debugger-owned bytecode copies, created only for chunks with a
+    /// trap. Slices stay at stable addresses even if the map itself grows.
+    overlays: std.AutoHashMapUnmanaged(ChunkId, []u8) = .empty,
     next_id: u32 = 1,
-    /// Temporary patches for the in-progress step (cleared on the next pause).
+    /// Temporary trap placements for the in-progress step (cleared on pause).
     step_temps: std.ArrayListUnmanaged(Placement) = .empty,
     /// A step stops only when the frame depth is ≤ this (so a step-over doesn't
     /// stop inside a deeper recursion of the same chunk). `maxInt` = any depth.
     step_max_depth: u32 = 0,
     /// `step into` must also follow code which does not exist yet when the
     /// command is issued (an import or deferred body compiled on demand).
-    /// `placeRegisteredChunk` patches those entry points before they can run.
+    /// `placeRegisteredChunk` traps those entry points before they can run.
     step_follow_new_chunks: bool = false,
     step_armed: bool = false,
     step_hit_kind: HitKind = .step,
@@ -54,7 +58,7 @@ pub const BreakpointTable = struct {
     /// A candidate step-stop location.
     pub const Site = struct { chunk_id: ChunkId, offset: u32 };
 
-    /// What the `breakpoint` handler should do at a patched site.
+    /// What the `breakpoint` handler should do at an overlay trap site.
     pub const HitKind = enum { none, breakpoint, step, entry };
     pub const Hit = struct { original: u8, pause: bool, kind: HitKind };
 
@@ -76,19 +80,19 @@ pub const BreakpointTable = struct {
         span: ?Chunk.SourceSpan = null,
     };
 
-    /// A patched site realizing a request in a specific chunk.
+    /// A trap site realizing a request in a specific chunk. The original
+    /// opcode remains authoritative in the immutable registry chunk.
     pub const Placement = struct {
         req_id: u32,
         chunk_id: ChunkId,
         offset: u32,
-        original: u8,
     };
 
     pub const SetResult = struct {
         id: u32,
         /// Resolved line (may differ from the requested one).
         line: u32,
-        /// How many sites were patched at set time (more may appear lazily).
+        /// How many sites were trapped at set time (more may appear lazily).
         sites: usize,
         pending: bool,
     };
@@ -102,12 +106,22 @@ pub const BreakpointTable = struct {
         self.requests.deinit(self.gpa);
         self.placements.deinit(self.gpa);
         self.step_temps.deinit(self.gpa);
+        var overlays = self.overlays.valueIterator();
+        while (overlays.next()) |code| self.gpa.free(code.*);
+        self.overlays.deinit(self.gpa);
+    }
+
+    /// Bytecode to execute for `chunk_id`. Chunks without debugger traps use
+    /// the canonical allocation directly; trap-bearing chunks use their stable
+    /// mutable overlay. Called only when dispatch enters or resumes a frame.
+    pub fn executableCode(self: *const BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk) []const u8 {
+        return self.overlays.get(chunk_id) orelse chunk.code;
     }
 
     /// Apply pending breakpoint requests to one explicitly reported new chunk.
     /// The evaluator calls this after registration; the registry has no hidden
     /// debugger mutation hook.
-    pub fn placeRegisteredChunk(self: *BreakpointTable, chunk_id: ChunkId, chunk: *Chunk) void {
+    pub fn placeRegisteredChunk(self: *BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk) void {
         for (self.requests.items) |req| {
             if (req.site_only) continue;
             if (!req.pending) self.placeRequestInChunk(req, chunk_id, chunk) catch {};
@@ -128,24 +142,39 @@ pub const BreakpointTable = struct {
         if (resolved != null)
             try self.placements.ensureUnusedCapacity(self.gpa, @intCast(registry.count()));
         const owned_file = try self.gpa.dupe(u8, file);
+        errdefer self.gpa.free(owned_file);
 
         const id = self.next_id;
-        self.next_id += 1;
-        self.requests.appendAssumeCapacity(.{
+        const req: Request = .{
             .id = id,
             .file = owned_file,
             .requested_line = line,
             .line = resolved orelse line,
             .pending = resolved == null,
-        });
-        const req = self.requests.items[self.requests.items.len - 1];
+        };
+        // Overlay allocation is the last fallible phase. Keep the request and
+        // placement lists unchanged until every matching chunk is prepared.
+        if (!req.pending) {
+            var cid: ChunkId = 0;
+            const n = registry.count();
+            while (cid < n) : (cid += 1) {
+                const chunk = registry.get(cid) orelse continue;
+                const offset = self.requestSiteInChunk(req, chunk) orelse continue;
+                if (self.canPlaceSite(cid, offset, chunk)) _ = try self.ensureOverlay(cid, chunk);
+            }
+        }
+
+        self.next_id += 1;
+        self.requests.appendAssumeCapacity(req);
 
         const before = self.placements.items.len;
         if (!req.pending) {
             var cid: ChunkId = 0;
             const n = registry.count();
             while (cid < n) : (cid += 1) {
-                if (registry.get(cid)) |c| try self.placeRequestInChunk(req, cid, c);
+                const chunk = registry.get(cid) orelse continue;
+                const offset = self.requestSiteInChunk(req, chunk) orelse continue;
+                if (self.canPlaceSite(cid, offset, chunk)) self.commitSite(req.id, cid, offset);
             }
         }
         return .{
@@ -174,19 +203,15 @@ pub const BreakpointTable = struct {
         }
     }
 
-    /// Remove a breakpoint by id, restoring every byte it patched. Returns true
-    /// if the id existed.
+    /// Remove a breakpoint by id, restoring its overlay sites from canonical
+    /// bytecode. Returns true if the id existed.
     pub fn remove(self: *BreakpointTable, registry: *ChunkRegistry, id: u32) bool {
         var found = false;
         var i: usize = 0;
         while (i < self.placements.items.len) {
             const p = self.placements.items[i];
             if (p.req_id == id) {
-                if (registry.get(p.chunk_id)) |c| {
-                    if (p.offset < c.code.len and c.code[p.offset] == breakpoint_byte) {
-                        c.code[p.offset] = p.original;
-                    }
-                }
+                self.restoreOverlaySite(registry, p);
                 _ = self.placements.swapRemove(i);
                 found = true;
                 continue;
@@ -206,13 +231,17 @@ pub const BreakpointTable = struct {
     }
 
     /// Set a per-instruction breakpoint at an exact `(chunk_id, offset)` site.
-    /// Unlike `set`, this does not resolve or track a source line: it patches
+    /// Unlike `set`, this does not resolve or track a source line: it traps
     /// the one instruction the caller selected. Source rows use `setSpan`
     /// because several nested spans may share an entry offset.
     pub fn setAt(self: *BreakpointTable, registry: *ChunkRegistry, chunk_id: ChunkId, offset: u32) !SetResult {
         try self.requests.ensureUnusedCapacity(self.gpa, 1);
         try self.placements.ensureUnusedCapacity(self.gpa, 1);
         const owned_file = try self.gpa.dupe(u8, "");
+        errdefer self.gpa.free(owned_file);
+        const chunk = registry.get(chunk_id);
+        const place = if (chunk) |c| self.canPlaceSite(chunk_id, offset, c) else false;
+        if (place) _ = try self.ensureOverlay(chunk_id, chunk.?);
 
         const id = self.next_id;
         self.next_id += 1;
@@ -225,7 +254,7 @@ pub const BreakpointTable = struct {
             .site_only = true,
         });
         const before = self.placements.items.len;
-        if (registry.get(chunk_id)) |chunk| try self.placeSite(id, chunk_id, offset, chunk);
+        if (place) self.commitSite(id, chunk_id, offset);
         return .{
             .id = id,
             .line = 0,
@@ -258,10 +287,18 @@ pub const BreakpointTable = struct {
             .sites = 0,
             .pending = false,
         };
+        if (!self.canPlaceSite(chunk_id, offset, chunk)) return .{
+            .id = 0,
+            .line = span.line,
+            .sites = 0,
+            .pending = false,
+        };
 
         try self.requests.ensureUnusedCapacity(self.gpa, 1);
         try self.placements.ensureUnusedCapacity(self.gpa, 1);
         const owned_file = try self.gpa.dupe(u8, "");
+        errdefer self.gpa.free(owned_file);
+        _ = try self.ensureOverlay(chunk_id, chunk);
 
         const id = self.next_id;
         self.next_id += 1;
@@ -275,23 +312,17 @@ pub const BreakpointTable = struct {
             .span_chunk = chunk_id,
             .span = span,
         });
-        const before = self.placements.items.len;
-        try self.placeSite(id, chunk_id, offset, chunk);
-        const sites = self.placements.items.len - before;
-        if (sites == 0) {
-            const request = self.requests.pop().?;
-            self.gpa.free(request.file);
-        }
+        self.commitSite(id, chunk_id, offset);
         return .{
-            .id = if (sites == 0) 0 else id,
+            .id = id,
             .line = span.line,
-            .sites = sites,
+            .sites = 1,
             .pending = false,
         };
     }
 
     /// Remove whatever breakpoint owns the placement at `(chunk_id, offset)`,
-    /// restoring the patched byte. Returns true if a placement existed there.
+    /// restoring the overlay byte. Returns true if a placement existed there.
     pub fn removeAt(self: *BreakpointTable, registry: *ChunkRegistry, chunk_id: ChunkId, offset: u32) bool {
         for (self.placements.items) |p| {
             if (p.chunk_id == chunk_id and p.offset == offset) return self.remove(registry, p.req_id);
@@ -329,14 +360,18 @@ pub const BreakpointTable = struct {
     /// Decide what the `breakpoint` handler does at `(chunk_id, offset)`: the
     /// saved original opcode to chain to, and whether to pause. A permanent
     /// breakpoint always pauses; a step temp pauses only at the target depth.
-    pub fn hit(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32, frames_len: u32) Hit {
+    pub fn hit(self: *const BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk, offset: u32, frames_len: u32) Hit {
+        const original = if (offset < chunk.code.len)
+            chunk.code[offset]
+        else
+            @intFromEnum(opcode.OpCode.halt);
         for (self.placements.items) |p| {
             if (p.chunk_id == chunk_id and p.offset == offset)
-                return .{ .original = p.original, .pause = true, .kind = .breakpoint };
+                return .{ .original = original, .pause = true, .kind = .breakpoint };
         }
         for (self.step_temps.items) |p| {
             if (p.chunk_id == chunk_id and p.offset == offset)
-                return .{ .original = p.original, .pause = frames_len <= self.step_max_depth, .kind = self.step_hit_kind };
+                return .{ .original = original, .pause = frames_len <= self.step_max_depth, .kind = self.step_hit_kind };
         }
         return .{ .original = @intFromEnum(opcode.OpCode.halt), .pause = false, .kind = .none };
     }
@@ -366,7 +401,7 @@ pub const BreakpointTable = struct {
             if (evaluationStepBoundary(op) and (skip == null or start != skip.?)) {
                 try sites.append(allocator, .{ .chunk_id = chunk_id, .offset = @intCast(start) });
             }
-            const next = self.instructionEnd(chunk_id, chunk, start) orelse return;
+            const next = instructionEnd(chunk, start) orelse return;
             if (next <= start) return;
             start = next;
         }
@@ -384,6 +419,13 @@ pub const BreakpointTable = struct {
         // Preflight the only fallible mutation. After clearStep the placement
         // loop is allocation-free, so OOM cannot leave a half-armed step.
         try self.step_temps.ensureTotalCapacity(self.gpa, sites.len);
+        for (sites) |site| {
+            const chunk = registry.get(site.chunk_id) orelse continue;
+            if (site.offset >= chunk.code.len) continue;
+            if (self.instructionBoundaryAtOrAfter(site.chunk_id, chunk, site.offset) != site.offset) continue;
+            if (self.placedAt(site.chunk_id, site.offset)) continue;
+            _ = try self.ensureOverlay(site.chunk_id, chunk);
+        }
         self.clearStep(registry);
         self.step_max_depth = max_depth;
         self.step_follow_new_chunks = follow_new_chunks;
@@ -402,6 +444,7 @@ pub const BreakpointTable = struct {
         const chunk = registry.get(chunk_id) orelse return false;
         const offset = firstMappedOffset(chunk) orelse return false;
         try self.step_temps.ensureTotalCapacity(self.gpa, 1);
+        _ = try self.ensureOverlay(chunk_id, chunk);
         self.clearStep(registry);
         self.step_max_depth = std.math.maxInt(u32);
         self.step_armed = true;
@@ -410,13 +453,9 @@ pub const BreakpointTable = struct {
         return self.placedAt(chunk_id, offset) or self.stepPlacedAt(chunk_id, offset);
     }
 
-    /// Restore every step-temp byte and disarm the step.
+    /// Restore every step-temp overlay site and disarm the step.
     pub fn clearStep(self: *BreakpointTable, registry: *ChunkRegistry) void {
-        for (self.step_temps.items) |p| {
-            if (registry.get(p.chunk_id)) |c| {
-                if (p.offset < c.code.len and c.code[p.offset] == breakpoint_byte) c.code[p.offset] = p.original;
-            }
-        }
+        for (self.step_temps.items) |p| self.restoreOverlaySite(registry, p);
         self.step_temps.clearRetainingCapacity();
         self.step_max_depth = 0;
         self.step_follow_new_chunks = false;
@@ -435,10 +474,12 @@ pub const BreakpointTable = struct {
         chunk: *const Chunk,
         offset: usize,
     ) ?u32 {
+        _ = self;
+        _ = chunk_id;
         var start: usize = 0;
         while (start < chunk.code.len) {
             if (offset <= start) return @intCast(start);
-            const next = self.instructionEnd(chunk_id, chunk, start) orelse return null;
+            const next = instructionEnd(chunk, start) orelse return null;
             if (offset < next) return if (next < chunk.code.len) @intCast(next) else null;
             start = next;
         }
@@ -448,52 +489,38 @@ pub const BreakpointTable = struct {
     /// Resolve a frame's saved ip to the instruction which suspended there.
     /// Handlers save positions anywhere from just after the opcode through the
     /// end of its operands, so this deliberately treats `ip == end` as part of
-    /// the preceding instruction. Patched breakpoint bytes are decoded through
-    /// their saved original opcodes.
+    /// the preceding instruction. Instruction discovery reads canonical
+    /// bytecode; debugger trap bytes exist only in the execution overlay.
     pub fn instructionForSavedIp(
         self: *const BreakpointTable,
         chunk_id: ChunkId,
         chunk: *const Chunk,
         ip: usize,
     ) ?u32 {
+        _ = self;
+        _ = chunk_id;
         var start: usize = 0;
         while (start < chunk.code.len) {
-            const end = self.instructionEnd(chunk_id, chunk, start) orelse return null;
+            const end = instructionEnd(chunk, start) orelse return null;
             if (ip <= end) return @intCast(start);
             start = end;
         }
         return null;
     }
 
-    /// Decode an instruction through any debugger patch currently covering its
-    /// opcode byte. Used for both granular-step selection and UI breadcrumbs.
+    /// Decode a canonical instruction. Debugger traps live only in execution
+    /// overlays, so instruction discovery never needs to undo patch state.
     pub fn instructionOpcode(self: *const BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk, offset: u32) ?opcode.OpCode {
+        _ = self;
+        _ = chunk_id;
         if (offset >= chunk.code.len) return null;
-        const raw = self.originalOpcodeByte(chunk_id, offset, chunk);
+        const raw = chunk.code[offset];
         if (raw >= opcode.count) return null;
         return @enumFromInt(raw);
     }
 
-    /// Restore debugger-patched opcode bytes in a caller-owned copy of a
-    /// chunk's code. Inspectors should describe the program, not the trap bytes
-    /// temporarily installed to implement breakpoints and granular stepping.
-    pub fn restoreOriginalCode(
-        self: *const BreakpointTable,
-        chunk_id: ChunkId,
-        destination: []u8,
-    ) void {
-        for (self.placements.items) |placement| {
-            if (placement.chunk_id == chunk_id and placement.offset < destination.len)
-                destination[placement.offset] = placement.original;
-        }
-        for (self.step_temps.items) |placement| {
-            if (placement.chunk_id == chunk_id and placement.offset < destination.len)
-                destination[placement.offset] = placement.original;
-        }
-    }
-
-    fn instructionEnd(self: *const BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk, start: usize) ?usize {
-        const raw = self.originalOpcodeByte(chunk_id, start, chunk);
+    fn instructionEnd(chunk: *const Chunk, start: usize) ?usize {
+        const raw = chunk.code[start];
         if (raw >= opcode.count) return null;
         const op: opcode.OpCode = @enumFromInt(raw);
         const operands_start = start + 1;
@@ -508,6 +535,8 @@ pub const BreakpointTable = struct {
         chunk: *const Chunk,
         wanted: Chunk.SourceSpan,
     ) ?u32 {
+        _ = self;
+        _ = chunk_id;
         var start: usize = 0;
         while (start < chunk.code.len) {
             var best: ?Chunk.SourceMapEntry = null;
@@ -517,7 +546,7 @@ pub const BreakpointTable = struct {
                     best = entry;
             }
             if (best) |entry| if (sameSpan(entry.span, wanted)) return @intCast(start);
-            const next = self.instructionEnd(chunk_id, chunk, start) orelse return null;
+            const next = instructionEnd(chunk, start) orelse return null;
             if (next <= start) return null;
             start = next;
         }
@@ -543,13 +572,14 @@ pub const BreakpointTable = struct {
         if (self.instructionBoundaryAtOrAfter(chunk_id, chunk, offset) != offset) return;
         if (self.placedAt(chunk_id, offset) or self.stepPlacedAt(chunk_id, offset)) return;
         if (chunk.code[offset] == breakpoint_byte) return;
-        try self.step_temps.append(self.gpa, .{
+        try self.step_temps.ensureUnusedCapacity(self.gpa, 1);
+        const executable = try self.ensureOverlay(chunk_id, chunk);
+        self.step_temps.appendAssumeCapacity(.{
             .req_id = step_request_id,
             .chunk_id = chunk_id,
             .offset = offset,
-            .original = chunk.code[offset],
         });
-        chunk.code[offset] = breakpoint_byte;
+        executable[offset] = breakpoint_byte;
     }
 
     pub fn list(self: *const BreakpointTable) []const Request {
@@ -578,41 +608,47 @@ pub const BreakpointTable = struct {
     /// Patch `req`'s line into `chunk` if present and not already placed. Uses
     /// the earliest instruction of that line in the chunk (one site per chunk).
     fn placeRequestInChunk(self: *BreakpointTable, req: Request, chunk_id: ChunkId, chunk: *const Chunk) !void {
+        const start = self.requestSiteInChunk(req, chunk) orelse return;
+        try self.placeSite(req.id, chunk_id, start, chunk);
+    }
+
+    fn requestSiteInChunk(self: *const BreakpointTable, req: Request, chunk: *const Chunk) ?u32 {
         var best_start: ?u32 = null;
         for (chunk.source_map) |entry| {
             if (entry.span.line != req.line) continue;
             if (!self.fileMatches(entry.span.file, req.file)) continue;
             if (best_start == null or entry.start < best_start.?) best_start = entry.start;
         }
-        const start = best_start orelse return;
-        try self.placeSite(req.id, chunk_id, start, chunk);
+        return best_start;
     }
 
-    /// Patch one `(chunk_id, offset)` site to the breakpoint opcode under
-    /// `req_id`, saving the original byte. Rejects offsets that aren't a real
-    /// instruction boundary, sites already owned by another permanent
-    /// placement, and promotes an overlapping step temp so a resolving
-    /// permanent breakpoint doesn't get lost when the step clears.
+    /// Trap one `(chunk_id, offset)` overlay site under `req_id`. Rejects
+    /// offsets that aren't a real instruction boundary, sites already owned by
+    /// another permanent placement, and promotes an overlapping step temp so a
+    /// resolving permanent breakpoint doesn't get lost when the step clears.
     fn placeSite(self: *BreakpointTable, req_id: u32, chunk_id: ChunkId, offset: u32, chunk: *const Chunk) !void {
-        if (offset >= chunk.code.len) return;
-        if (self.instructionBoundaryAtOrAfter(chunk_id, chunk, offset) != offset) return;
-        for (self.placements.items) |p| {
-            if (p.chunk_id == chunk_id and p.offset == offset) return;
-        }
+        if (!self.canPlaceSite(chunk_id, offset, chunk)) return;
         try self.placements.ensureUnusedCapacity(self.gpa, 1);
-        var original = chunk.code[offset];
-        if (original == breakpoint_byte) {
-            const promoted = self.takeStepPlacement(chunk_id, offset) orelse return;
-            original = promoted.original;
-        }
+        _ = try self.ensureOverlay(chunk_id, chunk);
+        self.commitSite(req_id, chunk_id, offset);
+    }
+
+    fn canPlaceSite(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32, chunk: *const Chunk) bool {
+        if (offset >= chunk.code.len) return false;
+        if (chunk.code[offset] == breakpoint_byte) return false;
+        if (self.instructionBoundaryAtOrAfter(chunk_id, chunk, offset) != offset) return false;
+        return !self.placedAt(chunk_id, offset);
+    }
+
+    fn commitSite(self: *BreakpointTable, req_id: u32, chunk_id: ChunkId, offset: u32) void {
+        const executable = self.overlays.get(chunk_id).?;
+        _ = self.takeStepPlacement(chunk_id, offset);
         self.placements.appendAssumeCapacity(.{
             .req_id = req_id,
             .chunk_id = chunk_id,
             .offset = offset,
-            .original = original,
         });
-        // `chunk.code` is `[]u8`; the bytes are mutable even through `*const`.
-        chunk.code[offset] = breakpoint_byte;
+        executable[offset] = breakpoint_byte;
     }
 
     fn takeStepPlacement(self: *BreakpointTable, chunk_id: ChunkId, offset: u32) ?Placement {
@@ -623,17 +659,24 @@ pub const BreakpointTable = struct {
         return null;
     }
 
-    /// Read the opcode which was present before any debugger patch at this
-    /// site, allowing boundary scans to run while permanent or temporary
-    /// breakpoints are armed.
-    fn originalOpcodeByte(self: *const BreakpointTable, chunk_id: ChunkId, offset: usize, chunk: *const Chunk) u8 {
-        for (self.placements.items) |p| {
-            if (p.chunk_id == chunk_id and p.offset == offset) return p.original;
+    fn ensureOverlay(self: *BreakpointTable, chunk_id: ChunkId, chunk: *const Chunk) ![]u8 {
+        if (self.overlays.get(chunk_id)) |code| return code;
+        const copy = try self.gpa.dupe(u8, chunk.code);
+        errdefer self.gpa.free(copy);
+        const gop = try self.overlays.getOrPut(self.gpa, chunk_id);
+        if (gop.found_existing) {
+            self.gpa.free(copy);
+            return gop.value_ptr.*;
         }
-        for (self.step_temps.items) |p| {
-            if (p.chunk_id == chunk_id and p.offset == offset) return p.original;
-        }
-        return chunk.code[offset];
+        gop.value_ptr.* = copy;
+        return copy;
+    }
+
+    fn restoreOverlaySite(self: *BreakpointTable, registry: *const ChunkRegistry, placement: Placement) void {
+        const chunk = registry.get(placement.chunk_id) orelse return;
+        const executable = self.overlays.get(placement.chunk_id) orelse return;
+        if (placement.offset < executable.len and placement.offset < chunk.code.len)
+            executable[placement.offset] = chunk.code[placement.offset];
     }
 
     /// A stored span file matches the user's path if it's an exact match, a path
@@ -667,6 +710,36 @@ fn firstMappedOffset(chunk: *const Chunk) ?u32 {
         if (best == null or entry.start < best.?) best = entry.start;
     }
     return best;
+}
+
+fn buildOverlayTestChunk(allocator: std.mem.Allocator) !Chunk {
+    var builder = try chunk_mod.ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+    try builder.emitConstant(allocator, Value.int(1));
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+    return builder.finish(allocator, 0);
+}
+
+fn setAtWithInjectedFailures(
+    allocator: std.mem.Allocator,
+    registry: *ChunkRegistry,
+    intern: *const InternTable,
+    chunk_id: ChunkId,
+) !void {
+    var table = BreakpointTable.init(allocator, intern);
+    defer table.deinit();
+    const result = table.setAt(registry, chunk_id, 0) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), table.requests.items.len);
+        try std.testing.expectEqual(@as(usize, 0), table.placements.items.len);
+        try std.testing.expectEqual(@as(u32, 1), table.next_id);
+        try std.testing.expectEqual(
+            @as(u8, @intFromEnum(opcode.OpCode.push_const)),
+            registry.get(chunk_id).?.code[0],
+        );
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 1), result.sites);
 }
 
 /// Instructions whose execution can enter another frame, force one or more
@@ -763,15 +836,13 @@ test "step sites advance suspended operand ips to instruction boundaries" {
     try std.testing.expectEqual(@as(?u32, 5), table.instructionBoundaryAtOrAfter(9, &chunk, 4));
 
     // A raw operand offset is rejected, while the normalized boundary is
-    // patched. Boundary scans still work through that debugger-owned patch.
+    // trapped only in debugger-owned executable code. Canonical bytecode and
+    // its instruction scans remain unchanged.
     try table.placeStepSite(9, 1, &chunk);
     try std.testing.expectEqual(@as(u8, 7), code[1]);
     try table.placeStepSite(9, 2, &chunk);
-    try std.testing.expectEqual(breakpoint_byte, code[2]);
-    var inspected = code;
-    table.restoreOriginalCode(9, &inspected);
-    try std.testing.expectEqual(@intFromEnum(opcode.OpCode.push_const), inspected[2]);
-    try std.testing.expectEqual(breakpoint_byte, code[2]);
+    try std.testing.expectEqual(@intFromEnum(opcode.OpCode.push_const), code[2]);
+    try std.testing.expectEqual(breakpoint_byte, table.executableCode(9, &chunk)[2]);
     try std.testing.expectEqual(@as(?u32, 5), table.instructionBoundaryAtOrAfter(9, &chunk, 3));
     try std.testing.expectEqual(@as(?u32, 0), table.instructionForSavedIp(9, &chunk, 1));
     try std.testing.expectEqual(@as(?u32, 0), table.instructionForSavedIp(9, &chunk, 2));
@@ -838,12 +909,58 @@ test "source-span breakpoints distinguish nested expressions on one line" {
     try std.testing.expect(table.hasSite(chunk_id, 0));
     try std.testing.expect(table.hasSite(chunk_id, 3));
     try std.testing.expect(table.hasSite(chunk_id, 6));
+    try std.testing.expectEqual(@intFromEnum(opcode.OpCode.push_const), chunk.code[0]);
+    try std.testing.expectEqual(breakpoint_byte, table.executableCode(chunk_id, chunk)[0]);
 
     try std.testing.expect(table.removeSpan(&registry, chunk_id, outer));
     try std.testing.expect(!table.hasSpan(chunk_id, outer));
     try std.testing.expectEqual(@as(u8, @intFromEnum(opcode.OpCode.int_add)), chunk.code[6]);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(opcode.OpCode.int_add)), table.executableCode(chunk_id, chunk)[6]);
     try std.testing.expect(table.hasSpan(chunk_id, left));
     try std.testing.expect(table.hasSpan(chunk_id, right));
     try std.testing.expect(table.removeSpan(&registry, chunk_id, left));
     try std.testing.expect(table.removeSpan(&registry, chunk_id, right));
+}
+
+test "breakpoint overlays preserve canonical chunk deduplication" {
+    const allocator = std.testing.allocator;
+    var intern = try InternTable.init(allocator);
+    defer intern.deinit();
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+    var table = BreakpointTable.init(allocator, &intern);
+    defer table.deinit();
+
+    const first = try registry.registerDeduped(
+        try buildOverlayTestChunk(allocator),
+        name_tree.root_name_id,
+    );
+    const canonical = registry.get(first.id).?;
+    const original = @intFromEnum(opcode.OpCode.push_const);
+    try std.testing.expectEqual(original, canonical.code[0]);
+    try std.testing.expectEqual(@as(usize, 1), (try table.setAt(&registry, first.id, 0)).sites);
+    try std.testing.expectEqual(original, canonical.code[0]);
+    try std.testing.expectEqual(breakpoint_byte, table.executableCode(first.id, canonical)[0]);
+
+    var duplicate = try buildOverlayTestChunk(allocator);
+    const second = try registry.registerDeduped(duplicate, name_tree.root_name_id);
+    if (second.reused) duplicate.deinit(allocator);
+    try std.testing.expect(second.reused);
+    try std.testing.expectEqual(first.id, second.id);
+    try std.testing.expectEqual(original, registry.get(second.id).?.code[0]);
+}
+
+test "breakpoint overlay installation is failure atomic" {
+    const allocator = std.testing.allocator;
+    var intern = try InternTable.init(allocator);
+    defer intern.deinit();
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+    const chunk_id = try registry.register(try buildOverlayTestChunk(allocator));
+
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        setAtWithInjectedFailures,
+        .{ &registry, &intern, chunk_id },
+    );
 }

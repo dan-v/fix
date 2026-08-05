@@ -22,7 +22,7 @@ const chunk = bytecode_mod.chunk;
 const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
 const InternTable = @import("runtime").intern.InternTable;
-const Scheduler = @import("../eval/workers/scheduler.zig").Scheduler;
+const VmRuntime = @import("../eval/workers/vm_runtime.zig").Runtime;
 const heap_mod = @import("runtime").heap;
 const ObjectHeap = heap_mod.ObjectHeap;
 const FileCache = @import("store").FileCache;
@@ -234,8 +234,9 @@ pub const VM = struct {
     fetchers: *FetchService,
     /// Engine-owned realization service for recipes, store I/O, and builds.
     realization: *RealizationStore,
-    /// Global scheduler (for spawning work).
-    scheduler: *Scheduler,
+    /// Borrowed worker capabilities. Queue storage and scheduler machinery
+    /// remain owned by the evaluator's worker runtime.
+    workers: VmRuntime,
     /// Engine-owned error trace collector.
     trace: ?*eval_trace.Trace,
     /// Sparse demand-committed language-effect store. Null only in isolated
@@ -338,7 +339,7 @@ pub const VM = struct {
         files: *FileCache,
         fetchers: *FetchService,
         realization: *RealizationStore,
-        scheduler: *Scheduler,
+        workers: VmRuntime,
         trace_sink: ?*eval_trace.Trace = null,
         effects: ?*effects_mod.Store = null,
         observer: observ.Observer = .{},
@@ -383,7 +384,7 @@ pub const VM = struct {
             .files = options.files,
             .fetchers = options.fetchers,
             .realization = options.realization,
-            .scheduler = options.scheduler,
+            .workers = options.workers,
             .trace = options.trace_sink,
             .effects = options.effects,
             .observer = options.observer,
@@ -402,7 +403,7 @@ pub const VM = struct {
             .sp_high_water = 0,
             .frames = frames,
             .frames_len = 0,
-            .solo = options.scheduler.worker_count == 1,
+            .solo = options.workers.isSolo(),
             .lazy_shells_visible = options.lazy_shells_visible,
             .policy = options.policy,
             .trace_verbose = options.trace_verbose,
@@ -416,6 +417,17 @@ pub const VM = struct {
     pub inline fn workerId(self: *const VM) u8 {
         _ = self;
         return worker_id_mod.currentId();
+    }
+
+    /// Select debugger-owned executable bytecode at a frame boundary. The
+    /// ordinary path returns the immutable chunk slice after one null check;
+    /// dispatch itself performs no breakpoint lookup per opcode.
+    pub inline fn executableCode(self: *const VM, chunk_id: ChunkId, chunk_ptr: *const Chunk) []const u8 {
+        if (self.debug.breakpoints) |breakpoints| {
+            @branchHint(.unlikely);
+            return breakpoints.executableCode(chunk_id, chunk_ptr);
+        }
+        return chunk_ptr.code;
     }
 
     /// The authoritative execution context. Computing the standalone fallback

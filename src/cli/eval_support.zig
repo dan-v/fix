@@ -37,30 +37,31 @@ pub fn evaluateAndWrite(
     ev.setValueColor(use_color);
     _ = label;
 
-    const result = ev.evaluation().evaluatePathAt(source.slice(), source.base_path, source.abs_path) catch |err| {
+    const result = ev.evaluatePathAt(source.slice(), source.base_path, source.abs_path) catch |err| {
         try render.evalFailure(io, use_color, show_trace, ev, source.slice(), err);
         return false;
     };
-
     writeResult(io, mode, ev, result) catch |err| {
         try render.evaluationError(io, use_color, show_trace, ev, source.slice(), err);
         return false;
     };
+    // Strict/result rendering can force deferred bodies and imports, which may
+    // add warnings after the top-level parse. Emit only once all evaluation
+    // work for this input is complete.
+    try render.evalDiagnostics(io, use_color, ev, source.slice());
     return true;
 }
 
 fn writeResult(io: std.Io, mode: EvaluationMode, ev: *Engine, result: Value) !void {
-    const evaluation = ev.evaluation();
-    const values = ev.values();
-    if (mode.strict) try evaluation.forceDeep(result);
+    if (mode.strict) try ev.forceDeep(result);
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     switch (mode.output) {
-        .nix => try values.write(&stdout.interface, result),
-        .raw => try values.writeRaw(&stdout.interface, result),
-        .json => try values.writeJson(&stdout.interface, result),
-        .xml => try values.writeXml(&stdout.interface, result),
+        .nix => try ev.writeValue(&stdout.interface, result),
+        .raw => try ev.writeRawValue(&stdout.interface, result),
+        .json => try ev.writeJsonValue(&stdout.interface, result),
+        .xml => try ev.writeXmlValue(&stdout.interface, result),
     }
     if (mode.output != .xml and mode.output != .raw) try stdout.interface.writeByte('\n');
     try stdout.interface.flush();

@@ -3,11 +3,12 @@
 //! to no-ops with zero runtime footprint.
 //!
 //! Helpers don't update counters (we only care about main's serial
-//! pathlength), so the per-call overhead on workers is one
-//! thread-local load + branch. On main it's two `rdtsc`s plus
-//! stack push/pop.
+//! pathlength). Each evaluator fiber owns its nesting stack, so suspension
+//! cannot splice another fiber's scopes into its exclusions. If a fiber
+//! migrates away from worker 0, its open main-thread scopes are discarded;
+//! only complete regions executed on worker 0 reach the plain counters.
 //!
-//! **Exclusive time.** A per-thread call stack tracks the nested
+//! **Exclusive time.** A per-fiber call stack tracks the nested
 //! instrumented scopes; at `end`, the inclusive delta is recorded
 //! as the sample's exclusive cycles, *minus* time already attributed
 //! to nested child scopes. The parent's `child_exclusion` then
@@ -67,9 +68,9 @@ pub const Path = enum {
     /// thunk — the fiber suspends until the resolver wakes it. While
     /// suspended, worker 0 may run other fibers / drain tasks; the
     /// TSC doesn't stop, so this cycles count is wall-clock cycles,
-    /// not CPU-cycles. The exclusive-time accounting subtracts any
-    /// instrumented work that happens *on the same OS thread* during
-    /// the yield.
+    /// not CPU-cycles. A same-worker resume records the whole wait;
+    /// a migration discards the open scope rather than attributing
+    /// another worker's clock interval to worker 0.
     wait_busy_thunk,
     /// Time spent in `parkAndAccount` on worker 0 (the OS thread
     /// running main) when its ready queue is empty. Pure idle time
@@ -170,6 +171,7 @@ pub inline fn tscMainOnly() u64 {
 /// builtins whose total wall share is biggest.
 pub inline fn recordBuiltin(builtin_id: u16, t_start: u64) void {
     if (!enabled) return;
+    if (worker_id.currentId() != 0) return;
     if (t_start == 0) return;
     if (builtin_id >= max_builtin_id) return;
     const inclusive = rdtsc() - t_start;
@@ -197,9 +199,57 @@ const StackFrame = struct {
 // attribute dropped regions to a shallower ancestor.
 const stack_cap: usize = 4096;
 
-/// Per-thread instrumentation stack. Only worker 0 writes to it.
-threadlocal var prof_stack: [stack_cap]StackFrame = undefined;
-threadlocal var prof_stack_len: usize = 0;
+/// Fiber-owned instrumentation state. WorkerFiber compiles one of these into
+/// each migratable fiber only in `-Dprof-main` builds. `generation` makes
+/// tokens opened before a migration reset incapable of matching later scopes.
+pub const Stack = struct {
+    frames: [stack_cap]StackFrame = undefined,
+    len: usize = 0,
+    generation: u32 = 1,
+
+    fn reset(self: *Stack) void {
+        self.len = 0;
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
+    }
+};
+
+/// The active fiber stack on this OS thread. Bare worker-0 work (parse,
+/// compile, parking) uses a separate TLS stack because it runs outside a
+/// fiber. `Worker.runFiber` installs/removes the fiber pointer around resume.
+threadlocal var active_stack: ?*Stack = null;
+threadlocal var bare_stack: Stack = .{};
+
+pub inline fn enterFiber(stack: *Stack) void {
+    if (!enabled) return;
+    std.debug.assert(active_stack == null);
+    active_stack = stack;
+    // A token opened on worker 0 must never close on a helper or survive a
+    // round-trip migration back to worker 0. Resetting here invalidates every
+    // open token through the generation check in end().
+    if (worker_id.currentId() != 0 and stack.len != 0) stack.reset();
+}
+
+pub inline fn leaveFiber() void {
+    if (!enabled) return;
+    active_stack = null;
+}
+
+/// Start a new task on a recycled fiber with no profiler state inherited from
+/// its previous task. Incrementing the generation also invalidates a token
+/// from malformed control flow that escaped the old task's unwind.
+pub inline fn resetFiber(stack: *Stack) void {
+    if (!enabled) return;
+    stack.reset();
+}
+
+inline fn currentStack() *Stack {
+    return active_stack orelse &bare_stack;
+}
+
+inline fn token(stack: *const Stack, idx: usize) u64 {
+    return (@as(u64, stack.generation) << 32) | @as(u64, @intCast(idx));
+}
 
 /// Read the TSC. `rdtsc` returns a 64-bit counter formed from
 /// edx:eax. We use it as a coarse time source — the TSC is
@@ -220,19 +270,20 @@ pub inline fn rdtsc() u64 {
 /// Start a measurement on the main thread. Returns a sentinel
 /// (UINT64_MAX) on helpers and on disabled builds; the matching
 /// `end` ignores that case. The real returned value is the
-/// `prof_stack` index of the pushed frame (always < stack_cap).
+/// generation + stack index of the pushed frame.
 pub inline fn start(comptime path: Path) u64 {
     if (!enabled) return std.math.maxInt(u64);
     if (worker_id.currentId() != 0) return std.math.maxInt(u64);
-    if (prof_stack_len >= stack_cap) return std.math.maxInt(u64);
-    const idx = prof_stack_len;
-    prof_stack[idx] = .{
+    const stack = currentStack();
+    if (stack.len >= stack_cap) return std.math.maxInt(u64);
+    const idx = stack.len;
+    stack.frames[idx] = .{
         .path = path,
         .start_tsc = rdtsc(),
         .child_exclusion = 0,
     };
-    prof_stack_len += 1;
-    return idx;
+    stack.len += 1;
+    return token(stack, idx);
 }
 
 /// Like `start(.apply_builtin)` but tags the frame so its EXCLUSIVE
@@ -243,16 +294,17 @@ pub inline fn start(comptime path: Path) u64 {
 pub inline fn startBuiltin(builtin_id: u16) u64 {
     if (!enabled) return std.math.maxInt(u64);
     if (worker_id.currentId() != 0) return std.math.maxInt(u64);
-    if (prof_stack_len >= stack_cap) return std.math.maxInt(u64);
-    const idx = prof_stack_len;
-    prof_stack[idx] = .{
+    const stack = currentStack();
+    if (stack.len >= stack_cap) return std.math.maxInt(u64);
+    const idx = stack.len;
+    stack.frames[idx] = .{
         .path = .apply_builtin,
         .start_tsc = rdtsc(),
         .child_exclusion = 0,
         .builtin_id = builtin_id,
     };
-    prof_stack_len += 1;
-    return idx;
+    stack.len += 1;
+    return token(stack, idx);
 }
 
 /// End a measurement started by `start`. No-op on disabled builds
@@ -260,13 +312,18 @@ pub inline fn startBuiltin(builtin_id: u16) u64 {
 pub inline fn end(comptime path: Path, t: u64) void {
     if (!enabled) return;
     if (t == std.math.maxInt(u64)) return;
+    if (worker_id.currentId() != 0) return;
+    const stack = currentStack();
+    const generation: u32 = @intCast(t >> 32);
+    const idx: usize = @intCast(t & std.math.maxInt(u32));
+    if (generation != stack.generation) return;
     const now = rdtsc();
     // The expected stack invariant: `t` indexes the topmost frame
     // and its path matches what we pushed. Tolerate mismatches by
     // unwinding only if depth is consistent — defensive guard
     // against unexpected control-flow that bypasses defer.
-    if (prof_stack_len == 0 or prof_stack_len - 1 != t) return;
-    const frame = &prof_stack[t];
+    if (stack.len == 0 or stack.len - 1 != idx) return;
+    const frame = &stack.frames[idx];
     if (frame.path != path) return;
     const inclusive = now - frame.start_tsc;
     const exclusive = inclusive - frame.child_exclusion;
@@ -280,11 +337,11 @@ pub inline fn end(comptime path: Path, t: u64) void {
         b.cycles += exclusive;
         b.cycles_inclusive += inclusive;
     }
-    prof_stack_len -= 1;
+    stack.len -= 1;
     // Attribute the popped scope's inclusive delta to the parent's
     // child_exclusion so the parent's exclusive time skips it.
-    if (prof_stack_len > 0) {
-        prof_stack[prof_stack_len - 1].child_exclusion += inclusive;
+    if (stack.len > 0) {
+        stack.frames[stack.len - 1].child_exclusion += inclusive;
     }
 }
 
@@ -353,4 +410,57 @@ pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
 
 pub fn pct(x: u64, total: u64) f64 {
     return if (total == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(total));
+}
+
+test "fiber profiler stack invalidates scopes on worker migration" {
+    if (!enabled) return error.SkipZigTest;
+
+    const saved_worker = worker_id.state();
+    defer worker_id.set(saved_worker.id, saved_worker.is_worker);
+
+    var stack: Stack = .{};
+    worker_id.set(0, true);
+    enterFiber(&stack);
+    const stale = start(.force_value);
+    try std.testing.expectEqual(@as(usize, 1), stack.len);
+    leaveFiber();
+
+    worker_id.set(1, true);
+    enterFiber(&stack);
+    try std.testing.expectEqual(@as(usize, 0), stack.len);
+    end(.force_value, stale);
+    try std.testing.expectEqual(@as(usize, 0), stack.len);
+    leaveFiber();
+
+    worker_id.set(0, true);
+    enterFiber(&stack);
+    end(.force_value, stale);
+    try std.testing.expectEqual(@as(usize, 0), stack.len);
+    leaveFiber();
+}
+
+test "fiber profiler stacks remain isolated across suspension" {
+    if (!enabled) return error.SkipZigTest;
+
+    const saved_worker = worker_id.state();
+    defer worker_id.set(saved_worker.id, saved_worker.is_worker);
+    worker_id.set(0, true);
+
+    var suspended: Stack = .{};
+    var other: Stack = .{};
+
+    enterFiber(&suspended);
+    const outer = start(.force_value);
+    leaveFiber();
+
+    enterFiber(&other);
+    const inner = start(.get_attr_value);
+    end(.get_attr_value, inner);
+    try std.testing.expectEqual(@as(usize, 0), other.len);
+    leaveFiber();
+
+    enterFiber(&suspended);
+    end(.force_value, outer);
+    try std.testing.expectEqual(@as(usize, 0), suspended.len);
+    leaveFiber();
 }

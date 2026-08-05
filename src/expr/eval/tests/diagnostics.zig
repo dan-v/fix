@@ -2,6 +2,29 @@ const std = @import("std");
 const eval_mod = @import("../../evaluator.zig");
 const Engine = eval_mod.Engine;
 const Diagnostic = eval_mod.Diagnostic;
+const policy_mod = @import("../../policy.zig");
+
+test "successful evaluation retains unsilenced parser deprecations" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
+    defer ev.deinit();
+
+    _ = try ev.evaluate(".5");
+    const warnings = ev.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), warnings.len);
+    try std.testing.expectEqual(Diagnostic.Severity.warning, warnings[0].severity);
+    try std.testing.expectEqual(Diagnostic.Kind.parse, warnings[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), warnings[0].offset);
+    try std.testing.expectEqualStrings(
+        "floating point literal without a leading zero; use --extra-deprecated-features floating-without-zero to silence this warning",
+        warnings[0].message,
+    );
+
+    var policy: policy_mod.LanguagePolicy = .{};
+    policy.applyFeatureSets(.initEmpty(), .initOne(.floating_without_zero));
+    ev.configureLanguage(policy);
+    _ = try ev.evaluate(".5");
+    try std.testing.expectEqual(@as(usize, 0), ev.getDiagnostics().len);
+}
 
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });

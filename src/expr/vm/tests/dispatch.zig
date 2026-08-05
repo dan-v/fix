@@ -22,8 +22,10 @@ const bytecode = @import("../../bytecode.zig");
 const ChunkBuilder = bytecode.ChunkBuilder;
 const OpCode = bytecode.OpCode;
 const closures = @import("../../vm.zig").closures;
+const force = @import("../../vm.zig").force;
 const stack = @import("../../vm.zig").stack;
 const equality = @import("../../vm.zig").equality;
+const FutureState = @import("runtime").future.FutureState;
 
 /// A live Engine plus a bare VM sharing its registry/heap/intern
 /// state. `evaluate("null")` on the Engine first drives the normal
@@ -63,7 +65,7 @@ const Harness = struct {
             .files = &ev.sources.files,
             .fetchers = &ev.sources.fetchers,
             .realization = &ev.store.realization,
-            .scheduler = &ev.execution.scheduler,
+            .workers = @import("../../eval/workers/vm_runtime.zig").Runtime.init(&ev.execution.scheduler),
             .builtins_value = ev.builtins_value.?,
         });
         return .{ .ev = ev, .scratch = scratch, .vm = vm };
@@ -504,6 +506,46 @@ test "thunk_w_st_cell publishes the thunk into a cell-initialized slot" {
     const result = try closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, null, false);
     try testing.expect(result.isInt());
     try testing.expectEqual(@as(i64, 42), result.asInt());
+}
+
+test "resolved forwarding thunk forces an unresolved binding cell to WHNF" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const binding = try force.makeBindingCell(&h.vm);
+    const outer_id = try h.vm.heap.addLazyShell(binding);
+    h.vm.heap.getThunkAssumeValid(binding.asObjectId()).publishCellBindingSolo(Value.int(42));
+
+    const result = try force.forceValue(&h.vm, Value.thunk(outer_id));
+    try testing.expect(result.isInt());
+    try testing.expectEqual(@as(i64, 42), result.asInt());
+}
+
+test "forwarding failure completes the outer thunk" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    // Return an upvalue without forcing it so the outer bytecode thunk must
+    // normalize the forwarding result itself.
+    var body = try ChunkBuilder.init(testing.allocator);
+    defer body.deinit(testing.allocator);
+    try body.writeOp(testing.allocator, .up_grab);
+    try body.writeU16(testing.allocator, 0);
+    try body.writeOp(testing.allocator, .ret);
+    try body.writeOp(testing.allocator, .halt);
+    const body_id = try h.ev.registry.register(try body.finish(testing.allocator, 0));
+
+    const binding = try force.makeBindingCell(&h.vm);
+    h.vm.heap.getThunkAssumeValid(binding.asObjectId()).publishCellBindingSolo(binding);
+    const outer_id = try h.vm.heap.addBytecodeThunk(body_id, &.{binding});
+    const outer = Value.thunk(outer_id);
+
+    try testing.expectError(error.RecursiveThunk, force.forceValue(&h.vm, outer));
+    try testing.expectEqual(
+        @intFromEnum(FutureState.errored),
+        h.vm.heap.getThunkAssumeValid(outer_id).future.state.load(.acquire),
+    );
+    try testing.expectError(error.RecursiveThunk, force.forceValue(&h.vm, outer));
 }
 
 // ---- strings.zig: real logic (interned-string concatenation) ----

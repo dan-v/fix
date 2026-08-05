@@ -3,9 +3,6 @@
 
 const std = @import("std");
 
-/// How many worker threads to spawn for the evaluation pool.
-pub const default_worker_count: u8 = 4;
-
 /// Maximum value stack slots for a VM. Sized so a call chain that is legal
 /// under `max-call-depth` (10k applications, each also pushing passthrough
 /// thunk-force frames with reserved locals) exhausts the logical depth cap
