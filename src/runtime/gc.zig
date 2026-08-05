@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 const containers = @import("base");
 const clock = @import("base").clock;
 const heap_mod = @import("heap.zig");
+const heap_edges = @import("heap/edges.zig");
 const heap_collector = @import("heap/collector.zig");
 const RangeFreeList = @import("heap/reuse.zig").RangeFreeList;
 const value_mod = @import("value.zig");
@@ -25,7 +26,6 @@ const ObjectHeap = heap_mod.ObjectHeap;
 const Value = value_mod.Value;
 const ObjectId = types.ObjectId;
 const future_mod = @import("future.zig");
-const FutureState = future_mod.FutureState;
 
 /// The mark bitmap's natural locality unit: one word describes 64 adjacent
 /// fixed-size object slots. Marking records object discovery in `mark_bits`
@@ -102,10 +102,6 @@ fn rangeWorkLessThan(_: void, a: RangeWork, b: RangeWork) bool {
     };
 }
 
-/// A `attrs_merge` whose `flattened` memo equals this has no flattened
-/// object to follow. Single source of truth in `heap.zig`.
-const no_flattened_attrs: ObjectId = heap_mod.no_flattened_attrs;
-
 /// Live-set tally accumulated by one mark pass: object slots reached, the
 /// value/attr/attr-pos store slots they own, and the total live bytes
 /// (object slots + owned ranges).
@@ -161,11 +157,11 @@ fn atomicReleasePage(pending_pages: []u64, page: MarkPage) void {
 /// bounce and erase the parallel win). All markers share the one atomic
 /// seen bitmap (`mark_bits`), scanned bitmap, and queued/in-flight page bitmap.
 ///
-/// `Marker` doubles as a `scanObject` **sink**: it exposes the same
-/// `markValue`/`markObject`/`count*` methods the serial `SerialSink` does, so
-/// the single generic edge-walk (`scanObject`) is the ONE place the heap trace
-/// map lives — serial and parallel marking can never drift.
+/// `Marker` doubles as a `heap_edges.walkObject` sink. Its small adapter
+/// surface keeps the graph shape independent from the parallel queue policy.
 pub const Marker = struct {
+    pub const Error = error{};
+
     deque: containers.GrowableDeque(MarkPage),
     ranges: containers.GrowableDeque(u128),
     stats: LiveStats = .{},
@@ -239,6 +235,30 @@ pub const Marker = struct {
     inline fn countAttrPos(self: *Marker, n: u64) void {
         self.stats.attr_pos += n;
         self.stats.bytes += n * @sizeOf(heap_mod.AttrPosEntry);
+    }
+
+    pub inline fn objectSlot(self: *Marker) Error!void {
+        self.countObject();
+    }
+    pub inline fn object(self: *Marker, heap: *const ObjectHeap, id: ObjectId) Error!void {
+        self.markObject(heap, id);
+    }
+    pub inline fn chunk(_: *Marker, _: types.ChunkId) Error!void {}
+    pub inline fn value(self: *Marker, heap: *const ObjectHeap, child: Value) Error!void {
+        self.markValue(heap, child);
+    }
+    pub inline fn valueRange(self: *Marker, heap: *const ObjectHeap, range: heap_mod.ValueRange) Error!void {
+        self.scanValues(heap, range);
+    }
+    pub inline fn attrRange(self: *Marker, heap: *const ObjectHeap, range: heap_mod.AttrRange) Error!void {
+        self.scanAttrs(heap, range);
+    }
+    pub inline fn attrPositions(self: *Marker, positions: heap_mod.AttrPositions) Error!void {
+        self.countAttrPos(positions.heapLen());
+    }
+    pub inline fn capturedValues(self: *Marker, heap: *const ObjectHeap, values: []const Value, owns_range: bool) Error!void {
+        if (owns_range) self.countValues(values.len);
+        for (values) |child| self.markValue(heap, child);
     }
 };
 
@@ -417,17 +437,17 @@ pub const Tracer = struct {
     }
 
     /// Seed the young referents of a remembered old `source` (an old→young
-    /// edge). Scans the source's outgoing edges via the shared trace map;
+    /// edge). Scans the source's outgoing edges via the canonical trace map;
     /// young children are marked+queued (the gate drops old ones), and the old
     /// source itself is never added to the live set. Call for each remembered
     /// source before `drainMinor`.
     pub fn markRemsetSource(self: *Tracer, heap: *const ObjectHeap, source: ObjectId) void {
         if (self.parallel_seed) |marker| {
-            scanObject(Marker, marker, heap, source);
+            heap_edges.walkObject(Marker, marker, heap, source) catch unreachable;
             return;
         }
         var sink = SerialSink{ .tr = self };
-        scanObject(SerialSink, &sink, heap, source);
+        heap_edges.walkObject(SerialSink, &sink, heap, source) catch unreachable;
     }
 
     /// Drain the young-gated mark to its transitive closure, then disarm the
@@ -637,11 +657,13 @@ pub const Tracer = struct {
     }
 };
 
-/// Serial-mark sink (`--workers=1`): the `scanObject` counterpart of `Marker`.
+/// Serial-mark sink (`--workers=1`): the counterpart of `Marker`.
 /// Pushes children to the Tracer's `stack` (plain, non-atomic `testAndSet`)
 /// and accumulates into the Tracer's `stats`. Same method surface as `Marker`
 /// so the one generic edge-walk drives both.
 const SerialSink = struct {
+    pub const Error = error{};
+
     tr: *Tracer,
 
     inline fn markValue(self: *SerialSink, heap: *const ObjectHeap, v: Value) void {
@@ -675,15 +697,37 @@ const SerialSink = struct {
         self.tr.stats.attr_pos += n;
         self.tr.stats.bytes += n * @sizeOf(heap_mod.AttrPosEntry);
     }
+
+    pub inline fn objectSlot(self: *SerialSink) Error!void {
+        self.countObject();
+    }
+    pub inline fn object(self: *SerialSink, heap: *const ObjectHeap, id: ObjectId) Error!void {
+        self.markObject(heap, id);
+    }
+    pub inline fn chunk(_: *SerialSink, _: types.ChunkId) Error!void {}
+    pub inline fn value(self: *SerialSink, heap: *const ObjectHeap, child: Value) Error!void {
+        self.markValue(heap, child);
+    }
+    pub inline fn valueRange(self: *SerialSink, heap: *const ObjectHeap, range: heap_mod.ValueRange) Error!void {
+        self.scanValues(heap, range);
+    }
+    pub inline fn attrRange(self: *SerialSink, heap: *const ObjectHeap, range: heap_mod.AttrRange) Error!void {
+        self.scanAttrs(heap, range);
+    }
+    pub inline fn attrPositions(self: *SerialSink, positions: heap_mod.AttrPositions) Error!void {
+        self.countAttrPos(positions.heapLen());
+    }
+    pub inline fn capturedValues(self: *SerialSink, heap: *const ObjectHeap, values: []const Value, owns_range: bool) Error!void {
+        if (owns_range) self.countValues(values.len);
+        for (values) |child| self.markValue(heap, child);
+    }
 };
 
-// --- the trace map (edge-walk), written exactly once ---
+// --- physically ordered work draining; graph shape lives in heap/edges.zig ---
 //
-// `scanObject` and its helpers are generic over the `Sink` (`SerialSink` or
-// `Marker`), so the mapping from each heap object to its outgoing edges — the
-// GC correctness invariant — has a single source of truth. A missed edge here
-// is a swept live object (use-after-free) at BOTH --workers=1 and --workers>1,
-// so both mark paths always agree by construction. See docs/gc.md.
+// `heap_edges.walkObject` is generic over `SerialSink` and `Marker`, so the GC
+// correctness invariant has one source of graph truth while both paths retain
+// their distinct queue mechanics. See docs/gc.md.
 
 /// Scan the newly-seen objects in one mark page in ascending ObjectId order.
 /// `bits` is a stable snapshot: discoveries made by these scans accumulate in
@@ -699,14 +743,13 @@ fn scanMarkedWord(
     while (bits != 0) {
         const bit: u6 = @intCast(@ctz(bits));
         const id: ObjectId = page * objects_per_mark_page + @as(ObjectId, bit);
-        scanObject(Sink, sink, heap, id);
+        heap_edges.walkObject(Sink, sink, heap, id) catch unreachable;
         bits &= bits - 1;
     }
 }
 
-/// Account and trace one physically-ordered side-store range. Like
-/// `scanObject`, this is generic so serial and parallel tracing share the
-/// exact same edge map.
+/// Account and trace one physically-ordered side-store range. This is generic
+/// so serial and parallel tracing share the exact same queue-drain policy.
 fn scanRangeWork(
     comptime Sink: type,
     sink: *Sink,
@@ -721,81 +764,6 @@ fn scanRangeWork(
         .attrs => |range| {
             sink.countAttrs(range.len);
             for (heap.attrs.slice(range)) |entry| sink.markValue(heap, entry.value);
-        },
-    }
-}
-
-/// Account object `id`'s slot and follow its outgoing edges via `sink`.
-fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: ObjectId) void {
-    sink.countObject();
-    const obj = heap.objects.get(id);
-    switch (obj.*) {
-        .list => |r| scanValues(Sink, sink, heap, r),
-        .attrs => |a| {
-            scanAttrs(Sink, sink, heap, a.range);
-            sink.countAttrPos(a.positions.heapLen());
-        },
-        .merge_attrs => |m| {
-            sink.markObject(heap, m.base);
-            sink.markObject(heap, m.overlay);
-            const flat = m.flattened.load(.monotonic);
-            if (flat != no_flattened_attrs) sink.markObject(heap, flat);
-        },
-        .closure => |c| scanValues(Sink, sink, heap, c.upvalues),
-        .builtin_closure => |c| scanValues(Sink, sink, heap, c.args),
-        .partial_app => |p| {
-            sink.markValue(heap, p.func);
-            scanValues(Sink, sink, heap, p.args);
-        },
-        .context_string => |c| scanAttrs(Sink, sink, heap, c.context),
-        // Leaves: byte payloads have no Value edges; marking the object
-        // keeps its byte range (if any) from being swept.
-        .heap_string, .heap_string_inline => {},
-        .boxed_int => {},
-        .thunk => scanThunk(Sink, sink, heap, &obj.thunk),
-    }
-}
-
-fn scanValues(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, range: heap_mod.ValueRange) void {
-    sink.scanValues(heap, range);
-}
-
-fn scanAttrs(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, range: heap_mod.AttrRange) void {
-    sink.scanAttrs(heap, range);
-}
-
-fn scanThunk(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, t: *const thunk_mod.Thunk) void {
-    const raw_state = t.future.state.load(.monotonic);
-    if (comptime heap_mod.gc_debug) {
-        if (raw_state == future_mod.poisoned_state)
-            @panic("gc: tracing a swept thunk — a live object still references it (stale edge / missed root)");
-    }
-    switch (@as(FutureState, @enumFromInt(raw_state))) {
-        .resolved => sink.markValue(heap, t.payload.result),
-        // `.errored` reuses the result bits as a heap-owned `FailureRef` (or
-        // an inline degraded error code); `.blackhole` is terminal. Neither
-        // holds a Value to follow.
-        .errored, .blackhole => {},
-        .unresolved, .evaluating => switch (t.targetKind()) {
-            .closure => sink.markValue(heap, t.payload.target.closure),
-            .pass_through => sink.markValue(heap, t.payload.target.pass_through),
-            .attr_access => sink.markValue(heap, t.payload.target.attr_access.base),
-            .bytecode => {
-                const bt = &t.payload.target.bytecode;
-                const ups = bt.upvalues();
-                // Spilled upvalues live in the value store and belong to this
-                // thunk; inline ones are inside the slot.
-                if (bt.upvalue_count > thunk_mod.BytecodeThunk.inline_capacity)
-                    sink.countValues(ups.len);
-                for (ups) |v| sink.markValue(heap, v);
-            },
-            .deferred => {
-                const dt = &t.payload.target.deferred;
-                const env = dt.env();
-                if (dt.env_count > thunk_mod.DeferredThunk.inline_capacity)
-                    sink.countValues(env.len);
-                for (env) |v| sink.markValue(heap, v);
-            },
         },
     }
 }

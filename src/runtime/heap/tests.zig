@@ -140,18 +140,47 @@ test "object reference inspection follows objects and chunks without recursion" 
 
     var refs: std.ArrayListUnmanaged(heap_mod.HeapReference) = .empty;
     defer refs.deinit(std.testing.allocator);
-    try heap.collectObjectReferences(&snapshot, parent_id, std.testing.allocator, &refs);
+    try @import("edges.zig").collectReferences(&heap, &snapshot, parent_id, std.testing.allocator, &refs);
     try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
         .{ .object = child_id },
         .{ .chunk = 0x2a },
     }, refs.items);
 
     refs.clearRetainingCapacity();
-    try heap.collectObjectReferences(&snapshot, closure_id, std.testing.allocator, &refs);
+    try @import("edges.zig").collectReferences(&heap, &snapshot, closure_id, std.testing.allocator, &refs);
     try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
         .{ .chunk = 0x31 },
         .{ .object = parent_id },
         .{ .chunk = 0x32 },
+    }, refs.items);
+
+    const position_table = [_]heap_mod.AttrPosEntry{.{
+        .name = 40,
+        .pos = .{ .file = 1, .line = 2, .column = 3 },
+    }};
+    const Resolver = struct {
+        fn resolve(ctx: *anyopaque, _: u32) []const heap_mod.AttrPosEntry {
+            const table: *const [1]heap_mod.AttrPosEntry = @ptrCast(@alignCast(ctx));
+            return table;
+        }
+    };
+    heap.setChunkAttrPosResolver(.{
+        .ctx = @ptrCast(@constCast(&position_table)),
+        .resolve = Resolver.resolve,
+    });
+    const positioned_id = try heap.addAttrsFromValuesSorted(
+        &.{40},
+        &.{Value.list(child_id)},
+        heap_mod.AttrPositions.fromChunk(0x44, 0, 1),
+    );
+
+    snapshot.deinit();
+    snapshot = try heap.objectSnapshot(std.testing.allocator);
+    refs.clearRetainingCapacity();
+    try @import("edges.zig").collectReferences(&heap, &snapshot, positioned_id, std.testing.allocator, &refs);
+    try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
+        .{ .object = child_id },
+        .{ .chunk = 0x44 },
     }, refs.items);
 }
 

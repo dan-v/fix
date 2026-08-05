@@ -1568,7 +1568,7 @@ pub const Engine = struct {
         allocator: std.mem.Allocator,
         out: *std.ArrayListUnmanaged(runtime.heap.HeapReference),
     ) !void {
-        return self.heap.collectObjectReferences(snapshot, id, allocator, out);
+        return runtime.heap_edges.collectReferences(&self.heap, snapshot, id, allocator, out);
     }
 
     /// Per-record access to the value/attr/attr-position stores, for the VM
