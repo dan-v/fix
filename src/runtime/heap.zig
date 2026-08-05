@@ -1580,7 +1580,12 @@ pub const ObjectHeap = struct {
                     break :blk .{ .id = rid, .reused = true };
                 }
                 local.object_reuse_misses += 1;
-                if (self.collection.object_miss_collect_armed.swap(false, .acq_rel)) {
+                // Disarmed is overwhelmingly the common case. Avoid a locked
+                // RMW on every fresh object allocation; only contenders that
+                // observe an armed trigger pay for the one-winner transition.
+                if (self.collection.object_miss_collect_armed.load(.monotonic) and
+                    self.collection.object_miss_collect_armed.cmpxchgStrong(true, false, .acq_rel, .monotonic) == null)
+                {
                     self.collection.collect_requested.store(true, .monotonic);
                     _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
                 }
@@ -2499,12 +2504,7 @@ pub const ObjectHeap = struct {
         return self.addAttrsFromValuesImpl(names, values, positions, .presorted_unique);
     }
 
-    /// `attrs_new_named` (unsorted) variant: like `addAttrsFromValuesSorted`
-    /// but the names carry no order guarantee — a persistently-cached chunk
-    /// loads with remapped intern ids, and remapping does not preserve the
-    /// compile-time id order its `_srt` twin baked in. Sorts (and
-    /// duplicate-rejects) the entries; the shared position table reference
-    /// is still required sorted (the cache loader re-sorts each range).
+    /// `attrs_new_named`: names carry no ordering guarantee.
     pub fn addAttrsFromValues(
         self: *ObjectHeap,
         names: []const InternId,
@@ -2878,9 +2878,11 @@ pub const ObjectHeap = struct {
     /// Positions counterpart of the strict literal merge (`attrs_merge_strict`,
     /// used when an attrset literal mixes static and dynamic entries): union of
     /// both sides' tables by name, left winning duplicates (the merged attr's
-    /// first definition site). A borrowed literal table can be retained when
-    /// the other side has no positions; otherwise, the sorted union is
-    /// materialized into a fresh, heap-owned range.
+    /// first definition site). Static literal positions live in the immutable
+    /// chunk table, so the overwhelmingly common `baked static + unpositioned
+    /// dynamic` case can share that reference instead of copying the same table
+    /// once per dynamic key. Heap ranges retain single-owner semantics and are
+    /// materialized below.
     pub fn mergeAttrPositionsStrict(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !AttrPositions {
         const left_positions = switch (self.get(left_id).*) {
             .attrs => |a| a.positions,

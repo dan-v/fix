@@ -222,10 +222,9 @@ pub fn armTracking(heap: *ObjectHeap) void {
     if (comptime gc_debug) if (!heap.collection.root_always) heap.gcPresizeAllocBits();
 }
 
-/// The budget/2 STW safepoint under the lazy policy: arm tracking and
-/// re-arm the threshold to the full budget. No mark, no sweep, no token
-/// bump — nothing allocated so far is tracked, so there is nothing to
-/// reclaim yet.
+/// The `armLineBytes` STW safepoint under the lazy policy: arm tracking and
+/// re-arm the threshold to the full budget. No mark, no sweep, no token bump —
+/// nothing allocated so far is tracked, so there is nothing to reclaim yet.
 pub fn armLazy(heap: *ObjectHeap) void {
     armTracking(heap);
     heap.collection.collect_requested.store(false, .monotonic);

@@ -18,7 +18,7 @@ pub const MemTag = enum(u8) {
     attrpos,
     /// Heap-string byte store segments (GC-able string text).
     strbytes,
-    /// Fiber stacks (8 MiB lazily-committed reservations).
+    /// Fiber stacks (16 MiB lazily-committed reservations).
     fiber_stack,
     /// AST arenas (parse-time nodes; the retained ones back deferred
     /// compiles for the evaluator's lifetime).

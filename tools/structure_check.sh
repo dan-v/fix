@@ -67,6 +67,11 @@ if rg -n '@import\("attrs\.zig"\)' \
   failed=1
 fi
 
+if rg -n '@import\("syntax"\)|compiler_mod\.Node' "$src/expr/compiler/emit.zig"; then
+  echo "structure-check: byte emission must remain independent of the AST" >&2
+  failed=1
+fi
+
 if [[ -e "$src/expr/engine/capabilities.zig" ]]; then
   echo "structure-check: do not restore forwarding-only Engine capability views" >&2
   failed=1
@@ -79,4 +84,5 @@ for subsystem in pages source_view view_state tree_projection controller preview
     failed=1
   fi
 done
+
 exit "$failed"

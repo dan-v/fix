@@ -391,9 +391,9 @@ test "intern: sortByNameLex matches byte-wise order" {
     // strict-prefix pairs shorter and longer than the inline prefix, the
     // empty string, and an embedded NUL aliasing the zero padding.
     const inputs = [_][]const u8{
-        "b",           "k10",         "ab\x00",      "same8byteXY", "abc",
-        "longprefixB", "k2",          "",            "a",           "k1",
-        "same8byteXX", "longprefix",  "ab",          "longprefixA",
+        "b",           "k10",        "ab\x00", "same8byteXY", "abc",
+        "longprefixB", "k2",         "",       "a",           "k1",
+        "same8byteXX", "longprefix", "ab",     "longprefixA",
     };
     const Named = struct { name: InternId };
     var entries: [inputs.len]Named = undefined;

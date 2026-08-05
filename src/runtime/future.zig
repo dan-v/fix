@@ -231,7 +231,7 @@ pub const Future = struct {
     }
 
     /// `publish` for a single-worker process: plain stores, and the waiter
-    /// drain skips the `waiters_mu` RMW when nobody ever enrolled (the
+    /// drain skips the waiter-word RMW when nobody ever enrolled (the
     /// overwhelmingly common case — enrollment means some same-thread fiber
     /// observed `.busy` and parked, and its list push is plainly visible
     /// here). Same solo-ness contract as `tryClaimSolo`.

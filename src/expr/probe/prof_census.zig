@@ -264,8 +264,10 @@ pub fn reportStrConcat() void {
             "prof str-long(>={d}B): plain={d}/{d}B ctx={d}/{d}B (plain share {d:.1}% of long bytes)\n",
             .{
                 long_string_threshold,
-                str.long_plain_calls, str.long_plain_bytes,
-                str.long_ctx_calls,   str.long_ctx_bytes,
+                str.long_plain_calls,
+                str.long_plain_bytes,
+                str.long_ctx_calls,
+                str.long_ctx_bytes,
                 pct(str.long_plain_bytes, str.long_plain_bytes + str.long_ctx_bytes),
             },
         );

@@ -352,13 +352,10 @@ pub fn memoryBudget(ev: Context) u64 {
     return autoCollectLine(ev);
 }
 
-/// CONSTRAINED MODE: is memory tight enough that the collector will plausibly
-/// ARM (cross budget/2 during a real eval)? Only then does pre-arming reclaim
-/// matter, and only then must transient rooting (`heap.collection.root_active`) stay
-/// live from evaluation start. True iff an explicit `--gc-budget` was given (the
-/// user opted into a limit), OR the auto line came in below the default ceiling
-/// (a RAM-limited box). A roomy auto machine (line clamped to the ceiling) never
-/// arms, so pre-arming reclaim stays off.
+/// Measurement override for keeping precise roots active from evaluation
+/// start. Normal evaluation arms tracking and transient rooting lazily at
+/// `collector.armLineBytes`; `FIX_GC_ROOTS=1` keeps the earlier, more expensive
+/// behavior available for detector and performance comparisons.
 pub fn constrainedMode(ev: Context, budget: u64) bool {
     // From-start precise rooting costs 2-7% wall on small evals and is
     // NOT how big evals get their reclaim any more: the lazy path arms
@@ -373,7 +370,6 @@ pub fn constrainedMode(ev: Context, budget: u64) bool {
         return !std.mem.eql(u8, s, "0");
     return false;
 }
-
 
 /// The automatic line: a fraction of physical RAM, clamped. MemTotal (not the
 /// fluctuating MemAvailable) so it's stable and read exactly once. The clamp
