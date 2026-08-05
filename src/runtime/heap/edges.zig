@@ -129,7 +129,7 @@ const ReferenceSink = struct {
     }
 
     pub fn value(self: *ReferenceSink, heap: *const ObjectHeap, child: Value) Error!void {
-        switch (heap_mod.ObjectHeap.inspectValue(child).target) {
+        switch (heap_mod.inspection.valueRef(child).target) {
             .object => |id| try self.object(heap, id),
             .chunk => |id| try self.chunk(id),
             .none, .intern, .builtin => {},

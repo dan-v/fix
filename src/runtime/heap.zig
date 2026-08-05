@@ -36,7 +36,7 @@ const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
 const DeferredThunk = @import("thunk.zig").DeferredThunk;
 const FailureStore = @import("failure.zig").FailureStore;
-const inspection = @import("heap/inspection.zig");
+pub const inspection = @import("heap/inspection.zig");
 const reuse = @import("heap/reuse.zig");
 const RangeFreeList = reuse.RangeFreeList;
 const nextSetBit = reuse.nextSetBit;
@@ -47,8 +47,6 @@ pub const ThunkState = inspection.ThunkState;
 pub const ThunkTargetInfo = inspection.ThunkTargetInfo;
 pub const ThunkInfo = inspection.ThunkInfo;
 pub const ObjectInfo = inspection.ObjectInfo;
-/// `-Dprof-main`: the creation-context / demanded-age probe fields on
-/// `Future` are live (see thunk.zig `created_tsc_enabled`).
 const prof_census_enabled = @import("thunk.zig").created_tsc_enabled;
 
 pub const ObjectId = types.ObjectId;
@@ -577,6 +575,10 @@ pub const HeapCollectionState = struct {
 };
 
 pub const ObjectHeap = struct {
+    pub const ObjectSnapshot = inspection.ObjectSnapshot;
+    pub const Counts = inspection.Counts;
+    pub const Stats = inspection.Stats;
+
     allocator: std.mem.Allocator,
     /// Unique owner for immutable failures borrowed by thunks, imports, and
     /// fiber exception carriers. Lives exactly as long as this heap.
@@ -713,19 +715,11 @@ pub const ObjectHeap = struct {
         self.objects.deinit(self.allocator);
     }
 
-    pub const Counts = struct {
-        objects: u32,
-        values: u32,
-        attrs: u32,
-        attr_positions: u32,
-        bytes: u32,
-    };
-
     /// Append the discarded-TLAB tails to an object-store `SkipSet` (from
     /// `collectUnfilled(.object)`) so slot scans skip their zeroed payload.
     /// Both lists are bounded by worker count, so the fixed `SkipSet` capacity
     /// is never a constraint in practice; excess is dropped defensively.
-    fn addDiscardedObjectTails(self: *const ObjectHeap, set: *SkipSet) void {
+    pub fn addDiscardedObjectTails(self: *const ObjectHeap, set: *SkipSet) void {
         for (self.discarded_object_tails.items) |r| {
             if (set.len >= set.starts.len) break;
             set.starts[set.len] = r[0];
@@ -750,60 +744,6 @@ pub const ObjectHeap = struct {
             l.object = .{};
         }
     }
-
-    /// Bitset snapshot of currently filled object slots. The explorer keeps
-    /// one bit per slot and discovers rows lazily.
-    /// Build and use this only while evaluation is idle.
-    pub const ObjectSnapshot = struct {
-        allocator: std.mem.Allocator,
-        live_bits: []u64,
-        high_water: ObjectId,
-        live_count: u32,
-
-        pub fn deinit(self: *ObjectSnapshot) void {
-            self.allocator.free(self.live_bits);
-            self.* = undefined;
-        }
-
-        pub fn isLive(self: *const ObjectSnapshot, id: ObjectId) bool {
-            if (id >= self.high_water) return false;
-            return self.live_bits[id >> 6] & (@as(u64, 1) << @intCast(id & 63)) != 0;
-        }
-
-        pub fn nextLive(self: *const ObjectSnapshot, start: ObjectId) ?ObjectId {
-            if (start >= self.high_water) return null;
-            var word_index: usize = start >> 6;
-            var word = self.live_bits[word_index] & (~@as(u64, 0) << @intCast(start & 63));
-            while (true) {
-                if (word != 0) {
-                    const id: ObjectId = @intCast(word_index * 64 + @ctz(word));
-                    return if (id < self.high_water) id else null;
-                }
-                word_index += 1;
-                if (word_index >= self.live_bits.len) return null;
-                word = self.live_bits[word_index];
-            }
-        }
-
-        /// One past the greatest live id, excluding a reserved or reclaimed
-        /// tail. Tree ranges use this instead of `high_water`, which is the
-        /// backing-store reservation frontier rather than a meaningful record
-        /// boundary.
-        pub fn liveExtent(self: *const ObjectSnapshot) ObjectId {
-            var word_index = self.live_bits.len;
-            while (word_index > 0) {
-                word_index -= 1;
-                const word = self.live_bits[word_index];
-                if (word == 0) continue;
-                const top_bit: usize = @bitSizeOf(u64) - 1 - @clz(word);
-                return @min(
-                    self.high_water,
-                    @as(ObjectId, @intCast(word_index * 64 + top_bit + 1)),
-                );
-            }
-            return 0;
-        }
-    };
 
     pub fn objectSnapshot(self: *const ObjectHeap, allocator: std.mem.Allocator) !ObjectSnapshot {
         const high_water = self.objects.count();
@@ -899,70 +839,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn inspectObject(self: *const ObjectHeap, snapshot: *const ObjectSnapshot, id: ObjectId) !ObjectInfo {
-        if (!snapshot.isLive(id)) return error.InvalidObjectId;
-        return switch (self.objects.get(id).*) {
-            .list => |range| .{ .list = .{ .len = range.len } },
-            .attrs => |attrs| .{ .attrs = .{
-                .len = attrs.range.len,
-                .positions = attrs.positions.len,
-                .sibling_swept = self.siblingSweepMarked(id),
-            } },
-            .merge_attrs => |merge| .{ .merge_attrs = .{
-                .base = merge.base,
-                .overlay = merge.overlay,
-                .depth = merge.depth,
-                .flattened = blk: {
-                    const flat = merge.flattened.load(.acquire);
-                    break :blk if (flat == no_flattened_attrs) null else flat;
-                },
-            } },
-            .closure => |closure| .{ .closure = .{ .chunk = closure.chunk_id, .upvalues = closure.upvalues.len } },
-            .builtin_closure => |closure| .{ .builtin_closure = .{ .builtin = closure.builtin_id, .args = closure.args.len } },
-            .thunk => |*thunk| .{ .thunk = inspectThunk(thunk) },
-            .context_string => |string| .{ .context_string = .{ .text = string.text, .context = string.context.len } },
-            .boxed_int => |value| .{ .boxed_int = value },
-            .partial_app => |partial| .{ .partial_app = .{ .function = inspectValue(partial.func), .args = partial.args.len } },
-            .heap_string => |hs| .{ .heap_string = .{ .len = hs.text_len } },
-            .heap_string_inline => |s| .{ .heap_string = .{ .len = s.len } },
-        };
-    }
-
-    fn inspectThunk(thunk: *const Thunk) ThunkInfo {
-        const raw_state = thunk.future.state.load(.acquire);
-        const state: ThunkState = @enumFromInt(@min(raw_state, @intFromEnum(ThunkState.errored)));
-        const body: @TypeOf(@as(ThunkInfo, undefined).body) = switch (state) {
-            .resolved => .{ .result = inspectValue(thunk.payload.result) },
-            .errored => .{ .error_name = @errorName(thunk.cachedFailure().err()) },
-            .unresolved, .evaluating, .blackhole => .{ .target = switch (thunk.targetKind()) {
-                .closure => .{ .closure = inspectValue(thunk.payload.target.closure) },
-                .bytecode => .{ .bytecode = .{
-                    .chunk = thunk.payload.target.bytecode.chunk_id,
-                    .captures = thunk.payload.target.bytecode.upvalue_count,
-                } },
-                .pass_through => .{ .pass_through = inspectValue(thunk.payload.target.pass_through) },
-                .attr_access => .{ .attr_access = .{
-                    .base = inspectValue(thunk.payload.target.attr_access.base),
-                    .name = thunk.payload.target.attr_access.name,
-                } },
-                .deferred => .{ .deferred = .{
-                    .id = thunk.payload.target.deferred.deferred_id,
-                    .captures = thunk.payload.target.deferred.env_count,
-                } },
-            } },
-        };
-        return .{ .state = state, .demanded = thunk.isDemanded(), .body = body };
-    }
-
-    pub fn inspectValue(value: Value) ValueRef {
-        const kind = value.kind();
-        const target: ValueRef.Target = switch (kind) {
-            .list, .attrs, .thunk, .builtin_closure, .string_context, .boxed_int, .partial_app => .{ .object = value.asObjectId() },
-            .closure => if (value.isFunction()) .{ .chunk = value.asFunctionChunkId() } else .{ .object = value.asObjectId() },
-            .string, .path => .{ .intern = value.asInternId() },
-            .builtin => .{ .builtin = value.asBuiltinId() },
-            else => .none,
-        };
-        return .{ .kind = kind, .target = target };
+        return inspection.objectInfo(self, snapshot, id);
     }
 
     fn clearSnapshotBit(bits: []u64, id: ObjectId) void {
@@ -1010,178 +887,10 @@ pub const ObjectHeap = struct {
         return self.attr_positions.getIfAllocated(id, &next);
     }
 
-    pub const Stats = struct {
-        objects: u32,
-        values: u32,
-        attrs: u32,
-        attr_positions: u32,
-        bytes: u32,
-        variant_counts: [10]u32,
-        thunk_states: [5]u32,
-        /// Of the `resolved` thunks (thunk_states[2]), the split by
-        /// `Thunk.demanded`: `resolved_demanded` were observed by a real
-        /// (demand) caller; `resolved_undemanded` were pre-forced by
-        /// speculation / fan-out and never observed — the speculative-waste
-        /// fraction. See docs/perf/probes.md (instrument I1).
-        resolved_demanded: u32,
-        resolved_undemanded: u32,
-        /// Magnitude histogram for inline `.int` values found in the
-        /// values + attrs stores. Buckets are chosen to inform a 16→8
-        /// byte Value migration: a NaN-boxed Value can hold a 48-bit
-        /// sign-extended integer inline, so `int_overflows_i48` is the
-        /// count that would have to be heap-boxed.
-        ///
-        ///   0 = zero
-        ///   1 = |x| < 2^15  (i16 range)
-        ///   2 = |x| < 2^31  (i32 range)
-        ///   3 = |x| < 2^47  (i48 range — NaN-box inline limit)
-        ///   4 = |x| >= 2^47 (would require boxing under NaN-boxing)
-        int_buckets: [5]u32,
-
-        pub fn variantName(index: usize) []const u8 {
-            return switch (index) {
-                0 => "list",
-                1 => "attrs",
-                2 => "closure",
-                3 => "builtin closure",
-                4 => "thunk",
-                5 => "context string",
-                6 => "boxed int",
-                7 => "attrs merge",
-                8 => "partial application",
-                9 => "heap string",
-                else => "?",
-            };
-        }
-
-        pub fn thunkStateName(index: usize) []const u8 {
-            return switch (index) {
-                0 => "unresolved",
-                1 => "evaluating",
-                2 => "resolved",
-                3 => "blackhole",
-                4 => "errored",
-                else => "?",
-            };
-        }
-
-        pub fn intBucketLabel(index: usize) []const u8 {
-            return switch (index) {
-                0 => "zero",
-                1 => "i16",
-                2 => "i32",
-                3 => "i48",
-                4 => ">=2^47",
-                else => "?",
-            };
-        }
-
-        pub fn intTotal(self: Stats) u32 {
-            var t: u32 = 0;
-            for (self.int_buckets) |c| t += c;
-            return t;
-        }
-
-        pub fn intOverflowsI48(self: Stats) u32 {
-            return self.int_buckets[4];
-        }
-    };
-
     /// Aggregate runtime stats. Safe only when there are no concurrent
     /// writers — the inspector calls this once evaluation has finished.
     pub fn stats(self: *const ObjectHeap) Stats {
-        var result: Stats = .{
-            .objects = self.objects.count(),
-            .values = self.values.count(),
-            .attrs = self.attrs.count(),
-            .attr_positions = self.attr_positions.count(),
-            .bytes = self.bytes.count(),
-            .variant_counts = [_]u32{0} ** 10,
-            .thunk_states = [_]u32{0} ** 5,
-            .resolved_demanded = 0,
-            .resolved_undemanded = 0,
-            .int_buckets = [_]u32{0} ** 5,
-        };
-
-        // Per-worker TLABs reserve a chunk of slots from each global store
-        // but fill them one at a time. Slots between `cursor` and `end`
-        // are reserved but unfilled — their payload is undefined memory.
-        // Build per-store skip sets so the scans below don't read garbage.
-        var obj_skip = self.collectUnfilled(.object);
-        self.addDiscardedObjectTails(&obj_skip);
-        const val_skip = self.collectUnfilled(.value);
-        const attr_skip = self.collectUnfilled(.attr);
-
-        var id: u32 = 0;
-        const total_objs = result.objects;
-        scan_obj: while (id < total_objs) : (id += 1) {
-            if (obj_skip.skipPast(id)) |next| {
-                id = next - 1;
-                continue :scan_obj;
-            }
-            const obj = self.objects.get(id);
-            const v_index: usize = switch (obj.*) {
-                .list => 0,
-                .attrs => 1,
-                .closure => 2,
-                .builtin_closure => 3,
-                .thunk => |t| blk: {
-                    const state = t.future.state.load(.acquire);
-                    const s_index: usize = @intCast(@min(state, 4));
-                    result.thunk_states[s_index] += 1;
-                    // Split resolved thunks by whether a real caller ever
-                    // demanded the value (vs. pre-forced and unobserved).
-                    if (s_index == 2) {
-                        if (t.isDemanded()) {
-                            result.resolved_demanded += 1;
-                        } else {
-                            result.resolved_undemanded += 1;
-                        }
-                    }
-                    break :blk 4;
-                },
-                .context_string => 5,
-                .boxed_int => 6,
-                .merge_attrs => 7,
-                .partial_app => 8,
-                .heap_string, .heap_string_inline => 9,
-            };
-            result.variant_counts[v_index] += 1;
-        }
-
-        // Walk the values + attrs stores for inline `.int` magnitudes.
-        // Lists, closure upvalues, and thunk-args all live in `values`;
-        // attrset values live in `attrs`. These two cover every place an
-        // int Value can be heap-resident — the VM stack contains transient
-        // ints during execution but is empty by the time stats() runs.
-        // Skip unallocated segments in sparse stores.
-        var vid: u32 = 0;
-        scan_val: while (vid < result.values) : (vid += 1) {
-            if (val_skip.skipPast(vid)) |next| {
-                vid = next - 1;
-                continue :scan_val;
-            }
-            var next_vid: u32 = undefined;
-            const v = self.values.getIfAllocated(vid, &next_vid) orelse {
-                vid = next_vid - 1;
-                continue :scan_val;
-            };
-            bucketInt(&result.int_buckets, v.*);
-        }
-        var aid: u32 = 0;
-        scan_attr: while (aid < result.attrs) : (aid += 1) {
-            if (attr_skip.skipPast(aid)) |next| {
-                aid = next - 1;
-                continue :scan_attr;
-            }
-            var next_aid: u32 = undefined;
-            const a = self.attrs.getIfAllocated(aid, &next_aid) orelse {
-                aid = next_aid - 1;
-                continue :scan_attr;
-            };
-            bucketInt(&result.int_buckets, a.value);
-        }
-        return result;
+        return inspection.stats(self);
     }
 
     // ---- `-Dprof-main` demand-prediction censuses ----
@@ -1196,164 +905,11 @@ pub const ObjectHeap = struct {
     // Print-only; compiled out unless `-Dprof-main`.
 
     pub fn profCreationCensus(self: *const ObjectHeap) void {
-        if (comptime !prof_census_enabled) return;
-        const Cell = struct {
-            n: u64 = 0,
-            dem_old: u64 = 0,
-            dem_young: u64 = 0,
-            never_resolved_spec: u64 = 0, // resolved but never demanded
-            never_unresolved: u64 = 0,
-            errored: u64 = 0,
-        };
-        var cells: [2]Cell = @splat(.{}); // [0]=demand-created, [1]=spec-created
-        var obj_skip = self.collectUnfilled(.object);
-        self.addDiscardedObjectTails(&obj_skip);
-        var id: u32 = 0;
-        const total = self.objects.count();
-        scan: while (id < total) : (id += 1) {
-            if (obj_skip.skipPast(id)) |next| {
-                id = next - 1;
-                continue :scan;
-            }
-            switch (self.objects.get(id).*) {
-                .thunk => |t| {
-                    const cell = &cells[if (t.created_demand) 0 else 1];
-                    cell.n += 1;
-                    const state = t.future.state.load(.acquire);
-                    if (t.isDemanded()) {
-                        if (t.demanded_old) cell.dem_old += 1 else cell.dem_young += 1;
-                    } else switch (state) {
-                        2 => cell.never_resolved_spec += 1, // resolved
-                        3, 4 => cell.errored += 1, // blackhole / errored
-                        else => cell.never_unresolved += 1,
-                    }
-                },
-                else => {},
-            }
-        }
-        for (cells, 0..) |c, i| {
-            if (c.n == 0) continue;
-            std.debug.print(
-                "prof creation-census [{s}]: n={d} demanded_old={d} ({d:.1}%) demanded_young={d} ({d:.1}%) never:spec_resolved={d} ({d:.1}%) never:unresolved={d} ({d:.1}%) errored={d}\n",
-                .{
-                    if (i == 0) "demand-created" else "spec-created",
-                    c.n,
-                    c.dem_old,
-                    profPct(c.dem_old, c.n),
-                    c.dem_young,
-                    profPct(c.dem_young, c.n),
-                    c.never_resolved_spec,
-                    profPct(c.never_resolved_spec, c.n),
-                    c.never_unresolved,
-                    profPct(c.never_unresolved, c.n),
-                    c.errored,
-                },
-            );
-        }
+        inspection.creationCensus(self);
     }
 
     pub fn profSiblingCensus(self: *const ObjectHeap) void {
-        if (comptime !prof_census_enabled) return;
-        // Size buckets: [4,8) [8,16) [16,32) [32,64) [64,256) [256,inf)
-        const bucket_lo = [_]usize{ 4, 8, 16, 32, 64, 256 };
-        const Bucket = struct {
-            sets: u64 = 0,
-            touched: u64 = 0,
-            all_demanded_sets: u64 = 0,
-            // Members of TOUCHED sets only (thunk-valued members):
-            members: u64 = 0,
-            dem_old: u64 = 0,
-            dem_young: u64 = 0,
-            spec_resolved: u64 = 0, // resolved, never demanded
-            unresolved: u64 = 0,
-        };
-        var buckets: [bucket_lo.len]Bucket = @splat(.{});
-        var merge_attrs_n: u64 = 0;
-        var obj_skip = self.collectUnfilled(.object);
-        self.addDiscardedObjectTails(&obj_skip);
-        var id: u32 = 0;
-        const total = self.objects.count();
-        scan: while (id < total) : (id += 1) {
-            if (obj_skip.skipPast(id)) |next| {
-                id = next - 1;
-                continue :scan;
-            }
-            const entries: []const AttrEntry = switch (self.objects.get(id).*) {
-                .attrs => |a| self.attrs.slice(a.range),
-                .merge_attrs => {
-                    merge_attrs_n += 1;
-                    continue :scan;
-                },
-                else => continue :scan,
-            };
-            if (entries.len < bucket_lo[0]) continue :scan;
-            var bi: usize = bucket_lo.len - 1;
-            while (entries.len < bucket_lo[bi]) bi -= 1;
-            const b = &buckets[bi];
-            b.sets += 1;
-            var members: u64 = 0;
-            var dem_old: u64 = 0;
-            var dem_young: u64 = 0;
-            var spec_resolved: u64 = 0;
-            var unresolved: u64 = 0;
-            for (entries) |entry| {
-                if (!entry.value.isThunk()) continue;
-                switch (self.objects.get(entry.value.asObjectId()).*) {
-                    .thunk => |t| {
-                        members += 1;
-                        if (t.isDemanded()) {
-                            if (t.demanded_old) dem_old += 1 else dem_young += 1;
-                        } else if (t.future.state.load(.acquire) == 2) {
-                            spec_resolved += 1;
-                        } else {
-                            unresolved += 1;
-                        }
-                    },
-                    else => {},
-                }
-            }
-            if (dem_old + dem_young == 0) continue :scan; // untouched set
-            b.touched += 1;
-            if (dem_old + dem_young == members) b.all_demanded_sets += 1;
-            b.members += members;
-            b.dem_old += dem_old;
-            b.dem_young += dem_young;
-            b.spec_resolved += spec_resolved;
-            b.unresolved += unresolved;
-        }
-        std.debug.print("prof sibling-census (attrsets by entry count; member stats over TOUCHED sets = >=1 demanded member; merge_attrs skipped n={d}):\n", .{merge_attrs_n});
-        var tot: Bucket = .{};
-        for (buckets, 0..) |b, i| {
-            tot.sets += b.sets;
-            tot.touched += b.touched;
-            tot.all_demanded_sets += b.all_demanded_sets;
-            tot.members += b.members;
-            tot.dem_old += b.dem_old;
-            tot.dem_young += b.dem_young;
-            tot.spec_resolved += b.spec_resolved;
-            tot.unresolved += b.unresolved;
-            if (b.sets == 0) continue;
-            std.debug.print(
-                "  size>={d:<3}: sets={d} touched={d} all_dem={d} members={d} dem_old={d} ({d:.1}%) dem_young={d} ({d:.1}%) spec_res={d} ({d:.1}%) unres={d} ({d:.1}%)\n",
-                .{
-                    bucket_lo[i],                        b.sets,                        b.touched,                        b.all_demanded_sets,             b.members,
-                    b.dem_old,                           profPct(b.dem_old, b.members), b.dem_young,                      profPct(b.dem_young, b.members), b.spec_resolved,
-                    profPct(b.spec_resolved, b.members), b.unresolved,                  profPct(b.unresolved, b.members),
-                },
-            );
-        }
-        std.debug.print(
-            "  TOTAL     : sets={d} touched={d} all_dem={d} members={d} dem_old={d} ({d:.1}%) dem_young={d} ({d:.1}%) spec_res={d} ({d:.1}%) unres={d} ({d:.1}%)\n",
-            .{
-                tot.sets,          tot.touched,                             tot.all_demanded_sets, tot.members,
-                tot.dem_old,       profPct(tot.dem_old, tot.members),       tot.dem_young,         profPct(tot.dem_young, tot.members),
-                tot.spec_resolved, profPct(tot.spec_resolved, tot.members), tot.unresolved,        profPct(tot.unresolved, tot.members),
-            },
-        );
-    }
-
-    fn profPct(x: u64, total: u64) f64 {
-        return if (total == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(total));
+        inspection.siblingCensus(self);
     }
 
     pub const Store = enum { object, value, attr };
@@ -1366,7 +922,7 @@ pub const ObjectHeap = struct {
         /// filled id past it; otherwise null. Callers use the returned id
         /// to skip the loop forward (subtract 1 to compensate for the
         /// loop's increment).
-        fn skipPast(self: SkipSet, id: u32) ?u32 {
+        pub fn skipPast(self: SkipSet, id: u32) ?u32 {
             for (self.starts[0..self.len], self.ends[0..self.len]) |s, e| {
                 if (id >= s and id < e) return e;
             }
@@ -3331,31 +2887,6 @@ pub const ObjectHeap = struct {
         };
     }
 };
-
-fn bucketInt(buckets: *[5]u32, value: Value) void {
-    // Boxed ints are by definition outside i48 inline range; count them
-    // in bucket 4 without a heap lookup. Inline ints get magnitude-binned.
-    if (value.isBoxedInt()) {
-        buckets[4] += 1;
-        return;
-    }
-    if (!value.isInt()) return;
-    const x = value.asInt();
-    if (x == 0) {
-        buckets[0] += 1;
-        return;
-    }
-    const mag: u64 = @abs(x);
-    const idx: usize = if (mag < (@as(u64, 1) << 15))
-        1
-    else if (mag < (@as(u64, 1) << 31))
-        2
-    else if (mag < (@as(u64, 1) << 47))
-        3
-    else
-        4;
-    buckets[idx] += 1;
-}
 
 fn binarySearchAttr(entries: []const AttrEntry, name: InternId) ?Value {
     const idx = binarySearchAttrIndex(entries, name) orelse return null;

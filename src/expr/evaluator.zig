@@ -1586,7 +1586,7 @@ pub const Engine = struct {
     }
 
     pub fn valueRef(_: *const Engine, value: Value) runtime.heap.ValueRef {
-        return ObjectHeap.inspectValue(value);
+        return runtime.heap.inspection.valueRef(value);
     }
 
     /// Enumerate an attrs / list object's members (non-forcing) for the VM
