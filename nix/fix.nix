@@ -8,6 +8,7 @@
   curl,
   libgit2,
   mercurial,
+  openssh,
   gnutar,
   installShellFiles,
   makeWrapper,
@@ -48,11 +49,12 @@ in
         --zsh <($out/bin/fix completions zsh)
     '';
 
-    # Mercurial and archive extraction remain subprocess adapters. Git source
-    # transport and local-worktree plumbing are both provided by libgit2.
+    # Mercurial, archive extraction, and ssh-ng daemon transport remain
+    # subprocess adapters. Git source transport and local-worktree plumbing
+    # are both provided by libgit2.
     postFixup = ''
       wrapProgram $out/bin/fix \
-        --prefix PATH : ${lib.makeBinPath [mercurial gnutar]}
+        --prefix PATH : ${lib.makeBinPath [mercurial openssh gnutar]}
     '';
 
     zigBuildFlags = (lib.optional (release != null) "--release=${release}") ++ (lib.optional (cpu != null) "-Dcpu=${cpu}");
