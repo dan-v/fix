@@ -540,7 +540,7 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
         .closure => |c| if (c.upvalues.len > 0) ranges.add(si_values, .{ .segment = c.upvalues.segment, .offset = c.upvalues.offset, .len = c.upvalues.len }),
         .attrs => |a| {
             if (a.range.len > 0) ranges.add(si_attrs, .{ .segment = a.range.segment, .offset = a.range.offset, .len = a.range.len });
-            // Chunk-ref positions are immortal chunk data — nothing to free.
+            // Borrowed positions are owned above the runtime — nothing to free.
             if (a.positions.heapLen() > 0) {
                 const pr = a.positions.heapRange();
                 ranges.add(si_attr_pos, .{ .segment = pr.segment, .offset = pr.offset, .len = pr.len });

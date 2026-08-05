@@ -158,20 +158,10 @@ test "object reference inspection follows objects and chunks without recursion" 
         .name = 40,
         .pos = .{ .file = 1, .line = 2, .column = 3 },
     }};
-    const Resolver = struct {
-        fn resolve(ctx: *anyopaque, _: u32) []const heap_mod.AttrPosEntry {
-            const table: *const [1]heap_mod.AttrPosEntry = @ptrCast(@alignCast(ctx));
-            return table;
-        }
-    };
-    heap.setChunkAttrPosResolver(.{
-        .ctx = @ptrCast(@constCast(&position_table)),
-        .resolve = Resolver.resolve,
-    });
     const positioned_id = try heap.addAttrsFromValuesSorted(
         &.{40},
         &.{Value.list(child_id)},
-        heap_mod.AttrPositions.fromChunk(0x44, 0, 1),
+        .borrowed(&position_table),
     );
 
     snapshot.deinit();
@@ -180,7 +170,6 @@ test "object reference inspection follows objects and chunks without recursion" 
     try @import("edges.zig").collectReferences(&heap, &snapshot, positioned_id, std.testing.allocator, &refs);
     try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
         .{ .object = child_id },
-        .{ .chunk = 0x44 },
     }, refs.items);
 }
 

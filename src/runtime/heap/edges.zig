@@ -144,9 +144,7 @@ const ReferenceSink = struct {
         for (heap.attrs.slice(range)) |entry| try self.value(heap, entry.value);
     }
 
-    pub fn attrPositions(self: *ReferenceSink, positions: heap_mod.AttrPositions) Error!void {
-        if (positions.chunkId()) |id| try self.chunk(id);
-    }
+    pub inline fn attrPositions(_: *ReferenceSink, _: heap_mod.AttrPositions) Error!void {}
 
     pub fn capturedValues(self: *ReferenceSink, heap: *const ObjectHeap, values: []const Value, _: bool) Error!void {
         for (values) |child| try self.value(heap, child);
