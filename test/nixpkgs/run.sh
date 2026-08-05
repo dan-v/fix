@@ -12,8 +12,8 @@
 # 2500-name chunk at --gc-budget 1024 peaks under 10 GB).
 #
 # Oracle results are cached under $FIX_NIXPKGS_EVAL_CACHE (default
-# ~/.cache/fix-nixpkgs-eval) keyed on the pinned nixpkgs store path, so pin
-# bumps invalidate them automatically.
+# ~/.cache/fix-nixpkgs-eval) keyed on the pinned nixpkgs store path and the
+# hermetic-evaluation schema, so either kind of change invalidates them.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -39,6 +39,12 @@ if [[ -n "$subtree" && -n "$chunk" ]]; then
   exit 2
 fi
 [[ -x "$fix" ]] || { echo "fix binary not found at $fix (build with \`zig build\`)" >&2; exit 2; }
+
+# nixpkgs' drbd expression includes builtins.getEnv "SHELL" in its derivation.
+# Pin the ambient input so an oracle made from one login shell remains valid
+# when the comparison is later run from another.
+export SHELL=/bin/sh
+oracle_schema="env-v1"
 
 # Materialize the npins nixpkgs pin (same expression as test/lang's resolvePin).
 nixpkgs="$(nix-build --no-out-link --expr "
@@ -80,7 +86,7 @@ elif [[ -n "$chunk" ]]; then
   key="chunk-$i-of-$n"
 fi
 
-oracle="$cache_dir/$pin-$key.json"
+oracle="$cache_dir/$pin-$oracle_schema-$key.json"
 if [[ ! -s "$oracle" ]]; then
   echo ">> oracle eval (nix-instantiate, cached to $oracle)" >&2
   nix-instantiate --eval --strict --json --readonly-mode \
