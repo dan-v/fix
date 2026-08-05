@@ -8,7 +8,6 @@
     nix = null;
     detsys = null;
     lix = null;
-    snix = null;
   };
   demos = {
     explorer = vhsDemo {tape = ./demo/explorer.tape;};

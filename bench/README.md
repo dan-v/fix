@@ -33,6 +33,10 @@ the harness without creating a `result` link. Useful environment variables are:
   drops reclaimable caches and compacts normal memory before every measured
   run. The harness obtains credentials once with `sudo -v`; explicit hugetlb
   pages remain in the configured pool and are reused after each evaluator exits.
+- `HUGETLB_MIN_AVAILABLE` sets the minimum number of unreserved free 2 MiB
+  hugetlb pages required before each run when a pool is configured. It defaults
+  to 1024 (2 GiB); set it to 0 to disable the capacity check. Other programs may
+  use the pool as long as this much capacity remains available.
 - With no `TOOLS` selector, the harness runs 1-core and automatic profiles for
   Fix and Determinate, plus the available Nix and Lix rows.
   `TOOLS=nix,lix,fix-1core` selects exact evaluator rows. `fix` and `detsys`
