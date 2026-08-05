@@ -5,11 +5,12 @@ const value = @import("runtime").value;
 const ValueType = value.ValueType;
 
 test "end-to-end: eager let-elision preserves error order under tryEval (§G)" {
-    // Must-force eager elision must not hoist a binding's evaluation ahead of
-    // the body's first demand — doing so reorders which error surfaces, which
-    // is observable under `builtins.tryEval` (caught `throw` vs uncaught
-    // `div 1 0`). Only the first-demanded binding may be elided. Verified
-    // against the Lix oracle. See strictness.firstForcedName / compileLetIn.
+    // Strict-prefix eager elision must not hoist a binding's evaluation
+    // ahead of the body's first demand — doing so reorders which error
+    // surfaces, which is observable under `builtins.tryEval` (caught `throw`
+    // vs uncaught `div 1 0`). Only bindings on the proven demand prefix may
+    // be elided, in demand order. Verified against the Lix oracle. See
+    // demand_prefix.analyze / compileLetIn.
     const alloc = std.testing.allocator;
     var ev = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev.deinit();

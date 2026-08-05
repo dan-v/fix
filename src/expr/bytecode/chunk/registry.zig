@@ -104,6 +104,12 @@ pub const ChunkRegistry = struct {
     /// and the hot `Chunk` layout is untouched. The REPL enables these while
     /// retaining parallel import compilation, so map access is synchronized.
     capture_names: bool = false,
+    /// An interactive debugger is installed: the compiler keeps every source
+    /// binding materialized in its written shape (`let_float` rewrites stand
+    /// down) so breakpoint scopes resolve locals by name. Sticky for the
+    /// engine's lifetime; disasm/name capture deliberately does NOT set this
+    /// — it must show production codegen.
+    preserve_bindings: bool = false,
     sidecar_mu: sync.BlockingMutex = .{},
     /// The source file each chunk was compiled from (interned path id), so even
     /// chunks with no per-op source map get a file. Populated under name capture.

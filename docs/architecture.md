@@ -28,8 +28,10 @@ demand; the scheduler may also submit eligible thunks speculatively.
 - **[compiler](compiler/pipeline.md)** — recursively lowers the AST to
   **bytecode chunks**, with separate name, reference, and
   [strictness](compiler/strictness.md) analyses where needed. It resolves names
-  to stack slots and [upvalue captures](compiler/scopes.md), and decides what to
-  make lazy, eager, or [deferred](compiler/lazy-compile.md).
+  to stack slots and [upvalue captures](compiler/scopes.md), decides what to
+  make lazy, eager, or [deferred](compiler/lazy-compile.md), and — per `let` —
+  runs a scoped rewrite that [places bindings](compiler/let-float.md) at their
+  demand point before classifying what's left.
 - **[runtime](runtime/values.md)** — the data model: an 8-byte NaN-boxed [`Value`](runtime/values.md), a flat [object heap](runtime/heap.md), string [interning](runtime/interning.md), and the [thunk](runtime/thunks.md) that carries laziness.
 - **[vm](vm/dispatch.md)** — a direct-threaded bytecode interpreter that [forces thunks](runtime/thunks.md), [calls closures](vm/calls.md), [reads attrsets/lists](vm/access.md), and runs the [builtins](vm/builtins.md).
 - **[store / derivation](derivation/model.md)** — the domain model: `Drv`, canonical hashing and paths, string context, and the evaluation-scoped registry of computed derivations. The `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths.
@@ -90,9 +92,14 @@ the old value. A failed update therefore leaves the previous configuration
 intact.
 
 Long-lived mutable owners are kept few and explicit (`Engine`, `FetchService`,
-`ObjectHeap`, `Scheduler`). Their inputs and intermediate decisions are values:
-`EngineConfig`/`FetchConfig`, parsed source units, `LetPlan`, derivation
-artifacts, and validated REPL command invocations. Orchestrators sequence those
+`ObjectHeap`, `Scheduler`). `ObjectHeap` alone owns its segmented stores and
+immutable failure store; evaluator and CLI code use counts, snapshots, and
+semantic failure operations. Read-only heap projection types, object summaries,
+post-evaluation censuses, and probe reporting live in `runtime/heap/inspection.zig`,
+separate from allocation and collection. Their inputs and intermediate decisions are values:
+`EngineConfig`/`FetchConfig`, parsed source units, `LetPlan` (and the
+[let-float](compiler/let-float.md) immutable `Graph` plus rewrite `Plan` it consumes),
+derivation artifacts, and validated REPL command invocations. Orchestrators sequence those
 values through named phases; mechanisms such as heap range reuse, inspection
 projections, scheduler queues, and CLI option application live in focused
 subdirectories. This preserves mutation where identity or concurrency requires

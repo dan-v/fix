@@ -5,6 +5,7 @@
 const std = @import("std");
 const scheduler_mod = @import("workers/scheduler.zig");
 const vm_strings = @import("../vm/strings.zig");
+const let_float = @import("../compiler/let_float.zig");
 
 const EnvMap = std.process.Environ.Map;
 
@@ -89,5 +90,12 @@ pub fn resolve(
     // scheduler knobs.
     if (envInt(usize, env, "FIX_HEAP_STR_MIN")) |value|
         vm_strings.heap_string_min = value;
+
+    // Compile-time let-binding placement (`compiler/let_float.zig`) — a
+    // kill switch for A/B measurement and debugging, same one-shot contract
+    // as the scheduler knobs. FIX_LET_FLOAT_STATS prints the rewrite census
+    // to stderr at engine teardown.
+    let_float.enabled = !envEnabled(env, "FIX_NO_LET_FLOAT", false);
+    let_float.report_on_deinit = envEnabled(env, "FIX_LET_FLOAT_STATS", false);
     return config;
 }

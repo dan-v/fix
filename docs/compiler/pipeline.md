@@ -7,9 +7,13 @@ buffered into a registered Chunk.*
 
 The main lowering pass is a **recursive tree-walk that emits
 [bytecode](../vm/dispatch.md) as it descends**. There is no separate IR or
-optimization pass over a completed program, but lowering invokes additional
-AST walks for jobs such as free-variable collection and strictness analysis.
-`Compiler.compileNode()` dispatches on the [AST `Node.tag`](../syntax/parsing.md)
+whole-program optimization pass, but lowering invokes additional AST walks for
+jobs such as free-variable collection and strictness analysis — and, scoped to
+each compiled `let`, an AST→AST rewrite ([let-float](let-float.md)) that runs
+before that `let`'s bindings are classified and lowered. The rewrite reasons
+about one cluster of sibling bindings at a time and feeds the result back into
+the same recursive lowering; it is not a general IR or a pass over a completed
+program. `Compiler.compileNode()` dispatches on the [AST `Node.tag`](../syntax/parsing.md)
 and hands each node to the module that owns its shape. Emission is
 stack-oriented: every node lowers to a sequence that leaves one value on the VM
 operand stack.
@@ -26,7 +30,7 @@ A `Compiler` instance compiles **one chunk** (one function body / thunk body / f
 | bool / null | (inline) | a single `push_true`/`push_false`/`push_null` op |
 | binary / unary | `fold` | operators; compile-time constant folding |
 | apply / lambda / lambda_attrs | `lambda` | calls, value-lambda uncurrying, attrset-pattern lambdas, `call_n`/`call_tail_n` spine flattening |
-| let | `let` | `let` binding classification, cell elision, eager elision |
+| let | `let` | demand-driven binding placement ([let-float](let-float.md)), binding classification, cell elision, [strict-prefix](strictness.md) eager elision |
 | if / assert / with | `control` | branch/join, assertion guard, dynamic-scope push |
 | attrset (static/dynamic/rec/inherit) | `attrs` | attr construction, merge, `inherit`, deferred-set gating |
 | attr access / `?` has-attr / list | `access` | static/dynamic/mixed attr paths, `or`-defaults, list building |
@@ -77,6 +81,53 @@ ChunkBuilder (mutable, arena)                 Chunk (persistent; normally read-o
 - **Constant folding** (`fold.zig`) — arithmetic, comparison, and unary (`!`, negation) operators over fully-literal operands are evaluated at compile time, emitting a single `push_const` instead of the op sequence; nested `&&`/`||`/`->` fold too when both sides are literal, but a top-level `&&`/`||`/`->` compiles to short-circuit branch code. Division and any i64-overflowing arithmetic are never folded: `{ x = 1/0; }` is valid Nix and must throw only when `.x` is forced, so folding stays conservative.
 - **`call_n` flattening** (`lambda.zig`) — a curried application spine `f a b c` normally lowers to nested `call`s (one frame per argument). For `K ≥ 2` the spine is flattened to a single `call_n K`: the callee is compiled, then K args pushed, then `call_n K`. When the callee is an **arity-matched uncurried (merged) lambda** the body runs in **one frame** with no intermediate closure/PAP allocation; a non-matching callee folds one arg at a time (same result). Each spine argument compiles as an immediate container value or a plain lazy thunk (not the runtime-adaptive `thunk_arg`, whose callee probe is only valid for the first arg); the saturated `call_n` path then eagerly forces the argument positions the callee's `strict_params` mark must-force. `K == 1` keeps the single-arg path (eager-strict-arg + tail-call frame reuse).
 
+## Binding placement: the let-float rewrite
+
+Before a `let` node's bindings are classified and lowered, `let_float.zig`
+runs a semantics-preserving AST→AST rewrite scoped to that one `let` (full
+design: [let-float.md](let-float.md)). The analysis it reasons from comes
+from a per-compile-unit **cluster registry** (`UnitAnalysis`, owned by the
+root `Compiler`): one walk over a `let`'s outermost enclosing subtree
+registers a `Cluster` for every nested `let` inside it, so nesting doesn't
+multiply analysis walks; an enclosing rewrite that changes a nested let's
+contents rebuilds that node and the (now-stale) cluster is simply re-walked
+on next use. The transform itself applies, in order: **nested-let spine
+merging** (folding `let a = …; in let b = …; in body` into one cluster,
+during the same walk, when no capture changes), a **dead-binding cascade**,
+**duplicable inlining** (a literal RHS or an alias `x = y` replaces every
+rewritable use), **single-use sinking** (a binding whose one live use sits
+in an at-most-once region moves to that use site), and **branch-local
+floating** (a binding used exclusively under one `if`-branch is wrapped in a
+synthetic `let` around that branch; uses split cleanly across both branches
+instead clone the wrap into each, size-gated to keep code growth bounded).
+Each transform is blocked where it would change what a moved expression
+captures (a shadowing binder between the original position and the target),
+what it may observably do (a `with`-resolved / dynamically-resolved name may
+still move, but only to a destination whose window crosses no `with` body —
+see [let-float.md](let-float.md#capture-safety)), or what it shares (a
+recursive dependency SCC stays atomic; a lambda-valued binding never sinks,
+preserving the qualified chunk name error traces attribute frames by,
+though it may still branch-float since the wrap is a real named binding).
+Rewrite nodes are allocated in the compiling unit's AST arena; the retained
+parser AST is never mutated, and subtrees the rewrite leaves alone are
+shared, not copied.
+
+The residual `let` — what remains after the rewrite, possibly no `let` at all
+if every binding floated or inlined away — is what `let.zig` classifies and
+emits, over three passes: pass 1 declares slots and literal direct-binds;
+pass 2 creates lazy thunks for every remaining binding in source order,
+skipping members of the strict prefix; pass 3 evaluates strict-prefix members
+directly into their slots, in demand order (see [strictness.md](strictness.md)).
+
+Kill switch `FIX_NO_LET_FLOAT=1` disables the rewrite wholesale, for A/B
+measurement; `FIX_LET_FLOAT_STATS=1` prints a per-counter census (lets
+analyzed, bindings seen, dead/inlined/sunk/floated counts, and why a
+candidate was blocked) at engine teardown. An installed debugger stands the
+pass down entirely (`ChunkRegistry.preserve_bindings`, set by
+`Engine.setDebugUi`), so breakpoint scopes resolve locals exactly as written;
+`disasm` and name-capture do **not** stand down — they must show production
+codegen.
+
 ## Super-op fusion (in `emit`)
 
 Fusion rewrites the *last emitted op in place* when the next emission completes a known pattern — no peephole pass. It is byte-for-byte behavior-preserving; the fused op is a single [dispatch](../vm/dispatch.md) instead of two.
@@ -124,7 +175,11 @@ Lambda bodies (`compileLambda` / `compileLambdaAttrs`) enter `compileTailExpress
 - **Registered chunks are immutable.** ChunkIds and canonical bytes never
   change after registration. Debugger traps live in `BreakpointTable`
   execution overlays, preserving structural-dedup identity.
+- **Let-float rewrites never change sharing or evaluation order.** A
+  binding's evaluation stays at its original first-demand point; only thunk
+  *creation* moves, which is unobservable. The retained parser AST is never
+  mutated — rewrite nodes live in the compiling unit's AST arena.
 
-Out of scope: how opcodes execute → [vm/dispatch.md](../vm/dispatch.md); name resolution → [scopes.md](scopes.md); strictness masks → [strictness.md](strictness.md); deferral/trivial short-circuits → [lazy-compile.md](lazy-compile.md).
+Out of scope: how opcodes execute → [vm/dispatch.md](../vm/dispatch.md); name resolution → [scopes.md](scopes.md); strictness masks → [strictness.md](strictness.md); the let-float rewrite in full → [let-float.md](let-float.md); deferral/trivial short-circuits → [lazy-compile.md](lazy-compile.md).
 
 Code: `src/expr/compiler/`

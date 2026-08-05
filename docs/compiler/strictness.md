@@ -59,7 +59,29 @@ ChunkStrictness {
 
 Bit `i` corresponds to the chunk-relative [upvalue index](scopes.md) `i`. **Chunks with more than 64 upvalue slots degrade coverage** — slots ≥ 64 are dropped from the masks (still safe: a missed bit only loses information, never forces anything wrongly). These masks are stamped onto `SchedulingHints.strictness` and read by the [disassembler](../vm/dispatch.md) and by the chunk-registry statistics — they are informational, not consulted on the force path.
 
-**2. Eager `let`-binding elision (`analyzeLetBindings` + `firstForcedName`).** A binding the body **must-forces**, that is non-recursive and forward-reference-free, is compiled straight into its slot with **no thunk at all**. Restricted to the single binding the body demands *first* (`firstForcedName`) so eager order equals lazy order and no error is reordered.
+**2. Eager `let`-binding elision (`analyzeLetBindings` + `demand_prefix.analyze`).** A binding the body **must-forces**, that is non-recursive and forward-reference-free, is compiled straight into its slot with **no thunk at all.** The distinct `demand_prefix.zig` subsystem computes the full **ordered strict prefix**: the maximal sequence of eligible bindings (single plain leaf, non-`inherit`, cell-free, an eager-eval — non-structural — RHS shape) provably forced, in order, before any other observable effect, extended *transitively* through binding RHSes (`b = f a` credits `a` before `b` when `a` is `b`'s own first demand). The walk tracks per-subexpression **completeness**: a subexpression is complete when reducing it to WHNF does nothing but prefix forces plus effect-free work (identifier reads, literal/closure construction); demand may continue past a complete subexpression, but an operator that can throw, a call, a lookup, a branch, `with`, a nested `let`, or any unmodeled construct ends the prefix there.
+
+The walk is also **callee-aware**: when a prefix binding's RHS is a
+statically-known value-lambda chain (`demand_prefix.Binding.lambda`, built from
+`lambdaShape` — pattern lambdas excluded, since formal validation can throw
+before any parameter is forced) and the body applies it fully saturated,
+the walk descends *into the lambda's body* instead of stopping at the call
+as a barrier, with the callee's parameters bound to the call's argument
+expressions (`PrefixFrame`). A sibling lambda's body is visible only through
+its own call-site frame; an inline lambda literal's body extends the
+current frame-visibility window. This lets an argument the callee's body
+must-forces join the prefix transitively through the call — e.g. `let f =
+x: x + 1; y = compute; in f y` eagerizes `y` through `f`'s body demand on
+`x` — not just through a direct sibling reference. Descent is depth-capped
+at 4 (`max_call_depth`). Effect order still follows body demand order (a
+parameter the body never forces stays lazy), so the existing "may reorder
+which error surfaces, never change a successful result" contract is
+unchanged — see [let-float.md](let-float.md#the-strict-prefix-and-its-validation)
+for a worked example.
+
+The prefix is bounded (32 members) and truncation anywhere is sound — each element is justified only by the elements before it.
+
+`let.zig` then **validates** the prefix against sibling reference edges: a prefix member may only be referenced from a *later* prefix member (whose pass-3 evaluation reads the member's already-filled slot). A reference from a lazy sibling, or from an earlier prefix member, demotes the referenced member back to an ordinary lazy thunk — demotions cascade, since a demoted member is itself then a lazy referencer. This validation closes a real bug the old single-binding first-demand gate had: without it, `let l = r + 1; p = l + 2; r = 5 + 5; in p` could eagerly evaluate `l` straight into its slot before `r`'s slot was filled, transitively forcing an unset cell and false-blackholing with `RecursiveThunk`. The emitter then evaluates the validated prefix (pass 3) directly into slots, in order, only after every sibling's lazy thunk already exists (pass 2) — so forward references resolve and eager order equals lazy order exactly, including which error surfaces first.
 
 **3. Per-parameter strictness (`bodyMustForceName` / `forwardingUpvalue`).** A single-parameter lambda whose body must-forces its parameter (`bodyMustForceName`) sets `SchedulingHints.strict_param` — a caller holding the closure passes its argument eagerly. Only when that fails, a structural check (`forwardingUpvalue`) matches the forwarder shape `x: f x` and records `f`'s upvalue index in `strict_via_upvalue`, so the lambda forces its parameter iff `f` does. An uncurried (arity > 1) lambda instead records a per-parameter `strict_params` bitmask (bit *i* = param *i* must-forced), which the saturated [`call_n`](pipeline.md) path (`vm/closures.zig forceStrictArgs`) forces eagerly in place. A directly-applied strict lambda `(x: body) arg` (`directlyAppliedStrictLambda`, also `bodyMustForceName`) likewise lets the caller pass `arg` eagerly instead of thunking it. `strict_param` and `strict_via_upvalue` are gated to `local_count == 1` at `ChunkBuilder.finish`.
 
@@ -76,6 +98,7 @@ capture-free body, since its mask would be all-zero.
   it must not turn a successful lazy evaluation into a failure or change its
   value.
 
-Out of scope: scheduler speculation and fan-out → [parallel/speculation.md](../parallel/speculation.md); thunk representation → [runtime/thunks.md](../runtime/thunks.md); the stamp site in the pipeline → [pipeline.md](pipeline.md).
+Out of scope: scheduler speculation and fan-out → [parallel/speculation.md](../parallel/speculation.md); thunk representation → [runtime/thunks.md](../runtime/thunks.md); the stamp site in the pipeline → [pipeline.md](pipeline.md); the binding-placement rewrite that runs before this analysis sees the residual `let` → [let-float.md](let-float.md).
 
-Code: `src/expr/compiler/strictness.zig`
+Code: `src/expr/compiler/strictness.zig`,
+`src/expr/compiler/demand_prefix.zig`
