@@ -22,6 +22,7 @@ const DebugSession = engine.DebugSession;
 const ChunkId = runtime.types.ChunkId;
 const bytecode = engine.bytecode;
 const disasm = engine.bytecode.disasm;
+const view_state = @import("view_state.zig");
 
 const Category = vm_model.Category;
 const HeapView = vm_model.HeapView;
@@ -39,6 +40,8 @@ const TreeState = vm_model.TreeState;
 const HeapIndexState = vm_model.HeapIndexState;
 const ReferenceIndexState = vm_model.ReferenceIndexState;
 const Viewport = vm_model.Viewport;
+const Layout = view_state.Layout;
+const preview_line_cap = 200;
 
 const disasm_options: disasm.Options = .{
     .show_constants = true,
@@ -49,18 +52,6 @@ const disasm_options: disasm.Options = .{
 
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.pages.RenderedValue;
-        const Layout = Explorer.Ops.view_state.Layout;
-        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
-        const OpenMode = Explorer.Ops.controller.OpenMode;
-        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
-        const TreeCell = Explorer.Ops.tree_render.TreeCell;
-        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
-        const range_leaf = Explorer.range_leaf;
-        const range_branch = Explorer.range_branch;
-        const preview_line_cap = Explorer.preview_line_cap;
-
         // -- drawing -----------------------------------------------------------------
 
         pub fn drawSession(
@@ -133,7 +124,7 @@ pub fn Methods(comptime Explorer: type) type {
             try frame.bar(1, header, cols, .header);
 
             if (explorer_rows > 0) {
-                try Explorer.Ops.preview.drawExplorerBody(self, arena, &frame, 2, explorer_rows, cols);
+                try drawExplorerBody(self, arena, &frame, 2, explorer_rows, cols);
                 const separator_row = 2 + explorer_rows;
                 try frame.clearRow(separator_row);
                 const separator = " ─ transcript ";
@@ -192,15 +183,15 @@ pub fn Methods(comptime Explorer: type) type {
 
             // Peeks are overlays, not columns: moving the selection no longer
             // changes either pane's width or reflows the inspector.
-            const popup_width = Explorer.Ops.preview.hoverMaxOuterWidth(self, cols, layout_now) -| 2;
+            const popup_width = hoverMaxOuterWidth(self, cols, layout_now) -| 2;
             const popup = if (self.navigation.focus == .tree and !Explorer.Ops.tree_projection.selectedTreeRowIsCurrentSubject(self))
-                try Explorer.Ops.preview.previewLines(self, arena, popup_width)
+                try previewLines(self, arena, popup_width)
             else if (Explorer.Ops.view_state.detailPreviewAction(self) != null)
-                try Explorer.Ops.preview.detailPreviewLines(self, arena, popup_width)
+                try detailPreviewLines(self, arena, popup_width)
             else
                 &.{};
             if (popup.len > 1 and cols >= 40 and rows >= 6)
-                try Explorer.Ops.preview.drawHoverPopup(self, arena, frame, first_row, rows, cols, layout_now, popup);
+                try drawHoverPopup(self, arena, frame, first_row, rows, cols, layout_now, popup);
         }
 
         pub fn previewRole(self: *const Explorer) tui.Role {
@@ -237,7 +228,7 @@ pub fn Methods(comptime Explorer: type) type {
             layout_now: Layout,
             lines: []const []const u8,
         ) !void {
-            const max_outer = Explorer.Ops.preview.hoverMaxOuterWidth(self, cols, layout_now);
+            const max_outer = hoverMaxOuterWidth(self, cols, layout_now);
             if (max_outer < 4) return;
             var desired: usize = @min(@as(usize, 28), max_outer);
             for (lines) |line| desired = @max(desired, tui.displayWidth(line, width_mod.cpWidth) + 2);
@@ -273,7 +264,7 @@ pub fn Methods(comptime Explorer: type) type {
                     @min(cols / 3 + 1, cols - outer_width + 1)
             else
                 cols - outer_width + 1;
-            const role = Explorer.Ops.preview.previewRole(self);
+            const role = previewRole(self);
             const fill = try arena.alloc(u8, content_width);
             @memset(fill, ' ');
             var horizontal: std.Io.Writer.Allocating = .init(arena);
@@ -339,7 +330,7 @@ pub fn Methods(comptime Explorer: type) type {
                                 if (snip.len > 0) try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{snip}));
                             }
                         }
-                        try Explorer.Ops.preview.appendChunkCodePreview(self, &lines, arena, entry.id, chunk, preview_line_cap);
+                        try appendChunkCodePreview(self, &lines, arena, entry.id, chunk, preview_line_cap);
                     }
                 },
                 .name => |entry| {
@@ -358,7 +349,7 @@ pub fn Methods(comptime Explorer: type) type {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{
                         try Explorer.Ops.value_summary.canonicalStoreRef(self, arena, .objects, entry.id, summary, true),
                     }));
-                    try Explorer.Ops.preview.appendObjectPreview(self, &lines, arena, entry.id, content_width);
+                    try appendObjectPreview(self, &lines, arena, entry.id, content_width);
                 },
                 .heap => |entry| {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " heap/{s}", .{@tagName(entry.view)}));
@@ -430,7 +421,7 @@ pub fn Methods(comptime Explorer: type) type {
                             true,
                         ),
                     }));
-                    try Explorer.Ops.preview.appendObjectPreview(self, &lines, arena, id, content_width);
+                    try appendObjectPreview(self, &lines, arena, id, content_width);
                 },
                 .chunk => |id| {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " chunk[0x{x}]", .{id}));
@@ -445,7 +436,7 @@ pub fn Methods(comptime Explorer: type) type {
                             ) catch "";
                             if (snip.len > 0) try lines.append(arena, try std.fmt.allocPrint(arena, " {s}", .{snip}));
                         }
-                        try Explorer.Ops.preview.appendChunkCodePreview(self, &lines, arena, id, chunk, preview_line_cap);
+                        try appendChunkCodePreview(self, &lines, arena, id, chunk, preview_line_cap);
                     }
                 },
                 .store_record => |record| {
@@ -565,7 +556,7 @@ pub fn Methods(comptime Explorer: type) type {
                             .bytecode => |body| {
                                 try lines.append(arena, try std.fmt.allocPrint(arena, " chunk[0x{x}] · {d} captures", .{ body.chunk, body.captures }));
                                 if (self.ev.getChunk(body.chunk)) |chunk|
-                                    try Explorer.Ops.preview.appendChunkCodePreview(self, lines, arena, body.chunk, chunk, preview_line_cap);
+                                    try appendChunkCodePreview(self, lines, arena, body.chunk, chunk, preview_line_cap);
                             },
                             .closure => |value| {
                                 const rendered = try Explorer.Ops.pages.renderValueRef(self, arena, value, content_width -| 9, true);
@@ -601,7 +592,7 @@ pub fn Methods(comptime Explorer: type) type {
                     try lines.append(arena, try std.fmt.allocPrint(arena, " {d} arguments", .{closure.args}));
                 },
                 .closure => |closure| if (self.ev.getChunk(closure.chunk)) |chunk|
-                    try Explorer.Ops.preview.appendChunkCodePreview(self, lines, arena, closure.chunk, chunk, preview_line_cap),
+                    try appendChunkCodePreview(self, lines, arena, closure.chunk, chunk, preview_line_cap),
                 else => {},
             }
         }

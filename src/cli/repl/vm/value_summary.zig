@@ -35,27 +35,8 @@ const HeapIndexState = vm_model.HeapIndexState;
 const ReferenceIndexState = vm_model.ReferenceIndexState;
 const Viewport = vm_model.Viewport;
 
-const disasm_options: disasm.Options = .{
-    .show_constants = true,
-    .show_source = true,
-    .show_bytes = true,
-    .recurse = false,
-};
-
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.pages.RenderedValue;
-        const Layout = Explorer.Ops.view_state.Layout;
-        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
-        const OpenMode = Explorer.Ops.controller.OpenMode;
-        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
-        const TreeCell = Explorer.Ops.tree_render.TreeCell;
-        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
-        const range_leaf = Explorer.range_leaf;
-        const range_branch = Explorer.range_branch;
-        const preview_line_cap = Explorer.preview_line_cap;
-
         pub fn identityForStore(view: HeapView) disasm.Identity {
             return switch (view) {
                 .overview, .objects => .object,
@@ -96,13 +77,13 @@ pub fn Methods(comptime Explorer: type) type {
         ) ![]const u8 {
             const raw: []const u8 = switch (view) {
                 .values => if (self.ev.heapValueAt(id)) |value|
-                    try Explorer.Ops.value_summary.valueSummary(self, arena, value.*, max_cells)
+                    try valueSummary(self, arena, value.*, max_cells)
                 else
                     "",
                 .attrs => if (self.ev.heapAttrAt(id)) |attr|
                     try std.fmt.allocPrint(arena, "{s} = {s}", .{
                         self.ev.internTable().get(attr.name),
-                        try Explorer.Ops.value_summary.valueSummary(self, arena, attr.value, max_cells),
+                        try valueSummary(self, arena, attr.value, max_cells),
                     })
                 else
                     "",
@@ -146,7 +127,7 @@ pub fn Methods(comptime Explorer: type) type {
             colored: bool,
         ) ![]const u8 {
             const bounded = if (preview) |text|
-                try width_mod.endEllipsis(arena, text, Explorer.Ops.value_summary.storePreviewBudget(self, store, id, max_cells))
+                try width_mod.endEllipsis(arena, text, storePreviewBudget(self, store, id, max_cells))
             else
                 null;
             var rendered: std.Io.Writer.Allocating = .init(arena);
@@ -259,7 +240,7 @@ pub fn Methods(comptime Explorer: type) type {
                         .merge_attrs => |merge| try std.fmt.allocPrint(arena, "attrs merge · depth {d}", .{merge.depth}),
                         .closure => |closure| try std.fmt.allocPrint(arena, "closure → chunk[0x{x}] · {d} upvalues", .{ closure.chunk, closure.upvalues }),
                         .builtin_closure => |closure| try std.fmt.allocPrint(arena, "builtin closure → {s} · {d} args", .{
-                            try Explorer.Ops.value_summary.locatedValue(
+                            try locatedValue(
                                 self,
                                 arena,
                                 "builtin",
@@ -304,7 +285,7 @@ pub fn Methods(comptime Explorer: type) type {
                         try out.writer.writeAll(" [");
                         for (items[0..@min(items.len, 3)], 0..) |item, i| {
                             if (i != 0) try out.writer.writeAll(", ");
-                            try out.writer.writeAll(try Explorer.Ops.value_summary.shallowValueSummary(
+                            try out.writer.writeAll(try shallowValueSummary(
                                 self,
                                 arena,
                                 item,
@@ -324,7 +305,7 @@ pub fn Methods(comptime Explorer: type) type {
                         for (attrs[0..@min(attrs.len, 2)], 0..) |attr, i| {
                             if (i != 0) try out.writer.writeAll(", ");
                             try out.writer.writeAll(self.ev.internTable().get(attr.name));
-                            if (try Explorer.Ops.value_summary.scalarText(self, arena, attr.value, @max(@as(usize, 8), max_cells / 2))) |scalar|
+                            if (try scalarText(self, arena, attr.value, @max(@as(usize, 8), max_cells / 2))) |scalar|
                                 try out.writer.print(" = {s}", .{scalar});
                         }
                         if (attrs.len > 2) try out.writer.writeAll(", …");
@@ -335,7 +316,7 @@ pub fn Methods(comptime Explorer: type) type {
                 else => {},
             }
 
-            const summary = try Explorer.Ops.value_summary.objectSummary(self, arena, id, max_cells);
+            const summary = try objectSummary(self, arena, id, max_cells);
             return if (std.mem.eql(u8, summary, "?")) disasm.valueKindLabel(kind) else summary;
         }
 
@@ -354,20 +335,20 @@ pub fn Methods(comptime Explorer: type) type {
                 .bool_true,
                 .int,
                 .float,
-                => try Explorer.Ops.value_summary.scalarValueSummary(self, arena, value, max_cells),
+                => try scalarValueSummary(self, arena, value, max_cells),
                 .string, .path => blk: {
                     const id = value.asInternId();
                     const preview = try escapedQuoted(
                         arena,
                         try std.fmt.allocPrint(arena, "{s} ", .{disasm.valueKindLabel(value.kind())}),
                         self.ev.internTable().get(id),
-                        Explorer.Ops.value_summary.storePreviewBudget(self, "intern", id, max_cells),
+                        storePreviewBudget(self, "intern", id, max_cells),
                     );
-                    break :blk try Explorer.Ops.value_summary.locatedValue(self, arena, "intern", id, .intern, preview, max_cells, false);
+                    break :blk try locatedValue(self, arena, "intern", id, .intern, preview, max_cells, false);
                 },
                 .builtin => blk: {
                     const id = value.asBuiltinId();
-                    break :blk try Explorer.Ops.value_summary.locatedValue(self, arena, "builtin", id, .builtin, disasm.builtinName(id), max_cells, false);
+                    break :blk try locatedValue(self, arena, "builtin", id, .builtin, disasm.builtinName(id), max_cells, false);
                 },
                 else => null,
             };
@@ -382,11 +363,11 @@ pub fn Methods(comptime Explorer: type) type {
             value: runtime.value.Value,
             max_cells: usize,
         ) ![]const u8 {
-            if (try Explorer.Ops.value_summary.scalarText(self, arena, value, max_cells)) |scalar|
+            if (try scalarText(self, arena, value, max_cells)) |scalar|
                 return width_mod.endEllipsis(arena, scalar, max_cells);
             if (value.kind() == .closure and value.isFunction())
-                return Explorer.Ops.value_summary.locatedValue(self, arena, "chunk", value.asFunctionChunkId(), .chunk, "function", max_cells, false);
-            return Explorer.Ops.value_summary.locatedValue(
+                return locatedValue(self, arena, "chunk", value.asFunctionChunkId(), .chunk, "function", max_cells, false);
+            return locatedValue(
                 self,
                 arena,
                 "objects",

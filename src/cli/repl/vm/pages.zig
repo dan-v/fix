@@ -48,22 +48,11 @@ const disasm_options: disasm.Options = .{
 
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const Layout = Explorer.Ops.view_state.Layout;
-        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
-        const OpenMode = Explorer.Ops.controller.OpenMode;
-        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
-        const TreeCell = Explorer.Ops.tree_render.TreeCell;
-        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
-        const range_leaf = Explorer.range_leaf;
-        const range_branch = Explorer.range_branch;
-        const preview_line_cap = Explorer.preview_line_cap;
-
         // -- page construction ---------------------------------------------------
 
         pub fn refreshPage(self: *Explorer, kind: Visit.Kind) !void {
             _ = self.arena.reset(.retain_capacity);
-            self.page = try Explorer.Ops.pages.buildPage(self, kind);
+            self.page = try buildPage(self, kind);
             self.navigation.detail_selection = @min(self.navigation.detail_selection, self.page.lines.len -| 1);
             if (!Explorer.Ops.controller.rowActionable(self, self.navigation.detail_selection)) self.navigation.detail_selection = Explorer.Ops.controller.firstActionableRow(self) orelse 0;
             Explorer.Ops.controller.ensureDetailVisible(self);
@@ -81,13 +70,13 @@ pub fn Methods(comptime Explorer: type) type {
                         };
                     };
                     var page: PageBuilder = .{ .arena = arena };
-                    try Explorer.Ops.pages.appendChunkEquivalence(self, &page, id);
+                    try appendChunkEquivalence(self, &page, id);
                     try Explorer.Ops.source_view.appendSourceDocument(self, &page, id, chunk, Explorer.Ops.source_view.focusedSourceSpan(self, id));
                     try page.line("", .none);
                     try page.heading(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{id}));
-                    try Explorer.Ops.pages.appendDisassemblyAt(self, &page, id, chunk, true, null);
+                    try appendDisassemblyAt(self, &page, id, chunk, true, null);
                     try page.line("", .none);
-                    try Explorer.Ops.pages.appendReferences(self, &page, .{ .chunk = id });
+                    try appendReferences(self, &page, .{ .chunk = id });
                     return .{
                         .title = try std.fmt.allocPrint(arena, "chunk[0x{x}]", .{id}),
                         .lines = page.lines.items,
@@ -95,11 +84,11 @@ pub fn Methods(comptime Explorer: type) type {
                         .locations = page.locations.items,
                     };
                 },
-                .heap => |view| return Explorer.Ops.pages.buildHeapPage(self, view),
-                .object => |id| return Explorer.Ops.pages.buildObjectPage(self, id),
-                .store_record => |r| return Explorer.Ops.pages.buildStoreRecordPage(self, r.view, r.id),
-                .debug_frame => |i| return Explorer.Ops.pages.buildDebugFramePage(self, i),
-                .debug_value => return Explorer.Ops.pages.buildReturnValuePage(self),
+                .heap => |view| return buildHeapPage(self, view),
+                .object => |id| return buildObjectPage(self, id),
+                .store_record => |r| return buildStoreRecordPage(self, r.view, r.id),
+                .debug_frame => |i| return buildDebugFramePage(self, i),
+                .debug_value => return buildReturnValuePage(self),
                 .help => {
                     const help_text =
                         \\  Tab             switch tree/detail focus
@@ -225,26 +214,26 @@ pub fn Methods(comptime Explorer: type) type {
             switch (info) {
                 .list => {
                     try page.line("", .none);
-                    try Explorer.Ops.pages.appendObjectMembers(self, &page, id);
+                    try appendObjectMembers(self, &page, id);
                 },
                 .attrs => |attrs| {
                     try page.line(try std.fmt.allocPrint(arena, "positions   {d}", .{attrs.positions}), .none);
                     try page.line(try std.fmt.allocPrint(arena, "swept       {s}", .{if (attrs.sibling_swept) "yes" else "no"}), .none);
                     try page.line("", .none);
-                    try Explorer.Ops.pages.appendObjectMembers(self, &page, id);
+                    try appendObjectMembers(self, &page, id);
                 },
                 .merge_attrs => |merge| {
-                    try Explorer.Ops.pages.appendObjectRef(self, &page, "base", merge.base);
-                    try Explorer.Ops.pages.appendObjectRef(self, &page, "overlay", merge.overlay);
+                    try appendObjectRef(self, &page, "base", merge.base);
+                    try appendObjectRef(self, &page, "overlay", merge.overlay);
                     try page.line(try std.fmt.allocPrint(arena, "depth       {d}", .{merge.depth}), .none);
-                    if (merge.flattened) |flat| try Explorer.Ops.pages.appendObjectRef(self, &page, "flattened", flat) else try page.line("flattened   not materialized", .none);
+                    if (merge.flattened) |flat| try appendObjectRef(self, &page, "flattened", flat) else try page.line("flattened   not materialized", .none);
                 },
                 .closure => |closure| {
                     const prefix = "chunk       ";
                     try page.line(
                         try std.fmt.allocPrint(arena, "{s}{s}", .{
                             prefix,
-                            try Explorer.Ops.value_summary.locatedValue(self, arena, "chunk", closure.chunk, .chunk, null, Explorer.Ops.pages.lineRemainderWidth(self, prefix), true),
+                            try Explorer.Ops.value_summary.locatedValue(self, arena, "chunk", closure.chunk, .chunk, null, lineRemainderWidth(self, prefix), true),
                         }),
                         .{ .chunk = closure.chunk },
                     );
@@ -261,7 +250,7 @@ pub fn Methods(comptime Explorer: type) type {
                             closure.builtin,
                             .builtin,
                             disasm.builtinName(closure.builtin),
-                            Explorer.Ops.pages.lineRemainderWidth(self, prefix),
+                            lineRemainderWidth(self, prefix),
                             true,
                         ),
                     }), .none);
@@ -271,29 +260,29 @@ pub fn Methods(comptime Explorer: type) type {
                     try page.line(try std.fmt.allocPrint(arena, "state       {s}", .{@tagName(thunk.state)}), .none);
                     try page.line(try std.fmt.allocPrint(arena, "demanded    {s}", .{if (thunk.demanded) "yes" else "no"}), .none);
                     switch (thunk.body) {
-                        .result => |value| try Explorer.Ops.pages.appendValueRef(self, &page, "result", value),
+                        .result => |value| try appendValueRef(self, &page, "result", value),
                         .error_name => |name| try page.line(try std.fmt.allocPrint(arena, "error       {s}", .{name}), .none),
                         .target => |target| switch (target) {
-                            .closure => |value| try Explorer.Ops.pages.appendValueRef(self, &page, "closure", value),
+                            .closure => |value| try appendValueRef(self, &page, "closure", value),
                             .bytecode => |body| {
                                 const prefix = "chunk       ";
                                 try page.line(
                                     try std.fmt.allocPrint(arena, "{s}{s}", .{
                                         prefix,
-                                        try Explorer.Ops.value_summary.locatedValue(self, arena, "chunk", body.chunk, .chunk, null, Explorer.Ops.pages.lineRemainderWidth(self, prefix), true),
+                                        try Explorer.Ops.value_summary.locatedValue(self, arena, "chunk", body.chunk, .chunk, null, lineRemainderWidth(self, prefix), true),
                                     }),
                                     .{ .chunk = body.chunk },
                                 );
                                 try page.line(try std.fmt.allocPrint(arena, "captures    {d}", .{body.captures}), .none);
                             },
-                            .pass_through => |value| try Explorer.Ops.pages.appendValueRef(self, &page, "value", value),
+                            .pass_through => |value| try appendValueRef(self, &page, "value", value),
                             .attr_access => |access| {
-                                try Explorer.Ops.pages.appendValueRef(self, &page, "base", access.base);
+                                try appendValueRef(self, &page, "base", access.base);
                                 const prefix = "attribute   ";
-                                const attribute = try Explorer.Ops.pages.renderValueRef(self, arena, .{
+                                const attribute = try renderValueRef(self, arena, .{
                                     .kind = .string,
                                     .target = .{ .intern = access.name },
-                                }, Explorer.Ops.pages.lineRemainderWidth(self, prefix), true);
+                                }, lineRemainderWidth(self, prefix), true);
                                 try page.line(try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, attribute.text }), .none);
                             },
                             .deferred => |body| {
@@ -305,22 +294,22 @@ pub fn Methods(comptime Explorer: type) type {
                 },
                 .context_string => |string| {
                     const prefix = "text        ";
-                    const text = try Explorer.Ops.pages.renderValueRef(self, arena, .{
+                    const text = try renderValueRef(self, arena, .{
                         .kind = .string,
                         .target = .{ .intern = string.text },
-                    }, Explorer.Ops.pages.lineRemainderWidth(self, prefix), true);
+                    }, lineRemainderWidth(self, prefix), true);
                     try page.line(try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, text.text }), .none);
                     try page.line(try std.fmt.allocPrint(arena, "context     {d} entries", .{string.context}), .none);
                 },
                 .boxed_int => |value| try page.line(try std.fmt.allocPrint(arena, "value       {d}", .{value}), .none),
                 .partial_app => |partial| {
-                    try Explorer.Ops.pages.appendValueRef(self, &page, "function", partial.function);
+                    try appendValueRef(self, &page, "function", partial.function);
                     try page.line(try std.fmt.allocPrint(arena, "arguments   {d}", .{partial.args}), .none);
                 },
                 .heap_string => |string| try page.line(try std.fmt.allocPrint(arena, "bytes       {d}", .{string.len}), .none),
             }
             try page.line("", .none);
-            try Explorer.Ops.pages.appendReferences(self, &page, .{ .object = id });
+            try appendReferences(self, &page, .{ .object = id });
             return .{
                 .title = try std.fmt.allocPrint(arena, "objects[0x{x}]", .{id}),
                 .lines = page.lines.items,
@@ -345,13 +334,13 @@ pub fn Methods(comptime Explorer: type) type {
             switch (view) {
                 .values => {
                     if (self.ev.heapValueAt(id)) |value| {
-                        try Explorer.Ops.pages.appendValueDetail(self, &page, "value", value.*);
+                        try appendValueDetail(self, &page, "value", value.*);
                     } else try page.line("(slot is out of range)", .none);
                 },
                 .attrs => {
                     if (self.ev.heapAttrAt(id)) |attr| {
                         try page.line(try std.fmt.allocPrint(arena, "name   {s}", .{self.ev.internTable().get(attr.name)}), .none);
-                        try Explorer.Ops.pages.appendValueDetail(self, &page, "value", attr.value);
+                        try appendValueDetail(self, &page, "value", attr.value);
                     } else try page.line("(slot is out of range)", .none);
                 },
                 .attr_positions => {
@@ -389,10 +378,10 @@ pub fn Methods(comptime Explorer: type) type {
             };
             try page.heading(vm_helpers.returnValueHeading(session.reason));
             try page.line("", .none);
-            try Explorer.Ops.pages.appendValueDetail(self, &page, "value", session.value);
+            try appendValueDetail(self, &page, "value", session.value);
             try page.line("", .none);
             switch (self.ev.valueRef(session.value).target) {
-                .object => |id| try Explorer.Ops.pages.appendObjectMembers(self, &page, id),
+                .object => |id| try appendObjectMembers(self, &page, id),
                 else => {},
             }
             return .{
@@ -415,7 +404,7 @@ pub fn Methods(comptime Explorer: type) type {
                         try page.line(try std.fmt.allocPrint(arena, "  … {d} more", .{attrs.len - cap}), .none);
                         break;
                     }
-                    try Explorer.Ops.pages.appendValueLine(self, page, try std.fmt.allocPrint(arena, "  {s} : ", .{self.ev.internTable().get(entry.name)}), entry.value);
+                    try appendValueLine(self, page, try std.fmt.allocPrint(arena, "  {s} : ", .{self.ev.internTable().get(entry.name)}), entry.value);
                 }
             } else |_| if (self.ev.heapListOf(id)) |items| {
                 try page.heading(try std.fmt.allocPrint(arena, "ITEMS · {d}", .{items.len}));
@@ -424,7 +413,7 @@ pub fn Methods(comptime Explorer: type) type {
                         try page.line(try std.fmt.allocPrint(arena, "  … {d} more", .{items.len - cap}), .none);
                         break;
                     }
-                    try Explorer.Ops.pages.appendValueLine(self, page, try std.fmt.allocPrint(arena, "  [{d}] ", .{i}), item);
+                    try appendValueLine(self, page, try std.fmt.allocPrint(arena, "  [{d}] ", .{i}), item);
                 }
             } else |_| {}
         }
@@ -464,7 +453,7 @@ pub fn Methods(comptime Explorer: type) type {
 
             if (session.reason == .break_builtin or session.reason == .eval_error) {
                 try page.heading(vm_helpers.returnValueHeading(session.reason));
-                try Explorer.Ops.pages.appendValueLine(self, &page, "  => ", session.value);
+                try appendValueLine(self, &page, "  => ", session.value);
                 try page.line("", .none);
             }
 
@@ -501,12 +490,12 @@ pub fn Methods(comptime Explorer: type) type {
             var any = false;
             for (0..session.localCount(index)) |slot| {
                 const nm = session.localName(index, slot) orelse continue;
-                try Explorer.Ops.pages.appendValueLine(self, &page, try std.fmt.allocPrint(arena, "  {s} : ", .{nm}), session.localValue(index, slot));
+                try appendValueLine(self, &page, try std.fmt.allocPrint(arena, "  {s} : ", .{nm}), session.localValue(index, slot));
                 any = true;
             }
             for (0..session.upvalueCount(index)) |slot| {
                 const nm = session.upvalueName(index, slot) orelse continue;
-                try Explorer.Ops.pages.appendValueLine(self, &page, try std.fmt.allocPrint(arena, "  ↑ {s} : ", .{nm}), session.upvalueValue(index, slot));
+                try appendValueLine(self, &page, try std.fmt.allocPrint(arena, "  ↑ {s} : ", .{nm}), session.upvalueValue(index, slot));
                 any = true;
             }
             if (!any) try page.line("  (no named locals or upvalues)", .none);
@@ -519,14 +508,14 @@ pub fn Methods(comptime Explorer: type) type {
                 var s: usize = 0;
                 while (s < stack_n) : (s += 1) {
                     const slot = stack_n - 1 - s;
-                    try Explorer.Ops.pages.appendValueLine(self, &page, try std.fmt.allocPrint(arena, "  [{d}] ", .{slot}), session.stackSlot(index, slot));
+                    try appendValueLine(self, &page, try std.fmt.allocPrint(arena, "  [{d}] ", .{slot}), session.stackSlot(index, slot));
                 }
                 try page.line("", .none);
             }
 
             if (self.ev.getChunk(chunk_id)) |chunk| {
                 try page.heading(try std.fmt.allocPrint(arena, "CODE · chunk[0x{x}]", .{chunk_id}));
-                try Explorer.Ops.pages.appendDisassemblyAt(self, &page, chunk_id, chunk, false, info.instruction);
+                try appendDisassemblyAt(self, &page, chunk_id, chunk, false, info.instruction);
             }
 
             return .{
@@ -539,7 +528,7 @@ pub fn Methods(comptime Explorer: type) type {
 
         pub fn appendObjectRef(self: *Explorer, page: *PageBuilder, label: []const u8, id: runtime.types.ObjectId) !void {
             const prefix = try std.fmt.allocPrint(page.arena, "{s:<12} ", .{label});
-            const ref_width = Explorer.Ops.pages.lineRemainderWidth(self, prefix);
+            const ref_width = lineRemainderWidth(self, prefix);
             const preview_width = Explorer.Ops.value_summary.storePreviewBudget(self, "objects", id, ref_width);
             try page.line(try std.fmt.allocPrint(page.arena, "{s}{s}", .{
                 prefix,
@@ -563,14 +552,14 @@ pub fn Methods(comptime Explorer: type) type {
         /// kinds. Inline scalars carry their data in the `Value` itself, so this is
         /// safe on a raw store slot without any heap deref or forcing.
         pub fn appendValueDetail(self: *Explorer, page: *PageBuilder, label: []const u8, value: runtime.value.Value) !void {
-            try Explorer.Ops.pages.appendValueLine(self, page, try std.fmt.allocPrint(page.arena, "{s:<12} ", .{label}), value);
+            try appendValueLine(self, page, try std.fmt.allocPrint(page.arena, "{s:<12} ", .{label}), value);
         }
 
         /// One navigable line for a `Value`: `<prefix><digest>[ → store[0xN]]`.
         /// Object/chunk-backed values carry a `.object`/`.chunk` action so Enter
         /// (or the right-hand preview) drills into them; scalars render inline.
         pub fn appendValueLine(self: *Explorer, page: *PageBuilder, prefix: []const u8, value: runtime.value.Value) !void {
-            const rendered = try Explorer.Ops.pages.renderValue(self, page.arena, value, Explorer.Ops.pages.lineRemainderWidth(self, prefix), true);
+            const rendered = try renderValue(self, page.arena, value, lineRemainderWidth(self, prefix), true);
             try page.line(
                 try std.fmt.allocPrint(page.arena, "{s}{s}", .{ prefix, rendered.text }),
                 rendered.action,
@@ -658,7 +647,7 @@ pub fn Methods(comptime Explorer: type) type {
 
         pub fn appendValueRef(self: *Explorer, page: *PageBuilder, label: []const u8, value: runtime.heap.ValueRef) !void {
             const prefix = try std.fmt.allocPrint(page.arena, "{s:<12} ", .{label});
-            const rendered = try Explorer.Ops.pages.renderValueRef(self, page.arena, value, Explorer.Ops.pages.lineRemainderWidth(self, prefix), true);
+            const rendered = try renderValueRef(self, page.arena, value, lineRemainderWidth(self, prefix), true);
             try page.line(
                 try std.fmt.allocPrint(page.arena, "{s}{s}", .{ prefix, rendered.text }),
                 rendered.action,
@@ -746,7 +735,7 @@ pub fn Methods(comptime Explorer: type) type {
                 const plain = base.terminal_text.stripAnsiInPlace(try page.arena.dupe(u8, line));
                 const target = vm_helpers.disasmTarget(plain);
                 const action: RowAction = if (target == .none and vm_helpers.disasmOffset(chunk, plain) != null) .instruction else target;
-                const location = Explorer.Ops.pages.disasmLocation(self, id, chunk, plain);
+                const location = disasmLocation(self, id, chunk, plain);
                 try page.lineAt(line, action, location);
             }
         }
@@ -788,7 +777,7 @@ pub fn Methods(comptime Explorer: type) type {
         /// the same object/chunk action as any other rendered value.
         pub fn focusValueRow(self: *Explorer, value: runtime.value.Value) void {
             for (self.page.actions, 0..) |action, i| {
-                if (!Explorer.Ops.pages.rowTargetsValue(self, action, value)) continue;
+                if (!rowTargetsValue(self, action, value)) continue;
                 self.navigation.detail_selection = i;
                 Explorer.Ops.controller.ensureDetailVisible(self);
                 return;
@@ -803,7 +792,7 @@ pub fn Methods(comptime Explorer: type) type {
         }
 
         pub fn chunkEquivalenceSuffix(self: *const Explorer, buffer: []u8, id: ChunkId) []const u8 {
-            const relation = Explorer.Ops.pages.chunkEquivalence(self, id) orelse return "";
+            const relation = chunkEquivalence(self, id) orelse return "";
             return switch (relation) {
                 .structural => |peer| std.fmt.bufPrint(buffer, " · identical chunk[0x{x}]", .{peer}) catch "",
                 .code => |peer| std.fmt.bufPrint(buffer, " · same code chunk[0x{x}]", .{peer}) catch "",
@@ -811,7 +800,7 @@ pub fn Methods(comptime Explorer: type) type {
         }
 
         pub fn appendChunkEquivalence(self: *Explorer, page: *PageBuilder, id: ChunkId) !void {
-            const relation = Explorer.Ops.pages.chunkEquivalence(self, id) orelse return;
+            const relation = chunkEquivalence(self, id) orelse return;
             switch (relation) {
                 .structural => |peer| try page.line(
                     try std.fmt.allocPrint(page.arena, "structurally identical to chunk[0x{x}]", .{peer}),
@@ -861,7 +850,7 @@ pub fn Methods(comptime Explorer: type) type {
                         const chunk = self.ev.getChunk(id) orelse return;
                         try bytecode.inspect.collectRefs(page.arena, chunk, &outgoing);
                         try page.heading(try std.fmt.allocPrint(page.arena, "OUTGOING · {d}", .{outgoing.items.len}));
-                        for (outgoing.items) |target| try Explorer.Ops.pages.appendChunkLabel(self, page, "  →", target);
+                        for (outgoing.items) |target| try appendChunkLabel(self, page, "  →", target);
                         return;
                     },
                 }
@@ -869,21 +858,21 @@ pub fn Methods(comptime Explorer: type) type {
 
             const outgoing = graph.outgoing(subject);
             try page.heading(try std.fmt.allocPrint(page.arena, "OUTGOING · {d}", .{outgoing.len}));
-            for (outgoing) |edge| try Explorer.Ops.pages.appendReferenceLabel(self, page, "  →", vm_refs.node(edge.target));
+            for (outgoing) |edge| try appendReferenceLabel(self, page, "  →", vm_refs.node(edge.target));
             try page.line("", .none);
             const incoming = graph.incoming(subject);
             try page.heading(try std.fmt.allocPrint(page.arena, "INCOMING · {d}", .{incoming.len}));
-            for (incoming) |edge| try Explorer.Ops.pages.appendReferenceLabel(self, page, "  ←", vm_refs.node(edge.target));
+            for (incoming) |edge| try appendReferenceLabel(self, page, "  ←", vm_refs.node(edge.target));
         }
 
         pub fn appendReferenceLabel(self: *Explorer, page: *PageBuilder, marker: []const u8, reference: vm_refs.Node) !void {
             switch (reference) {
-                .chunk => |id| try Explorer.Ops.pages.appendChunkLabel(self, page, marker, id),
+                .chunk => |id| try appendChunkLabel(self, page, marker, id),
                 .object => |id| {
                     if (self.heap_index.objects == null)
                         self.heap_index.objects = self.ev.heapObjectSnapshot(self.allocator) catch null;
                     const prefix = try std.fmt.allocPrint(page.arena, "{s} ", .{marker});
-                    const width = Explorer.Ops.pages.lineRemainderWidth(self, prefix);
+                    const width = lineRemainderWidth(self, prefix);
                     const summary = try Explorer.Ops.value_summary.objectSummary(
                         self,
                         page.arena,

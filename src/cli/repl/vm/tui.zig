@@ -311,10 +311,6 @@ const Tui = struct {
     /// so stepping from the tree does not pull the cursor into the subject pane.
     pending_step_focus: ?vm_navigation.Focus = null,
 
-    pub const range_leaf = 256;
-    pub const range_branch = 4096;
-    pub const preview_line_cap = 200;
-
     fn deinit(self: *Tui) void {
         self.navigation.back.deinit(self.allocator);
         self.navigation.forward.deinit(self.allocator);

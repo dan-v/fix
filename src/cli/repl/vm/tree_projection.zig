@@ -36,34 +36,18 @@ const HeapIndexState = vm_model.HeapIndexState;
 const ReferenceIndexState = vm_model.ReferenceIndexState;
 const Viewport = vm_model.Viewport;
 
-const disasm_options: disasm.Options = .{
-    .show_constants = true,
-    .show_source = true,
-    .show_bytes = true,
-    .recurse = false,
-};
+const range_leaf = 256;
+const range_branch = 4096;
 
 pub fn Methods(comptime Explorer: type) type {
     return struct {
-        const RenderedValue = Explorer.Ops.pages.RenderedValue;
-        const Layout = Explorer.Ops.view_state.Layout;
-        const StoreRecord = Explorer.Ops.view_state.StoreRecord;
-        const OpenMode = Explorer.Ops.controller.OpenMode;
-        const TreeViewport = Explorer.Ops.tree_render.TreeViewport;
-        const TreeCell = Explorer.Ops.tree_render.TreeCell;
-        const DebugOutcome = Explorer.Ops.debug_view.DebugOutcome;
-        const DebugCloseIntent = Explorer.Ops.debug_view.DebugCloseIntent;
-        const range_leaf = Explorer.range_leaf;
-        const range_branch = Explorer.range_branch;
-        const preview_line_cap = Explorer.preview_line_cap;
-
         pub fn rebuildTreeForCurrent(self: *Explorer) !void {
-            try Explorer.Ops.tree_projection.rebuildTree(self, self.tree.projected_chunk orelse std.math.maxInt(ChunkId));
+            try rebuildTree(self, self.tree.projected_chunk orelse std.math.maxInt(ChunkId));
         }
 
         pub fn expandFocusedPath(self: *Explorer, chunk_id: ChunkId) !void {
             self.tree.categories[@intFromEnum(Category.bytecode)] = true;
-            try Explorer.Ops.tree_projection.projectFocusedPath(self, chunk_id);
+            try projectFocusedPath(self, chunk_id);
         }
 
         pub fn projectFocusedPath(self: *Explorer, chunk_id: ChunkId) !void {
@@ -121,26 +105,26 @@ pub fn Methods(comptime Explorer: type) type {
                     if (!expanded) continue;
                     const projected_only = !heap_open or !self.tree.heap_views[@intFromEnum(view)];
                     if (view == .intern or view == .builtin) {
-                        try Explorer.Ops.tree_projection.appendDenseStoreRange(self, view, 0, Explorer.Ops.view_state.storeCount(self, view), 2, projected_only);
+                        try appendDenseStoreRange(self, view, 0, Explorer.Ops.view_state.storeCount(self, view), 2, projected_only);
                     } else {
                         const snapshot = if (view == .objects)
                             (if (self.heap_index.objects) |*s| s else null)
                         else
                             Explorer.Ops.view_state.ensureStoreSnapshot(self, view);
                         if (snapshot) |snap| {
-                            try Explorer.Ops.tree_projection.appendLiveRange(self, view, snap, 0, snap.liveExtent(), 2, projected_only);
+                            try appendLiveRange(self, view, snap, 0, snap.liveExtent(), 2, projected_only);
                         }
                     }
                 }
             }
             try self.tree.rows.append(self.allocator, .{ .category = .{ .kind = .bytecode, .depth = 0 } });
-            if (Explorer.Ops.tree_projection.filterActive(self)) {
-                try Explorer.Ops.tree_projection.computeFilterKeep(self);
-                try Explorer.Ops.tree_projection.appendFilteredNameRows(self, vm_tree.root_node_id, 1);
+            if (filterActive(self)) {
+                try computeFilterKeep(self);
+                try appendFilteredNameRows(self, vm_tree.root_node_id, 1);
             } else if (self.tree.categories[@intFromEnum(Category.bytecode)]) {
-                try Explorer.Ops.tree_projection.appendNameRows(self, vm_tree.root_node_id, 1, focused_chunk);
+                try appendNameRows(self, vm_tree.root_node_id, 1, focused_chunk);
             } else if (Explorer.Ops.view_state.currentChunk(self) != null) {
-                try Explorer.Ops.tree_projection.appendFocusedNameRows(self, vm_tree.root_node_id, 1, focused_chunk);
+                try appendFocusedNameRows(self, vm_tree.root_node_id, 1, focused_chunk);
             }
             self.navigation.tree_selection = 0;
             // 1) Keep the cursor on the same row it was on, if it still exists.
@@ -184,15 +168,15 @@ pub fn Methods(comptime Explorer: type) type {
         /// Populate `filter_keep` with every name node on a path to a filter match.
         pub fn computeFilterKeep(self: *Explorer) std.mem.Allocator.Error!void {
             self.tree.filter_keep.clearRetainingCapacity();
-            if (!Explorer.Ops.tree_projection.filterActive(self)) return;
-            _ = try Explorer.Ops.tree_projection.markFilterKeep(self, vm_tree.root_node_id);
+            if (!filterActive(self)) return;
+            _ = try markFilterKeep(self, vm_tree.root_node_id);
             try self.tree.filter_keep.put(self.allocator, vm_tree.root_node_id, {});
         }
 
         pub fn markFilterKeep(self: *Explorer, node_id: u32) std.mem.Allocator.Error!bool {
-            var keep = Explorer.Ops.tree_projection.nodeMatchesFilter(self, node_id);
+            var keep = nodeMatchesFilter(self, node_id);
             for (self.tree_index.childrenOf(node_id)) |child| {
-                if (try Explorer.Ops.tree_projection.markFilterKeep(self, child)) keep = true;
+                if (try markFilterKeep(self, child)) keep = true;
             }
             if (keep) try self.tree.filter_keep.put(self.allocator, node_id, {});
             return keep;
@@ -205,7 +189,7 @@ pub fn Methods(comptime Explorer: type) type {
             if (!self.tree.filter_keep.contains(name)) return;
             const children = self.tree_index.childrenOf(name);
             const chunks = self.tree_index.chunksOf(name);
-            if (name != vm_tree.root_node_id and children.len == 0 and chunks.len == 1 and Explorer.Ops.tree_projection.nodeMatchesFilter(self, name)) {
+            if (name != vm_tree.root_node_id and children.len == 0 and chunks.len == 1 and nodeMatchesFilter(self, name)) {
                 try self.tree.rows.append(self.allocator, .{ .chunk = .{ .id = chunks[0], .depth = depth, .label = name } });
                 return;
             }
@@ -216,9 +200,9 @@ pub fn Methods(comptime Explorer: type) type {
             } });
             const next_depth = depth +| 1;
             for (children) |child| {
-                if (self.tree.filter_keep.contains(child)) try Explorer.Ops.tree_projection.appendFilteredNameRows(self, child, next_depth);
+                if (self.tree.filter_keep.contains(child)) try appendFilteredNameRows(self, child, next_depth);
             }
-            if (Explorer.Ops.tree_projection.nodeMatchesFilter(self, name)) {
+            if (nodeMatchesFilter(self, name)) {
                 for (chunks) |id| try self.tree.rows.append(self.allocator, .{ .chunk = .{ .id = id, .depth = next_depth } });
             }
         }
@@ -237,7 +221,7 @@ pub fn Methods(comptime Explorer: type) type {
             } });
             const next_depth = depth +| 1;
             for (children) |child| {
-                if (self.tree.focus_path.contains(child)) try Explorer.Ops.tree_projection.appendFocusedNameRows(self, child, next_depth, focused_chunk);
+                if (self.tree.focus_path.contains(child)) try appendFocusedNameRows(self, child, next_depth, focused_chunk);
             }
             if (self.tree_index.nodeForChunk(focused_chunk) == name and self.ev.getChunk(focused_chunk) != null) {
                 try self.tree.rows.append(self.allocator, .{ .chunk = .{ .id = focused_chunk, .depth = next_depth } });
@@ -311,9 +295,9 @@ pub fn Methods(comptime Explorer: type) type {
                 };
                 try self.tree.rows.append(self.allocator, .{ .range = range });
                 if (self.tree.expanded_ranges.contains(range.key())) {
-                    try Explorer.Ops.tree_projection.appendDenseStoreRange(self, view, child_start, child_len, depth +| 1, false);
+                    try appendDenseStoreRange(self, view, child_start, child_len, depth +| 1, false);
                 } else if (contains_focus) {
-                    try Explorer.Ops.tree_projection.appendDenseStoreRange(self, view, child_start, child_len, depth +| 1, true);
+                    try appendDenseStoreRange(self, view, child_start, child_len, depth +| 1, true);
                 }
             }
         }
@@ -381,9 +365,9 @@ pub fn Methods(comptime Explorer: type) type {
                 };
                 try self.tree.rows.append(self.allocator, .{ .range = range });
                 if (self.tree.expanded_ranges.contains(range.key())) {
-                    try Explorer.Ops.tree_projection.appendLiveRange(self, view, snapshot, child_start, child_len, depth +| 1, false);
+                    try appendLiveRange(self, view, snapshot, child_start, child_len, depth +| 1, false);
                 } else if (contains_focus) {
-                    try Explorer.Ops.tree_projection.appendLiveRange(self, view, snapshot, child_start, child_len, depth +| 1, true);
+                    try appendLiveRange(self, view, snapshot, child_start, child_len, depth +| 1, true);
                 }
             }
         }
@@ -405,15 +389,15 @@ pub fn Methods(comptime Explorer: type) type {
             if (!self.tree.expanded_names.contains(name_key)) {
                 if (!self.tree.focus_path.contains(name)) return;
                 for (children) |child| {
-                    if (self.tree.focus_path.contains(child)) try Explorer.Ops.tree_projection.appendNameRows(self, child, next_depth, focused_chunk);
+                    if (self.tree.focus_path.contains(child)) try appendNameRows(self, child, next_depth, focused_chunk);
                 }
                 if (self.tree_index.nodeForChunk(focused_chunk) == name and self.ev.getChunk(focused_chunk) != null) {
                     try self.tree.rows.append(self.allocator, .{ .chunk = .{ .id = focused_chunk, .depth = next_depth } });
                 }
                 return;
             }
-            try Explorer.Ops.tree_projection.appendNameRange(self, name, children, 0, @intCast(children.len), next_depth, focused_chunk);
-            try Explorer.Ops.tree_projection.appendChunkRange(self, name, chunks, 0, @intCast(chunks.len), next_depth, focused_chunk);
+            try appendNameRange(self, name, children, 0, @intCast(children.len), next_depth, focused_chunk);
+            try appendChunkRange(self, name, chunks, 0, @intCast(chunks.len), next_depth, focused_chunk);
         }
 
         pub fn appendNameRange(
@@ -429,7 +413,7 @@ pub fn Methods(comptime Explorer: type) type {
             if (len <= range_leaf) {
                 for (children[start .. start + len]) |child| {
                     if (self.tree_index.statsOf(child).chunks == 0) continue;
-                    try Explorer.Ops.tree_projection.appendNameRows(self, child, depth, focused_chunk);
+                    try appendNameRows(self, child, depth, focused_chunk);
                 }
                 return;
             }
@@ -456,7 +440,7 @@ pub fn Methods(comptime Explorer: type) type {
                     }
                 }
                 if (contains_focus or self.tree.expanded_ranges.contains(range.key())) {
-                    try Explorer.Ops.tree_projection.appendNameRange(self, parent, children, range.start, range.len, depth +| 1, focused_chunk);
+                    try appendNameRange(self, parent, children, range.start, range.len, depth +| 1, focused_chunk);
                 }
             }
         }
@@ -494,7 +478,7 @@ pub fn Methods(comptime Explorer: type) type {
                 try self.tree.rows.append(self.allocator, .{ .range = range });
                 const slice = chunks[range.start .. range.start + range.len];
                 if (std.mem.indexOfScalar(ChunkId, slice, focused_chunk) != null or self.tree.expanded_ranges.contains(range.key())) {
-                    try Explorer.Ops.tree_projection.appendChunkRange(self, parent, chunks, range.start, range.len, depth +| 1, focused_chunk);
+                    try appendChunkRange(self, parent, chunks, range.start, range.len, depth +| 1, focused_chunk);
                 }
             }
         }
@@ -516,7 +500,7 @@ pub fn Methods(comptime Explorer: type) type {
                 .category => |entry| {
                     const index = @intFromEnum(entry.kind);
                     self.tree.categories[index] = !self.tree.categories[index];
-                    try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
+                    try rebuildTreeForCurrent(self);
                     for (self.tree.rows.items, 0..) |row, i| switch (row) {
                         .category => |candidate| if (candidate.kind == entry.kind) {
                             self.navigation.tree_selection = i;
@@ -531,7 +515,7 @@ pub fn Methods(comptime Explorer: type) type {
                     } else {
                         try self.tree.expanded_names.put(self.allocator, entry.key, {});
                     }
-                    try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
+                    try rebuildTreeForCurrent(self);
                     for (self.tree.rows.items, 0..) |row, i| switch (row) {
                         .name => |candidate| if (candidate.key == entry.key) {
                             self.navigation.tree_selection = i;
@@ -558,7 +542,7 @@ pub fn Methods(comptime Explorer: type) type {
                         if (self.heap_index.objects == null) self.status_msg = "(object index failed)";
                     }
                     self.tree.heap_views[@intFromEnum(entry.view)] = opening;
-                    try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
+                    try rebuildTreeForCurrent(self);
                     for (self.tree.rows.items, 0..) |row, i| switch (row) {
                         .heap => |candidate| if (candidate.view == entry.view) {
                             self.navigation.tree_selection = i;
@@ -571,7 +555,7 @@ pub fn Methods(comptime Explorer: type) type {
                 .store_record => |entry| try Explorer.Ops.controller.openMode(self, .{ .store_record = .{ .view = entry.view, .id = entry.id } }, .replace),
                 .range => |range| {
                     if (!self.tree.expanded_ranges.remove(range.key())) try self.tree.expanded_ranges.put(self.allocator, range.key(), {});
-                    try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
+                    try rebuildTreeForCurrent(self);
                     for (self.tree.rows.items, 0..) |row, i| switch (row) {
                         .range => |candidate| if (std.meta.eql(candidate.key(), range.key())) {
                             self.navigation.tree_selection = i;
@@ -607,7 +591,7 @@ pub fn Methods(comptime Explorer: type) type {
                 else => false,
             };
             if (collapsed) {
-                try Explorer.Ops.tree_projection.rebuildTreeForCurrent(self);
+                try rebuildTreeForCurrent(self);
                 for (self.tree.rows.items, 0..) |row, i| if (vm_helpers.treeRowsEqual(row, selected)) {
                     self.navigation.tree_selection = i;
                     return;

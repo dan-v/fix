@@ -45,4 +45,11 @@ if rg -n '@import\("(\.\./)+(base|syntax|runtime|store|fetchers|expr|cli)(/|\.zi
   failed=1
 fi
 
+for subsystem in pages source_view view_state tree_projection controller preview value_summary tree_render debug_view; do
+  file="$src/cli/repl/vm/$subsystem.zig"
+  if rg -n "Explorer\\.Ops\\.$subsystem\\." "$file"; then
+    echo "structure-check: VM explorer subsystems call their own helpers directly" >&2
+    failed=1
+  fi
+done
 exit "$failed"
