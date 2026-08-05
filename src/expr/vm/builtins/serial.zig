@@ -21,6 +21,7 @@ const shared = @import("shared.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
+const vm_strings = @import("../strings.zig");
 
 const appendContextEntry = string_context.appendContextEntry;
 const coerceAttrsToStringValue = strings.coerceAttrsToStringValue;
@@ -97,7 +98,7 @@ fn writeJsonValueInner(
             var fbuf: [shared.json_float_buffer_size]u8 = undefined;
             try writer.writeAll(shared.jsonFloatText(&fbuf, forced.asFloat()));
         },
-        .string, .string_context => try writeJsonStringValue(self, writer, forced, context),
+        .string, .string_context, .heap_string => try writeJsonStringValue(self, writer, forced, context),
         .path => {
             switch (path_mode) {
                 .raw => try std.json.Stringify.encodeJsonString(self.intern.get(forced.asInternId()), .{}, writer),
@@ -304,6 +305,11 @@ fn writeXmlValue(
         .string => {
             try writer.writeAll("<string value=\"");
             try writeXmlEscaped(writer, self.intern.get(forced.asInternId()));
+            try writer.writeAll("\" />\n");
+        },
+        .heap_string => {
+            try writer.writeAll("<string value=\"");
+            try writeXmlEscaped(writer, try vm_strings.stringBytes(self, forced));
             try writer.writeAll("\" />\n");
         },
         .string_context => {

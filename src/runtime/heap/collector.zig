@@ -44,6 +44,7 @@ const FreeRange = struct {
 const si_values = heap_mod.rangeStoreIndex("values");
 const si_attrs = heap_mod.rangeStoreIndex("attrs");
 const si_attr_pos = heap_mod.rangeStoreIndex("attr_pos");
+const si_bytes = heap_mod.rangeStoreIndex("bytes");
 
 /// Collection-local streaming coalescer. Sweep order follows allocation order
 /// closely (exactly on one worker, per-worker for a parallel minor), so adjacent
@@ -327,7 +328,7 @@ pub fn verifyMinorClosure(heap: *ObjectHeap, mark_bits: []const u64) void {
                     },
                 }
             },
-            .boxed_int => {},
+            .boxed_int, .heap_string => {},
         }
     }
     if (shown > 0) @panic("gc: minor mark not closed — missed edge (see MISSED EDGE lines)");
@@ -520,6 +521,11 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
             .context_string => |c| for (heap.attrs.sliceMut(c.context)) |*e| {
                 e.value = poison;
             },
+            // Byte payloads have no Value shape to poison with a trapping
+            // thunk; memset a sentinel so a dangling `getHeapString` slice
+            // reads visibly-garbage text in detector builds instead of
+            // stale-but-plausible bytes.
+            .heap_string => |r| @memset(heap.bytes.sliceMut(r), 0xAA),
             else => {},
         }
     }
@@ -534,6 +540,7 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
         .partial_app => |p| if (p.args.len > 0) ranges.add(si_values, .{ .segment = p.args.segment, .offset = p.args.offset, .len = p.args.len }),
         .context_string => |c| if (c.context.len > 0) ranges.add(si_attrs, .{ .segment = c.context.segment, .offset = c.context.offset, .len = c.context.len }),
         .thunk => |t| if (t.targetSpillRange()) |r| ranges.add(si_values, .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
+        .heap_string => |r| if (r.len > 0) ranges.add(si_bytes, .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
         .merge_attrs, .boxed_int => {},
     }
 }

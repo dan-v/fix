@@ -16,6 +16,8 @@ pub const MemTag = enum(u8) {
     attrs,
     /// Attr-position store segments.
     attrpos,
+    /// Heap-string byte store segments (GC-able string text).
+    strbytes,
     /// Fiber stacks (8 MiB lazily-committed reservations).
     fiber_stack,
     /// AST arenas (parse-time nodes; the retained ones back deferred
@@ -37,6 +39,7 @@ pub fn tagName(t: MemTag) [:0]const u8 {
         .values => "fix:values",
         .attrs => "fix:attrs",
         .attrpos => "fix:attrpos",
+        .strbytes => "fix:strbytes",
         .fiber_stack => "fix:fiber-stack",
         .ast_arena => "fix:ast-arena",
         .worker_arena => "fix:worker-arena",

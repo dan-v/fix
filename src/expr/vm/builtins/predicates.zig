@@ -35,7 +35,7 @@ pub fn builtinTypeOf(self: *VM, arg: Value) !Value {
         .bool_false, .bool_true => "bool",
         .int, .boxed_int => "int",
         .float => "float",
-        .string, .string_context => "string",
+        .string, .string_context, .heap_string => "string",
         .path => "path",
         .list => "list",
         .attrs => "set",

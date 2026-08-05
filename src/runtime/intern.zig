@@ -255,6 +255,23 @@ pub const InternTable = struct {
         return new_id;
     }
 
+    /// Look up `s` WITHOUT inserting: the id if `s` is already interned,
+    /// else null. Serves read-only string→id crossings (dynamic attr
+    /// select, hasAttr): every attr name is interned at construction, so
+    /// a probe miss proves the attr cannot exist — and the miss leaves no
+    /// permanent entry behind, unlike `intern`.
+    pub fn probe(self: *InternTable, s: []const u8) ?InternId {
+        const h = hashString(s);
+        if (threadCacheLookup(self.token, h, s)) |id| return id;
+        const shard = &self.shards[h & shard_mask];
+        if (!self.solo) shard.mu.lock();
+        defer if (!self.solo) shard.mu.unlock();
+        const adapter = StringAdapter{ .table = self, .precomputed_hash = h };
+        const id = shard.lookup.getKeyAdapted(s, adapter) orelse return null;
+        threadCacheStore(self.token, h, s, id);
+        return id;
+    }
+
     pub fn get(self: *const InternTable, id: InternId) []const u8 {
         if (id == 0 or id >= self.entries.count()) return "";
         const entry = self.entries.get(id).*;

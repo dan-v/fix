@@ -60,4 +60,5 @@ pub const ObjectInfo = union(enum) {
     context_string: struct { text: InternId, context: u32 },
     boxed_int: i64,
     partial_app: struct { function: ValueRef, args: u32 },
+    heap_string: struct { len: u32 },
 };

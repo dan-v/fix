@@ -54,7 +54,16 @@ pub const ValueType = enum(u8) {
     /// (`isFunction`, `typeOf "lambda"`) and is callable — applying the
     /// remaining args runs the underlying body. See `vm/closures.zig`.
     partial_app = 15,
-    // reserved 16..255 for future extensions
+    /// A GC-able string whose bytes live in the heap's byte store rather
+    /// than the immortal intern table. Payload is an ObjectId into an
+    /// `Object.heap_string` slot. Language-visible behavior is identical
+    /// to `.string`; producers route long derived text here (threshold in
+    /// `vm/strings.makeString`) so churn — unique intermediates a fold
+    /// never looks at again — can be collected. Equality/ordering must go
+    /// through byte comparison (`vm/strings.stringTextEqual`); attr NAMES
+    /// are always interned, never this.
+    heap_string = 16,
+    // reserved 17..255 for future extensions
 };
 
 // ---- bit layout constants ----
@@ -96,6 +105,7 @@ const misc_bool_false: u64 = 4;
 const misc_bool_true: u64 = 5;
 const misc_boxed_int: u64 = 6;
 const misc_partial_app: u64 = 7;
+const misc_heap_string: u64 = 8;
 
 // Mask matching the high 16 bits + the 4-bit misc sub-tag (bits 47:44).
 const misc_full_tag_mask: u64 = high_16_mask | (misc_subtag_mask << misc_subtag_shift);
@@ -220,6 +230,10 @@ pub const Value = extern struct {
         return miscTagged(misc_partial_app, id);
     }
 
+    pub fn heapString(id: ObjectId) Value {
+        return miscTagged(misc_heap_string, id);
+    }
+
     // ---- discrimination ----
 
     inline fn isTagged(self: Value) bool {
@@ -246,6 +260,7 @@ pub const Value = extern struct {
                 misc_bool_true => .bool_true,
                 misc_boxed_int => .boxed_int,
                 misc_partial_app => .partial_app,
+                misc_heap_string => .heap_string,
                 else => unreachable,
             },
             else => unreachable,
@@ -308,6 +323,10 @@ pub const Value = extern struct {
 
     pub fn isContextString(self: Value) bool {
         return self.isMiscSub(misc_string_context);
+    }
+
+    pub fn isHeapString(self: Value) bool {
+        return self.isMiscSub(misc_heap_string);
     }
 
     pub fn isBoxedInt(self: Value) bool {
@@ -409,6 +428,7 @@ pub const Value = extern struct {
             .string_context => try writer.writeAll("<string-context>"),
             .boxed_int => try writer.print("<boxed-int:{d}>", .{self.asObjectId()}),
             .partial_app => try writer.writeAll("<partial-app>"),
+            .heap_string => try writer.print("<heap-string:{d}>", .{self.asObjectId()}),
         }
     }
 };

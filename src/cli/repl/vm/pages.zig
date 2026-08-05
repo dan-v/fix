@@ -317,6 +317,7 @@ pub fn Methods(comptime Explorer: type) type {
                     try Explorer.Ops.pages.appendValueRef(self, &page, "function", partial.function);
                     try page.line(try std.fmt.allocPrint(arena, "arguments   {d}", .{partial.args}), .none);
                 },
+                .heap_string => |string| try page.line(try std.fmt.allocPrint(arena, "bytes       {d}", .{string.len}), .none),
             }
             try page.line("", .none);
             try Explorer.Ops.pages.appendReferences(self, &page, .{ .object = id });

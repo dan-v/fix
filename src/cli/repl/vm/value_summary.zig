@@ -236,6 +236,7 @@ pub fn Methods(comptime Explorer: type) type {
                 .thunk,
                 .builtin_closure,
                 .string_context,
+                .heap_string,
                 .boxed_int,
                 .partial_app,
                 => unreachable,
@@ -277,6 +278,7 @@ pub fn Methods(comptime Explorer: type) type {
                         .context_string => |string| try std.fmt.allocPrint(arena, "context string · {d} entries", .{string.context}),
                         .boxed_int => |value| try std.fmt.allocPrint(arena, "int {d}", .{value}),
                         .partial_app => |partial| try std.fmt.allocPrint(arena, "partial application · {d} args", .{partial.args}),
+                        .heap_string => |string| try std.fmt.allocPrint(arena, "heap string · {d} bytes", .{string.len}),
                     };
                     return width_mod.endEllipsis(arena, text, max_cells);
                 } else |_| {}

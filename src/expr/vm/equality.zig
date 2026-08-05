@@ -92,7 +92,7 @@ pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *EqualityPairSet
     }
 
     if (isStringComparable(va) and isStringComparable(vb)) {
-        return strings.stringTextInternIdsEqual(self, va, vb);
+        return strings.stringTextEqual(self, va, vb);
     }
     if (va.kind() != vb.kind()) return false;
     return switch (va.kind()) {
@@ -106,7 +106,7 @@ pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *EqualityPairSet
         .builtin => va.asBuiltinId() == vb.asBuiltinId(),
         .builtin_closure => va.asObjectId() == vb.asObjectId(),
         .partial_app => va.asObjectId() == vb.asObjectId(),
-        .string, .path, .string_context, .thunk => unreachable,
+        .string, .path, .string_context, .heap_string, .thunk => unreachable,
     };
 }
 
@@ -288,5 +288,5 @@ pub fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
 }
 
 pub fn isStringComparable(value: Value) bool {
-    return value.isString() or value.isPath() or value.isContextString();
+    return value.isString() or value.isPath() or value.isContextString() or value.isHeapString();
 }

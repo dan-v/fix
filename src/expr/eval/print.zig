@@ -193,6 +193,7 @@ const ValuePrinter = struct {
                 const string = try self.host.heap.getContextString(value.asObjectId());
                 try self.quotedString(self.host.intern.get(string.text));
             },
+            .heap_string => try self.quotedString(try self.host.heap.getHeapString(value.asObjectId())),
             .list => try self.writeList(value.asObjectId()),
             .attrs => try self.writeAttrs(value.asObjectId()),
             // Marker strings match Nix's value printer: a user lambda is

@@ -72,8 +72,68 @@ pub fn stringTextInternIdsEqual(self: *VM, left: Value, right: Value) !bool {
     return (try stringTextInternId(self, left)) == (try stringTextInternId(self, right));
 }
 
+/// Threshold at which derived-string producers allocate GC-able heap
+/// strings (`Value.heap_string`) instead of interning. `maxInt` = every
+/// string interns (the pre-heap-string behavior); 0 = everything eligible
+/// goes to the heap (the stress lane). Set once at engine init from
+/// `FIX_HEAP_STR_MIN` before workers start.
+pub var heap_string_min: usize = std.math.maxInt(usize);
+
+/// Construct a string value from freshly-assembled bytes. Short text
+/// interns (dedup pays: attr names, keys, repeated fragments); text of at
+/// least `heap_string_min` bytes becomes a GC-able heap string, so churn —
+/// unique intermediates nothing ever looks at again — can be collected.
+/// NEVER route text bound for a context string or an attr name through
+/// this: those stay id-keyed (`addContextString` asserts it).
+pub fn makeString(self: *VM, bytes: []const u8) !Value {
+    if (bytes.len >= heap_string_min)
+        return Value.heapString(try self.heap.addHeapString(bytes));
+    return Value.string(try self.intern.intern(bytes));
+}
+
+/// Borrow the text of a forced string-like value. For interned forms the
+/// slice is immortal; for a heap string it follows the
+/// `ObjectHeap.getHeapString` contract — valid while `value` stays rooted
+/// and only until the next GC safepoint. Copy or intern to retain.
+pub fn stringBytes(self: *VM, value: Value) ![]const u8 {
+    return switch (value.kind()) {
+        .string, .path => self.intern.get(value.asInternId()),
+        .string_context => self.intern.get((try self.heap.getContextString(value.asObjectId())).text),
+        .heap_string => self.heap.getHeapString(value.asObjectId()),
+        else => error.TypeError,
+    };
+}
+
+/// String equality over any string-like pair. Interned-only pairs keep the
+/// id-compare fast path; a heap string on either side compares bytes
+/// (unique-by-construction ids can't speak for content).
+pub fn stringTextEqual(self: *VM, left: Value, right: Value) !bool {
+    if (!left.isHeapString() and !right.isHeapString())
+        return stringTextInternIdsEqual(self, left, right);
+    return std.mem.eql(u8, try stringBytes(self, left), try stringBytes(self, right));
+}
+
+/// A string-like's text as an id for an id-keyed role (attr NAME
+/// construction, pattern-cache key): heap-resident text is interned here,
+/// at the boundary where identity starts to matter.
+pub fn stringNameId(self: *VM, value: Value) !InternId {
+    if (value.isHeapString())
+        return self.intern.intern(try self.heap.getHeapString(value.asObjectId()));
+    return stringTextInternId(self, value);
+}
+
+/// Read-only name lookup (dynamic select, hasAttr): like `stringNameId`
+/// but a heap string probes the intern table WITHOUT inserting — every
+/// attr name is interned at construction, so a probe miss proves the attr
+/// cannot exist, and the miss leaves no immortal entry behind.
+pub fn lookupNameId(self: *VM, value: Value) !?InternId {
+    if (value.isHeapString())
+        return self.intern.probe(try self.heap.getHeapString(value.asObjectId()));
+    return try stringTextInternId(self, value);
+}
+
 pub fn isPlainString(value: Value) bool {
-    return value.isString() or value.isContextString();
+    return value.isString() or value.isContextString() or value.isHeapString();
 }
 
 pub fn attrsStringLikeValue(self: *VM, attrs: Value) !Value {

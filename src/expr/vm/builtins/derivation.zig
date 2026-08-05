@@ -740,7 +740,7 @@ fn appendStructuredJsonValue(
             var fbuf: [shared.json_float_buffer_size]u8 = undefined;
             try out.appendSlice(self.allocator, shared.jsonFloatText(&fbuf, forced.asFloat()));
         },
-        .string, .path, .string_context => {
+        .string, .path, .string_context, .heap_string => {
             try appendStructuredJsonStringValue(self, out, forced, inputs, owned_strings);
         },
         .list => {

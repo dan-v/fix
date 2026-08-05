@@ -379,6 +379,7 @@ pub const Context = struct {
                 try self.writeHeapValueRef("function", partial.function);
                 try self.writer.print("  arguments: {d}\n", .{partial.args});
             },
+            .heap_string => |string| try self.writer.print("  bytes: {d}\n", .{string.len}),
         }
         try self.writeReferences(.{ .object = id }, limit);
     }
@@ -828,6 +829,7 @@ fn objectInfoLabel(info: runtime.heap.ObjectInfo) []const u8 {
         .context_string => "context_string",
         .boxed_int => "boxed_int",
         .partial_app => "partial_app",
+        .heap_string => "heap_string",
     };
 }
 

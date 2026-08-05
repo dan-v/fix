@@ -110,12 +110,16 @@ const ObjectStore = segments.FlatStore(Object, .{ .max_slots = object_max_slots,
 const ValueStore = segments.StableSegments(Value, .{ .first_segment_size = value_chunk_size, .vma_tag = .values, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 const AttrStore = segments.StableSegments(AttrEntry, .{ .first_segment_size = attr_chunk_size, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 const AttrPosStore = segments.StableSegments(AttrPosEntry, .{ .first_segment_size = attr_position_chunk_size, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+/// GC-able string text (`Object.heap_string`). Byte-granular: one "slot"
+/// is one byte, so range lengths are byte counts.
+const ByteStore = segments.StableSegments(u8, .{ .first_segment_size = byte_chunk_size, .vma_tag = .strbytes, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 
 pub var next_heap_token: std.atomic.Value(u64) = .init(1);
 
 pub const ValueRange = ValueStore.Range;
 pub const AttrRange = AttrStore.Range;
 pub const AttrPosRange = AttrPosStore.Range;
+pub const ByteRange = ByteStore.Range;
 
 /// A zero-length attr-position range: the attrset carries no source
 /// positions. Sliced only after a `len == 0` guard, so the (possibly
@@ -223,6 +227,13 @@ pub const Object = union(enum) {
     /// 48-bit inline int payload. See `runtime/int.zig`.
     boxed_int: i64,
     partial_app: PartialAppObject,
+    /// GC-able string text (`Value.heap_string`): bytes in the heap's
+    /// byte store instead of the immortal intern table. A GC leaf — no
+    /// outgoing Value edges; sweep returns the byte range. Equality and
+    /// ordering are byte-wise at the VM layer; the text is NOT id-keyed,
+    /// so it must be interned before use as an attr name or any other
+    /// id-compared role.
+    heap_string: ByteRange,
 };
 
 /// Per-worker thread-local allocation buffer. Each worker reserves a
@@ -240,6 +251,9 @@ const object_chunk_size: u32 = 8192;
 const value_chunk_size: u32 = 8192;
 const attr_chunk_size: u32 = 8192;
 const attr_position_chunk_size: u32 = 4096;
+/// Byte-granular slots: 64 KiB TLABs (comparable byte volume to the
+/// 8192-slot value chunks).
+const byte_chunk_size: u32 = 65536;
 
 /// Single source of truth for the heap's range side-stores. Everything
 /// indexed per-store — the `HeapLocal` reuse-stat arrays, the shared free
@@ -278,6 +292,16 @@ pub const range_stores = .{
         .shared = "gc_shared_free_attr_pos",
         .chunk_size = attr_position_chunk_size,
     },
+    .{
+        .name = "bytes",
+        .Store = ByteStore,
+        .Elem = u8,
+        .store = "bytes",
+        .chunk = "byte",
+        .free = "gc_free_bytes",
+        .shared = "gc_shared_free_bytes",
+        .chunk_size = byte_chunk_size,
+    },
 };
 
 /// Table row index by short store name; comptime-only.
@@ -311,6 +335,7 @@ pub const HeapLocal = struct {
     value: LocalChunk = .{},
     attr: LocalChunk = .{},
     attr_pos: LocalChunk = .{},
+    byte: LocalChunk = .{},
     /// Monotonic count of thunks this worker has created. One plain add
     /// on a cache line the allocation already touches; used by the
     /// sibling-sweep diagnostics (`FIX_SIBLING_LOG`) to attribute
@@ -334,6 +359,7 @@ pub const HeapLocal = struct {
     gc_free_values: RangeFreeList = .{},
     gc_free_attrs: RangeFreeList = .{},
     gc_free_attr_pos: RangeFreeList = .{},
+    gc_free_bytes: RangeFreeList = .{},
     /// Old objects that gained a young reference since the last minor. The
     /// worker-owned write barrier appends without locking; the next stop-the-
     /// world mark drains and clears the list.
@@ -358,9 +384,8 @@ pub const HeapLocal = struct {
 
     fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
         self.gc_free_objects.deinit(allocator);
-        self.gc_free_values.deinit(allocator);
-        self.gc_free_attrs.deinit(allocator);
-        self.gc_free_attr_pos.deinit(allocator);
+        inline for (range_stores) |row|
+            @field(self, row.free).deinit(allocator);
         self.gc_remset.deinit(allocator);
         self.gc_young_slots.deinit(allocator);
     }
@@ -421,6 +446,7 @@ pub const ObjectHeap = struct {
     values: ValueStore,
     attrs: AttrStore,
     attr_positions: AttrPosStore,
+    bytes: ByteStore,
     /// One entry per worker (including the main thread). Indexed by
     /// `worker_id_mod.currentId()`.
     worker_locals: []HeapLocal,
@@ -446,6 +472,7 @@ pub const ObjectHeap = struct {
     gc_shared_free_values: RangeFreeList,
     gc_shared_free_attrs: RangeFreeList,
     gc_shared_free_attr_pos: RangeFreeList,
+    gc_shared_free_bytes: RangeFreeList,
     gc_shared_free_range_mu: sync.SpinMutex,
     gc_shared_free_range_max: [range_stores.len]std.atomic.Value(u32),
     /// Unique-per-init id for cache invalidation. Same trick as the
@@ -494,6 +521,8 @@ pub const ObjectHeap = struct {
         attrs.setHugePolicy(huge_policy);
         var attr_positions: AttrPosStore = .empty;
         attr_positions.setHugePolicy(huge_policy);
+        var bytes: ByteStore = .empty;
+        bytes.setHugePolicy(huge_policy);
         const locals = try allocator.alloc(HeapLocal, @max(worker_count, 1));
         errdefer allocator.free(locals);
         for (locals) |*l| l.* = .{};
@@ -506,6 +535,7 @@ pub const ObjectHeap = struct {
             .values = values,
             .attrs = attrs,
             .attr_positions = attr_positions,
+            .bytes = bytes,
             .worker_locals = locals,
             .sweep_filter = sweep_filter,
             .gc_shared_free_objects = .empty,
@@ -514,6 +544,7 @@ pub const ObjectHeap = struct {
             .gc_shared_free_values = .{},
             .gc_shared_free_attrs = .{},
             .gc_shared_free_attr_pos = .{},
+            .gc_shared_free_bytes = .{},
             .gc_shared_free_range_mu = .{},
             .gc_shared_free_range_max = @splat(.init(0)),
             .token = next_heap_token.fetchAdd(1, .monotonic),
@@ -532,6 +563,7 @@ pub const ObjectHeap = struct {
         self.gc_shared_free_objects.deinit(self.allocator);
         inline for (range_stores) |row|
             @field(self, row.shared).deinit(self.allocator);
+        self.bytes.deinit(self.allocator);
         self.attr_positions.deinit(self.allocator);
         self.attrs.deinit(self.allocator);
         self.values.deinit(self.allocator);
@@ -746,6 +778,7 @@ pub const ObjectHeap = struct {
             .context_string => |string| .{ .context_string = .{ .text = string.text, .context = string.context.len } },
             .boxed_int => |value| .{ .boxed_int = value },
             .partial_app => |partial| .{ .partial_app = .{ .function = inspectValue(partial.func), .args = partial.args.len } },
+            .heap_string => |range| .{ .heap_string = .{ .len = range.len } },
         };
     }
 
@@ -783,7 +816,7 @@ pub const ObjectHeap = struct {
                 try collectValueReference(partial.func, allocator, out);
                 try self.collectValueRangeReferences(partial.args, allocator, out);
             },
-            .boxed_int => {},
+            .boxed_int, .heap_string => {},
             .thunk => |*thunk| try collectThunkReferences(thunk, allocator, out),
         }
     }
@@ -936,7 +969,7 @@ pub const ObjectHeap = struct {
         values: u32,
         attrs: u32,
         attr_positions: u32,
-        variant_counts: [9]u32,
+        variant_counts: [10]u32,
         thunk_states: [5]u32,
         /// Of the `resolved` thunks (thunk_states[2]), the split by
         /// `Thunk.demanded`: `resolved_demanded` were observed by a real
@@ -969,6 +1002,7 @@ pub const ObjectHeap = struct {
                 6 => "boxed int",
                 7 => "attrs merge",
                 8 => "partial application",
+                9 => "heap string",
                 else => "?",
             };
         }
@@ -1014,7 +1048,7 @@ pub const ObjectHeap = struct {
             .values = self.values.count(),
             .attrs = self.attrs.count(),
             .attr_positions = self.attr_positions.count(),
-            .variant_counts = [_]u32{0} ** 9,
+            .variant_counts = [_]u32{0} ** 10,
             .thunk_states = [_]u32{0} ** 5,
             .resolved_demanded = 0,
             .resolved_undemanded = 0,
@@ -1062,6 +1096,7 @@ pub const ObjectHeap = struct {
                 .boxed_int => 6,
                 .merge_attrs => 7,
                 .partial_app => 8,
+                .heap_string => 9,
             };
             result.variant_counts[v_index] += 1;
         }
@@ -1510,6 +1545,7 @@ pub const ObjectHeap = struct {
         values: RangeReuseCounts = .{},
         attrs: RangeReuseCounts = .{},
         attr_pos: RangeReuseCounts = .{},
+        bytes: RangeReuseCounts = .{},
     };
 
     pub const FreeRangeStats = RangeFreeList.Stats;
@@ -1519,6 +1555,7 @@ pub const ObjectHeap = struct {
         values: FreeRangeStats = .{},
         attrs: FreeRangeStats = .{},
         attr_pos: FreeRangeStats = .{},
+        bytes: FreeRangeStats = .{},
     };
 
     /// Aggregate diagnostics after evaluation has quiesced.
@@ -2764,6 +2801,27 @@ pub const ObjectHeap = struct {
 
     pub fn addBoxedInt(self: *ObjectHeap, v: i64) !ObjectId {
         return self.add(.{ .boxed_int = v });
+    }
+
+    /// Copy `text` into the GC-able byte store and wrap it in a
+    /// `heap_string` object. The caller keeps the returned Value rooted for
+    /// as long as it borrows slices of the text (`getHeapString`).
+    pub fn addHeapString(self: *ObjectHeap, text: []const u8) !ObjectId {
+        const range = try self.reserveStoreLocal(comptime rangeStoreIndex("bytes"), @intCast(text.len));
+        errdefer self.bytes.rollback(range);
+        @memcpy(self.bytes.sliceMut(range), text);
+        return self.add(.{ .heap_string = range });
+    }
+
+    /// Borrow a heap string's bytes. Same lifetime contract as
+    /// `materializeAttrs`: valid while the owning value is rooted, and only
+    /// until the next GC safepoint — code that forces/allocates while
+    /// holding the slice must re-fetch (or copy/intern for retention).
+    pub fn getHeapString(self: *const ObjectHeap, id: ObjectId) ![]const u8 {
+        return switch (self.get(id).*) {
+            .heap_string => |range| self.bytes.slice(range),
+            else => error.InvalidObjectType,
+        };
     }
 
     pub fn getBoxedInt(self: *const ObjectHeap, id: ObjectId) !i64 {
