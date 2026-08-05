@@ -42,7 +42,7 @@ test "end-to-end: dynamic attribute selection" {
     defer ev.deinit();
 
     const result = try ev.evaluate("let digits = { \"10\" = \"A\"; }; d = 10; in digits.${builtins.toString d}");
-    try std.testing.expectEqualStrings("A", ev.intern.get(result.asInternId()));
+    try std.testing.expectEqualStrings("A", (try ev.stringValue(result)).?);
 
     const declared = try ev.evaluate("let key = \"x\"; in ({ ${key} = 4; }).x");
     try std.testing.expectEqual(@as(i64, 4), declared.asInt());
@@ -57,7 +57,7 @@ test "end-to-end: dynamic attribute selection" {
     try std.testing.expectEqual(@as(i64, 9), defaulted_missing_prefix.asInt());
 
     const defaulted_arg = try ev.evaluate("let v = x: x; final = {}; in v final.gcc.arch or \"default\"");
-    try std.testing.expectEqualStrings("default", ev.intern.get(defaulted_arg.asInternId()));
+    try std.testing.expectEqualStrings("default", (try ev.stringValue(defaulted_arg)).?);
 
     const has_dynamic = try ev.evaluate("let key = \"x\"; in { x = 1; } ? ${key}");
     try std.testing.expect(has_dynamic.asBool());

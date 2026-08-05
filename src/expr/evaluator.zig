@@ -2142,6 +2142,7 @@ pub const Engine = struct {
         const program = switch (forced_prog.kind()) {
             .string, .path => self.intern.get(forced_prog.asInternId()),
             .string_context => self.intern.get((try self.heap.getContextString(forced_prog.asObjectId())).text),
+            .heap_string => try self.heap.getHeapString(forced_prog.asObjectId()),
             else => return null,
         };
         var drv_path: ?[]const u8 = null;
@@ -2166,6 +2167,7 @@ pub const Engine = struct {
         const text_id = switch (forced.kind()) {
             .string, .path => forced.asInternId(),
             .string_context => (try self.heap.getContextString(forced.asObjectId())).text,
+            .heap_string => try self.intern.intern(try self.heap.getHeapString(forced.asObjectId())),
             else => return null,
         };
         return self.intern.get(text_id);
@@ -2318,6 +2320,7 @@ pub const Engine = struct {
         return switch (forced.kind()) {
             .string, .path => self.intern.get(forced.asInternId()),
             .string_context => self.intern.get((try self.heap.getContextString(forced.asObjectId())).text),
+            .heap_string => try self.heap.getHeapString(forced.asObjectId()),
             else => null,
         };
     }
@@ -2442,6 +2445,9 @@ pub const Engine = struct {
             .collect = gcCollect,
             .help_mark = gcHelpMark,
         });
+        // Attr-position chunk refs resolve through the registry (literal
+        // attrsets share their chunk's baked table instead of copying it).
+        self.heap.setChunkAttrPosResolver(.{ .ctx = self, .resolve = chunkAttrPosResolve });
         if (self.sources.env_map) |em|
             if (em.get("FIX_GC_NOREUSE") != null) self.heap.gcSetDisableReuse(true);
         if (self.sources.env_map) |em|
@@ -2472,6 +2478,12 @@ pub const Engine = struct {
         else if (budget > 0)
             heap_collector.enableBudget(&self.heap, budget, gc_controller.constrainedMode(gcContext(self), budget));
         return w;
+    }
+
+    fn chunkAttrPosResolve(ctx: *anyopaque, chunk_id: u32) []const runtime.heap.AttrPosEntry {
+        const self: *Engine = @ptrCast(@alignCast(ctx));
+        const chunk = self.registry.get(chunk_id) orelse return &.{};
+        return chunk.attr_pos;
     }
 
     fn gcCollect(ctx: *anyopaque, collector_id: u8) void {
@@ -2936,8 +2948,7 @@ fn writeValueBody(_: *VM, ev: *Engine, writer: *std.Io.Writer, value: Value) !vo
 
 fn writeRawValueBody(vm: *VM, writer: *std.Io.Writer, value: Value) !void {
     const string_value = try vm_strings.coerceLanguageStringValue(vm, value);
-    const text_id = try vm_strings.stringTextInternId(vm, string_value);
-    try writer.writeAll(vm.intern.get(text_id));
+    try writer.writeAll(try vm_strings.stringBytes(vm, string_value));
 }
 
 fn valuePrintHost(ev: *Engine) eval_print.Host {

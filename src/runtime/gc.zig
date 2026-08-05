@@ -733,7 +733,7 @@ fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: Obj
         .list => |r| scanValues(Sink, sink, heap, r),
         .attrs => |a| {
             scanAttrs(Sink, sink, heap, a.range);
-            sink.countAttrPos(a.positions.len);
+            sink.countAttrPos(a.positions.heapLen());
         },
         .merge_attrs => |m| {
             sink.markObject(heap, m.base);
@@ -748,6 +748,9 @@ fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: Obj
             scanValues(Sink, sink, heap, p.args);
         },
         .context_string => |c| scanAttrs(Sink, sink, heap, c.context),
+        // Leaves: byte payloads have no Value edges; marking the object
+        // keeps its byte range (if any) from being swept.
+        .heap_string, .heap_string_inline => {},
         .boxed_int => {},
         .thunk => scanThunk(Sink, sink, heap, &obj.thunk),
     }
@@ -801,7 +804,7 @@ fn scanThunk(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, t: *cons
 pub inline fn hasObjectRef(v: Value) bool {
     return v.isList() or v.isAttrs() or v.isThunk() or v.isClosure() or
         v.isBuiltinClosure() or v.isContextString() or v.isBoxedInt() or
-        v.isPartialApp();
+        v.isPartialApp() or v.isHeapString();
 }
 
 // --- per-heap collection stats (written by the collection coordinator) ---
@@ -1088,6 +1091,51 @@ test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses the
     try std.testing.expectEqual(count_before, heap.objects.count()); // slot reused
     try std.testing.expectEqual(values_before, heap.values.count()); // value range reused
     try std.testing.expectEqual(@as(i64, 200), (try heap.getListItem(reused, 1)).asInt());
+}
+
+test "gc reclaim: heap strings survive marking; swept byte ranges poison and reuse" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    // Equal lengths so the dead range is an exact best-fit for the reuse
+    // allocation below.
+    const live_text = "live-" ++ "x" ** 55;
+    const dead_text = "dead-" ++ "y" ** 55;
+    const live_id = try heap.addHeapString(live_text);
+    const dead_id = try heap.addHeapString(dead_text);
+    // The dangling borrow a native caller could still hold across a
+    // collection that sweeps the owner.
+    const stale = try heap.getHeapString(dead_id);
+    const count_before = heap.objects.count();
+    const bytes_before = heap.bytes.count();
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    tr.markValue(&heap, Value.heapString(live_id));
+    tr.drain(&heap);
+    try std.testing.expectEqual(@as(u64, 1), tr.stats.objects);
+
+    const st = heap_collector.sweep(&heap, tr.mark_bits);
+    try std.testing.expectEqual(@as(u64, 1), st.objects_freed);
+
+    // The live string's text is intact.
+    try std.testing.expectEqualStrings(live_text, try heap.getHeapString(live_id));
+
+    // Detector builds memset swept byte ranges: the dangling slice reads
+    // visible garbage, never stale-but-plausible text.
+    if (comptime heap_mod.gc_debug) {
+        for (stale) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    }
+
+    // A same-length heap string reuses the freed byte range + object slot,
+    // so neither store grows — the churn-reclaim property end to end.
+    const reused = try heap.addHeapString(dead_text);
+    try std.testing.expectEqual(count_before, heap.objects.count());
+    try std.testing.expectEqual(bytes_before, heap.bytes.count());
+    try std.testing.expectEqualStrings(dead_text, try heap.getHeapString(reused));
 }
 
 test "concurrency: detector poisons swept thunk state so stale claims trap" {
@@ -1405,6 +1453,11 @@ test "major coalescing joins adjacent ranges freed by different collections" {
 }
 
 test "exhausting a reclaimed object pool requests an early collection once" {
+    // The object-reuse contract this asserts is deliberately void in
+    // detector builds: swept slots are retained un-reused so stale id reads
+    // keep trapping (`sweepYoungListInto`, the `!gc_debug` reuse gate in
+    // `reserveObjectSlot`), and pool-miss arming is bypassed with them.
+    if (comptime heap_mod.gc_debug) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
@@ -1416,7 +1469,7 @@ test "exhausting a reclaimed object pool requests an early collection once" {
     // the one-shot arm.
     heap.collection.object_miss_collect_armed.store(true, .monotonic);
     _ = try heap.reserveObjectSlot();
-    try std.testing.expect(heap.collection.collect_requested);
+    try std.testing.expect(heap.collection.collect_requested.load(.monotonic));
     try std.testing.expect(!heap.collection.object_miss_collect_armed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), heap.collection.object_miss_collect_requests.load(.monotonic));
 
@@ -1425,6 +1478,9 @@ test "exhausting a reclaimed object pool requests an early collection once" {
 }
 
 test "minor sweep publishes every allocation worker's storage for reuse" {
+    // Asserts object-slot reuse — deliberately void in detector builds
+    // (see the skip note in the pool-exhaustion test above).
+    if (comptime heap_mod.gc_debug) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 2);
     defer heap.deinit();
@@ -1481,6 +1537,9 @@ test "minor sweep publishes every allocation worker's storage for reuse" {
 }
 
 test "collection boundary makes free storage available to an idle worker" {
+    // Asserts object-slot reuse — deliberately void in detector builds
+    // (see the skip note in the pool-exhaustion test above).
+    if (comptime heap_mod.gc_debug) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 2);
     defer heap.deinit();

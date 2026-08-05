@@ -63,10 +63,10 @@ test "end-to-end: string concatenation" {
     defer ev.deinit();
 
     const literal = try ev.evaluate("\"ab\" + \"cd\"");
-    try std.testing.expectEqualStrings("abcd", ev.intern.get(literal.asInternId()));
+    try std.testing.expectEqualStrings("abcd", (try ev.stringValue(literal)).?);
 
     const bound = try ev.evaluate("let a = \"ab\"; in a + \"cd\"");
-    try std.testing.expectEqualStrings("abcd", ev.intern.get(bound.asInternId()));
+    try std.testing.expectEqualStrings("abcd", (try ev.stringValue(bound)).?);
 
     try std.testing.expectError(error.TypeError, ev.evaluate("\"ab\" + 1"));
 }
@@ -78,10 +78,10 @@ test "end-to-end: string concatenation coerces string-like attrs" {
     defer ev.deinit();
 
     const out_path = try ev.evaluate("{ outPath = \"/nix/store/source\"; } + \"/subdir\"");
-    try std.testing.expectEqualStrings("/nix/store/source/subdir", ev.intern.get(out_path.asInternId()));
+    try std.testing.expectEqualStrings("/nix/store/source/subdir", (try ev.stringValue(out_path)).?);
 
     const custom = try ev.evaluate("{ __toString = self: self.value; value = \"left\"; } + \"-right\"");
-    try std.testing.expectEqualStrings("left-right", ev.intern.get(custom.asInternId()));
+    try std.testing.expectEqualStrings("left-right", (try ev.stringValue(custom)).?);
 }
 
 test "end-to-end: path concatenation follows Nix left-path semantics" {
@@ -92,11 +92,11 @@ test "end-to-end: path concatenation follows Nix left-path semantics" {
 
     const suffix = try ev.evaluate("./foo + \"x\"");
     try std.testing.expectEqual(value.ValueType.path, suffix.kind());
-    try std.testing.expectEqualStrings("./foox", ev.intern.get(suffix.asInternId()));
+    try std.testing.expectEqualStrings("./foox", (try ev.stringValue(suffix)).?);
 
     const paths = try ev.evaluate("./foo + ./bar");
     try std.testing.expectEqual(value.ValueType.path, paths.kind());
-    try std.testing.expectEqualStrings("./foo./bar", ev.intern.get(paths.asInternId()));
+    try std.testing.expectEqualStrings("./foo./bar", (try ev.stringValue(paths)).?);
 
     var ev_with_base = try Engine.init(alloc, .{ .worker_count = 0 });
     defer ev_with_base.deinit();
@@ -111,16 +111,16 @@ test "end-to-end: string interpolation" {
     defer ev.deinit();
 
     const literal = try ev.evaluate("\"a${\"b\"}c\"");
-    try std.testing.expectEqualStrings("abc", ev.intern.get(literal.asInternId()));
+    try std.testing.expectEqualStrings("abc", (try ev.stringValue(literal)).?);
 
     const bound = try ev.evaluate("let x = \"b\"; in \"a${x}c\"");
-    try std.testing.expectEqualStrings("abc", ev.intern.get(bound.asInternId()));
+    try std.testing.expectEqualStrings("abc", (try ev.stringValue(bound)).?);
 
     const inherit_source = try ev.evaluate(
         \\let cfg = { host = "127.0.0.1"; port = 5000; threads = 8; };
         \\in "${({ inherit (cfg) host port threads; }).host}"
     );
-    try std.testing.expectEqualStrings("127.0.0.1", ev.intern.get(inherit_source.asInternId()));
+    try std.testing.expectEqualStrings("127.0.0.1", (try ev.stringValue(inherit_source)).?);
 
     try std.testing.expectError(error.TypeError, ev.evaluate("\"a${1}c\""));
 }
@@ -132,19 +132,19 @@ test "end-to-end: nested interpolation in strings" {
     defer ev.deinit();
 
     const literal_brace = try ev.evaluate("\"a${{ x = \"}\"; }.x}b\"");
-    try std.testing.expectEqualStrings("a}b", ev.intern.get(literal_brace.asInternId()));
+    try std.testing.expectEqualStrings("a}b", (try ev.stringValue(literal_brace)).?);
 
     const nested_attr = try ev.evaluate("\"a${{ x = { y = \"b\"; }; }.x.y}c\"");
-    try std.testing.expectEqualStrings("abc", ev.intern.get(nested_attr.asInternId()));
+    try std.testing.expectEqualStrings("abc", (try ev.stringValue(nested_attr)).?);
 
     const escaped_interpolation = try ev.evaluate("let x = \"X\"; in \"a$${x}b\"");
-    try std.testing.expectEqualStrings("a$${x}b", ev.intern.get(escaped_interpolation.asInternId()));
+    try std.testing.expectEqualStrings("a$${x}b", (try ev.stringValue(escaped_interpolation)).?);
 
     const odd_dollar_run_interpolates = try ev.evaluate("let x = \"X\"; in \"a$$${x}b\"");
-    try std.testing.expectEqualStrings("a$$Xb", ev.intern.get(odd_dollar_run_interpolates.asInternId()));
+    try std.testing.expectEqualStrings("a$$Xb", (try ev.stringValue(odd_dollar_run_interpolates)).?);
 
     const even_dollar_run_escapes = try ev.evaluate("let x = \"X\"; in \"a$$$${x}b\"");
-    try std.testing.expectEqualStrings("a$$$${x}b", ev.intern.get(even_dollar_run_escapes.asInternId()));
+    try std.testing.expectEqualStrings("a$$$${x}b", (try ev.stringValue(even_dollar_run_escapes)).?);
 }
 
 test "end-to-end: indented strings" {
@@ -159,7 +159,7 @@ test "end-to-end: indented strings" {
         \\  b
         \\''
     );
-    try std.testing.expectEqualStrings("a\nb\n", ev.intern.get(plain.asInternId()));
+    try std.testing.expectEqualStrings("a\nb\n", (try ev.stringValue(plain)).?);
 
     const interpolated = try ev.evaluate(
         \\let x = "b"; in ''
@@ -168,19 +168,19 @@ test "end-to-end: indented strings" {
         \\  c
         \\''
     );
-    try std.testing.expectEqualStrings("a\nb\nc\n", ev.intern.get(interpolated.asInternId()));
+    try std.testing.expectEqualStrings("a\nb\nc\n", (try ev.stringValue(interpolated)).?);
 
     const escaped = try ev.evaluate("'' ''${ ''' ''\\n ''");
-    try std.testing.expectEqualStrings("${ '' \n", ev.intern.get(escaped.asInternId()));
+    try std.testing.expectEqualStrings("${ '' \n", (try ev.stringValue(escaped)).?);
 
     const escaped_interpolation = try ev.evaluate("let x = \"X\"; in ''a$${x}b''");
-    try std.testing.expectEqualStrings("a$${x}b", ev.intern.get(escaped_interpolation.asInternId()));
+    try std.testing.expectEqualStrings("a$${x}b", (try ev.stringValue(escaped_interpolation)).?);
 
     const odd_dollar_run_interpolates = try ev.evaluate("let x = \"X\"; in ''a$$${x}b''");
-    try std.testing.expectEqualStrings("a$$Xb", ev.intern.get(odd_dollar_run_interpolates.asInternId()));
+    try std.testing.expectEqualStrings("a$$Xb", (try ev.stringValue(odd_dollar_run_interpolates)).?);
 
     const even_dollar_run_escapes = try ev.evaluate("let x = \"X\"; in ''a$$$${x}b''");
-    try std.testing.expectEqualStrings("a$$$${x}b", ev.intern.get(even_dollar_run_escapes.asInternId()));
+    try std.testing.expectEqualStrings("a$$$${x}b", (try ev.stringValue(even_dollar_run_escapes)).?);
 }
 
 test "end-to-end: list elements are lazy" {

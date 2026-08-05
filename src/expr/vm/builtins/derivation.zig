@@ -71,7 +71,7 @@ pub fn builtinDerivationLazyAttr(self: *VM, attrs_arg: Value, name_arg: Value) !
     const name = try vm_force.forceValue(self, name_arg);
     if (!attrs.isAttrs() or !isPlainString(name)) return error.TypeError;
 
-    const name_id = try stringTextInternId(self, name);
+    const name_id = try strings.stringNameId(self, name);
     const attrs_id = attrs.asObjectId();
     const name_text = self.intern.get(name_id);
 
@@ -293,7 +293,7 @@ fn readDerivationHeader(self: *VM, attrs_id: ObjectId) !DerivationHeader {
     const name_id = try self.intern.intern("name");
     const name_value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, name_id));
     if (!isPlainString(name_value)) return error.TypeError;
-    const drv_name_id = try stringTextInternId(self, name_value);
+    const drv_name_id = try strings.stringNameId(self, name_value);
     const drv_name = self.intern.get(drv_name_id);
     try validateDerivationName(self, drv_name);
 
@@ -571,9 +571,9 @@ fn applyFixedOutputAttrs(
         };
         const forced = try vm_force.forceValue(self, mode_value);
         if (!isPlainString(forced)) return error.TypeError;
-        break :blk self.intern.get(try stringTextInternId(self, forced));
+        break :blk try vm_strings.stringBytes(self, forced);
     };
-    const hash_text = self.intern.get(try stringTextInternId(self, hash_forced));
+    const hash_text = try vm_strings.stringBytes(self, hash_forced);
     const algo = try fixedOutputHashAlgorithm(self, attrs_id, hash_text);
     const hash_hex = derivation.hashToBase16(self.allocator, algo, hash_text) catch |err| switch (err) {
         error.InvalidHashAlgorithm => {
@@ -622,7 +622,7 @@ fn fixedOutputHashAlgorithm(self: *VM, attrs_id: ObjectId, hash_text: []const u8
     };
     const forced_algo = try vm_force.forceValue(self, algo_value);
     if (isPlainString(forced_algo)) {
-        const algo = self.intern.get(try stringTextInternId(self, forced_algo));
+        const algo = try vm_strings.stringBytes(self, forced_algo);
         if (algo.len != 0) return algo;
     } else if (!forced_algo.isNull()) return error.TypeError;
 
@@ -740,7 +740,7 @@ fn appendStructuredJsonValue(
             var fbuf: [shared.json_float_buffer_size]u8 = undefined;
             try out.appendSlice(self.allocator, shared.jsonFloatText(&fbuf, forced.asFloat()));
         },
-        .string, .path, .string_context => {
+        .string, .path, .string_context, .heap_string => {
             try appendStructuredJsonStringValue(self, out, forced, inputs, owned_strings);
         },
         .list => {
@@ -851,7 +851,7 @@ fn normalizeDerivationString(
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, value); // held across contextOutputs forces (below)
-    const text = self.intern.get(try stringTextInternId(self, value));
+    const text = try vm_strings.stringBytes(self, value);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
     var cursor: usize = 0;
@@ -955,7 +955,7 @@ fn contextOutputs(
             const item_value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
             if (!isPlainString(item_value)) return error.TypeError;
             // Interned — stable, no dupe (see normalizeDerivation).
-            output.* = self.intern.get(try stringTextInternId(self, item_value));
+            output.* = try vm_strings.stringBytes(self, item_value);
         }
         return outputs;
     } else |err| switch (err) {
@@ -1035,7 +1035,7 @@ fn derivationOutputNames(self: *VM, attrs_id: ObjectId) !DerivationOutputNames {
     for (names, 0..) |*name, i| {
         const value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
         if (!isPlainString(value)) return error.TypeError;
-        name.* = try stringTextInternId(self, value);
+        name.* = try strings.stringNameId(self, value);
         if (self.intern.get(name.*).len == 0) return error.InvalidDerivationOutput;
     }
     // Reject duplicate output names (Nix errors before building the .drv).

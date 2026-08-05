@@ -20,25 +20,41 @@ const prof_census = @import("../probe.zig").prof_census;
 
 const VM = vm_mod.VM;
 
+/// Intern the concatenation of `parts` (total byte length pre-computed by
+/// the caller). Small results — most attr names and interpolation results —
+/// assemble in a stack buffer, skipping the allocator round-trip a temp
+/// heap buffer pays per concat.
+fn internConcatParts(self: *VM, parts: []const []const u8, total: usize) !InternId {
+    var stack_buf: [64]u8 = undefined;
+    var heap_buf: []u8 = &.{};
+    defer if (heap_buf.len != 0) self.allocator.free(heap_buf);
+    const buf = if (total <= stack_buf.len) stack_buf[0..total] else blk: {
+        heap_buf = try self.allocator.alloc(u8, total);
+        break :blk heap_buf;
+    };
+    var off: usize = 0;
+    for (parts) |s| {
+        @memcpy(buf[off..][0..s.len], s);
+        off += s.len;
+    }
+    return self.intern.intern(buf);
+}
+
 pub fn concatInternedString(self: *VM, a: InternId, b: InternId) !InternId {
     const t_start = prof.tscMainOnly();
     const s_a = self.intern.get(a);
     const s_b = self.intern.get(b);
-    const buf = try self.allocator.alloc(u8, s_a.len + s_b.len);
-    defer self.allocator.free(buf);
-
-    @memcpy(buf[0..s_a.len], s_a);
-    @memcpy(buf[s_a.len..], s_b);
+    const total = s_a.len + s_b.len;
 
     const pre_entries = if (prof.enabled) self.intern.entries.count() else 0;
-    const id = try self.intern.intern(buf);
+    const id = try internConcatParts(self, &.{ s_a, s_b }, total);
     if (prof.enabled and t_start != 0) {
         prof_census.str.concat_calls += 1;
         prof_census.str.concat_cycles += prof.tscMainOnly() - t_start;
-        prof_census.str.concat_bytes += buf.len;
+        prof_census.str.concat_bytes += total;
         if (self.intern.entries.count() != pre_entries) {
             prof_census.str.concat_new += 1;
-            prof_census.str.concat_new_bytes += buf.len;
+            prof_census.str.concat_new_bytes += total;
         }
     }
     return id;
@@ -47,7 +63,7 @@ pub fn concatInternedString(self: *VM, a: InternId, b: InternId) !InternId {
 pub fn stringLikeValue(self: *VM, value: Value) !Value {
     const forced = try force.forceValue(self, value);
     return switch (forced.kind()) {
-        .string, .path, .string_context => forced,
+        .string, .path, .string_context, .heap_string => forced,
         .attrs => try attrsStringLikeValue(self, forced),
         else => trace.coercionError(self, forced),
     };
@@ -72,8 +88,136 @@ pub fn stringTextInternIdsEqual(self: *VM, left: Value, right: Value) !bool {
     return (try stringTextInternId(self, left)) == (try stringTextInternId(self, right));
 }
 
+/// Threshold at which derived-string producers allocate GC-able heap
+/// strings (`Value.heap_string`) instead of interning. Default 64: the
+/// phase-0 census put the churn class (unique fold/interpolation
+/// intermediates — the unbounded-growth case) at 64+ bytes, while
+/// shorter strings keep interning for dedup. Overridden once at engine
+/// init from `FIX_HEAP_STR_MIN`: a huge value restores the
+/// everything-interns behavior, 0 is the everything-heap stress lane.
+pub var heap_string_min: usize = 64;
+
+/// Construct a string value from freshly-assembled bytes. Short text
+/// interns (dedup pays: attr names, keys, repeated fragments); text of at
+/// least `heap_string_min` bytes becomes a GC-able heap string, so churn —
+/// unique intermediates nothing ever looks at again — can be collected.
+/// NEVER route text bound for a context string or an attr name through
+/// this: those stay id-keyed (`addContextString` asserts it).
+pub fn makeString(self: *VM, bytes: []const u8) !Value {
+    if (bytes.len >= heap_string_min)
+        return Value.heapString(try self.heap.addHeapString(bytes));
+    return Value.string(try self.intern.intern(bytes));
+}
+
+/// Construct a string value from DERIVED text whose global uniqueness the
+/// caller can't rule out but whose unbounded instances are unique —
+/// number formatting is the canonical producer. Two regimes:
+///
+/// - SHORT text (≤ 5 bytes) interns: small numbers (versions, ports,
+///   priorities, list indices) repeat millions of times across a real
+///   eval, and losing their dedup turned each occurrence into a live
+///   48-byte heap object — inflating the live set that every full mark
+///   walks (a measured +33% on the whole-nixpkgs eval). The possible
+///   short-numeric universe bounds the intern-table pollution at ~110k
+///   entries ever, so the churn fixture's unbounded-growth property is
+///   preserved.
+/// - LONGER text goes to the GC heap: real counters and timestamps are
+///   unique in practice, and interning a fold's worth of them was 33% of
+///   churn wall in table growth + rehash.
+///
+/// `heap_string_min` at maxInt remains the master off-switch.
+pub fn makeUniqueString(self: *VM, bytes: []const u8) !Value {
+    if (bytes.len <= 5 or heap_string_min == std.math.maxInt(usize))
+        return Value.string(try self.intern.intern(bytes));
+    return Value.heapString(try self.heap.addHeapString(bytes));
+}
+
+/// `makeString` over pre-sliced parts (the concat producers), carrying
+/// the -Dprof concat census that previously lived in
+/// `concatInternedString`. Contexted results must NOT come here — their
+/// text is id-keyed (`addContextString`); callers keep those on
+/// `internConcatParts`.
+pub fn makeConcatString(self: *VM, parts: []const []const u8, total: usize) !Value {
+    const t_start = prof.tscMainOnly();
+    if (total >= heap_string_min) {
+        const id = try self.heap.addHeapStringParts(parts, @intCast(total));
+        if (prof.enabled and t_start != 0) {
+            prof_census.str.concat_calls += 1;
+            prof_census.str.concat_cycles += prof.tscMainOnly() - t_start;
+            prof_census.str.concat_bytes += total;
+        }
+        return Value.heapString(id);
+    }
+    const pre_entries = if (prof.enabled) self.intern.entries.count() else 0;
+    const id = try internConcatParts(self, parts, total);
+    if (prof.enabled and t_start != 0) {
+        prof_census.str.concat_calls += 1;
+        prof_census.str.concat_cycles += prof.tscMainOnly() - t_start;
+        prof_census.str.concat_bytes += total;
+        if (self.intern.entries.count() != pre_entries) {
+            prof_census.str.concat_new += 1;
+            prof_census.str.concat_new_bytes += total;
+        }
+    }
+    return Value.string(id);
+}
+
+/// Borrow the text of a forced string-like value. For interned forms the
+/// slice is immortal; for a heap string it follows the
+/// `ObjectHeap.getHeapString` contract — valid while `value` stays rooted
+/// and only until the next GC safepoint. Copy or intern to retain.
+pub inline fn stringBytes(self: *VM, value: Value) ![]const u8 {
+    return switch (value.kind()) {
+        .string, .path => self.intern.get(value.asInternId()),
+        .string_context => self.intern.get((try self.heap.getContextString(value.asObjectId())).text),
+        .heap_string => self.heap.getHeapString(value.asObjectId()),
+        else => error.TypeError,
+    };
+}
+
+/// String equality over any string-like pair. Interned-only pairs keep the
+/// id-compare fast path; a heap string on either side compares bytes
+/// (unique-by-construction ids can't speak for content).
+pub fn stringTextEqual(self: *VM, left: Value, right: Value) !bool {
+    if (!left.isHeapString() and !right.isHeapString())
+        return stringTextInternIdsEqual(self, left, right);
+    return std.mem.eql(u8, try stringBytes(self, left), try stringBytes(self, right));
+}
+
+/// A string-like's text as an id for an id-keyed role (attr NAME
+/// construction, pattern-cache key): heap-resident text is interned here,
+/// at the boundary where identity starts to matter.
+pub fn stringNameId(self: *VM, value: Value) !InternId {
+    if (value.isHeapString())
+        return self.intern.intern(try self.heap.getHeapString(value.asObjectId()));
+    return stringTextInternId(self, value);
+}
+
+/// Read-only name lookup (dynamic select, hasAttr): like `stringNameId`
+/// but a heap string probes the intern table WITHOUT inserting — every
+/// attr name is interned at construction, so a probe miss proves the attr
+/// cannot exist, and the miss leaves no immortal entry behind.
+pub fn lookupNameId(self: *VM, value: Value) !?InternId {
+    if (value.isHeapString())
+        return self.intern.probe(try self.heap.getHeapString(value.asObjectId()));
+    return try stringTextInternId(self, value);
+}
+
+/// Resolve a forced dynamic-select NAME to an id for id-keyed attr lookup.
+/// Interned strings pass through untouched (the hot path); a heap string
+/// probes without inserting, mapping a miss to `error.MissingAttribute`
+/// (the caller's existing missing-attr handling — default value, `false`,
+/// user error — then applies unchanged). Everything else, including
+/// context strings, stays `error.TypeError` exactly as before.
+pub fn selectNameId(self: *VM, name_val: Value) !InternId {
+    if (name_val.isString()) return name_val.asInternId();
+    if (name_val.isHeapString())
+        return (try lookupNameId(self, name_val)) orelse error.MissingAttribute;
+    return error.TypeError;
+}
+
 pub fn isPlainString(value: Value) bool {
-    return value.isString() or value.isContextString();
+    return value.isString() or value.isContextString() or value.isHeapString();
 }
 
 pub fn attrsStringLikeValue(self: *VM, attrs: Value) !Value {
@@ -98,7 +242,11 @@ pub fn attrsStringLikeValue(self: *VM, attrs: Value) !Value {
 
 pub fn concatPathLike(self: *VM, left: Value, right: Value) !Value {
     const right_like = try stringLikeValue(self, right);
-    const raw_text_id = try concatInternedString(self, left.asInternId(), try stringTextInternId(self, right_like));
+    // Path values stay interned regardless of the right side's residency.
+    const raw_text_id = try internConcatParts(self, &.{
+        self.intern.get(left.asInternId()),
+        try stringBytes(self, right_like),
+    }, self.intern.get(left.asInternId()).len + (try stringBytes(self, right_like)).len);
     const raw_text = self.intern.get(raw_text_id);
     const text_id = if (std.fs.path.isAbsolute(raw_text)) text_id: {
         const normalized = try std.fs.path.resolve(self.allocator, &.{raw_text});
@@ -123,14 +271,24 @@ pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
     force.rootKeep(self, left_like); // held across the `right` coercion + appendStringContext forces
     const right_like = try coerceLanguageStringValue(self, right);
     force.rootKeep(self, right_like); // held across appendStringContext forces
-    const text_id = try concatInternedString(self, try stringTextInternId(self, left_like), try stringTextInternId(self, right_like));
-
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer context.deinit(self.allocator);
     try appendStringContext(self, &context, left_like);
     try appendStringContext(self, &context, right_like);
-    if (context.items.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, context.items));
+
+    // Slices AFTER the context forces: a force is a GC safepoint and a
+    // heap-string borrow must not be held across one.
+    const left_bytes = try stringBytes(self, left_like);
+    const right_bytes = try stringBytes(self, right_like);
+    const total = left_bytes.len + right_bytes.len;
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(total, context.items.len != 0);
+    if (context.items.len != 0) {
+        // Contexted text stays interned (context_string.text is id-keyed).
+        const text_id = try internConcatParts(self, &.{ left_bytes, right_bytes }, total);
+        return Value.contextString(try self.heap.addContextString(text_id, context.items));
+    }
+    return makeConcatString(self, &.{ left_bytes, right_bytes }, total);
 }
 
 /// `str_cat` opcode body: coerce the top `count` stack operands
@@ -152,26 +310,31 @@ pub fn concatStackStrings(self: *VM, count: u32) !Value {
     // interned, so re-interning (what `"" + x` pays) would be a no-op probe.
     if (count == 1) return self.stack[base];
 
+    // Derive each part's text slice ONCE (intern data segments are stable,
+    // so the slices stay valid across the assembly below) instead of paying
+    // stringTextInternId + intern.get again per part in a copy pass.
+    var slice_buf: [16][]const u8 = undefined;
+    const slices = if (count <= slice_buf.len)
+        slice_buf[0..count]
+    else
+        try self.allocator.alloc([]const u8, count);
+    defer if (count > slice_buf.len) self.allocator.free(slices);
+
     var total: usize = 0;
     var any_context = false;
     i = 0;
     while (i < count) : (i += 1) {
         const v = self.stack[base + i];
-        total += self.intern.get(try stringTextInternId(self, v)).len;
+        const s = try stringBytes(self, v);
+        slices[i] = s;
+        total += s.len;
         if (v.isContextString()) any_context = true;
     }
 
-    const buf = try self.allocator.alloc(u8, total);
-    defer self.allocator.free(buf);
-    var off: usize = 0;
-    i = 0;
-    while (i < count) : (i += 1) {
-        const s = self.intern.get(try stringTextInternId(self, self.stack[base + i]));
-        @memcpy(buf[off..][0..s.len], s);
-        off += s.len;
-    }
-    const text_id = try self.intern.intern(buf);
-    if (!any_context) return Value.string(text_id);
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(total, any_context);
+    if (!any_context) return makeConcatString(self, slices, total);
+    const text_id = try internConcatParts(self, slices, total);
 
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer context.deinit(self.allocator);
@@ -206,22 +369,23 @@ pub fn concatStackPath(self: *VM, count: u32) !Value {
         self.stack[base + i] = try stringLikeValue(self, self.stack[base + i]);
     }
 
-    // Assemble the raw concatenated text, then canonicalize once.
+    // Assemble the raw concatenated text, then canonicalize once. Same
+    // derive-each-slice-once pattern as `concatStackStrings`.
+    var slice_buf: [16][]const u8 = undefined;
+    const slices = if (count <= slice_buf.len)
+        slice_buf[0..count]
+    else
+        try self.allocator.alloc([]const u8, count);
+    defer if (count > slice_buf.len) self.allocator.free(slices);
+
     var total: usize = 0;
     i = 0;
     while (i < count) : (i += 1) {
-        total += self.intern.get(try stringTextInternId(self, self.stack[base + i])).len;
+        const s = try stringBytes(self, self.stack[base + i]);
+        slices[i] = s;
+        total += s.len;
     }
-    const buf = try self.allocator.alloc(u8, total);
-    defer self.allocator.free(buf);
-    var off: usize = 0;
-    i = 0;
-    while (i < count) : (i += 1) {
-        const s = self.intern.get(try stringTextInternId(self, self.stack[base + i]));
-        @memcpy(buf[off..][0..s.len], s);
-        off += s.len;
-    }
-    const raw_text_id = try self.intern.intern(buf);
+    const raw_text_id = try internConcatParts(self, slices, total);
     const raw_text = self.intern.get(raw_text_id);
     const text_id = if (std.fs.path.isAbsolute(raw_text)) text_id: {
         const normalized = try std.fs.path.resolve(self.allocator, &.{raw_text});
@@ -261,12 +425,13 @@ pub fn coerceLanguageStringValueOpt(self: *VM, value: Value, allow_int: bool) !V
     const forced = try force.forceValue(self, value);
     force.rootKeep(self, forced); // held across getAttrValue + callValue + recurse
     return switch (forced.kind()) {
-        .string, .string_context => forced,
+        .string, .string_context, .heap_string => forced,
         .path => try sourcePathStringValue(self, forced.asInternId()),
         .int, .boxed_int => if (allow_int and self.policy.coerce_integers_enabled) blk: {
-            const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(forced, self.heap)});
-            defer self.allocator.free(s);
-            break :blk Value.string(try self.intern.intern(s));
+            // Stack-format + unique-string: number text never dedups.
+            var buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{}", .{int_mod.get(forced, self.heap)}) catch unreachable;
+            break :blk try makeUniqueString(self, s);
         } else trace.coercionError(self, forced),
         .attrs => blk: {
             const to_string_id = try self.intern.intern("__toString");
@@ -308,7 +473,7 @@ pub fn sourcePathStringValue(self: *VM, path_id: InternId) !Value {
 
 pub fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), value: Value) !void {
     switch (value.kind()) {
-        .string => {},
+        .string, .heap_string => {},
         .path => {
             const path = self.intern.get(value.asInternId());
             if (!try self.files.pathExists(path)) return error.FileNotFound;

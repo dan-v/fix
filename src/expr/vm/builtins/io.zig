@@ -11,6 +11,8 @@ const path_ops = @import("runtime").paths;
 const FileCache = @import("store").FileCache;
 const strings = @import("strings.zig");
 const fetch = @import("fetch.zig");
+const prof = @import("../../probe.zig").prof;
+const prof_census = @import("../../probe.zig").prof_census;
 const purity = @import("purity.zig");
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
@@ -34,7 +36,9 @@ pub fn builtinPathExists(self: *VM, arg: Value) !Value {
 
 pub fn builtinReadFile(self: *VM, arg: Value) !Value {
     const contents = try self.files.readFile(try demandPathArg(self, arg));
-    return Value.string(try self.intern.intern(contents));
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(contents.len, false);
+    return vm_strings.makeString(self, contents);
 }
 
 pub fn builtinReadFileType(self: *VM, arg: Value) !Value {
@@ -63,7 +67,7 @@ pub fn demandPathArg(self: *VM, arg: Value) ![]const u8 {
     vm_force.rootKeep(self, forced);
     const value = try vm_strings.stringLikeValue(self, forced);
     vm_force.rootKeep(self, value);
-    const path = self.intern.get(try vm_strings.stringTextInternId(self, value));
+    const path = try vm_strings.stringBytes(self, value);
 
     // Pure eval confines filesystem reads to the store and the flake source.
     try purity.enforceReadPath(self, path);
@@ -139,7 +143,7 @@ fn demandContext(self: *VM, value: Value) !?DemandContext {
         for (outputs, 0..) |*output, index| {
             const item = try vm_force.forceValue(self, try self.heap.getListItem(list_id, index));
             if (!isPlainString(item)) return error.TypeError;
-            output.* = self.intern.get(try stringTextInternId(self, item));
+            output.* = try vm_strings.stringBytes(self, item);
         }
         return .{ .drv_path = self.intern.get(name), .outputs = outputs };
     }
@@ -279,7 +283,7 @@ pub fn builtinFindFile(self: *VM, search_path_arg: Value, name_arg: Value) !Valu
 
         const base_value = try vm_force.forceValue(self, try self.heap.getAttrValue(entry.asObjectId(), path_id));
         const base = switch (base_value.kind()) {
-            .path, .string, .string_context => self.intern.get(try stringTextInternId(self, base_value)),
+            .path, .string, .string_context, .heap_string => try vm_strings.stringBytes(self, base_value),
             else => return error.TypeError,
         };
 
@@ -289,7 +293,7 @@ pub fn builtinFindFile(self: *VM, search_path_arg: Value, name_arg: Value) !Valu
         };
         const prefix_forced = try vm_force.forceValue(self, prefix_value);
         if (!isPlainString(prefix_forced)) return error.TypeError;
-        const prefix = self.intern.get(try stringTextInternId(self, prefix_forced));
+        const prefix = try vm_strings.stringBytes(self, prefix_forced);
 
         if (is_corepkgs) {
             if (std.mem.eql(u8, prefix, "nix")) {

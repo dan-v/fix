@@ -25,6 +25,10 @@ const future_mod = @import("../future.zig");
 fn poisonSweptObject(heap: *ObjectHeap, id: ObjectId) void {
     switch (heap.objects.getMut(id).*) {
         .thunk => |*t| t.future.state.store(future_mod.poisoned_state, .monotonic),
+        // Inline string text lives in the slot itself; memset it so a
+        // dangling borrow reads visible garbage (the range-store analogue
+        // is in freeObjectRanges).
+        .heap_string_inline => |*is| @memset(&is.text, 0xAA),
         else => {},
     }
 }
@@ -44,6 +48,7 @@ const FreeRange = struct {
 const si_values = heap_mod.rangeStoreIndex("values");
 const si_attrs = heap_mod.rangeStoreIndex("attrs");
 const si_attr_pos = heap_mod.rangeStoreIndex("attr_pos");
+const si_bytes = heap_mod.rangeStoreIndex("bytes");
 
 /// Collection-local streaming coalescer. Sweep order follows allocation order
 /// closely (exactly on one worker, per-worker for a parallel minor), so adjacent
@@ -156,22 +161,34 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     armTracking(heap);
 }
 
-/// Lazy variant (the production collection-line policy, see
+/// Bytes of reserved growth at which the lazy path arms tracking+rooting:
+/// a QUARTER of the line (floored at 512 MiB, capped at line/2 so tiny
+/// budgets still arm before they collect). Everything allocated before
+/// arming stays pinned, so a lower arm line shrinks the unreclaimable
+/// floor — measured on whole-nixpkgs: arming at line/2 (16 GiB) left
+/// collections 13 GiB less effective than early rooting. A run that
+/// never reaches the arm line pays ZERO tracking or rooting cost, which
+/// is what keeps small evals exactly as fast under any budget form.
+pub fn armLineBytes(budget: u64) u64 {
+    const floor: u64 = 512 << 20;
+    return @min(@max(budget / 4, floor), budget / 2);
+}
+
+/// Lazy collection-line policy (the production default, see
 /// `gc_controller.memoryBudget`): don't start any per-allocation tracking yet — just
-/// watch the reserved-bytes cursor. At half the line the safepoint driver arms
+/// watch the reserved-bytes cursor. At `armLineBytes` the safepoint driver arms
 /// tracking (STW, `armTracking`); at the line it collects. A run that never
-/// reaches line/2 pays ZERO tracking cost (no young-slot appends, no write
-/// barrier, no free-list probes) — below the line the evaluator stays at
-/// rooting-tax-only. The price: objects allocated before arming are permanently
-/// old (unreclaimable floor ≈ reserved at line/2 — half the line, by
-/// construction) UNLESS `root_always` (constrained mode): then a major also
-/// reclaims that pre-arming region, paid for by keeping the transient-root
-/// gates live from here. `collection.bootstrap_end` is captured now
-/// as the reclaim boundary (bootstrap below it stays pinned).
+/// reaches the arm line pays ZERO tracking cost (no young-slot appends, no write
+/// barrier, no free-list probes). The price: objects allocated before arming are
+/// permanently old (unreclaimable floor ≈ reserved at the arm line)
+/// UNLESS `root_always` (`FIX_GC_ROOTS=1` / the step validation path): then a
+/// major also reclaims that pre-arming region, paid for by keeping the
+/// transient-root gates live from here. `collection.bootstrap_end` is captured
+/// now as the reclaim boundary (bootstrap below it stays pinned).
 pub fn enableBudget(heap: *ObjectHeap, budget: u64, root_always: bool) void {
     heap.collection.step_bytes = 0;
     heap.collection.budget_bytes = budget;
-    heap.collection.threshold_bytes = budget / 2;
+    heap.collection.threshold_bytes = armLineBytes(budget);
     heap.collection.bootstrap_end = heap.objects.count();
     heap.collection.root_always = root_always;
     heap.collection.root_active = root_always;
@@ -210,7 +227,7 @@ pub fn armTracking(heap: *ObjectHeap) void {
 /// reclaim yet.
 pub fn armLazy(heap: *ObjectHeap) void {
     armTracking(heap);
-    heap.collection.collect_requested = false;
+    heap.collection.collect_requested.store(false, .monotonic);
     const budget = heap.collection.budget_bytes;
     const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.gc_headroom);
     heap.collection.threshold_bytes = @max(budget, heap.totalReservedBytes() + headroom);
@@ -234,7 +251,7 @@ pub fn runCollect(heap: *ObjectHeap, collector_id: u8) void {
 /// (livelock). `live_bytes` is accepted for stats only.
 pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
     _ = live_bytes;
-    heap.collection.collect_requested = false;
+    heap.collection.collect_requested.store(false, .monotonic);
     // Post-collect headroom scales with the budget (an eighth, clamped to
     // [64 MB, gc_headroom]): a small-RAM budget must not grant itself a
     // flat 1 GB of growth per cycle, and a huge budget needn't collect
@@ -245,7 +262,7 @@ pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
         heap.totalReservedBytes() + heap.collection.step_bytes
     else
         @max(budget, heap.totalReservedBytes() + headroom);
-    heap.gcArmObjectMissCollection();
+    heap.gcArmPoolMissCollection();
     // Invalidate all thread-local caches (thunk memo, attr IC, call IC)
     // that key on `token`. Current thunk-memo and attr-cache values were
     // traced as roots for this collection because a cache may momentarily be
@@ -327,7 +344,7 @@ pub fn verifyMinorClosure(heap: *ObjectHeap, mark_bits: []const u64) void {
                     },
                 }
             },
-            .boxed_int => {},
+            .boxed_int, .heap_string, .heap_string_inline => {},
         }
     }
     if (shown > 0) @panic("gc: minor mark not closed — missed edge (see MISSED EDGE lines)");
@@ -363,6 +380,12 @@ fn sweepYoungListInto(heap: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLo
         if (marked) {
             heap.gcSetOld(id);
             st.promoted += 1;
+            // Byte-weighted gate charge for tenured string text (see
+            // MinorStats.promoted_charge).
+            switch (heap.objects.get(id).*) {
+                .heap_string => |hs| st.promoted_charge += hs.bytes.len / ObjectHeap.gc_bytes_per_object_charge,
+                else => {},
+            }
         } else {
             // Detector builds retain the slot so stale reads trap reliably.
             freeObjectRanges(heap, ranges, heap.objects.get(id));
@@ -387,6 +410,7 @@ pub fn beginMinorSweep(heap: *ObjectHeap, worker_count: u8) void {
     heap.collection.minor_sweep_next.store(0, .monotonic);
     heap.collection.minor_sweep_done.store(0, .monotonic);
     heap.collection.minor_sweep_promoted.store(0, .monotonic);
+    heap.collection.minor_sweep_promoted_charge.store(0, .monotonic);
     heap.collection.minor_sweep_freed.store(0, .monotonic);
     heap.collection.minor_sweep_open.store(false, .release);
 }
@@ -413,6 +437,7 @@ pub fn minorSweepClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
         _ = heap.collection.minor_sweep_done.fetchAdd(1, .release);
     }
     _ = heap.collection.minor_sweep_promoted.fetchAdd(local_st.promoted, .monotonic);
+    _ = heap.collection.minor_sweep_promoted_charge.fetchAdd(local_st.promoted_charge, .monotonic);
     _ = heap.collection.minor_sweep_freed.fetchAdd(local_st.freed, .monotonic);
 }
 
@@ -424,7 +449,11 @@ pub fn waitMinorSweepDone(heap: *ObjectHeap) void {
 /// Return the aggregate result after every list has drained.
 pub fn finishMinorSweep(heap: *ObjectHeap) ObjectHeap.MinorStats {
     heap.gcRebalanceFreeLists();
-    return .{ .promoted = heap.collection.minor_sweep_promoted.load(.monotonic), .freed = heap.collection.minor_sweep_freed.load(.monotonic) };
+    return .{
+        .promoted = heap.collection.minor_sweep_promoted.load(.monotonic),
+        .promoted_charge = heap.collection.minor_sweep_promoted_charge.load(.monotonic),
+        .freed = heap.collection.minor_sweep_freed.load(.monotonic),
+    };
 }
 
 /// Debug: verify the mark is closed — no MARKED object may reference an
@@ -520,6 +549,11 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
             .context_string => |c| for (heap.attrs.sliceMut(c.context)) |*e| {
                 e.value = poison;
             },
+            // Byte payloads have no Value shape to poison with a trapping
+            // thunk; memset a sentinel so a dangling `getHeapString` slice
+            // reads visibly-garbage text in detector builds instead of
+            // stale-but-plausible bytes.
+            .heap_string => |hs| @memset(heap.bytes.sliceMut(hs.bytes), 0xAA),
             else => {},
         }
     }
@@ -528,12 +562,17 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
         .closure => |c| if (c.upvalues.len > 0) ranges.add(si_values, .{ .segment = c.upvalues.segment, .offset = c.upvalues.offset, .len = c.upvalues.len }),
         .attrs => |a| {
             if (a.range.len > 0) ranges.add(si_attrs, .{ .segment = a.range.segment, .offset = a.range.offset, .len = a.range.len });
-            if (a.positions.len > 0) ranges.add(si_attr_pos, .{ .segment = a.positions.segment, .offset = a.positions.offset, .len = a.positions.len });
+            // Chunk-ref positions are immortal chunk data — nothing to free.
+            if (a.positions.heapLen() > 0) {
+                const pr = a.positions.heapRange();
+                ranges.add(si_attr_pos, .{ .segment = pr.segment, .offset = pr.offset, .len = pr.len });
+            }
         },
         .builtin_closure => |c| if (c.args.len > 0) ranges.add(si_values, .{ .segment = c.args.segment, .offset = c.args.offset, .len = c.args.len }),
         .partial_app => |p| if (p.args.len > 0) ranges.add(si_values, .{ .segment = p.args.segment, .offset = p.args.offset, .len = p.args.len }),
         .context_string => |c| if (c.context.len > 0) ranges.add(si_attrs, .{ .segment = c.context.segment, .offset = c.context.offset, .len = c.context.len }),
         .thunk => |t| if (t.targetSpillRange()) |r| ranges.add(si_values, .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
-        .merge_attrs, .boxed_int => {},
+        .heap_string => |hs| if (hs.bytes.len > 0) ranges.add(si_bytes, .{ .segment = hs.bytes.segment, .offset = hs.bytes.offset, .len = hs.bytes.len }),
+        .merge_attrs, .boxed_int, .heap_string_inline => {},
     }
 }

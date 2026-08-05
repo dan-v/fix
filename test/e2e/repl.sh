@@ -614,13 +614,20 @@ first=$(gc_soak 3)
 last=$(gc_soak 24)
 echo "gc soak: after 3 inputs:  $first"
 echo "gc soak: after 24 inputs: $last"
-mb() { echo "$1" | sed -n 's/.*capacity \([0-9.]*\) MiB.*/\1/p' | cut -d. -f1; }
-a=$(mb "$first")
-b=$(mb "$last")
-if [[ -n "$a" && -n "$b" ]] && ((b < a * 3 + 64)); then
-    pass "gc: capacity plateaus (${a} MiB -> ${b} MiB across 8x the inputs)"
+if [[ "$last" == *"detector build"* ]]; then
+    # Detector builds (ReleaseSafe) retain swept object slots un-reused so
+    # stale reads trap; capacity ratchets by design and the plateau
+    # property doesn't hold.
+    skip "gc: capacity plateau (detector build retains slots by design)"
 else
-    fail "gc: capacity grew (${a:-?} MiB -> ${b:-?} MiB)"
+    mb() { echo "$1" | sed -n 's/.*capacity \([0-9.]*\) MiB.*/\1/p' | cut -d. -f1; }
+    a=$(mb "$first")
+    b=$(mb "$last")
+    if [[ -n "$a" && -n "$b" ]] && ((b < a * 3 + 64)); then
+        pass "gc: capacity plateaus (${a} MiB -> ${b} MiB across 8x the inputs)"
+    else
+        fail "gc: capacity grew (${a:-?} MiB -> ${b:-?} MiB)"
+    fi
 fi
 
 e2e_finish

@@ -330,7 +330,7 @@ test "empty lists and attrs are interned to shared singletons after bootstrap" {
 
     const p = try heap.addAttrs(&.{});
     const q = try heap.addAttrsSorted(&.{});
-    const r = try heap.addAttrsFromValuesSorted(&.{}, &.{}, &.{});
+    const r = try heap.addAttrsFromValuesSorted(&.{}, &.{}, .none);
     const s = try heap.addAttrsFromStackPairs(&.{});
     try std.testing.expectEqual(heap.empty_attrs_id.?, p);
     try std.testing.expectEqual(p, q);

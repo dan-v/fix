@@ -11,6 +11,7 @@ const nar = @import("store").nar;
 const path_ops = @import("runtime").paths;
 const source_paths = @import("store").realization.source_path;
 const strings = @import("strings.zig");
+const vm_strings = @import("../strings.zig");
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
 const vm_closures = @import("../closures.zig");
@@ -30,13 +31,13 @@ pub fn builtinGetEnv(self: *VM, name_arg: Value) !Value {
     if (self.policy.pure_eval) return Value.string(try self.intern.intern(""));
     const host = self.import_host orelse return Value.string(try self.intern.intern(""));
     const value = try host.get_env(host.context, name);
-    return Value.string(try self.intern.intern(value));
+    return vm_strings.makeString(self, value);
 }
 
 pub fn builtinToPath(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     const text_id: InternId = switch (value.kind()) {
-        .path, .string, .string_context => try stringTextInternId(self, value),
+        .path, .string, .string_context, .heap_string => try vm_strings.stringNameId(self, value),
         else => return error.TypeError,
     };
     if (!std.fs.path.isAbsolute(self.intern.get(text_id))) return error.RelativePath;
@@ -48,11 +49,11 @@ pub fn builtinToFile(self: *VM, name_arg: Value, contents_arg: Value) !Value {
     const name_value = try vm_force.forceValue(self, name_arg);
     if (!isStringLike(name_value)) return error.TypeError;
 
-    const name_id = try stringTextInternId(self, name_value);
+    const name_id = try vm_strings.stringNameId(self, name_value);
     try validateStorePathName(self.intern.get(name_id));
 
     const contents_value = try coerceStringContextValue(self, contents_arg);
-    const contents_id = try stringTextInternId(self, contents_value);
+    const contents_id = try vm_strings.stringNameId(self, contents_value);
     var ref_ids: std.ArrayListUnmanaged(InternId) = .empty;
     defer ref_ids.deinit(self.allocator);
     for (try contextEntriesForValue(self, contents_value)) |entry| {

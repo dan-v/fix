@@ -15,6 +15,7 @@ const bytecode_mod = @import("../bytecode.zig");
 
 const closures = @import("closures.zig");
 const force = @import("force.zig");
+const vm_strings = @import("strings.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const vm_builtins = @import("builtins.zig");
@@ -228,9 +229,18 @@ pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Valu
         current = try force.forceValue(self, current);
     }
     const name_val = try force.forceValue(self, dynamic_name);
-    if (!name_val.isString()) return error.TypeError;
-    if (!current.isAttrs()) return force.forceValue(self, default_val);
-    const result = cachedAttrLookup(self, current.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
+    if (!current.isAttrs()) {
+        _ = vm_strings.selectNameId(self, name_val) catch |err| switch (err) {
+            error.MissingAttribute => {},
+            else => return err,
+        };
+        return force.forceValue(self, default_val);
+    }
+    const name_id = vm_strings.selectNameId(self, name_val) catch |err| switch (err) {
+        error.MissingAttribute => return force.forceValue(self, default_val),
+        else => return err,
+    };
+    const result = cachedAttrLookup(self, current.asObjectId(), name_id) catch |err| switch (err) {
         error.MissingAttribute => return force.forceValue(self, default_val),
         else => return err,
     };
@@ -255,10 +265,12 @@ pub fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []con
             },
             @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => name: {
                 const name_val = try force.forceValue(self, dynamic_names[dynamic_i]);
-                if (!name_val.isString()) return error.TypeError;
                 dynamic_i += 1;
                 if (!current.isAttrs()) return force.forceValue(self, default_val);
-                break :name name_val.asInternId();
+                break :name vm_strings.selectNameId(self, name_val) catch |err| switch (err) {
+                    error.MissingAttribute => return force.forceValue(self, default_val),
+                    else => return err,
+                };
             },
             else => return error.InvalidBytecode,
         };
@@ -304,10 +316,12 @@ pub fn hasAttrPathMixed(self: *VM, attrs_val: Value, dynamic_names: []const Valu
             },
             @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => name: {
                 const name_val = try force.forceValue(self, dynamic_names[dynamic_i]);
-                if (!name_val.isString()) return error.TypeError;
                 dynamic_i += 1;
                 if (!current.isAttrs()) return false;
-                break :name name_val.asInternId();
+                break :name vm_strings.selectNameId(self, name_val) catch |err| switch (err) {
+                    error.MissingAttribute => return false,
+                    else => return err,
+                };
             },
             else => return error.InvalidBytecode,
         };

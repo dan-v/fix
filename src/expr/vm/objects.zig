@@ -10,6 +10,7 @@ const heap_mod = @import("runtime").heap;
 const force = @import("force.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
+const vm_strings = @import("strings.zig");
 
 const VM = vm_mod.VM;
 
@@ -18,6 +19,15 @@ const VM = vm_mod.VM;
 pub fn buildAttrs(self: *VM, count: u16) !void {
     const value_count: u32 = @as(u32, count) * 2;
     const start = self.sp - value_count;
+    // Dynamic keys are arbitrary string values; a heap-string key interns
+    // here — names are id-keyed. In place: the slot keeps rooting the
+    // value across the intern.
+    var i: u32 = 0;
+    while (i < value_count) : (i += 2) {
+        const key = self.stack[start + i];
+        if (key.isHeapString())
+            self.stack[start + i] = Value.string(try vm_strings.stringNameId(self, key));
+    }
     const id = try self.heap.addAttrsFromStackPairs(self.stack[start..self.sp]);
     self.sp = start;
     try stack.push(self, Value.attrs(id));
@@ -26,7 +36,7 @@ pub fn buildAttrs(self: *VM, count: u16) !void {
 /// `attrs_new_named*`: entries are compile-time sorted by interned name and
 /// duplicate-free — skip the construction sort. Names come from the chunk
 /// side table, values are the top `count` stack slots.
-pub fn buildAttrsNamedSorted(self: *VM, names: []const u32, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
+pub fn buildAttrsNamedSorted(self: *VM, names: []const u32, count: u16, positions: heap_mod.AttrPositions) !void {
     const start = self.sp - count;
     const id = try self.heap.addAttrsFromValuesSorted(names, self.stack[start..self.sp], positions);
     self.sp = start;

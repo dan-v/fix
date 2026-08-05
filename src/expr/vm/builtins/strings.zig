@@ -17,6 +17,8 @@ const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
+const prof = @import("../../probe.zig").prof;
+const prof_census = @import("../../probe.zig").prof_census;
 
 pub fn firstReplacementIdAt(self: *VM, input: []const u8, needles: []const InternId) ?usize {
     for (needles, 0..) |needle_id, i| {
@@ -30,12 +32,13 @@ pub fn pathArg(self: *VM, arg: Value) ![]const u8 {
     return switch (value.kind()) {
         .path, .string => self.intern.get(value.asInternId()),
         .string_context => self.intern.get((try self.heap.getContextString(value.asObjectId())).text),
+        .heap_string => try vm_strings.stringBytes(self, value),
         else => vm_trace.typeErrorExpected(self, "path or string", value),
     };
 }
 
 pub fn builtinStringLength(self: *VM, arg: Value) !Value {
-    return Value.int(@intCast(self.intern.get(try coerceStringContextId(self, arg)).len));
+    return Value.int(@intCast((try vm_strings.stringBytes(self, try coerceStringContextValue(self, arg))).len));
 }
 
 pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Value {
@@ -48,8 +51,8 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
     vm_force.forceListAccelerate(self, list_id, items);
     const item_values = try self.allocator.alloc(Value, items.len);
     defer self.allocator.free(item_values);
-    const item_text_ids = try self.allocator.alloc(InternId, items.len);
-    defer self.allocator.free(item_text_ids);
+    const item_texts = try self.allocator.alloc([]const u8, items.len);
+    defer self.allocator.free(item_texts);
     // GC: each coerced path/attr can be a fresh context string held only in
     // item_values. Root it immediately, before coercing the next item (which
     // may force user code and collect), and retain all items through context
@@ -57,13 +60,15 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, sep_value);
-    const sep = self.intern.get(try stringTextInternId(self, sep_value));
+    const sep = try vm_strings.stringBytes(self, sep_value);
     var item_bytes: usize = 0;
-    for (item_values, item_text_ids, 0..) |*value, *text_id, i| {
+    for (item_values, item_texts, 0..) |*value, *text, i| {
         value.* = try coerceStringContextValue(self, try self.heap.getListItem(list_id, i));
         vm_force.rootKeep(self, value.*);
-        text_id.* = try stringTextInternId(self, value.*);
-        item_bytes = try std.math.add(usize, item_bytes, self.intern.get(text_id.*).len);
+        // Rooted owner + non-moving byte store: the slice stays valid
+        // across the later items' coercion forces.
+        text.* = try vm_strings.stringBytes(self, value.*);
+        item_bytes = try std.math.add(usize, item_bytes, text.*.len);
     }
 
     const separator_bytes: usize = if (item_values.len > 1)
@@ -84,12 +89,11 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
     }
 
     var out_at: usize = 0;
-    for (item_values, item_text_ids, 0..) |item_value, text_id, i| {
+    for (item_values, item_texts, 0..) |item_value, text, i| {
         if (i > 0) {
             @memcpy(out[out_at..][0..sep.len], sep);
             out_at += sep.len;
         }
-        const text = self.intern.get(text_id);
         @memcpy(out[out_at..][0..text.len], text);
         out_at += text.len;
         for (try string_context.contextEntriesForValue(self, item_value)) |entry| {
@@ -98,19 +102,20 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
     }
     std.debug.assert(out_at == out.len);
 
-    const text_id = try self.intern.intern(out);
-    if (ctx.items.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(out.len, ctx.items.len != 0);
+    if (ctx.items.len == 0) return vm_strings.makeString(self, out);
+    return Value.contextString(try self.heap.addContextString(try self.intern.intern(out), ctx.items));
 }
 
 pub fn coerceStringContextId(self: *VM, arg: Value) !InternId {
-    return stringTextInternId(self, try coerceStringContextValue(self, arg));
+    return vm_strings.stringNameId(self, try coerceStringContextValue(self, arg));
 }
 
 pub fn coerceStringContextValue(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     return switch (value.kind()) {
-        .string, .string_context => value,
+        .string, .string_context, .heap_string => value,
         .path => sourcePathStringValue(self, value.asInternId()),
         .attrs => coerceAttrsStringContextValue(self, value),
         else => error.TypeError,
@@ -156,7 +161,7 @@ pub fn builtinSubstring(self: *VM, start_arg: Value, len_arg: Value, string_arg:
     if (start_i < 0) return error.TypeError;
 
     const string_value = try coerceStringContextValue(self, string_arg);
-    const string = self.intern.get(try stringTextInternId(self, string_value));
+    const string = try vm_strings.stringBytes(self, string_value);
     // Nix always attaches the source string's context to the result — even for
     // an out-of-range slice that yields "".
     if (start_i > std.math.maxInt(usize)) return substringResult(self, "", string_value);
@@ -174,10 +179,12 @@ pub fn builtinSubstring(self: *VM, start_arg: Value, len_arg: Value, string_arg:
 }
 
 fn substringResult(self: *VM, text: []const u8, source: Value) !Value {
-    const text_id = try self.intern.intern(text);
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(text.len, source.isContextString());
     const ctx = try string_context.contextEntriesForValue(self, source);
-    if (ctx.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, ctx));
+    if (ctx.len == 0) return vm_strings.makeString(self, text);
+    // Contexted text stays interned (context_string.text is id-keyed).
+    return Value.contextString(try self.heap.addContextString(try self.intern.intern(text), ctx));
 }
 
 pub fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_arg: Value) !Value {
@@ -191,7 +198,12 @@ pub fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_a
     const input_value = try vm_force.forceValue(self, string_arg);
     if (from_ids.len != (try self.heap.getList(to_id)).len or !isPlainString(input_value)) return error.TypeError;
 
-    const input = self.intern.get(try stringTextInternId(self, input_value));
+    // GC: the replacement forces below are safepoints; a heap-string
+    // input's byte slice survives them only while its owner is rooted.
+    const input_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, input_roots);
+    vm_force.rootKeep(self, input_value);
+    const input = try vm_strings.stringBytes(self, input_value);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
 
@@ -215,7 +227,7 @@ pub fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_a
             const needle = self.intern.get(from_ids[replacement_index]);
             const replacement = try vm_force.forceValue(self, try self.heap.getListItem(to_id, replacement_index));
             if (!isPlainString(replacement)) return error.TypeError;
-            try out.appendSlice(self.allocator, self.intern.get(try stringTextInternId(self, replacement)));
+            try out.appendSlice(self.allocator, try vm_strings.stringBytes(self, replacement));
             for (try string_context.contextEntriesForValue(self, replacement)) |entry| {
                 try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
             }
@@ -233,24 +245,25 @@ pub fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_a
         }
     }
 
-    const text_id = try self.intern.intern(out.items);
-    if (ctx.items.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
+    if (comptime prof.enabled) if (self.workerId() == 0)
+        prof_census.recordLongString(out.items.len, ctx.items.len != 0);
+    if (ctx.items.len == 0) return vm_strings.makeString(self, out.items);
+    return Value.contextString(try self.heap.addContextString(try self.intern.intern(out.items), ctx.items));
 }
 
 pub fn stringArg(self: *VM, arg: Value) ![]const u8 {
     const value = try vm_force.forceValue(self, arg);
     if (!isStringLike(value) or value.isPath()) return vm_trace.typeErrorExpected(self, "a string", value);
-    return self.intern.get(try stringTextInternId(self, value));
+    return try vm_strings.stringBytes(self, value);
 }
 
 pub fn isStringLike(value: Value) bool {
-    return value.isString() or value.isPath() or value.isContextString();
+    return value.isString() or value.isPath() or value.isContextString() or value.isHeapString();
 }
 
-pub fn isPlainString(value: Value) bool {
-    return value.isString() or value.isContextString();
-}
+/// Re-export of the canonical predicate (vm/strings.zig) — a duplicate
+/// definition here once shadowed it and silently rejected heap strings.
+pub const isPlainString = vm_strings.isPlainString;
 
 pub fn isCallable(self: *VM, value: Value) !bool {
     return switch (value.kind()) {
@@ -266,13 +279,13 @@ pub fn isCallable(self: *VM, value: Value) !bool {
     };
 }
 
-pub fn stringTextInternId(self: *VM, value: Value) !InternId {
-    return switch (value.kind()) {
-        .string, .path => value.asInternId(),
-        .string_context => (try self.heap.getContextString(value.asObjectId())).text,
-        else => error.TypeError,
-    };
-}
+/// Re-exports of the canonical accessor seam (vm/strings.zig) for the
+/// builtin families that import this hub. The former duplicate
+/// definition of `stringTextInternId` lived here; one seam now.
+pub const stringTextInternId = vm_strings.stringTextInternId;
+pub const stringNameId = vm_strings.stringNameId;
+pub const stringBytes = vm_strings.stringBytes;
+pub const lookupNameId = vm_strings.lookupNameId;
 
 pub fn stringListArg(self: *VM, arg: Value) ![][]const u8 {
     const list = try vm_force.forceValue(self, arg);
@@ -297,7 +310,9 @@ pub fn stringListInternIdsArg(self: *VM, arg: Value) ![]InternId {
     for (ids, 0..) |*id, i| {
         const value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
         if (!isPlainString(value)) return error.TypeError;
-        id.* = try stringTextInternId(self, value);
+        // Needles are matched by id-resolved bytes repeatedly; heap-resident
+        // needles intern here (short, bounded set).
+        id.* = try vm_strings.stringNameId(self, value);
     }
     return ids;
 }
@@ -307,26 +322,26 @@ pub fn builtinToString(self: *VM, arg: Value) !Value {
 }
 
 pub fn coerceToStringId(self: *VM, arg: Value) !InternId {
-    return stringTextInternId(self, try coerceToStringValue(self, arg));
+    return vm_strings.stringNameId(self, try coerceToStringValue(self, arg));
 }
 
 pub fn coerceToStringValue(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     switch (value.kind()) {
-        .string, .string_context => return value,
+        .string, .string_context, .heap_string => return value,
         .path => return Value.string(value.asInternId()),
         .int, .boxed_int => {
-            const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(value, self.heap)});
-            defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            var buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{}", .{int_mod.get(value, self.heap)}) catch unreachable;
+            return vm_strings.makeUniqueString(self, s);
         },
         .float => {
             // Nix coerces a float with C++ `std::to_string` — fixed-point with
             // 6 fractional digits (`1.0` → "1.000000", `1.5e-6` → "0.000002"),
             // NOT the shortest `%g` form used to *print* a value.
-            const s = try std.fmt.allocPrint(self.allocator, "{d:.6}", .{value.asFloat()});
-            defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            var buf: [400]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d:.6}", .{value.asFloat()}) catch unreachable;
+            return vm_strings.makeUniqueString(self, s);
         },
         .bool_false, .null => return Value.string(try self.intern.intern("")),
         .bool_true => return Value.string(try self.intern.intern("1")),
@@ -337,7 +352,7 @@ pub fn coerceToStringValue(self: *VM, arg: Value) !Value {
 }
 
 pub fn coerceListToStringId(self: *VM, list_id: ObjectId) !InternId {
-    return stringTextInternId(self, try coerceListToStringValue(self, list_id));
+    return vm_strings.stringNameId(self, try coerceListToStringValue(self, list_id));
 }
 
 pub fn coerceListToStringValue(self: *VM, list_id: ObjectId) !Value {
@@ -376,17 +391,15 @@ pub fn coerceListToStringValue(self: *VM, list_id: ObjectId) !Value {
         // can collect; root `item_value` so its context slice isn't swept
         // mid-iteration (w>1 UAF). Same discipline as concatStringsSep.
         vm_force.rootKeep(self, item_value);
-        const item_id = try stringTextInternId(self, item_value);
-        try out.appendSlice(self.allocator, self.intern.get(item_id));
+        try out.appendSlice(self.allocator, try vm_strings.stringBytes(self, item_value));
         for (try string_context.contextEntriesForValue(self, item_value)) |entry| {
             try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
         }
     }
     if (trailing_empty_list) try out.append(self.allocator, ' ');
 
-    const text_id = try self.intern.intern(out.items);
-    if (ctx.items.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
+    if (ctx.items.len == 0) return vm_strings.makeString(self, out.items);
+    return Value.contextString(try self.heap.addContextString(try self.intern.intern(out.items), ctx.items));
 }
 
 pub fn isEmptyListStringItem(self: *VM, value: Value) !bool {
@@ -417,20 +430,20 @@ pub fn coerceAttrsToStringValue(self: *VM, attrs: Value) !Value {
 pub fn coerceDerivationStringValue(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     switch (value.kind()) {
-        .string, .string_context => return value,
+        .string, .string_context, .heap_string => return value,
         .path => return sourcePathStringValue(self, value.asInternId()),
         .int, .boxed_int => {
-            const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(value, self.heap)});
-            defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            var buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{}", .{int_mod.get(value, self.heap)}) catch unreachable;
+            return vm_strings.makeUniqueString(self, s);
         },
         .float => {
             // Nix coerces a float with C++ `std::to_string` — fixed-point with
             // 6 fractional digits (`1.0` → "1.000000", `1.5e-6` → "0.000002"),
             // NOT the shortest `%g` form used to *print* a value.
-            const s = try std.fmt.allocPrint(self.allocator, "{d:.6}", .{value.asFloat()});
-            defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            var buf: [400]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d:.6}", .{value.asFloat()}) catch unreachable;
+            return vm_strings.makeUniqueString(self, s);
         },
         .bool_false, .null => return Value.string(try self.intern.intern("")),
         .bool_true => return Value.string(try self.intern.intern("1")),
@@ -476,17 +489,15 @@ pub fn coerceDerivationListToStringValue(self: *VM, list_id: ObjectId) !Value {
         // `item_value` so its context slice survives (w>1 UAF on the drv
         // env-building hot path). Same discipline as concatStringsSep.
         vm_force.rootKeep(self, item_value);
-        const item_id = try stringTextInternId(self, item_value);
-        try out.appendSlice(self.allocator, self.intern.get(item_id));
+        try out.appendSlice(self.allocator, try vm_strings.stringBytes(self, item_value));
         for (try string_context.contextEntriesForValue(self, item_value)) |entry| {
             try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
         }
     }
     if (trailing_empty_list) try out.append(self.allocator, ' ');
 
-    const text_id = try self.intern.intern(out.items);
-    if (ctx.items.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, ctx.items));
+    if (ctx.items.len == 0) return vm_strings.makeString(self, out.items);
+    return Value.contextString(try self.heap.addContextString(try self.intern.intern(out.items), ctx.items));
 }
 
 pub fn coerceDerivationAttrsToStringValue(self: *VM, attrs: Value) !Value {

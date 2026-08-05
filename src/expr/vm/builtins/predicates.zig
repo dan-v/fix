@@ -15,7 +15,7 @@ pub fn builtinTypePredicate(self: *VM, arg: Value, expected: ValueType) !Value {
 
 pub fn builtinIsString(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    return Value.boolVal(value.isString() or value.isContextString());
+    return Value.boolVal(value.isString() or value.isContextString() or value.isHeapString());
 }
 
 pub fn builtinIsBool(self: *VM, arg: Value) !Value {
@@ -35,7 +35,7 @@ pub fn builtinTypeOf(self: *VM, arg: Value) !Value {
         .bool_false, .bool_true => "bool",
         .int, .boxed_int => "int",
         .float => "float",
-        .string, .string_context => "string",
+        .string, .string_context, .heap_string => "string",
         .path => "path",
         .list => "list",
         .attrs => "set",

@@ -11,6 +11,7 @@ const Value = @import("runtime").value.Value;
 const ObjectId = @import("runtime").types.ObjectId;
 const FutureState = @import("runtime").future.FutureState;
 const terminal_text = @import("base").terminal_text;
+const vm_strings = @import("strings.zig");
 
 /// A rendered effect message. `text` is either borrowed (an interned string
 /// that needed no sanitizing) or a prefix of `owned`; call `deinit` once the
@@ -77,6 +78,7 @@ fn writeValue(
         .boxed_int => try writer.print("{d}", .{try self.heap.getBoxedInt(value.asObjectId())}),
         .float => try writer.print("{d}", .{value.asFloat()}),
         .string => try writeString(writer, self.intern.get(value.asInternId()), root),
+        .heap_string => try writeString(writer, try vm_strings.stringBytes(self, value), root),
         .path => try writer.writeAll(self.intern.get(value.asInternId())),
         .string_context => {
             const string = try self.heap.getContextString(value.asObjectId());

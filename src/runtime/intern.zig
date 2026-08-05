@@ -146,6 +146,18 @@ const Shard = struct {
     mu: sync.SpinMutex = .{},
 };
 
+/// Power-of-two length-histogram buckets for first-time interns: bucket k
+/// counts strings with len in [2^k, 2^(k+1)), saturating at the last
+/// bucket. Sized so the top buckets isolate the long-derived-string tail
+/// (file contents, serialized output, concat results) that a GC-able
+/// string representation would take off the immortal table.
+pub const len_hist_buckets = 16;
+
+fn lenHistBucket(len: usize) usize {
+    if (len < 2) return 0;
+    return @min(len_hist_buckets - 1, std.math.log2_int(usize, len));
+}
+
 pub const InternTable = struct {
     allocator: std.mem.Allocator,
     entries: EntryStore,
@@ -163,6 +175,11 @@ pub const InternTable = struct {
     /// `intern()` skips the shard mutex — one lock RMW per uncached intern
     /// elided. `get()` was always lock-free. Default off.
     solo: bool = false,
+    /// First-intern length census (see `len_hist_buckets`): bumped only on
+    /// the miss path, where the string's bytes are being copied anyway.
+    /// Monotonic atomics — misses on different shards race benignly.
+    new_len_counts: [len_hist_buckets]std.atomic.Value(u64) = @splat(.init(0)),
+    new_len_bytes: [len_hist_buckets]std.atomic.Value(u64) = @splat(.init(0)),
 
     pub fn init(allocator: std.mem.Allocator) !InternTable {
         var table: InternTable = .{
@@ -232,7 +249,27 @@ pub const InternTable = struct {
 
         gop.key_ptr.* = new_id;
         threadCacheStore(self.token, h, s, new_id);
+        const bucket = lenHistBucket(s.len);
+        _ = self.new_len_counts[bucket].fetchAdd(1, .monotonic);
+        _ = self.new_len_bytes[bucket].fetchAdd(s.len, .monotonic);
         return new_id;
+    }
+
+    /// Look up `s` WITHOUT inserting: the id if `s` is already interned,
+    /// else null. Serves read-only string→id crossings (dynamic attr
+    /// select, hasAttr): every attr name is interned at construction, so
+    /// a probe miss proves the attr cannot exist — and the miss leaves no
+    /// permanent entry behind, unlike `intern`.
+    pub fn probe(self: *InternTable, s: []const u8) ?InternId {
+        const h = hashString(s);
+        if (threadCacheLookup(self.token, h, s)) |id| return id;
+        const shard = &self.shards[h & shard_mask];
+        if (!self.solo) shard.mu.lock();
+        defer if (!self.solo) shard.mu.unlock();
+        const adapter = StringAdapter{ .table = self, .precomputed_hash = h };
+        const id = shard.lookup.getKeyAdapted(s, adapter) orelse return null;
+        threadCacheStore(self.token, h, s, id);
+        return id;
     }
 
     pub fn get(self: *const InternTable, id: InternId) []const u8 {
@@ -246,6 +283,8 @@ pub const InternTable = struct {
         entries: u32,
         data_bytes: u32,
         shard_counts: [shard_count]u32,
+        new_len_counts: [len_hist_buckets]u64,
+        new_len_bytes: [len_hist_buckets]u64,
 
         pub fn shardImbalance(self: Stats) f64 {
             if (self.entries == 0) return 0;
@@ -261,7 +300,11 @@ pub const InternTable = struct {
             .entries = self.entries.count(),
             .data_bytes = self.data.count(),
             .shard_counts = [_]u32{0} ** shard_count,
+            .new_len_counts = undefined,
+            .new_len_bytes = undefined,
         };
+        for (&result.new_len_counts, &self.new_len_counts) |*dst, *src| dst.* = src.load(.monotonic);
+        for (&result.new_len_bytes, &self.new_len_bytes) |*dst, *src| dst.* = src.load(.monotonic);
         for (&self.shards, 0..) |*shard, i| {
             // Reading the shard's count is racy under concurrent intern,
             // but inspect runs after evaluation finishes when there are no

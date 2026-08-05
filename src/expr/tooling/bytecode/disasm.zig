@@ -958,6 +958,7 @@ fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
         },
         .builtin_closure => lineLocatedValue(l, "objects", value.asObjectId(), .object, "builtin closure"),
         .string_context => lineLocatedValue(l, "objects", value.asObjectId(), .object, "context string"),
+        .heap_string => lineLocatedValue(l, "objects", value.asObjectId(), .object, "heap string"),
         .boxed_int => lineLocatedValue(l, "objects", value.asObjectId(), .object, "boxed int"),
         .partial_app => lineLocatedValue(l, "objects", value.asObjectId(), .object, "partial application"),
     }
@@ -1994,6 +1995,7 @@ pub fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, 
         },
         .builtin_closure => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "builtin closure", color_depth),
         .string_context => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "context string", color_depth),
+        .heap_string => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "heap string", color_depth),
         .boxed_int => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "boxed int", color_depth),
         .partial_app => try writeStoreRef(writer, "objects", value.asObjectId(), .object, "partial application", color_depth),
     }

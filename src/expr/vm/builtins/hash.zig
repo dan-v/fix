@@ -5,6 +5,7 @@ const VM = @import("../context.zig").VM;
 const nix_hash = @import("runtime").hash;
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
+const vm_strings = @import("../strings.zig");
 
 const stringArg = strings.stringArg;
 const pathArg = strings.pathArg;
@@ -15,8 +16,8 @@ pub fn builtinHashString(self: *VM, algorithm_arg: Value, string_arg: Value) !Va
     const algorithm_value = try vm_force.forceValue(self, algorithm_arg);
     const string_value = try vm_force.forceValue(self, string_arg);
     if (!isPlainString(algorithm_value) or !isPlainString(string_value)) return error.TypeError;
-    const algorithm = self.intern.get(try stringTextInternId(self, algorithm_value));
-    const string = self.intern.get(try stringTextInternId(self, string_value));
+    const algorithm = try vm_strings.stringBytes(self, algorithm_value);
+    const string = try vm_strings.stringBytes(self, string_value);
     const digest = try nix_hash.hashBytes(self.allocator, algorithm, string);
     defer self.allocator.free(digest);
     return Value.string(try self.intern.intern(digest));

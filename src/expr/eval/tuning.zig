@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const scheduler_mod = @import("workers/scheduler.zig");
+const vm_strings = @import("../vm/strings.zig");
 
 const EnvMap = std.process.Environ.Map;
 
@@ -79,5 +80,14 @@ pub fn resolve(
     if (envInt(u64, env, "FIX_SPEC_BAND_BUDGET")) |value| config.spec_band_budget = value;
 
     resolveSibling(&config, env, worker_count);
+
+    // GC-able string threshold: producers route derived text of at least
+    // this many bytes to heap strings instead of the immortal intern table.
+    // Unset = off (every string interns); 0 = everything eligible goes to
+    // the heap (the stress lane). Resolved here (once, before workers
+    // start) though it lives on vm/strings — same one-shot contract as the
+    // scheduler knobs.
+    if (envInt(usize, env, "FIX_HEAP_STR_MIN")) |value|
+        vm_strings.heap_string_min = value;
     return config;
 }

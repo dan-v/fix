@@ -510,11 +510,16 @@ const Repl = struct {
                         @as(f64, @floatFromInt(r.capacity_bytes)) / (1 << 20),
                     });
                 } else {
-                    try w.print("gc: freed {d} object{s}; live {d:.1} MiB; heap capacity {d:.1} MiB retained for reuse\n", .{
+                    // The detector marker lets the gc-soak e2e skip its
+                    // capacity-plateau check: detector builds retain swept
+                    // object slots un-reused (stale reads must trap), so
+                    // capacity ratchets by design.
+                    try w.print("gc: freed {d} object{s}; live {d:.1} MiB; heap capacity {d:.1} MiB retained for reuse{s}\n", .{
                         r.objects_freed,
                         if (r.objects_freed == 1) "" else "s",
                         @as(f64, @floatFromInt(r.live_bytes)) / (1 << 20),
                         @as(f64, @floatFromInt(r.capacity_bytes)) / (1 << 20),
+                        if (comptime runtime.heap.gc_debug) " (detector build: no slot reuse)" else "",
                     });
                 }
             },
@@ -699,7 +704,7 @@ const Repl = struct {
             .bool_true, .bool_false => try w.writeAll("a boolean"),
             .int, .boxed_int => try w.writeAll("an integer"),
             .float => try w.writeAll("a float"),
-            .string, .string_context => try w.writeAll("a string"),
+            .string, .string_context, .heap_string => try w.writeAll("a string"),
             .path => try w.writeAll("a path"),
             .list => {
                 const n = self.ev.tooling().listLen(value) catch 0;
