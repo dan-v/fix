@@ -258,13 +258,7 @@ const ValuePrinter = struct {
         const Entry = std.meta.Elem(@TypeOf(stored));
         const entries = try self.host.allocator.dupe(Entry, stored);
         defer self.host.allocator.free(entries);
-        const Cmp = struct {
-            intern: @TypeOf(self.host.intern),
-            fn lessThan(ctx: @This(), a: Entry, b: Entry) bool {
-                return std.mem.lessThan(u8, ctx.intern.get(a.name), ctx.intern.get(b.name));
-            }
-        };
-        std.mem.sort(Entry, entries, Cmp{ .intern = self.host.intern }, Cmp.lessThan);
+        try self.host.intern.sortByNameLex(self.host.allocator, Entry, entries);
 
         self.depth += 1;
         defer self.depth -= 1;

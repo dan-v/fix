@@ -26,6 +26,19 @@ const Entry = struct {
     len: u32,
 };
 
+/// First 8 bytes of the string, big-endian, zero-padded: comparing two
+/// prefixes as `u64` orders exactly like `std.mem.lessThan` on the first
+/// `min(len, 8)` bytes. Used by lexicographic sorts to pre-extract one
+/// integer sort key per string instead of re-fetching bytes inside the
+/// comparator. Equal prefixes (shared 8-byte prefix, or an embedded NUL
+/// aliasing the padding) require a full byte-compare tiebreak.
+pub fn stringPrefix(s: []const u8) u64 {
+    var buf: [8]u8 = @splat(0);
+    const n = @min(s.len, buf.len);
+    @memcpy(buf[0..n], s[0..n]);
+    return std.mem.readInt(u64, &buf, .big);
+}
+
 const EntryStore = segments.StableSegments(Entry, .{ .first_segment_size = 256 }, mem_tag.vma);
 const ByteStore = segments.StableSegments(u8, .{ .first_segment_size = 4096 }, mem_tag.vma);
 
@@ -265,6 +278,52 @@ pub const InternTable = struct {
     pub fn eql(_: *const InternTable, a: InternId, b: InternId) bool {
         return a == b;
     }
+
+    /// Sort `entries` (any element type with an `InternId`-typed `name`
+    /// field) lexicographically by the named string, byte-wise — the order
+    /// Nix presents attrsets in. Fetching the string bytes inside the
+    /// comparator costs two segment indirections per comparison (~n log n
+    /// of them, cache-hostile); instead this extracts one integer sort key
+    /// per element up front (a linear, in-id-order walk), sorts the dense
+    /// key array with register compares, and permutes. Prefix ties (shared
+    /// 8-byte prefix) fall back to full byte compares; distinct names never
+    /// tie completely, so the sort's stability is irrelevant.
+    pub fn sortByNameLex(
+        self: *const InternTable,
+        allocator: std.mem.Allocator,
+        comptime T: type,
+        entries: []T,
+    ) !void {
+        if (entries.len < 2) return;
+        const Key = struct { prefix: u64, name: InternId, idx: u32 };
+        const keys = try allocator.alloc(Key, entries.len);
+        defer allocator.free(keys);
+        for (keys, entries, 0..) |*key, entry, i| key.* = .{
+            .prefix = stringPrefix(self.get(entry.name)),
+            .name = entry.name,
+            .idx = @intCast(i),
+        };
+
+        const Ctx = struct {
+            table: *const InternTable,
+            fn lessThan(ctx: @This(), a: Key, b: Key) bool {
+                if (a.prefix != b.prefix) return a.prefix < b.prefix;
+                if (a.name == b.name) return false;
+                return std.mem.lessThan(u8, ctx.table.get(a.name), ctx.table.get(b.name));
+            }
+        };
+        // Block sort, not pdq: interned-in-generation-order names (attr
+        // storage order) yield long ascending prefix runs with periodic
+        // drops ("k1".."k9" ascend, "k10" ranks back between "k1" and
+        // "k2"); the merge-based block sort consumes such runs in O(n)
+        // while pdq's partial-insertion heuristic measurably thrashes on
+        // them (attrset-heavy bench, 2026-08).
+        std.mem.sort(Key, keys, Ctx{ .table = self }, Ctx.lessThan);
+
+        const scratch = try allocator.dupe(T, entries);
+        defer allocator.free(scratch);
+        for (entries, keys) |*entry, key| entry.* = scratch[key.idx];
+    }
 };
 
 test "intern: round-trips and dedupes" {
@@ -287,6 +346,27 @@ test "intern: id 0 is empty sentinel" {
     try std.testing.expectEqualStrings("", table.get(0));
     const empty_id = try table.intern("");
     try std.testing.expectEqual(@as(InternId, 0), empty_id);
+}
+
+test "intern: sortByNameLex matches byte-wise order" {
+    var table = try InternTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    // Exercises: distinct prefixes, shared 8-byte prefix (tiebreak path),
+    // strict-prefix pairs shorter and longer than the inline prefix, the
+    // empty string, and an embedded NUL aliasing the zero padding.
+    const inputs = [_][]const u8{
+        "b",           "k10",         "ab\x00",      "same8byteXY", "abc",
+        "longprefixB", "k2",          "",            "a",           "k1",
+        "same8byteXX", "longprefix",  "ab",          "longprefixA",
+    };
+    const Named = struct { name: InternId };
+    var entries: [inputs.len]Named = undefined;
+    for (inputs, 0..) |s, i| entries[i] = .{ .name = try table.intern(s) };
+    try table.sortByNameLex(std.testing.allocator, Named, &entries);
+    for (entries[1..], entries[0 .. entries.len - 1]) |cur, prev| {
+        try std.testing.expect(std.mem.lessThan(u8, table.get(prev.name), table.get(cur.name)));
+    }
 }
 
 test "intern: distinguishes hash-colliding inputs" {

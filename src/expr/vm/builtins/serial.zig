@@ -435,12 +435,7 @@ fn writeXmlFunction(self: *VM, writer: *std.Io.Writer, value: Value, depth: usiz
             // Formal names, sorted lexicographically (as Nix prints them).
             const sorted = try self.allocator.dupe(heap_mod.AttrEntry, ch.function_args);
             defer self.allocator.free(sorted);
-            const Cmp = struct {
-                pub fn lessThan(vm: @TypeOf(self), a: heap_mod.AttrEntry, b: heap_mod.AttrEntry) bool {
-                    return std.mem.lessThan(u8, vm.intern.get(a.name), vm.intern.get(b.name));
-                }
-            };
-            std.mem.sort(heap_mod.AttrEntry, sorted, self, Cmp.lessThan);
+            try self.intern.sortByNameLex(self.allocator, heap_mod.AttrEntry, sorted);
             for (sorted) |entry| {
                 try writeXmlIndent(writer, depth + 2);
                 try writer.writeAll("<attr name=\"");
