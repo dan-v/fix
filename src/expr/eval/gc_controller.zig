@@ -255,6 +255,7 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
         tr.beginSeeding(collector_slot);
         markRoots(ev, tr);
         heap_collector.forEachRemsetSource(ev.heap, SeedCtx{ .tr = tr, .heap = ev.heap }, Seed.cb);
+        seedPinnedRegion(ev.heap, tr);
         tr.endSeeding();
         ev.scheduler.gcOpenMark();
         tr.drainParallel(ev.heap, collector_slot);
@@ -269,6 +270,7 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
         // Mutable edges recorded by the write barrier must seed the full mark
         // too; not every edge is recoverable by re-scanning its source object.
         heap_collector.forEachRemsetSource(ev.heap, SeedCtx{ .tr = tr, .heap = ev.heap }, Seed.cb);
+        seedPinnedRegion(ev.heap, tr);
         tr.drain(ev.heap);
     }
     const st = heap_collector.sweep(ev.heap, tr.mark_bits); // serial full sweep
@@ -540,6 +542,22 @@ pub fn markRoots(ev: Context, tr: *gc.Tracer) void {
     );
 }
 
+/// The lazily-armed pre-arming region `[0, track_from)` is PINNED — never
+/// swept, and readable forever through references older than root tracking
+/// (frames, upvalues, other pinned objects) that the armed root set cannot
+/// see. Its members are therefore permanent ROOTS for a full mark, not just
+/// unsweepable slots: a pinned thunk resolved after arming holds the only
+/// edge to its (sweepable, post-arming) result, and a major that fails to
+/// trace FROM it demotes and frees that result while the pinned parent
+/// lives on — a use-after-free read at the next access (wrong drvPaths /
+/// InvalidObjectType under tight budgets at w>1). Minors are covered by the
+/// remembered set; majors must seed the whole pinned region.
+fn seedPinnedRegion(heap: *ObjectHeap, tr: *gc.Tracer) void {
+    var id: types.ObjectId = 0;
+    const pinned_end = heap.collection.track_from;
+    while (id < pinned_end) : (id += 1) tr.markObject(heap, id);
+}
+
 pub fn markVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: *VM) void {
     tr.markValue(heap, vm.builtins);
     tr.markValue(heap, vm.gc_roots.extra); // value in-flight at the safepoint
@@ -552,6 +570,72 @@ pub fn markVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: *VM) void {
 fn markFrame(tr: *gc.Tracer, heap: *ObjectHeap, frame: *const Frame) void {
     if (frame.upvalue_owner) |id| tr.markObject(heap, id);
     if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);
+}
+
+test "a major roots the pinned pre-arming region (lazy arming)" {
+    // Regression: under the lazy-arming budget mode, objects allocated
+    // before arming are PINNED — never swept, and readable forever through
+    // references the armed root set cannot see. A pinned thunk resolved
+    // AFTER arming holds the only edge to its young result; the minor that
+    // consumes the write barrier's remset entry promotes the result, and a
+    // later major that does not seed the pinned region as roots demotes
+    // (gcMajorReconcile clears old bits) and sweeps it — a use-after-free
+    // read at the next access through the immortal pinned parent. This
+    // produced silent wrong drvPaths / InvalidObjectType on tight-budget
+    // nixpkgs runs.
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    // Lazy budget mode: nothing tracked or rooted until arming.
+    heap_collector.enableBudget(&heap, 64 << 20, false);
+
+    // Pinned parent: a thunk allocated before arming.
+    const thunk_id = try heap.addBytecodeThunk(0, &.{});
+    heap_collector.armTracking(&heap);
+    try std.testing.expect(thunk_id < heap.collection.track_from);
+
+    // Post-arming young result, reachable ONLY through the pinned thunk.
+    const items = [_]Value{ Value.int(1), Value.int(2) };
+    const young = try heap.addList(&items);
+    const thunk = heap.getThunkAssumeValid(thunk_id);
+    try std.testing.expect(thunk.tryForceSolo(1) == .claimed);
+    thunk.resolveSolo(Value.list(young));
+    heap.gcRecordEdge(thunk_id, Value.list(young));
+
+    // Minor: consumes the remset entry, marks + promotes the result.
+    var tr = gc.Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.resetMinor(heap.counts().objects);
+    tr.markRemsetSource(&heap, thunk_id);
+    tr.drainMinor(&heap);
+    try std.testing.expect(tr.isMarked(young));
+    try std.testing.expectEqual(@as(u64, 0), heap_collector.minorCollect(&heap, tr.mark_bits).freed);
+    heap_collector.remsetClear(&heap);
+    try std.testing.expect(!heap.gcIsYoung(young)); // promoted
+
+    // Control: a full mark from an EMPTY root set alone cannot see the
+    // result — the pinned thunk is exactly the edge a major must seed.
+    try tr.resetMajor(heap.counts().objects);
+    tr.drain(&heap);
+    try std.testing.expect(!tr.isMarked(young));
+
+    // The fix: majors seed [0, track_from) as roots. The result survives
+    // the sweep, stays tenured through reconcile, and remains readable.
+    try tr.resetMajor(heap.counts().objects);
+    seedPinnedRegion(&heap, &tr);
+    tr.drain(&heap);
+    try std.testing.expect(tr.isMarked(young));
+    try std.testing.expectEqual(@as(u64, 0), heap_collector.sweep(&heap, tr.mark_bits).objects_freed);
+    heap.gcMajorReconcile(tr.mark_bits);
+    heap_collector.remsetClear(&heap);
+    try std.testing.expect(!heap.gcIsYoung(young)); // re-tenured, not demoted
+
+    // A follow-up young-gated minor (remset long gone) must not free it.
+    try tr.resetMinor(heap.counts().objects);
+    tr.drainMinor(&heap);
+    try std.testing.expectEqual(@as(u64, 0), heap_collector.minorCollect(&heap, tr.mark_bits).freed);
+    const read = try heap.getList(young);
+    try std.testing.expectEqual(@as(usize, 2), read.len);
 }
 
 test "frame roots closure owner until its raw upvalue slice unwinds" {
