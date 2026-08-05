@@ -892,10 +892,23 @@ fn normalizeDerivationString(
             }
         }
     }
-    // No source-path rewrites — the interned text itself is the normalized
-    // string. It's stable for the evaluator's lifetime; skipping the dupe
-    // avoids an alloc+memcpy per env value (build scripts run to KBs).
-    if (out.items.len == 0) return text;
+    // No source-path rewrites — the text itself is the normalized string.
+    // INTERNED text (plain strings, paths, context-string text) is stable
+    // for the evaluator's lifetime, so skipping the dupe is safe and avoids
+    // an alloc+memcpy per env value (build scripts run to KBs). A HEAP
+    // string's bytes live only as long as the owning object — and here the
+    // owner is often a fresh, otherwise-unreachable coercion result that
+    // the caller unroots on return while the env walk keeps forcing (GC
+    // safepoints): returning the borrow made later collections free and
+    // re-hand the bytes under the slice, silently corrupting drv env text
+    // (wrong drvPaths under tight budgets / FIX_GC_STEP_MB). Dupe those.
+    if (out.items.len == 0) {
+        if (!value.isHeapString()) return text;
+        const copy = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(copy);
+        try owned_strings.append(self.allocator, copy);
+        return copy;
+    }
     try out.appendSlice(self.allocator, text[cursor..]);
     const normalized = try out.toOwnedSlice(self.allocator);
     errdefer self.allocator.free(normalized);
