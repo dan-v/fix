@@ -6,6 +6,21 @@ All notable changes to `fix` are documented in this file.
 
 ### Added
 
+- A persistent compiled-chunk cache: an unchanged source file (same source
+  bytes, path, language policy, codegen flags) skips parse + compile
+  entirely on later runs, loading its bytecode chunks and deferred entries
+  from `~/.cache/fix/chunks` (or `$XDG_CACHE_HOME`/`$FIX_CHUNK_CACHE_DIR`).
+  Cache generations are keyed by the binary's GNU build-id — a rebuilt fix
+  starts from an empty directory and sweeps stale siblings automatically.
+  Every failure mode falls back to a fresh compile; debugger and
+  name-capture sessions bypass the cache in both directions. Measured on a
+  warm nixos-minimal evaluation at one worker: 1.740s vs 2.149s without the
+  cache (1.23× faster). `FIX_NO_CHUNK_CACHE=1` disables it, and
+  `FIX_LET_FLOAT_STATS=1` prints a hits/misses/writes/rejects census at
+  teardown. Cache-file IO runs on a background writer lane (drained before
+  exit), so cold runs pay no measurable write tax; blobs carry a
+  whole-payload checksum, so torn writes and bit rot reject as corrupt and
+  self-heal on the recompile.
 - Demand-driven `let` binding placement (`let-float`): a compile-time,
   semantics-preserving rewrite that flattens nested-let spines, drops dead
   binding chains, inlines literal/alias bindings, sinks single-use bindings

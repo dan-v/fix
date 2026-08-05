@@ -52,6 +52,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // embedders/tests and for reports emitted by Engine.deinit().
     defer if (!process.exits_after_command or options.mem_report != null or options.gc_report or
         ev.letFloatCensusEnabled()) ev.deinit();
+    // Unlike the heap teardown skipped above, the chunk-cache writer lane
+    // MUST drain before a fast exit — queued cache blobs would be dropped.
+    // Runs before the conditional deinit (LIFO); the flush is idempotent.
+    defer ev.flushChunkCacheWrites();
     const term = try setup.configure(&ev, init, &options, &settings);
     defer term.deinit(ev.hostAllocator());
     if (options.read_write_mode) {

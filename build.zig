@@ -180,6 +180,11 @@ pub fn build(b: *std.Build) void {
         // chain.
         .use_llvm = true,
     });
+    // Content-derived GNU build-id: the persistent chunk cache keys its
+    // on-disk layout by the running binary's identity, so a rebuilt compiler
+    // auto-invalidates cached bytecode (and identical/reproducible rebuilds
+    // keep it valid). Link-step only — no recompilation cost.
+    exe.build_id = .sha1;
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");

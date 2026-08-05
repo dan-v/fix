@@ -20,6 +20,18 @@ operand stack.
 
 A `Compiler` instance compiles **one chunk** (one function body / thunk body / file body). Nested bodies (thunks, lambdas, deferred attrs) spawn a **child Compiler** linked by `parent` — the chain drives [name resolution and capture](scopes.md). Scratch state (locals, captures, diagnostics, strictness maps) lives on a per-unit arena and dies with the unit; only bytecode, constants, and the source map are duped onto the persistent allocator at `finish`.
 
+## The persistent chunk cache short-circuits all of this
+
+Before any of the below runs, `parseAndCompile` computes the unit's
+[persistent chunk-cache](chunk-cache.md) key from the raw source bytes —
+**pre-parse** — and on a hit registers the cached chunk graph directly:
+parse and compile are skipped entirely. The one thing a cached unit still
+defers is what an eager compile defers too — elided per-attr body spans
+([lazy-compile.md](lazy-compile.md)) are retained and sub-parse at force
+time. A miss compiles as described below and publishes the finished unit
+back to the cache; every cache failure mode falls back to this path.
+Debugger and name-capture sessions bypass the cache in both directions.
+
 ## Dispatch → domain modules
 
 `driver.compileNodeImpl` is the recursive dispatch switch; `context.zig` owns compiler state and carries the driver callback used by child compilers. High-level node compilers live in cohesive sibling modules and the driver imports each owner directly.
@@ -180,6 +192,6 @@ Lambda bodies (`compileLambda` / `compileLambdaAttrs`) enter `compileTailExpress
   *creation* moves, which is unobservable. The retained parser AST is never
   mutated — rewrite nodes live in the compiling unit's AST arena.
 
-Out of scope: how opcodes execute → [vm/dispatch.md](../vm/dispatch.md); name resolution → [scopes.md](scopes.md); strictness masks → [strictness.md](strictness.md); the let-float rewrite in full → [let-float.md](let-float.md); deferral/trivial short-circuits → [lazy-compile.md](lazy-compile.md).
+Out of scope: how opcodes execute → [vm/dispatch.md](../vm/dispatch.md); name resolution → [scopes.md](scopes.md); strictness masks → [strictness.md](strictness.md); the let-float rewrite in full → [let-float.md](let-float.md); deferral/trivial short-circuits → [lazy-compile.md](lazy-compile.md); the persistent chunk cache in full → [chunk-cache.md](chunk-cache.md).
 
 Code: `src/expr/compiler/`
