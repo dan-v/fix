@@ -211,7 +211,7 @@ pub fn armTracking(heap: *ObjectHeap) void {
 /// reclaim yet.
 pub fn armLazy(heap: *ObjectHeap) void {
     armTracking(heap);
-    heap.collection.collect_requested = false;
+    heap.collection.collect_requested.store(false, .monotonic);
     const budget = heap.collection.budget_bytes;
     const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.gc_headroom);
     heap.collection.threshold_bytes = @max(budget, heap.totalReservedBytes() + headroom);
@@ -235,7 +235,7 @@ pub fn runCollect(heap: *ObjectHeap, collector_id: u8) void {
 /// (livelock). `live_bytes` is accepted for stats only.
 pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
     _ = live_bytes;
-    heap.collection.collect_requested = false;
+    heap.collection.collect_requested.store(false, .monotonic);
     // Post-collect headroom scales with the budget (an eighth, clamped to
     // [64 MB, gc_headroom]): a small-RAM budget must not grant itself a
     // flat 1 GB of growth per cycle, and a huge budget needn't collect

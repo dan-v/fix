@@ -1469,7 +1469,7 @@ test "exhausting a reclaimed object pool requests an early collection once" {
     // the one-shot arm.
     heap.collection.object_miss_collect_armed.store(true, .monotonic);
     _ = try heap.reserveObjectSlot();
-    try std.testing.expect(heap.collection.collect_requested);
+    try std.testing.expect(heap.collection.collect_requested.load(.monotonic));
     try std.testing.expect(!heap.collection.object_miss_collect_armed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), heap.collection.object_miss_collect_requests.load(.monotonic));
 

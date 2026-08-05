@@ -426,7 +426,11 @@ pub const GcHook = struct {
 
 pub const HeapCollectionState = struct {
     hook: ?GcHook = null,
-    collect_requested: bool = false,
+    /// Advisory collection request, read at every force safepoint
+    /// (`pollForCollection`) and written by any worker crossing the
+    /// reserved-bytes threshold — atomic monotonic (same single byte
+    /// mov on x86, TSan-clean).
+    collect_requested: std.atomic.Value(bool) = .init(false),
     threshold_bytes: u64 = std.math.maxInt(u64),
     step_bytes: u64 = 0,
     budget_bytes: u64 = 0,
@@ -1686,10 +1690,12 @@ pub const ObjectHeap = struct {
         );
     }
 
+    /// Fresh byte-store growth signal: the store cursor. Cursor reads are
+    /// synchronized (StableSegments), unlike the per-worker fresh-slot
+    /// diagnostic counters, which are single-writer and must not be read
+    /// cross-thread.
     fn byteFreshGrowth(self: *const ObjectHeap) u64 {
-        var total: u64 = 0;
-        for (self.worker_locals) |*local| total += local.range_fresh_slots[comptime rangeStoreIndex("bytes")];
-        return total;
+        return self.bytes.count();
     }
 
     /// Byte-range pool miss (cold path): once fresh byte-store growth
@@ -1702,7 +1708,7 @@ pub const ObjectHeap = struct {
         const floor = self.collection.byte_growth_collect_floor.load(.acquire);
         if (self.byteFreshGrowth() < floor) return;
         self.collection.byte_growth_collect_floor.store(std.math.maxInt(u64), .release);
-        self.collection.collect_requested = true;
+        self.collection.collect_requested.store(true, .monotonic);
         _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
     }
 
@@ -1869,7 +1875,7 @@ pub const ObjectHeap = struct {
     /// (non-moving) collection to run at the next forceThunk safepoint — it marks
     /// live, promotes survivors in place, and frees dead ranges to the free lists.
     inline fn gcCheckThreshold(self: *ObjectHeap) void {
-        if (self.totalReservedBytes() >= self.collection.threshold_bytes) self.collection.collect_requested = true;
+        if (self.totalReservedBytes() >= self.collection.threshold_bytes) self.collection.collect_requested.store(true, .monotonic);
     }
 
     /// Register the collect callback. Fired at
@@ -1928,7 +1934,7 @@ pub const ObjectHeap = struct {
                 }
                 local.object_reuse_misses += 1;
                 if (self.collection.object_miss_collect_armed.swap(false, .acq_rel)) {
-                    self.collection.collect_requested = true;
+                    self.collection.collect_requested.store(true, .monotonic);
                     _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
                 }
             }
@@ -2030,7 +2036,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn gcCollectRequested(self: *const ObjectHeap) bool {
-        return self.collection.collect_requested;
+        return self.collection.collect_requested.load(.monotonic);
     }
 
     /// Rebuild the alloc bitmap (which slots are filled-and-live) from
@@ -2153,7 +2159,7 @@ pub const ObjectHeap = struct {
     pub inline fn gcHeapId(v: Value) ?ObjectId {
         if (v.isList() or v.isAttrs() or v.isThunk() or v.isClosure() or
             v.isBuiltinClosure() or v.isContextString() or v.isBoxedInt() or
-            v.isPartialApp()) return v.asObjectId();
+            v.isPartialApp() or v.isHeapString()) return v.asObjectId();
         return null;
     }
 

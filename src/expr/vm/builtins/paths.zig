@@ -127,7 +127,7 @@ pub fn builtinPath(self: *VM, arg: Value) !Value {
     const path_id = try self.intern.intern("path");
     const path_value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, path_id));
     const path = switch (path_value.kind()) {
-        .path, .string, .string_context => try vm_strings.stringBytes(self, path_value),
+        .path, .string, .string_context, .heap_string => try vm_strings.stringBytes(self, path_value),
         else => return error.TypeError,
     };
     if (!std.fs.path.isAbsolute(path)) return error.RelativePath;
