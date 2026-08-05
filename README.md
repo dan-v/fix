@@ -53,11 +53,10 @@ Compatibility is a target backed by several kinds of tests:
 - `fix parse` emits the same JSON-shaped syntax tree used by
   `nix-instantiate --parse`.
 
-The current pinned language suites pass, and the pinned nixpkgs universe
-evaluates to identical derivation paths (80,586 of 80,586 attributes,
-including agreement on which attributes fail to evaluate). See
-[the language-test documentation](test/lang/README.md) for exactly what is
-run. The nixpkgs differential runs monolithically with
+The language suites and nixpkgs derivation-path differential are separate
+checks, with their scope described in
+[the language-test documentation](test/lang/README.md). The nixpkgs
+differential runs monolithically with
 `zig build test-nixpkgs` (it wants a large-memory machine and caches the
 reference results per pin) and as a sharded matrix in CI.
 
@@ -93,9 +92,9 @@ that evaluation's heap remains available to inspect.
 
 ## Quick start
 
-`fix` is alpha-quality software under active development. Development currently
-takes place on x86_64 Linux; other platforms have not received the same level
-of use.
+`fix` is alpha-quality software under active development. The development
+environment is exercised on x86_64 Linux; other platforms have received less
+testing.
 
 Nix is not required to build `fix`. A direct build requires Zig 0.16,
 `pkg-config`, libcurl, and libgit2:
@@ -113,9 +112,8 @@ build environment and dependencies:
 $ nix-shell --run 'zig build --release=fast'
 ```
 
-Evaluation does not require a Nix or Lix executable; store-writing commands
-need a reachable Nix or Lix daemon. Tagged releases publish optimized build
-archives for x86_64 Linux, aarch64 Linux, and aarch64 macOS.
+Evaluation does not require a Nix or Lix executable. Store-writing commands
+need a reachable Nix or Lix daemon.
 
 ```console
 $ ./zig-out/bin/fix eval -E '1 + 2'
@@ -224,11 +222,10 @@ options.
 
 ### `fix switch`
 
-`fix switch` can build and activate NixOS configurations. It also implements
-the conventional nix-darwin and Home Manager activation paths, although those
-two have not been verified locally. It supports `switch`, `boot`, `test`,
-`build`, and `dry-activate` actions. When supplied, the action must be the first
-argument after `fix switch`.
+`fix switch` can build and activate NixOS configurations and implements the
+conventional nix-darwin and Home Manager activation paths. It supports
+`switch`, `boot`, `test`, `build`, and `dry-activate` actions. When supplied,
+the action must be the first argument after `fix switch`.
 
 ```console
 $ fix switch --nixos
@@ -236,10 +233,8 @@ $ fix switch --nixos
 $ fix switch build --home-manager --flake .#me
 ```
 
-This command is intentionally experimental. I am still thinking about what
-exactly `fix switch` should be—its scope, its interface, and its relationship to
-the existing rebuild tools—and it will likely change in the future. Treat the
-current command as a useful prototype, not a stable automation interface.
+This command is experimental. Its scope and interface may change; do not use it
+as a stable automation interface.
 
 ## Explorer and debugger
 
@@ -266,10 +261,11 @@ with `fix repl --no-tui` when an alternate-screen interface is undesirable.
 
 ## Performance
 
-The chart below compares wall-clock evaluation time across synthetic stress
-tests, real NixOS and Home Manager configurations, and JSON-producing
-workloads. Each cell is relative to the fastest evaluator for that workload;
-`1.00×` is fastest. The harness defaults to five recorded runs.
+The chart and tables are point-in-time measurements from pinned inputs, not a
+claim that `fix` wins every workload. They compare wall-clock evaluation time
+across synthetic stress tests, real NixOS and Home Manager configurations, and
+JSON-producing workloads. Each cell is relative to the fastest evaluator for
+that workload; `1.00×` is fastest. The harness defaults to five recorded runs.
 
 ![fix evaluator benchmark](demo/benchmark.png)
 
@@ -449,9 +445,8 @@ workloads. Each cell is relative to the fastest evaluator for that workload;
 
 </details>
 
-These results are point-in-time measurements from pinned inputs, not a claim
-that `fix` wins every workload. The timing harness uses Hyperfine, with separate
-warmup and measured runs and optional cache reclamation between runs.
+The timing harness uses Hyperfine, with separate warmup and measured runs and
+optional cache reclamation between runs.
 Correctness is checked separately by `zig build test-bench-fixtures`; it is not
 part of the timing script. See [the benchmark documentation](bench/README.md)
 for the workloads and reproduction commands.
@@ -499,11 +494,10 @@ without direnv.
 ## Project status
 
 `fix` is alpha-quality software under active development. Compatibility is a
-concrete target and is continuously tested, but this is not yet a promise that
-every Nix program or workflow is supported. Development currently takes place
-on x86_64 Linux; release builds also cover aarch64 Linux and aarch64 macOS.
-Keep Nix installed: it is a runtime requirement because `fix` uses the Nix
-daemon for store operations and builds.
+concrete target backed by focused and differential tests, but not a promise
+that every Nix program or workflow is supported. A Nix or Lix daemon is needed
+for store operations and builds; it need not be supplied by a locally installed
+Nix executable.
 
 If `fix` produces a different value, derivation, or store path from Nix for
 supported input, that is a bug. Releases are documented in

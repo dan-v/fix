@@ -34,7 +34,7 @@ Debugger and name-capture sessions bypass the cache in both directions.
 
 ## Dispatch → domain modules
 
-`driver.compileNodeImpl` is the recursive dispatch switch; `context.zig` owns compiler state and carries the driver callback used by child compilers. High-level node compilers live in cohesive sibling modules and the driver imports each owner directly.
+`driver.compileNodeImpl` is the recursive dispatch switch; `context.zig` owns compiler state and carries the driver callback used by child compilers. High-level node compilers live in cohesive sibling modules and the driver imports each owner directly. Shared attribute-name decoding lives in the leaf `attr_names.zig`; packed static/mixed path operands are lowered by `attr_path_operand.zig`. Neither concern requires a dependency on the full attrset compiler.
 
 | Node family | Module | Lowers |
 | --- | --- | --- |
@@ -49,7 +49,8 @@ Debugger and name-capture sessions bypass the cache in both directions.
 | free-variable collection | `refs` | conservative name-set walk shared by `let`/`lambda` classification |
 | name resolution & capture | `scope` | local slots, upvalue threading, `with`-scope collection |
 | must-force analysis + stamp | `strictness` | strictness masks, per-param must-force, body span |
-| low-level byte emission + fusion | `emit` | opcode + LE operand writes, super-op fusion, jump patching |
+| packed attribute paths | `attr_path_operand` | static/dynamic segment classification, source-aware operand limits |
+| low-level byte emission + fusion | `emit` | opcode + LE operand writes, super-op fusion, jump patching; no AST traversal |
 
 Domain modules call `emit` to write bytes; `emit` sees only opcodes/operands and never walks the AST.
 

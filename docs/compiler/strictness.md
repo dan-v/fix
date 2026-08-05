@@ -81,7 +81,14 @@ for a worked example.
 
 The prefix is bounded (32 members) and truncation anywhere is sound — each element is justified only by the elements before it.
 
-`let.zig` then **validates** the prefix against sibling reference edges: a prefix member may only be referenced from a *later* prefix member (whose pass-3 evaluation reads the member's already-filled slot). A reference from a lazy sibling, or from an earlier prefix member, demotes the referenced member back to an ordinary lazy thunk — demotions cascade, since a demoted member is itself then a lazy referencer. This validation closes a real bug the old single-binding first-demand gate had: without it, `let l = r + 1; p = l + 2; r = 5 + 5; in p` could eagerly evaluate `l` straight into its slot before `r`'s slot was filled, transitively forcing an unset cell and false-blackholing with `RecursiveThunk`. The emitter then evaluates the validated prefix (pass 3) directly into slots, in order, only after every sibling's lazy thunk already exists (pass 2) — so forward references resolve and eager order equals lazy order exactly, including which error surfaces first.
+`let.zig` then **validates** the prefix against sibling reference edges. A
+prefix member may be referenced only from a *later* prefix member, whose
+evaluation reads an already-filled slot. A reference from a lazy sibling or an
+earlier prefix member demotes the referenced binding back to a lazy thunk;
+demotions cascade. This prevents a strict prefix from reading an uninitialized
+recursive binding. The emitter creates every remaining lazy sibling before it
+evaluates the validated prefix into slots, in order. Forward references therefore
+resolve with the same ordering as the lazy program.
 
 **3. Per-parameter strictness (`bodyMustForceName` / `forwardingUpvalue`).** A single-parameter lambda whose body must-forces its parameter (`bodyMustForceName`) sets `SchedulingHints.strict_param` — a caller holding the closure passes its argument eagerly. Only when that fails, a structural check (`forwardingUpvalue`) matches the forwarder shape `x: f x` and records `f`'s upvalue index in `strict_via_upvalue`, so the lambda forces its parameter iff `f` does. An uncurried (arity > 1) lambda instead records a per-parameter `strict_params` bitmask (bit *i* = param *i* must-forced), which the saturated [`call_n`](pipeline.md) path (`vm/closures.zig forceStrictArgs`) forces eagerly in place. A directly-applied strict lambda `(x: body) arg` (`directlyAppliedStrictLambda`, also `bodyMustForceName`) likewise lets the caller pass `arg` eagerly instead of thunking it. `strict_param` and `strict_via_upvalue` are gated to `local_count == 1` at `ChunkBuilder.finish`.
 

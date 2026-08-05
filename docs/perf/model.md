@@ -60,7 +60,7 @@ point-in-time effects at w=32:
 | direct formal binding (skip binding cells) | ~-1.5% w=1 & w=32 | [vm/calls](../vm/calls.md) |
 | frameless `attr_access` thunk (no frame/dispatch) | ~-2% w=32 | [runtime/thunks](../runtime/thunks.md) |
 | ATerm bulk-copy on drv-hash path | ~-3.7% best w=32 | [derivation/hashing](../derivation/hashing.md) |
-| then-current thunk compaction | ~-2.4% w=32 | [runtime/thunks](../runtime/thunks.md) |
+| thunk compaction | ~-2.4% w=32 | [runtime/thunks](../runtime/thunks.md) |
 | thunk-result memo (skip recomputing same chunk+ups) | ~-2% w=32, ~-2.5–3% w=1 | [runtime/thunks](../runtime/thunks.md) |
 | uncurry value-lambda chains + PAP + per-param strictness | ~-1.5% w=1 | [vm/calls](../vm/calls.md) |
 | flat object store (`get(id)=base[id]`) | ~-3–4% w=1 | [runtime/heap](../runtime/heap.md) |
@@ -69,7 +69,7 @@ point-in-time effects at w=32:
 Cumulative session ~-5.5% w=32. Derivation hashing and module-function work
 remained the largest observed chain items after these changes.
 
-## Dead-ends — measured neutral or regressive, do NOT re-explore
+## Historical results to revisit only with new evidence
 
 | direction tried | measured result |
 | --- | --- |

@@ -75,13 +75,13 @@ then `direnv allow`.
 eval "$(fix print-dev-env ./shell.nix)"   # enter the dev shell in-place
 ```
 
-## Caveats / not-yet
+## Limitations and planned work
 
 - **No GC roots.** A `nix-collect-garbage` can drop realized inputs referenced
   by a cached environment. Remove the corresponding `.direnv/fix-*.env` cache
-  entry to recompute it. (A future `fix print-dev-env --add-root` would
-  register roots like `nix-direnv`.)
-- **`__structuredAttrs` derivations are not yet supported** (the env is emitted
+  entry to recompute it. A future `fix print-dev-env --add-root` could register
+  roots like `nix-direnv`.
+- **`__structuredAttrs` derivations are unsupported** (the env is emitted
   as a single `__json` blob rather than individual variables). `fix
   print-dev-env` reports this and exits non-zero.
 - The env is computed by building a get-env derivation (pure), so the first run

@@ -63,9 +63,8 @@ never once per nesting level below it. The census counters **cluster map
 hits** and **cluster walks** (below) count these two paths.
 
 Directly-nested let spines (`let A in let B in …`) merge into one cluster
-**during this same walk** (see "Nested-let spine merging" below), replacing
-the separate flattening pre-pass an earlier version of this pass ran before
-building the graph.
+**during this same walk** (see "Nested-let spine merging" below), so the
+graph captures bindings across the merged spine.
 
 The bullets below describe what the graph records once built; the registry
 above is what makes building it cheap.
@@ -93,12 +92,10 @@ above is what makes building it cheap.
   gives the full nested-branch path from the let header. Branch-local
   floating uses this to find the deepest branch common to a binding's uses.
 
-The walk mirrors `refs.zig`'s conservative coverage exactly — every mention
-that walker would report is either a resolved use or a pinned mention here —
-so liveness decisions stay at least as conservative as the pre-existing
-dead-binding elimination. It differs only in one safe direction: a mention
-that provably resolves to an inner binder (a shadowing lambda param, nested
-let, or rec-attr name) is not counted as a cluster use.
+The walk mirrors `refs.zig`'s conservative coverage: every mention it reports
+is either a resolved use or a pinned mention here. A mention that provably
+resolves to an inner binder (a shadowing lambda parameter, nested `let`, or
+recursive-attr name) is not counted as a cluster use.
 
 ## The transforms
 
@@ -246,20 +243,11 @@ original position and the target.
 **`with`/dynamic names move only within an unchanged `with`-chain.** A free
 name that resolves dynamically — through `with`, unresolvably, or through a
 `scopedImport`-replaced base environment (`classifyOuterName`'s `.dynamic`
-class) — used to pin the *whole* RHS unconditionally: it could never inline,
-sink, or float. That blanket rule is gone. A dynamic free name now gates
-**per destination**: the binding may still move to any site whose
-header-relative window crosses **no** `with` body (`Graph.withCrossedAt`,
-backed by `SharedTables.with_marks` — the ascending list of log positions
-where a `with` body begins). The reasoning is the same identity the old
-blanket rule protected conservatively: an identical `with`-chain at both the
-original position and the destination resolves the name to the identical
-value, so moving where the thunk is *created* changes nothing observable. A
-destination whose window *does* cross a `with` entry still blocks
-(`blocked_dynamic`), since the two positions could resolve the name through
-different scopes. On the pinned nixpkgs universe this raised single-use
-sinks from 3,235 to 4,078 and cut "blocked: dynamic free name" from ~7,000
-to 485 (measured on the nixpkgs pin — see [Cost profile](#cost-profile)).
+class) — is checked per destination. It may move only when the window from
+its original position crosses no `with` body (`Graph.withCrossedAt`, backed by
+`SharedTables.with_marks`). An identical `with`-chain resolves the name to the
+same value; crossing a `with` entry could change that resolution, so it blocks
+the move (`blocked_dynamic`).
 
 `scopedImport` still pins outright in practice: it replaces the *entire*
 base environment, so `classifyOuterName` classifies everything below
@@ -277,9 +265,6 @@ check is a walk-order position, not merely a count of binders. Without this,
 a binder-free `with` could be silently "hopped" by a move that should have
 been blocked.
 
-Elided (never-parsed) RHSes are unaffected by this change — they stay
-pinned by their own rule regardless of any `with`-crossing, described next.
-
 **Opaque (elided) spans immobilize too.** A never-parsed span inside an RHS
 means every ident-shaped word in it is a conservative pinned mention and the
 RHS as a whole is treated as opaque — it cannot be proven capture-safe, so it
@@ -287,8 +272,7 @@ stays put.
 
 **Recursive SCCs stay atomic.** A binding in a multi-member dependency cycle,
 or a self-referential binding, is marked `scc_recursive` and excluded from
-inlining, sinking, and floating outright (`blocked_recursive`) — the SCC
-compiles exactly as the classifier would have without the rewrite.
+inlining, sinking, and floating (`blocked_recursive`).
 
 ## Sharing safety
 
@@ -320,9 +304,9 @@ value-lambda chain (`demand_prefix.Binding.lambda`, built by `demand_prefix.lamb
 — pattern lambdas are excluded, since formal validation can throw before any
 parameter is forced) is treated as a pre-resolved closure shell: forcing the
 *binding* is effect-free. When the body applies it fully saturated, the walk
-no longer stops at the call as an opaque barrier — it descends into the
-lambda's body with parameters bound to the call's argument expressions, so
-the body's own demand order extends the prefix through the call:
+descends into the lambda's body with parameters bound to the call's argument
+expressions, so the body's own demand order extends the prefix through the
+call:
 
 ```nix
 let f = x: x + 1; y = compute; in f y
@@ -342,15 +326,11 @@ current visibility window (`strictness.md`'s window model has the full
 detail).
 
 The prefix is then **validated** against sibling reference edges collected
-during classification: a prefix member may only be referenced by a *later*
-prefix member (whose pass-3 evaluation reads the already-filled slot). A
-reference from a lazy sibling, or from an earlier prefix member, demotes the
-referenced member back to a lazy thunk — demotions cascade. This is what
-fixes a real pre-existing bug: without the "later members only" rule, the old
-single-binding elision could evaluate a binding straight into its slot before
-a binding it transitively depends on was ready, false-blackholing with
-`RecursiveThunk` (`let l = r + 1; p = l + 2; r = 5 + 5; in p` now correctly
-evaluates to `13`).
+during classification. A prefix member may be referenced only by a *later*
+prefix member, whose pass-3 evaluation reads an already-filled slot. A lazy
+sibling or an earlier prefix member demotes the referenced binding back to a
+lazy thunk; demotions cascade. This rule prevents the strict prefix from
+reading an uninitialized recursive binding.
 
 ## Interaction with deferred compilation and the debugger
 
@@ -396,32 +376,15 @@ shape.
 
 ## Cost profile
 
-The analysis now walks each **outermost** let subtree once — `core.analyze`
-registers a `Cluster` for every `let` nested inside it during that single
-pass, not via one independent walk per nesting level. This replaces the old
-per-let-walk model (a let at nesting depth *d* was walked by *d* enclosing
-analyses) and is the single unit-level analysis lever a prior revision of
-this pass had left as follow-up. The only remaining multiplier: an
-enclosing rewrite that *changes* a nested let's contents rebuilds that node,
-so its cluster isn't found in the registry and costs one extra re-walk of
-just that subtree — never the whole unit again.
+The analysis walks each **outermost** `let` subtree once and registers its
+nested `let`s in that pass. A rewrite that changes a nested subtree can require
+one additional analysis of that subtree, but not a fresh walk of every enclosing
+`let`.
 
-Measured on a NixOS-minimal eval (`-Dprof-main`), wall time is within noise
-of the prior per-let-walk version — this fixture's let-nesting isn't deep
-enough for the removed multiplier to separate from run-to-run variance at
-that scale. The win shows up on deeply-nested real-world trees: on the
-pinned nixpkgs full-universe evaluation (80,586 attrs, `test/nixpkgs`), the
-registry version measures **~52.0s** versus **~52.9s** for the prior
-per-let-walk version — about **3% cumulative** faster than pre-let-float
-HEAD (all measured on the nixpkgs pin).
-
-The rewrite's transforms still pay for themselves independent of the walk
-cost: `math-heavy` evaluates 1.42× faster and `list-heavy` +4% on their
-synthetic fixtures, with parallel real-world runs neutral. The per-site
-`with`-crossing rule (see [Capture safety](#capture-safety)) raised
-single-use sinks from **3,235 to 4,078** and cut "blocked: dynamic free
-name" from **~7,000 to 485** on the nixpkgs pin's `FIX_LET_FLOAT_STATS=1`
-census.
+Historical measurements against a pinned nixpkgs universe found this registry
+shape about 3% faster than the earlier per-`let` analysis. Treat that result as
+motivation for the design, not as a current performance guarantee; use the
+[performance probes](../perf/probes.md) to evaluate changes.
 
 ## Invariants
 
@@ -445,14 +408,14 @@ Out of scope: the strict-prefix walk and its completeness/barrier rules in
 full → [strictness.md](strictness.md); where the residual `let` is classified
 and emitted → [pipeline.md](pipeline.md); name resolution and the shadow
 model this pass reads → [scopes.md](scopes.md); deferred per-attr compilation
-→ [lazy-compile.md](lazy-compile.md). Not attempted by this pass: **full
-laziness** (floating a binding *outward*, past an enclosing lambda, to share
-across calls). The strict prefix **is** now callee-aware for saturated calls
-to statically-known sibling (or inline-literal) value lambdas, depth-capped
-at 4 — see [The strict prefix and its validation](#the-strict-prefix-and-its-validation)
-above and [strictness.md](strictness.md#products--consumers). Still out of
-scope: reasoning through an indirectly-referenced, dynamically-selected, or
-only partially-applied callee.
+→ [lazy-compile.md](lazy-compile.md). This pass does not attempt **full
+laziness**: floating a binding outward past an enclosing lambda to share it
+across calls. The strict prefix handles saturated calls to statically-known
+sibling or inline value lambdas, depth-capped at 4; see
+[The strict prefix and its validation](#the-strict-prefix-and-its-validation)
+and [strictness.md](strictness.md#products--consumers). It does not reason
+through indirectly referenced, dynamically selected, or partially applied
+callees.
 
 Code: `src/expr/compiler/let_float.zig` with `let_float/planner.zig`,
 `let_float/rewrite.zig`, and `let_float/model.zig`;

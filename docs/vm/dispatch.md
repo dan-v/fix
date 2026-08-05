@@ -45,9 +45,9 @@ Each opcode has a standalone handler so its locals and register pressure remain 
 
 ## Value stack and frames
 
-**Operand stack** — `vm.stack[0..sp)`, capacity `vm_stack_capacity` (65 536). `push`/`pushFrame` bounds-check against the cap and raise `error.StackOverflow`; `pop` is unchecked (it only decrements `sp`). `sp_high_water` tracks the peak for diagnostics.
+**Operand stack** — `vm.stack[0..sp)`, capacity `vm_stack_capacity` (524,288). `push`/`pushFrame` bounds-check against the cap and raise `error.StackOverflow`; `pop` is unchecked (it only decrements `sp`). `sp_high_water` tracks the peak for diagnostics.
 
-**Frames** — `vm.frames[0..frames_len)`, capacity `max_frames` (20,000). A `Frame` is:
+**Frames** — `vm.frames[0..frames_len)`, capacity `max_frames` (65,536). Function applications additionally obey the configurable logical `max-call-depth` limit (10,000 by default); passthrough thunk-force frames do not consume logical call depth. A `Frame` is:
 
 | field | meaning |
 |---|---|
@@ -83,9 +83,10 @@ This is what makes the interpreter **re-entrant**. `runIsolatedFrame(ch, chunk_i
 
 ## Chunk and registry
 
-A `Chunk` is fully initialized before registration and treated as read-only by
-normal evaluation. The debugger is the exception: `BreakpointTable`
-temporarily patches opcode bytes. Key fields (compiler-stamped; see
+A `Chunk` is fully initialized before registration and remains read-only.
+`BreakpointTable` creates a private mutable code overlay for a chunk only when
+the debugger places a breakpoint; dispatch selects that overlay at frame entry
+while registry users continue to see canonical bytecode. Key fields (compiler-stamped; see
 [compiler/scopes.md](../compiler/scopes.md) and
 [compiler/strictness.md](../compiler/strictness.md)):
 
@@ -116,9 +117,9 @@ Two **well-known stub chunks** (`genlist_apply`, `mapattrs_apply`) are registere
 - **Single reused dispatch frame.** Handler-to-handler transitions in the
   `always_tail` chain do not grow the native stack with opcode count. Language
   calls are tracked in the bounded VM frame array.
-- **Chunks are complete before publication.** Normal evaluation reads them
-  without mutation. Debugger opcode patches are installed and restored through
-  the breakpoint table.
+- **Chunks are complete before publication and immutable afterward.** Debugger
+  opcode patches are installed and restored only in private breakpoint-table
+  overlays.
 - **`frame.ip` is written back** before any op that can fault, re-enter the interpreter, or push a frame, so error traces and resumed callers see a consistent ip.
 
 Code: `src/expr/vm/`, `src/expr/bytecode/`
