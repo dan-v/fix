@@ -104,6 +104,10 @@ pub const Compiler = struct {
     line_index_ready: bool,
     parent: ?*Compiler,
     skip_local_slot: ?u16,
+    /// Prevent child chunks created in the current region from being submitted
+    /// speculatively. Deprecated recursive-set overrides use this while their
+    /// binding cells are still eligible for the one-time re-point operation.
+    suppress_child_speculation: bool,
     scope_depth: u8,
     slot_count: u16,
     /// Count of attr value bodies deferred during this compile (lazy
@@ -214,6 +218,7 @@ pub const Compiler = struct {
             .line_index_ready = false,
             .parent = null,
             .skip_local_slot = null,
+            .suppress_child_speculation = false,
             .scope_depth = 0,
             .slot_count = 0,
             .deferred_count = 0,
@@ -245,6 +250,7 @@ pub const Compiler = struct {
         child.policy = self.policy;
         child.source_file_id = self.source_file_id;
         child.registration_sink = self.registration_sink;
+        child.suppress_child_speculation = self.suppress_child_speculation;
         // Qualified-name tree: the first child spun up for a named bound value
         // claims the pending name as a child node of this compiler's name and
         // becomes the parent for its own nested bodies. Real binding segments
@@ -304,7 +310,9 @@ pub const Compiler = struct {
     }
 
     /// Register `ch`, tagging it with this compiler's qualified-name node.
-    pub fn registerChunk(self: *Compiler, ch: chunk.Chunk) !types.ChunkId {
+    pub fn registerChunk(self: *Compiler, input: chunk.Chunk) !types.ChunkId {
+        var ch = input;
+        if (self.suppress_child_speculation) ch.scheduling.body_is_substantial = false;
         if (!self.registry.dedup_compiler_chunks) {
             // One-shot compilation overwhelmingly produces unique chunks.
             // Hashing every body and its side tables, then allocating a dedup
