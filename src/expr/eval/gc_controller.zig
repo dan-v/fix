@@ -138,7 +138,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
     };
     if (ev.worker_count > 1) {
         const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
-        tr.resetParallelMinor(ev.heap.objects.count(), marker_count) catch {
+        tr.resetParallelMinor(ev.heap.counts().objects, marker_count) catch {
             heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
             return;
         };
@@ -168,7 +168,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
                 ctx.tr.markRemsetSource(ctx.heap, source);
             }
         };
-        tr.resetMinor(ev.heap.objects.count()) catch {
+        tr.resetMinor(ev.heap.counts().objects) catch {
             heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
             return;
         };
@@ -195,15 +195,16 @@ pub fn collect(ev: Context, collector_id: u8) void {
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
     gc.recordCollection(&ev.heap.collection.report, .minor, st.freed, tr.stats, ev.heap.totalReservedBytes());
     gc.recordTiming(&ev.heap.collection.report, t1 - t0, t2 - t1);
+    const reserved = ev.heap.counts();
     gc.recordBreakdown(&ev.heap.collection.report, .{
         .obj_live = tr.stats.objects,
-        .obj_reserved = ev.heap.objects.count(),
+        .obj_reserved = reserved.objects,
         .val_live = tr.stats.values,
-        .val_reserved = ev.heap.values.count(),
+        .val_reserved = reserved.values,
         .attr_live = tr.stats.attrs,
-        .attr_reserved = ev.heap.attrs.count(),
+        .attr_reserved = reserved.attrs,
         .attr_pos_live = tr.stats.attr_pos,
-        .attr_pos_reserved = ev.heap.attr_positions.count(),
+        .attr_pos_reserved = reserved.attr_positions,
     });
     observation.finish(.{ .metrics = &.{
         .{ .name = "freed", .value = .{ .unsigned = st.freed }, .unit = .items },
@@ -241,7 +242,7 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     };
     if (ev.worker_count > 1) {
         const marker_count = @min(@as(u32, ev.worker_count), ev.parallel_cap);
-        tr.resetParallel(ev.heap.objects.count(), marker_count) catch {
+        tr.resetParallel(ev.heap.counts().objects, marker_count) catch {
             heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
             return;
         };
@@ -262,7 +263,7 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
         ev.scheduler.gcCloseMark();
         tr.sumStats();
     } else {
-        tr.resetMajor(ev.heap.objects.count()) catch {
+        tr.resetMajor(ev.heap.counts().objects) catch {
             heap_collector.afterCollect(ev.heap, ev.heap.totalReservedBytes());
             return;
         };
@@ -295,15 +296,16 @@ pub fn collectMajor(ev: Context, collector_id: u8) void {
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
     gc.recordCollection(&ev.heap.collection.report, .major, st.objects_freed, tr.stats, ev.heap.totalReservedBytes());
     gc.recordTiming(&ev.heap.collection.report, t1 - t0, t2 - t1);
+    const reserved = ev.heap.counts();
     gc.recordBreakdown(&ev.heap.collection.report, .{
         .obj_live = tr.stats.objects,
-        .obj_reserved = ev.heap.objects.count(),
+        .obj_reserved = reserved.objects,
         .val_live = tr.stats.values,
-        .val_reserved = ev.heap.values.count(),
+        .val_reserved = reserved.values,
         .attr_live = tr.stats.attrs,
-        .attr_reserved = ev.heap.attrs.count(),
+        .attr_reserved = reserved.attrs,
         .attr_pos_live = tr.stats.attr_pos,
-        .attr_pos_reserved = ev.heap.attr_positions.count(),
+        .attr_pos_reserved = reserved.attr_positions,
     });
     observation.finish(.{ .metrics = &.{
         .{ .name = "freed", .value = .{ .unsigned = st.objects_freed }, .unit = .items },
@@ -666,7 +668,7 @@ test "frame roots closure owner until its raw upvalue slice unwinds" {
 
     var tr = gc.Tracer.init(allocator);
     defer tr.deinit();
-    try tr.resetMajor(heap.objects.count());
+    try tr.resetMajor(heap.counts().objects);
     markFrame(&tr, &heap, &frame);
     tr.drain(&heap);
     try std.testing.expect(tr.isMarked(owner));
@@ -674,7 +676,7 @@ test "frame roots closure owner until its raw upvalue slice unwinds" {
     try std.testing.expectEqual(@as(u64, 0), heap_collector.sweep(&heap, tr.mark_bits).objects_freed);
 
     // Once the frame is gone, the owner and its range are reclaimable.
-    try tr.resetMajor(heap.objects.count());
+    try tr.resetMajor(heap.counts().objects);
     tr.drain(&heap);
     try std.testing.expectEqual(@as(u64, 1), heap_collector.sweep(&heap, tr.mark_bits).objects_freed);
     const replacement = try heap.addList(&captures);
