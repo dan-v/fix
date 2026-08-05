@@ -211,6 +211,47 @@ pub const Table = struct {
         return self.entries.append(self.allocator, stored);
     }
 
+    /// Register one decoded cache unit as a single ownership transfer. All
+    /// entry allocations happen before the store reservation, so failure
+    /// publishes nothing; after reservation, filling the slots cannot fail.
+    pub fn registerBatch(self: *Table, entries: []const Entry, out_ids: []u32) !void {
+        if (entries.len != out_ids.len) return error.InvalidBatch;
+        if (entries.len == 0) return;
+        const stored = try self.allocator.alloc(*Entry, entries.len);
+        defer self.allocator.free(stored);
+        var allocated: usize = 0;
+        errdefer for (stored[0..allocated]) |ptr| self.allocator.destroy(ptr);
+        for (stored) |*slot| {
+            slot.* = try self.allocator.create(Entry);
+            allocated += 1;
+        }
+        const Initialize = struct {
+            store: *Store,
+            entries: []const Entry,
+            stored: []*Entry,
+            ids: []u32,
+
+            fn run(raw: *anyopaque, first_id: u32, len: u32) anyerror!void {
+                const context: *@This() = @ptrCast(@alignCast(raw));
+                std.debug.assert(len == context.entries.len);
+                for (context.entries, context.stored, context.ids, 0..) |entry, ptr, *id, i| {
+                    ptr.* = entry;
+                    const entry_id = first_id + @as(u32, @intCast(i));
+                    context.store.getMut(entry_id).* = ptr;
+                    id.* = entry_id;
+                }
+            }
+        };
+        var initialize: Initialize = .{ .store = &self.entries, .entries = entries, .stored = stored, .ids = out_ids };
+        _ = try self.entries.appendDenseInitialized(
+            self.allocator,
+            @intCast(entries.len),
+            &initialize,
+            Initialize.run,
+        );
+        allocated = 0;
+    }
+
     pub fn get(self: *const Table, id: u32) *Entry {
         return self.entries.get(id).*;
     }

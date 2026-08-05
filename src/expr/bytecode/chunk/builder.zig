@@ -258,7 +258,7 @@ pub const ChunkBuilder = struct {
 /// shapes that let `thunk` skip thunk allocation entirely.
 /// Run once at chunk-finish; result lives on the immutable Chunk so
 /// the hot path reads it without re-parsing the bytecode.
-fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: u16) TrivialBody {
+pub fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: u16) TrivialBody {
     // Trivial-body short-circuit is only safe for chunks used as
     // *thunk bodies*. Thunk bodies have local_count == 0 (no args,
     // no temporaries). Closure bodies (lambdas) have local_count >= 1

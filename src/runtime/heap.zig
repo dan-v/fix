@@ -2492,6 +2492,30 @@ pub const ObjectHeap = struct {
         return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = positions } });
     }
 
+    /// `attrs_new_named` (unsorted) variant: like `addAttrsFromValuesSorted`
+    /// but the names carry no order guarantee — a persistently-cached chunk
+    /// loads with remapped intern ids, and remapping does not preserve the
+    /// compile-time id order its `_srt` twin baked in. Sorts (and
+    /// duplicate-rejects) the entries; the shared position table reference
+    /// is still required sorted (the cache loader re-sorts each range).
+    pub fn addAttrsFromValues(
+        self: *ObjectHeap,
+        names: []const InternId,
+        values: []const Value,
+        positions: AttrPositions,
+    ) !ObjectId {
+        std.debug.assert(names.len == values.len);
+        if (names.len == 0) if (self.empty_attrs_id) |id| return id;
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
+        const range = try self.reserveAttrsLocal(@intCast(names.len));
+        const entries = self.attrs.sliceMut(range);
+        for (entries, names, values) |*e, n, v| e.* = .{ .name = n, .value = v };
+        try self.sortAndDedupAttrs(range);
+        std.debug.assert(positionsSortedByName(self.attrPositionsEntries(positions)));
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = positions } });
+    }
+
     /// `attrs_new_srt` fast path: the compiler guarantees the pairs
     /// are already in ascending interned-name order with no duplicates
     /// (static attrset literals are grouped — duplicates rejected — and

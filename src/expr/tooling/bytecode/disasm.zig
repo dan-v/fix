@@ -1194,7 +1194,7 @@ fn headRaw(l: *Line, f: Operand, code: []const u8, off: usize, col_byte: u16, fl
         .const_idx => l.groupPinned(col_byte, flen, color, "#{d}", .{readU16(code, off)}),
         .slot => |s| l.groupPinned(col_byte, flen, color, "#{d}", .{readWidth(s.w, code, off)}),
         .count => |c| l.groupPinned(col_byte, flen, color, "#{d}", .{readWidth(c.w, code, off)}),
-        .raw => |w| l.groupPinned(col_byte, flen, color, "#{d}", .{readWidth(w, code, off)}),
+        .deferred_id => |w| l.groupPinned(col_byte, flen, color, "#{d}", .{readWidth(w, code, off)}),
         else => {},
     }
 }
@@ -1740,17 +1740,17 @@ fn fieldHasRaw(f: Operand) bool {
     };
 }
 
-/// Every field but `.skip` and `.raw` (a bare scalar) has an interpretation.
+/// Every field but `.skip` has an interpretation.
 fn fieldHasInterp(f: Operand) bool {
     return switch (f) {
-        .skip, .raw => false,
+        .skip => false,
         else => true,
     };
 }
 
 fn writeFieldRaw(writer: *std.Io.Writer, f: Operand, code: []const u8, ip: usize) !void {
     switch (f) {
-        .raw, .skip => |w| try writer.print("#{d}", .{readWidth(w, code, ip)}),
+        .deferred_id, .skip => |w| try writer.print("#{d}", .{readWidth(w, code, ip)}),
         .const_idx => try writer.print("#{d}", .{readU16(code, ip)}),
         .slot => |s| try writer.print("#{d}", .{readWidth(s.w, code, ip)}),
         .cap1 => try writer.print("#{d}", .{readU16(code, ip + 1)}),
@@ -1776,7 +1776,8 @@ fn writeFieldInterp(
     referenced_chunks: ?RefSink,
 ) !void {
     switch (f) {
-        .raw, .skip => {},
+        .skip => {},
+        .deferred_id => |w| try writer.print("deferred[{d}]", .{readWidth(w, code, ip)}),
         .const_idx => {
             const idx = readU16(code, ip);
             if (idx < chunk.constants.len)
