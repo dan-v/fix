@@ -193,7 +193,19 @@ pub fn sourceSpanForChunk(chunk_ptr: *const chunk.Chunk, ip: usize) ?chunk.Chunk
     var best: ?chunk.Chunk.SourceMapEntry = null;
     for (chunk_ptr.source_map) |entry| {
         if (pc < entry.start or pc >= entry.end) continue;
-        if (best == null or entry.end - entry.start <= best.?.end - best.?.start) {
+        const b = best orelse {
+            best = entry;
+            continue;
+        };
+        const entry_range = entry.end - entry.start;
+        const best_range = b.end - b.start;
+        // Tightest code range wins; equal code ranges (an expression that IS
+        // the whole enclosing construct, e.g. a `let` dissolved into its
+        // body) tie-break on the narrower source span — the innermost
+        // expression is the truest attribution.
+        if (entry_range < best_range or
+            (entry_range == best_range and entry.span.len <= b.span.len))
+        {
             best = entry;
         }
     }

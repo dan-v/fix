@@ -676,7 +676,22 @@ pub const Engine = struct {
         return ev;
     }
 
+    /// Whether `FIX_LET_FLOAT_STATS` asked for the rewrite census at
+    /// teardown — fast-exit paths keep explicit `deinit` alive for it.
+    pub fn letFloatCensusEnabled(self: *const Engine) bool {
+        _ = self;
+        return compiler_mod.let_float.report_on_deinit;
+    }
+
     pub fn deinit(self: *Engine) void {
+        // Rewrite census (`FIX_LET_FLOAT_STATS=1`) — whole-process counters,
+        // reported once at teardown, entirely off the evaluation path.
+        if (compiler_mod.let_float.report_on_deinit) {
+            var buf: [4096]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            compiler_mod.let_float.writeReport(&w) catch {};
+            std.debug.print("let-float census:\n{s}", .{buf[0..w.end]});
+        }
         self.debugger.deinit();
         self.releaseEvaluationResources();
         owned_strings.free(self.allocator, self.pure_eval_roots);
@@ -1426,6 +1441,10 @@ pub const Engine = struct {
         // Keep every debugger entry on the deterministic demand path even for
         // embedding applications that do not use the CLI's --debugger setup.
         self.setParallelismToggles(true, true);
+        // Debugging wants the source's bindings materialized as written:
+        // let-float rewrites stand down for everything compiled from now on
+        // (sticky — already-registered chunks are immutable anyway).
+        self.registry.preserve_bindings = true;
         self.debugger.setUi(.{ .ctx = ctx, .run = run });
         self.ensureBreakpointTable();
     }

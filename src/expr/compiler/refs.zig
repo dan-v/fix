@@ -146,7 +146,7 @@ pub fn walkReferencedNames(self: *Compiler, node: *const Node, ctx: anytype) voi
 /// atom-typed fields without expanding through the string parser.
 /// A span with no `${` at all cannot reference anything — skip it
 /// (its words would only ever be false positives).
-fn walkIdentifiersInSpan(self: *Compiler, atom: Node.Atom, ctx: anytype) void {
+pub fn walkIdentifiersInSpan(self: *Compiler, atom: Node.Atom, ctx: anytype) void {
     const text = self.source[atom.offset .. atom.offset + atom.len];
     if (std.mem.indexOf(u8, text, "${") == null) return;
     markIdentWords(text, ctx);

@@ -2,6 +2,59 @@
 
 All notable changes to `fix` are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Demand-driven `let` binding placement (`let-float`): a compile-time,
+  semantics-preserving rewrite that flattens nested-let spines, drops dead
+  binding chains, inlines literal/alias bindings, sinks single-use bindings
+  to their consumer, and floats branch-exclusive bindings into the `if`-arm
+  that uses them — before the residual `let` is classified and lowered.
+  Evaluation order and sharing are unchanged; only thunk *creation* moves.
+  `FIX_NO_LET_FLOAT=1` disables it for A/B comparison, and
+  `FIX_LET_FLOAT_STATS=1` prints a per-rewrite census at teardown.
+  - The analysis is now a single-walk cluster **registry** per compile
+    unit: one pass over an outermost `let`'s subtree registers every nested
+    `let`'s cluster at once (header-relative measurements make each
+    cluster's graph invariant under an enclosing rewrite that merely moves
+    its subtree), instead of re-walking on every nested level. An enclosing
+    rewrite that changes a nested let's own contents rebuilds that node and
+    falls back to one fresh walk of just that subtree. Nested-let spine
+    merging now happens during this walk rather than as a separate
+    pre-pass. Measured on the pinned nixpkgs full-universe evaluation
+    (80,586 attrs): ~52.0s vs ~52.9s for the prior per-let-walk version,
+    about 3% cumulative faster than pre-let-float HEAD.
+  - Bindings whose RHS mentions a `with`-resolved (dynamic) name are no
+    longer globally immobile: they may inline/sink/float to any destination
+    whose window from the cluster header crosses no `with` body (identical
+    `with`-chain ⇒ identical resolution). On the nixpkgs pin this raised
+    single-use sinks from 3,235 to 4,078 and cut "blocked: dynamic free
+    name" from ~7,000 to 485. Elided (never-parsed) RHSes remain globally
+    immobile.
+- Strict-prefix `let` elision (`strictness.demandPrefix`) generalizes the old
+  single-binding eager-elision gate to an ordered, transitively-extended
+  prefix of bindings the body provably forces before any other observable
+  effect, evaluated straight into their slots with no thunk.
+  - The prefix walk is now callee-aware: a saturated call to a statically-
+    known sibling (or inline-literal) value lambda is no longer a demand
+    barrier — the walk descends into the callee's body with its parameters
+    bound to the call's argument expressions, so an argument the callee's
+    body provably forces joins the caller's strict prefix too (depth-capped
+    at 4). Effect order still follows body demand order, so which error
+    surfaces first is unchanged.
+
+### Fixed
+
+- A `let` whose bindings had an eager-elision-eligible RHS chain could
+  false-blackhole with `RecursiveThunk` when an earlier binding transitively
+  forced a not-yet-initialized later one (`let l = r + 1; p = l + 2; r = 5 +
+  5; in p` now evaluates to `13`, matching lazy semantics). The strict prefix
+  is now validated so a member is only referenced by a *later* member.
+- Non-strict list rendering matches Nix more closely for single-use `let`
+  bindings: `let x = 1 + 1; in [ x ]` prints `[ <CODE> ]` (an unforced thunk)
+  instead of eagerly printing `[ 2 ]`.
+
 ## [0.3.0] - 2026-08-02
 
 ### Added

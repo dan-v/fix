@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const bytecode = @import("../../bytecode.zig");
+const let_float = @import("../../compiler/let_float.zig");
 const opcode_mod = bytecode.opcode;
 const encoding = bytecode.encoding;
 const OpCode = opcode_mod.OpCode;
@@ -223,4 +224,9 @@ pub fn write(allocator: std.mem.Allocator, writer: *std.Io.Writer, registry: *co
         }
         try writer.print("duplicate bodies ({s}): members {d}   distinct {d}   duplicates {d}   wasted bytes {d}\n", .{ pair[0], members, distinct, members - distinct, wasted });
     }
+
+    // Binding-placement census (whole-process counters; nonzero only when
+    // the corpus was compiled in this process, e.g. `disasm --stats --eval`).
+    try writer.print("\nlet-float census:\n", .{});
+    try let_float.writeReport(writer);
 }

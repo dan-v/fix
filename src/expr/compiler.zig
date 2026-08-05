@@ -10,11 +10,15 @@ pub const scope = @import("compiler/scope.zig");
 pub const thunks = @import("compiler/thunks.zig");
 pub const diagnostics = @import("compiler/diagnostics.zig");
 pub const strictness = @import("compiler/strictness.zig");
+pub const demand_prefix = @import("compiler/demand_prefix.zig");
 pub const deferred_table = @import("compiler/deferred_table.zig");
 pub const deferred = @import("compiler/deferred.zig");
 pub const fold = @import("compiler/fold.zig");
 pub const lambda = @import("compiler/lambda.zig");
 pub const let = @import("compiler/let.zig");
+pub const let_float = @import("compiler/let_float.zig");
+pub const let_analysis_model = @import("compiler/let_analysis/model.zig");
+pub const let_analysis_walker = @import("compiler/let_analysis/walker.zig");
 pub const refs = @import("compiler/refs.zig");
 
 const driver_mod = @import("compiler/driver.zig");

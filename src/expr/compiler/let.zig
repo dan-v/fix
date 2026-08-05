@@ -1,8 +1,9 @@
-//! Lowers `let … in`: classifies each binding root
+//! Lowers `let … in`: runs the demand-driven placement rewrite
+//! (`let_float.zig`) first, then classifies each residual binding root
 //! (unreferenced/literal/uncaptured/needs_cell) to skip binding cells and
-//! dead bindings, then drives strictness-based eager elision (a
-//! first-demanded, forward-ref-free binding is evaluated straight into its
-//! slot with no thunk).
+//! dead bindings, and finally drives strict-prefix eager elision — the
+//! bindings the body provably forces first (`demand_prefix.analyze`) are
+//! evaluated straight into their slots in demand order, with no thunks.
 
 const std = @import("std");
 const compiler_mod = @import("context.zig");
@@ -15,9 +16,11 @@ const attrs = @import("attrs.zig");
 const attr_names = @import("attr_names.zig");
 const access = @import("access.zig");
 const strictness = @import("strictness.zig");
+const demand_prefix = @import("demand_prefix.zig");
 const refs_mod = @import("refs.zig");
 const lambda = @import("lambda.zig");
 const thunks = @import("thunks.zig");
+const let_float = @import("let_float.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -32,8 +35,34 @@ pub fn compileLetInWithTailBody(self: *Compiler, node: *const Node) anyerror!voi
     try compileLetInBody(self, node, true);
 }
 
+/// One "binding q's RHS mentions binding m" edge, by binding index (the
+/// group's first index for merged roots). Drives strict-prefix validation:
+/// a prefix member may only be referenced by LATER prefix members, whose
+/// pass-3 evaluations read its already-filled slot.
+const RhsEdge = struct { from: u32, to: u32 };
+
+const LetClassification = struct {
+    kinds: []LetBindingKind,
+    rhs_edges: []RhsEdge,
+
+    fn deinit(self: *LetClassification, allocator: std.mem.Allocator) void {
+        allocator.free(self.kinds);
+        allocator.free(self.rhs_edges);
+    }
+};
+
 fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerror!void {
-    const let_in = node.data.let_in;
+    // Demand-driven binding placement first (see `let_float.zig`): dead
+    // chains drop, duplicable aliases/literals inline, and single-use
+    // bindings sink to their consumers. What remains is the residual let
+    // this function classifies and emits. May return a non-let when every
+    // binding dissolved into the body.
+    const target = try let_float.rewriteLet(self, node);
+    if (target.tag != .let_in) {
+        if (tail_body) return lambda.compileTailExpression(self, target);
+        return self.compileNode(target);
+    }
+    const let_in = target.data.let_in;
 
     scope.beginScope(self);
 
@@ -62,17 +91,24 @@ const LetBindingKind = enum { unreferenced, literal, uncaptured, needs_cell };
 const InheritState = struct { slot: u16, initialized: bool = false };
 
 /// Immutable analysis result consumed by the two bytecode-emission passes.
-/// All arrays and the lookup map are region-local to one `let`.
+/// All arrays are region-local to one `let`.
 const LetPlan = struct {
     kinds: []LetBindingKind,
     name_ids: []InternId,
     eager: []bool,
-    must_force: []bool,
-    earliest_index: std.AutoHashMapUnmanaged(InternId, usize),
-    first_demanded: ?InternId,
+    /// Binding indices PROVABLY forced first (in order) when the body runs —
+    /// see `demand_prefix.analyze`. Emitted as direct evaluations into
+    /// their slots (no thunk), after every sibling thunk exists, so forward
+    /// references hold and eager order equals lazy order exactly.
+    strict_prefix: []u32,
+    /// Membership mask over `strict_prefix` (indexed by binding index):
+    /// pass 2 skips these initializers; pass 3 evaluates them in order.
+    in_prefix: []bool,
 
     fn init(self: *Compiler, bindings: []const Node.Binding, body: *const Node) !LetPlan {
-        const kinds = try classifyLetBindings(self, bindings, body);
+        const classification = try classifyLetBindings(self, bindings, body);
+        defer self.allocator.free(classification.rhs_edges);
+        const kinds = classification.kinds;
         errdefer self.allocator.free(kinds);
 
         const name_ids = try self.allocator.alloc(InternId, bindings.len);
@@ -81,17 +117,10 @@ const LetPlan = struct {
             name_id.* = try self.intern.intern(attr_names.span(self, binding.path[0]));
         }
 
-        var earliest_index: std.AutoHashMapUnmanaged(InternId, usize) = .empty;
-        errdefer earliest_index.deinit(self.allocator);
-        for (name_ids, 0..) |name_id, index| {
-            if (!earliest_index.contains(name_id))
-                try earliest_index.put(self.allocator, name_id, index);
-        }
-
         const eager = try self.allocator.alloc(bool, bindings.len);
         errdefer self.allocator.free(eager);
         const must_force = try self.allocator.alloc(bool, bindings.len);
-        errdefer self.allocator.free(must_force);
+        defer self.allocator.free(must_force);
         try strictness.analyzeLetBindings(
             self.allocator,
             self.intern,
@@ -102,13 +131,89 @@ const LetPlan = struct {
             must_force,
         );
 
+        // Strict-prefix eligibility per binding: a single plain leaf of a
+        // computational (non-structural) shape, non-recursive and cell-free.
+        // Cell-backed bindings are excluded: an earlier sibling captured the
+        // cell as a lazy handle, and eager evaluation would leave no thunk
+        // in it for that capture to force.
+        const prefix_bindings = try self.allocator.alloc(demand_prefix.Binding, bindings.len);
+        defer self.allocator.free(prefix_bindings);
+        for (bindings, kinds, name_ids, prefix_bindings) |binding, kind, name_id, *pb| {
+            const leaf: ?Node.Binding = if (kind != .unreferenced and binding.inherit_group == 0)
+                singleLeafBinding(self, bindings, binding.path[0])
+            else
+                null;
+            const eligible = leaf != null and kind == .uncaptured and isEagerEvalShape(leaf.?.expr);
+            pb.* = .{
+                .name_id = name_id,
+                .rhs = if (eligible) leaf.?.expr else null,
+                .eligible = eligible,
+                // A value-lambda leaf lets the prefix continue THROUGH a
+                // saturated call to this binding (see `demand_prefix`): the
+                // binding itself stays a lazy pre-resolved closure shell
+                // (filled in pass 2, effect-free to force), and the body's
+                // demand order extends the chain. Any kind of leaf binding
+                // qualifies — even cell-backed self-recursive functions.
+                .lambda = if (leaf != null)
+                    try demand_prefix.lambdaShape(self.allocator, self.intern, self.source, leaf.?.expr)
+                else
+                    null,
+            };
+        }
+        var prefix: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer prefix.deinit(self.allocator);
+        try demand_prefix.analyze(self.allocator, self.intern, self.source, body, prefix_bindings, &prefix);
+
+        const in_prefix = try self.allocator.alloc(bool, bindings.len);
+        errdefer self.allocator.free(in_prefix);
+        @memset(in_prefix, false);
+        for (prefix.items) |i| in_prefix[i] = true;
+        let_float.bumpPrefixMembers(prefix.items.len);
+
+        // Validate the prefix against sibling references: a member may only
+        // be referenced by LATER members (their pass-3 evaluations read its
+        // filled slot). A reference from a lazy sibling (its pass-2 thunk
+        // would capture the unset slot) or from an EARLIER member (its eager
+        // evaluation would read the unset slot — the transitive version of
+        // this is how the old single-binding elision could force an unset
+        // cell) demotes the member back to a lazy thunk, which is always
+        // sound: the remaining members' demand-order justifications don't
+        // depend on HOW a preceding binding gets forced, only that it is.
+        // Demotions cascade (a demoted member is itself a lazy referencer).
+        var pos = try self.allocator.alloc(u32, bindings.len);
+        defer self.allocator.free(pos);
+        var changed = true;
+        while (changed) {
+            changed = false;
+            @memset(pos, std.math.maxInt(u32));
+            for (prefix.items, 0..) |bi, k| pos[bi] = @intCast(k);
+            for (classification.rhs_edges) |edge| {
+                if (!in_prefix[edge.to]) continue;
+                if (kinds[edge.from] == .unreferenced) continue; // dead RHS never compiles
+                const from_lazy = !in_prefix[edge.from];
+                if (from_lazy or pos[edge.from] < pos[edge.to]) {
+                    in_prefix[edge.to] = false;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                var w: usize = 0;
+                for (prefix.items) |bi| {
+                    if (in_prefix[bi]) {
+                        prefix.items[w] = bi;
+                        w += 1;
+                    }
+                }
+                prefix.shrinkRetainingCapacity(w);
+            }
+        }
+
         return .{
             .kinds = kinds,
             .name_ids = name_ids,
             .eager = eager,
-            .must_force = must_force,
-            .earliest_index = earliest_index,
-            .first_demanded = try strictness.firstForcedName(self.intern, self.source, body),
+            .strict_prefix = try prefix.toOwnedSlice(self.allocator),
+            .in_prefix = in_prefix,
         };
     }
 
@@ -116,8 +221,8 @@ const LetPlan = struct {
         allocator.free(self.kinds);
         allocator.free(self.name_ids);
         allocator.free(self.eager);
-        allocator.free(self.must_force);
-        self.earliest_index.deinit(allocator);
+        allocator.free(self.strict_prefix);
+        allocator.free(self.in_prefix);
     }
 };
 
@@ -167,20 +272,11 @@ fn emitBindingInitializers(
     for (bindings, plan.kinds, 0..) |binding, kind, index| {
         if (bindingRootSeen(self, bindings[0..index], binding.path[0])) continue;
         if (kind == .literal or kind == .unreferenced) continue;
+        // Strict-prefix members get no thunk at all: pass 3 below evaluates
+        // them directly into their slots once every sibling thunk exists.
+        if (plan.in_prefix[index]) continue;
         const name = attr_names.span(self, binding.path[0]);
         const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
-
-        if (binding.inherit_group == 0 and kind == .uncaptured and plan.must_force[index] and
-            plan.first_demanded != null and plan.name_ids[index] == plan.first_demanded.?)
-        {
-            if (eligibleEagerLeaf(self, bindings, binding.path[0], &plan.earliest_index, index)) |leaf| {
-                self.armRecursiveName(plan.name_ids[index]);
-                try self.compileNode(leaf.expr);
-                self.name_hint = null;
-                try emit.emitSetLocal(self, slot);
-                continue;
-            }
-        }
 
         var inherit_source_slot: ?u16 = null;
         if (binding.inherit_group != 0) {
@@ -204,6 +300,23 @@ fn emitBindingInitializers(
             .literal, .unreferenced => unreachable,
         }
     }
+
+    // Pass 3 — the strict prefix: bindings the body PROVABLY forces first,
+    // evaluated directly into their slots in demand order (dependencies
+    // before dependents, so a chain member reads its precursor's finished
+    // value). All lazy siblings already hold their thunks, so forward
+    // references resolve; evaluation order — including which error surfaces
+    // first — is exactly what lazy evaluation would have produced.
+    for (plan.strict_prefix) |index| {
+        const binding = bindings[index];
+        const leaf = singleLeafBinding(self, bindings, binding.path[0]).?;
+        const name = attr_names.span(self, binding.path[0]);
+        const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
+        self.armRecursiveName(plan.name_ids[index]);
+        try self.compileNode(leaf.expr);
+        self.name_hint = null;
+        try emit.emitSetLocal(self, slot);
+    }
 }
 
 /// Decide for each binding whether it can skip the cell. A binding
@@ -220,7 +333,7 @@ fn emitBindingInitializers(
 /// many RHS regions mention it and the earliest such binding index;
 /// that pair answers both the "referenced by another RHS" and the
 /// "referenced at-or-before index" (cell-needed) predicates exactly.
-fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *const Node) ![]LetBindingKind {
+fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *const Node) !LetClassification {
     const kinds = try self.allocator.alloc(LetBindingKind, bindings.len);
     errdefer self.allocator.free(kinds);
 
@@ -266,13 +379,16 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
 
     var any_path_nested = false;
     var rhs_marker: RhsMarker = .{
+        .allocator = self.allocator,
         .slots = &slots,
+        .slot_first = slot_first,
         .counts = rhs_counts,
         .first = rhs_first,
         .stamp_seen = rhs_stamp,
         .stamp = 0,
         .index = 0,
     };
+    defer rhs_marker.edges.deinit(self.allocator);
     for (bindings) |binding| {
         if (binding.path.len > 1) {
             // Nested-path bindings synthesise an attr-set thunk
@@ -283,7 +399,11 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
         rhs_marker.stamp += 1;
         rhs_marker.index = slot_first[slots.get(attr_names.span(self, binding.path[0])).?];
         refs_mod.walkReferencedNames(self, binding.expr, &rhs_marker);
+        // Dotted tail segments may interpolate (`a."${x}" = 1;`): the
+        // group's thunk compiles them, so they are RHS references too.
+        for (binding.path[1..]) |seg| refs_mod.walkIdentifiersInSpan(self, seg, &rhs_marker);
     }
+    if (rhs_marker.err) |err| return err;
 
     for (bindings, 0..) |binding, i| {
         if (bindingRootSeen(self, bindings[0..i], binding.path[0])) {
@@ -315,7 +435,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             kinds[i] = .uncaptured;
         }
     }
-    return kinds;
+    return .{ .kinds = kinds, .rhs_edges = try rhs_marker.edges.toOwnedSlice(self.allocator) };
 }
 
 const BodyMarker = struct {
@@ -330,14 +450,19 @@ const BodyMarker = struct {
 /// Per-slot RHS aggregation: `counts[slot]` = number of RHS regions
 /// mentioning the name, `first[slot]` = earliest such binding index.
 /// `stamp_seen` deduplicates within one region, so repeated mentions in the
-/// same RHS count once.
+/// same RHS count once. Also collects the full reference edge list
+/// (`RhsEdge`) for strict-prefix validation.
 const RhsMarker = struct {
+    allocator: std.mem.Allocator,
     slots: *const std.StringHashMapUnmanaged(u32),
+    slot_first: []const u32,
     counts: []u32,
     first: []u32,
     stamp_seen: []u32,
     stamp: u32,
     index: u32,
+    edges: std.ArrayListUnmanaged(RhsEdge) = .empty,
+    err: ?anyerror = null,
 
     pub fn mark(self: *RhsMarker, name: []const u8) void {
         const slot = self.slots.get(name) orelse return;
@@ -347,6 +472,9 @@ const RhsMarker = struct {
         // Regions are visited in binding order but carry their group's first
         // index, which is not monotone — keep the minimum, not the first seen.
         if (self.counts[slot] == 1 or self.index < self.first[slot]) self.first[slot] = self.index;
+        self.edges.append(self.allocator, .{ .from = self.index, .to = self.slot_first[slot] }) catch |err| {
+            self.err = err;
+        };
     }
 };
 
@@ -441,26 +569,6 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
     return attrs.compileAttrEntriesThunk(self, tails, true);
 }
 
-/// Eager-elision eligibility for a let binding. Returns the single-leaf
-/// binding iff (a) it is a single leaf (not a nested attr path),
-/// (b) its RHS is a computational shape — not a structural builder we
-/// keep lazy (attrset/lambda/list) — and (c) its RHS references no
-/// binding defined later in the same `let` (which would read an
-/// unfilled slot when evaluated eagerly here). The caller guarantees
-/// the binding is non-recursive (`.uncaptured`) and must-forced.
-fn eligibleEagerLeaf(
-    self: *Compiler,
-    bindings: []const Node.Binding,
-    root: Node.Atom,
-    earliest: *const std.AutoHashMapUnmanaged(InternId, usize),
-    index: usize,
-) ?Node.Binding {
-    const leaf = singleLeafBinding(self, bindings, root) orelse return null;
-    if (!isEagerEvalShape(leaf.expr)) return null;
-    if (rhsHasForwardRef(self, leaf.expr, earliest, index)) return null;
-    return leaf;
-}
-
 /// Structural builders (attrset/lambda/list) stay lazy: they're already
 /// inlined thunk-free where eager, and eagerly building an attrset value
 /// can perturb module fixpoints. Everything else is a scalar/
@@ -471,28 +579,6 @@ pub fn isEagerEvalShape(expr: *const Node) bool {
         .attr_set, .lambda, .lambda_attrs, .list => false,
         else => true,
     };
-}
-
-/// Conservative forward-reference check: true if `expr` references any
-/// `let` binding root whose earliest definition index is > `index`. On
-/// collection failure returns true so the caller keeps the lazy path.
-fn rhsHasForwardRef(
-    self: *Compiler,
-    expr: *const Node,
-    earliest: *const std.AutoHashMapUnmanaged(InternId, usize),
-    index: usize,
-) bool {
-    var refs: std.StringHashMapUnmanaged(void) = .empty;
-    defer refs.deinit(self.allocator);
-    refs_mod.collectReferencedNames(self, expr, &refs) catch return true;
-    var it = refs.keyIterator();
-    while (it.next()) |k| {
-        const id = self.intern.intern(k.*) catch return true;
-        if (earliest.get(id)) |first| {
-            if (first > index) return true;
-        }
-    }
-    return false;
 }
 
 fn bindingRootSeen(self: *const Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {

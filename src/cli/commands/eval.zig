@@ -50,7 +50,8 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // Releasing a nixpkgs-sized heap node-by-node on that path only delays
     // exit; the kernel will reclaim it wholesale. Keep explicit teardown for
     // embedders/tests and for reports emitted by Engine.deinit().
-    defer if (!process.exits_after_command or options.mem_report != null or options.gc_report) ev.deinit();
+    defer if (!process.exits_after_command or options.mem_report != null or options.gc_report or
+        ev.letFloatCensusEnabled()) ev.deinit();
     const term = try setup.configure(&ev, init, &options, &settings);
     defer term.deinit(ev.hostAllocator());
     if (options.read_write_mode) {

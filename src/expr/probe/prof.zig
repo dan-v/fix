@@ -94,6 +94,13 @@ pub const Path = enum {
     /// second AST walk building NameSets). Sub-phase of `compile`; its
     /// exclusive cycles are carved out of the `compile` bucket.
     strictness,
+    /// `let_float.rewriteLet` — the demand-driven binding-placement pass
+    /// (graph walk + decisions + rebuild). Sub-phase of `compile`; its
+    /// exclusive cycles are carved out of the `compile` bucket.
+    let_float,
+    /// `core.analyze` — the cluster graph walk alone. Sub-phase of
+    /// `let_float`.
+    let_float_walk,
     /// `normalizeDerivation` — env-string assembly, attr walk, string
     /// dupes, context scans. Sub-phase of the `derivationLazyAttr` /
     /// `derivation` builtin bodies; nested force/call regions are

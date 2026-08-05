@@ -71,7 +71,11 @@ test "capture-free lambdas are immediate functions while captured lambdas use he
     const attrs = try ev.evaluate("{ x }: x");
     try std.testing.expect(attrs.isFunction());
 
-    const captured = try ev.evaluate("let y = 1; in x: x + y");
+    // The capture must not be a literal-shaped binding: let-float inlines a
+    // literal `let y = 1;` into the body, making the lambda capture-free. A
+    // computed RHS used under a lambda (a many-region) never moves, so the
+    // binding keeps its slot and the lambda genuinely captures it.
+    const captured = try ev.evaluate("let y = 1 + 0; in x: x + y");
     try std.testing.expect(captured.isClosure());
     try std.testing.expect(!captured.isFunction());
 

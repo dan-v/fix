@@ -20,6 +20,7 @@ thunk evaluation across a pool of worker threads.
 - [pipeline](compiler/pipeline.md) — AST → bytecode chunks
 - [scopes](compiler/scopes.md) — locals, upvalue captures, `with`
 - [strictness](compiler/strictness.md) — compile-time must-force analysis
+- [let-float](compiler/let-float.md) — demand-driven `let` binding placement rewrite
 - [lazy-compile](compiler/lazy-compile.md) — deferred compilation + trivial-body elision
 
 **Runtime** — [`runtime/`](runtime/)
