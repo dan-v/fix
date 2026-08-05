@@ -8,6 +8,7 @@
 const std = @import("std");
 const engine = @import("expr");
 const args = @import("../args.zig");
+const render = @import("../render.zig");
 const setup = @import("../setup.zig");
 
 const Engine = engine.Engine;
@@ -40,19 +41,20 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     }
     // A leading flag means the subcommand was omitted.
     if (sub.len > 0 and sub[0] == '-') {
-        std.debug.print("error: expected a flake subcommand\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "expected a flake subcommand", null, synopsis);
         return 2;
     }
 
     // Reuse the eval arg grammar: the flakeref is a bare positional, plus the
     // usual `--extra-experimental-features` / `--option` / `--impure` flags.
-    var options = args.parse(allocator, args_iter, null, .eval) catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, null, .eval, &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .eval);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
@@ -66,20 +68,22 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         setup.engineConfig(init, try setup.workerCount(&options), memory_backing),
     );
     defer ev.deinit();
-    _ = try setup.configure(&ev, init, &options, &settings);
+    const term = try setup.configure(&ev, init, &options, &settings);
     if (!ev.languagePolicy().flakes_enabled) {
-        std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
+        render.messageError(init.io, term.use_color, "{s}", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
 
-    if (std.mem.eql(u8, sub, "metadata")) return metadata(&ev, init.io, allocator, flakeRefOf(&options));
-    if (std.mem.eql(u8, sub, "show")) return show(&ev, init.io, allocator, flakeRefOf(&options));
-    if (std.mem.eql(u8, sub, "check")) return check(&ev, init.io, allocator, flakeRefOf(&options));
+    if (std.mem.eql(u8, sub, "metadata")) return metadata(&ev, init.io, term.use_color, allocator, flakeRefOf(&options));
+    if (std.mem.eql(u8, sub, "show")) return show(&ev, init.io, term.use_color, allocator, flakeRefOf(&options));
+    if (std.mem.eql(u8, sub, "check")) return check(&ev, init.io, term.use_color, allocator, flakeRefOf(&options));
     // update/lock operate on the cwd flake; positionals are input names.
-    if (std.mem.eql(u8, sub, "update")) return lockCmd(&ev, init.io, allocator, &options, true);
-    if (std.mem.eql(u8, sub, "lock")) return lockCmd(&ev, init.io, allocator, &options, false);
+    if (std.mem.eql(u8, sub, "update")) return lockCmd(&ev, init.io, term.use_color, allocator, &options, true);
+    if (std.mem.eql(u8, sub, "lock")) return lockCmd(&ev, init.io, term.use_color, allocator, &options, false);
 
-    std.debug.print("error: unknown flake subcommand '{s}'\n\n{s}\n", .{ sub, synopsis });
+    var msg_buf: [256]u8 = undefined;
+    const message = std.fmt.bufPrint(&msg_buf, "unknown flake subcommand '{s}'", .{sub}) catch "unknown flake subcommand";
+    render.usageError(init.io, init.environ_map, message, null, synopsis);
     return 2;
 }
 
@@ -119,15 +123,15 @@ fn stdoutWriter(io: std.Io, buf: []u8) std.Io.File.Writer {
     return std.Io.File.stdout().writerStreaming(io, buf);
 }
 
-fn printEvalError(err: anyerror) u8 {
-    std.debug.print("error: evaluating flake: {s}\n", .{@errorName(err)});
+fn printEvalError(io: std.Io, use_color: bool, err: anyerror) u8 {
+    render.caughtError(io, use_color, err, "evaluating flake", .{});
     return 1;
 }
 
 // ---- metadata -------------------------------------------------------------
 
-fn metadata(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
-    const flake = evalFlake(ev, allocator, flakeref) catch |err| return printEvalError(err);
+fn metadata(ev: *Engine, io: std.Io, use_color: bool, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
+    const flake = evalFlake(ev, allocator, flakeref) catch |err| return printEvalError(io, use_color, err);
 
     var buf: [4096]u8 = undefined;
     var w = stdoutWriter(io, &buf);
@@ -209,8 +213,8 @@ const Node = struct {
     children: std.ArrayListUnmanaged(*Node) = .empty,
 };
 
-fn show(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
-    const flake = evalFlake(ev, allocator, flakeref) catch |err| return printEvalError(err);
+fn show(ev: *Engine, io: std.Io, use_color: bool, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
+    const flake = evalFlake(ev, allocator, flakeref) catch |err| return printEvalError(io, use_color, err);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -267,8 +271,8 @@ fn printChildren(out: *std.Io.Writer, arena: std.mem.Allocator, node: *Node, pre
 
 // ---- check ----------------------------------------------------------------
 
-fn check(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
-    const flake = evalFlake(ev, allocator, flakeref) catch |err| return printEvalError(err);
+fn check(ev: *Engine, io: std.Io, use_color: bool, allocator: std.mem.Allocator, flakeref: []const u8) !u8 {
+    const flake = evalFlake(ev, allocator, flakeref) catch |err| return printEvalError(io, use_color, err);
 
     var buf: [4096]u8 = undefined;
     var w = stdoutWriter(io, &buf);
@@ -334,7 +338,7 @@ fn reportCheckFailure(out: *std.Io.Writer, category: []const u8, system: ?[]cons
 /// side effect of evaluating outputs. `update` with no inputs re-pins
 /// everything; `update x y` re-pins only x and y; `lock` just completes a
 /// missing lock, keeping existing pins.
-fn lockCmd(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, options: *const args.Options, is_update: bool) !u8 {
+fn lockCmd(ev: *Engine, io: std.Io, use_color: bool, allocator: std.mem.Allocator, options: *const args.Options, is_update: bool) !u8 {
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer names.deinit(allocator);
     for (options.sources.items) |src| switch (src) {
@@ -345,7 +349,7 @@ fn lockCmd(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, options: *cons
 
     // Resolve the cwd flake to an absolute path (parseFlakeRef needs it).
     const dir = std.process.currentPathAlloc(io, allocator) catch |err| {
-        std.debug.print("error: resolving current directory: {s}\n", .{@errorName(err)});
+        render.caughtError(io, use_color, err, "resolving current directory", .{});
         return 1;
     };
     defer allocator.free(dir);
@@ -356,7 +360,7 @@ fn lockCmd(ev: *Engine, io: std.Io, allocator: std.mem.Allocator, options: *cons
     const update_names: []const []const u8 = if (is_update) names.items else &.{};
 
     ev.updateFlakeLock(dir, update_all, update_names) catch |err| {
-        std.debug.print("error: {s} lock: {s}\n", .{ if (is_update) "update" else "lock", @errorName(err) });
+        render.caughtError(io, use_color, err, "{s} lock", .{if (is_update) @as([]const u8, "update") else "lock"});
         return 1;
     };
     std.debug.print("{s} flake.lock\n", .{if (is_update) "updated" else "wrote"});

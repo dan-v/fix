@@ -109,8 +109,7 @@ pub fn main(init: std.process.Init) !void {
     // print to stderr and exit nonzero (2). `-h`/`--help` prints to stdout and
     // exits 0 (POSIX).
     const command = args_iter.next() orelse {
-        std.debug.print("{s}", .{topUsage(allocator)});
-        std.process.exit(2);
+        usageFailure(init, allocator, "missing command", .{});
     };
 
     if (cli.presentation.isHelpFlag(command)) {
@@ -121,27 +120,43 @@ pub fn main(init: std.process.Init) !void {
     const subcommand = switch (command_match.resolve(&subcommand_names, command)) {
         .match => |index| &subcommands[index],
         .ambiguous => {
-            std.debug.print("fix: ambiguous command '{s}' (could be:", .{command});
+            var candidates: std.Io.Writer.Allocating = .init(allocator);
             for (subcommands) |candidate| {
                 if (std.mem.startsWith(u8, candidate.meta.name, command))
-                    std.debug.print(" {s}", .{candidate.meta.name});
+                    candidates.writer.print(" {s}", .{candidate.meta.name}) catch {};
             }
-            std.debug.print(")\n\n{s}", .{topUsage(allocator)});
-            std.process.exit(2);
+            usageFailure(init, allocator, "ambiguous command '{s}' (could be:{s})", .{ command, candidates.written() });
         },
         .none => {
-            std.debug.print("fix: unknown command '{s}'\n\n{s}", .{ command, topUsage(allocator) });
-            std.process.exit(2);
+            usageFailure(init, allocator, "unknown command '{s}'", .{command});
         },
     };
     std.process.exit(runSubcommand(subcommand, process, init, &args_iter));
+}
+
+/// Report a top-level usage error with the shared colored `error:` label,
+/// follow with the command list, and exit 2.
+fn usageFailure(init: std.process.Init, allocator: std.mem.Allocator, comptime format: []const u8, format_args: anytype) noreturn {
+    const use_color = cli.presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
+    failure: {
+        var stderr_buffer: [4096]u8 = undefined;
+        var stderr = cli.presentation.lockStderr(init.io, &stderr_buffer) catch break :failure;
+        defer stderr.deinit();
+        cli.render.messageErrorTo(stderr.writer(), use_color, format, format_args) catch break :failure;
+        stderr.writer().print("\n{s}", .{topUsage(allocator)}) catch break :failure;
+        stderr.flush() catch {};
+    }
+    std.process.exit(2);
 }
 
 fn runSubcommand(subcommand: *const Subcommand, process: cli.ProcessContext, init: std.process.Init, args_iter: *ArgsIterator) u8 {
     return subcommand.run(process, init, args_iter) catch |err| {
         // `error.ConfigError` (e.g. a bad nix.conf include) already printed
         // its own message; don't double-report.
-        if (err != error.ConfigError) std.debug.print("error: {s}\n", .{@errorName(err)});
+        if (err != error.ConfigError) {
+            const use_color = cli.presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
+            cli.render.caughtError(init.io, use_color, err, "", .{});
+        }
         return 1;
     };
 }

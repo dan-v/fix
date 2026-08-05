@@ -6,6 +6,7 @@ const std = @import("std");
 const engine = @import("expr");
 const realization_workflow = @import("../realize.zig");
 const args = @import("../args.zig");
+const render = @import("../render.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
 
@@ -21,19 +22,20 @@ pub const synopsis =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null, .run) catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, null, .run, &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .run);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
     defer options.deinit(allocator);
     if (options.sources.items.len > 1) {
-        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "this command accepts one expression or file", null, synopsis);
         return 2;
     }
 
@@ -48,12 +50,12 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const term = try setup.configure(&ev, init, &options, &settings);
 
     if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
-        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
+        render.usageError(init.io, init.environ_map, args.errorMessage(error.FlakesFeatureRequired), null, synopsis);
         return 2;
     }
 
     var source = eval_support.getSource(&ev, init.io, source_arg, options.sourceOptions()) catch |err| {
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, term.use_color, err, "reading source", .{});
         return 1;
     };
     defer source.deinit(ev.hostAllocator());
@@ -82,11 +84,11 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         .argv = argv.items,
         .environ_map = init.environ_map,
     }) catch |err| {
-        std.debug.print("error: running {s}: {s}\n", .{ exe, @errorName(err) });
+        render.caughtError(init.io, term.use_color, err, "running {s}", .{exe});
         return 127;
     };
     const status = child.wait(init.io) catch |err| {
-        std.debug.print("error: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, term.use_color, err, "", .{});
         return 1;
     };
     return switch (status) {

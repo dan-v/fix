@@ -12,6 +12,7 @@ const runtime = @import("runtime");
 const bytecode = engine.bytecode;
 const presentation = @import("../presentation.zig");
 const args = @import("../args.zig");
+const render = @import("../render.zig");
 const setup = @import("../setup.zig");
 const runner = @import("../eval_support.zig");
 
@@ -30,19 +31,20 @@ pub const synopsis =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null, .disasm) catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, null, .disasm, &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .disasm);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
     defer options.deinit(allocator);
     if (options.sources.items.len > 1) {
-        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "this command accepts one expression or file", null, synopsis);
         return 2;
     }
 
@@ -73,7 +75,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     ev.setCaptureChunkNames(true);
 
     if (runner.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
-        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
+        render.usageError(init.io, init.environ_map, args.errorMessage(error.FlakesFeatureRequired), null, synopsis);
         return 2;
     }
 
@@ -81,9 +83,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // unlike the eval commands whose diagnostics go to stderr.
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
     const color_depth = presentation.colorDepthForTerminal(options.color, stdout_tty, init.environ_map);
+    const use_color = presentation.colorDepth(options.color, init.io, init.environ_map).enabled();
 
     var source = runner.getSource(&ev, init.io, source_arg, options.sourceOptions()) catch |err| {
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, use_color, err, "reading source", .{});
         return 1;
     };
     // `--flake`/`-A`/`--arg` synthesize source text on the evaluator's host allocator; plain
@@ -99,22 +102,22 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // source path for span annotations; synthesized text has none.
     const source_path = runner.sourcePathOf(source_arg, source);
     if (options.disasm_eval) {
-        try compileByEval(&ev, source.slice(), source.base_path, source_path);
+        try compileByEval(&ev, init.io, use_color, source.slice(), source.base_path, source_path);
         if (options.disasm_chunk) |id| {
             target_id = id;
             target_chunk = ev.getChunk(id) orelse {
-                std.debug.print("error: chunk[0x{x}] not found\n", .{id});
+                render.messageError(init.io, use_color, "chunk[0x{x}] not found", .{id});
                 return 1;
             };
         }
     } else {
         const top_id = ev.compileSourceAt(source.slice(), source.base_path, source_path) catch |err| {
-            std.debug.print("error: compilation failed: {s}\n", .{@errorName(err)});
+            render.caughtError(init.io, use_color, err, "compilation failed", .{});
             return 1;
         };
         target_id = options.disasm_chunk orelse top_id;
         target_chunk = ev.getChunk(target_id) orelse {
-            std.debug.print("error: chunk[0x{x}] not found\n", .{target_id});
+            render.messageError(init.io, use_color, "chunk[0x{x}] not found", .{target_id});
             return 1;
         };
     }
@@ -228,9 +231,9 @@ const Pager = struct {
 /// (and would FrameOverflow, or blow a speculative worker's stack). Best-effort:
 /// a failing eval still leaves its compiled chunks behind to inspect, so a
 /// failure is a warning, not an abort.
-fn compileByEval(ev: *Engine, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !void {
+fn compileByEval(ev: *Engine, io: std.Io, use_color: bool, source: []const u8, base_path: ?[]const u8, source_path: ?[]const u8) !void {
     _ = ev.evaluatePathAt(source, base_path, source_path) catch |err| {
-        std.debug.print("warning: evaluation failed: {s} (dumping chunks compiled so far)\n", .{@errorName(err)});
+        render.messageWarning(io, use_color, "evaluation failed: {f} (dumping chunks compiled so far)", .{render.friendly(err)});
     };
 }
 

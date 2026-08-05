@@ -162,7 +162,7 @@ const OrderedPrinter = struct {
                             continue;
                         }
                     }
-                    render.messageError(self.io, self.use_color, "input {d} {s} failed: {s}", .{ index + 1, stage, @errorName(err) });
+                    render.caughtError(self.io, self.use_color, err, "input {d} {s} failed", .{ index + 1, stage });
                 }
                 continue;
             }
@@ -196,7 +196,7 @@ const OrderedPrinter = struct {
         const name = numberedName(self.allocator, base, index) catch return;
         defer self.allocator.free(name);
         const indirect = self.options.add_root == null or self.options.indirect;
-        linkRoot(self.io, self.allocator, self.ev, self.state_dir, name, target, indirect);
+        linkRoot(self.io, self.use_color, self.allocator, self.ev, self.state_dir, name, target, indirect);
     }
 
     fn linkDrv(self: *OrderedPrinter, index: usize, target: []const u8) void {
@@ -204,7 +204,7 @@ const OrderedPrinter = struct {
         const name = numberedName(self.allocator, self.options.drv_link orelse "derivation", index) catch return;
         defer self.allocator.free(name);
         makeLink(self.io, name, target) catch |err| {
-            std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
+            render.messageWarning(self.io, self.use_color, "could not create ./{s}: {f}", .{ name, render.friendly(err) });
         };
     }
 };
@@ -225,23 +225,23 @@ pub fn makeLink(io: std.Io, name: []const u8, target: []const u8) !void {
     try cwd.symLink(io, target, name, .{});
 }
 
-pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Engine, state_dir: []const u8, name: []const u8, target: []const u8, indirect: bool) void {
+pub fn linkRoot(io: std.Io, use_color: bool, allocator: std.mem.Allocator, ev: *Engine, state_dir: []const u8, name: []const u8, target: []const u8, indirect: bool) void {
     makeLink(io, name, target) catch |err| {
-        std.debug.print("warning: could not create {s}: {s}\n", .{ name, @errorName(err) });
+        render.messageWarning(io, use_color, "could not create {s}: {f}", .{ name, render.friendly(err) });
         return;
     };
     const abs = absolutePath(io, allocator, name) catch |err| {
-        std.debug.print("warning: could not resolve {s}: {s}\n", .{ name, @errorName(err) });
+        render.messageWarning(io, use_color, "could not resolve {s}: {f}", .{ name, render.friendly(err) });
         return;
     };
     defer allocator.free(abs);
     if (!indirect) {
         if (!isDirectRootPath(state_dir, abs))
-            std.debug.print("warning: {s} is not in the gcroots directory, so it will not be an effective GC root (pass --indirect)\n", .{abs});
+            render.messageWarning(io, use_color, "{s} is not in the gcroots directory, so it will not be an effective GC root (pass --indirect)", .{abs});
         return;
     }
     ev.addIndirectRoot(abs, target) catch |err| {
-        std.debug.print("warning: could not register GC root {s}: {s}\n", .{ abs, @errorName(err) });
+        render.messageWarning(io, use_color, "could not register GC root {s}: {f}", .{ abs, render.friendly(err) });
     };
 }
 
@@ -355,7 +355,7 @@ pub fn dryRunMany(
             _ = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, input.source.slice(), err);
             return 1;
         }) orelse {
-            std.debug.print("error: input {d} did not evaluate to a derivation\n", .{index + 1});
+            render.messageError(io, terminal.use_color, "input {d} did not evaluate to a derivation", .{index + 1});
             return 1;
         };
         derived[derived_count] = try std.fmt.allocPrint(allocator, "{s}!*", .{paths.drv_path});
@@ -605,12 +605,12 @@ pub fn realize(
     const drv_path = (ev.derivationDrvPath(value) catch |err| {
         return .{ .failed = try eval_support.storeOrEvalFailure(io, terminal.use_color, options.show_trace, ev, source.slice(), err) };
     }) orelse {
-        std.debug.print("error: that did not evaluate to a derivation\n", .{});
+        render.messageError(io, terminal.use_color, "that did not evaluate to a derivation", .{});
         return .{ .failed = 1 };
     };
     const out_path = (try ev.derivationOutPath(value)) orelse drv_path;
     const program: ?[]const u8 = if (want_program) ((try ev.derivationProgram(value)) orelse {
-        std.debug.print("error: could not determine a program name to run\n", .{});
+        render.messageError(io, terminal.use_color, "could not determine a program name to run", .{});
         return .{ .failed = 1 };
     }) else null;
 

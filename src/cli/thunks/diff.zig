@@ -16,6 +16,8 @@
 //! location in either log (so the report flows causally).
 
 const std = @import("std");
+const render = @import("../render.zig");
+const presentation = @import("../presentation.zig");
 const log_event = @import("log_event.zig");
 const Event = log_event.Event;
 const parseEvent = log_event.parse;
@@ -86,6 +88,7 @@ pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     var side: SideFilter = .both;
     var by_kind: bool = false;
 
+    const use_color = presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--asymmetric")) {
             asymmetric_only = true;
@@ -94,7 +97,7 @@ pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
         } else if (std.mem.eql(u8, arg, "--novel-in")) {
             asymmetric_only = true;
             const v = args_iter.next() orelse {
-                std.debug.print("error: --novel-in requires 'a' or 'b'\n", .{});
+                render.messageError(init.io, use_color, "--novel-in requires 'a' or 'b'", .{});
                 return 2;
             };
             if (std.mem.eql(u8, v, "a")) {
@@ -102,25 +105,25 @@ pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
             } else if (std.mem.eql(u8, v, "b")) {
                 side = .novel_in_b;
             } else {
-                std.debug.print("error: --novel-in expects 'a' or 'b'\n", .{});
+                render.messageError(init.io, use_color, "--novel-in expects 'a' or 'b'", .{});
                 return 2;
             }
         } else if (std.mem.eql(u8, arg, "--max-divergences")) {
             const v = args_iter.next() orelse {
-                std.debug.print("error: --max-divergences requires a value\n", .{});
+                render.messageError(init.io, use_color, "--max-divergences requires a value", .{});
                 return 2;
             };
             max_divergences = std.fmt.parseInt(usize, v, 10) catch {
-                std.debug.print("error: invalid --max-divergences\n", .{});
+                render.messageError(init.io, use_color, "invalid --max-divergences", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--max-outcomes")) {
             const v = args_iter.next() orelse {
-                std.debug.print("error: --max-outcomes requires a value\n", .{});
+                render.messageError(init.io, use_color, "--max-outcomes requires a value", .{});
                 return 2;
             };
             max_outcomes = std.fmt.parseInt(usize, v, 10) catch {
-                std.debug.print("error: invalid --max-outcomes\n", .{});
+                render.messageError(init.io, use_color, "invalid --max-outcomes", .{});
                 return 2;
             };
         } else if (path_a == null) {
@@ -128,12 +131,12 @@ pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
         } else if (path_b == null) {
             path_b = arg;
         } else {
-            std.debug.print("error: unexpected argument '{s}'\n\n{s}", .{ arg, usage });
+            render.usageError(init.io, init.environ_map, "unexpected argument", arg, usage);
             return 2;
         }
     }
     if (path_a == null or path_b == null) {
-        std.debug.print("error: diff needs two log paths\n\n{s}", .{usage});
+        render.usageError(init.io, init.environ_map, "diff needs two log paths", null, usage);
         return 2;
     }
 

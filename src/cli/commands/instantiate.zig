@@ -6,6 +6,7 @@ const std = @import("std");
 const engine = @import("expr");
 const progress_ui = @import("../progress.zig");
 const args = @import("../args.zig");
+const render = @import("../render.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
 const stats = @import("../stats.zig");
@@ -23,13 +24,14 @@ pub const synopsis =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null, .instantiate) catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, null, .instantiate, &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .instantiate);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
@@ -46,7 +48,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const input_plan = eval_support.InputPlan.init(&options, init.io);
     if (!options.find_file) {
         input_plan.validate(&ev) catch |err| {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), null, synopsis);
             return 2;
         };
     }
@@ -70,7 +72,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     progress.install();
 
     if (options.find_file) {
-        const code = try findFiles(init.io, &ev, options.sources.items);
+        const code = try findFiles(init.io, term.use_color, &ev, options.sources.items);
         if (options.stats) stats.report(&ev);
         ok = code == 0;
         return code;
@@ -83,7 +85,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     ok = true;
     for (0..input_count) |index| {
         var input = input_plan.load(&ev, index) catch |err| {
-            eval_support.reportInputReadError(input_count, index, err);
+            eval_support.reportInputReadError(init.io, term.use_color, input_count, index, err);
             ok = false;
             continue;
         };
@@ -94,7 +96,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     return if (ok) 0 else 1;
 }
 
-fn findFiles(io: std.Io, ev: *Engine, sources: []const args.SourceArg) !u8 {
+fn findFiles(io: std.Io, use_color: bool, ev: *Engine, sources: []const args.SourceArg) !u8 {
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     for (sources) |source| {
@@ -106,9 +108,9 @@ fn findFiles(io: std.Io, ev: *Engine, sources: []const args.SourceArg) !u8 {
         const path = ev.resolveLookupPath(ev.hostAllocator(), name) catch |err| {
             try stdout.interface.flush();
             if (err == error.FileNotFound)
-                std.debug.print("error: file '{s}' was not found in the Nix search path (add it using $NIX_PATH or -I)\n", .{name})
+                render.messageError(io, use_color, "file '{s}' was not found in the Nix search path (add it using $NIX_PATH or -I)", .{name})
             else
-                std.debug.print("error: looking up file '{s}': {s}\n", .{ name, @errorName(err) });
+                render.caughtError(io, use_color, err, "looking up file '{s}'", .{name});
             return 1;
         };
         defer ev.hostAllocator().free(path);
@@ -136,7 +138,7 @@ fn instantiateOne(
         _ = try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.slice(), err);
         return false;
     } orelse {
-        std.debug.print("error: input {d} did not evaluate to a derivation\n", .{index + 1});
+        render.messageError(init.io, term.use_color, "input {d} did not evaluate to a derivation", .{index + 1});
         return false;
     };
 
@@ -149,13 +151,13 @@ fn instantiateOne(
     if (options.add_root) |root_path| {
         const name = try build.numberedName(allocator, root_path, index);
         defer allocator.free(name);
-        build.linkRoot(init.io, allocator, ev, setup.stateDir(init), name, drv_path, options.indirect);
+        build.linkRoot(init.io, term.use_color, allocator, ev, setup.stateDir(init), name, drv_path, options.indirect);
     }
     if (options.add_drv_link) {
         const name = try build.numberedName(allocator, options.drv_link orelse "derivation", index);
         defer allocator.free(name);
         build.makeLink(init.io, name, drv_path) catch |err| {
-            std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
+            render.messageWarning(init.io, term.use_color, "could not create ./{s}: {f}", .{ name, render.friendly(err) });
         };
     }
 

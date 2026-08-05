@@ -150,11 +150,11 @@ pub const InputPlan = struct {
     }
 };
 
-pub fn reportInputReadError(input_count: usize, index: usize, err: anyerror) void {
+pub fn reportInputReadError(io: std.Io, use_color: bool, input_count: usize, index: usize, err: anyerror) void {
     if (input_count == 1)
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)})
+        render.caughtError(io, use_color, err, "reading source", .{})
     else
-        std.debug.print("error: reading input {d}: {s}\n", .{ index + 1, @errorName(err) });
+        render.caughtError(io, use_color, err, "reading input {d}", .{index + 1});
 }
 
 test "input plan shares ordered source and selector expansion" {
@@ -200,7 +200,7 @@ pub fn sourceLabel(source: SourceArg) []const u8 {
 pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Engine, source: []const u8, err: anyerror) !u8 {
     switch (err) {
         error.DaemonError => render.messageError(io, use_color, "daemon: {s}", .{ev.lastStoreError() orelse "unknown"}),
-        error.StoreUnavailable => render.messageError(io, use_color, "cannot reach the nix-daemon (is it running?)", .{}),
+        error.StoreUnavailable => render.caughtError(io, use_color, err, "", .{}),
         else => try render.evalFailure(io, use_color, show_trace, ev, source, err),
     }
     return 1;
@@ -214,8 +214,8 @@ pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *En
 pub fn buildFailure(io: std.Io, use_color: bool, last_store_error: ?[]const u8, err: anyerror) u8 {
     switch (err) {
         error.DaemonError => render.messageError(io, use_color, "daemon: {s}", .{last_store_error orelse "unknown"}),
-        error.StoreUnavailable => render.messageError(io, use_color, "cannot reach the nix-daemon (is it running?)", .{}),
-        else => render.messageError(io, use_color, "build failed: {s}", .{@errorName(err)}),
+        error.StoreUnavailable => render.caughtError(io, use_color, err, "", .{}),
+        else => render.caughtError(io, use_color, err, "build failed", .{}),
     }
     return 1;
 }

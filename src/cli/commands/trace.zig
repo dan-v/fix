@@ -10,6 +10,7 @@
 const std = @import("std");
 const engine = @import("expr");
 const presentation = @import("../presentation.zig");
+const render = @import("../render.zig");
 const bytecode = engine.bytecode;
 const trace_log = engine.vm.trace_log;
 
@@ -34,23 +35,23 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const allocator = process.allocator;
     _ = allocator;
     const sub = args_iter.next() orelse {
-        std.debug.print("{s}", .{usage});
+        render.usageError(init.io, init.environ_map, "missing subcommand", null, usage);
         return 2;
     };
     if (std.mem.eql(u8, sub, "diff")) {
         const a = args_iter.next() orelse {
-            std.debug.print("error: missing first trace file\n\n{s}", .{usage});
+            render.usageError(init.io, init.environ_map, "missing first trace file", null, usage);
             return 2;
         };
         const b = args_iter.next() orelse {
-            std.debug.print("error: missing second trace file\n\n{s}", .{usage});
+            render.usageError(init.io, init.environ_map, "missing second trace file", null, usage);
             return 2;
         };
         return runDiff(init, a, b);
     }
     if (std.mem.eql(u8, sub, "dump")) {
         const path = args_iter.next() orelse {
-            std.debug.print("error: missing trace file\n\n{s}", .{usage});
+            render.usageError(init.io, init.environ_map, "missing trace file", null, usage);
             return 2;
         };
         return runDump(init, path);
@@ -59,7 +60,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         presentation.printHelp(init.io, usage);
         return 0;
     }
-    std.debug.print("error: unknown subcommand '{s}'\n\n{s}", .{ sub, usage });
+    render.usageError(init.io, init.environ_map, "unknown subcommand", sub, usage);
     return 2;
 }
 
