@@ -44,9 +44,8 @@ pub fn Params(comptime Vma: type) type {
         /// (64–256 MB) and mostly empty at peak, and an up-front hugetlb map
         /// bills the whole segment against the pool — mapped-but-untouched
         /// hugetlb is real pool consumption. 0 = off (every segment through
-        /// the allocator, as before). Requires every cursor advance to hold
-        /// `write_mu` (`reserve`/`reserveLocal`), so it is
-        /// incompatible with `appendAtomic` (enforced at comptime).
+        /// the allocator, as before). Every cursor advance holds `write_mu`,
+        /// so the frontier always covers a range before it is published.
         huge_overlay_min: usize = 0,
     };
 }
@@ -174,13 +173,10 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             self.cursor.store(0, .monotonic);
         }
 
-        /// Reserve `len` consecutive slots. Caller initializes via `sliceMut`.
-        pub fn reserve(self: *Self, allocator: std.mem.Allocator, len: u32) !Range {
-            if (len == 0) return .{ .segment = 0, .offset = 0, .len = 0 };
-
-            self.write_mu.lock();
-            defer self.write_mu.unlock();
-
+        /// Find and back one range while `write_mu` is held, without advancing
+        /// the public cursor. Separating preparation from publication lets a
+        /// batch initialize every slot before `count()` exposes any of them.
+        fn prepareRangeLocked(self: *Self, allocator: std.mem.Allocator, len: u32) !Range {
             const cur = self.cursor.load(.monotonic);
             var seg = segmentOf(cur);
             var used = usedOf(cur);
@@ -211,58 +207,84 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
                 self.extendSegHugeFrontier(seg, (@as(usize, used) + len) * @sizeOf(T));
             self.extendSegPopulateFrontier(seg, (@as(usize, used) + len) * @sizeOf(T));
 
-            const range: Range = .{ .segment = seg, .offset = used, .len = len };
-            self.cursor.store(packCursor(seg, used + len), .release);
+            return .{ .segment = seg, .offset = used, .len = len };
+        }
+
+        /// Reserve `len` consecutive slots. Caller initializes via `sliceMut`.
+        pub fn reserve(self: *Self, allocator: std.mem.Allocator, len: u32) !Range {
+            if (len == 0) return .{ .segment = 0, .offset = 0, .len = 0 };
+
+            self.write_mu.lock();
+            defer self.write_mu.unlock();
+
+            const range = try self.prepareRangeLocked(allocator, len);
+            self.cursor.store(packCursor(range.segment, range.offset + range.len), .release);
             return range;
+        }
+
+        pub const DenseInitializeFn = *const fn (context: *anyopaque, first_id: u32, len: u32) anyerror!void;
+
+        /// Initialize a dense flat-id batch before publishing it. Unlike a
+        /// `Range`, the batch may cross segment boundaries: every id from
+        /// `first_id` through `first_id + len - 1` is backed before `initialize`
+        /// runs, so flat-id consumers never observe skipped segment tails.
+        ///
+        /// `write_mu` serializes every reservation path. If `initialize`
+        /// fails, the cursor never moves and the whole batch remains invisible.
+        pub fn appendDenseInitialized(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            len: u32,
+            context: *anyopaque,
+            initialize: DenseInitializeFn,
+        ) !u32 {
+            if (len == 0) return error.EmptyBatch;
+
+            self.write_mu.lock();
+            defer self.write_mu.unlock();
+
+            const cur = self.cursor.load(.monotonic);
+            var seg = segmentOf(cur);
+            var used = usedOf(cur);
+            const first_id = segmentStart(seg) + used;
+            var remaining = len;
+            while (remaining > 0) {
+                const cap = segmentCapacity(seg);
+                if (used == cap) {
+                    if (seg + 1 >= segment_count) return error.OutOfMemory;
+                    seg += 1;
+                    used = 0;
+                    continue;
+                }
+                const take = @min(remaining, cap - used);
+                try self.ensureSegment(allocator, seg);
+                if (comptime overlay_enabled)
+                    self.extendSegHugeFrontier(seg, (@as(usize, used) + take) * @sizeOf(T));
+                self.extendSegPopulateFrontier(seg, (@as(usize, used) + take) * @sizeOf(T));
+                used += take;
+                remaining -= take;
+            }
+
+            try initialize(context, first_id, len);
+            self.cursor.store(packCursor(seg, used), .release);
+            return first_id;
         }
 
         /// Append a single value. Returns its global u32 id.
         pub fn append(self: *Self, allocator: std.mem.Allocator, value: T) !u32 {
-            const range = try self.reserve(allocator, 1);
+            self.write_mu.lock();
+            defer self.write_mu.unlock();
+
+            const range = try self.prepareRangeLocked(allocator, 1);
             const slot = self.segments[range.segment].load(.acquire).?;
             slot[range.offset] = value;
+            self.cursor.store(packCursor(range.segment, range.offset + 1), .release);
             return globalIdOf(range.segment, range.offset);
         }
 
-        /// Lock-free single-slot append: reserve a slot by CAS-bumping the
-        /// cursor (no `write_mu`), ensure its segment exists via a CAS-alloc,
-        /// then write the value. Lets many workers register concurrently
-        /// without serializing on the writer mutex. `count()` stays
-        /// accurate (each reserved slot is written by its own call before the
-        /// id escapes); a reserved-but-unwritten slot is transient and only
-        /// observable by a full-store scan, which never races registration
-        /// (scans run at teardown / STW / after eval).
-        pub fn appendAtomic(self: *Self, allocator: std.mem.Allocator, value: T) !u32 {
-            // The overlay scheme requires every cursor advance to hold
-            // `write_mu` (the frontier must cover a range before it is
-            // handed out); this lock-free path can't uphold that.
-            comptime if (overlay_enabled) @compileError("appendAtomic is incompatible with huge_overlay_min");
-            while (true) {
-                const cur = self.cursor.load(.acquire);
-                const seg = segmentOf(cur);
-                const used = usedOf(cur);
-                const cap = segmentCapacity(seg);
-                if (used >= cap) {
-                    if (seg + 1 >= segment_count) return error.OutOfMemory;
-                    // Advance to the next segment; whoever wins the CAS moves
-                    // the cursor, everyone retries and reserves in the new one.
-                    _ = self.cursor.cmpxchgWeak(cur, packCursor(seg + 1, 0), .acq_rel, .monotonic);
-                    continue;
-                }
-                try self.ensureSegmentAtomic(allocator, seg);
-                if (self.cursor.cmpxchgWeak(cur, packCursor(seg, used + 1), .acq_rel, .monotonic) != null) continue;
-                // Won slot (seg, used). Its segment existed before the cursor
-                // publication, so a recoverable allocation failure can never
-                // leave count() spanning an unwritten hole.
-                const slot = self.segments[seg].load(.acquire).?;
-                slot[used] = value;
-                return globalIdOf(seg, used);
-            }
-        }
-
-        /// `appendAtomic` for a caller that guarantees NO concurrent writer
-        /// exists (a `--workers=1` evaluator): the same cursor/segment
-        /// protocol with plain-cost monotonic accesses instead of the CAS.
+        /// Append for a caller that guarantees NO concurrent writer exists
+        /// (a `--workers=1` evaluator): the same cursor/segment protocol with
+        /// plain-cost monotonic accesses instead of taking `write_mu`.
         /// Concurrent readers (`get`/`count` from post-eval walkers) stay
         /// well-defined — monotonic keeps the accesses atomic,
         /// it just drops the RMW and fences.
@@ -280,19 +302,6 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             slot[used] = value;
             self.cursor.store(packCursor(seg, used + 1), .release);
             return globalIdOf(seg, used);
-        }
-
-        /// Allocate `segment`'s backing buffer if absent, racing-safe: the CAS
-        /// loser frees its buffer and uses the winner's.
-        fn ensureSegmentAtomic(self: *Self, allocator: std.mem.Allocator, segment: u32) !void {
-            if (self.segments[segment].load(.acquire) != null) return;
-            const cap = segmentCapacity(segment);
-            const buf = try allocator.alloc(T, cap);
-            if (self.segments[segment].cmpxchgStrong(null, buf.ptr, .acq_rel, .acquire) != null) {
-                allocator.free(buf);
-                return;
-            }
-            nameSegment(buf);
         }
 
         /// Re-tag a freshly-claimed segment's backing region for RSS
@@ -848,6 +857,37 @@ test "stable segments: reserve spans multiple segments" {
 
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC }, seg.slice(r1));
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x11, 0x22 }, seg.slice(r2));
+}
+
+test "stable segments: dense initialized batch crosses a segment boundary without holes" {
+    const allocator = std.testing.allocator;
+    const Store = StableSegments(u32, .{ .first_segment_size = 4 }, TestVma);
+    var store = Store.empty;
+    defer store.deinit(allocator);
+
+    _ = try store.append(allocator, 10);
+    _ = try store.append(allocator, 11);
+    _ = try store.append(allocator, 12);
+
+    const Initialize = struct {
+        store: *Store,
+
+        fn run(raw: *anyopaque, first_id: u32, len: u32) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var i: u32 = 0;
+            while (i < len) : (i += 1) self.store.getMut(first_id + i).* = 100 + first_id + i;
+        }
+    };
+    var initialize: Initialize = .{ .store = &store };
+    const first = try store.appendDenseInitialized(allocator, 4, &initialize, Initialize.run);
+
+    try std.testing.expectEqual(@as(u32, 3), first);
+    try std.testing.expectEqual(@as(u32, 7), store.count());
+    var id: u32 = 0;
+    while (id < store.count()) : (id += 1) {
+        const expected: u32 = if (id < 3) 10 + id else 100 + id;
+        try std.testing.expectEqual(expected, store.get(id).*);
+    }
 }
 
 test "stable segments: rollback within current segment" {

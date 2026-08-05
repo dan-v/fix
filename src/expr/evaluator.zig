@@ -41,6 +41,8 @@ const observ = @import("base").observ;
 const hugetlb = @import("base").hugetlb;
 const ast_mod = @import("syntax").ast;
 const deferred_mod = @import("compiler.zig").deferred_table;
+const chunk_cache = @import("bytecode/chunk/cache.zig");
+const chunk_cache_store = @import("bytecode/chunk/cache/store.zig");
 const EvaluationReport = @import("eval/report.zig").EvaluationReport;
 const path_ops = @import("runtime").paths;
 const eval_print = @import("eval/print.zig");
@@ -511,6 +513,14 @@ const CompilationState = struct {
     deferred_table: deferred_mod.Table,
     retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena) = .empty,
     retained_arenas_mu: SpinMutex = .{},
+    /// Persistent chunk-cache configuration, resolved once at
+    /// `prepareEvaluations` (null = disabled: no cache dir resolvable,
+    /// FIX_NO_CHUNK_CACHE set, or a debugger/name-capture session).
+    chunk_cache: ?chunk_cache_store.Store = null,
+    cache_hits: std.atomic.Value(u64) = .init(0),
+    cache_misses: std.atomic.Value(u64) = .init(0),
+    cache_writes: std.atomic.Value(u64) = .init(0),
+    cache_rejects: std.atomic.Value(u64) = .init(0),
 };
 
 const CollectionState = struct {
@@ -684,6 +694,12 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        // Join every compiler/cache producer before closing the writer or
+        // freeing registry/intern/heap state that inline serialization reads.
+        self.releaseEvaluationResources();
+        // Publish queued cache writes before the census reads the `writes`
+        // counter and before the cache dir path is freed.
+        self.flushChunkCacheWrites();
         // Rewrite census (`FIX_LET_FLOAT_STATS=1`) — whole-process counters,
         // reported once at teardown, entirely off the evaluation path.
         if (compiler_mod.let_float.report_on_deinit) {
@@ -691,9 +707,20 @@ pub const Engine = struct {
             var w: std.Io.Writer = .fixed(&buf);
             compiler_mod.let_float.writeReport(&w) catch {};
             std.debug.print("let-float census:\n{s}", .{buf[0..w.end]});
+            std.debug.print(
+                "chunk-cache census:\n  hits: {d}\n  misses: {d}\n  writes: {d}\n  rejects: {d}\n",
+                .{
+                    self.compilation.cache_hits.load(.monotonic),
+                    self.compilation.cache_misses.load(.monotonic),
+                    self.compilation.cache_writes.load(.monotonic),
+                    self.compilation.cache_rejects.load(.monotonic),
+                },
+            );
+        }
+        if (self.compilation.chunk_cache) |*cc| {
+            cc.deinit();
         }
         self.debugger.deinit();
-        self.releaseEvaluationResources();
         owned_strings.free(self.allocator, self.pure_eval_roots);
         if (self.sources.base_path) |path| self.allocator.free(path);
         // Language workers are joined by releaseEvaluationResources, so no fiber remains
@@ -1074,6 +1101,14 @@ pub const Engine = struct {
         scope: ?Value,
     ) !ChunkId {
         try self.requireActiveEvaluation();
+        // Persistent chunk cache: an unchanged unit (same source bytes, path,
+        // binary, policy, codegen flags) skips parse+compile entirely. Debug
+        // and name-capture sessions bypass in both directions (see
+        // `chunkCacheKey`); every failure mode falls back to compiling.
+        const cache_key = self.chunkCacheKey(source, source_path, scope);
+        if (cache_key) |key| {
+            if (self.tryLoadCachedUnit(key, source, base_path, source_path)) |top| return top;
+        }
         var parsed = try self.parseSourceUnit(source, source_path);
         var retain_arena = false;
         defer if (!retain_arena) parsed.arena.deinit();
@@ -1084,6 +1119,7 @@ pub const Engine = struct {
             base_path,
             source_path,
             scope,
+            cache_key,
             &retain_arena,
         );
     }
@@ -1146,6 +1182,7 @@ pub const Engine = struct {
         base_path: ?[]const u8,
         source_path: ?[]const u8,
         scope: ?Value,
+        cache_key: ?chunk_cache.Key,
         retain_arena: *bool,
     ) !ChunkId {
         const subject = source_path orelse "expression";
@@ -1213,6 +1250,10 @@ pub const Engine = struct {
 
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
         const chunk_id = try self.registerTopLevelChunk(chunk, &compiler, source_path);
+
+        // Publish the freshly-compiled unit to the persistent cache
+        // (best-effort; `cache_key` is non-null only for eligible units).
+        if (cache_key) |key| self.writeCachedUnit(key, &compiler, source_path.?, chunk_id);
 
         // If any attr body in this file was deferred, its AST nodes are
         // referenced by `deferred_table` entries and must outlive the
@@ -1354,6 +1395,180 @@ pub const Engine = struct {
                 breakpoints.resolvePendingFile(&self.registry, path);
         }
         return id;
+    }
+
+    /// Resolve the persistent chunk-cache configuration once per engine —
+    /// env knobs, cache directory, and the identity context every unit key
+    /// embeds (exe fingerprint, policy fingerprint, codegen-affecting
+    /// flags). Must run AFTER `tuning.resolve` (the key snapshots
+    /// `let_float.enabled`). Failure to resolve leaves the cache disabled.
+    fn resolveChunkCache(self: *Engine) void {
+        if (self.compilation.chunk_cache != null) return;
+        const env = self.sources.env_map orelse return;
+        if (env.get("FIX_NO_CHUNK_CACHE")) |v| {
+            if (!std.mem.eql(u8, v, "0")) return;
+        }
+        const io = self.sources.files.io orelse return;
+
+        const root = blk: {
+            if (env.get("FIX_CHUNK_CACHE_DIR")) |d| break :blk self.allocator.dupe(u8, d) catch return;
+            if (env.get("XDG_CACHE_HOME")) |x| {
+                if (x.len != 0) break :blk std.fs.path.join(self.allocator, &.{ x, "fix", "chunks" }) catch return;
+            }
+            if (env.get("HOME")) |h| {
+                if (h.len != 0) break :blk std.fs.path.join(self.allocator, &.{ h, ".cache", "fix", "chunks" }) catch return;
+            }
+            return;
+        };
+        defer self.allocator.free(root);
+
+        // The running binary's identity IS the cache generation: units live
+        // under `<root>/<build-id>/`, so a rebuilt compiler starts from an
+        // empty directory automatically — no format-version discipline
+        // required. The GNU build-id (content-derived, `-fbuild-id=sha1`)
+        // survives reproducible rebuilds and nix-store copies whose mtimes
+        // are epoch; platforms without one fall back to an exe-stat hash.
+        var id_buf: [64]u8 = undefined;
+        var fp_buf: [16]u8 = undefined;
+        const fingerprint: []const u8 = chunk_cache.selfBuildId(&id_buf) orelse blk: {
+            const exe = std.process.executablePathAlloc(io, self.allocator) catch return;
+            defer self.allocator.free(exe);
+            const exe_stat = std.Io.Dir.cwd().statFile(io, exe, .{}) catch return;
+            var h = std.hash.Wyhash.init(0xB111D);
+            std.hash.autoHash(&h, exe_stat.size);
+            std.hash.autoHash(&h, exe_stat.mtime.nanoseconds);
+            break :blk std.fmt.bufPrint(&fp_buf, "{x:0>16}", .{h.final()}) catch return;
+        };
+
+        self.compilation.chunk_cache = chunk_cache_store.Store.init(.{
+            .allocator = self.allocator,
+            .io = io,
+            .root = root,
+            .generation = fingerprint,
+            .home = env.get("HOME"),
+            .policy_fp = policyFingerprint(&self.policy),
+            .let_float_enabled = compiler_mod.let_float.enabled,
+        }) catch return;
+    }
+
+    /// Drain and stop the chunk-cache writer lane, blocking until every
+    /// queued unit has been published. Cheap when the queue is empty (one
+    /// thread join). Idempotent; safe to call before `deinit`, and REQUIRED
+    /// on fast-exit paths that skip `deinit` — a process exit with queued
+    /// writes would silently drop them.
+    pub fn flushChunkCacheWrites(self: *Engine) void {
+        const state = &(self.compilation.chunk_cache orelse return);
+        state.flush();
+    }
+
+    /// Hash every `LanguagePolicy` field into the cache key. Field-generic
+    /// so a newly added policy knob automatically invalidates by value; the
+    /// one slice field hashes its contents.
+    fn policyFingerprint(policy: *const LanguagePolicy) u64 {
+        var h = std.hash.Wyhash.init(0xF17C_CACE);
+        inline for (@typeInfo(LanguagePolicy).@"struct".fields) |field| {
+            if (comptime std.mem.eql(u8, field.name, "allowed_path_roots")) {
+                for (policy.allowed_path_roots) |root| {
+                    h.update(root);
+                    h.update(&.{0});
+                }
+            } else {
+                std.hash.autoHash(&h, @field(policy.*, field.name));
+            }
+        }
+        return h.final();
+    }
+
+    /// The cache key for a unit, or null when this compile must bypass the
+    /// cache: string/scoped units, name-capture (`fix disasm`, REPL), or an
+    /// installed debugger (`preserve_bindings` — debug sessions compile
+    /// source-shaped, unoptimized bindings and must neither read optimized
+    /// cached units nor poison the cache with debug-shaped ones).
+    fn chunkCacheKey(self: *Engine, source: []const u8, source_path: ?[]const u8, scope: ?Value) ?chunk_cache.Key {
+        if (scope != null) return null;
+        const path = source_path orelse return null;
+        if (self.registry.capture_names or self.registry.preserve_bindings) return null;
+        const state = &(self.compilation.chunk_cache orelse return null);
+        return state.key(source, path);
+    }
+
+    /// Load a cached unit for `key`, registering its chunks and deferred
+    /// entries. Any failure (missing, stale, corrupt, id-width misfit)
+    /// falls back to a fresh compile.
+    fn tryLoadCachedUnit(
+        self: *Engine,
+        key: chunk_cache.Key,
+        source: []const u8,
+        base_path: ?[]const u8,
+        source_path: ?[]const u8,
+    ) ?ChunkId {
+        const state = &(self.compilation.chunk_cache orelse return null);
+        const bytes = state.readAlloc(self.allocator, key, .limited(256 * 1024 * 1024)) catch {
+            _ = self.compilation.cache_misses.fetchAdd(1, .monotonic);
+            return null;
+        };
+        defer self.allocator.free(bytes);
+
+        var arena = ast_mod.AstArena.init(self.allocator);
+        const result = chunk_cache.load(bytes, .{
+            .allocator = self.allocator,
+            .registry = &self.registry,
+            .intern = &self.intern,
+            .heap = &self.heap,
+            .deferred = &self.compilation.deferred_table,
+            .ast_arena = &arena,
+            .source = source,
+            .base_path = base_path,
+            .source_path = source_path,
+            .policy = self.policy,
+        }) catch |err| {
+            arena.deinit();
+            _ = self.compilation.cache_rejects.fetchAdd(1, .monotonic);
+            if (compiler_mod.let_float.report_on_deinit)
+                std.debug.print("chunk-cache reject: {s} {s}\n", .{ @errorName(err), source_path orelse "?" });
+            return null;
+        };
+        // Deferred bodies materialize their synthesized `.elided` nodes from
+        // this arena at force time; keep it for the engine's lifetime, same
+        // as an eager compile's retained AST arena.
+        if (result.deferred_count > 0) self.retainDeferredArena(arena) else arena.deinit();
+        _ = self.compilation.cache_hits.fetchAdd(1, .monotonic);
+        return result.top;
+    }
+
+    /// Serialize and publish a freshly-compiled unit (best-effort: a cache
+    /// write failure never fails the compile). Serialization is inline — it
+    /// reads live compiler/registry state — but the file IO goes to the
+    /// bounded background writer lane, so the demanding evaluation resumes
+    /// without waiting on disk or accumulating unbounded queued blobs. The `writes`
+    /// census counter is bumped by the lane, so it is only final after
+    /// `flushChunkCacheWrites`.
+    fn writeCachedUnit(
+        self: *Engine,
+        key: chunk_cache.Key,
+        compiler: *compiler_mod.Compiler,
+        source_path: []const u8,
+        top: ChunkId,
+    ) void {
+        const scratch = compiler.allocator;
+
+        var ids = scratch.alloc(ChunkId, compiler.unit_chunks.items.len + 1) catch return;
+        @memcpy(ids[0..compiler.unit_chunks.items.len], compiler.unit_chunks.items);
+        ids[compiler.unit_chunks.items.len] = top;
+
+        // Serialize directly into the allocation the background job will own;
+        // there is no scratch blob followed by a full duplicate.
+        const bytes = chunk_cache.serialize(self.allocator, &self.registry, &self.intern, &self.heap, &self.compilation.deferred_table, .{
+            .source_path = source_path,
+            .chunk_ids = ids,
+            .deferred_ids = compiler.unit_deferred.items,
+        }) catch {
+            _ = self.compilation.cache_rejects.fetchAdd(1, .monotonic);
+            return;
+        };
+
+        if (!self.compilation.chunk_cache.?.enqueueOwned(key, bytes, &self.compilation.cache_writes))
+            _ = self.compilation.cache_rejects.fetchAdd(1, .monotonic);
     }
 
     fn retainDeferredArena(self: *Engine, arena: ast_mod.AstArena) void {
@@ -1750,6 +1965,9 @@ pub const Engine = struct {
         }
         // Prefetch work is deduplicated by the import and file registries, and
         // bounded so speculative tasks cannot grow without limit.
+        // After tuning: the cache key snapshots codegen-affecting knobs
+        // (`let_float.enabled`) that tuning just resolved.
+        self.resolveChunkCache();
         const prefetch = tuning.resolvePrefetch(self.sources.env_map, self.execution.worker_count);
         self.sources.prefetch.budget = prefetch.import_budget;
         self.execution.scheduler.setReadDirPrefetch(prefetch.read_dir_min, prefetch.read_dir_budget);
