@@ -298,10 +298,7 @@ pub fn computeNarHash(self: *VM, path_value: Value, exclude_value: Value) !Value
     const exclude = self.intern.get(exclude_value.asInternId());
     var ctx = ExcludeCtx{ .name = exclude };
     const filter: ?nar.Filter = if (exclude.len == 0) null else .{ .context = &ctx, .accept = excludeAccept };
-    const nar_bytes = try nar.serialize(self.allocator, self.files, path, filter);
-    defer self.allocator.free(nar_bytes);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
+    const digest = try nar.hashPathDigestFiltered(self.allocator, self.files, path, filter);
     const enc = std.base64.standard.Encoder;
     var buf: [7 + 44]u8 = undefined;
     @memcpy(buf[0..7], "sha256-");
