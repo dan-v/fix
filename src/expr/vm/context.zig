@@ -59,7 +59,15 @@ pub const BufferPool = struct {
     mu: SpinMutex = .{},
     list: std.ArrayListUnmanaged(Buffers) = .empty,
 
-    pub const Buffers = struct { stack: []Value, frames: []Frame };
+    // These are large, mostly-sparse reservations. Give them an alignment
+    // above the page size so BlockCacheAllocator sends them directly to its
+    // ordinary mmap-backed allocator instead of eagerly prefaulting the whole
+    // capacity from the hugetlb pool. The VM keeps the enlarged correctness
+    // limits while ordinary evaluations pay only for pages they touch.
+    pub const buffer_alignment: std.mem.Alignment = .fromByteUnits(std.heap.page_size_min * 2);
+    pub const ValueStack = []align(buffer_alignment.toByteUnits()) Value;
+    pub const FrameStack = []align(buffer_alignment.toByteUnits()) Frame;
+    pub const Buffers = struct { stack: ValueStack, frames: FrameStack };
 
     pub fn init(allocator: std.mem.Allocator) BufferPool {
         return .{ .allocator = allocator };
@@ -85,9 +93,9 @@ pub const BufferPool = struct {
         // bucket so the report separates them from transient blocks.
         const prev_tag = vma.setAllocTag(.worker_arena);
         defer _ = vma.setAllocTag(prev_tag);
-        const value_stack = try self.allocator.alloc(Value, types.vm_stack_capacity);
+        const value_stack = try self.allocator.alignedAlloc(Value, buffer_alignment, types.vm_stack_capacity);
         errdefer self.allocator.free(value_stack);
-        const frames = try self.allocator.alloc(Frame, types.max_frames);
+        const frames = try self.allocator.alignedAlloc(Frame, buffer_alignment, types.max_frames);
         return .{ .stack = value_stack, .frames = frames };
     }
 
@@ -289,7 +297,7 @@ pub const VM = struct {
     buffer_pool: ?*BufferPool,
     /// The value stack. Fixed capacity = vm_stack_capacity; `sp` is the
     /// logical length.
-    stack: []Value,
+    stack: BufferPool.ValueStack,
     /// Stack pointer — index of the next push slot.
     sp: u32,
     /// Max value of `sp` ever observed on this VM since construction.
@@ -300,7 +308,7 @@ pub const VM = struct {
     sp_high_water: u32,
     /// Call frames. Fixed capacity = max_frames; `frames_len` is the
     /// logical count.
-    frames: []Frame,
+    frames: BufferPool.FrameStack,
     frames_len: u32,
     /// Single-worker mode (`Scheduler.worker_count == 1`, captured at VM
     /// construction — before any helper thread can exist). When set, the
@@ -360,9 +368,9 @@ pub const VM = struct {
 
     pub fn init(options: Init) !VM {
         const bufs: BufferPool.Buffers = if (options.buffer_pool) |bp| try bp.acquire() else blk: {
-            const value_stack = try options.allocator.alloc(Value, types.vm_stack_capacity);
+            const value_stack = try options.allocator.alignedAlloc(Value, BufferPool.buffer_alignment, types.vm_stack_capacity);
             errdefer options.allocator.free(value_stack);
-            const frames = try options.allocator.alloc(Frame, types.max_frames);
+            const frames = try options.allocator.alignedAlloc(Frame, BufferPool.buffer_alignment, types.max_frames);
             break :blk .{ .stack = value_stack, .frames = frames };
         };
         const value_stack = bufs.stack;
