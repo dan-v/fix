@@ -718,6 +718,13 @@ pub const ObjectHeap = struct {
         self.objects.deinit(self.allocator);
     }
 
+    /// Whether allocation tracking has armed and heap-owned transient values
+    /// can actually be reclaimed. Before this point a GC-able string costs an
+    /// object forever, just like an interned string, but without deduplication.
+    pub inline fn collectionEnabled(self: *const ObjectHeap) bool {
+        return self.collection.collect_enabled;
+    }
+
     /// Retain a terminal runtime failure for as long as the heap lives.
     pub fn captureFailure(
         self: *ObjectHeap,
