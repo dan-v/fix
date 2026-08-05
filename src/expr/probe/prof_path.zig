@@ -234,7 +234,7 @@ pub fn locName(registry: *const ChunkRegistry, intern: *const InternTable, key: 
     if (key == other_key) return "<other>";
     if (key >= builtin_key_base) {
         const id: u16 = @intCast(key - builtin_key_base);
-        return std.fmt.bufPrint(&name_scratch, "<builtin {s}>", .{@tagName(@as(BuiltinId, @enumFromInt(id)))}) catch "<builtin>";
+        return std.fmt.bufPrint(&name_scratch, "<builtin {s}>", .{@import("runtime").builtins.displayName(@enumFromInt(id))}) catch "<builtin>";
     }
     const ch = registry.get(key) orelse return "<unknown chunk>";
     if (ch.source_map.len == 0)

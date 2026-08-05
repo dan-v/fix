@@ -15,11 +15,9 @@ pub const NixPathEntry = struct {
 };
 
 /// Identifies every builtin the evaluator can invoke. Most variants are
-/// user-facing: they appear in `builtin_bindings` and are reachable as
-/// `builtins.<name>` from Nix. A handful are compiler-internal only —
-/// continuations/thunks with no name binding, never nameable from Nix:
-/// `mapAttrValue`, `zipAttrsValue`, `derivationLazyAttr`, `mapValue`,
-/// and `constantValue`.
+/// user-facing: their enum tag is their `builtins.<name>` spelling in Nix. A
+/// handful are evaluator-internal continuations/thunks with no name binding;
+/// `publicName` is the canonical visibility boundary.
 pub const BuiltinId = enum(u16) {
     toString = 0,
     isAttrs = 1,
@@ -149,119 +147,38 @@ pub const BuiltinId = enum(u16) {
     pure_guarded = 114,
 };
 
-const BuiltinBinding = struct {
-    name: []const u8,
-    id: BuiltinId,
-};
+/// Public spelling for an id, or null for an evaluator-internal continuation.
+/// Nearly every public name is the enum tag; keeping the exceptional spellings
+/// here avoids a second full registry that can drift from `BuiltinId`.
+pub fn publicName(id: BuiltinId) ?[]const u8 {
+    return switch (id) {
+        .mapAttrValue,
+        .zipAttrsValue,
+        .derivationLazyAttr,
+        .mapValue,
+        .constantValue,
+        .resolve_flake_node,
+        .compute_nar_hash,
+        .pure_guarded,
+        => null,
+        .foldlStrict => "foldl'",
+        .break_ => "break",
+        else => @tagName(id),
+    };
+}
 
-const builtin_bindings = [_]BuiltinBinding{
-    .{ .name = "toString", .id = .toString },
-    .{ .name = "isAttrs", .id = .isAttrs },
-    .{ .name = "isList", .id = .isList },
-    .{ .name = "isString", .id = .isString },
-    .{ .name = "isInt", .id = .isInt },
-    .{ .name = "isBool", .id = .isBool },
-    .{ .name = "isNull", .id = .isNull },
-    .{ .name = "isFloat", .id = .isFloat },
-    .{ .name = "isFunction", .id = .isFunction },
-    .{ .name = "isPath", .id = .isPath },
-    .{ .name = "length", .id = .length },
-    .{ .name = "head", .id = .head },
-    .{ .name = "tail", .id = .tail },
-    .{ .name = "attrNames", .id = .attrNames },
-    .{ .name = "attrValues", .id = .attrValues },
-    .{ .name = "hasAttr", .id = .hasAttr },
-    .{ .name = "getAttr", .id = .getAttr },
-    .{ .name = "elemAt", .id = .elemAt },
-    .{ .name = "typeOf", .id = .typeOf },
-    .{ .name = "concatLists", .id = .concatLists },
-    .{ .name = "listToAttrs", .id = .listToAttrs },
-    .{ .name = "removeAttrs", .id = .removeAttrs },
-    .{ .name = "intersectAttrs", .id = .intersectAttrs },
-    .{ .name = "elem", .id = .elem },
-    .{ .name = "seq", .id = .seq },
-    .{ .name = "all", .id = .all },
-    .{ .name = "any", .id = .any },
-    .{ .name = "filter", .id = .filter },
-    .{ .name = "foldl'", .id = .foldlStrict },
-    .{ .name = "deepSeq", .id = .deepSeq },
-    .{ .name = "pathExists", .id = .pathExists },
-    .{ .name = "readFile", .id = .readFile },
-    .{ .name = "import", .id = .import },
-    .{ .name = "readDir", .id = .readDir },
-    .{ .name = "readFileType", .id = .readFileType },
-    .{ .name = "findFile", .id = .findFile },
-    .{ .name = "map", .id = .map },
-    .{ .name = "concatMap", .id = .concatMap },
-    .{ .name = "mapAttrs", .id = .mapAttrs },
-    .{ .name = "genList", .id = .genList },
-    .{ .name = "stringLength", .id = .stringLength },
-    .{ .name = "concatStringsSep", .id = .concatStringsSep },
-    .{ .name = "substring", .id = .substring },
-    .{ .name = "replaceStrings", .id = .replaceStrings },
-    .{ .name = "throw", .id = .throw },
-    .{ .name = "abort", .id = .abort },
-    .{ .name = "tryEval", .id = .tryEval },
-    .{ .name = "trace", .id = .trace },
-    .{ .name = "derivation", .id = .derivation },
-    .{ .name = "derivationStrict", .id = .derivationStrict },
-    .{ .name = "storePath", .id = .storePath },
-    .{ .name = "path", .id = .path },
-    .{ .name = "sort", .id = .sort },
-    .{ .name = "partition", .id = .partition },
-    .{ .name = "groupBy", .id = .groupBy },
-    .{ .name = "genericClosure", .id = .genericClosure },
-    .{ .name = "functionArgs", .id = .functionArgs },
-    .{ .name = "unsafeGetAttrPos", .id = .unsafeGetAttrPos },
-    .{ .name = "add", .id = .add },
-    .{ .name = "sub", .id = .sub },
-    .{ .name = "mul", .id = .mul },
-    .{ .name = "div", .id = .div },
-    .{ .name = "lessThan", .id = .lessThan },
-    .{ .name = "bitAnd", .id = .bitAnd },
-    .{ .name = "bitOr", .id = .bitOr },
-    .{ .name = "bitXor", .id = .bitXor },
-    .{ .name = "floor", .id = .floor },
-    .{ .name = "ceil", .id = .ceil },
-    .{ .name = "baseNameOf", .id = .baseNameOf },
-    .{ .name = "dirOf", .id = .dirOf },
-    .{ .name = "catAttrs", .id = .catAttrs },
-    .{ .name = "zipAttrsWith", .id = .zipAttrsWith },
-    .{ .name = "hashString", .id = .hashString },
-    .{ .name = "hashFile", .id = .hashFile },
-    .{ .name = "toJSON", .id = .toJSON },
-    .{ .name = "fromJSON", .id = .fromJSON },
-    .{ .name = "compareVersions", .id = .compareVersions },
-    .{ .name = "splitVersion", .id = .splitVersion },
-    .{ .name = "parseDrvName", .id = .parseDrvName },
-    .{ .name = "getEnv", .id = .getEnv },
-    .{ .name = "fromTOML", .id = .fromTOML },
-    .{ .name = "toXML", .id = .toXML },
-    .{ .name = "match", .id = .match },
-    .{ .name = "split", .id = .split },
-    .{ .name = "traceVerbose", .id = .traceVerbose },
-    .{ .name = "warn", .id = .warn },
-    .{ .name = "addErrorContext", .id = .addErrorContext },
-    .{ .name = "unsafeDiscardStringContext", .id = .unsafeDiscardStringContext },
-    .{ .name = "unsafeDiscardOutputDependency", .id = .unsafeDiscardOutputDependency },
-    .{ .name = "addDrvOutputDependencies", .id = .addDrvOutputDependencies },
-    .{ .name = "appendContext", .id = .appendContext },
-    .{ .name = "getContext", .id = .getContext },
-    .{ .name = "hasContext", .id = .hasContext },
-    .{ .name = "toPath", .id = .toPath },
-    .{ .name = "toFile", .id = .toFile },
-    .{ .name = "placeholder", .id = .placeholder },
-    .{ .name = "filterSource", .id = .filterSource },
-    .{ .name = "scopedImport", .id = .scopedImport },
-    .{ .name = "fetchurl", .id = .fetchurl },
-    .{ .name = "fetchTarball", .id = .fetchTarball },
-    .{ .name = "fetchGit", .id = .fetchGit },
-    .{ .name = "fetchMercurial", .id = .fetchMercurial },
-    .{ .name = "fetchTree", .id = .fetchTree },
-    .{ .name = "getFlake", .id = .getFlake },
-    .{ .name = "parseFlakeRef", .id = .parseFlakeRef },
-    .{ .name = "flakeRefToString", .id = .flakeRefToString },
-    .{ .name = "break", .id = .break_ },
+/// Diagnostic spelling for every id, including internal continuations.
+pub fn displayName(id: BuiltinId) []const u8 {
+    return publicName(id) orelse @tagName(id);
+}
+
+const public_builtin_count: usize = count: {
+    var count: usize = 0;
+    for (std.meta.fields(BuiltinId)) |field| {
+        const id: BuiltinId = @enumFromInt(field.value);
+        if (publicName(id) != null) count += 1;
+    }
+    break :count count;
 };
 
 const constant_bindings = [_][]const u8{
@@ -277,10 +194,25 @@ const constant_bindings = [_][]const u8{
 };
 
 pub fn idForName(name: []const u8) ?BuiltinId {
-    for (builtin_bindings) |binding| {
-        if (std.mem.eql(u8, binding.name, name)) return binding.id;
+    inline for (std.meta.fields(BuiltinId)) |field| {
+        const id: BuiltinId = @enumFromInt(field.value);
+        if (publicName(id)) |candidate| {
+            if (std.mem.eql(u8, candidate, name)) return id;
+        }
     }
     return null;
+}
+
+test "public builtin names round-trip from the canonical id" {
+    inline for (std.meta.fields(BuiltinId)) |field| {
+        const id: BuiltinId = @enumFromInt(field.value);
+        if (publicName(id)) |builtin_name| {
+            try std.testing.expectEqual(id, idForName(builtin_name).?);
+        }
+    }
+    try std.testing.expectEqualStrings("foldl'", publicName(.foldlStrict).?);
+    try std.testing.expectEqualStrings("break", publicName(.break_).?);
+    try std.testing.expect(publicName(.mapAttrValue) == null);
 }
 
 pub fn ambientIdForName(name: []const u8) ?BuiltinId {
@@ -441,10 +373,13 @@ pub fn arity(id: BuiltinId) u8 {
 pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const NixPathEntry, store_dir: []const u8) !Value {
     var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
     defer entries.deinit(heap.allocator);
-    try entries.ensureTotalCapacity(heap.allocator, builtin_bindings.len + constant_bindings.len + 1);
+    try entries.ensureTotalCapacity(heap.allocator, public_builtin_count + constant_bindings.len + 1);
 
-    for (builtin_bindings) |binding| {
-        entries.appendAssumeCapacity(try builtinEntry(intern, binding));
+    inline for (std.meta.fields(BuiltinId)) |field| {
+        const id: BuiltinId = @enumFromInt(field.value);
+        if (publicName(id)) |builtin_name| {
+            entries.appendAssumeCapacity(try builtinEntry(intern, builtin_name, id));
+        }
     }
 
     entries.appendAssumeCapacity(.{ .name = try intern.intern("true"), .value = Value.boolVal(true) });
@@ -500,10 +435,10 @@ fn pureGuardedThunk(heap: *ObjectHeap, value: Value) !Value {
     return Value.thunk(try heap.addThunk(Thunk.init(closure)));
 }
 
-fn builtinEntry(intern: *InternTable, binding: BuiltinBinding) !AttrEntry {
+fn builtinEntry(intern: *InternTable, builtin_name: []const u8, id: BuiltinId) !AttrEntry {
     return .{
-        .name = try intern.intern(binding.name),
-        .value = Value.builtin(@intFromEnum(binding.id)),
+        .name = try intern.intern(builtin_name),
+        .value = Value.builtin(@intFromEnum(id)),
     };
 }
 

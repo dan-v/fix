@@ -868,9 +868,10 @@ fn chunkIdWide(op: OpCode) bool {
 /// The builtin's Nix-visible name for a raw builtin id, if the id is valid.
 /// Kept public so debugger/value views can use the same spelling as disassembly.
 pub fn builtinName(id: u64) ?[]const u8 {
-    const BuiltinId = @import("runtime").builtins.BuiltinId;
+    const builtins = @import("runtime").builtins;
+    const BuiltinId = builtins.BuiltinId;
     inline for (@typeInfo(BuiltinId).@"enum".fields) |f| {
-        if (f.value == id) return f.name;
+        if (f.value == id) return builtins.displayName(@enumFromInt(f.value));
     }
     return null;
 }
