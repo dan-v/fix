@@ -108,9 +108,10 @@ fn compileMixedRecursiveAttrEntryViews(self: *Compiler, entries: []const AttrEnt
     defer if (prepared) |p| self.allocator.free(p);
     var grouped = if (prepared) |p| try attrEntryGroups(self, p) else initial;
     defer if (prepared != null) grouped.deinit(self.allocator);
-    try compileRecursiveAttrCells(self, grouped.groups);
+    const overrides_id = try recursiveOverridesId(self, grouped.groups);
+    try compileRecursiveAttrCells(self, grouped.groups, overrides_id != null);
     try emitRecursiveAttrObject(self, grouped.groups);
-    try maybeEmitRecursiveOverrides(self, grouped.groups);
+    if (overrides_id) |id| try emit.emitApplyOverrides(self, id);
 
     for (entries) |entry| {
         if (!isDynamicAttrEntryView(self, entry)) continue;
@@ -422,9 +423,10 @@ fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) 
     var grouped = if (prepared != null) try attrEntryGroups(self, effective_entries) else initial;
     defer if (prepared != null) grouped.deinit(self.allocator);
 
-    try compileRecursiveAttrCells(self, grouped.groups);
+    const overrides_id = try recursiveOverridesId(self, grouped.groups);
+    try compileRecursiveAttrCells(self, grouped.groups, overrides_id != null);
     try emitRecursiveAttrObject(self, grouped.groups);
-    try maybeEmitRecursiveOverrides(self, grouped.groups);
+    if (overrides_id) |id| try emit.emitApplyOverrides(self, id);
     scope.endScope(self);
 }
 
@@ -489,12 +491,12 @@ fn compilePlainAttrGroup(
 }
 
 /// If this recursive set statically declares a top-level `__overrides`
-/// attribute, emit the runtime override-application step over the
-/// just-built rec object (on the stack). No-op for the overwhelmingly
+/// attribute, validate the feature gate and return its interned name for the
+/// caller's runtime override-application step. No-op for the overwhelmingly
 /// common case (no `__overrides` key), so plain rec sets pay nothing.
 /// Nested `__overrides` (e.g. `rec { a.__overrides.a = 1; }`) is NOT a
 /// top-level key here, so it correctly does not trigger.
-fn maybeEmitRecursiveOverrides(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
+fn recursiveOverridesId(self: *Compiler, groups: []const AttrEntryGroup) anyerror!?InternId {
     const overrides_id = try self.intern.intern("__overrides");
     for (groups) |group| {
         if (group.name_id == overrides_id) {
@@ -505,10 +507,10 @@ fn maybeEmitRecursiveOverrides(self: *Compiler, groups: []const AttrEntryGroup) 
                 try diagnostics.reportCompileError(self, group.first.offset, group.first.len, "__overrides attributes are deprecated and will be removed in the future. Use --extra-deprecated-features rec-set-overrides to silence this warning.");
                 return error.RecSetOverridesDeprecated;
             }
-            try emit.emitApplyOverrides(self, overrides_id);
-            return;
+            return overrides_id;
         }
     }
+    return null;
 }
 
 fn declareRecursiveAttrLocals(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
@@ -518,7 +520,11 @@ fn declareRecursiveAttrLocals(self: *Compiler, groups: []const AttrEntryGroup) a
     }
 }
 
-fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
+fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup, suppress_speculation: bool) anyerror!void {
+    const previous_suppression = self.suppress_child_speculation;
+    self.suppress_child_speculation = previous_suppression or suppress_speculation;
+    defer self.suppress_child_speculation = previous_suppression;
+
     for (groups) |group| {
         const slot = scope.resolveLocalId(self, group.name_id) orelse return error.UndefinedVariable;
         const leaf = group.leaf;

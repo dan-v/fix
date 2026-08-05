@@ -1,5 +1,6 @@
 const std = @import("std");
 const Engine = @import("../../evaluator.zig").Engine;
+const chunk = @import("../../bytecode.zig").chunk;
 
 test "compiles a plain attribute set with two entries" {
     var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
@@ -22,6 +23,38 @@ test "compiles a recursive attribute set referencing a sibling" {
 
     const result = try ev.evaluate("(rec { a = 1; b = a + 1; }).b");
     try std.testing.expectEqual(@as(i64, 2), result.asInt());
+}
+
+test "recursive overrides keep re-pointable cells out of speculation" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 8 });
+    defer ev.deinit();
+    var policy = ev.languagePolicy();
+    policy.allow_rec_set_overrides = true;
+    ev.configureLanguage(policy);
+
+    var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll("(rec { x = ");
+    for (0..80) |_| try source.writer.writeAll("z + ");
+    try source.writer.writeAll("z; z = 1; y = x; __overrides = { x = 2; }; }).y");
+
+    const before = ev.registry.count();
+    const result = try ev.evaluate(source.written());
+    try std.testing.expectEqual(@as(i64, 2), result.asInt());
+
+    const x_name = try ev.intern.intern("x");
+    var found_substantial_x = false;
+    var id = before;
+    while (id < ev.registry.count()) : (id += 1) {
+        const name_id = ev.registry.nameOf(id) orelse continue;
+        const name = ev.registry.nameNode(name_id) orelse continue;
+        const slot = ev.registry.slot(id).?;
+        if (name.parent != 0 or name.segment != x_name or
+            slot.ptr.code.len < chunk.speculation_min_code_bytes) continue;
+        found_substantial_x = true;
+        try std.testing.expect(!slot.body_is_substantial);
+    }
+    try std.testing.expect(found_substantial_x);
 }
 
 test "compiles a dynamic attribute name from string interpolation" {
