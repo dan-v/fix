@@ -112,7 +112,7 @@ pub fn styleCode(use_color: bool, which: Style) []const u8 {
         .note_label => "\x1b[1;36m",
         .trace_label => "\x1b[36m",
         .success => "\x1b[32m",
-        .warning => "\x1b[33m",
+        .warning => "\x1b[1;33m",
     };
 }
 
