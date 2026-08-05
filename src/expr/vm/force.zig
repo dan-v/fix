@@ -414,6 +414,16 @@ const fan_out_min_items: usize = 4;
 /// Keep tasks coarse enough to limit queue traffic while retaining fan-out.
 const fan_out_batch_items: u8 = 16;
 
+/// True when handing `value` to a helper can do any work: a thunk still
+/// unresolved. Racy-benign monotonic read — a resolve racing the check at
+/// worst skips a batch the caller's own walk resolves anyway, or submits
+/// a batch that no-ops.
+inline fn fanOutWorthy(self: *VM, value: Value) bool {
+    if (!value.isThunk()) return false;
+    return self.heap.getThunkAssumeValid(value.asObjectId()).future.state.load(.monotonic) ==
+        @intFromEnum(future_mod.FutureState.unresolved);
+}
+
 pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) void {
     // Allow helpers running speculative tasks to fan out further list
     // work too. Module-import trees in lib.evalModules are recursive
@@ -427,6 +437,17 @@ pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) voi
     while (offset < items.len) {
         const remaining = items.len - offset;
         const this_len: u8 = @intCast(@min(@as(usize, fan_out_batch_items), remaining));
+        // A batch with nothing to force (plain values, or thunks already
+        // resolved) is pure queue/wake/steal freight — skip it. The scan
+        // touches memory the caller's own strict walk is about to read.
+        const batch = items[offset..][0..this_len];
+        const live = for (batch) |item| {
+            if (fanOutWorthy(self, item)) break true;
+        } else false;
+        if (!live) {
+            offset += this_len;
+            continue;
+        }
         if (!self.scheduler.submitUrgent(.{ .force_list_range = .{
             .list_id = list_id,
             .offset = offset,
@@ -449,6 +470,15 @@ pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const heap_m
     while (offset < entries.len) {
         const remaining = entries.len - offset;
         const this_len: u8 = @intCast(@min(@as(usize, fan_out_batch_items), remaining));
+        // Same zero-work batch gate as `fanOutListShallow`.
+        const batch = entries[offset..][0..this_len];
+        const live = for (batch) |entry| {
+            if (fanOutWorthy(self, entry.value)) break true;
+        } else false;
+        if (!live) {
+            offset += this_len;
+            continue;
+        }
         if (!self.scheduler.submitUrgent(.{ .force_attrs_range = .{
             .attrs_id = attrs_id,
             .offset = offset,
