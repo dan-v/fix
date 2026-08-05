@@ -38,19 +38,28 @@ pub fn serializeReport(
     filter: ?Filter,
     unsupported: ?*Unsupported,
 ) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try writeArchive(allocator, files, &out.writer, path, filter, unsupported);
+    return out.toOwnedSlice();
+}
 
-    try appendString(allocator, &out, "nix-archive-1");
+fn writeArchive(
+    allocator: std.mem.Allocator,
+    files: *FileCache,
+    writer: *std.Io.Writer,
+    path: []const u8,
+    filter: ?Filter,
+    unsupported: ?*Unsupported,
+) !void {
+    try writeString(writer, "nix-archive-1");
     // Nix resolves the *root* source object before serializing: a top-level
     // symlink is followed to its target, which is then dumped as that target's
     // type (e.g. a directory). Only the root is resolved — symlinks encountered
     // as directory entries are still serialized as symlink nodes (below).
     const root = try resolveRootSymlink(allocator, files, path);
     defer allocator.free(root);
-    try appendNode(allocator, files, &out, root, filter, unsupported);
-
-    return out.toOwnedSlice(allocator);
+    try writeNode(allocator, files, writer, root, filter, unsupported);
 }
 
 /// Follow a chain of symlinks at the *root* of a source path, returning the
@@ -95,9 +104,30 @@ pub fn hashPath(allocator: std.mem.Allocator, files: *FileCache, path: []const u
 }
 
 pub fn hashPathFiltered(allocator: std.mem.Allocator, files: *FileCache, path: []const u8, filter: ?Filter) ![]u8 {
-    const nar_bytes = try serialize(allocator, files, path, filter);
-    defer allocator.free(nar_bytes);
-    return hashSerialized(allocator, nar_bytes);
+    const digest = try hashPathDigestFiltered(allocator, files, path, filter);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &encoded);
+}
+
+/// SHA-256 of a canonical NAR stream, produced incrementally. Traversal still
+/// allocates bounded path/sort scratch, but never retains the archive payload.
+pub fn hashPathDigest(allocator: std.mem.Allocator, files: *FileCache, path: []const u8) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    return hashPathDigestFiltered(allocator, files, path, null);
+}
+
+pub fn hashPathDigestFiltered(
+    allocator: std.mem.Allocator,
+    files: *FileCache,
+    path: []const u8,
+    filter: ?Filter,
+) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var hashing: std.Io.Writer.Hashing(Sha256) = .init(&.{});
+    try writeArchive(allocator, files, &hashing.writer, path, filter, null);
+    try hashing.writer.flush();
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hashing.hasher.final(&digest);
+    return digest;
 }
 
 /// Hex sha256 of an already-serialized NAR byte stream (caller owns result).
@@ -108,22 +138,22 @@ pub fn hashSerialized(allocator: std.mem.Allocator, nar_bytes: []const u8) ![]u8
     return allocator.dupe(u8, &encoded);
 }
 
-fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayListUnmanaged(u8), path: []const u8, filter: ?Filter, unsupported: ?*Unsupported) !void {
-    try appendString(allocator, out, "(");
+fn writeNode(allocator: std.mem.Allocator, files: *FileCache, writer: *std.Io.Writer, path: []const u8, filter: ?Filter, unsupported: ?*Unsupported) !void {
+    try writeString(writer, "(");
     switch (try files.fileType(path)) {
         .regular => {
-            try appendString(allocator, out, "type");
-            try appendString(allocator, out, "regular");
+            try writeString(writer, "type");
+            try writeString(writer, "regular");
             if (try files.isExecutable(path)) {
-                try appendString(allocator, out, "executable");
-                try appendString(allocator, out, "");
+                try writeString(writer, "executable");
+                try writeString(writer, "");
             }
-            try appendString(allocator, out, "contents");
-            try appendString(allocator, out, try files.readFile(path));
+            try writeString(writer, "contents");
+            try writeString(writer, try files.readFile(path));
         },
         .directory => {
-            try appendString(allocator, out, "type");
-            try appendString(allocator, out, "directory");
+            try writeString(writer, "type");
+            try writeString(writer, "directory");
             const entries = try sortedDirEntries(allocator, try files.readDir(path));
             defer allocator.free(entries);
             for (entries) |entry| {
@@ -137,22 +167,22 @@ fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayLi
                     const kind = files.fileType(child) catch entry.kind;
                     if (!try f.accept(f.context, child, kind)) continue;
                 }
-                try appendString(allocator, out, "entry");
-                try appendString(allocator, out, "(");
-                try appendString(allocator, out, "name");
-                try appendString(allocator, out, entry.name);
-                try appendString(allocator, out, "node");
-                try appendNode(allocator, files, out, child, filter, unsupported);
-                try appendString(allocator, out, ")");
+                try writeString(writer, "entry");
+                try writeString(writer, "(");
+                try writeString(writer, "name");
+                try writeString(writer, entry.name);
+                try writeString(writer, "node");
+                try writeNode(allocator, files, writer, child, filter, unsupported);
+                try writeString(writer, ")");
             }
         },
         .symlink => {
             const target = try files.readLink(path);
             defer allocator.free(target);
-            try appendString(allocator, out, "type");
-            try appendString(allocator, out, "symlink");
-            try appendString(allocator, out, "target");
-            try appendString(allocator, out, target);
+            try writeString(writer, "type");
+            try writeString(writer, "symlink");
+            try writeString(writer, "target");
+            try writeString(writer, target);
         },
         .unknown => {
             if (unsupported) |u| {
@@ -161,16 +191,16 @@ fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayLi
             return error.UnsupportedPathType;
         },
     }
-    try appendString(allocator, out, ")");
+    try writeString(writer, ")");
 }
 
-fn appendString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+fn writeString(writer: *std.Io.Writer, text: []const u8) !void {
     var len: [8]u8 = undefined;
     std.mem.writeInt(u64, &len, text.len, .little);
-    try out.appendSlice(allocator, &len);
-    try out.appendSlice(allocator, text);
+    try writer.writeAll(&len);
+    try writer.writeAll(text);
     const padding = (8 - text.len % 8) % 8;
-    try out.appendNTimes(allocator, 0, padding);
+    try writer.splatByteAll(0, padding);
 }
 
 fn sortedDirEntries(allocator: std.mem.Allocator, entries: []const FileCache.DirEntry) ![]FileCache.DirEntry {
@@ -181,4 +211,37 @@ fn sortedDirEntries(allocator: std.mem.Allocator, entries: []const FileCache.Dir
         }
     }.lessThan);
     return sorted;
+}
+
+test "streaming path digest matches retained canonical NAR bytes" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "payload",
+        .data = "stream me without retaining a second archive",
+    });
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fs.path.resolve(testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "payload",
+    });
+    defer testing.allocator.free(path);
+
+    var files = FileCache.init(testing.allocator);
+    defer files.deinit();
+    files.setIo(testing.io);
+
+    const serialized = try serialize(testing.allocator, &files, path, null);
+    defer testing.allocator.free(serialized);
+    const retained_hash = try hashSerialized(testing.allocator, serialized);
+    defer testing.allocator.free(retained_hash);
+
+    const digest = try hashPathDigest(testing.allocator, &files, path);
+    const streaming_hash = std.fmt.bytesToHex(digest, .lower);
+    try testing.expectEqualStrings(retained_hash, &streaming_hash);
 }

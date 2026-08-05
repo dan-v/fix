@@ -871,10 +871,7 @@ pub const FetchCache = struct {
         defer self.allocator.free(staging);
         errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
         const metadata = try git_transport.snapshotLocal(self.allocator, io, path, staging, spec.rev, spec.submodules);
-        const serialized = try nar.serialize(self.allocator, files, staging, null);
-        defer self.allocator.free(serialized);
-        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(serialized, &digest, .{});
+        const digest = try nar.hashPathDigest(self.allocator, files, staging);
         const encoded = std.fmt.bytesToHex(digest, .lower);
         const snapshot = try std.fs.path.join(self.allocator, &.{ snapshots, encoded[0..32], "source" });
         defer self.allocator.free(snapshot);
