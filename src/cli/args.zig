@@ -762,7 +762,14 @@ fn writeFishEscaped(w: *std.Io.Writer, text: []const u8) !void {
 // Parsing
 // ---------------------------------------------------------------------------
 
-pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, first: ?[:0]const u8, cmd: Cmd) !Options {
+/// Parse-failure context for user-facing reporting. `offending` borrows the
+/// argument token being processed when parsing failed; it stays valid as long
+/// as the caller's args iterator.
+pub const Diag = struct {
+    offending: ?[]const u8 = null,
+};
+
+pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, first: ?[:0]const u8, cmd: Cmd, diag: ?*Diag) !Options {
     var options: Options = .{ .cmd = cmd };
     errdefer options.deinit(allocator);
 
@@ -772,6 +779,9 @@ pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
             carried = null;
             break :blk c;
         } else (args_iter.next() orelse break);
+        errdefer if (diag) |d| {
+            d.offending = arg;
+        };
 
         // End of options: leave the rest in the iterator (e.g. `fix run`
         // forwards them as program arguments).
@@ -989,9 +999,9 @@ fn writeWrappedHelp(w: *std.Io.Writer, help: []const u8, help_col: usize) !void 
 
 pub fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.MissingValue => "missing value after that option",
-        error.MissingSecondValue => "that option expects two values (NAME and VALUE)",
-        error.UnexpectedValue => "that option does not take a value",
+        error.MissingValue => "missing value for option",
+        error.MissingSecondValue => "expected two values (NAME and VALUE) for option",
+        error.UnexpectedValue => "option does not take a value",
         error.FlakesFeatureRequired => "flake inputs require the flakes experimental feature; pass --extra-experimental-features flakes",
         error.TooManySources => "provide only one expression or file",
         error.InvalidColorMode => "expected --color to be auto, always, or never",
@@ -1006,7 +1016,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.InvalidTimelineFlows => "expected --timeline-flows to be off or all",
         error.InvalidChunkId => "expected --chunk to be a chunk id (decimal, or 0x-prefixed hex)",
         error.UnknownOption => "unknown option",
-        error.OptionNotValidForCommand => "that option is not valid for this command",
+        error.OptionNotValidForCommand => "option not valid for this command",
         else => @errorName(err),
     };
 }
@@ -1016,7 +1026,7 @@ fn parseForTest(argv: std.process.Args.Vector, cmd: Cmd) !Options {
     var iter = try process_args.iterateAllocator(std.testing.allocator);
     defer iter.deinit();
     _ = iter.next();
-    return parse(std.testing.allocator, &iter, null, cmd);
+    return parse(std.testing.allocator, &iter, null, cmd, null);
 }
 
 test "typed sources preserve mixed command-line order" {

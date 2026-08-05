@@ -15,6 +15,7 @@ const std = @import("std");
 const engine = @import("expr");
 const runtime = @import("runtime");
 const presentation = @import("presentation.zig");
+const render = @import("render.zig");
 const term_mod = @import("repl/term.zig");
 const command_mod = @import("debugger_command.zig");
 const source_render = @import("source_render.zig");
@@ -194,7 +195,7 @@ pub const Console = struct {
             .help => try self.help(),
             .eval => |source| {
                 const result = s.eval(source, scope) catch |e| {
-                    try self.reportErr("{s}", .{@errorName(e)});
+                    try self.reportErr("{f}", .{render.friendly(e)});
                     return false;
                 };
                 self.vm_queries.clearRuntime();
@@ -453,7 +454,7 @@ pub const Console = struct {
     }
 
     fn armStep(self: *Console, s: *DebugSession, kind: DebugSession.StepKind) !void {
-        s.step(kind) catch |e| try self.reportErr("{s}", .{@errorName(e)});
+        s.step(kind) catch |e| try self.reportErr("{f}", .{render.friendly(e)});
     }
 
     /// `break FILE:LINE` — set a source-line breakpoint.
@@ -483,10 +484,7 @@ pub const Console = struct {
         defer out.interface.flush() catch {};
         const w = &out.interface;
         self.renderTo(w, s, v) catch |e| {
-            try self.style(w, .error_label);
-            try w.writeAll("error");
-            try presentation.reset(w, self.use_color);
-            try w.print(": {s}\n", .{@errorName(e)});
+            try render.caughtErrorTo(w, self.use_color, e, "", .{});
             return;
         };
         try w.writeByte('\n');
@@ -533,11 +531,7 @@ pub const Console = struct {
     fn reportErr(self: *Console, comptime fmt: []const u8, fmt_args: anytype) !void {
         var out = self.stderr();
         defer out.interface.flush() catch {};
-        const w = &out.interface;
-        try self.style(w, .error_label);
-        try w.writeAll("error");
-        try presentation.reset(w, self.use_color);
-        try w.print(": " ++ fmt ++ "\n", fmt_args);
+        try render.messageErrorTo(&out.interface, self.use_color, fmt, fmt_args);
     }
 };
 

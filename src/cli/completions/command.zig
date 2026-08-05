@@ -12,6 +12,7 @@ const args = @import("../args.zig");
 const command_match = @import("../command_match.zig");
 const command_meta = @import("../command_meta.zig");
 const presentation = @import("../presentation.zig");
+const render = @import("../render.zig");
 const setup = @import("../setup.zig");
 const engine = @import("expr");
 const context = @import("context.zig");
@@ -230,7 +231,7 @@ const fish_script_suffix =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const mode = args_iter.next() orelse {
-        std.debug.print("error: choose bash, zsh, or fish\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "choose bash, zsh, or fish", null, synopsis);
         return 2;
     };
     if (presentation.isHelpFlag(mode)) {
@@ -242,7 +243,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     if (std.mem.eql(u8, mode, "fish")) {
         if (args_iter.next() != null) {
-            std.debug.print("error: completions accepts exactly one shell name\n\n{s}\n", .{synopsis});
+            render.usageError(init.io, init.environ_map, "completions accepts exactly one shell name", null, synopsis);
             return 2;
         }
         try writeFishScript(init.io);
@@ -254,11 +255,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     else if (std.mem.eql(u8, mode, "zsh"))
         zsh_script
     else {
-        std.debug.print("error: unknown shell '{s}' (expected bash, zsh, or fish)\n\n{s}\n", .{ mode, synopsis });
+        var msg_buf: [256]u8 = undefined;
+        const message = std.fmt.bufPrint(&msg_buf, "unknown shell '{s}' (expected bash, zsh, or fish)", .{mode}) catch "unknown shell (expected bash, zsh, or fish)";
+        render.usageError(init.io, init.environ_map, message, null, synopsis);
         return 2;
     };
     if (args_iter.next() != null) {
-        std.debug.print("error: completions accepts exactly one shell name\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "completions accepts exactly one shell name", null, synopsis);
         return 2;
     }
     try writeStdout(init.io, script);

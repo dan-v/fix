@@ -18,6 +18,7 @@ const std = @import("std");
 const engine = @import("expr");
 const store = @import("store");
 const args = @import("../args.zig");
+const render = @import("../render.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
 
@@ -63,19 +64,20 @@ const get_env_script =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null, .print_dev_env) catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, null, .print_dev_env, &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .print_dev_env);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
     defer options.deinit(allocator);
     if (options.source == null) {
-        std.debug.print("error: give a source (path, -E <expr>, or --flake <installable>)\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "give a source (path, -E <expr>, or --flake <installable>)", null, synopsis);
         return 2;
     }
 
@@ -94,11 +96,11 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // -- evaluate to a derivation --------------------------------------------
     const source_arg = options.source.?;
     if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
-        std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
+        render.messageError(init.io, term.use_color, "{s}", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
     var source = eval_support.getSource(&ev, init.io, source_arg, options.sourceOptions()) catch |err| {
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, term.use_color, err, "reading source", .{});
         return 1;
     };
     defer source.deinit(ev.hostAllocator());
@@ -109,17 +111,17 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     const paths = (ev.derivationBuildPaths(value) catch |err| {
         return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.slice(), err);
     }) orelse {
-        std.debug.print("error: expression did not evaluate to a derivation\n", .{});
+        render.messageError(init.io, term.use_color, "expression did not evaluate to a derivation", .{});
         return 1;
     };
 
     // -- construct the get-env derivation ------------------------------------
     const record = findRecord(ev.derivationDebugRecords(), paths.drv_path) orelse {
-        std.debug.print("error: could not recover the build recipe for {s}\n", .{paths.drv_path});
+        render.messageError(init.io, term.use_color, "could not recover the build recipe for {s}", .{paths.drv_path});
         return 1;
     };
     for (record.env) |e| if (std.mem.eql(u8, e.name, "__json")) {
-        std.debug.print("error: print-dev-env does not yet support __structuredAttrs derivations\n", .{});
+        render.messageError(init.io, term.use_color, "print-dev-env does not yet support __structuredAttrs derivations", .{});
         return 1;
     };
 
@@ -131,7 +133,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     var drv = try buildGetEnvDrv(a, record, get_env_script);
     const computed = drv.computePaths(a, ev.storeResolver()) catch |err| {
-        std.debug.print("error: computing get-env derivation: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, term.use_color, err, "computing get-env derivation", .{});
         return 1;
     };
     const out_path = try a.dupe(u8, drv.outputs[0].path);
@@ -164,7 +166,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         ev.readFileViaDaemon(allocator, out_path)
     else
         ev.readStorePathFile(init.io, allocator, out_path)) catch |err| {
-        std.debug.print("error: reading the dev environment ({s}): {s}\n", .{ out_path, @errorName(err) });
+        render.caughtError(init.io, term.use_color, err, "reading the dev environment ({s})", .{out_path});
         return 1;
     };
     defer allocator.free(data);

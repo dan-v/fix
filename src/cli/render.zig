@@ -15,16 +15,145 @@ pub fn messageError(io: std.Io, use_color: bool, comptime format: []const u8, ar
     var stderr_buffer: [4096]u8 = undefined;
     var stderr = presentation.lockStderr(io, &stderr_buffer) catch return;
     defer stderr.deinit();
-    writeMessageError(stderr.writer(), use_color, format, args) catch return;
+    messageErrorTo(stderr.writer(), use_color, format, args) catch return;
     stderr.flush() catch {};
 }
 
-fn writeMessageError(writer: *std.Io.Writer, use_color: bool, comptime format: []const u8, args: anytype) !void {
-    try presentation.style(writer, use_color, .error_label);
-    try writer.writeAll("error");
+pub fn messageErrorTo(writer: *std.Io.Writer, use_color: bool, comptime format: []const u8, args: anytype) !void {
+    try writeLabel(writer, use_color, .error_label, "error");
+    try writer.print(format, args);
+    try writer.writeByte('\n');
+}
+
+/// Render a non-fatal condition with a colored `warning:` label.
+pub fn messageWarning(io: std.Io, use_color: bool, comptime format: []const u8, args: anytype) void {
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr = presentation.lockStderr(io, &stderr_buffer) catch return;
+    defer stderr.deinit();
+    messageWarningTo(stderr.writer(), use_color, format, args) catch return;
+    stderr.flush() catch {};
+}
+
+pub fn messageWarningTo(writer: *std.Io.Writer, use_color: bool, comptime format: []const u8, args: anytype) !void {
+    try writeLabel(writer, use_color, .warning, "warning");
+    try writer.print(format, args);
+    try writer.writeByte('\n');
+}
+
+/// A `hint:` continuation line naming an action the user can take.
+pub fn hintTo(writer: *std.Io.Writer, use_color: bool, comptime format: []const u8, args: anytype) !void {
+    try writeLabel(writer, use_color, .note_label, "hint");
+    try writer.print(format, args);
+    try writer.writeByte('\n');
+}
+
+fn writeLabel(writer: *std.Io.Writer, use_color: bool, which: presentation.Style, label: []const u8) !void {
+    try presentation.style(writer, use_color, which);
+    try writer.writeAll(label);
     try presentation.reset(writer, use_color);
     try writer.writeAll(": ");
-    try writer.print(format, args);
+}
+
+/// Render a failure caught as a Zig error: `error: <context>: <friendly
+/// name>`, plus a `hint:` line when the error has a known remedy. This is the
+/// user-facing spelling for caught errors; never print `@errorName` directly.
+pub fn caughtError(io: std.Io, use_color: bool, err: anyerror, comptime context: []const u8, args: anytype) void {
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr = presentation.lockStderr(io, &stderr_buffer) catch return;
+    defer stderr.deinit();
+    caughtErrorTo(stderr.writer(), use_color, err, context, args) catch return;
+    stderr.flush() catch {};
+}
+
+pub fn caughtErrorTo(writer: *std.Io.Writer, use_color: bool, err: anyerror, comptime context: []const u8, args: anytype) !void {
+    try writeLabel(writer, use_color, .error_label, "error");
+    if (context.len > 0) {
+        try writer.print(context, args);
+        try writer.writeAll(": ");
+    }
+    try writer.print("{f}\n", .{friendly(err)});
+    if (errorHint(err)) |remedy| try hintTo(writer, use_color, "{s}", .{remedy});
+}
+
+/// Wrap a caught Zig error for `{f}` display: well-known errors render as
+/// prose ("no such file or directory"); the rest de-camelize their error name
+/// ("LockFileInvalid" → "lock file invalid") so users never see
+/// `error.CamelCase` verbatim.
+pub fn friendly(err: anyerror) FriendlyError {
+    return .{ .err = err };
+}
+
+pub const FriendlyError = struct {
+    err: anyerror,
+
+    pub fn format(self: FriendlyError, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (describeError(self.err)) |prose| return writer.writeAll(prose);
+        const name = @errorName(self.err);
+        for (name, 0..) |c, i| {
+            if (std.ascii.isUpper(c)) {
+                const follows_word = i > 0 and (std.ascii.isLower(name[i - 1]) or std.ascii.isDigit(name[i - 1]));
+                const starts_word = i + 1 < name.len and std.ascii.isLower(name[i + 1]);
+                if (follows_word or (i > 0 and starts_word)) try writer.writeByte(' ');
+                try writer.writeByte(std.ascii.toLower(c));
+            } else {
+                try writer.writeByte(c);
+            }
+        }
+    }
+};
+
+fn describeError(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.FileNotFound => "no such file or directory",
+        error.AccessDenied, error.PermissionDenied => "permission denied",
+        error.IsDir => "is a directory",
+        error.NotDir => "not a directory",
+        error.OutOfMemory => "out of memory",
+        error.BrokenPipe => "broken pipe",
+        error.ConnectionRefused => "connection refused",
+        error.ConnectionResetByPeer => "connection reset by peer",
+        error.CurrentWorkingDirectoryUnlinked => "the current working directory no longer exists",
+        error.StoreUnavailable => "cannot reach the nix-daemon",
+        error.Unexpected => "unexpected system error",
+        else => null,
+    };
+}
+
+/// An actionable remedy for errors whose fix is environment-level rather than
+/// call-site-specific. Context-dependent hints belong at the call site.
+pub fn errorHint(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.StoreUnavailable, error.ConnectionRefused => "check that the nix-daemon is running (e.g. `systemctl status nix-daemon`), or point --store/NIX_REMOTE at a reachable store",
+        error.FlakesFeatureRequired => "re-run with `--extra-experimental-features flakes`, or add `experimental-features = nix-command flakes` to nix.conf",
+        error.CurrentWorkingDirectoryUnlinked => "cd to an existing directory and re-run",
+        else => null,
+    };
+}
+
+/// Render an argument/usage error, before command settings exist: color is
+/// auto-detected from the environment. `offending` names the argument that
+/// failed to parse, when the parser recorded it.
+pub fn usageError(
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    message: []const u8,
+    offending: ?[]const u8,
+    synopsis: []const u8,
+) void {
+    const use_color = presentation.colorDepth(.auto, io, env).enabled();
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr = presentation.lockStderr(io, &stderr_buffer) catch return;
+    defer stderr.deinit();
+    writeUsageError(stderr.writer(), use_color, message, offending, synopsis) catch return;
+    stderr.flush() catch {};
+}
+
+fn writeUsageError(writer: *std.Io.Writer, use_color: bool, message: []const u8, offending: ?[]const u8, synopsis: []const u8) !void {
+    try writeLabel(writer, use_color, .error_label, "error");
+    try writer.writeAll(message);
+    if (offending) |arg| try writer.print(": {s}", .{arg});
+    try writer.writeAll("\n\n");
+    try writer.writeAll(synopsis);
     try writer.writeByte('\n');
 }
 
@@ -125,7 +254,7 @@ fn writeEvaluationError(
     } else if (trace.message) |message| {
         try writer.print(": {s}\n", .{message});
     } else {
-        try writer.print(": evaluation failed with {s}\n", .{@errorName(err)});
+        try writer.print(": evaluation failed: {f}\n", .{friendly(err)});
     }
 
     try writeTraceFrames(writer, use_color, show_trace, ev, source, trace.frames.items);
@@ -194,6 +323,49 @@ fn traceFrameSource(ev: *Engine, source: []const u8, frame: EvalTrace.Frame) ?[]
     return source;
 }
 
+test "friendly errors read as prose, never error.CamelCase" {
+    var buffer: [128]u8 = undefined;
+
+    var known = std.Io.Writer.fixed(&buffer);
+    try known.print("{f}", .{friendly(error.FileNotFound)});
+    try std.testing.expectEqualStrings("no such file or directory", known.buffered());
+
+    var decamelized = std.Io.Writer.fixed(&buffer);
+    try decamelized.print("{f}", .{friendly(error.LockFileInvalid)});
+    try std.testing.expectEqualStrings("lock file invalid", decamelized.buffered());
+
+    var acronym = std.Io.Writer.fixed(&buffer);
+    try acronym.print("{f}", .{friendly(error.TlsInitializationFailed)});
+    try std.testing.expectEqualStrings("tls initialization failed", acronym.buffered());
+}
+
+test "caught errors carry an actionable hint when one is known" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try caughtErrorTo(&output.writer, false, error.StoreUnavailable, "", .{});
+    try std.testing.expectEqualStrings(
+        "error: cannot reach the nix-daemon\n" ++
+            "hint: check that the nix-daemon is running (e.g. `systemctl status nix-daemon`), " ++
+            "or point --store/NIX_REMOTE at a reachable store\n",
+        output.written(),
+    );
+
+    var plain: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer plain.deinit();
+    try caughtErrorTo(&plain.writer, false, error.FileNotFound, "reading input {d}", .{2});
+    try std.testing.expectEqualStrings("error: reading input 2: no such file or directory\n", plain.written());
+}
+
+test "usage errors name the offending argument" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeUsageError(&output.writer, false, "unknown option", "--frobnicate", "usage: fix eval [options]");
+    try std.testing.expectEqualStrings(
+        "error: unknown option: --frobnicate\n\nusage: fix eval [options]\n",
+        output.written(),
+    );
+}
+
 test "trace contexts render their complete prose once" {
     var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer ev.deinit();
@@ -215,7 +387,7 @@ test "trace contexts render their complete prose once" {
 test "message errors use the diagnostic error-label style" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try writeMessageError(&output.writer, true, "input {d} build failed: {s}", .{ 1, "boom" });
+    try messageErrorTo(&output.writer, true, "input {d} build failed: {s}", .{ 1, "boom" });
     try std.testing.expectEqualStrings(
         "\x1b[1;31merror\x1b[0m: input 1 build failed: boom\n",
         output.written(),

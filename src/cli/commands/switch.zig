@@ -26,6 +26,8 @@ const builtin = @import("builtin");
 const engine = @import("expr");
 const realization_workflow = @import("../realize.zig");
 const args = @import("../args.zig");
+const render = @import("../render.zig");
+const presentation = @import("../presentation.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
 const build = @import("build.zig");
@@ -86,33 +88,36 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         } else first = t0;
     }
 
-    var options = args.parse(allocator, args_iter, first, .@"switch") catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, first, .@"switch", &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .@"switch");
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
     defer options.deinit(allocator);
     if (options.sources.items.len > 1) {
-        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "this command accepts one expression or file", null, synopsis);
         return 2;
     }
+
+    const use_color = presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
 
     // Re-exec'd privileged half: skip eval/build, activate the given path.
     if (options.activate_toplevel) |top| {
         const target = resolveTarget(init, &options) catch {
-            std.debug.print("error: --activate-toplevel needs an explicit --nixos/--darwin/--home-manager\n", .{});
+            render.messageError(init.io, use_color, "--activate-toplevel needs an explicit --nixos/--darwin/--home-manager", .{});
             return 2;
         };
         return activate(allocator, init, target, action, top);
     }
 
     const target = resolveTarget(init, &options) catch {
-        std.debug.print("error: could not detect the target; pass --nixos, --darwin, or --home-manager\n", .{});
+        render.messageError(init.io, use_color, "could not detect the target; pass --nixos, --darwin, or --home-manager", .{});
         return 2;
     };
 
@@ -162,12 +167,12 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
     const term = try setup.configure(&ev, init, options, &settings);
 
     if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
-        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
+        render.usageError(init.io, init.environ_map, args.errorMessage(error.FlakesFeatureRequired), null, synopsis);
         return 2;
     }
 
     var source = eval_support.getSource(&ev, init.io, source_arg, options.sourceOptions()) catch |err| {
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, term.use_color, err, "reading source", .{});
         return 1;
     };
     defer source.deinit(ev.hostAllocator());
@@ -183,7 +188,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
 
     // `build`: just link ./result and print the path, like `fix build`.
     if (action == .build) {
-        build.linkRoot(init.io, allocator, &ev, setup.stateDir(init), "result", out_path, true);
+        build.linkRoot(init.io, term.use_color, allocator, &ev, setup.stateDir(init), "result", out_path, true);
         var stdout_buf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
         try w.interface.print("{s}\n", .{out_path});
@@ -195,7 +200,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
     // (which may block for seconds on a sudo password prompt) with an indirect
     // root, cleaned up once we're done.
     const gc_link = ".fix-switch-gcroot";
-    build.linkRoot(init.io, allocator, &ev, setup.stateDir(init), gc_link, out_path, true);
+    build.linkRoot(init.io, term.use_color, allocator, &ev, setup.stateDir(init), gc_link, out_path, true);
     defer std.Io.Dir.cwd().deleteFile(init.io, gc_link) catch {};
 
     // Local activation needs root for nixos/darwin. Elevate that half only.
@@ -208,8 +213,9 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
 /// Re-exec `sudo fix switch <action> <target> --activate-toplevel <top>` so the
 /// profile-set + activation run as root. No rebuild happens in the child.
 fn sudoReexec(allocator: std.mem.Allocator, init: std.process.Init, target: Target, action: Action, top: []const u8) !u8 {
+    const use_color = presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
     const self = std.process.executablePathAlloc(init.io, allocator) catch |err| {
-        std.debug.print("error: cannot locate own executable to re-exec under sudo: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, use_color, err, "cannot locate own executable to re-exec under sudo", .{});
         return 1;
     };
     defer allocator.free(self);
@@ -222,10 +228,10 @@ fn sudoReexec(allocator: std.mem.Allocator, init: std.process.Init, target: Targ
         targetFlag(target), "--activate-toplevel", top,
     };
     var child = std.process.spawn(init.io, .{ .argv = &argv, .environ_map = init.environ_map }) catch |err| {
-        std.debug.print("error: launching sudo: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, use_color, err, "launching sudo", .{});
         return 127;
     };
-    return waitCode(init.io, &child);
+    return waitCode(init, &child);
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +241,8 @@ fn sudoReexec(allocator: std.mem.Allocator, init: std.process.Init, target: Targ
 fn activate(allocator: std.mem.Allocator, init: std.process.Init, target: Target, action: Action, top: []const u8) !u8 {
     if (setsProfile(target, action)) {
         setSystemProfile(allocator, init.io, setup.stateDir(init), top) catch |err| {
-            std.debug.print("error: setting the system profile: {s}\n", .{@errorName(err)});
+            const use_color = presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
+            render.caughtError(init.io, use_color, err, "setting the system profile", .{});
             return 1;
         };
     }
@@ -312,10 +319,11 @@ fn runActivation(allocator: std.mem.Allocator, init: std.process.Init, target: T
     if (target == .nixos) try argv.append(allocator, action.word());
 
     var child = std.process.spawn(init.io, .{ .argv = argv.items, .environ_map = init.environ_map }) catch |err| {
-        std.debug.print("error: running {s}: {s}\n", .{ exe, @errorName(err) });
+        const use_color = presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
+        render.caughtError(init.io, use_color, err, "running {s}", .{exe});
         return 127;
     };
-    return waitCode(init.io, &child);
+    return waitCode(init, &child);
 }
 
 // ---------------------------------------------------------------------------
@@ -411,9 +419,10 @@ fn pathExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-fn waitCode(io: std.Io, child: *std.process.Child) !u8 {
-    const status = child.wait(io) catch |err| {
-        std.debug.print("error: {s}\n", .{@errorName(err)});
+fn waitCode(init: std.process.Init, child: *std.process.Child) !u8 {
+    const status = child.wait(init.io) catch |err| {
+        const use_color = presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
+        render.caughtError(init.io, use_color, err, "", .{});
         return 1;
     };
     return switch (status) {

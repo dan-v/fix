@@ -113,7 +113,7 @@ pub fn parseOptionsBefore(
     var iterator = try process_args.iterateAllocator(allocator);
     defer iterator.deinit();
     _ = iterator.next();
-    var options = try args.parse(allocator, &iterator, null, cmd);
+    var options = try args.parse(allocator, &iterator, null, cmd, null);
     options.attr = null;
     options.attrs.clearRetainingCapacity();
     options.color = .never;

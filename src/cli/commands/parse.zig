@@ -15,6 +15,8 @@ const engine = @import("expr");
 const syntax = @import("syntax");
 const args = @import("../args.zig");
 const fileish = @import("../fileish.zig");
+const presentation = @import("../presentation.zig");
+const render = @import("../render.zig");
 const setup = @import("../setup.zig");
 
 const Engine = engine.Engine;
@@ -33,21 +35,23 @@ pub const synopsis =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null, .parse) catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, null, .parse, &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .parse);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
     defer options.deinit(allocator);
     if (options.sources.items.len > 1) {
-        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "this command accepts one expression or file", null, synopsis);
         return 2;
     }
+    const use_color = presentation.colorDepth(options.color, init.io, init.environ_map).enabled();
 
     const memory_backing = setup.applyMemoryBacking(process, null);
     var settings = setup.loadSettingsAndFlakeConfig(allocator, init, &options) catch |err| {
@@ -58,13 +62,13 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var ev = try Engine.init(allocator, setup.engineConfig(init, 1, memory_backing));
     defer ev.deinit();
     _ = setup.configure(&ev, init, &options, &settings) catch |err| {
-        std.debug.print("error: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, use_color, err, "", .{});
         return 1;
     };
 
     const source_arg = options.source orelse options.defaultSource();
     var loaded = loadSource(&ev, init.io, source_arg) catch |err| {
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, use_color, err, "reading source", .{});
         return 1;
     };
     defer loaded.deinit(allocator);
@@ -83,7 +87,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
                 if (d.source == null) d.source = source;
                 if (d.source_path == null) d.source_path = source_path;
             }
-            try writeDiagnostics(init, source, parser.diagnostics.items);
+            try writeDiagnostics(init, use_color, source, parser.diagnostics.items);
             return 1;
         },
         else => return err,
@@ -95,20 +99,20 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     // eager, whole-expression compilation (no lazy body deferral), so an
     // unbound variable in any position is caught, matching `bindVars`.
     _ = ev.compileSource(source, null) catch {
-        try writeDiagnostics(init, source, ev.getDiagnostics());
+        try writeDiagnostics(init, use_color, source, ev.getDiagnostics());
         return 1;
     };
 
     // Deprecation warnings: emit each recorded warning whose feature is not
     // enabled (to stderr, semantically — not Nix's exact prose).
-    try emitWarnings(init, allocator, &parser, &options, source, source_path);
+    try emitWarnings(init, use_color, allocator, &parser, &options, source, source_path);
 
     // A surviving CR line ending means cr-line-endings is enabled (otherwise
     // compileSource would have errored above); Lix still warns in that case.
     // This gate is inverted (the feature enables rather than silences), so it
     // is emitted directly, not through emitWarnings.
     if (parser.first_cr_offset) |off| {
-        try writeDiagnostics(init, source, &.{.{
+        try writeDiagnostics(init, use_color, source, &.{.{
             .severity = .warning,
             .line = syntax.diagnostic.lineForOffset(source, off),
             .column = syntax.diagnostic.columnForOffset(source, off),
@@ -125,7 +129,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var buf: [64 * 1024]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(init.io, &buf);
     syntax.json.write(&w.interface, allocator, source, node) catch |err| {
-        std.debug.print("error: writing JSON: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, use_color, err, "writing JSON", .{});
         return 1;
     };
     w.interface.flush() catch {};
@@ -142,7 +146,7 @@ fn loadSource(ev: *Engine, io: std.Io, source: args.SourceArg) !fileish.Source {
     };
 }
 
-fn emitWarnings(init: std.process.Init, allocator: std.mem.Allocator, parser: *Parser, options: *const args.Options, source: []const u8, source_path: ?[]const u8) !void {
+fn emitWarnings(init: std.process.Init, use_color: bool, allocator: std.mem.Allocator, parser: *Parser, options: *const args.Options, source: []const u8, source_path: ?[]const u8) !void {
     if (parser.warnings.items.len == 0) return;
     var warns: std.ArrayListUnmanaged(Diagnostic) = .empty;
     defer warns.deinit(allocator);
@@ -163,14 +167,14 @@ fn emitWarnings(init: std.process.Init, allocator: std.mem.Allocator, parser: *P
             .source_path = source_path,
         }) catch break;
     }
-    if (warns.items.len != 0) try writeDiagnostics(init, source, warns.items);
+    if (warns.items.len != 0) try writeDiagnostics(init, use_color, source, warns.items);
 }
 
-fn writeDiagnostics(init: std.process.Init, source: []const u8, diagnostics: []const Diagnostic) !void {
+fn writeDiagnostics(init: std.process.Init, use_color: bool, source: []const u8, diagnostics: []const Diagnostic) !void {
     var buf: [8192]u8 = undefined;
     var stderr = try init.io.lockStderr(&buf, null);
     defer init.io.unlockStderr();
     const w = &stderr.file_writer.interface;
-    syntax.diagnostic.writeAll(w, source, diagnostics) catch {};
+    syntax.diagnostic.writeAllWithOptions(w, source, diagnostics, .{ .color = use_color }) catch {};
     w.flush() catch {};
 }

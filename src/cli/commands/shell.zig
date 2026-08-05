@@ -15,6 +15,8 @@ const args = @import("../args.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
 const stats = @import("../stats.zig");
+const render = @import("../render.zig");
+const presentation = @import("../presentation.zig");
 
 const Engine = engine.Engine;
 const EnvMap = std.process.Environ.Map;
@@ -29,24 +31,25 @@ pub const synopsis =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null, .shell) catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, null, .shell, &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .shell);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
     defer options.deinit(allocator);
     if (options.sources.items.len > 1) {
-        std.debug.print("error: this command accepts one expression or file\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "this command accepts one expression or file", null, synopsis);
         return 2;
     }
 
     if (options.packages.items.len == 0 and options.source == null) {
-        std.debug.print("error: give packages (-p) or a source (-E/--file/--flake)\n\n{s}\n", .{synopsis});
+        render.usageError(init.io, init.environ_map, "give packages (-p) or a source (-E/--file/--flake)", null, synopsis);
         return 2;
     }
 
@@ -108,13 +111,13 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *En
         const drv = (ev.attrPathValue(nixpkgs, name) catch |err| {
             return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, name, err);
         }) orelse {
-            std.debug.print("error: '{s}' not found in <nixpkgs>\n", .{name});
+            render.messageError(init.io, term.use_color, "'{s}' not found in <nixpkgs>", .{name});
             return 1;
         };
         const drv_path = (ev.derivationDrvPath(drv) catch |err| {
             return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, name, err);
         }) orelse {
-            std.debug.print("error: '{s}' is not a derivation\n", .{name});
+            render.messageError(init.io, term.use_color, "'{s}' is not a derivation", .{name});
             return 1;
         };
         try out_paths.ensureUnusedCapacity(allocator, 1);
@@ -145,11 +148,11 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *En
 fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Engine, release_action: ?engine.ReleaseAction, term: setup.Terminal, options: *const args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const source_arg = options.source.?;
     if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
-        std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
+        render.messageError(init.io, term.use_color, "{s}", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
     var source = eval_support.getSource(ev, init.io, source_arg, options.sourceOptions()) catch |err| {
-        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, term.use_color, err, "reading source", .{});
         return 1;
     };
     defer source.deinit(ev.hostAllocator());
@@ -160,7 +163,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Engi
     const drv_path = (ev.derivationDrvPath(result) catch |err| {
         return try eval_support.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.slice(), err);
     }) orelse {
-        std.debug.print("error: expression did not evaluate to a derivation\n", .{});
+        render.messageError(init.io, term.use_color, "expression did not evaluate to a derivation", .{});
         return 1;
     };
     try out_paths.ensureUnusedCapacity(allocator, 1);
@@ -207,12 +210,13 @@ fn launch(allocator: std.mem.Allocator, init: std.process.Init, out_paths: []con
         try argv.append(allocator, init.environ_map.get("SHELL") orelse "/bin/sh");
     }
 
+    const use_color = presentation.colorDepth(.auto, init.io, init.environ_map).enabled();
     var child = std.process.spawn(init.io, .{ .argv = argv.items, .environ_map = &env }) catch |err| {
-        std.debug.print("error: launching {s}: {s}\n", .{ argv.items[0], @errorName(err) });
+        render.caughtError(init.io, use_color, err, "launching {s}", .{argv.items[0]});
         return 127;
     };
     const status = child.wait(init.io) catch |err| {
-        std.debug.print("error: {s}\n", .{@errorName(err)});
+        render.caughtError(init.io, use_color, err, "", .{});
         return 1;
     };
     return switch (status) {

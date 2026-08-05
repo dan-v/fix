@@ -4,6 +4,7 @@ const std = @import("std");
 const engine = @import("expr");
 const progress_ui = @import("../progress.zig");
 const args = @import("../args.zig");
+const render = @import("../render.zig");
 const setup = @import("../setup.zig");
 const eval_support = @import("../eval_support.zig");
 const debugger = @import("../debugger.zig");
@@ -22,13 +23,14 @@ pub const synopsis =
 
 pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const allocator = process.allocator;
-    var options = args.parse(allocator, args_iter, null, .eval) catch |err| switch (err) {
+    var diag: args.Diag = .{};
+    var options = args.parse(allocator, args_iter, null, .eval, &diag) catch |err| switch (err) {
         error.Help => {
             args.writeHelp(init.io, synopsis, .eval);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+            render.usageError(init.io, init.environ_map, args.errorMessage(err), diag.offending, synopsis);
             return 2;
         },
     };
@@ -67,7 +69,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     const input_plan = eval_support.InputPlan.init(&options, init.io);
     input_plan.validate(&ev) catch |err| {
-        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
+        render.usageError(init.io, init.environ_map, args.errorMessage(err), null, synopsis);
         return 2;
     };
     const input_count = try input_plan.count();
@@ -88,18 +90,18 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer progress.deinit(ok);
     progress.install();
 
-    var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, &options);
+    var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, term.use_color, &options);
     defer vm_trace.deinit(allocator);
     if (vm_trace.trace) |t| ev.setVmTrace(t);
 
-    var thunks_setup = try trace_setup.setupThunkTrace(allocator, init.io, &ev, &options);
+    var thunks_setup = try trace_setup.setupThunkTrace(allocator, init.io, term.use_color, &ev, &options);
     defer thunks_setup.deinit(allocator);
     if (thunks_setup.trace) |t| ev.setThunkTrace(t);
 
     ok = true;
     for (0..input_count) |index| {
         var input = input_plan.load(&ev, index) catch |err| {
-            eval_support.reportInputReadError(input_count, index, err);
+            eval_support.reportInputReadError(init.io, term.use_color, input_count, index, err);
             ok = false;
             continue;
         };

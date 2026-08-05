@@ -15,6 +15,8 @@
 //! (`extra-foo = x` appends to `foo`, as in Nix — see `setOrAppend`).
 
 const std = @import("std");
+const presentation = @import("presentation.zig");
+const render = @import("render.zig");
 
 /// Config files are tiny; cap the read so a pathological path can't blow up.
 const max_conf_bytes = 1 << 20;
@@ -38,14 +40,14 @@ fn envGet(env: ?*const std.process.Environ.Map, name: []const u8) ?[]const u8 {
 /// aborts without re-reporting it.
 pub const MergeError = error{ OutOfMemory, ConfigError };
 
-fn mergeFile(settings: *Settings, io: std.Io, path: []const u8, depth: u8, forward: bool) MergeError!bool {
+fn mergeFile(settings: *Settings, io: std.Io, env: ?*const std.process.Environ.Map, path: []const u8, depth: u8, forward: bool) MergeError!bool {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, settings.allocator, .limited(max_conf_bytes)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
     };
     defer settings.allocator.free(data);
     const dir = std.fs.path.dirname(path) orelse ".";
-    try mergeConfigText(settings, .{ .io = io, .dir = dir, .depth = depth, .parent = path }, data, forward);
+    try mergeConfigText(settings, .{ .io = io, .env = env, .dir = dir, .depth = depth, .parent = path }, data, forward);
     return true;
 }
 
@@ -170,7 +172,7 @@ pub const Settings = struct {
 
 const max_include_depth = 100; // guards against include cycles
 
-const IncludeCtx = struct { io: std.Io, dir: []const u8, depth: u8, parent: []const u8 };
+const IncludeCtx = struct { io: std.Io, env: ?*const std.process.Environ.Map, dir: []const u8, depth: u8, parent: []const u8 };
 const IncludeSpec = struct { path: []const u8, required: bool };
 
 /// Parse config `content` line by line into `settings`. With an `IncludeCtx`,
@@ -209,11 +211,12 @@ fn includeFile(settings: *Settings, ctx: IncludeCtx, spec: IncludeSpec, forward:
     else
         try std.fs.path.join(alloc, &.{ ctx.dir, spec.path });
     defer alloc.free(path);
-    const found = try mergeFile(settings, ctx.io, path, ctx.depth + 1, forward);
+    const found = try mergeFile(settings, ctx.io, ctx.env, path, ctx.depth + 1, forward);
     if (!found and spec.required) {
         // Match Nix: abort with the file that couldn't be included and its
         // source. The message is printed here, so the caller must not re-report.
-        std.debug.print("error: file '{s}' included from '{s}' not found\n", .{ path, ctx.parent });
+        const use_color = if (ctx.env) |env| presentation.colorDepth(.auto, ctx.io, env).enabled() else false;
+        render.messageError(ctx.io, use_color, "file '{s}' included from '{s}' not found", .{ path, ctx.parent });
         return error.ConfigError;
     }
 }
@@ -230,7 +233,7 @@ pub fn load(allocator: std.mem.Allocator, env: ?*const std.process.Environ.Map, 
         const dir = envGet(env, "NIX_CONF_DIR") orelse "/etc/nix";
         const path = try std.fs.path.join(allocator, &.{ dir, "nix.conf" });
         defer allocator.free(path);
-        _ = try mergeFile(&settings, io, path, 0, false);
+        _ = try mergeFile(&settings, io, env, path, 0, false);
     }
 
     // 2. User config files (lowest priority first, so the highest wins last).
@@ -258,7 +261,7 @@ fn mergeUserConfig(allocator: std.mem.Allocator, settings: *Settings, io: std.Io
         var i = files.items.len;
         while (i > 0) {
             i -= 1;
-            _ = try mergeFile(settings, io, files.items[i], 0, true);
+            _ = try mergeFile(settings, io, env, files.items[i], 0, true);
         }
         return;
     }
@@ -283,7 +286,7 @@ fn mergeUserConfig(allocator: std.mem.Allocator, settings: *Settings, io: std.Io
         i -= 1;
         const path = try std.fs.path.join(allocator, &.{ dirs.items[i], "nix", "nix.conf" });
         defer allocator.free(path);
-        _ = try mergeFile(settings, io, path, 0, true);
+        _ = try mergeFile(settings, io, env, path, 0, true);
     }
 }
 

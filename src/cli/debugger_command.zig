@@ -7,6 +7,7 @@
 const std = @import("std");
 const engine = @import("expr");
 const runtime = @import("runtime");
+const render = @import("render.zig");
 
 const DebugSession = engine.DebugSession;
 
@@ -96,7 +97,7 @@ pub fn addBreakpoint(session: *DebugSession, writer: *std.Io.Writer, arg: []cons
         });
     };
     const result = session.setBreakpoint(target.file, target.line) catch |err| {
-        return writer.print("error: {s}", .{@errorName(err)});
+        return writer.print("error: {f}", .{render.friendly(err)});
     };
     try writer.print("breakpoint {d} {s}at {s}:{d}", .{
         result.id,
