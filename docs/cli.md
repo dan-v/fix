@@ -1,8 +1,12 @@
 # CLI
 
-*The command surface and the introspection tools that read the machine's mind.*
+*The command surface and the tools for inspecting evaluation.*
 
-The command surface lives in the `cli` module (`src/cli/root.zig`). User-facing entry points are grouped under `src/cli/commands/`; the module exposes them as `cli.commands`, while shared CLI infrastructure stays at the module root. It consumes `expr`, `runtime`, `syntax`, and `store` directly according to each command's needs. Commands import focused helpers: `presentation.zig` owns terminal policy and styling, `progress.zig` renders evaluation progress, and `realize.zig` owns the shared evaluation-to-build workflow. `src/main.zig` is composition only; it imports `cli`, sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar, and `src/cli/setup.zig` folds common `Options → Engine` configuration through `expr` and `store` types. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
+The `cli` module owns command parsing, presentation, progress, and the shared
+evaluation-to-realization workflow. Commands use the durable `expr`, `runtime`,
+`syntax`, and `store` modules directly; `src/main.zig` only composes the process
+and dispatches a required subcommand. `src/cli/args.zig` is the source of truth
+for the common option grammar.
 
 ## Invocation
 
@@ -50,15 +54,29 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` evaluate expressi
 
 **Commands** (`:?` shows this table in-repl): `:?`/`:help`, `:q`/`:quit`/`:exit`, `:l`/`:load PATH`, `:r`/`:reload`, `:t`/`:type EXPR`, `:p`/`:print EXPR` (deep-force), `:i`/`:inspect EXPR` (kind, thunk state + backing chunk, closure chunk/arity), `:debug`/`:d EXPR` (pause before forcing an expression), `:vm [COMMAND | EXPR]`, `:env`, `:gc`.
 
-**`:vm` — focus and explore VM state.** Every successful evaluation updates a stable focused chunk: a closure or bytecode thunk contributes its backing chunk; other values use the evaluation's entry chunk. `:vm EXPR` evaluates and focuses, plain `:vm` reopens the same focus even when no chunk was newly compiled (or opens the collapsed help workspace before the first evaluation), and `:vm chunk ID` focuses a registry id directly. `c`/`t`/`s`/`r` select the code, tables (constants, function arguments and positions, attr names/positions, captures, upvalues), syntax-highlighted source, or references panel instead of folding those sections into the disassembly document. At 140 columns and wider, the source selection appears beside bytecode, and wide screens allocate proportional space to tree/source instead of feeding all surplus width to disassembly. The sidebar contains collapsed HEAP and BYTECODE roots. BYTECODE groups source files by relative path component, then consolidates identical compiler-name siblings even when their append-only numeric IDs are disjoint. A name with one direct chunk and no children becomes a labeled leaf instead of a redundant one-item group. Closed nodes project only the focused chunk and its ancestors; large explicitly-open sets become recursively expandable range nodes. Ordinary long names are truncated in the middle; selected nodes and pinned ancestors use bounded, indented continuation lines. Opening references starts one compact asynchronous whole-registry graph build; page refreshes then use constant-time CSR slices instead of rescanning every chunk.
+**`:vm` — inspect the VM.** `:vm EXPR` evaluates and focuses the resulting
+chunk; plain `:vm` reopens that focus, and `:vm chunk ID` selects a registry
+chunk directly. The full-screen explorer exposes source, bytecode, chunk tables,
+references, and heap objects. Its trees are lazy and range-based, so large
+registries and heaps remain navigable.
 
-The code panel is an inspector, not static text: j/k or arrows visit instruction rows, Enter follows decoded `chunk[...]` and heap-object references, and `p` toggles a source breakpoint for the selected instruction (`●` marks one, `◆` marks the selected breakpoint). Heap targets open the existing lazy live-object explorer, whose object pages expose further object/chunk links; clearing uses the same `p` toggle. Breakpoint requests survive panel navigation and are reused when `:debug` or a persistent debugger is attached.
+The code panel follows chunk and heap references and can toggle a source
+breakpoint for the selected instruction. Heap views expose semantic fields and
+further references; breakpoint requests are shared with debugger sessions.
 
-At NixOS scale the display hierarchy is projected into compact CSR arrays off the compiler hot path; chunk IDs remain the stable fallback order within a canonical leaf. Registry growth triggers a background rebuild while the current generation remains usable; a completed generation swaps in from the UI thread before the next evaluation mutates the registry. The heap tree's store reservation counts are constant-time; its object-variant/thunk-state census and one-bit-per-object live index are separate asynchronous jobs. The OBJECTS node starts collapsed and uses recursively tiered 64-way ranges, so millions of IDs never become millions of rows. Object pages expose semantic fields and actionable object/chunk references without borrowing mutable heap storage. Closed object ranges, like closed name nodes, retain only the selected object and its ancestor breadcrumbs. The transcript retains only its newest 4 MiB and indexes at most 2,000 trailing lines, so printing or compiling millions of objects does not make the terminal surface grow without bound.
+Explorer indexes and censuses run off the evaluation path. Large stores are
+presented as expandable ranges, and the transcript is bounded, so inspecting a
+large evaluation does not require materializing every object or line at once.
 
-Inline mode exposes the same model with fixed-size, composable queries. `:vm ls [@NAME] [LIMIT]`, `:vm chunks [@NAME] [LIMIT]`, and `:vm find TEXT [LIMIT]` browse and search bytecode names. `:vm chunk ID` prints the full tables/disassembly plus equivalent chunks and its cheap direct references; `:vm spans [ID] [START] [LIMIT]` enumerates source subexpressions and executable offsets. `:vm heap` prints the aggregate census, while `:vm store NAME [START] [LIMIT]` and `:vm record NAME ID` cover every explorer store (`objects`, `values`, `attrs`, `attr-positions`, `intern`, and `builtin`). `:vm object ID [LIMIT]` includes bounded container members and references, and the explicit `:vm refs (chunk|object) ID [LIMIT]` builds the whole graph to query incoming and outgoing edges. `:vm break-at CHUNK OFFSET`, `:vm clear-at CHUNK OFFSET`, `:vm breakpoints`, and `:vm delete N` expose the explorer's instruction/source-span breakpoint controls. Listings default to 40 rows with a hard maximum of 1,000; object members use the requested bound. Every identifier printed by one query is accepted by the follow-up queries, including canonical forms such as `chunk[0x2a]`.
+Inline mode provides the same model through bounded queries: `:vm ls`,
+`:vm chunks`, and `:vm find` browse bytecode; `:vm chunk`, `:vm spans`,
+`:vm heap`, `:vm store`, `:vm record`, `:vm object`, and `:vm refs` inspect
+specific records and relationships. `:vm break-at`, `:vm clear-at`,
+`:vm breakpoints`, and `:vm delete` manage instruction and source breakpoints.
+Listings default to 40 rows and accept at most 1,000.
 
-The explorer describes semantic content and behavior rather than emitting terminal protocol itself. `base/tui.zig` owns alternate-screen lifecycle, cursor placement, ANSI-aware clipped cells, full-width bars/dividers, and semantic color roles quantized through the shared terminal-color model. This keeps terminal mechanics reusable while leaving explorer layout and interaction policy local to the VM workspace.
+The explorer owns its layout and interaction policy; the shared terminal layer
+owns alternate-screen lifecycle, clipping, and color rendering.
 
 ## The debugger
 
@@ -115,19 +133,14 @@ in an ordinary REPL enables the scheduler's debug-serial gate instead.
 
 One honest caveat: this is a **lazy** language, so stepping follows *demand* order, not source order. Stepping "over" a line whose value is a thunk lands wherever that thunk is actually forced — often a different binding or file — and a value already forced (memoised) is skipped. `step` into a call typically lands in the argument thunk first (Nix forces arguments on demand). Stepping is most intuitive as "step into this call and see where evaluation goes next," less so as classic line-by-line imperative stepping. Results are always preserved — a step patch chains to the original opcode. Imports execute in fresh nested VMs, but those VMs retain a debugger-parent link, so `bt`, `next`, and `finish` see one logical stack across the import boundary.
 
-**Source locations.** A frame's `ip` is resolved with `disasm.frameSpan` — the narrowest covering source span, but with an *inclusive* end and a `body_span` fallback. The inclusive end matters for a caller frame, whose `ip` points *past* the call it's suspended on (exactly at the covering span's exclusive end); plain `bestSpan` (used by `fix disasm` for the instruction about to execute) would miss it and the frame would show no location. This is why a backtrace reads `f.nix:11:8 f ← 13:42 ← 13:3` rather than blank caller lines.
+**Source locations.** The debugger maps each frame to its narrowest source span,
+including callers suspended just after a call, so backtraces retain useful source
+locations across call boundaries.
 
-**Architecture.** The engine exposes a neutral break seam so the layering stays
-down-only: `vm.BreakSink` on the VM (null in normal runs, where
-`builtins.break` acts as identity), the `breakpoint` opcode +
-`bytecode.BreakpointTable` (patch/restore, with new chunks patched by the
-evaluator's `chunkRegistered` callback), an `expr.DebugSession` view over the
-paused VM (backtrace, scope, evaluate-in-place, value rendering, frame
-disassembly, breakpoint set/list/delete, stepping), and `Engine.setDebugUi`.
-The `cli` layer supplies either the console (`src/cli/debugger.zig`) or the
-integrated VM screen (`src/cli/repl/vm/`) through that view. Both share
-`debugger_command.zig`; the console and non-TUI REPL additionally share the
-bounded query implementation in `src/cli/repl/vm/plain.zig`.
+**Architecture.** The expression engine exposes a debugger view over a paused
+VM and keeps registry bytecode immutable by applying breakpoints through a
+private overlay. The CLI supplies either a console or the integrated VM screen
+through that view; both use the same command language.
 
 ## Key flags
 

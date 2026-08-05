@@ -9,7 +9,8 @@ This is a **differential** suite, separate from `zig build test`. The runner
 discovers the pinned corpora and attempts each discovered case. A divergence,
 an unsupported case, or an unrecognised custom test directory is a `FAIL`, and
 any failure makes the command exit non-zero. There is no known-failures list.
-`fix` currently passes both pinned suites.
+The runner reports every attempted case, so the command output is the source of
+truth for a pin's conformance status.
 
 ## Running
 

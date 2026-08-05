@@ -1,15 +1,12 @@
 # GC
 
-*A non-moving, precise, generational collector. It is part of every supported
-build and runs at all worker counts. Reclaim tracking is armed lazily at the
-first `armLineBytes` safepoint (normally budget/4, with a 512 MiB floor and a
-budget/2 cap), so smaller evaluations avoid young tracking,
-barriers, and free-list probes.*
+*A non-moving, precise, generational collector. It runs at every worker count.
+Tracking starts lazily, so evaluations below the arming threshold avoid its
+barriers and free-list work.*
 
-**Why a collector at all.** Without reclamation, the stores track *total*
-allocation rather than the live set. The collector lets later allocations
-reuse storage belonging to unreachable objects; current cost measurements
-belong in [perf/model](perf/model.md).
+Without reclamation, heap storage grows with total allocation rather than the
+live set. Collection returns unreachable storage to later allocations. Its
+measured cost belongs in [perf/model](perf/model.md).
 
 ## Memory budget (the collection policy)
 
@@ -17,7 +14,12 @@ One number decides when the collector runs: a threshold over heap-reserved
 bytes.
 
 - Resolution order: `--gc-budget=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemTotal**, clamped by defaults of 256 MiB–32 GiB (fallback: half of an assumed 4 GiB). `FIX_GC_FLOOR` and `FIX_GC_CEILING` override those bounds with the same size syntax. The budget covers the evaluator heap stores, not total process RSS; side allocations such as chunks, interned strings, and thread stacks sit outside it. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
-- **Lazy arming**: below `armLineBytes(budget)` the heap only compares its reserved-bytes cursor against the threshold once per TLAB refill — no young-slot tracking, no write barrier, no free-list probes. The first crossing runs an arming stop-the-world safepoint (`armLazy`): everything allocated so far becomes untracked/old (the unreclaimable prefix), and real collections start at the full budget, re-armed to `max(budget, reserved + clamp(budget/8, 64MB, 1GB))` after each. The arm line is `min(max(budget/4, 512 MiB), budget/2)`.
+- **Lazy arming**: below `armLineBytes(budget)`, the heap checks its reservation
+  cursor only at TLAB refill. The first crossing stops workers, classifies the
+  existing allocation as old, and enables young-object tracking, write barriers,
+  and free lists. The arm line is
+  `min(max(budget/4, 512 MiB), budget/2)`; later thresholds are at least the
+  budget and advance with reservation growth.
 - Consequence: evaluations below the arming threshold do not collect, while
   constrained budgets begin reclamation once reservations cross the configured
   threshold.
@@ -80,10 +82,15 @@ Root set (all must be enumerated — precise):
 ## Sweep (reclaim)
 
 - Processing each young object: **marked ⇒ survivor**, promoted in place (`gcSetOld`, id unchanged, ranges stay put); **unmarked ⇒ dead**, its store ranges returned to the free lists in place and its slot id recycled.
-- **Worker-local caches with shared overflow** in the [heap](runtime/heap.md) (`HeapLocal.gc_free_objects` for slot ids; `gc_free_values` / `gc_free_attrs` / `gc_free_attr_pos` are range lists keyed by length). Minor sweep first returns dead storage to its allocation worker even when a different helper processes that worker's young list. At the stop-the-world boundary, unused slots and ranges move to shared overflow. Mutators refill object ids 4096 at a time and compatible range classes 256 at a time, so cross-worker reuse needs one lock per batch rather than the old lock and peer probes on every allocation. A range refill claims and returns one concrete best-fit entry while the central list is locked, and moves only the rest of that worker's fair share into its local cache; allocation never relies on a later pop merely because a transfer reported success. Consecutive adjacent ranges are coalesced as sweep streams them back, without allocating per-range address metadata. TLAB suffixes that cannot fit the next request and unused worst-case merge capacity are returned explicitly because no owner exists for sweep to find. Allocation takes exact range matches first, otherwise uses a non-empty-class best-fit index and splits the smallest suitable range; slot ids are LIFO.
+- **Worker-local caches with shared overflow** reduce allocation-path
+  contention. Sweep returns dead slots and ranges to the allocation worker's
+  local cache; unused entries move to shared overflow at the stop-the-world
+  boundary. Refill and range allocation use bounded batches, coalescing and
+  splitting ranges as needed. Slot ids are LIFO.
 - Spilled bytecode/deferred-thunk captures record their value-store range. An unresolved dead thunk returns that range during sweep; a forced thunk returns it immediately after its evaluation frame unwinds and just before publishing its result or sticky error. Transient failures keep the range for retry. Closure frames record and root the heap closure that owns their raw upvalue slice, so a live executing closure keeps its captures while dead closures return their value-store ranges during sweep.
 - Non-moving: no compaction pass, so scattered death can leave fragmentation.
-- A major sweeps every allocated object slot rather than the young lists, then tenures every survivor and clears the remembered set. It also rebuilds each store's fragmented free ranges from a bitmap and releases the now-empty vectors for obsolete range-length classes, preventing historical class distributions from retaining allocator capacity indefinitely. The full sweep is currently serial.
+- A major sweeps every allocated object slot, tenures survivors, clears the
+  remembered set, and rebuilds fragmented free ranges. Major sweep is serial.
 
 ## Safepoints
 
@@ -107,14 +114,14 @@ At `--workers=1` a minor is serial on the lone mutator. At `--workers>1` every l
 - **Parallel major mark** — the same parked peers drain a non-young-gated full mark, then remain parked while the collector performs the full sweep serially.
 - Evaluation still runs `worker_count`-wide; collection participation is capped. Peers over the cap remain parked.
 
-## Status
+## Cost and limits
 
-| Mode | State |
-|------|-------|
-| w=1 | Minor and major collection are enabled; detector builds validate reads and mark closure. |
-| w>1 | Minor mark/sweep and major mark run across parked peers; major sweep is serial and free lists are per-worker sharded. |
-
-**Cost model:** force-chain and temporary-root maintenance must stay complete across the arming boundary. Once collection is active, minor pauses consist of survivor marking and young-list sweep; a less-frequent major adds a full-heap sweep. Frequency is budget-driven. Non-moving fragmentation limits how much storage can be returned directly to the OS.
+Minor collections mark and sweep young objects; less-frequent major collections
+also sweep the old generation. With multiple workers, parked peers help mark
+and perform minor sweep, while major sweep remains serial. Force-chain and
+temporary-root maintenance must remain complete across the arming boundary.
+Non-moving allocation can leave fragmentation, so releasing storage does not
+necessarily reduce process memory immediately.
 
 ## Correctness tooling
 

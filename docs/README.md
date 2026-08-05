@@ -1,10 +1,11 @@
-# `fix` developer docs
+# `fix` developer documentation
 
-*A parallel evaluator for the Nix expression language, in Zig. These docs describe the system you're about to modify.*
+*A parallel evaluator for the Nix expression language, in Zig.*
 
 `fix` parses and evaluates Nix expressions to values and derivations. It targets
 the same derivation text and store paths as `nix-instantiate`, and can schedule
-thunk evaluation across a pool of worker threads.
+thunk evaluation across worker threads. The pages introduce the system before
+describing the invariants that changes must preserve.
 
 **Start with [architecture](architecture.md)** for the whole system in one pass and the recommended reading order, then [invariants](invariants.md) for the cross-cutting rules every change must respect.
 
@@ -65,7 +66,9 @@ thunk evaluation across a pool of worker threads.
 
 ## Conventions
 
-- Docs describe **the system** — mechanisms, data flow, invariants, and the *why* — not the text of specific `.zig` files. Subsystem docs include a `Code:` pointer to their implementation area.
+- Docs describe **the system** — mechanisms, data flow, invariants, and the
+  reason each exists — rather than narrating edits or refactors. Subsystem docs
+  finish with a `Code:` pointer to the relevant implementation area.
 - The interpreter is the execution engine. Collection and diagnostic probes
   must not change language results. Derivation text and store paths are covered
   by focused tests and differential workload checks.

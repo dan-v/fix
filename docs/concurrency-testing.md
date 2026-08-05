@@ -36,6 +36,6 @@ ReleaseFast stress on x86_64/aarch64 Linux plus a seeded TSan stress pass.
 The scheduled workflow also evaluates the real-world bench fixtures at
 `--workers 8` as a parallel-eval differential against reference Nix — under
 TSan on x86_64, and on aarch64 as the only weak-memory coverage of a real
-eval (TSan on x86 cannot see ordering bugs that TSO hides). This lane exists
-because the synthetic stress workloads cannot reproduce the module-fixpoint
-shapes where real races have surfaced; it caught two on its first run.
+evaluation (TSan on x86 cannot expose ordering bugs that TSO hides). This lane
+complements synthetic stress workloads, which do not reproduce every
+module-fixpoint shape.

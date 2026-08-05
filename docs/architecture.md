@@ -71,39 +71,30 @@ src/main.zig       → cli, process_support
                 Process composition; executable `fix`.
 ```
 
-`base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and the runtime supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
+`base` is independent of evaluator-specific policy. For example, its virtual
+memory accounting is generic over the caller's tag type; the runtime supplies
+the evaluator's memory categories.
 
-Within `expr` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler/context.zig` and `vm/context.zig` own state, their sibling drivers own recursive dispatch, and `evaluator.zig` composes those services into `Engine`. Construction takes one borrowed `EngineConfig` value. Engine helper files receive narrow state or execution capabilities at real ownership boundaries; callers use concrete Engine operations instead of whole-object forwarding views. `eval/workers/` owns the scheduler, fiber workers, fiber-scoped context, and capabilities for parking futures and blocking work away from compute workers; queue mechanics live below scheduler policy in `eval/workers/scheduler/`. The VM borrows worker capabilities without owning worker machinery. `store/realization/daemon_execution.zig` defines the store-facing executor capability, while `expr/eval/workers/daemon_executor.zig` supplies its fiber implementation. The CLI consumes `expr`, `runtime`, `syntax`, and `store` directly instead of routing them through an umbrella module. Deferred-body compilation calls from `vm` into `compiler`, while import orchestration and synthetic corepkgs sources remain engine-owned and `eval/imports.zig` owns only the concurrent registry/entry state. See [build](build.md).
-
-Callbacks mark real ownership, policy, or execution-domain changes: CLI debugger/progress/build sinks, heap/scheduler GC dispatch, fiber wakeups, blocking execution, and leaf policies such as NAR filters. File extraction alone is not a boundary. Engine helper files therefore receive concrete state views (for example debugger `Context`) or remain engine-owned instead of back-calling through opaque “host” bundles. Concurrent progress `Span` handles retain the sink that created them, so a sink replacement cannot misroute an in-flight token.
-
-The VM explorer is one private UI state machine split into focused implementation
-modules. Calls within a module are direct; `Explorer.Ops.<subsystem>` spelling is
-reserved for cross-subsystem coordination and import-cycle breaking. The
-registry is deliberately not presented as a capability boundary.
+Within `expr`, the compiler and VM own their execution state, and
+`evaluator.zig` composes them into `Engine`. `eval/workers/` owns scheduling,
+fibers, and the capabilities that park work or send blocking work away from
+compute threads. The VM uses those capabilities but does not own worker state.
+The store exposes a narrow executor capability, implemented by the evaluator's
+fiber workers, so store operations do not depend on evaluator internals. The
+CLI consumes the module groups it needs directly. See [build](build.md) for the
+enforced module graph.
 
 ## Ownership and state changes
 
-Ownership is represented in types, not parallel flags. Text that may be
-borrowed or heap-owned uses `base.TextRef`; `deinit` consumes a pointer and frees
-only the `.owned` case. Owned configuration replacement is transactional:
-allocate/parse the replacement first, then swap it into live state and release
-the old value. A failed update therefore leaves the previous configuration
-intact.
+Ownership is explicit in the data model. `base.TextRef` distinguishes borrowed
+from owned text; only the owned form is freed. Replacing owned configuration is
+transactional: prepare the replacement, then swap it into the live state.
 
-Long-lived mutable owners are kept few and explicit (`Engine`, `FetchService`,
-`ObjectHeap`, `Scheduler`). `ObjectHeap` alone owns its segmented stores and
-immutable failure store; evaluator and CLI code use counts, snapshots, and
-semantic failure operations. Read-only heap projection types, object summaries,
-post-evaluation censuses, and probe reporting live in `runtime/heap/inspection.zig`,
-separate from allocation and collection. Their inputs and intermediate decisions are values:
-`EngineConfig`/`FetchConfig`, parsed source units, `LetPlan` (and the
-[let-float](compiler/let-float.md) immutable `Graph` plus rewrite `Plan` it consumes),
-derivation artifacts, and validated REPL command invocations. Orchestrators sequence those
-values through named phases; mechanisms such as heap range reuse, inspection
-projections, scheduler queues, and CLI option application live in focused
-subdirectories. This preserves mutation where identity or concurrency requires
-it without making mutation the default modeling tool.
+Long-lived mutable state has clear owners: `Engine`, `FetchService`,
+`ObjectHeap`, and `Scheduler`. The heap owns its segmented stores and failure
+records; other layers use its semantic operations and read-only projections.
+Parsed units, compilation plans, derivation artifacts, and validated REPL
+commands are values passed between phases rather than additional shared owners.
 
 ## Laziness and parallelism are one primitive
 
