@@ -91,6 +91,7 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
     // alloc + one copy compared to the staged-then-flush pattern.
     const cap: u32 = @intCast(left_len + right_len);
     const reserved = try self.heap.reserveAttrsForMerge(cap);
+    errdefer self.heap.abortMergedAttrs(reserved);
     const dst = self.heap.attrsMutSlice(reserved);
 
     var out: usize = 0;

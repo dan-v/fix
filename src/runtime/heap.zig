@@ -218,6 +218,12 @@ pub const PendingObjectSlot = struct {
     reused: bool,
 };
 
+/// Worst-case attr storage filled by a merge before its final length is
+/// known. The token must be published or aborted exactly once.
+pub const PendingAttrs = struct {
+    range: AttrRange,
+};
+
 const BuiltinClosureObject = struct {
     builtin_id: u16,
     args: ValueRange,
@@ -1622,20 +1628,13 @@ pub const ObjectHeap = struct {
 
     const gc_range_refill_batch: usize = 256;
 
-    /// Reuse a worker-owned freed range of at least `n` slots from the
-    /// `range_stores[si]` store. An exact match wins; otherwise the list
-    /// splits a larger range. On a local miss, refill one compatible size
-    /// class from the central overflow in bulk. The fast path remains
-    /// lock-free, while no worker can strand an entire shard of ranges that
-    /// another worker needs.
-    fn gcReuseRange(self: *ObjectHeap, local: *HeapLocal, comptime si: usize, n: u32) ?RangeFreeList.Loc {
+    /// Refill from the central range overflow after the caller has checked its
+    /// worker-local list. The fast path remains lock-free, while no worker can
+    /// strand an entire shard of ranges that another worker needs.
+    fn gcReuseSharedRange(self: *ObjectHeap, local: *HeapLocal, comptime si: usize, n: u32) ?RangeFreeList.Loc {
         const store_index = si;
         const field = range_stores[si].free;
         const shared_field = range_stores[si].shared;
-        if (@field(local, field).pop(self.allocator, n)) |hit| {
-            if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
-            return hit.loc;
-        }
         if (n > self.gc_shared_free_range_max[store_index].load(.acquire)) {
             if (n > 0) {
                 local.range_reuse_miss[store_index] += 1;
@@ -1902,9 +1901,20 @@ pub const ObjectHeap = struct {
     /// across forces), else bump the worker TLAB.
     inline fn reserveStoreLocal(self: *ObjectHeap, comptime si: usize, n: u32) !range_stores[si].Store.Range {
         const row = range_stores[si];
+        if (n == 0) return .{ .segment = 0, .offset = 0, .len = 0 };
         const local = self.currentLocal();
+        const free_list = &@field(local, row.free);
         if (self.collection.collect_enabled) {
-            if (self.gcReuseRange(local, si, n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            if (free_list.pop(self.allocator, n)) |hit| {
+                if (hit.split) local.range_reuse_split[si] += 1 else local.range_reuse_exact[si] += 1;
+                return .{ .segment = hit.loc.segment, .offset = hit.loc.offset, .len = n };
+            }
+            if (self.gcReuseSharedRange(local, si, n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+        } else if (free_list.maxLen() >= n) {
+            // Aborted construction ranges can exist before collection is
+            // armed. Reuse them locally without entering the GC shared pool.
+            if (free_list.pop(self.allocator, n)) |hit|
+                return .{ .segment = hit.loc.segment, .offset = hit.loc.offset, .len = n };
         }
         return self.reserveRangeLocal(
             row.Store,
@@ -1917,6 +1927,44 @@ pub const ObjectHeap = struct {
         );
     }
 
+    /// Release an unpublished side-store reservation. The worker TLAB is the
+    /// common path and rewinds without synchronization. Oversized or reused
+    /// ranges first attempt a concurrency-safe global-tail rewind; if another
+    /// writer has advanced the store, retain the range in the worker's local
+    /// pool so it remains visible to snapshots and reusable before GC.
+    inline fn releaseStoreRange(
+        self: *ObjectHeap,
+        comptime si: usize,
+        range: range_stores[si].Store.Range,
+    ) void {
+        if (range.len == 0) return;
+        const row = range_stores[si];
+        const local = self.currentLocal();
+        const chunk = &@field(local, row.chunk);
+        if (chunk.segment == range.segment and chunk.cursor == range.offset + range.len) {
+            chunk.cursor = range.offset;
+            return;
+        }
+        if (@field(self, row.store).rollback(range)) return;
+        @field(local, row.free).push(self.allocator, range.segment, range.offset, range.len);
+    }
+
+    fn releaseValues(self: *ObjectHeap, range: ValueRange) void {
+        self.releaseStoreRange(comptime rangeStoreIndex("values"), range);
+    }
+
+    fn releaseAttrs(self: *ObjectHeap, range: AttrRange) void {
+        self.releaseStoreRange(comptime rangeStoreIndex("attrs"), range);
+    }
+
+    fn releaseAttrPositions(self: *ObjectHeap, range: AttrPosRange) void {
+        self.releaseStoreRange(comptime rangeStoreIndex("attr_pos"), range);
+    }
+
+    fn releaseBytes(self: *ObjectHeap, range: ByteRange) void {
+        self.releaseStoreRange(comptime rangeStoreIndex("bytes"), range);
+    }
+
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
         return self.reserveStoreLocal(comptime rangeStoreIndex("values"), n);
     }
@@ -1926,25 +1974,33 @@ pub const ObjectHeap = struct {
     /// publishes the final entry count with `publishMergedAttrs`. Used
     /// by attr-set merge primitives to skip a per-merge ArrayList +
     /// extra copy.
-    pub fn reserveAttrsForMerge(self: *ObjectHeap, n: u32) !AttrRange {
-        return self.reserveAttrsLocal(n);
+    pub fn reserveAttrsForMerge(self: *ObjectHeap, n: u32) !PendingAttrs {
+        return .{ .range = try self.reserveAttrsLocal(n) };
     }
 
-    pub fn attrsMutSlice(self: *ObjectHeap, range: AttrRange) []AttrEntry {
-        return self.attrs.sliceMut(range);
+    pub fn attrsMutSlice(self: *ObjectHeap, pending: PendingAttrs) []AttrEntry {
+        return self.attrs.sliceMut(pending.range);
+    }
+
+    pub fn abortMergedAttrs(self: *ObjectHeap, pending: PendingAttrs) void {
+        self.releaseAttrs(pending.range);
     }
 
     /// Commit a partially-filled reservation as a new attrs object. Return the
     /// unused suffix immediately: it has no owner for sweep to find later.
-    pub fn publishMergedAttrs(self: *ObjectHeap, range: AttrRange, actual: u32) !ObjectId {
-        self.releaseAttrsTail(range, actual);
-        if (actual == 0) if (self.empty_attrs_id) |id| return id;
+    pub fn publishMergedAttrs(self: *ObjectHeap, pending: PendingAttrs, actual: u32) !ObjectId {
+        const object = try self.beginObjectSlot();
+        self.releaseAttrsTail(pending.range, actual);
+        if (actual == 0) if (self.empty_attrs_id) |id| {
+            self.abortObjectSlot(object);
+            return id;
+        };
         const trimmed: AttrRange = .{
-            .segment = range.segment,
-            .offset = range.offset,
+            .segment = pending.range.segment,
+            .offset = pending.range.offset,
             .len = actual,
         };
-        return self.add(.{ .attrs = .{ .range = trimmed } });
+        return self.commitObjectSlot(object, .{ .attrs = .{ .range = trimmed } });
     }
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
@@ -1958,13 +2014,11 @@ pub const ObjectHeap = struct {
     fn releaseAttrsTail(self: *ObjectHeap, range: AttrRange, actual: u32) void {
         std.debug.assert(actual <= range.len);
         if (actual == range.len) return;
-        if (!self.collection.collect_enabled and !self.collection.root_active) return;
-        self.currentLocal().gc_free_attrs.push(
-            self.allocator,
-            range.segment,
-            range.offset + actual,
-            range.len - actual,
-        );
+        self.releaseAttrs(.{
+            .segment = range.segment,
+            .offset = range.offset + actual,
+            .len = range.len - actual,
+        });
     }
 
     /// Threshold hook: once reserved bytes cross `collection.threshold_bytes`, request a
@@ -2779,6 +2833,7 @@ pub const ObjectHeap = struct {
         const pending = try self.beginObjectSlot();
         errdefer self.abortObjectSlot(pending);
         const range = try self.reserveValuesLocal(@intCast(total));
+        errdefer self.releaseValues(range);
         const dst = self.values.sliceMut(range);
         var out: usize = 0;
         for (lists) |list| {
@@ -2818,6 +2873,7 @@ pub const ObjectHeap = struct {
     /// containing slot's id.
     pub fn prepareAttrsRange(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
         const range = try self.appendAttrEntries(entries);
+        errdefer self.releaseAttrs(range);
         try self.sortAndDedupAttrs(range);
         return range;
     }
@@ -2832,11 +2888,11 @@ pub const ObjectHeap = struct {
         const pending = try self.beginObjectSlot();
         errdefer self.abortObjectSlot(pending);
         const range = try self.appendAttrEntries(entries);
-        errdefer self.attrs.rollback(range);
+        errdefer self.releaseAttrs(range);
         try self.sortAndDedupAttrs(range);
 
         const pos_range = try self.appendAttrPositions(positions);
-        errdefer self.attr_positions.rollback(pos_range);
+        errdefer self.releaseAttrPositions(pos_range);
         self.sortAttrPositions(pos_range);
         return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
@@ -2845,7 +2901,7 @@ pub const ObjectHeap = struct {
         const pending = try self.beginObjectSlot();
         errdefer self.abortObjectSlot(pending);
         const range = try self.appendAttrEntries(context);
-        errdefer self.attrs.rollback(range);
+        errdefer self.releaseAttrs(range);
         try self.sortAndDedupAttrs(range);
         return self.commitObjectSlot(pending, .{ .context_string = .{ .text = text, .context = range } });
     }
@@ -2865,6 +2921,7 @@ pub const ObjectHeap = struct {
         // duplicate names is returned to the range free list below.
         const cap: u32 = @intCast(left.len + right.len);
         const reserved = try self.reserveAttrsLocal(cap);
+        errdefer self.releaseAttrs(reserved);
         const dst = self.attrs.sliceMut(reserved);
 
         var out: usize = 0;
@@ -2900,7 +2957,7 @@ pub const ObjectHeap = struct {
         }
 
         const positions = try self.mergeAttrPositions(left_id, right_id, right);
-        errdefer if (positions.len != 0) self.attr_positions.rollback(positions);
+        errdefer self.releaseAttrPositions(positions);
 
         const range: AttrRange = .{
             .segment = reserved.segment,
@@ -2981,6 +3038,7 @@ pub const ObjectHeap = struct {
         const pending = try self.beginObjectSlot();
         errdefer self.abortObjectSlot(pending);
         const range = try self.reserveAttrsLocal(count);
+        errdefer self.releaseAttrs(range);
         const entries = self.attrs.sliceMut(range);
 
         var i: usize = 0;
@@ -3007,7 +3065,7 @@ pub const ObjectHeap = struct {
         // runtime sort needed (findAttrPos binary-searches by name).
         std.debug.assert(positionsSortedByName(positions));
         const pos_range = try self.appendAttrPositions(positions);
-        errdefer self.attr_positions.rollback(pos_range);
+        errdefer self.releaseAttrPositions(pos_range);
         return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
 
@@ -3192,7 +3250,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn rollbackBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) void {
-        self.values.rollback(pending.range);
+        self.releaseValues(pending.range);
         self.abortObjectSlot(pending.object);
     }
 
@@ -3342,15 +3400,22 @@ pub const ObjectHeap = struct {
     }
 
     /// `publishMergedAttrs` with a position table attached.
-    pub fn publishMergedAttrsWithPositions(self: *ObjectHeap, range: AttrRange, actual: u32, positions: AttrPosRange) !ObjectId {
-        self.releaseAttrsTail(range, actual);
-        if (actual == 0 and positions.len == 0) if (self.empty_attrs_id) |id| return id;
+    pub fn publishMergedAttrsWithPositions(self: *ObjectHeap, pending: PendingAttrs, actual: u32, positions: AttrPosRange) !ObjectId {
+        const object = self.beginObjectSlot() catch |err| {
+            self.releaseAttrPositions(positions);
+            return err;
+        };
+        self.releaseAttrsTail(pending.range, actual);
+        if (actual == 0 and positions.len == 0) if (self.empty_attrs_id) |id| {
+            self.abortObjectSlot(object);
+            return id;
+        };
         const trimmed: AttrRange = .{
-            .segment = range.segment,
-            .offset = range.offset,
+            .segment = pending.range.segment,
+            .offset = pending.range.offset,
             .len = actual,
         };
-        return self.add(.{ .attrs = .{ .range = trimmed, .positions = AttrPositions.fromRange(positions) } });
+        return self.commitObjectSlot(object, .{ .attrs = .{ .range = trimmed, .positions = AttrPositions.fromRange(positions) } });
     }
 
     /// Borrow an attrset's source-position entries (empty slice when it

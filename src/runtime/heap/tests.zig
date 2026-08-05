@@ -243,12 +243,63 @@ test "object heap rejects duplicate attrs" {
         .{ .name = 10, .value = Value.int(3) },
     }));
 
+    var objects_after_error = try heap.objectSnapshot(std.testing.allocator);
+    defer objects_after_error.deinit();
+    var attrs_after_error = try heap.attrSnapshot(std.testing.allocator);
+    defer attrs_after_error.deinit();
+    try std.testing.expectEqual(@as(u32, 0), objects_after_error.live_count);
+    try std.testing.expectEqual(@as(u32, 0), attrs_after_error.live_count);
+
     // Subsequent non-duplicate adds still work.
     const attrs_id = try heap.addAttrs(&.{
         .{ .name = 10, .value = Value.int(1) },
         .{ .name = 20, .value = Value.int(2) },
     });
     try std.testing.expectEqual(@as(i64, 1), (try heap.getAttrValue(attrs_id, 10)).asInt());
+}
+
+test "multi-store attr construction rolls back when positions allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var heap = try ObjectHeap.init(failing.allocator(), 1);
+    defer heap.deinit();
+
+    // Prewarm object and attr TLABs; the first attr-position segment remains
+    // the next allocation point.
+    _ = try heap.addAttrs(&.{.{ .name = 1, .value = Value.int(1) }});
+    var before_objects = try heap.objectSnapshot(std.testing.allocator);
+    defer before_objects.deinit();
+    var before_attrs = try heap.attrSnapshot(std.testing.allocator);
+    defer before_attrs.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, heap.addAttrsWithPositions(
+        &.{.{ .name = 2, .value = Value.int(2) }},
+        &.{.{ .name = 2, .pos = .{ .file = 3, .line = 4, .column = 5 } }},
+    ));
+    var after_objects = try heap.objectSnapshot(std.testing.allocator);
+    defer after_objects.deinit();
+    var after_attrs = try heap.attrSnapshot(std.testing.allocator);
+    defer after_attrs.deinit();
+    try std.testing.expectEqual(before_objects.live_count, after_objects.live_count);
+    try std.testing.expectEqual(before_attrs.live_count, after_attrs.live_count);
+
+    failing.fail_index = std.math.maxInt(usize);
+    _ = try heap.addAttrsWithPositions(
+        &.{.{ .name = 2, .value = Value.int(2) }},
+        &.{.{ .name = 2, .pos = .{ .file = 3, .line = 4, .column = 5 } }},
+    );
+}
+
+test "pending attr merges return storage before collection is armed" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const first = try heap.reserveAttrsForMerge(7);
+    heap.abortMergedAttrs(first);
+    const second = try heap.reserveAttrsForMerge(7);
+    defer heap.abortMergedAttrs(second);
+    try std.testing.expectEqual(first.range.segment, second.range.segment);
+    try std.testing.expectEqual(first.range.offset, second.range.offset);
 }
 
 test "object heap preserves earlier ranges as side arenas grow" {

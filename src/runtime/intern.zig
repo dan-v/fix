@@ -248,7 +248,7 @@ pub const InternTable = struct {
             // Every writer to these two stores holds commit_mu, so another
             // shard cannot move the tail between this reservation and a
             // failed entry append.
-            errdefer self.data.rollback(data_range);
+            errdefer std.debug.assert(self.data.rollback(data_range));
             const entry: Entry = .{
                 .segment = data_range.segment,
                 .offset = data_range.offset,

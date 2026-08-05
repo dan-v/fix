@@ -1295,6 +1295,7 @@ test "partially filled attr reservation returns its unowned tail" {
     heap_collector.enableCollect(&heap, 64 << 20, 0);
 
     const reserved = try heap.reserveAttrsForMerge(7);
+    errdefer heap.abortMergedAttrs(reserved);
     const dst = heap.attrsMutSlice(reserved);
     dst[0] = .{ .name = 1, .value = Value.int(1) };
     dst[1] = .{ .name = 2, .value = Value.int(2) };
@@ -1311,8 +1312,8 @@ test "partially filled attr reservation returns its unowned tail" {
         .attrs => |attrs| attrs.range,
         else => unreachable,
     };
-    try std.testing.expectEqual(reserved.segment, tail_range.segment);
-    try std.testing.expectEqual(reserved.offset + 2, tail_range.offset);
+    try std.testing.expectEqual(reserved.range.segment, tail_range.segment);
+    try std.testing.expectEqual(reserved.range.offset + 2, tail_range.offset);
 }
 
 test "range TLAB refill returns the abandoned tail" {

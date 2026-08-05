@@ -306,11 +306,12 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             }
         }
 
-        /// Rollback the most recently reserved range. UB if `range` is not the
-        /// tail of allocations — call sites should `errdefer` immediately
-        /// after a reserve.
-        pub fn rollback(self: *Self, range: Range) void {
-            if (range.len == 0) return;
+        /// Try to rewind the most recently reserved range. Returns false when
+        /// another writer has advanced the cursor; callers that own a higher-
+        /// level free list can then retain the range for reuse instead of
+        /// silently stranding it.
+        pub fn rollback(self: *Self, range: Range) bool {
+            if (range.len == 0) return true;
             self.write_mu.lock();
             defer self.write_mu.unlock();
             const cur = self.cursor.load(.monotonic);
@@ -318,10 +319,9 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             const used = usedOf(cur);
             if (seg == range.segment and used == range.offset + range.len) {
                 self.cursor.store(packCursor(seg, range.offset), .release);
+                return true;
             }
-            // Not the tail — leave the slots stranded. They're unused, will
-            // be overwritten only on the next reservation if it lands there
-            // (it won't, since `used` already moved past).
+            return false;
         }
 
         pub fn slice(self: *const Self, range: Range) []const T {
@@ -861,7 +861,7 @@ test "stable segments: rollback within current segment" {
     seg.sliceMut(r)[0] = 0xDEAD;
     try std.testing.expectEqual(@as(u32, 5), seg.count());
 
-    seg.rollback(r);
+    try std.testing.expect(seg.rollback(r));
     try std.testing.expectEqual(@as(u32, 2), seg.count());
 
     const id3 = try seg.append(allocator, 99);
@@ -881,10 +881,21 @@ test "stable segments: rollback after segment-skip leaves earlier slots stranded
     try std.testing.expectEqual(@as(u32, 1), r.segment);
 
     // rollback rewinds within segment 1 but doesn't go back to segment 0.
-    seg.rollback(r);
+    try std.testing.expect(seg.rollback(r));
     const next = try seg.append(allocator, 7);
     // next id lands in segment 1 at offset 0 → global id 4.
     try std.testing.expectEqual(@as(u32, 4), next);
+}
+
+test "stable segments: rollback reports a range displaced by another writer" {
+    const allocator = std.testing.allocator;
+    var seg = StableSegments(u32, .{ .first_segment_size = 8 }, TestVma).empty;
+    defer seg.deinit(allocator);
+
+    const first = try seg.reserve(allocator, 2);
+    _ = try seg.reserve(allocator, 1);
+    try std.testing.expect(!seg.rollback(first));
+    try std.testing.expectEqual(@as(u32, 3), seg.count());
 }
 
 test "stable segments: locationOf round-trips" {
