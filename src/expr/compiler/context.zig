@@ -23,7 +23,8 @@ const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const InternTable = @import("runtime").intern.InternTable;
 const DeferredTable = @import("deferred_table.zig").Table;
 const UnitAnalysis = @import("let_analysis/model.zig").UnitAnalysis;
-const LetFloatUnitState = @import("let_float/model.zig").UnitState;
+const let_float_model = @import("let_float/model.zig");
+const LetFloatUnitState = let_float_model.UnitState;
 
 const InternId = types.InternId;
 
@@ -92,6 +93,9 @@ pub const Compiler = struct {
     /// (Nix resolves the tilde at parse time). Null when unset in the env.
     home_dir: ?[]const u8,
     policy: LanguagePolicy = .{},
+    /// Immutable codegen policy plus Engine-owned census, inherited by child
+    /// compilers and supplied explicitly to force-time deferred compiles.
+    let_float: let_float_model.Context = .{},
     source_file_id: ?InternId,
     locals: std.ArrayListUnmanaged(Local),
     captures: std.ArrayListUnmanaged(Capture),
@@ -267,6 +271,7 @@ pub const Compiler = struct {
         child.source_path = self.source_path;
         child.home_dir = self.home_dir;
         child.policy = self.policy;
+        child.let_float = self.let_float;
         child.source_file_id = self.source_file_id;
         child.registration_sink = self.registration_sink;
         child.suppress_child_speculation = self.suppress_child_speculation;

@@ -982,7 +982,7 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
             var slot = entry.compiled.load(.acquire);
             if (slot == 0) {
                 const line_index = try table.lineIndexFor(entry.source);
-                const new_id = try deferred_compile.compile(table.allocator, self.registry, self.intern, self.heap, self.registration_sink, entry, line_index);
+                const new_id = try deferred_compile.compile(table.allocator, self.registry, self.intern, self.heap, self.registration_sink, table.let_float, entry, line_index);
                 // Publish once; a concurrent racer may have won — then our
                 // registration is either the same deduplicated chunk or an
                 // unreferenced valid chunk, and `slot` is the selected id.

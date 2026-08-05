@@ -1,11 +1,12 @@
-//! Resolve `FIX_*` scheduler and speculation environment overrides.
+//! Resolve `FIX_*` evaluation tuning from one Engine's environment.
 //!
-//! Runs once before `scheduler.start`.
+//! The resulting `Policy` is immutable and Engine-owned. Resolution happens
+//! on the Engine's first compile/evaluate operation, after callers have had a
+//! chance to configure the scheduler and environment, and before any worker
+//! starts.
 
 const std = @import("std");
 const scheduler_mod = @import("workers/scheduler.zig");
-const vm_strings = @import("../vm/strings.zig");
-const let_float = @import("../compiler/let_float.zig");
 
 const EnvMap = std.process.Environ.Map;
 
@@ -45,8 +46,19 @@ pub const PrefetchPolicy = struct {
     read_dir_budget: u32,
 };
 
+pub const Policy = struct {
+    scheduler: scheduler_mod.Config,
+    prefetch: PrefetchPolicy,
+    /// Derived strings at or above this length are eligible for the GC heap.
+    /// Each Engine starts from 64; environment overrides never leak between
+    /// sequential or concurrent Engines.
+    heap_string_min: usize = 64,
+    let_float_enabled: bool = true,
+    let_float_report: bool = false,
+};
+
 /// Resolve import and directory prefetch limits. Both require helper workers.
-pub fn resolvePrefetch(env: ?*const EnvMap, worker_count: u8) PrefetchPolicy {
+fn resolvePrefetch(env: ?*const EnvMap, worker_count: u8) PrefetchPolicy {
     const helpers_available = worker_count > 1;
     const import_enabled = helpers_available and envEnabled(env, "FIX_IMPORT_PREFETCH", true);
     const read_dir_enabled = helpers_available and envEnabled(env, "FIX_READDIR_PREFETCH", true);
@@ -57,12 +69,13 @@ pub fn resolvePrefetch(env: ?*const EnvMap, worker_count: u8) PrefetchPolicy {
     };
 }
 
-/// Resolve scheduler and speculation tuning into one immutable policy value.
+/// Resolve scheduler, prefetch, VM, and compiler tuning into one immutable
+/// value owned by the calling Engine.
 pub fn resolve(
     base: scheduler_mod.Config,
     env: ?*const EnvMap,
     worker_count: u8,
-) scheduler_mod.Config {
+) Policy {
     var config = base;
 
     if (envInt(u32, env, "FIX_SPEC_BACKLOG")) |value| config.spec_backlog_per_helper = value;
@@ -82,20 +95,34 @@ pub fn resolve(
 
     resolveSibling(&config, env, worker_count);
 
-    // GC-able string threshold: producers route derived text of at least
-    // this many bytes to heap strings instead of the immortal intern table.
-    // Unset = off (every string interns); 0 = everything eligible goes to
-    // the heap (the stress lane). Resolved here (once, before workers
-    // start) though it lives on vm/strings — same one-shot contract as the
-    // scheduler knobs.
-    if (envInt(usize, env, "FIX_HEAP_STR_MIN")) |value|
-        vm_strings.heap_string_min = value;
+    return .{
+        .scheduler = config,
+        .prefetch = resolvePrefetch(env, worker_count),
+        .heap_string_min = envInt(usize, env, "FIX_HEAP_STR_MIN") orelse 64,
+        .let_float_enabled = !envEnabled(env, "FIX_NO_LET_FLOAT", false),
+        .let_float_report = envEnabled(env, "FIX_LET_FLOAT_STATS", false),
+    };
+}
 
-    // Compile-time let-binding placement (`compiler/let_float.zig`) — a
-    // kill switch for A/B measurement and debugging, same one-shot contract
-    // as the scheduler knobs. FIX_LET_FLOAT_STATS prints the rewrite census
-    // to stderr at engine teardown.
-    let_float.enabled = !envEnabled(env, "FIX_NO_LET_FLOAT", false);
-    let_float.report_on_deinit = envEnabled(env, "FIX_LET_FLOAT_STATS", false);
-    return config;
+test "policy resolution is isolated per Engine environment" {
+    const testing = std.testing;
+    var overridden = EnvMap.init(testing.allocator);
+    defer overridden.deinit();
+    try overridden.put("FIX_HEAP_STR_MIN", "0");
+    try overridden.put("FIX_NO_LET_FLOAT", "1");
+    try overridden.put("FIX_LET_FLOAT_STATS", "1");
+    try overridden.put("FIX_IMPORT_PREFETCH", "0");
+
+    const first = resolve(.{}, &overridden, 2);
+    const second = resolve(.{}, null, 2);
+
+    try testing.expectEqual(@as(usize, 0), first.heap_string_min);
+    try testing.expect(!first.let_float_enabled);
+    try testing.expect(first.let_float_report);
+    try testing.expectEqual(@as(u32, 0), first.prefetch.import_budget);
+
+    try testing.expectEqual(@as(usize, 64), second.heap_string_min);
+    try testing.expect(second.let_float_enabled);
+    try testing.expect(!second.let_float_report);
+    try testing.expectEqual(@as(u32, 8192), second.prefetch.import_budget);
 }

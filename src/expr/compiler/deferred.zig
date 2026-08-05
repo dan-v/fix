@@ -29,6 +29,7 @@ const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
 const deferred = @import("deferred_table.zig");
+const LetFloatContext = @import("let_float/model.zig").Context;
 const LineIndex = @import("syntax").diagnostic.LineIndex;
 
 /// Compile one deferred body and return its registered ChunkId. Uses the
@@ -42,6 +43,7 @@ pub fn compile(
     intern: *InternTable,
     heap: *ObjectHeap,
     registration_sink: ?compiler_mod.ChunkRegistrationSink,
+    let_float_context: LetFloatContext,
     entry: *const deferred.Entry,
     line_index: *LineIndex,
 ) !ChunkId {
@@ -64,6 +66,7 @@ pub fn compile(
     parent.source_path = entry.source_path;
     parent.source_file_id = entry.source_file_id;
     parent.policy = entry.policy;
+    parent.let_float = let_float_context;
     // Shared line index — avoid rebuilding it over the whole source per body.
     // Take a by-value copy: `line_starts` is immutable and safely shared, but
     // `positionForOffset` mutates the embedded last-lookup cache, and
@@ -109,6 +112,7 @@ pub fn compile(
     child.source_path = entry.source_path;
     child.source_file_id = entry.source_file_id;
     child.policy = entry.policy;
+    child.let_float = let_float_context;
     child.name_id = entry.name_id; // qualified name (traces/errors/disasm)
     defer child.deinit();
     for (entry.scope, 0..) |cap, i| {

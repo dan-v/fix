@@ -164,7 +164,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
 
     const write_err: ?anyerror = blk: {
         if (options.stats) {
-            bytecode.stats.write(allocator, writer, ev.chunkRegistry()) catch |e| break :blk e;
+            bytecode.stats.write(allocator, writer, ev.chunkRegistry(), ev.letFloatStats()) catch |e| break :blk e;
         } else if (options.disasm_eval and options.disasm_chunk == null) {
             dumpAll(writer, &ev, symbols, opts) catch |e| break :blk e;
         } else {

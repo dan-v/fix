@@ -554,7 +554,7 @@ test "constants preserve a folded attrs/list value graph across roundtrip" {
     for (d1.lines, d2.lines) |a, b| try testing.expectEqualStrings(a.name, b.name);
 }
 
-test "computeKey is stable for identical inputs and varies with source" {
+test "computeKey is stable for identical inputs and varies with codegen policy" {
     const ctx: KeyContext = .{
         .policy_fp = 42,
         .let_float_enabled = true,
@@ -566,4 +566,9 @@ test "computeKey is stable for identical inputs and varies with source" {
 
     const k3 = computeKey("let x = 2; in x", "a.nix", ctx);
     try testing.expect(!std.mem.eql(u8, &k1, &k3));
+
+    var no_float = ctx;
+    no_float.let_float_enabled = false;
+    const k4 = computeKey("let x = 1; in x", "a.nix", no_float);
+    try testing.expect(!std.mem.eql(u8, &k1, &k4));
 }

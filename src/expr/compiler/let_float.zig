@@ -45,22 +45,13 @@ const prof = @import("../probe.zig").prof;
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
 
-/// Global kill switch, resolved from `FIX_NO_LET_FLOAT` at engine start
-/// (`eval/tuning.zig`). Compile-time only; safe to flip between units.
-pub var enabled: bool = true;
-
-/// Print the census to stderr when the engine tears down
-/// (`FIX_LET_FLOAT_STATS=1`, resolved alongside the kill switch).
-pub var report_on_deinit: bool = false;
-
-/// Monotonic census counters (whole-process, compile-time only — never on
-/// the force path). Reported by `fix disasm --stats`.
+/// Monotonic census counters owned by one Engine and updated only while
+/// compiling. Reported by that Engine's teardown and `fix disasm --stats`.
 pub const Stats = model.Stats;
-pub var stats: Stats = .{};
 
 /// Report the census (`FIX_LET_FLOAT_STATS=1` prints it at engine teardown;
 /// `fix disasm --stats` embeds it). One line per counter, zeros skipped.
-pub fn writeReport(w: *std.Io.Writer) !void {
+pub fn writeReport(w: *std.Io.Writer, stats: *const Stats) !void {
     const fields = .{
         .{ "lets analyzed", &stats.lets },
         .{ "bindings seen", &stats.bindings },
@@ -87,17 +78,19 @@ pub fn writeReport(w: *std.Io.Writer) !void {
     }
 }
 
-fn bump(counter: *std.atomic.Value(u64)) void {
-    _ = counter.fetchAdd(1, .monotonic);
+fn bump(stats: ?*Stats, comptime field: []const u8) void {
+    if (stats) |s| _ = @field(s, field).fetchAdd(1, .monotonic);
 }
 
-fn bumpBy(counter: *std.atomic.Value(u64), n: u64) void {
-    if (n != 0) _ = counter.fetchAdd(n, .monotonic);
+fn bumpBy(stats: ?*Stats, comptime field: []const u8, n: u64) void {
+    if (n != 0) {
+        if (stats) |s| _ = @field(s, field).fetchAdd(n, .monotonic);
+    }
 }
 
 /// Census hook for `let.zig` (the prefix is computed there, on the residual).
-pub fn bumpPrefixMembers(n: usize) void {
-    bumpBy(&stats.prefix_members, n);
+pub fn bumpPrefixMembers(stats: ?*Stats, n: usize) void {
+    bumpBy(stats, "prefix_members", n);
 }
 
 fn rootAstArena(self: *Compiler) ?*ast.AstArena {
@@ -132,7 +125,7 @@ fn unitRewriteState(self: *Compiler) !*model.UnitState {
 /// the original node when nothing improved, a rebuilt `let_in`, or — when
 /// every binding dissolved — the (rewritten) body expression itself.
 pub fn rewriteLet(self: *Compiler, node: *const Node) !*const Node {
-    if (!enabled) return node;
+    if (!self.let_float.enabled) return node;
     // An installed debugger wants the source's bindings materialized as
     // written (breakpoint scopes resolve locals by name), so the optimizer
     // stands down entirely. Disasm/name capture does NOT stand down — it
@@ -148,7 +141,10 @@ pub fn rewriteLet(self: *Compiler, node: *const Node) !*const Node {
     defer prof.end(.let_float, _pt);
 
     const ua = try unitAnalysis(self);
-    if (ua.clusters.get(node) != null) bump(&stats.cluster_hits) else bump(&stats.cluster_walks);
+    if (ua.clusters.get(node) != null)
+        bump(self.let_float.stats, "cluster_hits")
+    else
+        bump(self.let_float.stats, "cluster_walks");
     const cluster = ua.clusters.get(node) orelse blk: {
         // First let of a subtree not yet analyzed (an outermost let, a
         // materialized elided body, an interpolation sub-parse, or a
@@ -167,10 +163,10 @@ pub fn rewriteLet(self: *Compiler, node: *const Node) !*const Node {
     // positions, so the decisions apply identically).
     const overlay = try (try unitRewriteState(self)).overlay(cluster.head);
     if (overlay.plan == null) {
-        bump(&stats.lets);
-        bumpBy(&stats.bindings, cluster.graph.bindings.len);
-        bumpBy(&stats.flattened_lets, cluster.levels - 1);
-        overlay.plan = try planner.decide(self, &cluster.graph, cluster.entries, &stats);
+        bump(self.let_float.stats, "lets");
+        bumpBy(self.let_float.stats, "bindings", cluster.graph.bindings.len);
+        bumpBy(self.let_float.stats, "flattened_lets", cluster.levels - 1);
+        overlay.plan = try planner.decide(self, &cluster.graph, cluster.entries, self.let_float.stats);
     }
     const decisions = &overlay.plan.?;
 

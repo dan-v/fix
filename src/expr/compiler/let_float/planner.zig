@@ -14,12 +14,14 @@ const InternId = types.InternId;
 const BindingId = analysis.BindingId;
 const invalid_binding = analysis.invalid_binding;
 
-fn bump(counter: *std.atomic.Value(u64)) void {
-    _ = counter.fetchAdd(1, .monotonic);
+fn bump(census: ?*model.Stats, comptime field: []const u8) void {
+    if (census) |stats| _ = @field(stats, field).fetchAdd(1, .monotonic);
 }
 
-fn bumpBy(counter: *std.atomic.Value(u64), n: u64) void {
-    if (n != 0) _ = counter.fetchAdd(n, .monotonic);
+fn bumpBy(census: ?*model.Stats, comptime field: []const u8, n: u64) void {
+    if (n != 0) {
+        if (census) |stats| _ = @field(stats, field).fetchAdd(n, .monotonic);
+    }
 }
 
 fn rootAstArena(self: *Compiler) ?*ast.AstArena {
@@ -32,7 +34,7 @@ pub fn decide(
     self: *Compiler,
     graph: *const analysis.Graph,
     let_bindings: []const Node.Binding,
-    census: *model.Stats,
+    census: ?*model.Stats,
 ) !model.Plan {
     const allocator = self.allocator;
     const n = graph.bindings.len;
@@ -78,7 +80,7 @@ pub fn decide(
                     keep[i] = false;
                     rhs_gone[i] = true;
                     any_change = true;
-                    bump(&census.dropped_dead);
+                    bump(census, "dropped_dead");
                 },
                 // Dotted groups always compile (their merge/duplicate
                 // diagnostics are load-bearing), matching today's behavior.
@@ -102,7 +104,7 @@ pub fn decide(
         if (!keep[i] or !alive[i]) continue;
         if (binding.kind != .plain) continue;
         if (binding.scc_recursive) {
-            bump(&census.blocked_recursive);
+            bump(census, "blocked_recursive");
             continue;
         }
         const leaf = binding.leaf.?;
@@ -132,14 +134,14 @@ pub fn decide(
             total += 1;
             if (use.pinned or use.site == null) continue;
             if (is_alias and graph.shadowedAt(target_id, use.shadow_mark)) {
-                bump(&census.blocked_shadow);
+                bump(census, "blocked_shadow");
                 continue;
             }
             // A dynamically-resolved target (`with`-scope name) reads the
             // same value only under an identical with-chain: the window to
             // the site must cross no `with` body.
             if (is_alias and hasDynamicFree(binding, facts[i]) and graph.withCrossedAt(use.shadow_mark)) {
-                bump(&census.blocked_dynamic);
+                bump(census, "blocked_dynamic");
                 continue;
             }
             const fresh = try freshCopy(self, use.site.?, shape);
@@ -171,12 +173,15 @@ pub fn decide(
             try consumed.append(allocator, false);
         }
 
-        if (is_literal) bumpBy(&census.inlined_literal_uses, replaced) else bumpBy(&census.inlined_alias_uses, replaced);
+        if (is_literal)
+            bumpBy(census, "inlined_literal_uses", replaced)
+        else
+            bumpBy(census, "inlined_alias_uses", replaced);
         if (replaced != 0) any_change = true;
         if (replaced == total and total != 0) {
             keep[i] = false;
             rhs_gone[i] = true;
-            bump(&census.inlined_bindings);
+            bump(census, "inlined_bindings");
             // The alias's own RHS (a bare identifier read) disappears with
             // it; its use record of the target is inside this RHS and is
             // filtered by `rhs_gone`.
@@ -193,7 +198,7 @@ pub fn decide(
         // per destination below (movement is fine while the with-chain is
         // unchanged between header and site).
         if (hasOpaque(binding, facts[i])) {
-            bump(&census.blocked_dynamic);
+            bump(census, "blocked_dynamic");
             continue;
         }
         const leaf = binding.leaf.?;
@@ -218,25 +223,25 @@ pub fn decide(
         if (live.items.len == 1 and !is_lambda) sink: {
             const use = live.items[0];
             if (use.pinned or use.site == null) {
-                bump(&census.blocked_pinned);
+                bump(census, "blocked_pinned");
                 break :sink;
             }
             if (use.mult == .many) {
-                bump(&census.blocked_many);
+                bump(census, "blocked_many");
                 break :sink;
             }
             if (anyFreeShadowedAt(graph, binding, facts[i], use.shadow_mark)) {
-                bump(&census.blocked_shadow);
+                bump(census, "blocked_shadow");
                 break :sink;
             }
             if (hasDynamicFree(binding, facts[i]) and graph.withCrossedAt(use.shadow_mark)) {
-                bump(&census.blocked_dynamic);
+                bump(census, "blocked_dynamic");
                 break :sink;
             }
             try replacements.put(allocator, use.site.?, leaf);
             keep[i] = false;
             any_change = true;
-            bump(&census.sunk_single_use);
+            bump(census, "sunk_single_use");
             // The RHS now lives inside the owner's region: fold its free
             // names into the owner so a later sink of the owner checks them.
             if (use.in_rhs_of != invalid_binding) {
@@ -260,17 +265,17 @@ pub fn decide(
         for (targets.branches) |branch_id| {
             const branch = graph.tables.branches.items[branch_id];
             if (graph.branchMult(branch) == .many) {
-                bump(&census.blocked_many);
+                bump(census, "blocked_many");
                 ok = false;
                 break;
             }
             if (anyFreeShadowedAt(graph, binding, facts[i], branch.shadow_mark)) {
-                bump(&census.blocked_shadow);
+                bump(census, "blocked_shadow");
                 ok = false;
                 break;
             }
             if (hasDynamicFree(binding, facts[i]) and graph.withCrossedAt(branch.shadow_mark)) {
-                bump(&census.blocked_dynamic);
+                bump(census, "blocked_dynamic");
                 ok = false;
                 break;
             }
@@ -288,7 +293,10 @@ pub fn decide(
         }
         keep[i] = false;
         any_change = true;
-        if (targets.branches.len > 1) bump(&census.floated_cloned) else bump(&census.floated_branch);
+        if (targets.branches.len > 1)
+            bump(census, "floated_cloned")
+        else
+            bump(census, "floated_branch");
     }
 
     return .{ .keep = keep, .replacements = replacements, .wraps = wraps, .any_change = any_change };
