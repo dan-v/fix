@@ -5,8 +5,8 @@
 //! centralizes object layout behind heap accessors.
 //!
 //! Thread safety:
-//!   - The four backing stores are non-relocating: `objects` is a flat
-//!     mmap `FlatStore`, `values`/`attrs`/`attr_positions` are
+//!   - The five backing stores are non-relocating: `objects` is a flat
+//!     mmap `FlatStore`, `values`/`attrs`/`attr_positions`/`bytes` are
 //!     `StableSegments`. Readers are lock-free; writers serialize per-store
 //!     on the store's internal `SpinMutex`.
 //!   - In-place mutation of an object payload is restricted to atomics:
@@ -367,11 +367,12 @@ fn byteAllocSize(n: u32) u32 {
 /// This keeps the hot path off the global mutex on workloads that
 /// allocate many small ranges (lists, attrsets, closure upvalues).
 ///
-/// All four stores TLAB their allocation: a worker reserves a chunk under the
-/// store mutex, then hands out slots lock-free. The `objects` store also
-/// supports reserving a slot up front (`reserveObjectSlot`/`fillObjectSlot`) so
-/// a value can learn its own ObjectId before the object exists — how
-/// `buildAttrSet` builds the `builtins.builtins` self-reference.
+/// All four range stores TLAB their allocation: a worker reserves a chunk under
+/// the store mutex, then hands out slots lock-free. The separate `objects`
+/// store does the same and also supports reserving a slot up front
+/// (`beginObjectSlot`/`commitObjectSlot`) so a value can learn its own ObjectId
+/// before the object exists — how `buildAttrSet` builds the `builtins.builtins`
+/// self-reference.
 const object_chunk_size: u32 = 8192;
 const value_chunk_size: u32 = 8192;
 const attr_chunk_size: u32 = 8192;
@@ -490,7 +491,7 @@ pub const HeapLocal = struct {
     /// world mark drains and clears the list.
     gc_remset: std.ArrayListUnmanaged(ObjectId) = .empty,
     /// This worker's young objects since the last minor (every id from
-    /// `reserveObjectSlot`, including reused slots). The STW minor iterates
+    /// `beginObjectSlot`, including reused slots). The STW minor iterates
     /// exactly these — O(young) — and clears the list. Reuse- and TLAB-tail-
     /// safe, unlike an id-range frontier.
     gc_young_slots: std.ArrayListUnmanaged(ObjectId) = .empty,
@@ -1679,7 +1680,7 @@ pub const ObjectHeap = struct {
         }
     }
 
-    /// Total bytes ever reserved across the four stores — the committed-RSS
+    /// Total bytes ever reserved across every backing store — the committed-RSS
     /// proxy. Reuse keeps the cursors (and this) from growing, so it
     /// plateaus near the threshold once collection keeps up.
     pub fn totalReservedBytes(self: *const ObjectHeap) u64 {
