@@ -119,17 +119,33 @@
       exit 1
     fi
 
+    hugepages_min_available="$1"
+    huge_dir=/sys/kernel/mm/hugepages/hugepages-2048kB
+
+    if [[ -r "$huge_dir/nr_hugepages" && -r "$huge_dir/free_hugepages" && -r "$huge_dir/resv_hugepages" ]]; then
+      huge_total="$(<"$huge_dir/nr_hugepages")"
+      if (( huge_total > 0 )); then
+        huge_free="$(<"$huge_dir/free_hugepages")"
+        huge_reserved="$(<"$huge_dir/resv_hugepages")"
+        huge_available=$((huge_free - huge_reserved))
+        if (( huge_available < hugepages_min_available )); then
+          echo "fix-bench needs $hugepages_min_available available 2 MB huge pages; found $huge_available ($huge_free free, $huge_reserved reserved)" >&2
+          echo "free hugetlb capacity or lower HUGETLB_MIN_AVAILABLE before recording results" >&2
+          exit 1
+        fi
+      fi
+    fi
+
     # Release clean page-cache/slab pages, then coalesce the resulting free
     # pages so every run starts with the same opportunity to obtain THPs.
-    # Explicit hugetlb mappings return to their configured pool at process
-    # exit, so deliberately leave vm.nr_hugepages unchanged.
+    # Persistent HugeTLB pages are a shared system pool and remain untouched.
     ${pkgs.coreutils}/bin/sync
     printf '3\n' > /proc/sys/vm/drop_caches
     printf '1\n' > /proc/sys/vm/compact_memory
   '';
   prepareMemory = pkgs.writeShellScript "fix-bench-prepare-memory" ''
     set -euo pipefail
-    exec sudo ${reclaimMemoryAsRoot}
+    exec sudo ${reclaimMemoryAsRoot} "$@"
   '';
 in
   pkgs.writeShellApplication {
@@ -148,6 +164,9 @@ in
         RUNS=N              measured runs per command (default: 5)
         WARMUP=N            warmup runs per command (default: 1)
         RECLAIM_MEMORY=0    skip per-run cache reclaim and memory compaction
+        HUGETLB_MIN_AVAILABLE=N
+                            minimum unreserved free 2 MB pages when a pool is
+                            configured (default: 1024; 0 disables the check)
         OUT=DIR             output directory (default: /tmp/fix-bench.XXXXXX)
         TOOLS=RULE,...      select evaluator rows: group, exact name, or /Bash ERE/;
                             prefix a rule with - to exclude it. If every rule
@@ -171,6 +190,11 @@ in
       runs="''${RUNS:-5}"
       warmup="''${WARMUP:-1}"
       reclaim_memory="''${RECLAIM_MEMORY:-1}"
+      hugetlb_min_available="''${HUGETLB_MIN_AVAILABLE:-1024}"
+      if [[ ! "$hugetlb_min_available" =~ ^[0-9]+$ ]]; then
+        echo "invalid HUGETLB_MIN_AVAILABLE value: $hugetlb_min_available (expected a non-negative page count)" >&2
+        exit 2
+      fi
       prepare_args=()
       case "$reclaim_memory" in
         1|true|yes)
@@ -180,7 +204,7 @@ in
           fi
           echo "authorizing per-run memory reclaim with sudo"
           sudo -v
-          prepare_args=(--prepare ${prepareMemory})
+          prepare_args=(--prepare "${prepareMemory} $hugetlb_min_available")
           ;;
         0|false|no)
           ;;
