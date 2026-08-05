@@ -1,6 +1,7 @@
 //! Network fetch builtins and fetched-source realization.
 
 const std = @import("std");
+const clock = @import("base").clock;
 const observ = @import("base").observ;
 const VM = @import("../context.zig").VM;
 const types = @import("runtime").types;
@@ -306,14 +307,22 @@ pub fn computeNarHash(self: *VM, path_value: Value, exclude_value: Value) !Value
     return Value.string(try self.intern.intern(buf[0 .. 7 + encoded.len]));
 }
 
-pub fn pathTreeValue(self: *VM, path: []const u8, nar_hash: []const u8) !Value {
+pub fn pathTreeValue(self: *VM, path: []const u8, nar_hash: []const u8, last_modified: i64) !Value {
     const entries = [_]heap_mod.AttrEntry{
-        .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
-        .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
+        .{ .name = try self.intern.intern("lastModified"), .value = Value.int(last_modified) },
+        .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern(&clock.formatUtc(last_modified))) },
         .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash, "") },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
     };
     return Value.attrs(try self.heap.addAttrs(&entries));
+}
+
+/// A local source tree's `lastModified`: the root's mtime in whole seconds, as
+/// Nix's path fetcher reports it (0 when the stat fails).
+pub fn sourceLastModified(self: *VM, path: []const u8) i64 {
+    const io = self.files.io orelse return 0;
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch return 0;
+    return @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_s));
 }
 
 pub fn fileTreeValue(self: *VM, path: []const u8, nar_hash: []const u8) !Value {
@@ -726,12 +735,16 @@ pub fn forgeTreeSpec(self: *VM, attrs_id: ObjectId, forge: []const u8) !ForgeTre
     };
 }
 
-pub fn githubTreeValue(self: *VM, path: []const u8, nar_hash: []const u8, rev: ?[]const u8, metadata: ?FetchService.ForgeMetadata) !Value {
+/// `locked_last_modified` is the pin carried on the ref attrs (a flake.lock
+/// `locked` field, or a caller-supplied `lastModified`): the fallback when the
+/// fetch was satisfied without live forge metadata (rev-pinned, cached).
+pub fn githubTreeValue(self: *VM, path: []const u8, nar_hash: []const u8, rev: ?[]const u8, metadata: ?FetchService.ForgeMetadata, locked_last_modified: i64) !Value {
+    const last_modified = if (metadata) |item| item.last_modified else locked_last_modified;
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
     try entries.appendSlice(self.allocator, &.{
-        .{ .name = try self.intern.intern("lastModified"), .value = Value.int(if (metadata) |item| item.last_modified else 0) },
-        .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern(if (metadata) |item| item.last_modified_date else "19700101000000")) },
+        .{ .name = try self.intern.intern("lastModified"), .value = Value.int(last_modified) },
+        .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern(&clock.formatUtc(last_modified))) },
         .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash, "") },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
     });

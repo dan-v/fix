@@ -13,6 +13,7 @@ const strings = @import("strings.zig");
 const fetch = @import("fetch.zig");
 const prof = @import("../../probe.zig").prof;
 const prof_census = @import("../../probe.zig").prof_census;
+const corepkgs = @import("../../eval/imports/corepkgs.zig");
 const purity = @import("purity.zig");
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
@@ -261,7 +262,7 @@ pub fn builtinFindFile(self: *VM, search_path_arg: Value, name_arg: Value) !Valu
     // it: a reserved `nix=` prefix, or a prefixless entry that supplies
     // `nix/fetchurl.nix`, is an error unless `nix-path-shadow` is enabled (in
     // which case a matching prefixless entry wins over the corepkgs default).
-    const is_corepkgs = std.mem.eql(u8, name, "nix/fetchurl.nix");
+    const is_corepkgs = std.mem.eql(u8, name, corepkgs.fetchurl_name);
 
     // Pure eval forbids `<...>` / NIX_PATH lookups, except the synthetic
     // `<nix/fetchurl.nix>` corepkgs file (not a real search-path entry).
@@ -317,7 +318,7 @@ pub fn builtinFindFile(self: *VM, search_path_arg: Value, name_arg: Value) !Valu
             return Value.path(try self.intern.intern(candidate));
         }
     }
-    if (is_corepkgs) return Value.path(try self.intern.intern("/__corepkgs__/fetchurl.nix"));
+    if (is_corepkgs) return Value.path(try self.intern.intern(corepkgs.fetchurl_path));
     return error.FileNotFound;
 }
 
