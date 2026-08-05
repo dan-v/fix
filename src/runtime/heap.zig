@@ -204,7 +204,18 @@ pub const ContextString = struct {
 
 pub const PendingBytecodeThunk = struct {
     chunk_id: ChunkId,
+    object: PendingObjectSlot,
     range: ValueRange,
+};
+
+/// An object id reserved but not yet published. Construction APIs keep this
+/// token across their fallible side-store work, then either commit a fully
+/// initialized object or abort the reservation. The source bit lets abort
+/// restore a reclaimed id without allocation; fresh ids rewind the owning
+/// worker's TLAB.
+pub const PendingObjectSlot = struct {
+    id: ObjectId,
+    reused: bool,
 };
 
 const BuiltinClosureObject = struct {
@@ -1598,11 +1609,10 @@ pub const ObjectHeap = struct {
         const fair_share = (available + self.worker_locals.len - 1) / self.worker_locals.len;
         const take = @min(gc_object_refill_batch, fair_share);
         if (take == 0) return null;
-        local.gc_free_objects.ensureUnusedCapacity(self.allocator, take) catch {
-            const id = self.gc_shared_free_objects.pop();
-            self.gc_shared_free_count.store(self.gc_shared_free_objects.items.len, .release);
-            return id;
-        };
+        // A claimed id must always be abortable without allocation. Refill
+        // into the worker-local vector first; popping from it leaves one slot
+        // of capacity that PendingObjectSlot can use to return the id.
+        local.gc_free_objects.ensureUnusedCapacity(self.allocator, take) catch return null;
         const start = self.gc_shared_free_objects.items.len - take;
         local.gc_free_objects.appendSliceAssumeCapacity(self.gc_shared_free_objects.items[start..]);
         self.gc_shared_free_objects.items.len = start;
@@ -1987,8 +1997,11 @@ pub const ObjectHeap = struct {
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
-        const id = try self.reserveObjectSlot();
-        self.fillObjectSlot(id, object);
+        const pending = try self.beginObjectSlot();
+        return self.commitObjectSlot(pending, object);
+    }
+
+    fn noteObjectCreated(self: *ObjectHeap, id: ObjectId, object: Object) void {
         if (object == .thunk) self.currentLocal().thunks_created += 1;
         // `-Dprof-main` creation-context probe: tag the thunk with whether
         // it was created on the demand chain (vs. inside speculative work).
@@ -1997,26 +2010,28 @@ pub const ObjectHeap = struct {
             if (object == .thunk)
                 self.objects.getMut(id).thunk.created_demand = !self.currentLocal().spec_ctx;
         }
-        return id;
     }
 
-    /// Reserve an object slot and return its ObjectId without filling
-    /// payload. The slot's contents are undefined until `fillObjectSlot`
-    /// is called. The ID is only valid to expose once the slot has been
-    /// filled — concurrent readers reaching the slot before that would
-    /// see garbage. Currently used only at build-time for the
-    /// `builtins.builtins` self-reference, where no other thread can
-    /// observe the in-flight slot.
-    pub fn reserveObjectSlot(self: *ObjectHeap) !ObjectId {
+    /// Begin an object construction transaction. No other object allocation
+    /// may occur on this worker before commit/abort: fresh reservations are
+    /// rolled back by rewinding the worker TLAB, and the young-slot record is
+    /// the list tail. This deliberately narrow lifetime covers heap
+    /// constructors and the single-threaded `builtins.builtins` self-reference.
+    pub fn beginObjectSlot(self: *ObjectHeap) !PendingObjectSlot {
         const local = self.currentLocal();
-        const id = blk: {
+        // Tracking must be infallible after an id has been removed from a free
+        // list or a TLAB cursor has advanced.
+        if (self.collection.collect_enabled)
+            try local.gc_young_slots.ensureUnusedCapacity(self.allocator, 1);
+
+        const pending: PendingObjectSlot = blk: {
             // Reuse a slot freed by a prior collection (own shard, else
             // work-steal from a peer). Detector leaves freed slots unused so
             // use-after-free is caught.
             if (self.collection.collect_enabled and !self.collection.disable_reuse and !gc_debug) {
                 if (self.gcReuseObject(local)) |rid| {
                     local.object_reuse_hits += 1;
-                    break :blk rid;
+                    break :blk .{ .id = rid, .reused = true };
                 }
                 local.object_reuse_misses += 1;
                 if (self.collection.object_miss_collect_armed.swap(false, .acq_rel)) {
@@ -2028,7 +2043,7 @@ pub const ObjectHeap = struct {
             if (chunk.cursor < chunk.end) {
                 const cid = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
                 chunk.cursor += 1;
-                break :blk cid;
+                break :blk .{ .id = cid, .reused = false };
             }
             const refilled = try self.objects.reserve(self.allocator, object_chunk_size);
             local.object_fresh_refills += 1;
@@ -2037,18 +2052,19 @@ pub const ObjectHeap = struct {
             chunk.end = refilled.offset + refilled.len;
             const cid = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
             chunk.cursor += 1;
-            break :blk cid;
+            break :blk .{ .id = cid, .reused = false };
         };
         // Record the id in this worker's young-slot list: the minor iterates
         // exactly these (O(young)), and it's robust to slot reuse and the
         // reserved-vs-filled TLAB tail (both of which broke an id-range frontier).
         if (self.collection.collect_enabled)
-            local.gc_young_slots.append(self.allocator, id) catch @panic("gc young-object tracking exhausted");
-        return id;
+            local.gc_young_slots.appendAssumeCapacity(pending.id);
+        return pending;
     }
 
-    pub fn fillObjectSlot(self: *ObjectHeap, id: ObjectId, object: Object) void {
-        self.objects.getMut(id).* = object;
+    /// Publish a fully initialized object and consume its reservation.
+    pub fn commitObjectSlot(self: *ObjectHeap, pending: PendingObjectSlot, object: Object) ObjectId {
+        self.objects.getMut(pending.id).* = object;
         // In the UAF-detector build the alloc bitmap must be live between
         // collections (every heap read asserts the bit), so set it per fill.
         // In release builds the bitmap is reconstructed at collection time
@@ -2059,8 +2075,29 @@ pub const ObjectHeap = struct {
             // bits go live from eval start so the pre-arming region [bootstrap_
             // end, track_from) has precise per-object bits for the major sweep +
             // assert. Non-constrained: identical to gating on collect_enabled.
-            if (self.collection.root_active) self.gcSetAllocBit(id);
+            if (self.collection.root_active) self.gcSetAllocBit(pending.id);
         }
+        self.noteObjectCreated(pending.id, object);
+        return pending.id;
+    }
+
+    /// Cancel an unpublished object reservation without allocation.
+    pub fn abortObjectSlot(self: *ObjectHeap, pending: PendingObjectSlot) void {
+        const local = self.currentLocal();
+        if (self.collection.collect_enabled) {
+            const young = local.gc_young_slots.pop().?;
+            std.debug.assert(young == pending.id);
+        }
+        if (pending.reused) {
+            // gcReuseObject always pops from a worker-local vector (refilling
+            // it first when necessary), so the pop left room for this return.
+            local.gc_free_objects.appendAssumeCapacity(pending.id);
+            return;
+        }
+        const chunk = &local.object;
+        std.debug.assert(chunk.cursor > 0);
+        std.debug.assert(ObjectStore.globalIdOf(chunk.segment, chunk.cursor - 1) == pending.id);
+        chunk.cursor -= 1;
     }
 
     // --- GC allocation and reclamation state ---
@@ -2689,9 +2726,11 @@ pub const ObjectHeap = struct {
 
     pub fn addList(self: *ObjectHeap, items: []const Value) !ObjectId {
         if (items.len == 0) if (self.empty_list_id) |id| return id;
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveValuesLocal(@intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);
-        return self.add(.{ .list = range });
+        return self.commitObjectSlot(pending, .{ .list = range });
     }
 
     pub fn addConcatenatedLists(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
@@ -2705,11 +2744,13 @@ pub const ObjectHeap = struct {
         const right = try self.getList(right_id);
         if (right.len == 0) return left_id;
 
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveValuesLocal(@intCast(left.len + right.len));
         const dst = self.values.sliceMut(range);
         @memcpy(dst[0..left.len], left);
         @memcpy(dst[left.len..], right);
-        return self.add(.{ .list = range });
+        return self.commitObjectSlot(pending, .{ .list = range });
     }
 
     /// Concatenate already-validated list Values directly into one heap
@@ -2735,6 +2776,8 @@ pub const ObjectHeap = struct {
         if (non_empty == 0) return lists[lists.len - 1].asObjectId();
         if (non_empty == 1) return sole_non_empty;
 
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveValuesLocal(@intCast(total));
         const dst = self.values.sliceMut(range);
         var out: usize = 0;
@@ -2745,13 +2788,15 @@ pub const ObjectHeap = struct {
             @memcpy(dst[out..][0..items.len], items);
             out += items.len;
         }
-        return self.add(.{ .list = range });
+        return self.commitObjectSlot(pending, .{ .list = range });
     }
 
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         if (entries.len == 0) if (self.empty_attrs_id) |id| return id;
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.prepareAttrsRange(entries);
-        return self.add(.{ .attrs = .{ .range = range } });
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range } });
     }
 
     /// Same as `addAttrs` but the caller guarantees `entries` is already
@@ -2761,8 +2806,10 @@ pub const ObjectHeap = struct {
     /// `intersectAttrs`) whose output is sorted+unique by construction.
     pub fn addAttrsSorted(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         if (entries.len == 0) if (self.empty_attrs_id) |id| return id;
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendAttrEntries(entries);
-        return self.add(.{ .attrs = .{ .range = range } });
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range } });
     }
 
     /// Allocate + sort + dedup an AttrRange without wrapping it in an
@@ -2782,6 +2829,8 @@ pub const ObjectHeap = struct {
     ) !ObjectId {
         if (positions.len == 0) return self.addAttrs(entries);
 
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendAttrEntries(entries);
         errdefer self.attrs.rollback(range);
         try self.sortAndDedupAttrs(range);
@@ -2789,19 +2838,23 @@ pub const ObjectHeap = struct {
         const pos_range = try self.appendAttrPositions(positions);
         errdefer self.attr_positions.rollback(pos_range);
         self.sortAttrPositions(pos_range);
-        return self.add(.{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
 
     pub fn addContextString(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendAttrEntries(context);
         errdefer self.attrs.rollback(range);
         try self.sortAndDedupAttrs(range);
-        return self.add(.{ .context_string = .{ .text = text, .context = range } });
+        return self.commitObjectSlot(pending, .{ .context_string = .{ .text = text, .context = range } });
     }
 
     pub fn addMergedAttrs(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
         const left = try self.materializeAttrs(left_id);
         const right = try self.materializeAttrs(right_id);
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
 
         // Reserve worst-case capacity and write the merge directly into heap
         // storage. Inputs are both sorted and deduplicated, so
@@ -2857,8 +2910,11 @@ pub const ObjectHeap = struct {
         self.releaseAttrsTail(reserved, range.len);
         // Both operands empty (`{} // {}` strict): the tail release above
         // already returned the reserved storage; hand back the shared `{ }`.
-        if (range.len == 0 and positions.len == 0) if (self.empty_attrs_id) |id| return id;
-        return self.add(.{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(positions) } });
+        if (range.len == 0 and positions.len == 0) if (self.empty_attrs_id) |id| {
+            self.abortObjectSlot(pending);
+            return id;
+        };
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(positions) } });
     }
 
     pub fn addAttrsFromStackPairs(self: *ObjectHeap, pairs: []const Value) !ObjectId {
@@ -2876,6 +2932,8 @@ pub const ObjectHeap = struct {
     ) !ObjectId {
         std.debug.assert(names.len == values.len);
         if (names.len == 0) if (self.empty_attrs_id) |id| return id;
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveAttrsLocal(@intCast(names.len));
         const entries = self.attrs.sliceMut(range);
         for (entries, names, values) |*e, n, v| e.* = .{ .name = n, .value = v };
@@ -2884,7 +2942,7 @@ pub const ObjectHeap = struct {
         // instance of the literal shares the chunk's baked table; nothing
         // is copied into the heap store.
         std.debug.assert(positionsSortedByName(self.attrPositionsEntries(positions)));
-        return self.add(.{ .attrs = .{ .range = range, .positions = positions } });
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = positions } });
     }
 
     /// `attrs_new_srt` fast path: the compiler guarantees the pairs
@@ -2920,6 +2978,8 @@ pub const ObjectHeap = struct {
         // Every key was a dynamic `null` (or there were no pairs): `{ }`.
         if (count == 0) if (self.empty_attrs_id) |id| return id;
 
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveAttrsLocal(count);
         const entries = self.attrs.sliceMut(range);
 
@@ -2940,7 +3000,7 @@ pub const ObjectHeap = struct {
             try self.sortAndDedupAttrs(range);
         }
 
-        if (positions.len == 0) return self.add(.{ .attrs = .{ .range = range } });
+        if (positions.len == 0) return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range } });
 
         // Positions arrive pre-sorted by name: the only producer is the
         // compiler's `emitBuildAttrs`, which bakes them sorted. No
@@ -2948,7 +3008,7 @@ pub const ObjectHeap = struct {
         std.debug.assert(positionsSortedByName(positions));
         const pos_range = try self.appendAttrPositions(positions);
         errdefer self.attr_positions.rollback(pos_range);
-        return self.add(.{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
 
     fn attrEntriesSortedUnique(entries: []const AttrEntry) bool {
@@ -2968,18 +3028,20 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addClosure(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(upvalues);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .closure = .{
+        return self.commitObjectSlot(pending, .{ .closure = .{
             .chunk_id = chunk_id,
             .upvalues = range,
         } });
     }
 
     pub fn addBuiltinClosure(self: *ObjectHeap, builtin_id: u16, args: []const Value) !ObjectId {
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(args);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .builtin_closure = .{
+        return self.commitObjectSlot(pending, .{ .builtin_closure = .{
             .builtin_id = builtin_id,
             .args = range,
         } });
@@ -2992,9 +3054,10 @@ pub const ObjectHeap = struct {
     /// Build a partial-application object from `func` (an arity>1 closure
     /// or another PAP's underlying closure) and the args supplied so far.
     pub fn addPartialApp(self: *ObjectHeap, func: Value, args: []const Value) !ObjectId {
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(args);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .partial_app = .{
+        return self.commitObjectSlot(pending, .{ .partial_app = .{
             .func = func,
             .args = range,
         } });
@@ -3027,15 +3090,16 @@ pub const ObjectHeap = struct {
             }
             return self.add(.{ .heap_string_inline = obj });
         }
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveStoreLocal(comptime rangeStoreIndex("bytes"), byteAllocSize(total));
-        errdefer self.bytes.rollback(range);
         const dst = self.bytes.sliceMut(range);
         var off: usize = 0;
         for (parts) |s| {
             @memcpy(dst[off..][0..s.len], s);
             off += s.len;
         }
-        return self.add(.{ .heap_string = .{ .bytes = range, .text_len = total } });
+        return self.commitObjectSlot(pending, .{ .heap_string = .{ .bytes = range, .text_len = total } });
     }
 
     /// Borrow a heap string's bytes. Same lifetime contract as
@@ -3068,9 +3132,10 @@ pub const ObjectHeap = struct {
         if (upvalues.len <= BytecodeThunk.inline_capacity) {
             return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, upvalues) });
         }
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(upvalues);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .thunk = Thunk.initBytecodeSpilled(chunk_id, self.values.slice(range), range.segment, range.offset) });
+        return self.commitObjectSlot(pending, .{ .thunk = Thunk.initBytecodeSpilled(chunk_id, self.values.slice(range), range.segment, range.offset) });
     }
 
     /// A deferred-compile thunk (lazy per-attr compilation). Same inline
@@ -3079,9 +3144,10 @@ pub const ObjectHeap = struct {
         if (env.len <= DeferredThunk.inline_capacity) {
             return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, env) });
         }
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(env);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .thunk = Thunk.initDeferredSpilled(deferred_id, self.values.slice(range), range.segment, range.offset) });
+        return self.commitObjectSlot(pending, .{ .thunk = Thunk.initDeferredSpilled(deferred_id, self.values.slice(range), range.segment, range.offset) });
     }
 
     /// Wrap `value` in a pre-resolved, undemanded thunk. Used by the
@@ -3093,9 +3159,12 @@ pub const ObjectHeap = struct {
     }
 
     pub fn beginBytecodeThunk(self: *ObjectHeap, chunk_id: ChunkId, upvalue_count: usize) !PendingBytecodeThunk {
+        const object = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(object);
         const range = try self.reserveValuesLocal(@intCast(upvalue_count));
         return .{
             .chunk_id = chunk_id,
+            .object = object,
             .range = range,
         };
     }
@@ -3105,11 +3174,10 @@ pub const ObjectHeap = struct {
     }
 
     pub fn commitBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) !ObjectId {
-        errdefer self.values.rollback(pending.range);
         const upvalues = self.values.slice(pending.range);
         if (upvalues.len <= BytecodeThunk.inline_capacity)
-            return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, upvalues) });
-        return self.add(.{ .thunk = Thunk.initBytecodeSpilled(pending.chunk_id, upvalues, pending.range.segment, pending.range.offset) });
+            return self.commitObjectSlot(pending.object, .{ .thunk = Thunk.initBytecode(pending.chunk_id, upvalues) });
+        return self.commitObjectSlot(pending.object, .{ .thunk = Thunk.initBytecodeSpilled(pending.chunk_id, upvalues, pending.range.segment, pending.range.offset) });
     }
 
     /// Return a thunk target's spilled captures once evaluation has unwound
@@ -3125,6 +3193,7 @@ pub const ObjectHeap = struct {
 
     pub fn rollbackBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) void {
         self.values.rollback(pending.range);
+        self.abortObjectSlot(pending.object);
     }
 
     fn appendValues(self: *ObjectHeap, items: []const Value) !ValueRange {

@@ -166,6 +166,11 @@ pub const InternTable = struct {
     /// the input's hash. `entries` and `data` remain global so that ids
     /// stay dense and `get()` doesn't need to know the shard.
     shards: [shard_count]Shard,
+    /// Serializes the two-store commit for a new string. Lookup hits remain
+    /// shard-local; only misses enter this mutex. Keeping the data reservation
+    /// and entry append in one commit section makes a failed entry allocation
+    /// safe to roll back even while other shards are interning concurrently.
+    commit_mu: sync.BlockingMutex = .{},
     /// Unique-per-init identifier the thread-local intern cache uses to
     /// avoid stale-hit races when an InternTable is recreated at the
     /// same heap address.
@@ -224,35 +229,47 @@ pub const InternTable = struct {
         defer if (!self.solo) shard.mu.unlock();
 
         const adapter = StringAdapter{ .table = self, .precomputed_hash = h };
-        const ctx = IdContext{ .table = self };
-        const gop = try shard.lookup.getOrPutContextAdapted(self.allocator, s, adapter, ctx);
-        if (gop.found_existing) {
-            threadCacheStore(self.token, h, s, gop.key_ptr.*);
-            return gop.key_ptr.*;
+        if (shard.lookup.getKeyAdapted(s, adapter)) |id| {
+            threadCacheStore(self.token, h, s, id);
+            return id;
         }
 
-        // Append bytes, then the entry. The byte rollback handles failure
-        // mid-allocation; entry append happens last so its failure leaves
-        // the byte storage to be cleaned up by the errdefer.
-        const new_id = blk: {
-            const data_range = try self.data.reserve(self.allocator, @intCast(s.len));
-            errdefer self.data.rollback(data_range);
-            @memcpy(self.data.sliceMut(data_range), s);
+        // Preflight the only allocation involved in publication. From this
+        // point onward inserting the finished id into the lookup is
+        // infallible, so the map can never contain an uninitialized key.
+        const ctx = IdContext{ .table = self };
+        try shard.lookup.ensureUnusedCapacityContext(self.allocator, 1, ctx);
 
+        const pending = blk: {
+            self.commit_mu.lock();
+            defer self.commit_mu.unlock();
+
+            const data_range = try self.data.reserve(self.allocator, @intCast(s.len));
+            // Every writer to these two stores holds commit_mu, so another
+            // shard cannot move the tail between this reservation and a
+            // failed entry append.
+            errdefer self.data.rollback(data_range);
             const entry: Entry = .{
                 .segment = data_range.segment,
                 .offset = data_range.offset,
                 .len = data_range.len,
             };
-            break :blk try self.entries.append(self.allocator, entry);
+            break :blk .{
+                .id = try self.entries.append(self.allocator, entry),
+                .data_range = data_range,
+            };
         };
 
-        gop.key_ptr.* = new_id;
-        threadCacheStore(self.token, h, s, new_id);
+        // Copying and map publication cannot fail. The commit mutex need not
+        // cover the copy: no reader can discover the new id until the lookup
+        // entry is installed below.
+        @memcpy(self.data.sliceMut(pending.data_range), s);
+        shard.lookup.putAssumeCapacityContext(pending.id, {}, ctx);
+        threadCacheStore(self.token, h, s, pending.id);
         const bucket = lenHistBucket(s.len);
         _ = self.new_len_counts[bucket].fetchAdd(1, .monotonic);
         _ = self.new_len_bytes[bucket].fetchAdd(s.len, .monotonic);
-        return new_id;
+        return pending.id;
     }
 
     /// Look up `s` WITHOUT inserting: the id if `s` is already interned,
@@ -434,6 +451,58 @@ test "intern: get is safe for slices borrowed from previous interns" {
     const base = path[path.len - "file.txt".len ..];
     const base_id = try table.intern(base);
     try std.testing.expectEqualStrings("file.txt", table.get(base_id));
+}
+
+test "intern: allocation failures never publish partial strings" {
+    // A fresh table has an entry segment (for id 0) but no byte segment.
+    // Failing that first byte allocation must leave every logical count and
+    // lookup unchanged, and the same table must remain usable afterward.
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var table = try InternTable.init(failing.allocator());
+        defer table.deinit();
+
+        const before = table.stats();
+        failing.fail_index = failing.alloc_index;
+        const large: [4096]u8 = @splat('x');
+        try std.testing.expectError(error.OutOfMemory, table.intern(&large));
+        const after = table.stats();
+        try std.testing.expectEqual(before.entries, after.entries);
+        try std.testing.expectEqual(before.data_bytes, after.data_bytes);
+        try std.testing.expect(table.probe(&large) == null);
+
+        failing.fail_index = std.math.maxInt(usize);
+        const id = try table.intern(&large);
+        try std.testing.expectEqualStrings(&large, table.get(id));
+        try std.testing.expectEqual(id, table.probe(&large).?);
+    }
+
+    // Fill entry segment 0, then fail allocation of segment 1 after the byte
+    // reservation. commit_mu makes the rollback tail-safe even though lookup
+    // maps are sharded.
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var table = try InternTable.init(failing.allocator());
+        defer table.deinit();
+
+        var buf: [16]u8 = undefined;
+        while (table.entries.count() < EntryStore.first_segment_size) {
+            const name = try std.fmt.bufPrint(&buf, "name-{d}", .{table.entries.count()});
+            _ = try table.intern(name);
+        }
+        const before = table.stats();
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectError(error.OutOfMemory, table.intern("entry-segment-boundary"));
+        const after = table.stats();
+        try std.testing.expectEqual(before.entries, after.entries);
+        try std.testing.expectEqual(before.data_bytes, after.data_bytes);
+        try std.testing.expect(table.probe("entry-segment-boundary") == null);
+
+        failing.fail_index = std.math.maxInt(usize);
+        const id = try table.intern("entry-segment-boundary");
+        try std.testing.expectEqualStrings("entry-segment-boundary", table.get(id));
+        try std.testing.expectEqual(id, try table.intern("entry-segment-boundary"));
+    }
 }
 
 test "intern: concurrent inserts dedupe correctly" {

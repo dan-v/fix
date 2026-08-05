@@ -1456,7 +1456,7 @@ test "exhausting a reclaimed object pool requests an early collection once" {
     // The object-reuse contract this asserts is deliberately void in
     // detector builds: swept slots are retained un-reused so stale id reads
     // keep trapping (`sweepYoungListInto`, the `!gc_debug` reuse gate in
-    // `reserveObjectSlot`), and pool-miss arming is bypassed with them.
+    // object construction), and pool-miss arming is bypassed with them.
     if (comptime heap_mod.gc_debug) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
@@ -1468,12 +1468,12 @@ test "exhausting a reclaimed object pool requests an early collection once" {
     // the first true pool miss requests a safepoint collection and consumes
     // the one-shot arm.
     heap.collection.object_miss_collect_armed.store(true, .monotonic);
-    _ = try heap.reserveObjectSlot();
+    _ = try heap.addBoxedInt(1);
     try std.testing.expect(heap.collection.collect_requested.load(.monotonic));
     try std.testing.expect(!heap.collection.object_miss_collect_armed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), heap.collection.object_miss_collect_requests.load(.monotonic));
 
-    _ = try heap.reserveObjectSlot();
+    _ = try heap.addBoxedInt(2);
     try std.testing.expectEqual(@as(u64, 1), heap.collection.object_miss_collect_requests.load(.monotonic));
 }
 

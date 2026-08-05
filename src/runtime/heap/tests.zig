@@ -66,6 +66,37 @@ test "object heap stores list and attrs payloads behind object ids" {
     try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 13));
 }
 
+test "object construction abort restores the reserved slot" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const abandoned = try heap.beginObjectSlot();
+    heap.abortObjectSlot(abandoned);
+
+    const committed = try heap.addBoxedInt(42);
+    try std.testing.expectEqual(abandoned.id, committed);
+    var snapshot = try heap.objectSnapshot(std.testing.allocator);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u32, 1), snapshot.live_count);
+    try std.testing.expect(snapshot.isLive(committed));
+}
+
+test "object construction does not consume an id when young tracking allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var heap = try ObjectHeap.init(failing.allocator(), 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const before = heap.counts();
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, heap.addBoxedInt(1));
+    try std.testing.expectEqual(before.objects, heap.counts().objects);
+
+    failing.fail_index = std.math.maxInt(usize);
+    const id = try heap.addBoxedInt(2);
+    try std.testing.expectEqual(@as(i64, 2), try heap.getBoxedInt(id));
+}
+
 test "object snapshot indexes only filled slots and exposes semantic details" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();

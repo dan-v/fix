@@ -482,13 +482,14 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
     // entries, then fill the slot once we have the AttrRange. This is
     // single-threaded — `Engine.evaluate` calls `ensureBuiltins` before
     // `scheduler.start` — so no other thread can observe the in-flight slot.
-    const self_id = try heap.reserveObjectSlot();
+    const self_slot = try heap.beginObjectSlot();
+    errdefer heap.abortObjectSlot(self_slot);
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("builtins"),
-        .value = Value.attrs(self_id),
+        .value = Value.attrs(self_slot.id),
     });
     const attr_range = try heap.prepareAttrsRange(entries.items);
-    heap.fillObjectSlot(self_id, .{ .attrs = .{ .range = attr_range } });
+    const self_id = heap.commitObjectSlot(self_slot, .{ .attrs = .{ .range = attr_range } });
     return Value.attrs(self_id);
 }
 
