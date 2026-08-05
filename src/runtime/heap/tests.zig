@@ -66,6 +66,37 @@ test "object heap stores list and attrs payloads behind object ids" {
     try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 13));
 }
 
+test "object construction abort restores the reserved slot" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const abandoned = try heap.beginObjectSlot();
+    heap.abortObjectSlot(abandoned);
+
+    const committed = try heap.addBoxedInt(42);
+    try std.testing.expectEqual(abandoned.id, committed);
+    var snapshot = try heap.objectSnapshot(std.testing.allocator);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u32, 1), snapshot.live_count);
+    try std.testing.expect(snapshot.isLive(committed));
+}
+
+test "object construction does not consume an id when young tracking allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var heap = try ObjectHeap.init(failing.allocator(), 1);
+    defer heap.deinit();
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
+
+    const before = heap.counts();
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, heap.addBoxedInt(1));
+    try std.testing.expectEqual(before.objects, heap.counts().objects);
+
+    failing.fail_index = std.math.maxInt(usize);
+    const id = try heap.addBoxedInt(2);
+    try std.testing.expectEqual(@as(i64, 2), try heap.getBoxedInt(id));
+}
+
 test "object snapshot indexes only filled slots and exposes semantic details" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();
@@ -109,18 +140,47 @@ test "object reference inspection follows objects and chunks without recursion" 
 
     var refs: std.ArrayListUnmanaged(heap_mod.HeapReference) = .empty;
     defer refs.deinit(std.testing.allocator);
-    try heap.collectObjectReferences(&snapshot, parent_id, std.testing.allocator, &refs);
+    try @import("edges.zig").collectReferences(&heap, &snapshot, parent_id, std.testing.allocator, &refs);
     try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
         .{ .object = child_id },
         .{ .chunk = 0x2a },
     }, refs.items);
 
     refs.clearRetainingCapacity();
-    try heap.collectObjectReferences(&snapshot, closure_id, std.testing.allocator, &refs);
+    try @import("edges.zig").collectReferences(&heap, &snapshot, closure_id, std.testing.allocator, &refs);
     try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
         .{ .chunk = 0x31 },
         .{ .object = parent_id },
         .{ .chunk = 0x32 },
+    }, refs.items);
+
+    const position_table = [_]heap_mod.AttrPosEntry{.{
+        .name = 40,
+        .pos = .{ .file = 1, .line = 2, .column = 3 },
+    }};
+    const Resolver = struct {
+        fn resolve(ctx: *anyopaque, _: u32) []const heap_mod.AttrPosEntry {
+            const table: *const [1]heap_mod.AttrPosEntry = @ptrCast(@alignCast(ctx));
+            return table;
+        }
+    };
+    heap.setChunkAttrPosResolver(.{
+        .ctx = @ptrCast(@constCast(&position_table)),
+        .resolve = Resolver.resolve,
+    });
+    const positioned_id = try heap.addAttrsFromValuesSorted(
+        &.{40},
+        &.{Value.list(child_id)},
+        heap_mod.AttrPositions.fromChunk(0x44, 0, 1),
+    );
+
+    snapshot.deinit();
+    snapshot = try heap.objectSnapshot(std.testing.allocator);
+    refs.clearRetainingCapacity();
+    try @import("edges.zig").collectReferences(&heap, &snapshot, positioned_id, std.testing.allocator, &refs);
+    try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
+        .{ .object = child_id },
+        .{ .chunk = 0x44 },
     }, refs.items);
 }
 
@@ -212,12 +272,63 @@ test "object heap rejects duplicate attrs" {
         .{ .name = 10, .value = Value.int(3) },
     }));
 
+    var objects_after_error = try heap.objectSnapshot(std.testing.allocator);
+    defer objects_after_error.deinit();
+    var attrs_after_error = try heap.attrSnapshot(std.testing.allocator);
+    defer attrs_after_error.deinit();
+    try std.testing.expectEqual(@as(u32, 0), objects_after_error.live_count);
+    try std.testing.expectEqual(@as(u32, 0), attrs_after_error.live_count);
+
     // Subsequent non-duplicate adds still work.
     const attrs_id = try heap.addAttrs(&.{
         .{ .name = 10, .value = Value.int(1) },
         .{ .name = 20, .value = Value.int(2) },
     });
     try std.testing.expectEqual(@as(i64, 1), (try heap.getAttrValue(attrs_id, 10)).asInt());
+}
+
+test "multi-store attr construction rolls back when positions allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var heap = try ObjectHeap.init(failing.allocator(), 1);
+    defer heap.deinit();
+
+    // Prewarm object and attr TLABs; the first attr-position segment remains
+    // the next allocation point.
+    _ = try heap.addAttrs(&.{.{ .name = 1, .value = Value.int(1) }});
+    var before_objects = try heap.objectSnapshot(std.testing.allocator);
+    defer before_objects.deinit();
+    var before_attrs = try heap.attrSnapshot(std.testing.allocator);
+    defer before_attrs.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, heap.addAttrsWithPositions(
+        &.{.{ .name = 2, .value = Value.int(2) }},
+        &.{.{ .name = 2, .pos = .{ .file = 3, .line = 4, .column = 5 } }},
+    ));
+    var after_objects = try heap.objectSnapshot(std.testing.allocator);
+    defer after_objects.deinit();
+    var after_attrs = try heap.attrSnapshot(std.testing.allocator);
+    defer after_attrs.deinit();
+    try std.testing.expectEqual(before_objects.live_count, after_objects.live_count);
+    try std.testing.expectEqual(before_attrs.live_count, after_attrs.live_count);
+
+    failing.fail_index = std.math.maxInt(usize);
+    _ = try heap.addAttrsWithPositions(
+        &.{.{ .name = 2, .value = Value.int(2) }},
+        &.{.{ .name = 2, .pos = .{ .file = 3, .line = 4, .column = 5 } }},
+    );
+}
+
+test "pending attr merges return storage before collection is armed" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const first = try heap.reserveAttrsForMerge(7);
+    heap.abortMergedAttrs(first);
+    const second = try heap.reserveAttrsForMerge(7);
+    defer heap.abortMergedAttrs(second);
+    try std.testing.expectEqual(first.range.segment, second.range.segment);
+    try std.testing.expectEqual(first.range.offset, second.range.offset);
 }
 
 test "object heap preserves earlier ranges as side arenas grow" {

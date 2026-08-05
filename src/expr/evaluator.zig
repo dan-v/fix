@@ -1568,7 +1568,7 @@ pub const Engine = struct {
         allocator: std.mem.Allocator,
         out: *std.ArrayListUnmanaged(runtime.heap.HeapReference),
     ) !void {
-        return self.heap.collectObjectReferences(snapshot, id, allocator, out);
+        return runtime.heap_edges.collectReferences(&self.heap, snapshot, id, allocator, out);
     }
 
     /// Per-record access to the value/attr/attr-position stores, for the VM
@@ -1586,7 +1586,7 @@ pub const Engine = struct {
     }
 
     pub fn valueRef(_: *const Engine, value: Value) runtime.heap.ValueRef {
-        return ObjectHeap.inspectValue(value);
+        return runtime.heap.inspection.valueRef(value);
     }
 
     /// Enumerate an attrs / list object's members (non-forcing) for the VM

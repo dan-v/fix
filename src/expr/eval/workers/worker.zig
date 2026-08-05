@@ -663,10 +663,11 @@ pub const Worker = struct {
     fn sampleTimelineCounters(f: *WorkerFiber) void {
         if (!f.vm.observer.shouldSample(1_000_000)) return;
         const heap = f.vm.heap;
+        const heap_counts = heap.counts();
         f.vm.observer.counter(&heap_counter, &.{
-            .{ .name = "objects", .value = .{ .unsigned = heap.objects.count() }, .unit = .items },
-            .{ .name = "values", .value = .{ .unsigned = heap.values.count() }, .unit = .items },
-            .{ .name = "attrs", .value = .{ .unsigned = heap.attrs.count() }, .unit = .items },
+            .{ .name = "objects", .value = .{ .unsigned = heap_counts.objects }, .unit = .items },
+            .{ .name = "values", .value = .{ .unsigned = heap_counts.values }, .unit = .items },
+            .{ .name = "attrs", .value = .{ .unsigned = heap_counts.attrs }, .unit = .items },
         });
         // RSS (peak so far) + total bytes reserved across the object stores — the
         // memory-growth curve, correlatable with the speculation backlog below.
@@ -1221,7 +1222,7 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
     vm_force.rootKeep(&f.vm, Value.attrs(attrs_id));
     const entries = f.vm.heap.materializeAttrs(attrs_id) catch return;
     const log = f.worker.scheduler.config.sibling_log;
-    const objects_before: u32 = if (log) f.vm.heap.objects.count() else 0;
+    const objects_before: u32 = if (log) f.vm.heap.counts().objects else 0;
     var label_buf: [160]u8 = undefined;
     var rendered_buf: [224]u8 = undefined;
 
@@ -1245,7 +1246,7 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
     }
     if (log) {
         std.debug.print("sweep attrs={d} done: t_us={d} heap_growth={d}\n", .{
-            attrs_id, vm_force.diagNowUs(), f.vm.heap.objects.count() -| objects_before,
+            attrs_id, vm_force.diagNowUs(), f.vm.heap.counts().objects -| objects_before,
         });
     }
 }

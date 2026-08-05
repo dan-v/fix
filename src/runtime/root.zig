@@ -9,6 +9,7 @@
 pub const types = @import("types.zig");
 pub const value = @import("value.zig");
 pub const heap = @import("heap.zig");
+pub const heap_edges = @import("heap/edges.zig");
 pub const heap_collector = @import("heap/collector.zig");
 pub const future = @import("future.zig");
 pub const failure = @import("failure.zig");
@@ -33,6 +34,7 @@ test {
     _ = types;
     _ = value;
     _ = heap;
+    _ = heap_edges;
     _ = heap_collector;
     _ = future;
     _ = failure;

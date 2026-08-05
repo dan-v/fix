@@ -5,8 +5,8 @@
 //! centralizes object layout behind heap accessors.
 //!
 //! Thread safety:
-//!   - The four backing stores are non-relocating: `objects` is a flat
-//!     mmap `FlatStore`, `values`/`attrs`/`attr_positions` are
+//!   - The five backing stores are non-relocating: `objects` is a flat
+//!     mmap `FlatStore`, `values`/`attrs`/`attr_positions`/`bytes` are
 //!     `StableSegments`. Readers are lock-free; writers serialize per-store
 //!     on the store's internal `SpinMutex`.
 //!   - In-place mutation of an object payload is restricted to atomics:
@@ -36,7 +36,9 @@ const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
 const DeferredThunk = @import("thunk.zig").DeferredThunk;
 const FailureStore = @import("failure.zig").FailureStore;
-const inspection = @import("heap/inspection.zig");
+const FailureFrame = @import("failure.zig").FailureFrame;
+const FailureRef = @import("failure.zig").FailureRef;
+pub const inspection = @import("heap/inspection.zig");
 const reuse = @import("heap/reuse.zig");
 const RangeFreeList = reuse.RangeFreeList;
 const nextSetBit = reuse.nextSetBit;
@@ -47,8 +49,6 @@ pub const ThunkState = inspection.ThunkState;
 pub const ThunkTargetInfo = inspection.ThunkTargetInfo;
 pub const ThunkInfo = inspection.ThunkInfo;
 pub const ObjectInfo = inspection.ObjectInfo;
-/// `-Dprof-main`: the creation-context / demanded-age probe fields on
-/// `Future` are live (see thunk.zig `created_tsc_enabled`).
 const prof_census_enabled = @import("thunk.zig").created_tsc_enabled;
 
 pub const ObjectId = types.ObjectId;
@@ -172,6 +172,10 @@ pub const AttrPositions = extern struct {
         std.debug.assert(!self.isChunkRef());
         return .{ .segment = self.tag_and_start, .offset = self.id_or_offset, .len = self.len };
     }
+
+    pub fn chunkId(self: AttrPositions) ?ChunkId {
+        return if (self.isChunkRef()) self.id_or_offset else null;
+    }
 };
 
 /// Resolves a chunk's baked attr-position table for `AttrPositions` chunk
@@ -204,7 +208,24 @@ pub const ContextString = struct {
 
 pub const PendingBytecodeThunk = struct {
     chunk_id: ChunkId,
+    object: PendingObjectSlot,
     range: ValueRange,
+};
+
+/// An object id reserved but not yet published. Construction APIs keep this
+/// token across their fallible side-store work, then either commit a fully
+/// initialized object or abort the reservation. The source bit lets abort
+/// restore a reclaimed id without allocation; fresh ids rewind the owning
+/// worker's TLAB.
+pub const PendingObjectSlot = struct {
+    id: ObjectId,
+    reused: bool,
+};
+
+/// Worst-case attr storage filled by a merge before its final length is
+/// known. The token must be published or aborted exactly once.
+pub const PendingAttrs = struct {
+    range: AttrRange,
 };
 
 const BuiltinClosureObject = struct {
@@ -346,11 +367,12 @@ fn byteAllocSize(n: u32) u32 {
 /// This keeps the hot path off the global mutex on workloads that
 /// allocate many small ranges (lists, attrsets, closure upvalues).
 ///
-/// All four stores TLAB their allocation: a worker reserves a chunk under the
-/// store mutex, then hands out slots lock-free. The `objects` store also
-/// supports reserving a slot up front (`reserveObjectSlot`/`fillObjectSlot`) so
-/// a value can learn its own ObjectId before the object exists — how
-/// `buildAttrSet` builds the `builtins.builtins` self-reference.
+/// All four range stores TLAB their allocation: a worker reserves a chunk under
+/// the store mutex, then hands out slots lock-free. The separate `objects`
+/// store does the same and also supports reserving a slot up front
+/// (`beginObjectSlot`/`commitObjectSlot`) so a value can learn its own ObjectId
+/// before the object exists — how `buildAttrSet` builds the `builtins.builtins`
+/// self-reference.
 const object_chunk_size: u32 = 8192;
 const value_chunk_size: u32 = 8192;
 const attr_chunk_size: u32 = 8192;
@@ -469,7 +491,7 @@ pub const HeapLocal = struct {
     /// world mark drains and clears the list.
     gc_remset: std.ArrayListUnmanaged(ObjectId) = .empty,
     /// This worker's young objects since the last minor (every id from
-    /// `reserveObjectSlot`, including reused slots). The STW minor iterates
+    /// `beginObjectSlot`, including reused slots). The STW minor iterates
     /// exactly these — O(young) — and clears the list. Reuse- and TLAB-tail-
     /// safe, unlike an id-range frontier.
     gc_young_slots: std.ArrayListUnmanaged(ObjectId) = .empty,
@@ -556,10 +578,14 @@ pub const HeapCollectionState = struct {
 };
 
 pub const ObjectHeap = struct {
+    pub const ObjectSnapshot = inspection.ObjectSnapshot;
+    pub const Counts = inspection.Counts;
+    pub const Stats = inspection.Stats;
+
     allocator: std.mem.Allocator,
     /// Unique owner for immutable failures borrowed by thunks, imports, and
     /// fiber exception carriers. Lives exactly as long as this heap.
-    failures: FailureStore,
+    failure_store: FailureStore,
     objects: ObjectStore,
     values: ValueStore,
     attrs: AttrStore,
@@ -652,7 +678,7 @@ pub const ObjectHeap = struct {
         for (sweep_filter) |*word| word.* = .init(0);
         return .{
             .allocator = allocator,
-            .failures = FailureStore.init(allocator),
+            .failure_store = FailureStore.init(allocator),
             .objects = objects,
             .values = values,
             .attrs = attrs,
@@ -675,7 +701,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn deinit(self: *ObjectHeap) void {
-        self.failures.deinit();
+        self.failure_store.deinit();
         self.discarded_object_tails.deinit(self.allocator);
         self.allocator.free(self.collection.alloc_bits);
         self.allocator.free(self.collection.old_bits);
@@ -692,19 +718,26 @@ pub const ObjectHeap = struct {
         self.objects.deinit(self.allocator);
     }
 
-    pub const Counts = struct {
-        objects: u32,
-        values: u32,
-        attrs: u32,
-        attr_positions: u32,
-        bytes: u32,
-    };
+    /// Retain a terminal runtime failure for as long as the heap lives.
+    pub fn captureFailure(
+        self: *ObjectHeap,
+        err_value: anyerror,
+        message: []const u8,
+        frames: []const FailureFrame,
+    ) FailureRef {
+        return self.failure_store.captureOrigin(err_value, message, frames);
+    }
+
+    /// Retain one immutable context layer without exposing the backing store.
+    pub fn addFailureContext(self: *ObjectHeap, cause: FailureRef, message: []const u8) FailureRef {
+        return self.failure_store.addContext(cause, message);
+    }
 
     /// Append the discarded-TLAB tails to an object-store `SkipSet` (from
     /// `collectUnfilled(.object)`) so slot scans skip their zeroed payload.
     /// Both lists are bounded by worker count, so the fixed `SkipSet` capacity
     /// is never a constraint in practice; excess is dropped defensively.
-    fn addDiscardedObjectTails(self: *const ObjectHeap, set: *SkipSet) void {
+    pub fn addDiscardedObjectTails(self: *const ObjectHeap, set: *SkipSet) void {
         for (self.discarded_object_tails.items) |r| {
             if (set.len >= set.starts.len) break;
             set.starts[set.len] = r[0];
@@ -729,60 +762,6 @@ pub const ObjectHeap = struct {
             l.object = .{};
         }
     }
-
-    /// Bitset snapshot of currently filled object slots. The explorer keeps
-    /// one bit per slot and discovers rows lazily.
-    /// Build and use this only while evaluation is idle.
-    pub const ObjectSnapshot = struct {
-        allocator: std.mem.Allocator,
-        live_bits: []u64,
-        high_water: ObjectId,
-        live_count: u32,
-
-        pub fn deinit(self: *ObjectSnapshot) void {
-            self.allocator.free(self.live_bits);
-            self.* = undefined;
-        }
-
-        pub fn isLive(self: *const ObjectSnapshot, id: ObjectId) bool {
-            if (id >= self.high_water) return false;
-            return self.live_bits[id >> 6] & (@as(u64, 1) << @intCast(id & 63)) != 0;
-        }
-
-        pub fn nextLive(self: *const ObjectSnapshot, start: ObjectId) ?ObjectId {
-            if (start >= self.high_water) return null;
-            var word_index: usize = start >> 6;
-            var word = self.live_bits[word_index] & (~@as(u64, 0) << @intCast(start & 63));
-            while (true) {
-                if (word != 0) {
-                    const id: ObjectId = @intCast(word_index * 64 + @ctz(word));
-                    return if (id < self.high_water) id else null;
-                }
-                word_index += 1;
-                if (word_index >= self.live_bits.len) return null;
-                word = self.live_bits[word_index];
-            }
-        }
-
-        /// One past the greatest live id, excluding a reserved or reclaimed
-        /// tail. Tree ranges use this instead of `high_water`, which is the
-        /// backing-store reservation frontier rather than a meaningful record
-        /// boundary.
-        pub fn liveExtent(self: *const ObjectSnapshot) ObjectId {
-            var word_index = self.live_bits.len;
-            while (word_index > 0) {
-                word_index -= 1;
-                const word = self.live_bits[word_index];
-                if (word == 0) continue;
-                const top_bit: usize = @bitSizeOf(u64) - 1 - @clz(word);
-                return @min(
-                    self.high_water,
-                    @as(ObjectId, @intCast(word_index * 64 + top_bit + 1)),
-                );
-            }
-            return 0;
-        }
-    };
 
     pub fn objectSnapshot(self: *const ObjectHeap, allocator: std.mem.Allocator) !ObjectSnapshot {
         const high_water = self.objects.count();
@@ -878,170 +857,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn inspectObject(self: *const ObjectHeap, snapshot: *const ObjectSnapshot, id: ObjectId) !ObjectInfo {
-        if (!snapshot.isLive(id)) return error.InvalidObjectId;
-        return switch (self.objects.get(id).*) {
-            .list => |range| .{ .list = .{ .len = range.len } },
-            .attrs => |attrs| .{ .attrs = .{
-                .len = attrs.range.len,
-                .positions = attrs.positions.len,
-                .sibling_swept = self.siblingSweepMarked(id),
-            } },
-            .merge_attrs => |merge| .{ .merge_attrs = .{
-                .base = merge.base,
-                .overlay = merge.overlay,
-                .depth = merge.depth,
-                .flattened = blk: {
-                    const flat = merge.flattened.load(.acquire);
-                    break :blk if (flat == no_flattened_attrs) null else flat;
-                },
-            } },
-            .closure => |closure| .{ .closure = .{ .chunk = closure.chunk_id, .upvalues = closure.upvalues.len } },
-            .builtin_closure => |closure| .{ .builtin_closure = .{ .builtin = closure.builtin_id, .args = closure.args.len } },
-            .thunk => |*thunk| .{ .thunk = inspectThunk(thunk) },
-            .context_string => |string| .{ .context_string = .{ .text = string.text, .context = string.context.len } },
-            .boxed_int => |value| .{ .boxed_int = value },
-            .partial_app => |partial| .{ .partial_app = .{ .function = inspectValue(partial.func), .args = partial.args.len } },
-            .heap_string => |hs| .{ .heap_string = .{ .len = hs.text_len } },
-            .heap_string_inline => |s| .{ .heap_string = .{ .len = s.len } },
-        };
-    }
-
-    /// Collect the direct object/chunk references held by one live object.
-    ///
-    /// This is a tooling-only, non-forcing walk over already-published payloads.
-    /// It intentionally does not flatten merge attrs, force thunks, compile
-    /// deferred bodies, or recursively traverse children.
-    pub fn collectObjectReferences(
-        self: *const ObjectHeap,
-        snapshot: *const ObjectSnapshot,
-        id: ObjectId,
-        allocator: std.mem.Allocator,
-        out: *std.ArrayListUnmanaged(HeapReference),
-    ) !void {
-        if (!snapshot.isLive(id)) return error.InvalidObjectId;
-        const object = self.objects.get(id);
-        switch (object.*) {
-            .list => |range| try self.collectValueRangeReferences(range, allocator, out),
-            .attrs => |attrs| try self.collectAttrRangeReferences(attrs.range, allocator, out),
-            .merge_attrs => |merge| {
-                try out.append(allocator, .{ .object = merge.base });
-                try out.append(allocator, .{ .object = merge.overlay });
-                const flattened = merge.flattened.load(.acquire);
-                if (flattened != no_flattened_attrs)
-                    try out.append(allocator, .{ .object = flattened });
-            },
-            .closure => |closure| {
-                try out.append(allocator, .{ .chunk = closure.chunk_id });
-                try self.collectValueRangeReferences(closure.upvalues, allocator, out);
-            },
-            .builtin_closure => |closure| try self.collectValueRangeReferences(closure.args, allocator, out),
-            .context_string => |string| try self.collectAttrRangeReferences(string.context, allocator, out),
-            .partial_app => |partial| {
-                try collectValueReference(partial.func, allocator, out);
-                try self.collectValueRangeReferences(partial.args, allocator, out);
-            },
-            .boxed_int, .heap_string, .heap_string_inline => {},
-            .thunk => |*thunk| try collectThunkReferences(thunk, allocator, out),
-        }
-    }
-
-    fn collectValueReference(
-        value: Value,
-        allocator: std.mem.Allocator,
-        out: *std.ArrayListUnmanaged(HeapReference),
-    ) !void {
-        switch (inspectValue(value).target) {
-            .object => |target| try out.append(allocator, .{ .object = target }),
-            .chunk => |target| try out.append(allocator, .{ .chunk = target }),
-            .none, .intern, .builtin => {},
-        }
-    }
-
-    fn collectValueRangeReferences(
-        self: *const ObjectHeap,
-        range: ValueRange,
-        allocator: std.mem.Allocator,
-        out: *std.ArrayListUnmanaged(HeapReference),
-    ) !void {
-        for (self.values.slice(range)) |value|
-            try collectValueReference(value, allocator, out);
-    }
-
-    fn collectAttrRangeReferences(
-        self: *const ObjectHeap,
-        range: AttrRange,
-        allocator: std.mem.Allocator,
-        out: *std.ArrayListUnmanaged(HeapReference),
-    ) !void {
-        for (self.attrs.slice(range)) |entry|
-            try collectValueReference(entry.value, allocator, out);
-    }
-
-    fn collectThunkReferences(
-        thunk: *const Thunk,
-        allocator: std.mem.Allocator,
-        out: *std.ArrayListUnmanaged(HeapReference),
-    ) !void {
-        const raw_state = thunk.future.state.load(.acquire);
-        const state: ThunkState = @enumFromInt(@min(raw_state, @intFromEnum(ThunkState.errored)));
-        switch (state) {
-            .resolved => try collectValueReference(thunk.payload.result, allocator, out),
-            // These states do not contain a readable Value payload.
-            .errored, .blackhole => {},
-            .unresolved, .evaluating => switch (thunk.targetKind()) {
-                .closure => try collectValueReference(thunk.payload.target.closure, allocator, out),
-                .pass_through => try collectValueReference(thunk.payload.target.pass_through, allocator, out),
-                .attr_access => try collectValueReference(thunk.payload.target.attr_access.base, allocator, out),
-                .bytecode => {
-                    const target = &thunk.payload.target.bytecode;
-                    try out.append(allocator, .{ .chunk = target.chunk_id });
-                    for (target.upvalues()) |value|
-                        try collectValueReference(value, allocator, out);
-                },
-                .deferred => {
-                    for (thunk.payload.target.deferred.env()) |value|
-                        try collectValueReference(value, allocator, out);
-                },
-            },
-        }
-    }
-
-    fn inspectThunk(thunk: *const Thunk) ThunkInfo {
-        const raw_state = thunk.future.state.load(.acquire);
-        const state: ThunkState = @enumFromInt(@min(raw_state, @intFromEnum(ThunkState.errored)));
-        const body: @TypeOf(@as(ThunkInfo, undefined).body) = switch (state) {
-            .resolved => .{ .result = inspectValue(thunk.payload.result) },
-            .errored => .{ .error_name = @errorName(thunk.cachedFailure().err()) },
-            .unresolved, .evaluating, .blackhole => .{ .target = switch (thunk.targetKind()) {
-                .closure => .{ .closure = inspectValue(thunk.payload.target.closure) },
-                .bytecode => .{ .bytecode = .{
-                    .chunk = thunk.payload.target.bytecode.chunk_id,
-                    .captures = thunk.payload.target.bytecode.upvalue_count,
-                } },
-                .pass_through => .{ .pass_through = inspectValue(thunk.payload.target.pass_through) },
-                .attr_access => .{ .attr_access = .{
-                    .base = inspectValue(thunk.payload.target.attr_access.base),
-                    .name = thunk.payload.target.attr_access.name,
-                } },
-                .deferred => .{ .deferred = .{
-                    .id = thunk.payload.target.deferred.deferred_id,
-                    .captures = thunk.payload.target.deferred.env_count,
-                } },
-            } },
-        };
-        return .{ .state = state, .demanded = thunk.isDemanded(), .body = body };
-    }
-
-    pub fn inspectValue(value: Value) ValueRef {
-        const kind = value.kind();
-        const target: ValueRef.Target = switch (kind) {
-            .list, .attrs, .thunk, .builtin_closure, .string_context, .boxed_int, .partial_app => .{ .object = value.asObjectId() },
-            .closure => if (value.isFunction()) .{ .chunk = value.asFunctionChunkId() } else .{ .object = value.asObjectId() },
-            .string, .path => .{ .intern = value.asInternId() },
-            .builtin => .{ .builtin = value.asBuiltinId() },
-            else => .none,
-        };
-        return .{ .kind = kind, .target = target };
+        return inspection.objectInfo(self, snapshot, id);
     }
 
     fn clearSnapshotBit(bits: []u64, id: ObjectId) void {
@@ -1089,178 +905,10 @@ pub const ObjectHeap = struct {
         return self.attr_positions.getIfAllocated(id, &next);
     }
 
-    pub const Stats = struct {
-        objects: u32,
-        values: u32,
-        attrs: u32,
-        attr_positions: u32,
-        bytes: u32,
-        variant_counts: [10]u32,
-        thunk_states: [5]u32,
-        /// Of the `resolved` thunks (thunk_states[2]), the split by
-        /// `Thunk.demanded`: `resolved_demanded` were observed by a real
-        /// (demand) caller; `resolved_undemanded` were pre-forced by
-        /// speculation / fan-out and never observed — the speculative-waste
-        /// fraction. See docs/perf/probes.md (instrument I1).
-        resolved_demanded: u32,
-        resolved_undemanded: u32,
-        /// Magnitude histogram for inline `.int` values found in the
-        /// values + attrs stores. Buckets are chosen to inform a 16→8
-        /// byte Value migration: a NaN-boxed Value can hold a 48-bit
-        /// sign-extended integer inline, so `int_overflows_i48` is the
-        /// count that would have to be heap-boxed.
-        ///
-        ///   0 = zero
-        ///   1 = |x| < 2^15  (i16 range)
-        ///   2 = |x| < 2^31  (i32 range)
-        ///   3 = |x| < 2^47  (i48 range — NaN-box inline limit)
-        ///   4 = |x| >= 2^47 (would require boxing under NaN-boxing)
-        int_buckets: [5]u32,
-
-        pub fn variantName(index: usize) []const u8 {
-            return switch (index) {
-                0 => "list",
-                1 => "attrs",
-                2 => "closure",
-                3 => "builtin closure",
-                4 => "thunk",
-                5 => "context string",
-                6 => "boxed int",
-                7 => "attrs merge",
-                8 => "partial application",
-                9 => "heap string",
-                else => "?",
-            };
-        }
-
-        pub fn thunkStateName(index: usize) []const u8 {
-            return switch (index) {
-                0 => "unresolved",
-                1 => "evaluating",
-                2 => "resolved",
-                3 => "blackhole",
-                4 => "errored",
-                else => "?",
-            };
-        }
-
-        pub fn intBucketLabel(index: usize) []const u8 {
-            return switch (index) {
-                0 => "zero",
-                1 => "i16",
-                2 => "i32",
-                3 => "i48",
-                4 => ">=2^47",
-                else => "?",
-            };
-        }
-
-        pub fn intTotal(self: Stats) u32 {
-            var t: u32 = 0;
-            for (self.int_buckets) |c| t += c;
-            return t;
-        }
-
-        pub fn intOverflowsI48(self: Stats) u32 {
-            return self.int_buckets[4];
-        }
-    };
-
     /// Aggregate runtime stats. Safe only when there are no concurrent
     /// writers — the inspector calls this once evaluation has finished.
     pub fn stats(self: *const ObjectHeap) Stats {
-        var result: Stats = .{
-            .objects = self.objects.count(),
-            .values = self.values.count(),
-            .attrs = self.attrs.count(),
-            .attr_positions = self.attr_positions.count(),
-            .bytes = self.bytes.count(),
-            .variant_counts = [_]u32{0} ** 10,
-            .thunk_states = [_]u32{0} ** 5,
-            .resolved_demanded = 0,
-            .resolved_undemanded = 0,
-            .int_buckets = [_]u32{0} ** 5,
-        };
-
-        // Per-worker TLABs reserve a chunk of slots from each global store
-        // but fill them one at a time. Slots between `cursor` and `end`
-        // are reserved but unfilled — their payload is undefined memory.
-        // Build per-store skip sets so the scans below don't read garbage.
-        var obj_skip = self.collectUnfilled(.object);
-        self.addDiscardedObjectTails(&obj_skip);
-        const val_skip = self.collectUnfilled(.value);
-        const attr_skip = self.collectUnfilled(.attr);
-
-        var id: u32 = 0;
-        const total_objs = result.objects;
-        scan_obj: while (id < total_objs) : (id += 1) {
-            if (obj_skip.skipPast(id)) |next| {
-                id = next - 1;
-                continue :scan_obj;
-            }
-            const obj = self.objects.get(id);
-            const v_index: usize = switch (obj.*) {
-                .list => 0,
-                .attrs => 1,
-                .closure => 2,
-                .builtin_closure => 3,
-                .thunk => |t| blk: {
-                    const state = t.future.state.load(.acquire);
-                    const s_index: usize = @intCast(@min(state, 4));
-                    result.thunk_states[s_index] += 1;
-                    // Split resolved thunks by whether a real caller ever
-                    // demanded the value (vs. pre-forced and unobserved).
-                    if (s_index == 2) {
-                        if (t.isDemanded()) {
-                            result.resolved_demanded += 1;
-                        } else {
-                            result.resolved_undemanded += 1;
-                        }
-                    }
-                    break :blk 4;
-                },
-                .context_string => 5,
-                .boxed_int => 6,
-                .merge_attrs => 7,
-                .partial_app => 8,
-                .heap_string, .heap_string_inline => 9,
-            };
-            result.variant_counts[v_index] += 1;
-        }
-
-        // Walk the values + attrs stores for inline `.int` magnitudes.
-        // Lists, closure upvalues, and thunk-args all live in `values`;
-        // attrset values live in `attrs`. These two cover every place an
-        // int Value can be heap-resident — the VM stack contains transient
-        // ints during execution but is empty by the time stats() runs.
-        // Skip unallocated segments in sparse stores.
-        var vid: u32 = 0;
-        scan_val: while (vid < result.values) : (vid += 1) {
-            if (val_skip.skipPast(vid)) |next| {
-                vid = next - 1;
-                continue :scan_val;
-            }
-            var next_vid: u32 = undefined;
-            const v = self.values.getIfAllocated(vid, &next_vid) orelse {
-                vid = next_vid - 1;
-                continue :scan_val;
-            };
-            bucketInt(&result.int_buckets, v.*);
-        }
-        var aid: u32 = 0;
-        scan_attr: while (aid < result.attrs) : (aid += 1) {
-            if (attr_skip.skipPast(aid)) |next| {
-                aid = next - 1;
-                continue :scan_attr;
-            }
-            var next_aid: u32 = undefined;
-            const a = self.attrs.getIfAllocated(aid, &next_aid) orelse {
-                aid = next_aid - 1;
-                continue :scan_attr;
-            };
-            bucketInt(&result.int_buckets, a.value);
-        }
-        return result;
+        return inspection.stats(self);
     }
 
     // ---- `-Dprof-main` demand-prediction censuses ----
@@ -1275,164 +923,11 @@ pub const ObjectHeap = struct {
     // Print-only; compiled out unless `-Dprof-main`.
 
     pub fn profCreationCensus(self: *const ObjectHeap) void {
-        if (comptime !prof_census_enabled) return;
-        const Cell = struct {
-            n: u64 = 0,
-            dem_old: u64 = 0,
-            dem_young: u64 = 0,
-            never_resolved_spec: u64 = 0, // resolved but never demanded
-            never_unresolved: u64 = 0,
-            errored: u64 = 0,
-        };
-        var cells: [2]Cell = @splat(.{}); // [0]=demand-created, [1]=spec-created
-        var obj_skip = self.collectUnfilled(.object);
-        self.addDiscardedObjectTails(&obj_skip);
-        var id: u32 = 0;
-        const total = self.objects.count();
-        scan: while (id < total) : (id += 1) {
-            if (obj_skip.skipPast(id)) |next| {
-                id = next - 1;
-                continue :scan;
-            }
-            switch (self.objects.get(id).*) {
-                .thunk => |t| {
-                    const cell = &cells[if (t.created_demand) 0 else 1];
-                    cell.n += 1;
-                    const state = t.future.state.load(.acquire);
-                    if (t.isDemanded()) {
-                        if (t.demanded_old) cell.dem_old += 1 else cell.dem_young += 1;
-                    } else switch (state) {
-                        2 => cell.never_resolved_spec += 1, // resolved
-                        3, 4 => cell.errored += 1, // blackhole / errored
-                        else => cell.never_unresolved += 1,
-                    }
-                },
-                else => {},
-            }
-        }
-        for (cells, 0..) |c, i| {
-            if (c.n == 0) continue;
-            std.debug.print(
-                "prof creation-census [{s}]: n={d} demanded_old={d} ({d:.1}%) demanded_young={d} ({d:.1}%) never:spec_resolved={d} ({d:.1}%) never:unresolved={d} ({d:.1}%) errored={d}\n",
-                .{
-                    if (i == 0) "demand-created" else "spec-created",
-                    c.n,
-                    c.dem_old,
-                    profPct(c.dem_old, c.n),
-                    c.dem_young,
-                    profPct(c.dem_young, c.n),
-                    c.never_resolved_spec,
-                    profPct(c.never_resolved_spec, c.n),
-                    c.never_unresolved,
-                    profPct(c.never_unresolved, c.n),
-                    c.errored,
-                },
-            );
-        }
+        inspection.creationCensus(self);
     }
 
     pub fn profSiblingCensus(self: *const ObjectHeap) void {
-        if (comptime !prof_census_enabled) return;
-        // Size buckets: [4,8) [8,16) [16,32) [32,64) [64,256) [256,inf)
-        const bucket_lo = [_]usize{ 4, 8, 16, 32, 64, 256 };
-        const Bucket = struct {
-            sets: u64 = 0,
-            touched: u64 = 0,
-            all_demanded_sets: u64 = 0,
-            // Members of TOUCHED sets only (thunk-valued members):
-            members: u64 = 0,
-            dem_old: u64 = 0,
-            dem_young: u64 = 0,
-            spec_resolved: u64 = 0, // resolved, never demanded
-            unresolved: u64 = 0,
-        };
-        var buckets: [bucket_lo.len]Bucket = @splat(.{});
-        var merge_attrs_n: u64 = 0;
-        var obj_skip = self.collectUnfilled(.object);
-        self.addDiscardedObjectTails(&obj_skip);
-        var id: u32 = 0;
-        const total = self.objects.count();
-        scan: while (id < total) : (id += 1) {
-            if (obj_skip.skipPast(id)) |next| {
-                id = next - 1;
-                continue :scan;
-            }
-            const entries: []const AttrEntry = switch (self.objects.get(id).*) {
-                .attrs => |a| self.attrs.slice(a.range),
-                .merge_attrs => {
-                    merge_attrs_n += 1;
-                    continue :scan;
-                },
-                else => continue :scan,
-            };
-            if (entries.len < bucket_lo[0]) continue :scan;
-            var bi: usize = bucket_lo.len - 1;
-            while (entries.len < bucket_lo[bi]) bi -= 1;
-            const b = &buckets[bi];
-            b.sets += 1;
-            var members: u64 = 0;
-            var dem_old: u64 = 0;
-            var dem_young: u64 = 0;
-            var spec_resolved: u64 = 0;
-            var unresolved: u64 = 0;
-            for (entries) |entry| {
-                if (!entry.value.isThunk()) continue;
-                switch (self.objects.get(entry.value.asObjectId()).*) {
-                    .thunk => |t| {
-                        members += 1;
-                        if (t.isDemanded()) {
-                            if (t.demanded_old) dem_old += 1 else dem_young += 1;
-                        } else if (t.future.state.load(.acquire) == 2) {
-                            spec_resolved += 1;
-                        } else {
-                            unresolved += 1;
-                        }
-                    },
-                    else => {},
-                }
-            }
-            if (dem_old + dem_young == 0) continue :scan; // untouched set
-            b.touched += 1;
-            if (dem_old + dem_young == members) b.all_demanded_sets += 1;
-            b.members += members;
-            b.dem_old += dem_old;
-            b.dem_young += dem_young;
-            b.spec_resolved += spec_resolved;
-            b.unresolved += unresolved;
-        }
-        std.debug.print("prof sibling-census (attrsets by entry count; member stats over TOUCHED sets = >=1 demanded member; merge_attrs skipped n={d}):\n", .{merge_attrs_n});
-        var tot: Bucket = .{};
-        for (buckets, 0..) |b, i| {
-            tot.sets += b.sets;
-            tot.touched += b.touched;
-            tot.all_demanded_sets += b.all_demanded_sets;
-            tot.members += b.members;
-            tot.dem_old += b.dem_old;
-            tot.dem_young += b.dem_young;
-            tot.spec_resolved += b.spec_resolved;
-            tot.unresolved += b.unresolved;
-            if (b.sets == 0) continue;
-            std.debug.print(
-                "  size>={d:<3}: sets={d} touched={d} all_dem={d} members={d} dem_old={d} ({d:.1}%) dem_young={d} ({d:.1}%) spec_res={d} ({d:.1}%) unres={d} ({d:.1}%)\n",
-                .{
-                    bucket_lo[i],                        b.sets,                        b.touched,                        b.all_demanded_sets,             b.members,
-                    b.dem_old,                           profPct(b.dem_old, b.members), b.dem_young,                      profPct(b.dem_young, b.members), b.spec_resolved,
-                    profPct(b.spec_resolved, b.members), b.unresolved,                  profPct(b.unresolved, b.members),
-                },
-            );
-        }
-        std.debug.print(
-            "  TOTAL     : sets={d} touched={d} all_dem={d} members={d} dem_old={d} ({d:.1}%) dem_young={d} ({d:.1}%) spec_res={d} ({d:.1}%) unres={d} ({d:.1}%)\n",
-            .{
-                tot.sets,          tot.touched,                             tot.all_demanded_sets, tot.members,
-                tot.dem_old,       profPct(tot.dem_old, tot.members),       tot.dem_young,         profPct(tot.dem_young, tot.members),
-                tot.spec_resolved, profPct(tot.spec_resolved, tot.members), tot.unresolved,        profPct(tot.unresolved, tot.members),
-            },
-        );
-    }
-
-    fn profPct(x: u64, total: u64) f64 {
-        return if (total == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(total));
+        inspection.siblingCensus(self);
     }
 
     pub const Store = enum { object, value, attr };
@@ -1445,7 +940,7 @@ pub const ObjectHeap = struct {
         /// filled id past it; otherwise null. Callers use the returned id
         /// to skip the loop forward (subtract 1 to compensate for the
         /// loop's increment).
-        fn skipPast(self: SkipSet, id: u32) ?u32 {
+        pub fn skipPast(self: SkipSet, id: u32) ?u32 {
             for (self.starts[0..self.len], self.ends[0..self.len]) |s, e| {
                 if (id >= s and id < e) return e;
             }
@@ -1598,11 +1093,10 @@ pub const ObjectHeap = struct {
         const fair_share = (available + self.worker_locals.len - 1) / self.worker_locals.len;
         const take = @min(gc_object_refill_batch, fair_share);
         if (take == 0) return null;
-        local.gc_free_objects.ensureUnusedCapacity(self.allocator, take) catch {
-            const id = self.gc_shared_free_objects.pop();
-            self.gc_shared_free_count.store(self.gc_shared_free_objects.items.len, .release);
-            return id;
-        };
+        // A claimed id must always be abortable without allocation. Refill
+        // into the worker-local vector first; popping from it leaves one slot
+        // of capacity that PendingObjectSlot can use to return the id.
+        local.gc_free_objects.ensureUnusedCapacity(self.allocator, take) catch return null;
         const start = self.gc_shared_free_objects.items.len - take;
         local.gc_free_objects.appendSliceAssumeCapacity(self.gc_shared_free_objects.items[start..]);
         self.gc_shared_free_objects.items.len = start;
@@ -1612,20 +1106,13 @@ pub const ObjectHeap = struct {
 
     const gc_range_refill_batch: usize = 256;
 
-    /// Reuse a worker-owned freed range of at least `n` slots from the
-    /// `range_stores[si]` store. An exact match wins; otherwise the list
-    /// splits a larger range. On a local miss, refill one compatible size
-    /// class from the central overflow in bulk. The fast path remains
-    /// lock-free, while no worker can strand an entire shard of ranges that
-    /// another worker needs.
-    fn gcReuseRange(self: *ObjectHeap, local: *HeapLocal, comptime si: usize, n: u32) ?RangeFreeList.Loc {
+    /// Refill from the central range overflow after the caller has checked its
+    /// worker-local list. The fast path remains lock-free, while no worker can
+    /// strand an entire shard of ranges that another worker needs.
+    fn gcReuseSharedRange(self: *ObjectHeap, local: *HeapLocal, comptime si: usize, n: u32) ?RangeFreeList.Loc {
         const store_index = si;
         const field = range_stores[si].free;
         const shared_field = range_stores[si].shared;
-        if (@field(local, field).pop(self.allocator, n)) |hit| {
-            if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
-            return hit.loc;
-        }
         if (n > self.gc_shared_free_range_max[store_index].load(.acquire)) {
             if (n > 0) {
                 local.range_reuse_miss[store_index] += 1;
@@ -1892,9 +1379,20 @@ pub const ObjectHeap = struct {
     /// across forces), else bump the worker TLAB.
     inline fn reserveStoreLocal(self: *ObjectHeap, comptime si: usize, n: u32) !range_stores[si].Store.Range {
         const row = range_stores[si];
+        if (n == 0) return .{ .segment = 0, .offset = 0, .len = 0 };
         const local = self.currentLocal();
+        const free_list = &@field(local, row.free);
         if (self.collection.collect_enabled) {
-            if (self.gcReuseRange(local, si, n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            if (free_list.pop(self.allocator, n)) |hit| {
+                if (hit.split) local.range_reuse_split[si] += 1 else local.range_reuse_exact[si] += 1;
+                return .{ .segment = hit.loc.segment, .offset = hit.loc.offset, .len = n };
+            }
+            if (self.gcReuseSharedRange(local, si, n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+        } else if (free_list.maxLen() >= n) {
+            // Aborted construction ranges can exist before collection is
+            // armed. Reuse them locally without entering the GC shared pool.
+            if (free_list.pop(self.allocator, n)) |hit|
+                return .{ .segment = hit.loc.segment, .offset = hit.loc.offset, .len = n };
         }
         return self.reserveRangeLocal(
             row.Store,
@@ -1907,6 +1405,44 @@ pub const ObjectHeap = struct {
         );
     }
 
+    /// Release an unpublished side-store reservation. The worker TLAB is the
+    /// common path and rewinds without synchronization. Oversized or reused
+    /// ranges first attempt a concurrency-safe global-tail rewind; if another
+    /// writer has advanced the store, retain the range in the worker's local
+    /// pool so it remains visible to snapshots and reusable before GC.
+    inline fn releaseStoreRange(
+        self: *ObjectHeap,
+        comptime si: usize,
+        range: range_stores[si].Store.Range,
+    ) void {
+        if (range.len == 0) return;
+        const row = range_stores[si];
+        const local = self.currentLocal();
+        const chunk = &@field(local, row.chunk);
+        if (chunk.segment == range.segment and chunk.cursor == range.offset + range.len) {
+            chunk.cursor = range.offset;
+            return;
+        }
+        if (@field(self, row.store).rollback(range)) return;
+        @field(local, row.free).push(self.allocator, range.segment, range.offset, range.len);
+    }
+
+    fn releaseValues(self: *ObjectHeap, range: ValueRange) void {
+        self.releaseStoreRange(comptime rangeStoreIndex("values"), range);
+    }
+
+    fn releaseAttrs(self: *ObjectHeap, range: AttrRange) void {
+        self.releaseStoreRange(comptime rangeStoreIndex("attrs"), range);
+    }
+
+    fn releaseAttrPositions(self: *ObjectHeap, range: AttrPosRange) void {
+        self.releaseStoreRange(comptime rangeStoreIndex("attr_pos"), range);
+    }
+
+    fn releaseBytes(self: *ObjectHeap, range: ByteRange) void {
+        self.releaseStoreRange(comptime rangeStoreIndex("bytes"), range);
+    }
+
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
         return self.reserveStoreLocal(comptime rangeStoreIndex("values"), n);
     }
@@ -1916,25 +1452,33 @@ pub const ObjectHeap = struct {
     /// publishes the final entry count with `publishMergedAttrs`. Used
     /// by attr-set merge primitives to skip a per-merge ArrayList +
     /// extra copy.
-    pub fn reserveAttrsForMerge(self: *ObjectHeap, n: u32) !AttrRange {
-        return self.reserveAttrsLocal(n);
+    pub fn reserveAttrsForMerge(self: *ObjectHeap, n: u32) !PendingAttrs {
+        return .{ .range = try self.reserveAttrsLocal(n) };
     }
 
-    pub fn attrsMutSlice(self: *ObjectHeap, range: AttrRange) []AttrEntry {
-        return self.attrs.sliceMut(range);
+    pub fn attrsMutSlice(self: *ObjectHeap, pending: PendingAttrs) []AttrEntry {
+        return self.attrs.sliceMut(pending.range);
+    }
+
+    pub fn abortMergedAttrs(self: *ObjectHeap, pending: PendingAttrs) void {
+        self.releaseAttrs(pending.range);
     }
 
     /// Commit a partially-filled reservation as a new attrs object. Return the
     /// unused suffix immediately: it has no owner for sweep to find later.
-    pub fn publishMergedAttrs(self: *ObjectHeap, range: AttrRange, actual: u32) !ObjectId {
-        self.releaseAttrsTail(range, actual);
-        if (actual == 0) if (self.empty_attrs_id) |id| return id;
+    pub fn publishMergedAttrs(self: *ObjectHeap, pending: PendingAttrs, actual: u32) !ObjectId {
+        const object = try self.beginObjectSlot();
+        self.releaseAttrsTail(pending.range, actual);
+        if (actual == 0) if (self.empty_attrs_id) |id| {
+            self.abortObjectSlot(object);
+            return id;
+        };
         const trimmed: AttrRange = .{
-            .segment = range.segment,
-            .offset = range.offset,
+            .segment = pending.range.segment,
+            .offset = pending.range.offset,
             .len = actual,
         };
-        return self.add(.{ .attrs = .{ .range = trimmed } });
+        return self.commitObjectSlot(object, .{ .attrs = .{ .range = trimmed } });
     }
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
@@ -1948,13 +1492,11 @@ pub const ObjectHeap = struct {
     fn releaseAttrsTail(self: *ObjectHeap, range: AttrRange, actual: u32) void {
         std.debug.assert(actual <= range.len);
         if (actual == range.len) return;
-        if (!self.collection.collect_enabled and !self.collection.root_active) return;
-        self.currentLocal().gc_free_attrs.push(
-            self.allocator,
-            range.segment,
-            range.offset + actual,
-            range.len - actual,
-        );
+        self.releaseAttrs(.{
+            .segment = range.segment,
+            .offset = range.offset + actual,
+            .len = range.len - actual,
+        });
     }
 
     /// Threshold hook: once reserved bytes cross `collection.threshold_bytes`, request a
@@ -1987,8 +1529,11 @@ pub const ObjectHeap = struct {
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
-        const id = try self.reserveObjectSlot();
-        self.fillObjectSlot(id, object);
+        const pending = try self.beginObjectSlot();
+        return self.commitObjectSlot(pending, object);
+    }
+
+    fn noteObjectCreated(self: *ObjectHeap, id: ObjectId, object: Object) void {
         if (object == .thunk) self.currentLocal().thunks_created += 1;
         // `-Dprof-main` creation-context probe: tag the thunk with whether
         // it was created on the demand chain (vs. inside speculative work).
@@ -1997,26 +1542,28 @@ pub const ObjectHeap = struct {
             if (object == .thunk)
                 self.objects.getMut(id).thunk.created_demand = !self.currentLocal().spec_ctx;
         }
-        return id;
     }
 
-    /// Reserve an object slot and return its ObjectId without filling
-    /// payload. The slot's contents are undefined until `fillObjectSlot`
-    /// is called. The ID is only valid to expose once the slot has been
-    /// filled — concurrent readers reaching the slot before that would
-    /// see garbage. Currently used only at build-time for the
-    /// `builtins.builtins` self-reference, where no other thread can
-    /// observe the in-flight slot.
-    pub fn reserveObjectSlot(self: *ObjectHeap) !ObjectId {
+    /// Begin an object construction transaction. No other object allocation
+    /// may occur on this worker before commit/abort: fresh reservations are
+    /// rolled back by rewinding the worker TLAB, and the young-slot record is
+    /// the list tail. This deliberately narrow lifetime covers heap
+    /// constructors and the single-threaded `builtins.builtins` self-reference.
+    pub fn beginObjectSlot(self: *ObjectHeap) !PendingObjectSlot {
         const local = self.currentLocal();
-        const id = blk: {
+        // Tracking must be infallible after an id has been removed from a free
+        // list or a TLAB cursor has advanced.
+        if (self.collection.collect_enabled)
+            try local.gc_young_slots.ensureUnusedCapacity(self.allocator, 1);
+
+        const pending: PendingObjectSlot = blk: {
             // Reuse a slot freed by a prior collection (own shard, else
             // work-steal from a peer). Detector leaves freed slots unused so
             // use-after-free is caught.
             if (self.collection.collect_enabled and !self.collection.disable_reuse and !gc_debug) {
                 if (self.gcReuseObject(local)) |rid| {
                     local.object_reuse_hits += 1;
-                    break :blk rid;
+                    break :blk .{ .id = rid, .reused = true };
                 }
                 local.object_reuse_misses += 1;
                 if (self.collection.object_miss_collect_armed.swap(false, .acq_rel)) {
@@ -2028,7 +1575,7 @@ pub const ObjectHeap = struct {
             if (chunk.cursor < chunk.end) {
                 const cid = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
                 chunk.cursor += 1;
-                break :blk cid;
+                break :blk .{ .id = cid, .reused = false };
             }
             const refilled = try self.objects.reserve(self.allocator, object_chunk_size);
             local.object_fresh_refills += 1;
@@ -2037,18 +1584,19 @@ pub const ObjectHeap = struct {
             chunk.end = refilled.offset + refilled.len;
             const cid = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
             chunk.cursor += 1;
-            break :blk cid;
+            break :blk .{ .id = cid, .reused = false };
         };
         // Record the id in this worker's young-slot list: the minor iterates
         // exactly these (O(young)), and it's robust to slot reuse and the
         // reserved-vs-filled TLAB tail (both of which broke an id-range frontier).
         if (self.collection.collect_enabled)
-            local.gc_young_slots.append(self.allocator, id) catch @panic("gc young-object tracking exhausted");
-        return id;
+            local.gc_young_slots.appendAssumeCapacity(pending.id);
+        return pending;
     }
 
-    pub fn fillObjectSlot(self: *ObjectHeap, id: ObjectId, object: Object) void {
-        self.objects.getMut(id).* = object;
+    /// Publish a fully initialized object and consume its reservation.
+    pub fn commitObjectSlot(self: *ObjectHeap, pending: PendingObjectSlot, object: Object) ObjectId {
+        self.objects.getMut(pending.id).* = object;
         // In the UAF-detector build the alloc bitmap must be live between
         // collections (every heap read asserts the bit), so set it per fill.
         // In release builds the bitmap is reconstructed at collection time
@@ -2059,8 +1607,29 @@ pub const ObjectHeap = struct {
             // bits go live from eval start so the pre-arming region [bootstrap_
             // end, track_from) has precise per-object bits for the major sweep +
             // assert. Non-constrained: identical to gating on collect_enabled.
-            if (self.collection.root_active) self.gcSetAllocBit(id);
+            if (self.collection.root_active) self.gcSetAllocBit(pending.id);
         }
+        self.noteObjectCreated(pending.id, object);
+        return pending.id;
+    }
+
+    /// Cancel an unpublished object reservation without allocation.
+    pub fn abortObjectSlot(self: *ObjectHeap, pending: PendingObjectSlot) void {
+        const local = self.currentLocal();
+        if (self.collection.collect_enabled) {
+            const young = local.gc_young_slots.pop().?;
+            std.debug.assert(young == pending.id);
+        }
+        if (pending.reused) {
+            // gcReuseObject always pops from a worker-local vector (refilling
+            // it first when necessary), so the pop left room for this return.
+            local.gc_free_objects.appendAssumeCapacity(pending.id);
+            return;
+        }
+        const chunk = &local.object;
+        std.debug.assert(chunk.cursor > 0);
+        std.debug.assert(ObjectStore.globalIdOf(chunk.segment, chunk.cursor - 1) == pending.id);
+        chunk.cursor -= 1;
     }
 
     // --- GC allocation and reclamation state ---
@@ -2111,7 +1680,7 @@ pub const ObjectHeap = struct {
         }
     }
 
-    /// Total bytes ever reserved across the four stores — the committed-RSS
+    /// Total bytes ever reserved across every backing store — the committed-RSS
     /// proxy. Reuse keeps the cursors (and this) from growing, so it
     /// plateaus near the threshold once collection keeps up.
     pub fn totalReservedBytes(self: *const ObjectHeap) u64 {
@@ -2689,9 +2258,11 @@ pub const ObjectHeap = struct {
 
     pub fn addList(self: *ObjectHeap, items: []const Value) !ObjectId {
         if (items.len == 0) if (self.empty_list_id) |id| return id;
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveValuesLocal(@intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);
-        return self.add(.{ .list = range });
+        return self.commitObjectSlot(pending, .{ .list = range });
     }
 
     pub fn addConcatenatedLists(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
@@ -2705,11 +2276,13 @@ pub const ObjectHeap = struct {
         const right = try self.getList(right_id);
         if (right.len == 0) return left_id;
 
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveValuesLocal(@intCast(left.len + right.len));
         const dst = self.values.sliceMut(range);
         @memcpy(dst[0..left.len], left);
         @memcpy(dst[left.len..], right);
-        return self.add(.{ .list = range });
+        return self.commitObjectSlot(pending, .{ .list = range });
     }
 
     /// Concatenate already-validated list Values directly into one heap
@@ -2735,7 +2308,10 @@ pub const ObjectHeap = struct {
         if (non_empty == 0) return lists[lists.len - 1].asObjectId();
         if (non_empty == 1) return sole_non_empty;
 
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveValuesLocal(@intCast(total));
+        errdefer self.releaseValues(range);
         const dst = self.values.sliceMut(range);
         var out: usize = 0;
         for (lists) |list| {
@@ -2745,13 +2321,15 @@ pub const ObjectHeap = struct {
             @memcpy(dst[out..][0..items.len], items);
             out += items.len;
         }
-        return self.add(.{ .list = range });
+        return self.commitObjectSlot(pending, .{ .list = range });
     }
 
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         if (entries.len == 0) if (self.empty_attrs_id) |id| return id;
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.prepareAttrsRange(entries);
-        return self.add(.{ .attrs = .{ .range = range } });
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range } });
     }
 
     /// Same as `addAttrs` but the caller guarantees `entries` is already
@@ -2761,8 +2339,10 @@ pub const ObjectHeap = struct {
     /// `intersectAttrs`) whose output is sorted+unique by construction.
     pub fn addAttrsSorted(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         if (entries.len == 0) if (self.empty_attrs_id) |id| return id;
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendAttrEntries(entries);
-        return self.add(.{ .attrs = .{ .range = range } });
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range } });
     }
 
     /// Allocate + sort + dedup an AttrRange without wrapping it in an
@@ -2771,6 +2351,7 @@ pub const ObjectHeap = struct {
     /// containing slot's id.
     pub fn prepareAttrsRange(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
         const range = try self.appendAttrEntries(entries);
+        errdefer self.releaseAttrs(range);
         try self.sortAndDedupAttrs(range);
         return range;
     }
@@ -2782,26 +2363,32 @@ pub const ObjectHeap = struct {
     ) !ObjectId {
         if (positions.len == 0) return self.addAttrs(entries);
 
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendAttrEntries(entries);
-        errdefer self.attrs.rollback(range);
+        errdefer self.releaseAttrs(range);
         try self.sortAndDedupAttrs(range);
 
         const pos_range = try self.appendAttrPositions(positions);
-        errdefer self.attr_positions.rollback(pos_range);
+        errdefer self.releaseAttrPositions(pos_range);
         self.sortAttrPositions(pos_range);
-        return self.add(.{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
 
     pub fn addContextString(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendAttrEntries(context);
-        errdefer self.attrs.rollback(range);
+        errdefer self.releaseAttrs(range);
         try self.sortAndDedupAttrs(range);
-        return self.add(.{ .context_string = .{ .text = text, .context = range } });
+        return self.commitObjectSlot(pending, .{ .context_string = .{ .text = text, .context = range } });
     }
 
     pub fn addMergedAttrs(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
         const left = try self.materializeAttrs(left_id);
         const right = try self.materializeAttrs(right_id);
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
 
         // Reserve worst-case capacity and write the merge directly into heap
         // storage. Inputs are both sorted and deduplicated, so
@@ -2812,6 +2399,7 @@ pub const ObjectHeap = struct {
         // duplicate names is returned to the range free list below.
         const cap: u32 = @intCast(left.len + right.len);
         const reserved = try self.reserveAttrsLocal(cap);
+        errdefer self.releaseAttrs(reserved);
         const dst = self.attrs.sliceMut(reserved);
 
         var out: usize = 0;
@@ -2847,7 +2435,7 @@ pub const ObjectHeap = struct {
         }
 
         const positions = try self.mergeAttrPositions(left_id, right_id, right);
-        errdefer if (positions.len != 0) self.attr_positions.rollback(positions);
+        errdefer self.releaseAttrPositions(positions);
 
         const range: AttrRange = .{
             .segment = reserved.segment,
@@ -2857,8 +2445,11 @@ pub const ObjectHeap = struct {
         self.releaseAttrsTail(reserved, range.len);
         // Both operands empty (`{} // {}` strict): the tail release above
         // already returned the reserved storage; hand back the shared `{ }`.
-        if (range.len == 0 and positions.len == 0) if (self.empty_attrs_id) |id| return id;
-        return self.add(.{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(positions) } });
+        if (range.len == 0 and positions.len == 0) if (self.empty_attrs_id) |id| {
+            self.abortObjectSlot(pending);
+            return id;
+        };
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(positions) } });
     }
 
     pub fn addAttrsFromStackPairs(self: *ObjectHeap, pairs: []const Value) !ObjectId {
@@ -2876,6 +2467,8 @@ pub const ObjectHeap = struct {
     ) !ObjectId {
         std.debug.assert(names.len == values.len);
         if (names.len == 0) if (self.empty_attrs_id) |id| return id;
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveAttrsLocal(@intCast(names.len));
         const entries = self.attrs.sliceMut(range);
         for (entries, names, values) |*e, n, v| e.* = .{ .name = n, .value = v };
@@ -2884,7 +2477,7 @@ pub const ObjectHeap = struct {
         // instance of the literal shares the chunk's baked table; nothing
         // is copied into the heap store.
         std.debug.assert(positionsSortedByName(self.attrPositionsEntries(positions)));
-        return self.add(.{ .attrs = .{ .range = range, .positions = positions } });
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = positions } });
     }
 
     /// `attrs_new_srt` fast path: the compiler guarantees the pairs
@@ -2920,7 +2513,10 @@ pub const ObjectHeap = struct {
         // Every key was a dynamic `null` (or there were no pairs): `{ }`.
         if (count == 0) if (self.empty_attrs_id) |id| return id;
 
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveAttrsLocal(count);
+        errdefer self.releaseAttrs(range);
         const entries = self.attrs.sliceMut(range);
 
         var i: usize = 0;
@@ -2940,15 +2536,15 @@ pub const ObjectHeap = struct {
             try self.sortAndDedupAttrs(range);
         }
 
-        if (positions.len == 0) return self.add(.{ .attrs = .{ .range = range } });
+        if (positions.len == 0) return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range } });
 
         // Positions arrive pre-sorted by name: the only producer is the
         // compiler's `emitBuildAttrs`, which bakes them sorted. No
         // runtime sort needed (findAttrPos binary-searches by name).
         std.debug.assert(positionsSortedByName(positions));
         const pos_range = try self.appendAttrPositions(positions);
-        errdefer self.attr_positions.rollback(pos_range);
-        return self.add(.{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
+        errdefer self.releaseAttrPositions(pos_range);
+        return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
 
     fn attrEntriesSortedUnique(entries: []const AttrEntry) bool {
@@ -2968,18 +2564,20 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addClosure(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(upvalues);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .closure = .{
+        return self.commitObjectSlot(pending, .{ .closure = .{
             .chunk_id = chunk_id,
             .upvalues = range,
         } });
     }
 
     pub fn addBuiltinClosure(self: *ObjectHeap, builtin_id: u16, args: []const Value) !ObjectId {
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(args);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .builtin_closure = .{
+        return self.commitObjectSlot(pending, .{ .builtin_closure = .{
             .builtin_id = builtin_id,
             .args = range,
         } });
@@ -2992,9 +2590,10 @@ pub const ObjectHeap = struct {
     /// Build a partial-application object from `func` (an arity>1 closure
     /// or another PAP's underlying closure) and the args supplied so far.
     pub fn addPartialApp(self: *ObjectHeap, func: Value, args: []const Value) !ObjectId {
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(args);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .partial_app = .{
+        return self.commitObjectSlot(pending, .{ .partial_app = .{
             .func = func,
             .args = range,
         } });
@@ -3027,15 +2626,16 @@ pub const ObjectHeap = struct {
             }
             return self.add(.{ .heap_string_inline = obj });
         }
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.reserveStoreLocal(comptime rangeStoreIndex("bytes"), byteAllocSize(total));
-        errdefer self.bytes.rollback(range);
         const dst = self.bytes.sliceMut(range);
         var off: usize = 0;
         for (parts) |s| {
             @memcpy(dst[off..][0..s.len], s);
             off += s.len;
         }
-        return self.add(.{ .heap_string = .{ .bytes = range, .text_len = total } });
+        return self.commitObjectSlot(pending, .{ .heap_string = .{ .bytes = range, .text_len = total } });
     }
 
     /// Borrow a heap string's bytes. Same lifetime contract as
@@ -3068,9 +2668,10 @@ pub const ObjectHeap = struct {
         if (upvalues.len <= BytecodeThunk.inline_capacity) {
             return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, upvalues) });
         }
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(upvalues);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .thunk = Thunk.initBytecodeSpilled(chunk_id, self.values.slice(range), range.segment, range.offset) });
+        return self.commitObjectSlot(pending, .{ .thunk = Thunk.initBytecodeSpilled(chunk_id, self.values.slice(range), range.segment, range.offset) });
     }
 
     /// A deferred-compile thunk (lazy per-attr compilation). Same inline
@@ -3079,9 +2680,10 @@ pub const ObjectHeap = struct {
         if (env.len <= DeferredThunk.inline_capacity) {
             return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, env) });
         }
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
         const range = try self.appendValues(env);
-        errdefer self.values.rollback(range);
-        return self.add(.{ .thunk = Thunk.initDeferredSpilled(deferred_id, self.values.slice(range), range.segment, range.offset) });
+        return self.commitObjectSlot(pending, .{ .thunk = Thunk.initDeferredSpilled(deferred_id, self.values.slice(range), range.segment, range.offset) });
     }
 
     /// Wrap `value` in a pre-resolved, undemanded thunk. Used by the
@@ -3093,9 +2695,12 @@ pub const ObjectHeap = struct {
     }
 
     pub fn beginBytecodeThunk(self: *ObjectHeap, chunk_id: ChunkId, upvalue_count: usize) !PendingBytecodeThunk {
+        const object = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(object);
         const range = try self.reserveValuesLocal(@intCast(upvalue_count));
         return .{
             .chunk_id = chunk_id,
+            .object = object,
             .range = range,
         };
     }
@@ -3105,11 +2710,10 @@ pub const ObjectHeap = struct {
     }
 
     pub fn commitBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) !ObjectId {
-        errdefer self.values.rollback(pending.range);
         const upvalues = self.values.slice(pending.range);
         if (upvalues.len <= BytecodeThunk.inline_capacity)
-            return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, upvalues) });
-        return self.add(.{ .thunk = Thunk.initBytecodeSpilled(pending.chunk_id, upvalues, pending.range.segment, pending.range.offset) });
+            return self.commitObjectSlot(pending.object, .{ .thunk = Thunk.initBytecode(pending.chunk_id, upvalues) });
+        return self.commitObjectSlot(pending.object, .{ .thunk = Thunk.initBytecodeSpilled(pending.chunk_id, upvalues, pending.range.segment, pending.range.offset) });
     }
 
     /// Return a thunk target's spilled captures once evaluation has unwound
@@ -3124,7 +2728,8 @@ pub const ObjectHeap = struct {
     }
 
     pub fn rollbackBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) void {
-        self.values.rollback(pending.range);
+        self.releaseValues(pending.range);
+        self.abortObjectSlot(pending.object);
     }
 
     fn appendValues(self: *ObjectHeap, items: []const Value) !ValueRange {
@@ -3273,15 +2878,22 @@ pub const ObjectHeap = struct {
     }
 
     /// `publishMergedAttrs` with a position table attached.
-    pub fn publishMergedAttrsWithPositions(self: *ObjectHeap, range: AttrRange, actual: u32, positions: AttrPosRange) !ObjectId {
-        self.releaseAttrsTail(range, actual);
-        if (actual == 0 and positions.len == 0) if (self.empty_attrs_id) |id| return id;
+    pub fn publishMergedAttrsWithPositions(self: *ObjectHeap, pending: PendingAttrs, actual: u32, positions: AttrPosRange) !ObjectId {
+        const object = self.beginObjectSlot() catch |err| {
+            self.releaseAttrPositions(positions);
+            return err;
+        };
+        self.releaseAttrsTail(pending.range, actual);
+        if (actual == 0 and positions.len == 0) if (self.empty_attrs_id) |id| {
+            self.abortObjectSlot(object);
+            return id;
+        };
         const trimmed: AttrRange = .{
-            .segment = range.segment,
-            .offset = range.offset,
+            .segment = pending.range.segment,
+            .offset = pending.range.offset,
             .len = actual,
         };
-        return self.add(.{ .attrs = .{ .range = trimmed, .positions = AttrPositions.fromRange(positions) } });
+        return self.commitObjectSlot(object, .{ .attrs = .{ .range = trimmed, .positions = AttrPositions.fromRange(positions) } });
     }
 
     /// Borrow an attrset's source-position entries (empty slice when it
@@ -3293,31 +2905,6 @@ pub const ObjectHeap = struct {
         };
     }
 };
-
-fn bucketInt(buckets: *[5]u32, value: Value) void {
-    // Boxed ints are by definition outside i48 inline range; count them
-    // in bucket 4 without a heap lookup. Inline ints get magnitude-binned.
-    if (value.isBoxedInt()) {
-        buckets[4] += 1;
-        return;
-    }
-    if (!value.isInt()) return;
-    const x = value.asInt();
-    if (x == 0) {
-        buckets[0] += 1;
-        return;
-    }
-    const mag: u64 = @abs(x);
-    const idx: usize = if (mag < (@as(u64, 1) << 15))
-        1
-    else if (mag < (@as(u64, 1) << 31))
-        2
-    else if (mag < (@as(u64, 1) << 47))
-        3
-    else
-        4;
-    buckets[idx] += 1;
-}
 
 fn binarySearchAttr(entries: []const AttrEntry, name: InternId) ?Value {
     const idx = binarySearchAttrIndex(entries, name) orelse return null;

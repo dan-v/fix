@@ -39,10 +39,11 @@ pub fn report(
     }.f;
     const p = std.debug.print;
 
-    const obj_b = @as(u64, heap.objects.count()) * @sizeOf(heap_mod.Object);
-    const val_b = @as(u64, heap.values.count()) * @sizeOf(Value);
-    const attr_b = @as(u64, heap.attrs.count()) * @sizeOf(heap_mod.AttrEntry);
-    const apos_b = @as(u64, heap.attr_positions.count()) * @sizeOf(heap_mod.AttrPosEntry);
+    const heap_counts = heap.counts();
+    const obj_b = @as(u64, heap_counts.objects) * @sizeOf(heap_mod.Object);
+    const val_b = @as(u64, heap_counts.values) * @sizeOf(Value);
+    const attr_b = @as(u64, heap_counts.attrs) * @sizeOf(heap_mod.AttrEntry);
+    const apos_b = @as(u64, heap_counts.attr_positions) * @sizeOf(heap_mod.AttrPosEntry);
     const stores_b = obj_b + val_b + attr_b + apos_b;
 
     const is = intern.stats();
@@ -64,9 +65,9 @@ pub fn report(
     const footprint = rss + huge_peak;
 
     p("\n=== MEM REPORT — peak RSS attribution ===\n", .{});
-    p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), heap.objects.count() });
-    p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), heap.values.count() });
-    p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), heap.attrs.count() });
+    p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), heap_counts.objects });
+    p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), heap_counts.values });
+    p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), heap_counts.attrs });
     p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
     p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
     const object_reuse = heap.objectReuseStats();

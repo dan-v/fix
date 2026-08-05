@@ -45,4 +45,31 @@ if rg -n '@import\("(\.\./)+(base|syntax|runtime|store|fetchers|expr|cli)(/|\.zi
   failed=1
 fi
 
+# ObjectHeap's stores are collector implementation details. Expression and CLI
+# code consume counts, snapshots, and semantic accessors instead of coupling to
+# the segmented backing layout.
+if rg -n '\bheap\.(objects|values|attrs|attr_positions|bytes)\b' \
+  "$src/expr" "$src/cli" "$src/store" "$src/fetchers"; then
+  echo "structure-check: use ObjectHeap APIs outside the runtime heap implementation" >&2
+  failed=1
+fi
+
+# Foundational compiler stages must not import the attrset lowering stage just
+# to decode names or report diagnostics; attr_names.zig owns that leaf concern.
+if rg -n '@import\("attrs\.zig"\)' \
+  "$src/expr/compiler/diagnostics.zig" \
+  "$src/expr/compiler/emit.zig" \
+  "$src/expr/compiler/access.zig" \
+  "$src/expr/compiler/fold.zig" \
+  "$src/expr/compiler/lambda.zig" \
+  "$src/expr/compiler/literals.zig"; then
+  echo "structure-check: compiler leaf stages must not depend on attrset lowering" >&2
+  failed=1
+fi
+
+if [[ -e "$src/expr/engine/capabilities.zig" ]]; then
+  echo "structure-check: do not restore forwarding-only Engine capability views" >&2
+  failed=1
+fi
+
 exit "$failed"

@@ -82,7 +82,7 @@ pub fn builtinAddErrorContext(self: *VM, message_arg: Value, value_arg: Value) !
         };
         self.trace = saved_trace;
         ctx.clearFailure();
-        const wrapped = self.heap.failures.addContext(cause, message);
+        const wrapped = self.heap.addFailureContext(cause, message);
         ctx.restore(wrapped);
         // If the origin has already been materialized into this demand trace,
         // append the new context now. A future cached observer reconstructs it

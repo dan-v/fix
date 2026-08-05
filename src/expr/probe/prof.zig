@@ -386,7 +386,7 @@ pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
     std.debug.print("prof builtins (top-{d} by EXCL cycles — own-body cost):\n", .{top_count});
     for (top_b) |entry| {
         if (entry.cycles == 0) break;
-        const name = @tagName(@as(BuiltinId, @enumFromInt(entry.id)));
+        const name = @import("runtime").builtins.displayName(@enumFromInt(entry.id));
         std.debug.print("  {s}: excl={d} incl={d} calls={d} avg_excl={d}\n", .{ name, entry.cycles, entry.incl, entry.calls, entry.cycles / entry.calls });
     }
     // Attr inline-cache, thunk-memo, repeat-force, and attr-lookup size censuses.

@@ -24,7 +24,7 @@ bytes.
 ## Why non-moving + precise
 
 - **Non-moving.** [ObjectIds](runtime/heap.md) are dense indices baked into thunks, [values](runtime/values.md), and range headers across many *suspended [fibers](parallel/fibers.md)*. Moving objects would require finding and rewriting every ObjectId in parked fiber state. This collector instead keeps objects in place; survivors are promoted in place (the generation bit flips, the id is unchanged) and may leave fragmentation.
-- **Precise.** No C-stack / register scan. The collector walks *exact heap edges* from an enumerated root set via the heap's trace map. This is why roots must be enumerated explicitly and completely (below) — a missed root is a use-after-free, not a conservative over-retention.
+- **Precise.** No C-stack / register scan. The collector walks *exact heap edges* from an enumerated root set via the canonical `runtime/heap/edges.zig` trace map, shared with closure validation and tooling. This is why roots must be enumerated explicitly and completely (below) — a missed root is a use-after-free, not a conservative over-retention.
 
 ## Generational structure
 

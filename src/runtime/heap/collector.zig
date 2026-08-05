@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const heap_mod = @import("../heap.zig");
+const heap_edges = @import("edges.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const HeapLocal = heap_mod.HeapLocal;
 const Object = heap_mod.Object;
@@ -280,16 +281,78 @@ pub fn remsetClear(heap: *ObjectHeap) void {
     for (heap.worker_locals) |*wl| wl.gc_remset.clearRetainingCapacity();
 }
 
+fn bitSet(bits: []const u64, id: ObjectId) bool {
+    const word = id >> 6;
+    return word < bits.len and bits[word] & (@as(u64, 1) << @intCast(id & 63)) != 0;
+}
+
+const ClosureCheck = enum { minor, full };
+
+/// Verification policy over the canonical object-edge walk. Keeping the
+/// checker separate from graph shape makes it impossible for diagnostics to
+/// silently omit a newly-added object arm or thunk target.
+const ClosureSink = struct {
+    pub const Error = error{};
+
+    heap: *const ObjectHeap,
+    mark_bits: []const u64,
+    parent: ObjectId,
+    shown: *u32,
+    check: ClosureCheck,
+
+    fn checkObject(self: *ClosureSink, child: ObjectId) void {
+        switch (self.check) {
+            .minor => {
+                if (!self.heap.gcIsYoung(child) or bitSet(self.mark_bits, child)) return;
+                if (self.shown.* < 8) {
+                    std.debug.print("GC MISSED EDGE: {s} {d} -> unmarked young {s} {d}\n", .{
+                        @tagName(self.heap.objects.get(self.parent).*),
+                        self.parent,
+                        @tagName(self.heap.objects.get(child).*),
+                        child,
+                    });
+                    self.shown.* += 1;
+                }
+            },
+            .full => {
+                if (!bitSet(self.heap.collection.alloc_bits, child) or bitSet(self.mark_bits, child)) return;
+                if (self.shown.* < 8) {
+                    std.debug.print("  TRACER-MISSED EDGE: marked {d} ({s}) -> unmarked {d} ({s})\n", .{
+                        self.parent,
+                        @tagName(self.heap.objects.get(self.parent).*),
+                        child,
+                        @tagName(self.heap.objects.get(child).*),
+                    });
+                    self.shown.* += 1;
+                }
+            },
+        }
+    }
+
+    pub inline fn objectSlot(_: *ClosureSink) Error!void {}
+    pub inline fn object(self: *ClosureSink, _: *const ObjectHeap, child: ObjectId) Error!void {
+        self.checkObject(child);
+    }
+    pub inline fn chunk(_: *ClosureSink, _: heap_mod.ChunkId) Error!void {}
+    pub inline fn value(self: *ClosureSink, _: *const ObjectHeap, child: Value) Error!void {
+        if (ObjectHeap.gcHeapId(child)) |id| self.checkObject(id);
+    }
+    pub inline fn valueRange(self: *ClosureSink, heap: *const ObjectHeap, range: heap_mod.ValueRange) Error!void {
+        for (heap.values.slice(range)) |child| try self.value(heap, child);
+    }
+    pub inline fn attrRange(self: *ClosureSink, heap: *const ObjectHeap, range: heap_mod.AttrRange) Error!void {
+        for (heap.attrs.slice(range)) |entry| try self.value(heap, entry.value);
+    }
+    pub inline fn attrPositions(_: *ClosureSink, _: heap_mod.AttrPositions) Error!void {}
+    pub inline fn capturedValues(self: *ClosureSink, heap: *const ObjectHeap, values: []const Value, _: bool) Error!void {
+        for (values) |child| try self.value(heap, child);
+    }
+};
+
 /// In detector builds, verify that every young child of a live object was
 /// marked before sweeping. A failure identifies the missed parent-child edge.
 pub fn verifyMinorClosure(heap: *ObjectHeap, mark_bits: []const u64) void {
     if (comptime !gc_debug) return;
-    const marked = struct {
-        fn f(mb: []const u64, id: ObjectId) bool {
-            const w = id >> 6;
-            return w < mb.len and (mb[w] & (@as(u64, 1) << @intCast(id & 63))) != 0;
-        }
-    }.f;
     var shown: u32 = 0;
     // Include pinned objects because they may point into the young generation.
     var id: ObjectId = 0;
@@ -301,51 +364,9 @@ pub fn verifyMinorClosure(heap: *ObjectHeap, mark_bits: []const u64) void {
         // Only LIVE parents constrain the mark: a dead young object
         // (unmarked, about to be swept) may freely reference dead young
         // children. Old and marked-young parents are live.
-        if (heap.gcIsYoung(id) and !marked(mark_bits, id)) continue;
-        const obj = heap.objects.get(id);
-        const check = struct {
-            fn f(h: *ObjectHeap, mb: []const u64, parent: ObjectId, child_v: Value, sh: *u32) void {
-                const cid = ObjectHeap.gcHeapId(child_v) orelse return;
-                if (!h.gcIsYoung(cid)) return; // old child: fine (not in minor set)
-                if (!marked(mb, cid) and sh.* < 8) {
-                    std.debug.print("GC MISSED EDGE: {s} {d} -> unmarked young {s} {d}\n", .{ @tagName(h.objects.get(parent).*), parent, @tagName(h.objects.get(cid).*), cid });
-                    sh.* += 1;
-                }
-            }
-        }.f;
-        switch (obj.*) {
-            .list => |r| for (heap.values.slice(r)) |v| check(heap, mark_bits, id, v, &shown),
-            .attrs => |a| for (heap.attrs.slice(a.range)) |e| check(heap, mark_bits, id, e.value, &shown),
-            .closure => |c| for (heap.values.slice(c.upvalues)) |v| check(heap, mark_bits, id, v, &shown),
-            .builtin_closure => |c| for (heap.values.slice(c.args)) |v| check(heap, mark_bits, id, v, &shown),
-            .partial_app => |p| {
-                check(heap, mark_bits, id, p.func, &shown);
-                for (heap.values.slice(p.args)) |v| check(heap, mark_bits, id, v, &shown);
-            },
-            .context_string => |c| for (heap.attrs.slice(c.context)) |e| check(heap, mark_bits, id, e.value, &shown),
-            .merge_attrs => |m| {
-                check(heap, mark_bits, id, Value.attrs(m.base), &shown);
-                check(heap, mark_bits, id, Value.attrs(m.overlay), &shown);
-                const flat = m.flattened.load(.monotonic);
-                if (flat != heap_mod.no_flattened_attrs) check(heap, mark_bits, id, Value.attrs(flat), &shown);
-            },
-            .thunk => |*t| {
-                const FutureState = @import("../future.zig").FutureState;
-                const fs = @as(FutureState, @enumFromInt(t.future.state.load(.monotonic)));
-                switch (fs) {
-                    .resolved => check(heap, mark_bits, id, t.payload.result, &shown),
-                    .errored, .blackhole => {},
-                    .unresolved, .evaluating => switch (t.targetKind()) {
-                        .closure => check(heap, mark_bits, id, t.payload.target.closure, &shown),
-                        .pass_through => check(heap, mark_bits, id, t.payload.target.pass_through, &shown),
-                        .attr_access => check(heap, mark_bits, id, t.payload.target.attr_access.base, &shown),
-                        .bytecode => for (t.payload.target.bytecode.upvalues()) |v| check(heap, mark_bits, id, v, &shown),
-                        .deferred => for (t.payload.target.deferred.env()) |v| check(heap, mark_bits, id, v, &shown),
-                    },
-                }
-            },
-            .boxed_int, .heap_string, .heap_string_inline => {},
-        }
+        if (heap.gcIsYoung(id) and !bitSet(mark_bits, id)) continue;
+        var sink = ClosureSink{ .heap = heap, .mark_bits = mark_bits, .parent = id, .shown = &shown, .check = .minor };
+        heap_edges.walkObject(ClosureSink, &sink, heap, id) catch unreachable;
     }
     if (shown > 0) @panic("gc: minor mark not closed — missed edge (see MISSED EDGE lines)");
 }
@@ -462,56 +483,13 @@ pub fn finishMinorSweep(heap: *ObjectHeap) ObjectHeap.MinorStats {
 /// object is genuinely unreachable (held only by a Zig local / untracked
 /// root). Prints up to a few violations. STW-only.
 pub fn verifyMarkClosed(heap: *ObjectHeap, mark_bits: []const u64) void {
-    const marked = struct {
-        fn f(mb: []const u64, ab: []const u64, id: ObjectId) bool {
-            const w = id >> 6;
-            const bit = @as(u64, 1) << @intCast(id & 63);
-            if (w >= ab.len or ab[w] & bit == 0) return false; // not filled
-            return w < mb.len and (mb[w] & bit != 0);
-        }
-    }.f;
-    const check = struct {
-        fn f(h: *ObjectHeap, mb: []const u64, parent: ObjectId, child_v: Value, shown: *u32) void {
-            if (!(child_v.isList() or child_v.isAttrs() or child_v.isThunk() or child_v.isClosure() or
-                child_v.isBuiltinClosure() or child_v.isContextString() or child_v.isBoxedInt() or child_v.isPartialApp())) return;
-            const child = child_v.asObjectId();
-            const w = child >> 6;
-            const bit = @as(u64, 1) << @intCast(child & 63);
-            const filled = w < h.collection.alloc_bits.len and (h.collection.alloc_bits[w] & bit != 0);
-            if (!filled) return;
-            const cmarked = w < mb.len and (mb[w] & bit != 0);
-            if (!cmarked and shown.* < 8) {
-                std.debug.print("  TRACER-MISSED EDGE: marked {d} ({s}) -> unmarked {d} ({s})\n", .{ parent, @tagName(h.objects.get(parent).*), child, @tagName(h.objects.get(child).*) });
-                shown.* += 1;
-            }
-        }
-    }.f;
     var shown: u32 = 0;
     var id: ObjectId = 0;
     const n = heap.objects.count();
     while (id < n and shown < 8) : (id += 1) {
-        if (!marked(mark_bits, heap.collection.alloc_bits, id)) continue;
-        const obj = heap.objects.get(id);
-        switch (obj.*) {
-            .list => |r| for (heap.values.slice(r)) |v| check(heap, mark_bits, id, v, &shown),
-            .attrs => |a| for (heap.attrs.slice(a.range)) |e| check(heap, mark_bits, id, e.value, &shown),
-            .closure => |c| for (heap.values.slice(c.upvalues)) |v| check(heap, mark_bits, id, v, &shown),
-            .builtin_closure => |c| for (heap.values.slice(c.args)) |v| check(heap, mark_bits, id, v, &shown),
-            .partial_app => |p| {
-                check(heap, mark_bits, id, p.func, &shown);
-                for (heap.values.slice(p.args)) |v| check(heap, mark_bits, id, v, &shown);
-            },
-            .context_string => |c| for (heap.attrs.slice(c.context)) |e| check(heap, mark_bits, id, e.value, &shown),
-            .merge_attrs => |m| {
-                check(heap, mark_bits, id, Value.attrs(m.base), &shown);
-                check(heap, mark_bits, id, Value.attrs(m.overlay), &shown);
-            },
-            .thunk => |*t| {
-                if (@as(@import("../future.zig").FutureState, @enumFromInt(t.future.state.load(.monotonic))) == .resolved)
-                    check(heap, mark_bits, id, t.payload.result, &shown);
-            },
-            else => {},
-        }
+        if (!bitSet(heap.collection.alloc_bits, id) or !bitSet(mark_bits, id)) continue;
+        var sink = ClosureSink{ .heap = heap, .mark_bits = mark_bits, .parent = id, .shown = &shown, .check = .full };
+        heap_edges.walkObject(ClosureSink, &sink, heap, id) catch unreachable;
     }
     if (shown > 0) std.debug.print("=== ^ mark NOT closed: tracer missed edges (bug) ===\n", .{});
 }
