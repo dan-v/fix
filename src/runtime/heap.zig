@@ -128,62 +128,63 @@ pub const ByteRange = ByteStore.Range;
 /// segment-less) store is never indexed.
 pub const empty_attr_positions: AttrPosRange = .{ .segment = 0, .offset = 0, .len = 0 };
 
-/// Where an attrset's source positions live: nowhere (`len == 0`), in the
-/// heap's attr-position store (dynamic builders — `listToAttrs`, `//`
-/// merges), or in a bytecode chunk's immortal baked table (literal
-/// attrsets — the dominant population; every instance of a literal
-/// SHARES the chunk's sorted table instead of copying it into the heap,
-/// which was ~200M copied entries / 2.4GB on a whole-nixpkgs eval).
-/// 12 bytes in all forms; bit 31 of `tag_and_start` marks a chunk ref.
+const AttrPositionStorage = extern union {
+    heap: extern struct { segment: u32, offset: u32 },
+    borrowed: [*]const AttrPosEntry,
+};
+
+/// Where an attrset's source positions live: nowhere, in the heap's
+/// attr-position store (dynamic builders — `listToAttrs`, `//` merges), or in
+/// borrowed immutable storage owned by the expression engine (literal
+/// attrsets). Runtime objects retain only the view they need; they do not know
+/// which compiler storage object owns it.
 pub const AttrPositions = extern struct {
-    /// Chunk ref: `chunk_ref_tag | table_start`. Heap range: segment.
-    tag_and_start: u32,
-    /// Chunk ref: the ChunkId. Heap range: offset.
-    id_or_offset: u32,
+    storage: AttrPositionStorage,
     len: u32,
+    kind: enum(u32) { none, heap, borrowed },
 
-    const chunk_ref_tag: u32 = 1 << 31;
-
-    pub const none: AttrPositions = .{ .tag_and_start = 0, .id_or_offset = 0, .len = 0 };
+    pub const none: AttrPositions = .{
+        .storage = .{ .heap = .{ .segment = 0, .offset = 0 } },
+        .len = 0,
+        .kind = .none,
+    };
 
     pub fn fromRange(r: AttrPosRange) AttrPositions {
-        std.debug.assert(r.segment & chunk_ref_tag == 0);
         if (r.len == 0) return none;
-        return .{ .tag_and_start = r.segment, .id_or_offset = r.offset, .len = r.len };
+        return .{
+            .storage = .{ .heap = .{ .segment = r.segment, .offset = r.offset } },
+            .len = r.len,
+            .kind = .heap,
+        };
     }
 
-    pub fn fromChunk(chunk_id: u32, table_start: u32, count: u32) AttrPositions {
-        std.debug.assert(table_start < chunk_ref_tag);
-        if (count == 0) return none;
-        return .{ .tag_and_start = chunk_ref_tag | table_start, .id_or_offset = chunk_id, .len = count };
+    pub fn borrowed(entries: []const AttrPosEntry) AttrPositions {
+        if (entries.len == 0) return none;
+        return .{
+            .storage = .{ .borrowed = entries.ptr },
+            .len = @intCast(entries.len),
+            .kind = .borrowed,
+        };
     }
 
-    pub fn isChunkRef(self: AttrPositions) bool {
-        return self.tag_and_start & chunk_ref_tag != 0;
+    pub fn isBorrowed(self: AttrPositions) bool {
+        return self.kind == .borrowed;
     }
 
-    /// Entries resident in the heap store (0 for chunk refs) — the store
+    /// Entries resident in the heap store (0 for borrowed views) — the store
     /// accounting/sweep quantity.
     pub fn heapLen(self: AttrPositions) u32 {
-        return if (self.isChunkRef()) 0 else self.len;
+        return if (self.kind == .heap) self.len else 0;
     }
 
     pub fn heapRange(self: AttrPositions) AttrPosRange {
-        std.debug.assert(!self.isChunkRef());
-        return .{ .segment = self.tag_and_start, .offset = self.id_or_offset, .len = self.len };
+        std.debug.assert(self.kind == .heap);
+        return .{
+            .segment = self.storage.heap.segment,
+            .offset = self.storage.heap.offset,
+            .len = self.len,
+        };
     }
-
-    pub fn chunkId(self: AttrPositions) ?ChunkId {
-        return if (self.isChunkRef()) self.id_or_offset else null;
-    }
-};
-
-/// Resolves a chunk's baked attr-position table for `AttrPositions` chunk
-/// refs. Type-erased: the chunk registry lives in the expression engine
-/// and the heap must not import it (same pattern as `GcHook`).
-pub const ChunkAttrPosResolver = struct {
-    ctx: *anyopaque,
-    resolve: *const fn (ctx: *anyopaque, chunk_id: u32) []const AttrPosEntry,
 };
 
 pub const Closure = struct {
@@ -624,10 +625,6 @@ pub const ObjectHeap = struct {
     /// allocator can reuse heap addresses, so a stale slot would match
     /// pointer equality even though it refers to a freed heap.
     token: u64,
-    /// Resolves `AttrPositions` chunk refs to the chunk's baked table.
-    /// Set once by the engine after the chunk registry exists; null only
-    /// in standalone heap tests, where chunk refs are never created.
-    chunk_attr_pos: ?ChunkAttrPosResolver = null,
     /// Collection policy, barriers, bitmaps, and parallel minor-sweep state.
     collection: HeapCollectionState,
     /// Shared immutable singletons for `[]` and `{}`: every empty list/attrs
@@ -1506,6 +1503,16 @@ pub const ObjectHeap = struct {
         });
     }
 
+    fn releaseAttrPositionsTail(self: *ObjectHeap, range: AttrPosRange, actual: u32) void {
+        std.debug.assert(actual <= range.len);
+        if (actual == range.len) return;
+        self.releaseAttrPositions(.{
+            .segment = range.segment,
+            .offset = range.offset + actual,
+            .len = range.len - actual,
+        });
+    }
+
     /// Threshold hook: once reserved bytes cross `collection.threshold_bytes`, request a
     /// (non-moving) collection to run at the next forceThunk safepoint — it marks
     /// live, promotes survivors in place, and frees dead ranges to the free lists.
@@ -1573,12 +1580,7 @@ pub const ObjectHeap = struct {
                     break :blk .{ .id = rid, .reused = true };
                 }
                 local.object_reuse_misses += 1;
-                // Disarmed is overwhelmingly the common case. Avoid a locked
-                // RMW on every fresh object allocation; only contenders that
-                // observe an armed trigger pay for the one-winner transition.
-                if (self.collection.object_miss_collect_armed.load(.monotonic) and
-                    self.collection.object_miss_collect_armed.cmpxchgStrong(true, false, .acq_rel, .monotonic) == null)
-                {
+                if (self.collection.object_miss_collect_armed.swap(false, .acq_rel)) {
                     self.collection.collect_requested.store(true, .monotonic);
                     _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
                 }
@@ -1997,22 +1999,14 @@ pub const ObjectHeap = struct {
         };
     }
 
-    pub fn setChunkAttrPosResolver(self: *ObjectHeap, resolver: ChunkAttrPosResolver) void {
-        self.chunk_attr_pos = resolver;
-    }
-
-    /// The position entries an `AttrPositions` names — a chunk's baked
-    /// table slice (immortal, shared) or a heap-store slice.
+    /// The position entries an `AttrPositions` names — an immutable borrowed
+    /// view owned above the runtime layer or a heap-store slice.
     pub fn attrPositionsEntries(self: *const ObjectHeap, p: AttrPositions) []const AttrPosEntry {
-        if (p.len == 0) return &.{};
-        if (p.isChunkRef()) {
-            const r = self.chunk_attr_pos orelse return &.{};
-            const table = r.resolve(r.ctx, p.id_or_offset);
-            const start = p.tag_and_start & ~AttrPositions.chunk_ref_tag;
-            if (start + p.len > table.len) return &.{};
-            return table[start .. start + p.len];
-        }
-        return self.attr_positions.slice(p.heapRange());
+        return switch (p.kind) {
+            .none => &.{},
+            .heap => self.attr_positions.slice(p.heapRange()),
+            .borrowed => p.storage.borrowed[0..p.len],
+        };
     }
 
     pub fn getAttrPos(self: *const ObjectHeap, id: ObjectId, name: InternId) ?SourcePos {
@@ -2468,14 +2462,17 @@ pub const ObjectHeap = struct {
         return self.addAttrsFromStackPairsImpl(pairs, &.{}, false);
     }
 
-    /// Build an attrset from parallel (names, values): names are compile-time
-    /// interned ids in ascending order with no duplicates (the attrs_new_named*
-    /// contract); values are the N stack slots. Positions arrive pre-sorted.
-    pub fn addAttrsFromValuesSorted(
+    const AttrOrdering = enum { presorted_unique, unordered };
+
+    /// Build an attrset from parallel compile-time names and stack values.
+    /// The opcode selects the ordering contract explicitly; positions are an
+    /// already-sorted immutable view.
+    fn addAttrsFromValuesImpl(
         self: *ObjectHeap,
         names: []const InternId,
         values: []const Value,
         positions: AttrPositions,
+        ordering: AttrOrdering,
     ) !ObjectId {
         std.debug.assert(names.len == values.len);
         if (names.len == 0) if (self.empty_attrs_id) |id| return id;
@@ -2484,12 +2481,32 @@ pub const ObjectHeap = struct {
         const range = try self.reserveAttrsLocal(@intCast(names.len));
         const entries = self.attrs.sliceMut(range);
         for (entries, names, values) |*e, n, v| e.* = .{ .name = n, .value = v };
-        std.debug.assert(attrEntriesSortedUnique(entries));
-        // A chunk-ref position table is stored AS the reference — every
-        // instance of the literal shares the chunk's baked table; nothing
-        // is copied into the heap store.
+        switch (ordering) {
+            .presorted_unique => std.debug.assert(attrEntriesSortedUnique(entries)),
+            .unordered => try self.sortAndDedupAttrs(range),
+        }
         std.debug.assert(positionsSortedByName(self.attrPositionsEntries(positions)));
         return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = positions } });
+    }
+
+    /// `attrs_new_named_srt`: names are in ascending order with no duplicates.
+    pub fn addAttrsFromValuesSorted(
+        self: *ObjectHeap,
+        names: []const InternId,
+        values: []const Value,
+        positions: AttrPositions,
+    ) !ObjectId {
+        return self.addAttrsFromValuesImpl(names, values, positions, .presorted_unique);
+    }
+
+    /// `attrs_new_named`: names carry no ordering guarantee.
+    pub fn addAttrsFromValues(
+        self: *ObjectHeap,
+        names: []const InternId,
+        values: []const Value,
+        positions: AttrPositions,
+    ) !ObjectId {
+        return self.addAttrsFromValuesImpl(names, values, positions, .unordered);
     }
 
     /// `attrs_new_srt` fast path: the compiler guarantees the pairs
@@ -2856,43 +2873,67 @@ pub const ObjectHeap = struct {
     /// Positions counterpart of the strict literal merge (`attrs_merge_strict`,
     /// used when an attrset literal mixes static and dynamic entries): union of
     /// both sides' tables by name, left winning duplicates (the merged attr's
-    /// first definition site). Every name from both sides survives a strict
-    /// merge, so the whole union applies; both tables are sorted by name
-    /// (heap invariant), so the union is emitted sorted.
-    pub fn mergeAttrPositionsStrict(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !AttrPosRange {
-        const l = self.attrPositionsSlice(left_id);
-        const r = self.attrPositionsSlice(right_id);
-        if (l.len == 0 and r.len == 0) return empty_attr_positions;
+    /// first definition site). A borrowed literal table can be retained when
+    /// the other side has no positions; otherwise, the sorted union is
+    /// materialized into a fresh, heap-owned range.
+    pub fn mergeAttrPositionsStrict(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !AttrPositions {
+        const left_positions = switch (self.get(left_id).*) {
+            .attrs => |a| a.positions,
+            else => AttrPositions.none,
+        };
+        const right_positions = switch (self.get(right_id).*) {
+            .attrs => |a| a.positions,
+            else => AttrPositions.none,
+        };
+        if (right_positions.len == 0 and left_positions.isBorrowed()) return left_positions;
+        if (left_positions.len == 0 and right_positions.isBorrowed()) return right_positions;
 
-        var merged = try std.ArrayListUnmanaged(AttrPosEntry).initCapacity(
-            self.allocator,
-            l.len + r.len,
-        );
-        defer merged.deinit(self.allocator);
+        const l = self.attrPositionsEntries(left_positions);
+        const r = self.attrPositionsEntries(right_positions);
+        if (l.len == 0 and r.len == 0) return .none;
+
+        const reserved = try self.reserveAttrPositionsLocal(@intCast(l.len + r.len));
+        errdefer self.releaseAttrPositions(reserved);
+        const merged = self.attr_positions.sliceMut(reserved);
+        var out: usize = 0;
         var li: usize = 0;
         var ri: usize = 0;
         while (li < l.len and ri < r.len) {
             if (l[li].name < r[ri].name) {
-                merged.appendAssumeCapacity(l[li]);
+                merged[out] = l[li];
+                out += 1;
                 li += 1;
             } else if (l[li].name > r[ri].name) {
-                merged.appendAssumeCapacity(r[ri]);
+                merged[out] = r[ri];
+                out += 1;
                 ri += 1;
             } else {
-                merged.appendAssumeCapacity(l[li]);
+                merged[out] = l[li];
+                out += 1;
                 li += 1;
                 ri += 1;
             }
         }
-        merged.appendSliceAssumeCapacity(l[li..]);
-        merged.appendSliceAssumeCapacity(r[ri..]);
-        return self.appendAttrPositions(merged.items);
+        if (li < l.len) {
+            @memcpy(merged[out..][0 .. l.len - li], l[li..]);
+            out += l.len - li;
+        }
+        if (ri < r.len) {
+            @memcpy(merged[out..][0 .. r.len - ri], r[ri..]);
+            out += r.len - ri;
+        }
+        self.releaseAttrPositionsTail(reserved, @intCast(out));
+        return .fromRange(.{
+            .segment = reserved.segment,
+            .offset = reserved.offset,
+            .len = @intCast(out),
+        });
     }
 
     /// `publishMergedAttrs` with a position table attached.
-    pub fn publishMergedAttrsWithPositions(self: *ObjectHeap, pending: PendingAttrs, actual: u32, positions: AttrPosRange) !ObjectId {
+    pub fn publishMergedAttrsWithPositions(self: *ObjectHeap, pending: PendingAttrs, actual: u32, positions: AttrPositions) !ObjectId {
         const object = self.beginObjectSlot() catch |err| {
-            self.releaseAttrPositions(positions);
+            if (positions.heapLen() != 0) self.releaseAttrPositions(positions.heapRange());
             return err;
         };
         self.releaseAttrsTail(pending.range, actual);
@@ -2905,7 +2946,7 @@ pub const ObjectHeap = struct {
             .offset = pending.range.offset,
             .len = actual,
         };
-        return self.commitObjectSlot(object, .{ .attrs = .{ .range = trimmed, .positions = AttrPositions.fromRange(positions) } });
+        return self.commitObjectSlot(object, .{ .attrs = .{ .range = trimmed, .positions = positions } });
     }
 
     /// Borrow an attrset's source-position entries (empty slice when it

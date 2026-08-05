@@ -502,8 +502,9 @@ fn opBuildAttrsNamedPosSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usiz
     const names = frame.chunk_ptr.attr_names;
     const table = frame.chunk_ptr.attr_pos;
     if (names_start + count > names.len or pos_start + pos_count > table.len) return error.InvalidBytecode;
-    // Positions stay in the chunk's baked table; the attrset stores a ref.
-    try objects.buildAttrsNamedSorted(vm, names[names_start .. names_start + count], count, heap_mod.AttrPositions.fromChunk(frame.chunk_id, pos_start, pos_count));
+    // The registry outlives the heap, so literal attrsets can borrow this
+    // immutable table slice without teaching runtime objects about chunks.
+    try objects.buildAttrsNamedSorted(vm, names[names_start .. names_start + count], count, .borrowed(table[pos_start .. pos_start + pos_count]));
     return dispatch(vm, frame, code, ip + 12, stop_depth);
 }
 

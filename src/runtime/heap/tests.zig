@@ -158,20 +158,10 @@ test "object reference inspection follows objects and chunks without recursion" 
         .name = 40,
         .pos = .{ .file = 1, .line = 2, .column = 3 },
     }};
-    const Resolver = struct {
-        fn resolve(ctx: *anyopaque, _: u32) []const heap_mod.AttrPosEntry {
-            const table: *const [1]heap_mod.AttrPosEntry = @ptrCast(@alignCast(ctx));
-            return table;
-        }
-    };
-    heap.setChunkAttrPosResolver(.{
-        .ctx = @ptrCast(@constCast(&position_table)),
-        .resolve = Resolver.resolve,
-    });
     const positioned_id = try heap.addAttrsFromValuesSorted(
         &.{40},
         &.{Value.list(child_id)},
-        heap_mod.AttrPositions.fromChunk(0x44, 0, 1),
+        .borrowed(&position_table),
     );
 
     snapshot.deinit();
@@ -180,7 +170,6 @@ test "object reference inspection follows objects and chunks without recursion" 
     try @import("edges.zig").collectReferences(&heap, &snapshot, positioned_id, std.testing.allocator, &refs);
     try std.testing.expectEqualSlices(heap_mod.HeapReference, &.{
         .{ .object = child_id },
-        .{ .chunk = 0x44 },
     }, refs.items);
 }
 
@@ -285,6 +274,26 @@ test "object heap rejects duplicate attrs" {
         .{ .name = 20, .value = Value.int(2) },
     });
     try std.testing.expectEqual(@as(i64, 1), (try heap.getAttrValue(attrs_id, 10)).asInt());
+}
+
+test "strict attr merge shares borrowed positions with an unpositioned dynamic side" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const position_table = [_]heap_mod.AttrPosEntry{.{
+        .name = 10,
+        .pos = .{ .file = 1, .line = 2, .column = 3 },
+    }};
+    const borrowed = heap_mod.AttrPositions.borrowed(&position_table);
+    const static_id = try heap.addAttrsFromValuesSorted(&.{10}, &.{Value.int(1)}, borrowed);
+    try std.testing.expectEqual(@as(u32, 0), heap.stats().attr_positions);
+    try std.testing.expectEqual(position_table[0].pos, heap.getAttrPos(static_id, 10).?);
+    const dynamic_id = try heap.addAttrs(&.{.{ .name = 20, .value = Value.int(2) }});
+    const merged = try heap.mergeAttrPositionsStrict(static_id, dynamic_id);
+
+    try std.testing.expect(merged.isBorrowed());
+    try std.testing.expectEqual(borrowed.storage.borrowed, merged.storage.borrowed);
+    try std.testing.expectEqual(borrowed.len, merged.len);
 }
 
 test "multi-store attr construction rolls back when positions allocation fails" {

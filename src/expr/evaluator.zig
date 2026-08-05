@@ -2450,9 +2450,6 @@ pub const Engine = struct {
             .collect = gcCollect,
             .help_mark = gcHelpMark,
         });
-        // Attr-position chunk refs resolve through the registry (literal
-        // attrsets share their chunk's baked table instead of copying it).
-        self.heap.setChunkAttrPosResolver(.{ .ctx = self, .resolve = chunkAttrPosResolve });
         if (self.sources.env_map) |em|
             if (em.get("FIX_GC_NOREUSE") != null) self.heap.gcSetDisableReuse(true);
         if (self.sources.env_map) |em|
@@ -2483,12 +2480,6 @@ pub const Engine = struct {
         else if (budget > 0)
             heap_collector.enableBudget(&self.heap, budget, gc_controller.constrainedMode(gcContext(self), budget));
         return w;
-    }
-
-    fn chunkAttrPosResolve(ctx: *anyopaque, chunk_id: u32) []const runtime.heap.AttrPosEntry {
-        const self: *Engine = @ptrCast(@alignCast(ctx));
-        const chunk = self.registry.get(chunk_id) orelse return &.{};
-        return chunk.attr_pos;
     }
 
     fn gcCollect(ctx: *anyopaque, collector_id: u8) void {
