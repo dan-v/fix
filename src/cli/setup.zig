@@ -35,7 +35,7 @@ pub fn workerCount(options: *const args.Options) !u8 {
 
 /// Resolve the process capabilities that must be present when the engine's
 /// long-lived services are constructed. Remaining language/store policy is
-/// applied by `configure` after nix.conf has been folded.
+/// applied by `Session.configure` after nix.conf has been folded.
 pub fn engineConfig(
     init: std.process.Init,
     worker_count: u8,
@@ -59,8 +59,56 @@ pub const Terminal = struct {
         return self.log_progress;
     }
 
-    pub fn deinit(self: Terminal, allocator: std.mem.Allocator) void {
+    fn deinit(self: Terminal, allocator: std.mem.Allocator) void {
         self.output.destroy(allocator);
+    }
+};
+
+/// Owns the composition lifetime of an evaluator and its CLI-facing output.
+///
+/// `Engine` borrows the callback context stored in `terminal`, so teardown must
+/// quiesce the evaluator before releasing that context. Keeping both actions
+/// behind one defer prevents command call sites from accidentally reversing
+/// their order.
+pub const Session = struct {
+    engine: *Engine,
+    terminal: ?Terminal = null,
+
+    pub const Teardown = enum {
+        full,
+        /// The process exits immediately after the command. Drain durable
+        /// chunk-cache writes, but let the kernel reclaim the evaluator and its
+        /// still-borrowed output together.
+        fast_exit,
+    };
+
+    pub fn init(ev: *Engine) Session {
+        return .{ .engine = ev };
+    }
+
+    pub fn configure(
+        self: *Session,
+        process_init: std.process.Init,
+        options: *const args.Options,
+        settings: *nix_conf.Settings,
+    ) !Terminal {
+        std.debug.assert(self.terminal == null);
+        const terminal = try configureEngine(self.engine, process_init, options, settings);
+        self.terminal = terminal;
+        return terminal;
+    }
+
+    pub fn deinit(self: *Session, teardown: Teardown) void {
+        if (teardown == .fast_exit) {
+            self.engine.flushChunkCacheWrites();
+            // Deliberately retain `terminal`: Engine still borrows its sink and
+            // the process-exit contract lets the kernel reclaim both together.
+            return;
+        }
+        const allocator = self.engine.hostAllocator();
+        self.engine.deinit();
+        if (self.terminal) |terminal| terminal.deinit(allocator);
+        self.terminal = null;
     }
 };
 
@@ -68,8 +116,8 @@ pub const Terminal = struct {
 /// `Engine.init` maps the heap (the flat object store picks its mapping
 /// at init): `--hugetlb` (`cli_mode`, null for subcommands without the shared
 /// parser), defaulting to `auto`.
-/// Deliberately NOT a nix.conf setting: config loads in `configure`, after
-/// the heap already exists, so a config-sourced value could only half-apply.
+/// Deliberately NOT a nix.conf setting: config loads in `Session.configure`,
+/// after the heap already exists, so a config-sourced value could only half-apply.
 /// Call before `Engine.init` in every eval-producing subcommand.
 pub fn applyMemoryBacking(
     process: @import("process_context.zig").ProcessContext,
@@ -83,7 +131,7 @@ pub fn applyMemoryBacking(
 /// Apply already-resolved settings and CLI policy to an Engine, then derive
 /// terminal presentation. This phase performs no configuration discovery and
 /// does not construct a hidden evaluator.
-pub fn configure(
+fn configureEngine(
     ev: *Engine,
     init: std.process.Init,
     options: *const args.Options,
@@ -315,4 +363,44 @@ fn applyNixPath(ev: *Engine, init: std.process.Init, options: *const args.Option
         }
     }
     try ev.setNixPath(buf.items);
+}
+
+test "Session cleans up an Engine when configuration does not complete" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0, .io = std.testing.io });
+    var session = Session.init(&ev);
+    session.deinit(.full);
+}
+
+test "Session retains effect output through Engine teardown" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0, .io = std.testing.io });
+    const output = try effect_output.StderrSink.create(std.testing.allocator, std.testing.io, false);
+    ev.setEffectSink(output.effectSink());
+
+    var session = Session.init(&ev);
+    session.terminal = .{
+        .use_color = false,
+        .color_depth = .none,
+        .log_progress = false,
+        .output = output,
+    };
+    session.deinit(.full);
+}
+
+test "Session fast exit retains output borrowed by the live Engine" {
+    var ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0, .io = std.testing.io });
+    const output = try effect_output.StderrSink.create(std.testing.allocator, std.testing.io, false);
+    ev.setEffectSink(output.effectSink());
+
+    var session = Session.init(&ev);
+    session.terminal = .{
+        .use_color = false,
+        .color_depth = .none,
+        .log_progress = false,
+        .output = output,
+    };
+    session.deinit(.fast_exit);
+    try std.testing.expect(session.terminal != null);
+
+    // Tests cannot exit the process, so finish the retained ownership normally.
+    session.deinit(.full);
 }

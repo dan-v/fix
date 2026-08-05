@@ -5,9 +5,10 @@
 //! becomes `ExprConcatStrings`, `-`/`*`/`/`/`<`/`>` become primop calls,
 //! static attr paths are nested and merged, curried applies are flattened, and
 //! so on. This module performs those transforms in a depth-first stream. Each
-//! node builds only its shallow JSON fields; child nodes are deferred until the
-//! emitter reaches them. Attribute sets retain only the merge/sort index their
-//! compatibility schema requires, never a second whole-result tree.
+//! node builds only its shallow JSON fields; a typed writer visits child nodes
+//! when their field reaches the stream. Attribute sets retain only the
+//! merge/sort index their compatibility schema requires, never a second
+//! whole-result tree.
 //!
 //! Output format mirrors nlohmann's `dump(2)`: 2-space indent, object keys
 //! sorted lexicographically with `_type` pinned first, empty collection fields
@@ -21,145 +22,252 @@ const ast = syntax.ast;
 const Node = ast.Node;
 const string_syntax = syntax.string_syntax;
 const parser_mod = syntax.parser;
-const JsonValue = @import("parse_json/value.zig").Value;
-const emitter = @import("parse_json/emitter.zig");
+
+/// A shallow JSON value. Recursive AST work stays typed and is performed by
+/// `CompatibilityWriter` only when the containing value reaches the output.
+const JsonValue = union(enum) {
+    int: i64,
+    float: f64,
+    str: []const u8,
+    boolean: bool,
+    nul,
+    array: []JsonValue,
+    object: []Field,
+    child: Child,
+
+    const Field = struct { key: []const u8, val: JsonValue };
+};
+
+const Child = union(enum) {
+    node: *const Node,
+    interpolation: []const u8,
+    set: *BindingSet,
+    list: *const Node.List,
+};
 
 /// Serialize `node` (a parse-OKAY AST rooted in `source`) as JSON to `writer`.
-/// `gpa` backs per-node scratch arenas, decoded strings, and the sub-parsers
-/// used for string interpolations.
+/// `gpa` backs depth-reused scratch, decoded strings, and the sub-parsers used
+/// for string interpolations.
 pub fn write(
     writer: *std.Io.Writer,
     gpa: std.mem.Allocator,
     source: []const u8,
     node: *const Node,
 ) !void {
-    try writeNodeIndented(writer, gpa, source, node, 0);
-    try writer.writeByte('\n');
-}
-
-fn writeNodeIndented(
-    writer: *std.Io.Writer,
-    gpa: std.mem.Allocator,
-    source: []const u8,
-    node: *const Node,
-    indent: usize,
-) !void {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var ser: Serializer = .{ .arena = arena, .gpa = gpa, .source = source };
-    try emitter.writeIndented(writer, arena, try ser.node(node), indent);
-}
-
-fn writeDeferredNode(
-    context: ?*const anyopaque,
-    gpa: std.mem.Allocator,
-    source: []const u8,
-    writer: *std.Io.Writer,
-    indent: usize,
-) !void {
-    const node: *const Node = @ptrCast(@alignCast(context.?));
-    try writeNodeIndented(writer, gpa, source, node, indent);
-}
-
-fn writeDeferredInterpolation(
-    context: ?*const anyopaque,
-    gpa: std.mem.Allocator,
-    source: []const u8,
-    writer: *std.Io.Writer,
-    indent: usize,
-) !void {
-    _ = context;
-    var ast_arena = ast.AstArena.init(gpa);
-    defer ast_arena.deinit();
-    var parser = parser_mod.Parser.init(gpa, &ast_arena, source);
-    defer parser.deinit();
-    const node = parser.parse() catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InterpolationParseError,
+    var compatibility: CompatibilityWriter = .{
+        .writer = writer,
+        .gpa = gpa,
+        .source = source,
     };
-    try writeNodeIndented(writer, gpa, source, node, indent);
+    defer compatibility.deinit();
+    try compatibility.writeNode(node);
 }
 
-fn writeDeferredSet(
-    context: ?*const anyopaque,
+const CompatibilityWriter = struct {
+    writer: *std.Io.Writer,
     gpa: std.mem.Allocator,
     source: []const u8,
-    writer: *std.Io.Writer,
-    indent: usize,
-) !void {
-    const set: *BindingSet = @ptrCast(@alignCast(@constCast(context.?)));
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var ser: Serializer = .{ .arena = arena, .gpa = gpa, .source = source };
-    try emitter.writeIndented(writer, arena, try ser.emitSet(set, false, null), indent);
-}
+    /// One stable arena state per active traversal depth. Siblings reset and
+    /// reuse their level instead of constructing an allocator for every node.
+    scratch: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
 
-fn writeDeferredList(
-    context: ?*const anyopaque,
-    gpa: std.mem.Allocator,
-    source: []const u8,
-    writer: *std.Io.Writer,
-    indent: usize,
-) !void {
-    const list: *const Node.List = @ptrCast(@alignCast(context.?));
-    if (list.items.len == 0) return writer.writeAll("[]");
-    try writer.writeAll("[\n");
-    for (list.items, 0..) |item, i| {
-        try writer.splatByteAll(' ', indent + 2);
-        try writeNodeIndented(writer, gpa, source, item, indent + 2);
-        if (i + 1 != list.items.len) try writer.writeByte(',');
-        try writer.writeByte('\n');
+    fn deinit(self: *CompatibilityWriter) void {
+        for (self.scratch.items) |arena| {
+            arena.deinit();
+            self.gpa.destroy(arena);
+        }
+        self.scratch.deinit(self.gpa);
     }
-    try writer.splatByteAll(' ', indent);
-    try writer.writeByte(']');
+
+    fn writeNode(self: *CompatibilityWriter, node: *const Node) !void {
+        try self.writeNodeIndented(self.source, node, 0, 0);
+        try self.writer.writeByte('\n');
+    }
+
+    fn scratchAt(self: *CompatibilityWriter, depth: usize) !std.mem.Allocator {
+        while (self.scratch.items.len <= depth) {
+            const arena = try self.gpa.create(std.heap.ArenaAllocator);
+            errdefer self.gpa.destroy(arena);
+            arena.* = std.heap.ArenaAllocator.init(self.gpa);
+            errdefer arena.deinit();
+            try self.scratch.append(self.gpa, arena);
+        }
+        const arena = self.scratch.items[depth];
+        _ = arena.reset(.retain_capacity);
+        return arena.allocator();
+    }
+
+    fn writeNodeIndented(
+        self: *CompatibilityWriter,
+        source: []const u8,
+        node: *const Node,
+        indent: usize,
+        depth: usize,
+    ) anyerror!void {
+        const arena = try self.scratchAt(depth);
+        var lowerer: Lowerer = .{ .arena = arena, .gpa = self.gpa, .source = source };
+        try self.writeValue(source, try lowerer.node(node), indent, depth);
+    }
+
+    fn writeSetIndented(
+        self: *CompatibilityWriter,
+        source: []const u8,
+        set: *BindingSet,
+        indent: usize,
+        depth: usize,
+    ) anyerror!void {
+        const arena = try self.scratchAt(depth);
+        var lowerer: Lowerer = .{ .arena = arena, .gpa = self.gpa, .source = source };
+        try self.writeValue(source, try lowerer.emitSet(set, false, null), indent, depth);
+    }
+
+    fn writeInterpolation(
+        self: *CompatibilityWriter,
+        source: []const u8,
+        indent: usize,
+        depth: usize,
+    ) anyerror!void {
+        var ast_arena = ast.AstArena.init(self.gpa);
+        defer ast_arena.deinit();
+        var parser = parser_mod.Parser.init(self.gpa, &ast_arena, source);
+        defer parser.deinit();
+        const node = parser.parse() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InterpolationParseError,
+        };
+        try self.writeNodeIndented(source, node, indent, depth);
+    }
+
+    fn writeList(
+        self: *CompatibilityWriter,
+        source: []const u8,
+        list: *const Node.List,
+        indent: usize,
+        depth: usize,
+    ) anyerror!void {
+        if (list.items.len == 0) return self.writer.writeAll("[]");
+        try self.writer.writeAll("[\n");
+        for (list.items, 0..) |item, i| {
+            try self.writer.splatByteAll(' ', indent + 2);
+            try self.writeNodeIndented(source, item, indent + 2, depth);
+            if (i + 1 != list.items.len) try self.writer.writeByte(',');
+            try self.writer.writeByte('\n');
+        }
+        try self.writer.splatByteAll(' ', indent);
+        try self.writer.writeByte(']');
+    }
+
+    fn writeValue(
+        self: *CompatibilityWriter,
+        source: []const u8,
+        value: JsonValue,
+        indent: usize,
+        depth: usize,
+    ) anyerror!void {
+        switch (value) {
+            .int => |v| try self.writer.print("{d}", .{v}),
+            .float => |v| try emitFloat(self.writer, v),
+            .str => |s| try emitString(self.writer, s),
+            .boolean => |b| try self.writer.writeAll(if (b) "true" else "false"),
+            .nul => try self.writer.writeAll("null"),
+            .array => |items| {
+                if (items.len == 0) return self.writer.writeAll("[]");
+                try self.writer.writeAll("[\n");
+                for (items, 0..) |item, i| {
+                    try self.writer.splatByteAll(' ', indent + 2);
+                    try self.writeValue(source, item, indent + 2, depth);
+                    if (i + 1 != items.len) try self.writer.writeByte(',');
+                    try self.writer.writeByte('\n');
+                }
+                try self.writer.splatByteAll(' ', indent);
+                try self.writer.writeByte(']');
+            },
+            .object => |fields| {
+                if (fields.len == 0) return self.writer.writeAll("{}");
+                std.mem.sort(JsonValue.Field, fields, {}, fieldLess);
+                try self.writer.writeAll("{\n");
+                for (fields, 0..) |field, i| {
+                    try self.writer.splatByteAll(' ', indent + 2);
+                    try emitString(self.writer, field.key);
+                    try self.writer.writeAll(": ");
+                    try self.writeValue(source, field.val, indent + 2, depth);
+                    if (i + 1 != fields.len) try self.writer.writeByte(',');
+                    try self.writer.writeByte('\n');
+                }
+                try self.writer.splatByteAll(' ', indent);
+                try self.writer.writeByte('}');
+            },
+            .child => |child| switch (child) {
+                .node => |node| try self.writeNodeIndented(source, node, indent, depth + 1),
+                .interpolation => |sub| try self.writeInterpolation(sub, indent, depth + 1),
+                .set => |set| try self.writeSetIndented(source, set, indent, depth + 1),
+                .list => |list| try self.writeList(source, list, indent, depth + 1),
+            },
+        }
+    }
+};
+
+fn fieldLess(_: void, a: JsonValue.Field, b: JsonValue.Field) bool {
+    const a_type = std.mem.eql(u8, a.key, "_type");
+    const b_type = std.mem.eql(u8, b.key, "_type");
+    if (a_type != b_type) return a_type;
+    return std.mem.lessThan(u8, a.key, b.key);
 }
 
-const Serializer = struct {
+fn emitFloat(writer: *std.Io.Writer, value: f64) !void {
+    var buf: [64]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch {
+        try writer.print("{d}", .{value});
+        return;
+    };
+    try writer.writeAll(text);
+    if (std.mem.indexOfAny(u8, text, ".eEnN") == null) try writer.writeAll(".0");
+}
+
+fn emitString(writer: *std.Io.Writer, string: []const u8) !void {
+    try writer.writeByte('"');
+    for (string) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0c => try writer.writeAll("\\f"),
+            else => if (c < 0x20)
+                try writer.print("\\u{x:0>4}", .{c})
+            else
+                try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+const Lowerer = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     source: []const u8,
 
-    fn deferredNode(self: *const Serializer, child: *const Node) JsonValue {
-        return .{ .deferred = .{
-            .context = child,
-            .gpa = self.gpa,
-            .source = self.source,
-            .write_fn = writeDeferredNode,
-        } };
+    fn childNode(_: *const Lowerer, child: *const Node) JsonValue {
+        return .{ .child = .{ .node = child } };
     }
 
-    fn deferredInterpolation(self: *const Serializer, source: []const u8) JsonValue {
-        return .{ .deferred = .{
-            .context = null,
-            .gpa = self.gpa,
-            .source = source,
-            .write_fn = writeDeferredInterpolation,
-        } };
+    fn childInterpolation(_: *const Lowerer, source: []const u8) JsonValue {
+        return .{ .child = .{ .interpolation = source } };
     }
 
-    fn deferredSet(self: *const Serializer, set: *BindingSet) JsonValue {
-        return .{ .deferred = .{
-            .context = set,
-            .gpa = self.gpa,
-            .source = self.source,
-            .write_fn = writeDeferredSet,
-        } };
+    fn childSet(_: *const Lowerer, set: *BindingSet) JsonValue {
+        return .{ .child = .{ .set = set } };
     }
 
-    fn deferredList(self: *const Serializer, items: *const Node.List) JsonValue {
-        return .{ .deferred = .{
-            .context = items,
-            .gpa = self.gpa,
-            .source = self.source,
-            .write_fn = writeDeferredList,
-        } };
+    fn childList(_: *const Lowerer, items: *const Node.List) JsonValue {
+        return .{ .child = .{ .list = items } };
     }
 
     // ---- dispatch ----
 
-    fn node(self: *Serializer, n_in: *const Node) anyerror!JsonValue {
+    fn node(self: *Lowerer, n_in: *const Node) anyerror!JsonValue {
         const n = ast.unwrapParens(n_in);
         return switch (n.tag) {
             .integer => try self.literal("Int", .{ .int = try self.parseInt(n.data.atom) }),
@@ -181,26 +289,26 @@ const Serializer = struct {
             .lambda => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprLambda" } },
                 .{ .key = "arg", .val = .{ .str = self.atomText(.{ .offset = n.data.lambda.param_offset, .len = n.data.lambda.param_len }) } },
-                .{ .key = "body", .val = self.deferredNode(n.data.lambda.body) },
+                .{ .key = "body", .val = self.childNode(n.data.lambda.body) },
             }),
             .lambda_attrs => try self.lambdaAttrs(n.data.lambda_attrs),
 
             .let_in => try self.letIn(n.data.let_in),
             .if_else => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprIf" } },
-                .{ .key = "cond", .val = self.deferredNode(n.data.if_else.cond) },
-                .{ .key = "then", .val = self.deferredNode(n.data.if_else.then_branch) },
-                .{ .key = "else", .val = self.deferredNode(n.data.if_else.else_branch) },
+                .{ .key = "cond", .val = self.childNode(n.data.if_else.cond) },
+                .{ .key = "then", .val = self.childNode(n.data.if_else.then_branch) },
+                .{ .key = "else", .val = self.childNode(n.data.if_else.else_branch) },
             }),
             .assert => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprAssert" } },
-                .{ .key = "cond", .val = self.deferredNode(n.data.assert.cond) },
-                .{ .key = "body", .val = self.deferredNode(n.data.assert.body) },
+                .{ .key = "cond", .val = self.childNode(n.data.assert.cond) },
+                .{ .key = "body", .val = self.childNode(n.data.assert.body) },
             }),
             .with_expr => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprWith" } },
-                .{ .key = "attrs", .val = self.deferredNode(n.data.with_expr.attr_set) },
-                .{ .key = "body", .val = self.deferredNode(n.data.with_expr.body) },
+                .{ .key = "attrs", .val = self.childNode(n.data.with_expr.attr_set) },
+                .{ .key = "body", .val = self.childNode(n.data.with_expr.body) },
             }),
 
             .attr_set => try self.attrSet(n),
@@ -217,19 +325,19 @@ const Serializer = struct {
 
     // ---- atoms ----
 
-    fn atomText(self: *Serializer, atom: Node.Atom) []const u8 {
+    fn atomText(self: *Lowerer, atom: Node.Atom) []const u8 {
         return self.source[atom.offset .. atom.offset + atom.len];
     }
 
-    fn parseInt(self: *Serializer, atom: Node.Atom) !i64 {
+    fn parseInt(self: *Lowerer, atom: Node.Atom) !i64 {
         return std.fmt.parseInt(i64, self.atomText(atom), 10) catch error.InvalidInteger;
     }
 
-    fn parseFloat(self: *Serializer, atom: Node.Atom) !f64 {
+    fn parseFloat(self: *Lowerer, atom: Node.Atom) !f64 {
         return std.fmt.parseFloat(f64, self.atomText(atom)) catch error.InvalidFloat;
     }
 
-    fn literal(self: *Serializer, value_type: []const u8, value: JsonValue) !JsonValue {
+    fn literal(self: *Lowerer, value_type: []const u8, value: JsonValue) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprLiteral" } },
             .{ .key = "value", .val = value },
@@ -240,21 +348,21 @@ const Serializer = struct {
     /// A string or name value: a JSON string when valid UTF-8, else a JSON
     /// array of byte values (`[97, 255, 98]`) — matching how Nix's parse JSON
     /// represents an invalid-UTF-8 string/name.
-    fn strOrBytes(self: *Serializer, bytes: []const u8) !JsonValue {
+    fn strOrBytes(self: *Lowerer, bytes: []const u8) !JsonValue {
         if (std.unicode.utf8ValidateSlice(bytes)) return .{ .str = bytes };
         const out = try self.arena.alloc(JsonValue, bytes.len);
         for (bytes, out) |b, *j| j.* = .{ .int = b };
         return .{ .array = out };
     }
 
-    fn exprVar(self: *Serializer, name: []const u8) !JsonValue {
+    fn exprVar(self: *Lowerer, name: []const u8) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprVar" } },
             .{ .key = "value", .val = try self.strOrBytes(name) },
         });
     }
 
-    fn identifier(self: *Serializer, name: []const u8) !JsonValue {
+    fn identifier(self: *Lowerer, name: []const u8) !JsonValue {
         // The magic `__curPos` identifier is Nix's `ExprPos`.
         if (std.mem.eql(u8, name, "__curPos")) {
             return self.obj(&.{.{ .key = "_type", .val = .{ .str = "ExprPos" } }});
@@ -262,7 +370,7 @@ const Serializer = struct {
         return self.exprVar(name);
     }
 
-    fn searchPath(self: *Serializer, atom: Node.Atom) !JsonValue {
+    fn searchPath(self: *Lowerer, atom: Node.Atom) !JsonValue {
         // `<x>` → __findFile __nixPath "x"
         const text = self.atomText(atom);
         const inner = if (text.len >= 2 and text[0] == '<' and text[text.len - 1] == '>')
@@ -283,7 +391,7 @@ const Serializer = struct {
 
     /// A string atom. A single constant text run is an `ExprLiteral String`;
     /// any `${...}` makes it an interpolating `ExprConcatStrings`.
-    fn stringNode(self: *Serializer, atom: Node.Atom) !JsonValue {
+    fn stringNode(self: *Lowerer, atom: Node.Atom) !JsonValue {
         const parsed = string_syntax.parseLiteral(self.gpa, self.source, .{
             .start = atom.offset,
             .end = atom.offset + atom.len,
@@ -360,7 +468,7 @@ const Serializer = struct {
 
     /// If `${...}` interpolates a single constant string literal, its decoded
     /// bytes (arena-owned); else null.
-    fn constInterpolation(self: *Serializer, span: string_syntax.Span) !?[]const u8 {
+    fn constInterpolation(self: *Lowerer, span: string_syntax.Span) !?[]const u8 {
         const sub = self.source[span.start..span.end];
         var arena = ast.AstArena.init(self.gpa);
         defer arena.deinit();
@@ -388,31 +496,31 @@ const Serializer = struct {
     }
 
     /// Defer one `${...}` interpolation. It is a standalone expression over
-    /// its source slice, so the emitter parses and renders it only when reached.
-    fn interpolation(self: *Serializer, span: string_syntax.Span) !JsonValue {
+    /// its source slice, so the writer parses and renders it only when reached.
+    fn interpolation(self: *Lowerer, span: string_syntax.Span) !JsonValue {
         const sub = self.source[span.start..span.end];
-        return self.deferredInterpolation(sub);
+        return self.childInterpolation(sub);
     }
 
     // ---- operators ----
 
-    fn unary(self: *Serializer, u: Node.Unary) !JsonValue {
+    fn unary(self: *Lowerer, u: Node.Unary) !JsonValue {
         return switch (u.op) {
             .not => try self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprOpNot" } },
-                .{ .key = "e", .val = self.deferredNode(u.expr) },
+                .{ .key = "e", .val = self.childNode(u.expr) },
             }),
             // -x  →  __sub 0 x
             .negate => try self.primopCall("__sub", &.{
                 try self.literal("Int", .{ .int = 0 }),
-                self.deferredNode(u.expr),
+                self.childNode(u.expr),
             }),
         };
     }
 
-    fn binary(self: *Serializer, b: Node.Binary) !JsonValue {
-        const l = self.deferredNode(b.left);
-        const r = self.deferredNode(b.right);
+    fn binary(self: *Lowerer, b: Node.Binary) !JsonValue {
+        const l = self.childNode(b.left);
+        const r = self.childNode(b.right);
         return switch (b.op) {
             // `+` is string/path/int concat → ExprConcatStrings
             .add => try self.concatStrings(&.{ l, r }, false),
@@ -433,7 +541,7 @@ const Serializer = struct {
         };
     }
 
-    fn binOp(self: *Serializer, type_name: []const u8, e1: JsonValue, e2: JsonValue) !JsonValue {
+    fn binOp(self: *Lowerer, type_name: []const u8, e1: JsonValue, e2: JsonValue) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = type_name } },
             .{ .key = "e1", .val = e1 },
@@ -441,14 +549,14 @@ const Serializer = struct {
         });
     }
 
-    fn opNot(self: *Serializer, e: JsonValue) !JsonValue {
+    fn opNot(self: *Lowerer, e: JsonValue) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprOpNot" } },
             .{ .key = "e", .val = e },
         });
     }
 
-    fn primopCall(self: *Serializer, name: []const u8, args: []const JsonValue) !JsonValue {
+    fn primopCall(self: *Lowerer, name: []const u8, args: []const JsonValue) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprCall" } },
             .{ .key = "fun", .val = try self.exprVar(name) },
@@ -456,7 +564,7 @@ const Serializer = struct {
         });
     }
 
-    fn concatStrings(self: *Serializer, es: []const JsonValue, is_interp: bool) !JsonValue {
+    fn concatStrings(self: *Lowerer, es: []const JsonValue, is_interp: bool) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprConcatStrings" } },
             .{ .key = "es", .val = try self.arr(es) },
@@ -466,15 +574,15 @@ const Serializer = struct {
 
     // ---- application (curried-apply flattening) ----
 
-    fn call(self: *Serializer, n: *const Node) !JsonValue {
+    fn call(self: *Lowerer, n: *const Node) !JsonValue {
         const app = n.data.apply;
         // A pipe application is a single call `func arg`; the spine is not
         // flattened across it.
         if (app.pipe != .none) {
             return self.obj(&.{
                 .{ .key = "_type", .val = .{ .str = "ExprCall" } },
-                .{ .key = "fun", .val = self.deferredNode(app.func) },
-                .{ .key = "args", .val = try self.arr(&.{self.deferredNode(app.arg)}) },
+                .{ .key = "fun", .val = self.childNode(app.func) },
+                .{ .key = "args", .val = try self.arr(&.{self.childNode(app.arg)}) },
             });
         }
         // Flatten the left spine of plain applies: apply(apply(f,a),b) → f [a,b].
@@ -487,28 +595,28 @@ const Serializer = struct {
         const args = try self.arena.alloc(JsonValue, args_rev.items.len);
         // args_rev holds outermost-arg-first; reverse into source order.
         for (args_rev.items, 0..) |arg_node, i| {
-            args[args_rev.items.len - 1 - i] = self.deferredNode(arg_node);
+            args[args_rev.items.len - 1 - i] = self.childNode(arg_node);
         }
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprCall" } },
-            .{ .key = "fun", .val = self.deferredNode(cur) },
+            .{ .key = "fun", .val = self.childNode(cur) },
             .{ .key = "args", .val = .{ .array = args } },
         });
     }
 
     // ---- lambda patterns ----
 
-    fn lambdaAttrs(self: *Serializer, la: *const Node.LambdaAttrs) !JsonValue {
+    fn lambdaAttrs(self: *Lowerer, la: *const Node.LambdaAttrs) !JsonValue {
         var fields: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
         try fields.append(self.arena, .{ .key = "_type", .val = .{ .str = "ExprLambda" } });
         if (la.bind_name) |bind| {
             try fields.append(self.arena, .{ .key = "arg", .val = .{ .str = self.atomText(bind) } });
         }
-        try fields.append(self.arena, .{ .key = "body", .val = self.deferredNode(la.body) });
+        try fields.append(self.arena, .{ .key = "body", .val = self.childNode(la.body) });
         if (la.params.len != 0) {
             var formals: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
             for (la.params) |p| {
-                const dflt: JsonValue = if (p.default) |d| self.deferredNode(d) else .nul;
+                const dflt: JsonValue = if (p.default) |d| self.childNode(d) else .nul;
                 try formals.append(self.arena, .{ .key = try self.attrNameText(p.name), .val = dflt });
             }
             try fields.append(self.arena, .{ .key = "formals", .val = .{ .object = try formals.toOwnedSlice(self.arena) } });
@@ -523,18 +631,18 @@ const Serializer = struct {
     /// Flatten a select chain (`attr_path`/`attr_dynamic` nesting) into a base
     /// expression `e` plus an ordered `attrs` list (static names as strings,
     /// dynamic keys as expressions).
-    fn select(self: *Serializer, chain: *const Node, default: ?*const Node) !JsonValue {
+    fn select(self: *Lowerer, chain: *const Node, default: ?*const Node) !JsonValue {
         var attrs: std.ArrayListUnmanaged(JsonValue) = .empty;
         const base = try self.collectSelect(chain, &attrs);
         var fields: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
         try fields.append(self.arena, .{ .key = "_type", .val = .{ .str = "ExprSelect" } });
         try fields.append(self.arena, .{ .key = "attrs", .val = try self.arr(try attrs.toOwnedSlice(self.arena)) });
-        if (default) |d| try fields.append(self.arena, .{ .key = "default", .val = self.deferredNode(d) });
-        try fields.append(self.arena, .{ .key = "e", .val = self.deferredNode(base) });
+        if (default) |d| try fields.append(self.arena, .{ .key = "default", .val = self.childNode(d) });
+        try fields.append(self.arena, .{ .key = "e", .val = self.childNode(base) });
         return .{ .object = try fields.toOwnedSlice(self.arena) };
     }
 
-    fn collectSelect(self: *Serializer, n_in: *const Node, attrs: *std.ArrayListUnmanaged(JsonValue)) anyerror!*const Node {
+    fn collectSelect(self: *Lowerer, n_in: *const Node, attrs: *std.ArrayListUnmanaged(JsonValue)) anyerror!*const Node {
         const n = ast.unwrapParens(n_in);
         switch (n.tag) {
             .attr_path => {
@@ -546,55 +654,55 @@ const Serializer = struct {
             },
             .attr_dynamic => {
                 const base = try self.collectSelect(n.data.attr_dynamic.root, attrs);
-                try attrs.append(self.arena, self.deferredNode(n.data.attr_dynamic.name));
+                try attrs.append(self.arena, self.childNode(n.data.attr_dynamic.name));
                 return base;
             },
             else => return n,
         }
     }
 
-    fn hasAttr(self: *Serializer, n: *const Node) !JsonValue {
+    fn hasAttr(self: *Lowerer, n: *const Node) !JsonValue {
         const ha = n.data.has_attr;
         const attrs = try self.arena.alloc(JsonValue, ha.segments.len);
         for (ha.segments, attrs) |seg, *out| out.* = try self.strOrBytes(try self.attrNameText(seg));
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprOpHasAttr" } },
             .{ .key = "attrs", .val = .{ .array = attrs } },
-            .{ .key = "e", .val = self.deferredNode(ha.root) },
+            .{ .key = "e", .val = self.childNode(ha.root) },
         });
     }
 
-    fn hasAttrMixed(self: *Serializer, n: *const Node) !JsonValue {
+    fn hasAttrMixed(self: *Lowerer, n: *const Node) !JsonValue {
         const ha = n.data.has_attr_mixed;
         const attrs = try self.arena.alloc(JsonValue, ha.segments.len);
         for (ha.segments, attrs) |seg, *out| {
             out.* = switch (seg) {
                 .static => |a| try self.strOrBytes(try self.attrNameText(a)),
-                .dynamic => |d| self.deferredNode(d),
+                .dynamic => |d| self.childNode(d),
             };
         }
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprOpHasAttr" } },
             .{ .key = "attrs", .val = .{ .array = attrs } },
-            .{ .key = "e", .val = self.deferredNode(ha.root) },
+            .{ .key = "e", .val = self.childNode(ha.root) },
         });
     }
 
-    fn list(self: *Serializer, list_node: *const Node.List) !JsonValue {
+    fn list(self: *Lowerer, list_node: *const Node.List) !JsonValue {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprList" } },
-            .{ .key = "elems", .val = self.deferredList(list_node) },
+            .{ .key = "elems", .val = self.childList(list_node) },
         });
     }
 
     // ---- attribute sets / let (nesting, merging, inherit regrouping) ----
 
-    fn attrSet(self: *Serializer, n: *const Node) !JsonValue {
+    fn attrSet(self: *Lowerer, n: *const Node) !JsonValue {
         const set = try self.buildSet(n.data.attr_set);
         return self.emitSet(set, false, null);
     }
 
-    fn letIn(self: *Serializer, l: Node.LetIn) !JsonValue {
+    fn letIn(self: *Lowerer, l: Node.LetIn) !JsonValue {
         const set = try self.arena.create(BindingSet);
         set.* = .{};
         for (l.bindings) |b| {
@@ -603,7 +711,7 @@ const Serializer = struct {
         return self.emitSet(set, true, l.body);
     }
 
-    fn buildSet(self: *Serializer, s: Node.AttrSet) anyerror!*BindingSet {
+    fn buildSet(self: *Lowerer, s: Node.AttrSet) anyerror!*BindingSet {
         const set = try self.arena.create(BindingSet);
         set.* = .{ .recursive = s.recursive };
         for (s.entries) |e| {
@@ -616,7 +724,7 @@ const Serializer = struct {
     /// folding, static-path nesting/merging, and inherit / inherit-from
     /// regrouping.
     fn addBinding(
-        self: *Serializer,
+        self: *Lowerer,
         set: *BindingSet,
         path: []const Node.Atom,
         dynamic_name: ?*const Node,
@@ -661,7 +769,7 @@ const Serializer = struct {
         try self.setLeaf(cur, try self.attrNameText(path[path.len - 1]), expr);
     }
 
-    fn addInheritFrom(self: *Serializer, set: *BindingSet, from: *const Node, name: []const u8) !void {
+    fn addInheritFrom(self: *Lowerer, set: *BindingSet, from: *const Node, name: []const u8) !void {
         const from_off: u32 = if (from.span) |s| s.offset else 0;
         if (set.inherit_from.items.len > 0) {
             const last = &set.inherit_from.items[set.inherit_from.items.len - 1];
@@ -676,7 +784,7 @@ const Serializer = struct {
     }
 
     /// Descend (creating/merging as needed) into the nested set at `name`.
-    fn descend(self: *Serializer, set: *BindingSet, name: []const u8) !*BindingSet {
+    fn descend(self: *Lowerer, set: *BindingSet, name: []const u8) !*BindingSet {
         if (set.attrs.getPtr(name)) |slot| {
             switch (slot.*) {
                 .set => |s| return s,
@@ -699,7 +807,7 @@ const Serializer = struct {
 
     /// Assign `expr` at `name`, merging when both the existing and new values
     /// are (non-recursive) attribute sets — Nix's recursive attr merge.
-    fn setLeaf(self: *Serializer, set: *BindingSet, name: []const u8, expr: *const Node) !void {
+    fn setLeaf(self: *Lowerer, set: *BindingSet, name: []const u8, expr: *const Node) !void {
         const newv = try self.buildValue(expr);
         if (set.attrs.getPtr(name)) |slot| {
             if (slot.* == .set and newv == .set and !slot.set.recursive and !newv.set.recursive) {
@@ -712,7 +820,7 @@ const Serializer = struct {
         try set.attrs.put(self.arena, name, newv);
     }
 
-    fn mergeSets(self: *Serializer, dst: *BindingSet, src: *BindingSet) !void {
+    fn mergeSets(self: *Lowerer, dst: *BindingSet, src: *BindingSet) !void {
         var it = src.attrs.iterator();
         while (it.next()) |kv| {
             const name = kv.key_ptr.*;
@@ -735,17 +843,17 @@ const Serializer = struct {
     /// A value slot: a non-recursive attribute-set literal becomes a mutable
     /// `BindingSet` (so sibling binds can merge into it); everything else is a leaf
     /// serialized on demand.
-    fn buildValue(self: *Serializer, expr: *const Node) !BindingValue {
+    fn buildValue(self: *Lowerer, expr: *const Node) !BindingValue {
         const e = ast.unwrapParens(expr);
         if (e.tag == .attr_set) return .{ .set = try self.buildSet(e.data.attr_set) };
         return .{ .leaf = e };
     }
 
-    fn emitSet(self: *Serializer, set: *BindingSet, is_let: bool, body: ?*const Node) anyerror!JsonValue {
+    fn emitSet(self: *Lowerer, set: *BindingSet, is_let: bool, body: ?*const Node) anyerror!JsonValue {
         var fields: std.ArrayListUnmanaged(JsonValue.Field) = .empty;
         try fields.append(self.arena, .{ .key = "_type", .val = .{ .str = if (is_let) "ExprLet" else "ExprSet" } });
         if (is_let) {
-            try fields.append(self.arena, .{ .key = "body", .val = self.deferredNode(body.?) });
+            try fields.append(self.arena, .{ .key = "body", .val = self.childNode(body.?) });
         } else {
             try fields.append(self.arena, .{ .key = "recursive", .val = .{ .boolean = set.recursive } });
         }
@@ -779,7 +887,7 @@ const Serializer = struct {
             const dyn = try self.arena.alloc(JsonValue, set.dynamic.items.len);
             for (set.dynamic.items, dyn) |d, *out| {
                 out.* = try self.obj(&.{
-                    .{ .key = "name", .val = self.deferredNode(d.name) },
+                    .{ .key = "name", .val = self.childNode(d.name) },
                     .{ .key = "value", .val = try self.emitValue(d.value) },
                 });
             }
@@ -814,7 +922,7 @@ const Serializer = struct {
                 for (g.names.items, names) |name, *nn| nn.* = try self.strOrBytes(name);
                 out.* = try self.obj(&.{
                     .{ .key = "attrs", .val = .{ .array = names } },
-                    .{ .key = "from", .val = self.deferredNode(g.from) },
+                    .{ .key = "from", .val = self.childNode(g.from) },
                 });
             }
             try fields.append(self.arena, .{ .key = "inheritFrom", .val = .{ .array = groups } });
@@ -823,10 +931,10 @@ const Serializer = struct {
         return .{ .object = try fields.toOwnedSlice(self.arena) };
     }
 
-    fn emitValue(self: *Serializer, v: BindingValue) !JsonValue {
+    fn emitValue(self: *Lowerer, v: BindingValue) !JsonValue {
         return switch (v) {
-            .leaf => |n| self.deferredNode(n),
-            .set => |s| self.deferredSet(s),
+            .leaf => |n| self.childNode(n),
+            .set => |s| self.childSet(s),
         };
     }
 
@@ -834,7 +942,7 @@ const Serializer = struct {
 
     /// The textual name of a static attr/formal atom. A quoted-string atom is
     /// decoded (`"a b"` → `a b`); a bare identifier/keyword is taken verbatim.
-    fn attrNameText(self: *Serializer, atom: Node.Atom) ![]const u8 {
+    fn attrNameText(self: *Lowerer, atom: Node.Atom) ![]const u8 {
         const text = self.atomText(atom);
         if (string_syntax.kindAt(text, 0) == null) return text;
         const parsed = string_syntax.parseLiteral(self.gpa, self.source, .{
@@ -857,7 +965,7 @@ const Serializer = struct {
 
     /// If `n` is a constant (non-interpolating) string literal, its decoded
     /// text; otherwise null. Drives `${"lit"}` → static-attr folding.
-    fn constString(self: *Serializer, n_in: *const Node) !?[]const u8 {
+    fn constString(self: *Lowerer, n_in: *const Node) !?[]const u8 {
         const n = ast.unwrapParens(n_in);
         if (n.tag != .string) return null;
         const atom = n.data.atom;
@@ -881,11 +989,11 @@ const Serializer = struct {
 
     // ---- JsonValue builders ----
 
-    fn obj(self: *Serializer, fields: []const JsonValue.Field) !JsonValue {
+    fn obj(self: *Lowerer, fields: []const JsonValue.Field) !JsonValue {
         return .{ .object = try self.arena.dupe(JsonValue.Field, fields) };
     }
 
-    fn arr(self: *Serializer, items: []const JsonValue) !JsonValue {
+    fn arr(self: *Lowerer, items: []const JsonValue) !JsonValue {
         return .{ .array = try self.arena.dupe(JsonValue, items) };
     }
 };
@@ -915,5 +1023,4 @@ const BInheritFrom = struct {
 
 test {
     _ = @import("parse_json/tests.zig");
-    _ = emitter;
 }

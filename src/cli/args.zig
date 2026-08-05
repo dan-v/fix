@@ -71,7 +71,7 @@ pub const SourceOptions = struct {
 };
 
 /// A `--option NAME VALUE` override for a `nix.conf` setting. Applied over the
-/// loaded config at highest precedence (see `setup.configure`). Borrowed from
+/// loaded config at highest precedence (see `setup.Session.configure`). Borrowed from
 /// argv.
 pub const OptionOverride = struct {
     name: []const u8,
@@ -134,7 +134,7 @@ pub const Options = struct {
     /// True once `--experimental-features` (the replace form) has been seen on
     /// the CLI. It overrides the `nix.conf` base entirely; without it the config
     /// value is the base and `--extra-experimental-features` appends to it (Nix
-    /// precedence). See `setup.configure`.
+    /// precedence). See `setup.Session.configure`.
     experimental_features_reset: bool = false,
     /// Deprecated features enabled via `--extra-deprecated-features` /
     /// `--deprecated-features` (Lix compat).

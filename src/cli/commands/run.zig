@@ -48,9 +48,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
-    defer ev.deinit();
-    const term = try setup.configure(&ev, init, &options, &settings);
-    defer term.deinit(ev.hostAllocator());
+    var session = setup.Session.init(&ev);
+    defer session.deinit(.full);
+    const term = try session.configure(init, &options, &settings);
 
     if (eval_support.sourceRequiresFlakes(source_arg) and !ev.languagePolicy().flakes_enabled) {
         render.usageError(init.io, init.environ_map, args.errorMessage(error.FlakesFeatureRequired), null, synopsis);

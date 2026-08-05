@@ -46,14 +46,16 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
     ev.setTransientChunkRegistration(process.exits_after_command and !options.debugger);
+    var session = setup.Session.init(&ev);
     // `main` terminates the process immediately after this command returns.
     // Releasing a nixpkgs-sized heap node-by-node on that path only delays
     // exit; the kernel will reclaim it wholesale. Keep explicit teardown for
     // embedders/tests and for reports emitted by Engine.deinit().
-    defer if (!process.exits_after_command or options.mem_report != null or options.gc_report or
-        ev.letFloatCensusEnabled()) ev.deinit();
-    const term = try setup.configure(&ev, init, &options, &settings);
-    defer term.deinit(ev.hostAllocator());
+    // Even on that fast path, Session drains the chunk-cache writer before it
+    // releases the output sink borrowed by the evaluator.
+    defer session.deinit(if (!process.exits_after_command or options.mem_report != null or options.gc_report or
+        ev.letFloatCensusEnabled()) .full else .fast_exit);
+    const term = try session.configure(init, &options, &settings);
     if (options.read_write_mode) {
         // Store writes are observable. Keep them on the demand path so helper
         // speculation cannot instantiate derivations the user never demanded.
