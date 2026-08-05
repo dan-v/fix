@@ -2498,8 +2498,7 @@ pub const ObjectHeap = struct {
     /// containing slot's id.
     pub fn prepareAttrsRange(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
         const range = try self.appendAttrEntries(entries);
-        self.sortAttrs(range);
-        try self.rejectDuplicateAttrs(range);
+        try self.sortAndDedupAttrs(range);
         return range;
     }
 
@@ -2512,8 +2511,7 @@ pub const ObjectHeap = struct {
 
         const range = try self.appendAttrEntries(entries);
         errdefer self.attrs.rollback(range);
-        self.sortAttrs(range);
-        try self.rejectDuplicateAttrs(range);
+        try self.sortAndDedupAttrs(range);
 
         const pos_range = try self.appendAttrPositions(positions);
         errdefer self.attr_positions.rollback(pos_range);
@@ -2524,8 +2522,7 @@ pub const ObjectHeap = struct {
     pub fn addContextString(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
         const range = try self.appendAttrEntries(context);
         errdefer self.attrs.rollback(range);
-        self.sortAttrs(range);
-        try self.rejectDuplicateAttrs(range);
+        try self.sortAndDedupAttrs(range);
         return self.add(.{ .context_string = .{ .text = text, .context = range } });
     }
 
@@ -2667,8 +2664,7 @@ pub const ObjectHeap = struct {
         if (comptime presorted) {
             std.debug.assert(attrEntriesSortedUnique(entries));
         } else {
-            self.sortAttrs(range);
-            try self.rejectDuplicateAttrs(range);
+            try self.sortAndDedupAttrs(range);
         }
 
         if (positions.len == 0) return self.add(.{ .attrs = .{ .range = range } });
@@ -2826,12 +2822,29 @@ pub const ObjectHeap = struct {
         return range;
     }
 
+    // Block sort deliberately: runtime-built attr entries carry names in
+    // near-generation order (long ascending runs), which the merge-based
+    // block sort consumes in O(n) while pdq's partial-insertion heuristic
+    // measurably thrashes on (attrset-heavy bench, 2026-08). Stability is
+    // incidental — duplicate names are rejected after every sort.
     fn sortAttrs(self: *ObjectHeap, range: AttrRange) void {
         std.mem.sort(AttrEntry, self.attrs.sliceMut(range), {}, attrEntryLessThan);
     }
 
     fn sortAttrPositions(self: *ObjectHeap, range: AttrPosRange) void {
         std.mem.sort(AttrPosEntry, self.attr_positions.sliceMut(range), {}, attrPosEntryLessThan);
+    }
+
+    /// Sort + duplicate-reject an unsorted attr range, with a linear
+    /// pre-check that skips both when the input is already strictly
+    /// ascending (sorted-unique implies duplicate-free). Runtime builders
+    /// frequently produce sorted input — e.g. `listToAttrs` over a
+    /// generated list interns names in id order — and the check reads
+    /// exactly the memory the sort was about to touch.
+    fn sortAndDedupAttrs(self: *ObjectHeap, range: AttrRange) !void {
+        if (attrEntriesSortedUnique(self.attrs.slice(range))) return;
+        self.sortAttrs(range);
+        try self.rejectDuplicateAttrs(range);
     }
 
     fn rejectDuplicateAttrs(self: *const ObjectHeap, range: AttrRange) !void {

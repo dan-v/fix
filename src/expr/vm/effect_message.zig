@@ -108,13 +108,7 @@ fn writeAttrs(self: *VM, writer: *std.Io.Writer, id: ObjectId, seen: *std.AutoHa
     const Entry = std.meta.Elem(@TypeOf(stored));
     const entries = try self.allocator.dupe(Entry, stored);
     defer self.allocator.free(entries);
-    const Cmp = struct {
-        intern: @TypeOf(self.intern),
-        fn lessThan(ctx: @This(), a: Entry, b: Entry) bool {
-            return std.mem.lessThan(u8, ctx.intern.get(a.name), ctx.intern.get(b.name));
-        }
-    };
-    std.mem.sort(Entry, entries, Cmp{ .intern = self.intern }, Cmp.lessThan);
+    try self.intern.sortByNameLex(self.allocator, Entry, entries);
 
     try writer.writeAll("{ ");
     for (entries) |entry| {

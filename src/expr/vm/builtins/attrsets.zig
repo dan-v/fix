@@ -135,12 +135,8 @@ pub fn sortedAttrEntries(self: *VM, arg: Value) ![]heap_mod.AttrEntry {
 
     const entries = try self.heap.materializeAttrs(value.asObjectId());
     const sorted = try self.allocator.dupe(heap_mod.AttrEntry, entries);
-    const Comparator = struct {
-        pub fn lessThan(vm: @TypeOf(self), a: heap_mod.AttrEntry, b: heap_mod.AttrEntry) bool {
-            return std.mem.lessThan(u8, vm.intern.get(a.name), vm.intern.get(b.name));
-        }
-    };
-    std.mem.sort(heap_mod.AttrEntry, sorted, self, Comparator.lessThan);
+    errdefer self.allocator.free(sorted);
+    try self.intern.sortByNameLex(self.allocator, heap_mod.AttrEntry, sorted);
     return sorted;
 }
 
