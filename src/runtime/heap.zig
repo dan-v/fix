@@ -241,6 +241,53 @@ const value_chunk_size: u32 = 8192;
 const attr_chunk_size: u32 = 8192;
 const attr_position_chunk_size: u32 = 4096;
 
+/// Single source of truth for the heap's range side-stores. Everything
+/// indexed per-store — the `HeapLocal` reuse-stat arrays, the shared free
+/// lists and their max-length hints, the free-list rebalance/coalesce
+/// sweeps, reserved-byte accounting, and the collector's sweep coalescer
+/// (`collector.RangeBatch`) — derives from this table. Adding a store is
+/// adding one row plus the `ObjectHeap`/`HeapLocal` fields the row names.
+pub const range_stores = .{
+    .{
+        .name = "values",
+        .Store = ValueStore,
+        .Elem = Value,
+        .store = "values",
+        .chunk = "value",
+        .free = "gc_free_values",
+        .shared = "gc_shared_free_values",
+        .chunk_size = value_chunk_size,
+    },
+    .{
+        .name = "attrs",
+        .Store = AttrStore,
+        .Elem = AttrEntry,
+        .store = "attrs",
+        .chunk = "attr",
+        .free = "gc_free_attrs",
+        .shared = "gc_shared_free_attrs",
+        .chunk_size = attr_chunk_size,
+    },
+    .{
+        .name = "attr_pos",
+        .Store = AttrPosStore,
+        .Elem = AttrPosEntry,
+        .store = "attr_positions",
+        .chunk = "attr_pos",
+        .free = "gc_free_attr_pos",
+        .shared = "gc_shared_free_attr_pos",
+        .chunk_size = attr_position_chunk_size,
+    },
+};
+
+/// Table row index by short store name; comptime-only.
+pub fn rangeStoreIndex(comptime name: []const u8) comptime_int {
+    inline for (range_stores, 0..) |row, i| {
+        if (comptime std.mem.eql(u8, row.name, name)) return i;
+    }
+    @compileError("unknown range store: " ++ name);
+}
+
 const LocalSlice = struct { segment: u32, offset: u32, len: u32 };
 
 const LocalChunk = struct {
@@ -296,14 +343,15 @@ pub const HeapLocal = struct {
     /// exactly these — O(young) — and clears the list. Reuse- and TLAB-tail-
     /// safe, unlike an id-range frontier.
     gc_young_slots: std.ArrayListUnmanaged(ObjectId) = .empty,
-    /// Range-reuse diagnostics. Single-writer (this worker's allocation
-    /// path), read only after evaluation has quiesced for `--mem-report`.
-    range_reuse_exact: [3]u64 = @splat(0),
-    range_reuse_split: [3]u64 = @splat(0),
-    range_reuse_miss: [3]u64 = @splat(0),
-    range_reuse_miss_slots: [3]u64 = @splat(0),
-    range_fresh_refills: [3]u64 = @splat(0),
-    range_fresh_slots: [3]u64 = @splat(0),
+    /// Range-reuse diagnostics, indexed by `range_stores` row. Single-writer
+    /// (this worker's allocation path), read only after evaluation has
+    /// quiesced for `--mem-report`.
+    range_reuse_exact: [range_stores.len]u64 = @splat(0),
+    range_reuse_split: [range_stores.len]u64 = @splat(0),
+    range_reuse_miss: [range_stores.len]u64 = @splat(0),
+    range_reuse_miss_slots: [range_stores.len]u64 = @splat(0),
+    range_fresh_refills: [range_stores.len]u64 = @splat(0),
+    range_fresh_slots: [range_stores.len]u64 = @splat(0),
     object_reuse_hits: u64 = 0,
     object_reuse_misses: u64 = 0,
     object_fresh_refills: u64 = 0,
@@ -399,7 +447,7 @@ pub const ObjectHeap = struct {
     gc_shared_free_attrs: RangeFreeList,
     gc_shared_free_attr_pos: RangeFreeList,
     gc_shared_free_range_mu: sync.SpinMutex,
-    gc_shared_free_range_max: [3]std.atomic.Value(u32),
+    gc_shared_free_range_max: [range_stores.len]std.atomic.Value(u32),
     /// Unique-per-init id for cache invalidation. Same trick as the
     /// intern table: thread-local caches outlive an Engine, and the
     /// allocator can reuse heap addresses, so a stale slot would match
@@ -467,7 +515,7 @@ pub const ObjectHeap = struct {
             .gc_shared_free_attrs = .{},
             .gc_shared_free_attr_pos = .{},
             .gc_shared_free_range_mu = .{},
-            .gc_shared_free_range_max = .{ .init(0), .init(0), .init(0) },
+            .gc_shared_free_range_max = @splat(.init(0)),
             .token = next_heap_token.fetchAdd(1, .monotonic),
             .collection = .{ .major_gate = gc_major_gate_floor },
         };
@@ -482,9 +530,8 @@ pub const ObjectHeap = struct {
         self.allocator.free(self.worker_locals);
         self.allocator.free(self.sweep_filter);
         self.gc_shared_free_objects.deinit(self.allocator);
-        self.gc_shared_free_values.deinit(self.allocator);
-        self.gc_shared_free_attrs.deinit(self.allocator);
-        self.gc_shared_free_attr_pos.deinit(self.allocator);
+        inline for (range_stores) |row|
+            @field(self, row.shared).deinit(self.allocator);
         self.attr_positions.deinit(self.allocator);
         self.attrs.deinit(self.allocator);
         self.values.deinit(self.allocator);
@@ -1403,26 +1450,16 @@ pub const ObjectHeap = struct {
 
     const gc_range_refill_batch: usize = 256;
 
-    /// Reuse a worker-owned freed range of at least `n` slots from `field`.
-    /// An exact match wins; otherwise the list splits a larger range. On a
-    /// local miss, refill one compatible size class from the central overflow
-    /// in bulk. The fast path remains lock-free, while no worker can strand an
-    /// entire shard of ranges that another worker needs.
-    fn gcReuseRange(self: *ObjectHeap, local: *HeapLocal, comptime field: []const u8, n: u32) ?RangeFreeList.Loc {
-        const store_index = comptime if (std.mem.eql(u8, field, "gc_free_values"))
-            0
-        else if (std.mem.eql(u8, field, "gc_free_attrs"))
-            1
-        else if (std.mem.eql(u8, field, "gc_free_attr_pos"))
-            2
-        else
-            @compileError("unknown GC range store");
-        const shared_field = comptime if (std.mem.eql(u8, field, "gc_free_values"))
-            "gc_shared_free_values"
-        else if (std.mem.eql(u8, field, "gc_free_attrs"))
-            "gc_shared_free_attrs"
-        else
-            "gc_shared_free_attr_pos";
+    /// Reuse a worker-owned freed range of at least `n` slots from the
+    /// `range_stores[si]` store. An exact match wins; otherwise the list
+    /// splits a larger range. On a local miss, refill one compatible size
+    /// class from the central overflow in bulk. The fast path remains
+    /// lock-free, while no worker can strand an entire shard of ranges that
+    /// another worker needs.
+    fn gcReuseRange(self: *ObjectHeap, local: *HeapLocal, comptime si: usize, n: u32) ?RangeFreeList.Loc {
+        const store_index = si;
+        const field = range_stores[si].free;
+        const shared_field = range_stores[si].shared;
         if (@field(local, field).pop(self.allocator, n)) |hit| {
             if (hit.split) local.range_reuse_split[store_index] += 1 else local.range_reuse_exact[store_index] += 1;
             return hit.loc;
@@ -1488,7 +1525,8 @@ pub const ObjectHeap = struct {
     pub fn rangeReuseStats(self: *const ObjectHeap) RangeReuseStats {
         var total: RangeReuseStats = .{};
         for (self.worker_locals) |*local| {
-            inline for (.{ &total.values, &total.attrs, &total.attr_pos }, 0..) |dst, i| {
+            inline for (range_stores, 0..) |row, i| {
+                const dst = &@field(total, row.name);
                 dst.exact += local.range_reuse_exact[i];
                 dst.split += local.range_reuse_split[i];
                 dst.miss += local.range_reuse_miss[i];
@@ -1520,14 +1558,12 @@ pub const ObjectHeap = struct {
 
     pub fn freeRangesStats(self: *const ObjectHeap) FreeRangesStats {
         var total: FreeRangesStats = .{ .objects = self.gc_shared_free_objects.items.len };
-        total.values.add(self.gc_shared_free_values.stats());
-        total.attrs.add(self.gc_shared_free_attrs.stats());
-        total.attr_pos.add(self.gc_shared_free_attr_pos.stats());
+        inline for (range_stores) |row|
+            @field(total, row.name).add(@field(self, row.shared).stats());
         for (self.worker_locals) |*local| {
             total.objects += local.gc_free_objects.items.len;
-            total.values.add(local.gc_free_values.stats());
-            total.attrs.add(local.gc_free_attrs.stats());
-            total.attr_pos.add(local.gc_free_attr_pos.stats());
+            inline for (range_stores) |row|
+                @field(total, row.name).add(@field(local, row.free).stats());
         }
         return total;
     }
@@ -1564,14 +1600,10 @@ pub const ObjectHeap = struct {
     pub fn gcRebalanceFreeLists(self: *ObjectHeap) void {
         if (self.worker_locals.len < 2) return;
         gcPoolFreeObjects(self);
-        inline for (.{
-            .{ "gc_free_values", "gc_shared_free_values", 0 },
-            .{ "gc_free_attrs", "gc_shared_free_attrs", 1 },
-            .{ "gc_free_attr_pos", "gc_shared_free_attr_pos", 2 },
-        }) |fields| {
+        inline for (range_stores, 0..) |row, i| {
             for (self.worker_locals) |*local|
-                @field(local, fields[0]).moveAllTo(&@field(self, fields[1]), self.allocator);
-            self.gc_shared_free_range_max[fields[2]].store(@field(self, fields[1]).maxLen(), .release);
+                @field(local, row.free).moveAllTo(&@field(self, row.shared), self.allocator);
+            self.gc_shared_free_range_max[i].store(@field(self, row.shared).maxLen(), .release);
         }
     }
 
@@ -1585,11 +1617,8 @@ pub const ObjectHeap = struct {
     /// stores are processed sequentially, bounding temporary memory to the
     /// largest store's bitmap.
     pub fn gcCoalesceFreeRanges(self: *ObjectHeap) void {
-        inline for (.{
-            .{ ValueStore, "values", "gc_free_values", "gc_shared_free_values", 0 },
-            .{ AttrStore, "attrs", "gc_free_attrs", "gc_shared_free_attrs", 1 },
-            .{ AttrPosStore, "attr_positions", "gc_free_attr_pos", "gc_shared_free_attr_pos", 2 },
-        }) |fields| self.gcCoalesceRangeStore(fields[0], fields[1], fields[2], fields[3], fields[4]);
+        inline for (range_stores, 0..) |row, i|
+            self.gcCoalesceRangeStore(row.Store, row.store, row.free, row.shared, i);
     }
 
     fn gcCoalesceRangeStore(
@@ -1652,15 +1681,29 @@ pub const ObjectHeap = struct {
         self.gc_shared_free_range_max[store_index].store(@field(self, shared_field).maxLen(), .release);
     }
 
-    fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
+    /// Reserve `n` slots in the `range_stores[si]` side-store: reuse a swept
+    /// dead range first (NON-MOVING — a reused range of at least `n` is
+    /// split when larger, never relocated, so returned slices stay stable
+    /// across forces), else bump the worker TLAB.
+    inline fn reserveStoreLocal(self: *ObjectHeap, comptime si: usize, n: u32) !range_stores[si].Store.Range {
+        const row = range_stores[si];
         const local = self.currentLocal();
-        // NON-MOVING reuse: a swept dead range of at least `n` is reused (and
-        // split when larger) before touching the bump cursor. Ranges never
-        // relocate, so the returned slice remains stable across forces.
         if (self.collection.collect_enabled) {
-            if (self.gcReuseRange(local, "gc_free_values", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            if (self.gcReuseRange(local, si, n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(ValueStore, &self.values, &local.value, &local.gc_free_values, 0, value_chunk_size, n);
+        return self.reserveRangeLocal(
+            row.Store,
+            &@field(self, row.store),
+            &@field(local, row.chunk),
+            &@field(local, row.free),
+            si,
+            row.chunk_size,
+            n,
+        );
+    }
+
+    fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
+        return self.reserveStoreLocal(comptime rangeStoreIndex("values"), n);
     }
 
     /// Reserve `n` slots of attr storage for a merge in progress.
@@ -1690,19 +1733,11 @@ pub const ObjectHeap = struct {
     }
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
-        const local = self.currentLocal();
-        if (self.collection.collect_enabled) {
-            if (self.gcReuseRange(local, "gc_free_attrs", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
-        }
-        return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, &local.gc_free_attrs, 1, attr_chunk_size, n);
+        return self.reserveStoreLocal(comptime rangeStoreIndex("attrs"), n);
     }
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
-        const local = self.currentLocal();
-        if (self.collection.collect_enabled) {
-            if (self.gcReuseRange(local, "gc_free_attr_pos", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
-        }
-        return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, &local.gc_free_attr_pos, 2, attr_position_chunk_size, n);
+        return self.reserveStoreLocal(comptime rangeStoreIndex("attr_pos"), n);
     }
 
     fn releaseAttrsTail(self: *ObjectHeap, range: AttrRange, actual: u32) void {
@@ -1875,10 +1910,10 @@ pub const ObjectHeap = struct {
     /// proxy. Reuse keeps the cursors (and this) from growing, so it
     /// plateaus near the threshold once collection keeps up.
     pub fn totalReservedBytes(self: *const ObjectHeap) u64 {
-        return @as(u64, self.objects.count()) * @sizeOf(Object) +
-            @as(u64, self.values.count()) * @sizeOf(Value) +
-            @as(u64, self.attrs.count()) * @sizeOf(AttrEntry) +
-            @as(u64, self.attr_positions.count()) * @sizeOf(AttrPosEntry);
+        var total = @as(u64, self.objects.count()) * @sizeOf(Object);
+        inline for (range_stores) |row|
+            total += @as(u64, @field(self, row.store).count()) * @sizeOf(row.Elem);
+        return total;
     }
 
     pub fn gcCollectRequested(self: *const ObjectHeap) bool {
