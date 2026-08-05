@@ -42,9 +42,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
     var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
-    defer ev.deinit();
-    const term = try setup.configure(&ev, init, &options, &settings);
-    defer term.deinit(ev.hostAllocator());
+    var session = setup.Session.init(&ev);
+    defer session.deinit(.full);
+    const term = try session.configure(init, &options, &settings);
 
     ev.enableStoreWrites();
 

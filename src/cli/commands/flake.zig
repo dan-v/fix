@@ -69,9 +69,9 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
         allocator,
         setup.engineConfig(init, try setup.workerCount(&options), memory_backing),
     );
-    defer ev.deinit();
-    const term = try setup.configure(&ev, init, &options, &settings);
-    defer term.deinit(ev.hostAllocator());
+    var session = setup.Session.init(&ev);
+    defer session.deinit(.full);
+    const term = try session.configure(init, &options, &settings);
     if (!ev.languagePolicy().flakes_enabled) {
         render.messageError(init.io, term.use_color, "{s}", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;

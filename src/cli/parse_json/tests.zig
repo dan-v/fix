@@ -291,6 +291,7 @@ const PeakAllocator = struct {
     child: std.mem.Allocator,
     active: usize = 0,
     peak: usize = 0,
+    allocations: usize = 0,
 
     const vtable: std.mem.Allocator.VTable = .{
         .alloc = alloc,
@@ -316,6 +317,7 @@ const PeakAllocator = struct {
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
         const ptr = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.allocations += 1;
         self.add(len);
         return ptr;
     }
@@ -341,7 +343,7 @@ const PeakAllocator = struct {
     }
 };
 
-test "wide lists stream with bounded serializer memory" {
+test "wide lists stream through reused bounded scratch" {
     var source_buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer source_buffer.deinit();
     try source_buffer.writer.writeByte('[');
@@ -362,5 +364,6 @@ test "wide lists stream with bounded serializer memory" {
 
     try std.testing.expect(output.fullCount() > 256 * 1024);
     try std.testing.expect(measured.peak < 64 * 1024);
+    try std.testing.expect(measured.allocations < 64);
     try std.testing.expectEqual(@as(usize, 0), measured.active);
 }
