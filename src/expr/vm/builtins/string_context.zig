@@ -23,7 +23,7 @@ pub fn builtinGetContext(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     // getContext does not coerce — a path or derivation is a type error (unlike
     // string concatenation, which coerces them).
-    if (value.kind() != .string and value.kind() != .string_context) {
+    if (value.kind() != .string and value.kind() != .string_context and value.kind() != .heap_string) {
         return vm_trace.typeErrorExpected(self, "a string", value);
     }
     return Value.attrs(try self.heap.addAttrs(try contextEntriesForValue(self, value)));
@@ -45,21 +45,24 @@ pub fn builtinAppendContext(self: *VM, string_arg: Value, context_arg: Value) !V
     for (try contextEntriesForValue(self, string_value)) |entry| try appendContextEntry(self, &entries, entry.name, entry.value);
     for (try self.heap.materializeAttrs(context_value.asObjectId())) |entry| try appendContextEntry(self, &entries, entry.name, entry.value);
 
-    if (entries.items.len == 0) return Value.string(try strings.stringTextInternId(self, string_value));
-    return Value.contextString(try self.heap.addContextString(try strings.stringTextInternId(self, string_value), entries.items));
+    if (entries.items.len == 0) return Value.string(try strings.stringNameId(self, string_value));
+    return Value.contextString(try self.heap.addContextString(try strings.stringNameId(self, string_value), entries.items));
 }
 
 pub fn builtinUnsafeDiscardStringContext(self: *VM, arg: Value) !Value {
     // Nix coerces the argument to a string first (paths, derivations, and
     // `__toString` attrsets are accepted), then drops the context.
     const value = try strings.coerceStringContextValue(self, arg);
+    // A plain heap string has no context to discard; hand it back rather
+    // than interning it.
+    if (value.isHeapString()) return value;
     return Value.string(try strings.stringTextInternId(self, value));
 }
 
 pub fn builtinUnsafeDiscardOutputDependency(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!strings.isStringLike(value)) return error.TypeError;
-    const text_id = try strings.stringTextInternId(self, value);
+    const text_id = try strings.stringNameId(self, value);
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
     for (try contextEntriesForValue(self, value)) |entry| {
@@ -72,7 +75,7 @@ pub fn builtinUnsafeDiscardOutputDependency(self: *VM, arg: Value) !Value {
 pub fn builtinAddDrvOutputDependencies(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
     if (!strings.isStringLike(value)) return vm_trace.typeErrorExpected(self, "a string", value);
-    const text_id = try strings.stringTextInternId(self, value);
+    const text_id = try strings.stringNameId(self, value);
 
     // Nix requires the context to have exactly one element, which must be a
     // bare derivation (`.drv`), not one of its outputs.
@@ -108,7 +111,7 @@ pub fn builtinAddDrvOutputDependencies(self: *VM, arg: Value) !Value {
 
 pub fn contextEntriesForValue(self: *VM, value: Value) ![]const heap_mod.AttrEntry {
     return switch (value.kind()) {
-        .string => &.{},
+        .string, .heap_string => &.{},
         .path => try singleContextEntry(self, value.asInternId(), try pathContextValue(self)),
         .string_context => (try self.heap.getContextString(value.asObjectId())).context,
         else => error.TypeError,

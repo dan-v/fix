@@ -175,10 +175,9 @@ pub fn derivationAttrsEqual(
     seen: *EqualityPairSet,
 ) !?bool {
     const type_name = try self.intern.intern("type");
-    const derivation_type = try self.intern.intern("derivation");
 
-    if (!try attrsHaveDerivationType(self, a_id, type_name, derivation_type)) return null;
-    if (!try attrsHaveDerivationType(self, b_id, type_name, derivation_type)) return null;
+    if (!try attrsHaveDerivationType(self, a_id, type_name)) return null;
+    if (!try attrsHaveDerivationType(self, b_id, type_name)) return null;
 
     const out_path_name = try self.intern.intern("outPath");
     const a_out_path = attrValue(try self.heap.materializeAttrs(a_id), out_path_name) orelse return null;
@@ -191,13 +190,11 @@ pub fn attrsHaveDerivationType(
     self: *VM,
     id: heap_mod.ObjectId,
     type_name: InternId,
-    derivation_type: InternId,
 ) !bool {
     const type_value = attrValue(try self.heap.materializeAttrs(id), type_name) orelse return false;
     const forced = try force.forceValue(self, type_value);
     if (!isStringComparable(forced)) return false;
-    const text_id = try strings.stringTextInternId(self, forced);
-    return text_id == derivation_type;
+    return std.mem.eql(u8, try strings.stringBytes(self, forced), "derivation");
 }
 
 pub fn attrValue(entries: []const heap_mod.AttrEntry, name: InternId) ?Value {
@@ -249,9 +246,12 @@ pub fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
             if (af > bf) return .gt;
             return .eq;
         },
-        .string, .path, .string_context => {
-            if (!isStringComparable(vb) or vb.kind() != va.kind()) return error.TypeError;
-            return switch (std.mem.order(u8, self.intern.get(try strings.stringTextInternId(self, va)), self.intern.get(try strings.stringTextInternId(self, vb)))) {
+        .string, .path, .string_context, .heap_string => {
+            // Plain strings order with plain strings regardless of
+            // residency; other kind pairings keep the exact-match rule.
+            const plainish = (va.isString() or va.isHeapString()) and (vb.isString() or vb.isHeapString());
+            if (!isStringComparable(vb) or (!plainish and vb.kind() != va.kind())) return error.TypeError;
+            return switch (std.mem.order(u8, try strings.stringBytes(self, va), try strings.stringBytes(self, vb))) {
                 .lt => .lt,
                 .eq => .eq,
                 .gt => .gt,

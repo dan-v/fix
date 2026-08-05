@@ -191,7 +191,7 @@ pub fn collect(ev: Context, collector_id: u8) void {
     heap_collector.remsetClear(ev.heap);
     // Charge this minor's tenurings against the major gate: once enough has
     // accumulated in the old generation, the next collection escalates.
-    ev.heap.gcNoteMinorPromoted(st.promoted);
+    ev.heap.gcNoteMinorPromoted(st.promoted + st.promoted_charge);
     heap_collector.afterCollect(ev.heap, tr.stats.bytes);
     gc.recordCollection(&ev.heap.collection.report, .minor, st.freed, tr.stats, ev.heap.totalReservedBytes());
     gc.recordTiming(&ev.heap.collection.report, t1 - t0, t2 - t1);

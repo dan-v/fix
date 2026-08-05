@@ -14,8 +14,8 @@ const prof_path = engine.probe.prof_path;
 pub fn report(ev: *Engine) void {
     const h = ev.heapStats();
     std.debug.print(
-        "heap: objects={d} values={d} attrs={d} attr_positions={d}\n",
-        .{ h.objects, h.values, h.attrs, h.attr_positions },
+        "heap: objects={d} values={d} attrs={d} attr_positions={d} strbytes={d}\n",
+        .{ h.objects, h.values, h.attrs, h.attr_positions, h.bytes },
     );
     const intern = ev.internStats();
     std.debug.print(

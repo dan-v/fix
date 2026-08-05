@@ -246,7 +246,7 @@ pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
         heap.totalReservedBytes() + heap.collection.step_bytes
     else
         @max(budget, heap.totalReservedBytes() + headroom);
-    heap.gcArmObjectMissCollection();
+    heap.gcArmPoolMissCollection();
     // Invalidate all thread-local caches (thunk memo, attr IC, call IC)
     // that key on `token`. Current thunk-memo and attr-cache values were
     // traced as roots for this collection because a cache may momentarily be
@@ -364,6 +364,12 @@ fn sweepYoungListInto(heap: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLo
         if (marked) {
             heap.gcSetOld(id);
             st.promoted += 1;
+            // Byte-weighted gate charge for tenured string text (see
+            // MinorStats.promoted_charge).
+            switch (heap.objects.get(id).*) {
+                .heap_string => |hs| st.promoted_charge += hs.bytes.len / ObjectHeap.gc_bytes_per_object_charge,
+                else => {},
+            }
         } else {
             // Detector builds retain the slot so stale reads trap reliably.
             freeObjectRanges(heap, ranges, heap.objects.get(id));
@@ -388,6 +394,7 @@ pub fn beginMinorSweep(heap: *ObjectHeap, worker_count: u8) void {
     heap.collection.minor_sweep_next.store(0, .monotonic);
     heap.collection.minor_sweep_done.store(0, .monotonic);
     heap.collection.minor_sweep_promoted.store(0, .monotonic);
+    heap.collection.minor_sweep_promoted_charge.store(0, .monotonic);
     heap.collection.minor_sweep_freed.store(0, .monotonic);
     heap.collection.minor_sweep_open.store(false, .release);
 }
@@ -414,6 +421,7 @@ pub fn minorSweepClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
         _ = heap.collection.minor_sweep_done.fetchAdd(1, .release);
     }
     _ = heap.collection.minor_sweep_promoted.fetchAdd(local_st.promoted, .monotonic);
+    _ = heap.collection.minor_sweep_promoted_charge.fetchAdd(local_st.promoted_charge, .monotonic);
     _ = heap.collection.minor_sweep_freed.fetchAdd(local_st.freed, .monotonic);
 }
 
@@ -425,7 +433,11 @@ pub fn waitMinorSweepDone(heap: *ObjectHeap) void {
 /// Return the aggregate result after every list has drained.
 pub fn finishMinorSweep(heap: *ObjectHeap) ObjectHeap.MinorStats {
     heap.gcRebalanceFreeLists();
-    return .{ .promoted = heap.collection.minor_sweep_promoted.load(.monotonic), .freed = heap.collection.minor_sweep_freed.load(.monotonic) };
+    return .{
+        .promoted = heap.collection.minor_sweep_promoted.load(.monotonic),
+        .promoted_charge = heap.collection.minor_sweep_promoted_charge.load(.monotonic),
+        .freed = heap.collection.minor_sweep_freed.load(.monotonic),
+    };
 }
 
 /// Debug: verify the mark is closed — no MARKED object may reference an
@@ -525,7 +537,7 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
             // thunk; memset a sentinel so a dangling `getHeapString` slice
             // reads visibly-garbage text in detector builds instead of
             // stale-but-plausible bytes.
-            .heap_string => |r| @memset(heap.bytes.sliceMut(r), 0xAA),
+            .heap_string => |hs| @memset(heap.bytes.sliceMut(hs.bytes), 0xAA),
             else => {},
         }
     }
@@ -540,7 +552,7 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
         .partial_app => |p| if (p.args.len > 0) ranges.add(si_values, .{ .segment = p.args.segment, .offset = p.args.offset, .len = p.args.len }),
         .context_string => |c| if (c.context.len > 0) ranges.add(si_attrs, .{ .segment = c.context.segment, .offset = c.context.offset, .len = c.context.len }),
         .thunk => |t| if (t.targetSpillRange()) |r| ranges.add(si_values, .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
-        .heap_string => |r| if (r.len > 0) ranges.add(si_bytes, .{ .segment = r.segment, .offset = r.offset, .len = r.len }),
+        .heap_string => |hs| if (hs.bytes.len > 0) ranges.add(si_bytes, .{ .segment = hs.bytes.segment, .offset = hs.bytes.offset, .len = hs.bytes.len }),
         .merge_attrs, .boxed_int => {},
     }
 }

@@ -111,8 +111,10 @@ const ValueStore = segments.StableSegments(Value, .{ .first_segment_size = value
 const AttrStore = segments.StableSegments(AttrEntry, .{ .first_segment_size = attr_chunk_size, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 const AttrPosStore = segments.StableSegments(AttrPosEntry, .{ .first_segment_size = attr_position_chunk_size, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 /// GC-able string text (`Object.heap_string`). Byte-granular: one "slot"
-/// is one byte, so range lengths are byte counts.
-const ByteStore = segments.StableSegments(u8, .{ .first_segment_size = byte_chunk_size, .vma_tag = .strbytes, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+/// is one byte, so range lengths are byte counts. Deliberately NO hugetlb
+/// overlay: this is a churn store — huge pages would pin 2 MiB of
+/// physical memory per surviving shard and hide the footprint from RSS.
+const ByteStore = segments.StableSegments(u8, .{ .first_segment_size = byte_chunk_size, .vma_tag = .strbytes }, mem_tag.vma);
 
 pub var next_heap_token: std.atomic.Value(u64) = .init(1);
 
@@ -233,8 +235,29 @@ pub const Object = union(enum) {
     /// ordering are byte-wise at the VM layer; the text is NOT id-keyed,
     /// so it must be interned before use as an attr name or any other
     /// id-compared role.
-    heap_string: ByteRange,
+    heap_string: HeapStringObject,
 };
+
+/// `bytes.len` is the size-class-padded allocation (`byteAllocSize`) so
+/// churn recycles exact-fit instead of shredding the free pool with split
+/// remainders; `text_len` is the string's real length within it.
+pub const HeapStringObject = struct {
+    bytes: ByteRange,
+    text_len: u32,
+};
+
+/// Size-class rounding for heap-string byte allocations. Near-uniform
+/// alloc/free traffic (a fold's churn) with EXACT lengths fragments the
+/// best-fit free list: a 70-byte free range serves a 64-byte request and
+/// leaves a 6-byte shard, and the pool degenerates into sub-request-size
+/// fragments (measured: 400k free ranges, max len 61, 60% miss rate).
+/// Classes make equal-class traffic self-recycling; waste is bounded
+/// (<=15/255/4095 bytes per string by band).
+fn byteAllocSize(n: u32) u32 {
+    if (n <= 256) return (n + 15) & ~@as(u32, 15);
+    if (n <= 4096) return (n + 255) & ~@as(u32, 255);
+    return (n + 4095) & ~@as(u32, 4095);
+}
 
 /// Per-worker thread-local allocation buffer. Each worker reserves a
 /// chunk of slots from the global stores under their mutex once, then
@@ -428,6 +451,7 @@ pub const HeapCollectionState = struct {
     /// release/acquire handshake publishes this non-atomic phase bit.
     collecting_major: bool = false,
     minor_sweep_promoted: std.atomic.Value(u64) = .init(0),
+    minor_sweep_promoted_charge: std.atomic.Value(u64) = .init(0),
     minor_sweep_freed: std.atomic.Value(u64) = .init(0),
     /// Armed after a collection leaves a worthwhile object-id reserve. The
     /// first allocation that exhausts that reserve requests another collection
@@ -435,6 +459,15 @@ pub const HeapCollectionState = struct {
     /// the global byte threshold.
     object_miss_collect_armed: std.atomic.Value(bool) = .init(false),
     object_miss_collect_requests: std.atomic.Value(u64) = .init(0),
+    /// Byte-store churn pacing: request a collection once cumulative fresh
+    /// byte-store growth (sum of per-worker `range_fresh_slots[bytes]`)
+    /// crosses this floor — armed by `gcArmPoolMissCollection` to
+    /// "current growth + max(reclaimed byte pool, 1 MiB)", so each
+    /// early collection requires at least a pool's worth of forward
+    /// progress (no thrash) while heap-string churn plateaus instead of
+    /// growing by the flat post-collect headroom every cycle. maxInt =
+    /// disarmed.
+    byte_growth_collect_floor: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
 };
 
 pub const ObjectHeap = struct {
@@ -575,6 +608,7 @@ pub const ObjectHeap = struct {
         values: u32,
         attrs: u32,
         attr_positions: u32,
+        bytes: u32,
     };
 
     /// Append the discarded-TLAB tails to an object-store `SkipSet` (from
@@ -778,7 +812,7 @@ pub const ObjectHeap = struct {
             .context_string => |string| .{ .context_string = .{ .text = string.text, .context = string.context.len } },
             .boxed_int => |value| .{ .boxed_int = value },
             .partial_app => |partial| .{ .partial_app = .{ .function = inspectValue(partial.func), .args = partial.args.len } },
-            .heap_string => |range| .{ .heap_string = .{ .len = range.len } },
+            .heap_string => |hs| .{ .heap_string = .{ .len = hs.text_len } },
         };
     }
 
@@ -939,6 +973,7 @@ pub const ObjectHeap = struct {
             .values = self.values.count(),
             .attrs = self.attrs.count(),
             .attr_positions = self.attr_positions.count(),
+            .bytes = self.bytes.count(),
         };
     }
 
@@ -969,6 +1004,7 @@ pub const ObjectHeap = struct {
         values: u32,
         attrs: u32,
         attr_positions: u32,
+        bytes: u32,
         variant_counts: [10]u32,
         thunk_states: [5]u32,
         /// Of the `resolved` thunks (thunk_states[2]), the split by
@@ -1048,6 +1084,7 @@ pub const ObjectHeap = struct {
             .values = self.values.count(),
             .attrs = self.attrs.count(),
             .attr_positions = self.attr_positions.count(),
+            .bytes = self.bytes.count(),
             .variant_counts = [_]u32{0} ** 10,
             .thunk_states = [_]u32{0} ** 5,
             .resolved_demanded = 0,
@@ -1503,6 +1540,7 @@ pub const ObjectHeap = struct {
             if (n > 0) {
                 local.range_reuse_miss[store_index] += 1;
                 local.range_reuse_miss_slots[store_index] += n;
+                self.gcNoteRangePoolMiss(si);
             }
             return null;
         }
@@ -1528,6 +1566,7 @@ pub const ObjectHeap = struct {
         if (n > 0) {
             local.range_reuse_miss[store_index] += 1;
             local.range_reuse_miss_slots[store_index] += n;
+            self.gcNoteRangePoolMiss(si);
         }
         return null;
     }
@@ -1619,15 +1658,52 @@ pub const ObjectHeap = struct {
         self.gc_shared_free_count.store(self.gc_shared_free_objects.items.len, .release);
     }
 
-    /// Re-arm the object-pool exhaustion trigger only when the completed
-    /// collection produced enough reusable slots to amortize another pause.
-    /// If a growing live set leaves little or nothing free, the ordinary byte
+    /// Re-arm the pool-exhaustion trigger only when the completed
+    /// collection produced enough reusable storage to amortize another
+    /// pause — a worthwhile OBJECT pool or a worthwhile BYTE pool (heap-
+    /// string churn can dominate while the object pool stays modest). If a
+    /// growing live set leaves little or nothing free, the ordinary byte
     /// headroom remains the sole trigger and prevents collection thrashing.
-    pub fn gcArmObjectMissCollection(self: *ObjectHeap) void {
+    pub fn gcArmPoolMissCollection(self: *ObjectHeap) void {
         const min_reclaimed_slots: usize = 1 << 16;
-        var available = self.gc_shared_free_count.load(.acquire);
-        for (self.worker_locals) |*local| available += local.gc_free_objects.items.len;
-        self.collection.object_miss_collect_armed.store(available >= min_reclaimed_slots, .release);
+        const min_reclaimed_bytes: u64 = 1 << 20;
+        var objects_available = self.gc_shared_free_count.load(.acquire);
+        for (self.worker_locals) |*local| objects_available += local.gc_free_objects.items.len;
+        self.collection.object_miss_collect_armed.store(objects_available >= min_reclaimed_slots, .release);
+
+        // Byte-store churn pacing (see `byte_growth_collect_floor`): only a
+        // worthwhile reclaimed byte pool arms the growth floor, and the
+        // floor demands at least that pool's worth of fresh growth before
+        // the next early collection.
+        var bytes_available: u64 = self.gc_shared_free_bytes.stats().slots;
+        for (self.worker_locals) |*local| bytes_available += local.gc_free_bytes.stats().slots;
+        self.collection.byte_growth_collect_floor.store(
+            if (bytes_available >= min_reclaimed_bytes)
+                self.byteFreshGrowth() + @max(bytes_available, min_reclaimed_bytes)
+            else
+                std.math.maxInt(u64),
+            .release,
+        );
+    }
+
+    fn byteFreshGrowth(self: *const ObjectHeap) u64 {
+        var total: u64 = 0;
+        for (self.worker_locals) |*local| total += local.range_fresh_slots[comptime rangeStoreIndex("bytes")];
+        return total;
+    }
+
+    /// Byte-range pool miss (cold path): once fresh byte-store growth
+    /// crosses the armed floor, request one early safepoint collection —
+    /// the range-store analogue of the object pool-miss trigger, and what
+    /// keeps heap-string churn's footprint a plateau rather than growing
+    /// by the flat post-collect headroom every cycle.
+    fn gcNoteRangePoolMiss(self: *ObjectHeap, comptime si: usize) void {
+        if (comptime si != rangeStoreIndex("bytes")) return;
+        const floor = self.collection.byte_growth_collect_floor.load(.acquire);
+        if (self.byteFreshGrowth() < floor) return;
+        self.collection.byte_growth_collect_floor.store(std.math.maxInt(u64), .release);
+        self.collection.collect_requested = true;
+        _ = self.collection.object_miss_collect_requests.fetchAdd(1, .monotonic);
     }
 
     /// Stop-the-world publication for worker-owned free lists. With one worker,
@@ -2098,7 +2174,16 @@ pub const ObjectHeap = struct {
 
     /// GC minor-collect statistics; populated by the collector
     /// driver in `heap/collector.zig`.
-    pub const MinorStats = struct { promoted: u64 = 0, freed: u64 = 0 };
+    pub const MinorStats = struct {
+        promoted: u64 = 0,
+        freed: u64 = 0,
+        /// Byte-weighted extra promotion charge (`gc_bytes_per_object_charge`
+        /// per tenured heap-string byte block): a tenured 4 KiB string must
+        /// press on the major gate like the dozens of objects it displaces,
+        /// or dead tenured string churn accumulates gigabytes between
+        /// object-counted majors.
+        promoted_charge: u64 = 0,
+    };
 
     /// Grab the next marker slot for this worker (collector or peer). A slot
     /// `>= marker_count` means "don't participate — park idle". Called by both
@@ -2155,9 +2240,15 @@ pub const ObjectHeap = struct {
         return self.collection.promoted_since_major >= self.collection.major_gate;
     }
 
-    /// A minor tenured `promoted` objects; charge them against the major gate.
-    pub fn gcNoteMinorPromoted(self: *ObjectHeap, promoted: u64) void {
-        self.collection.promoted_since_major += promoted;
+    /// Per how many tenured heap-string BYTES the major gate is charged one
+    /// extra object-equivalent (see `MinorStats.promoted_charge`).
+    pub const gc_bytes_per_object_charge: u32 = 64;
+
+    /// A minor tenured objects worth `charge` gate units (object count plus
+    /// the byte-weighted heap-string surcharge); press them against the
+    /// major gate.
+    pub fn gcNoteMinorPromoted(self: *ObjectHeap, charge: u64) void {
+        self.collection.promoted_since_major += charge;
     }
 
     /// A major just ran, leaving `live_objects` alive (all now tenured). Reset
@@ -2807,10 +2898,24 @@ pub const ObjectHeap = struct {
     /// `heap_string` object. The caller keeps the returned Value rooted for
     /// as long as it borrows slices of the text (`getHeapString`).
     pub fn addHeapString(self: *ObjectHeap, text: []const u8) !ObjectId {
-        const range = try self.reserveStoreLocal(comptime rangeStoreIndex("bytes"), @intCast(text.len));
+        return self.addHeapStringParts(&.{text}, @intCast(text.len));
+    }
+
+    /// `addHeapString` over pre-sliced parts (concat results), copied
+    /// directly into the byte store — no temp assembly buffer. Parts may
+    /// themselves borrow heap-string bytes: byte-store growth never moves
+    /// existing segments and allocation is not a GC safepoint, so the
+    /// input slices stay valid throughout.
+    pub fn addHeapStringParts(self: *ObjectHeap, parts: []const []const u8, total: u32) !ObjectId {
+        const range = try self.reserveStoreLocal(comptime rangeStoreIndex("bytes"), byteAllocSize(total));
         errdefer self.bytes.rollback(range);
-        @memcpy(self.bytes.sliceMut(range), text);
-        return self.add(.{ .heap_string = range });
+        const dst = self.bytes.sliceMut(range);
+        var off: usize = 0;
+        for (parts) |s| {
+            @memcpy(dst[off..][0..s.len], s);
+            off += s.len;
+        }
+        return self.add(.{ .heap_string = .{ .bytes = range, .text_len = total } });
     }
 
     /// Borrow a heap string's bytes. Same lifetime contract as
@@ -2819,7 +2924,7 @@ pub const ObjectHeap = struct {
     /// holding the slice must re-fetch (or copy/intern for retention).
     pub fn getHeapString(self: *const ObjectHeap, id: ObjectId) ![]const u8 {
         return switch (self.get(id).*) {
-            .heap_string => |range| self.bytes.slice(range),
+            .heap_string => |hs| self.bytes.slice(hs.bytes)[0..hs.text_len],
             else => error.InvalidObjectType,
         };
     }

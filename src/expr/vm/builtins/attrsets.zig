@@ -13,6 +13,7 @@ const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
+const vm_strings = @import("../strings.zig");
 
 const makeBuiltinThunk = shared.makeBuiltinThunk;
 const isPlainString = strings.isPlainString;
@@ -33,7 +34,11 @@ pub fn builtinCatAttrs(self: *VM, name_arg: Value, list_arg: Value) !Value {
         const item = try self.heap.getListItem(list_id, i);
         const attrs = try vm_force.forceValue(self, item);
         if (!attrs.isAttrs()) return error.TypeError;
-        const value = self.heap.getAttrValue(attrs.asObjectId(), try stringTextInternId(self, name)) catch |err| switch (err) {
+        const name_id = vm_strings.selectNameId(self, name) catch |err| switch (err) {
+            error.MissingAttribute => continue,
+            else => return err,
+        };
+        const value = self.heap.getAttrValue(attrs.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => continue,
             else => return err,
         };
@@ -143,9 +148,12 @@ pub fn sortedAttrEntries(self: *VM, arg: Value) ![]heap_mod.AttrEntry {
 pub fn builtinHasAttr(self: *VM, name_arg: Value, attrs_arg: Value) !Value {
     const name = try vm_force.forceValue(self, name_arg);
     const attrs = try vm_force.forceValue(self, attrs_arg);
-    if (!name.isString() or !attrs.isAttrs()) return error.TypeError;
-
-    _ = self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()) catch |err| switch (err) {
+    if (!attrs.isAttrs()) return error.TypeError;
+    const name_id = vm_strings.selectNameId(self, name) catch |err| switch (err) {
+        error.MissingAttribute => return Value.boolVal(false),
+        else => return err,
+    };
+    _ = self.heap.getAttrValue(attrs.asObjectId(), name_id) catch |err| switch (err) {
         error.MissingAttribute => return Value.boolVal(false),
         else => return err,
     };
@@ -155,9 +163,8 @@ pub fn builtinHasAttr(self: *VM, name_arg: Value, attrs_arg: Value) !Value {
 pub fn builtinGetAttr(self: *VM, name_arg: Value, attrs_arg: Value) !Value {
     const name = try vm_force.forceValue(self, name_arg);
     const attrs = try vm_force.forceValue(self, attrs_arg);
-    if (!name.isString() or !attrs.isAttrs()) return error.TypeError;
-
-    return vm_force.forceValue(self, try self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()));
+    if (!attrs.isAttrs()) return error.TypeError;
+    return vm_force.forceValue(self, try self.heap.getAttrValue(attrs.asObjectId(), try vm_strings.selectNameId(self, name)));
 }
 
 pub fn builtinMapAttrs(self: *VM, fn_arg: Value, attrs_arg: Value) !Value {
@@ -234,7 +241,10 @@ pub fn builtinUnsafeGetAttrPos(self: *VM, name_arg: Value, attrs_arg: Value) !Va
     const attrs = try vm_force.forceValue(self, attrs_arg);
     if (!isPlainString(name) or !attrs.isAttrs()) return error.TypeError;
     const object_id = attrs.asObjectId();
-    const name_id = try stringTextInternId(self, name);
+    const name_id = if (name.isHeapString())
+        (try vm_strings.lookupNameId(self, name)) orelse return Value.null_val
+    else
+        try stringTextInternId(self, name);
     _ = self.heap.getAttrValue(object_id, name_id) catch |err| switch (err) {
         error.MissingAttribute => return Value.null_val,
         else => return err,
@@ -285,7 +295,10 @@ pub fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value 
             const item = try self.heap.getListItem(names_id, resolved.items.len);
             const value = try vm_force.forceValue(self, item);
             if (!isPlainString(value)) return error.TypeError;
-            const name_id = try stringTextInternId(self, value);
+            // A name absent from the intern table matches no entry; the
+            // sentinel keeps the resolved-names memo advancing in step
+            // with the list without interning the miss.
+            const name_id = (try vm_strings.lookupNameId(self, value)) orelse std.math.maxInt(InternId);
             try resolved.append(self.allocator, name_id);
             if (name_id == entry.name) continue :outer;
         }

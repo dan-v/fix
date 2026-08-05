@@ -18,6 +18,7 @@ const attrsets = @import("attrsets.zig");
 const vm_force = @import("../force.zig");
 const vm_equality = @import("../equality.zig");
 const vm_closures = @import("../closures.zig");
+const vm_strings = @import("../strings.zig");
 
 const isCallable = strings.isCallable;
 const isPlainString = strings.isPlainString;
@@ -97,7 +98,9 @@ pub fn builtinListToAttrs(self: *VM, arg: Value) !Value {
 
         const name_value = try vm_force.forceValue(self, try self.heap.getAttrValue(item_value.asObjectId(), name_id));
         if (!isPlainString(name_value)) return error.TypeError;
-        const name_intern = try stringTextInternId(self, name_value);
+        // Constructive boundary: the name WILL exist, so heap-resident
+        // text interns here.
+        const name_intern = try vm_strings.stringNameId(self, name_value);
         if ((try entry_idx.find(self.allocator, entries.items, name_intern)) != null) continue;
 
         try entries.append(self.allocator, .{
@@ -142,7 +145,10 @@ fn gcKeyHashCode(self: *VM, key: Value) !u64 {
         return gcKeyMix(1, @bitCast(norm));
     }
     if (vm_equality.isStringComparable(key)) {
-        return gcKeyMix(2, try stringTextInternId(self, key));
+        // Content hash, not intern id: equal keys MUST share a hashcode,
+        // and a heap-resident string can be byte-equal to an interned one
+        // while having no id at all.
+        return gcKeyMix(2, std.hash.Wyhash.hash(0, try vm_strings.stringBytes(self, key)));
     }
     return switch (key.kind()) {
         .null => 3,
@@ -446,7 +452,8 @@ pub fn builtinGroupBy(self: *VM, fn_arg: Value, list_arg: Value) !Value {
         const item = try self.heap.getListItem(list_id, i);
         const key = try vm_force.forceValue(self, try vm_closures.callValue(self, func, item));
         if (!isPlainString(key)) return error.TypeError;
-        const key_id = try stringTextInternId(self, key);
+        // Constructive name boundary: groupBy keys become attr names.
+        const key_id = try vm_strings.stringNameId(self, key);
         const index = (try group_idx.find(self.allocator, groups.items, key_id)) orelse blk: {
             try groups.append(self.allocator, .{ .name = key_id });
             const idx = groups.items.len - 1;

@@ -45,9 +45,8 @@ pub fn builtinToJSON(self: *VM, arg: Value) !Value {
     defer self.allocator.free(text);
     if (comptime prof.enabled) if (self.workerId() == 0)
         prof_census.recordLongString(text.len, context.items.len != 0);
-    const text_id = try self.intern.intern(text);
-    if (context.items.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, context.items));
+    if (context.items.len == 0) return vm_strings.makeString(self, text);
+    return Value.contextString(try self.heap.addContextString(try self.intern.intern(text), context.items));
 }
 
 pub fn writeJsonValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
@@ -127,7 +126,7 @@ fn writeJsonStringValue(
     value: Value,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) !void {
-    const text = self.intern.get(try stringTextInternId(self, value));
+    const text = try vm_strings.stringBytes(self, value);
     // Nix's toJSON errors on invalid UTF-8 (JSON strings must be valid UTF-8).
     if (!std.unicode.utf8ValidateSlice(text)) return error.TypeError;
     try std.json.Stringify.encodeJsonString(text, .{}, writer);
@@ -247,9 +246,8 @@ pub fn builtinToXML(self: *VM, arg: Value) !Value {
     defer self.allocator.free(text);
     if (comptime prof.enabled) if (self.workerId() == 0)
         prof_census.recordLongString(text.len, context.items.len != 0);
-    const text_id = try self.intern.intern(text);
-    if (context.items.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, context.items));
+    if (context.items.len == 0) return vm_strings.makeString(self, text);
+    return Value.contextString(try self.heap.addContextString(try self.intern.intern(text), context.items));
 }
 
 pub fn writeLazyXmlValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
@@ -314,7 +312,7 @@ fn writeXmlValue(
         },
         .string_context => {
             try writer.writeAll("<string value=\"");
-            try writeXmlEscaped(writer, self.intern.get(try stringTextInternId(self, forced)));
+            try writeXmlEscaped(writer, try vm_strings.stringBytes(self, forced));
             try writer.writeAll("\" />\n");
             if (context) |entries| {
                 for (try contextEntriesForValue(self, forced)) |entry| {
@@ -495,7 +493,7 @@ fn valueFromJson(self: *VM, value: std.json.Value) anyerror!Value {
         .integer => |i| int_mod.make(self.heap, i),
         .float => |f| Value.float(f),
         .number_string => |s| numberStringFromJson(self, s),
-        .string => |s| Value.string(try self.intern.intern(s)),
+        .string => |s| try vm_strings.makeString(self, s),
         .array => |array| listFromJson(self, array.items),
         .object => |object| attrsFromJson(self, object),
     };
@@ -540,7 +538,7 @@ fn valueFromToml(self: *VM, value: toml.Value) anyerror!Value {
         .boolean => |b| Value.boolVal(b),
         .integer => |i| int_mod.make(self.heap, i),
         .float => |f| Value.float(f),
-        .string => |s| Value.string(try self.intern.intern(s)),
+        .string => |s| try vm_strings.makeString(self, s),
         .array => |items| listFromToml(self, items),
         .table => |table| attrsFromToml(self, table),
     };
@@ -569,8 +567,8 @@ pub fn builtinCompareVersions(self: *VM, left_arg: Value, right_arg: Value) !Val
     const left_value = try vm_force.forceValue(self, left_arg);
     const right_value = try vm_force.forceValue(self, right_arg);
     if (!isPlainString(left_value) or !isPlainString(right_value)) return error.TypeError;
-    const left = self.intern.get(try stringTextInternId(self, left_value));
-    const right = self.intern.get(try stringTextInternId(self, right_value));
+    const left = try vm_strings.stringBytes(self, left_value);
+    const right = try vm_strings.stringBytes(self, right_value);
     return Value.int(try version.compareVersions(self.allocator, left, right));
 }
 
@@ -601,8 +599,10 @@ pub fn builtinMatch(self: *VM, regex_arg: Value, text_arg: Value) !Value {
     const pattern_value = try vm_force.forceValue(self, regex_arg);
     const text_value = try vm_force.forceValue(self, text_arg);
     if (!isPlainString(pattern_value) or !isPlainString(text_value)) return error.TypeError;
-    const pattern_id = try stringTextInternId(self, pattern_value);
-    const text = self.intern.get(try stringTextInternId(self, text_value));
+    // The PatternCache is keyed by intern id, so a heap-resident pattern
+    // interns here (patterns are short and bounded in number).
+    const pattern_id = try vm_strings.stringNameId(self, pattern_value);
+    const text = try vm_strings.stringBytes(self, text_value);
 
     var owned: ?regex.Pattern = null;
     defer if (owned) |*p| p.deinit();
@@ -617,8 +617,8 @@ pub fn builtinSplit(self: *VM, regex_arg: Value, text_arg: Value) !Value {
     const pattern_value = try vm_force.forceValue(self, regex_arg);
     const text_value = try vm_force.forceValue(self, text_arg);
     if (!isPlainString(pattern_value) or !isPlainString(text_value)) return error.TypeError;
-    const pattern_id = try stringTextInternId(self, pattern_value);
-    const text = self.intern.get(try stringTextInternId(self, text_value));
+    const pattern_id = try vm_strings.stringNameId(self, pattern_value);
+    const text = try vm_strings.stringBytes(self, text_value);
 
     var owned: ?regex.Pattern = null;
     defer if (owned) |*p| p.deinit();
@@ -633,7 +633,7 @@ pub fn builtinSplit(self: *VM, regex_arg: Value, text_arg: Value) !Value {
         const found = (try pattern.find(self.allocator, text, search_start)) orelse break;
         errdefer found.deinit(self.allocator);
 
-        try out.append(self.allocator, Value.string(try self.intern.intern(text[cursor..found.start])));
+        try out.append(self.allocator, try vm_strings.makeString(self, text[cursor..found.start]));
         try out.append(self.allocator, try regexCapturesValue(self, found.captures));
 
         cursor = found.end;
@@ -643,14 +643,14 @@ pub fn builtinSplit(self: *VM, regex_arg: Value, text_arg: Value) !Value {
                 found.deinit(self.allocator);
                 break;
             }
-            try out.append(self.allocator, Value.string(try self.intern.intern(text[cursor .. cursor + 1])));
+            try out.append(self.allocator, try vm_strings.makeString(self, text[cursor .. cursor + 1]));
             cursor += 1;
             search_start = cursor;
         }
         found.deinit(self.allocator);
     }
 
-    try out.append(self.allocator, Value.string(try self.intern.intern(text[cursor..])));
+    try out.append(self.allocator, try vm_strings.makeString(self, text[cursor..]));
     return Value.list(try self.heap.addList(out.items));
 }
 
@@ -660,7 +660,7 @@ fn regexCapturesValue(self: *VM, captures: []const ?[]const u8) !Value {
 
     for (captures, values) |capture, *value| {
         value.* = if (capture) |text|
-            Value.string(try self.intern.intern(text))
+            try vm_strings.makeString(self, text)
         else
             Value.null_val;
     }

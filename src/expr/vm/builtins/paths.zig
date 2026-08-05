@@ -16,6 +16,7 @@ const string_context = @import("string_context.zig");
 const source_store = @import("source_store.zig");
 const vm_force = @import("../force.zig");
 const vm_trace = @import("../trace.zig");
+const vm_strings = @import("../strings.zig");
 
 const stringArg = strings.stringArg;
 const stringTextInternId = strings.stringTextInternId;
@@ -28,11 +29,11 @@ pub fn builtinBaseNameOf(self: *VM, arg: Value) !Value {
     // store copy; a string/derivation keeps its context.
     const forced = try vm_force.forceValue(self, arg);
     const value = switch (forced.kind()) {
-        .path, .string, .string_context => forced,
+        .path, .string, .string_context, .heap_string => forced,
         .attrs => try strings.coerceAttrsStringContextValue(self, forced),
         else => return error.TypeError,
     };
-    const base_id = try self.intern.intern(path_ops.baseName(self.intern.get(try stringTextInternId(self, value))));
+    const base_id = try self.intern.intern(path_ops.baseName(try vm_strings.stringBytes(self, value)));
     if (value.isContextString()) {
         const ctx = (try self.heap.getContextString(value.asObjectId())).context;
         return Value.contextString(try self.heap.addContextString(base_id, ctx));
@@ -43,11 +44,11 @@ pub fn builtinBaseNameOf(self: *VM, arg: Value) !Value {
 pub fn builtinDirOf(self: *VM, arg: Value) !Value {
     const forced = try vm_force.forceValue(self, arg);
     const value = switch (forced.kind()) {
-        .path, .string, .string_context => forced,
+        .path, .string, .string_context, .heap_string => forced,
         .attrs => try strings.coerceAttrsStringContextValue(self, forced),
         else => return error.TypeError,
     };
-    const dir_id = try self.intern.intern(path_ops.dirOf(self.intern.get(try stringTextInternId(self, value))));
+    const dir_id = try self.intern.intern(path_ops.dirOf(try vm_strings.stringBytes(self, value)));
     if (value.isPath()) return Value.path(dir_id);
     if (value.isContextString()) {
         const ctx = (try self.heap.getContextString(value.asObjectId())).context;
@@ -126,7 +127,7 @@ pub fn builtinPath(self: *VM, arg: Value) !Value {
     const path_id = try self.intern.intern("path");
     const path_value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, path_id));
     const path = switch (path_value.kind()) {
-        .path, .string, .string_context => self.intern.get(try stringTextInternId(self, path_value)),
+        .path, .string, .string_context => try vm_strings.stringBytes(self, path_value),
         else => return error.TypeError,
     };
     if (!std.fs.path.isAbsolute(path)) return error.RelativePath;
@@ -136,7 +137,7 @@ pub fn builtinPath(self: *VM, arg: Value) !Value {
     if (!name_value.isNull()) {
         const name = try vm_force.forceValue(self, name_value);
         if (!isPlainString(name)) return error.TypeError;
-        store_name = self.intern.get(try stringTextInternId(self, name));
+        store_name = try vm_strings.stringBytes(self, name);
     }
     // Nix validates the store-path name before touching the filesystem.
     try validateStorePathName(self, store_name);
@@ -161,7 +162,7 @@ pub fn builtinPath(self: *VM, arg: Value) !Value {
     if (!sha_value.isNull()) {
         const value = try vm_force.forceValue(self, sha_value);
         if (!isPlainString(value)) return error.TypeError;
-        expected_hash = self.intern.get(try stringTextInternId(self, value));
+        expected_hash = try vm_strings.stringBytes(self, value);
     }
 
     if (!recursive) {
