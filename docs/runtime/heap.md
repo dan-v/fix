@@ -2,7 +2,7 @@
 
 *The object store and memory model: flat mmap slots, append-only stable segments, per-worker TLABs, and the layered `//` node.*
 
-Every non-immediate [`Value`](values.md) refers to a boxed runtime object by **`ObjectId`**, never by host pointer. `ObjectHeap` owns four backing stores and hands out ids that name an object for as long as it stays reachable. The heap is **non-moving** — an object's bytes never relocate — so a published `ObjectId` is a stable handle, and its union tag (fixed when the object is created) can be pattern-matched without synchronization.
+Every non-immediate [`Value`](values.md) refers to a boxed runtime object by **`ObjectId`**, never by host pointer. `ObjectHeap` owns five backing stores and hands out ids that name an object for as long as it stays reachable. The heap is **non-moving** — an object's bytes never relocate — so a published `ObjectId` is a stable handle, and its union tag (fixed when the object is created) can be pattern-matched without synchronization.
 
 ## Mental model
 
@@ -12,11 +12,11 @@ Every non-immediate [`Value`](values.md) refers to a boxed runtime object by **`
 
 ## The object store: `FlatStore`
 
-The `objects` store is a `FlatStore` — a single `mmap` region, **not** geometric segments. `object_max_slots = 2^30` slots are reserved virtually with `MAP_NORESERVE`; only touched pages cost physical memory. The base pointer is immutable after init, so `get(id)` is `base[id]` with no segment decode or per-access atomic. Allocation remains per-worker TLAB-based; the flat layout only governs lookup. The `builtins.builtins` self-reference reserves its slot up front (`reserveObjectSlot` → `fillObjectSlot`) so it can embed its own id before the object is filled.
+The `objects` store is a `FlatStore` — a single `mmap` region, **not** geometric segments. `object_max_slots = 2^30` slots are reserved virtually with `MAP_NORESERVE`; only touched pages cost physical memory. The base pointer is immutable after init, so `get(id)` is `base[id]` with no segment decode or per-access atomic. Allocation remains per-worker TLAB-based; the flat layout only governs lookup. The `builtins.builtins` self-reference begins a pending slot and commits it after constructing the self-referential entry (`beginObjectSlot` → `commitObjectSlot`).
 
 ## The range stores: `StableSegments`
 
-`values`, `attrs`, and `attr_positions` are `StableSegments`: append-only storage split into geometrically growing segments (segment *i* has capacity `first_size << i`; ids for segment *i* start at `first_size·(2^i − 1)`). A segment's backing array is **pinned after allocation** and never relocated, so:
+`values`, `attrs`, `attr_positions`, and GC-able string `bytes` are `StableSegments`: append-only storage split into geometrically growing segments (segment *i* has capacity `first_size << i`; ids for segment *i* start at `first_size·(2^i − 1)`). A segment's backing array is **pinned after allocation** and never relocated, so:
 - **Reads** resolve `(segment, offset)` via a single atomic segment-pointer load plus CLZ-based index math (`locationOf`); readers may cache segment pointers safely.
 - **Writers** serialize on the store's `SpinMutex`.
 
@@ -24,7 +24,7 @@ API: `append(v) → id`, `reserve(len) → Range`, `slice`/`sliceMut`, and tail-
 
 ## Per-worker TLABs (`HeapLocal`)
 
-Each worker (including main, indexed by `worker_id`) owns a `HeapLocal` with a `LocalChunk` cursor per store (object/value/attr/attr_pos). A worker **reserves a chunk from the global store once under the store mutex** (8192 objects / 8192 values / 8192 attrs / 4096 attr-positions per refill), then hands out slots lock-free (`fits`/`take`) until the chunk is exhausted and it refills. The larger batches keep parallel allocation bursts from contending on the refill mutex; unused suffixes remain bounded to one chunk per worker.
+Each worker (including main, indexed by `worker_id`) owns a `HeapLocal` with a `LocalChunk` cursor per store (object/value/attr/attr_pos/bytes). A worker **reserves a chunk from the global store once under the store mutex** (8192 objects / 8192 values / 8192 attrs / 4096 attr-positions / 65,536 bytes per refill), then hands out slots lock-free (`fits`/`take`) until the chunk is exhausted and it refills. The larger batches keep parallel allocation bursts from contending on the refill mutex; unused suffixes remain bounded to one chunk per worker.
 
 Reclaimed storage uses **per-worker** free lists (`HeapLocal.gc_free_*`). Sweep
 returns dead slots and ranges to worker-local lists. At a stop-the-world
@@ -43,6 +43,8 @@ thunk         Thunk                     // see thunks.md
 context_string { text: InternId, context: AttrRange }
 boxed_int     i64                       // out-of-i48 escape; see values.md
 partial_app   { func: Value, args: ValueRange }
+heap_string   { bytes: ByteRange, text_len: u32 }
+heap_string_inline { len: u8, text: [30]u8 }
 ```
 
 Source positions live inside the `attrs` variant rather than in every object. `positions.len == 0` means "none" and is never sliced.
@@ -64,8 +66,10 @@ The NixOS module/overlay fixpoints `//` a massive accumulator thousands of times
 
 ## Constants
 
-The evaluator-wide limits live in `src/runtime/types.zig`: `vm_stack_capacity = 65,536`, `max_frames = 20,000`, and `max_uncurry_arity = 4`.
+The evaluator-wide limits live in `src/runtime/types.zig`: `vm_stack_capacity = 524,288`, `max_frames = 65,536`, `default_max_call_depth = 10,000`, and `max_uncurry_arity = 4`.
 
 Out of scope: the `//` opcode's execution and inline cache → [vm/access.md](../vm/access.md); thunk internals/state machine → [thunks.md](thunks.md); the collection algorithm → [gc.md](../gc.md).
 
-Code: `src/runtime/heap.zig`
+Code: `src/runtime/heap.zig`; read-only tooling projections and censuses:
+`src/runtime/heap/inspection.zig`; edge traversal and collector mechanics:
+`src/runtime/heap/edges.zig`, `src/runtime/heap/collector.zig`.

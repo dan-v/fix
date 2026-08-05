@@ -57,7 +57,7 @@ loop:
 ```
 
 - **First claimer** runs `compileImportPath` **inline**: read file → `evaluateSource` (parse + compile + eval) → value. No task handoff; the claimer *is* the evaluator for that file.
-- **Concurrent fibers** enroll on the future's waiter list via `enrollWaiter` (linked through `Future.waiters_head`, guarded by `waiters_mu`) and park (the [import fiber-park](workers.md), symmetric with thunk waiting). On `publish()`, woken fibers are enqueued on their **home-worker** ready [queue](scheduler.md).
+- **Concurrent fibers** enroll on the future's waiter list via `enrollWaiter` (the atomic head word packs the list pointer with a low-bit spin lock) and park (the [import fiber-park](workers.md), symmetric with thunk waiting). On `publish()`, woken fibers are enqueued on their **home-worker** ready [queue](scheduler.md).
 - **Cycles** come for free: a `ClaimerId` is stable across [fiber migration](fibers.md), so `A imports B imports A` reaches a slot the *same claimer* already owns → `Future` returns `.blackhole` → `error.ImportCycle`.
 
 ### Failure caching

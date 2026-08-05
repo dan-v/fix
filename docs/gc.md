@@ -2,7 +2,8 @@
 
 *A non-moving, precise, generational collector. It is part of every supported
 build and runs at all worker counts. Reclaim tracking is armed lazily at the
-first budget/2 safepoint, so smaller evaluations avoid young tracking,
+first `armLineBytes` safepoint (normally budget/4, with a 512 MiB floor and a
+budget/2 cap), so smaller evaluations avoid young tracking,
 barriers, and free-list probes.*
 
 **Why a collector at all.** Without reclamation, the stores track *total*
@@ -16,7 +17,7 @@ One number decides when the collector runs: a threshold over heap-reserved
 bytes.
 
 - Resolution order: `--gc-budget=N` (MiB, or `Nk`/`Nm`/`Ng`) → **half of `/proc/meminfo` MemTotal**, clamped by defaults of 256 MiB–32 GiB (fallback: half of an assumed 4 GiB). `FIX_GC_FLOOR` and `FIX_GC_CEILING` override those bounds with the same size syntax. The budget covers the evaluator heap stores, not total process RSS; side allocations such as chunks, interned strings, and thread stacks sit outside it. `0` = never collect (reclaim machinery remains dormant and allocation stays bump-only).
-- **Lazy arming**: below budget/2 the heap only compares its reserved-bytes cursor against the threshold once per TLAB refill — no young-slot tracking, no write barrier, no free-list probes. The first budget/2 crossing runs an arming stop-the-world safepoint (`armLazy`): everything allocated so far becomes untracked/old (the unreclaimable floor, ≈ reserved at budget/2 by construction), and real collections start at the full budget, re-armed to `max(budget, reserved + clamp(budget/8, 64MB, 1GB))` after each.
+- **Lazy arming**: below `armLineBytes(budget)` the heap only compares its reserved-bytes cursor against the threshold once per TLAB refill — no young-slot tracking, no write barrier, no free-list probes. The first crossing runs an arming stop-the-world safepoint (`armLazy`): everything allocated so far becomes untracked/old (the unreclaimable prefix), and real collections start at the full budget, re-armed to `max(budget, reserved + clamp(budget/8, 64MB, 1GB))` after each. The arm line is `min(max(budget/4, 512 MiB), budget/2)`.
 - Consequence: evaluations below the arming threshold do not collect, while
   constrained budgets begin reclamation once reservations cross the configured
   threshold.

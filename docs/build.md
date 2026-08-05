@@ -71,7 +71,7 @@ TLA+ specifications and mutation checks, while `zig build
 stress-concurrency -- --seed N --iterations N` drives the longer reproducible
 stress executable. See [concurrency verification](concurrency-testing.md).
 
-Expression-engine integration tests live under `src/integration/expr_api`; evaluator, compiler, and VM unit tests live with their `src/expr` subsystems, while the store realization facade owns its socket-backed tests and fake daemon. `test/*.nix` holds pathology and spec fixtures driven through evaluation.
+Expression-engine integration tests live under `src/integration/expr_api`; evaluator, compiler, and VM unit tests live with their `src/expr` subsystems, while the store realization facade owns its socket-backed tests and fake daemon. `test/*.nix` holds pathology and spec fixtures driven through evaluation. `zig build check-static` also runs `tools/structure_check.sh`, which enforces the durable module roots plus selected internal boundaries (including heap-store encapsulation and the compiler's AST-independent emitter).
 
 ## The correctness gate
 

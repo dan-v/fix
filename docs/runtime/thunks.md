@@ -17,7 +17,7 @@ They are required to preserve the value produced by ordinary demand.
 
 ## Representation
 
-Large evaluations can keep millions of thunks live, so thunk-only metadata stays on `Thunk` while the reusable synchronization primitive remains small. On the current 64-bit layout a `Future` is 24 bytes. A production `Thunk` is at most 56 bytes, while safety builds retain an active-union tag and allow up to 80; a size test enforces the `Thunk` bounds. Two ideas keep unrelated future users from paying for evaluator state and keep the thunk payload bounded:
+Large evaluations can keep millions of thunks live, so thunk-only metadata stays on `Thunk` while the reusable synchronization primitive remains small. On the current 64-bit layout a `Future` is 16 bytes. A production `Thunk` is at most 56 bytes, while safety builds retain an active-union tag and allow up to 80; a size test enforces the `Thunk` bounds. Two ideas keep unrelated future users from paying for evaluator state and keep the thunk payload bounded:
 
 - **Separated responsibilities.** `Future` owns only state, claimer identity, and waiters. `Thunk` adds `demanded`, the `TargetKind` discriminant, and optional profiling fields. Imports, realization claims, and I/O futures therefore do not carry thunk scheduling metadata.
 - **`target` XOR `result` overlap.** The `Payload` is a bare 24-byte union: `.target` (what to evaluate) is the live arm while unresolved/evaluating; `.result` (the resolved `Value`, or a `FailureRef`'s bits) is live once terminal. They are *never both live* — the body reads `target`, then the resolver overwrites the same bytes with `result`. So resolving costs no growth. `future.state` is the discriminant that says which arm is live.
@@ -27,8 +27,7 @@ Thunk
   future: Future
     state:        atomic u32   // FutureState FSM (the discriminant)
     claimer:      atomic u32   // ClaimerId of the evaluating fiber
-    waiters_head: ?*Waiter     // parked fibers (null when uncontended)
-    waiters_mu:   BlockingMutex
+    waiters:      atomic usize // waiter-head pointer + low-bit spin lock
   demanded:       atomic u8    // observed by a real caller? (vs speculation)
   target_kind:    TargetKind
   profiling:      zero-sized unless its build probe is enabled
@@ -83,7 +82,7 @@ the computation rather than the OS thread.
 
 ## Waiter list & wake
 
-A `.busy` caller enrolls a `Waiter` and yields its worker (so the worker runs other fibers meanwhile). `enrollWaiter` takes `waiters_mu` and **re-checks state under the lock**: if the thunk already left `.evaluating`, it returns `false` and the caller re-loops `tryClaim` instead of parking (closing the enroll-vs-resolve race). Otherwise it prepends to `waiters_head`.
+A `.busy` caller enrolls a `Waiter` and yields its worker (so the worker runs other fibers meanwhile). `enrollWaiter` takes the low-bit lock packed into the atomic waiter-head word and **re-checks state under the lock**: if the thunk already left `.evaluating`, it returns `false` and the caller re-loops `tryClaim` instead of parking (closing the enroll-vs-resolve race). Otherwise it prepends to the waiter list.
 
 The resolver (`publish` / `publishErrored` / `reset` / `blackhole`) writes the result, release-stores the terminal state, then re-takes the lock, drains the list to a local, releases, and calls each `wake_fn` **outside** the lock (a slow wake must not block other resolvers draining unrelated futures). Each `wake_fn` recovers its fiber via `@fieldParentPtr` and enqueues it on its home-worker ready queue (ready fibers are then stealable by any worker — see [workers](../parallel/workers.md)).
 
@@ -92,7 +91,7 @@ memory model
   resolver:  store result (plain)              // payload write
              claimer.store(INVALID, release)
              state.store(terminal, release)     // publishes the result write
-             ── re-lock waiters_mu, drain, unlock, wake_fn each (outside lock)
+             ── lock waiter word, drain, unlock, wake_fn each (outside lock)
   claimer:   state.load(acquire) == terminal    // observes the result write
              read payload.result
   blackhole: claimer.store(release) / load(acquire)  // pairs for the id compare
