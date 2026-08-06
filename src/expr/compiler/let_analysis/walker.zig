@@ -186,6 +186,7 @@ pub const Walker = struct {
     /// shadow check still guards against crossing a binder that introduces
     /// the hook.
     fn refName(self: *Walker, name_id: InternId, site: ?*const Node, pinned: bool, static_fallback: bool) !void {
+        if (self.c.let_float.full_lazy) try self.ua.tables.logMention(name_id);
         var found: ?usize = self.by_name.get(name_id);
         // `inherit`-outer skip-slot: resolution skips the binding's own
         // binder. Skips are rare; the stack is almost always empty.
@@ -264,6 +265,7 @@ pub const Walker = struct {
     /// Resolve `name_id` skipping the innermost binder of that exact name
     /// (`inherit x;` in rec attrsets / nested lets), as a pinned mention.
     fn refPastInnermost(self: *Walker, name_id: InternId) !void {
+        if (self.c.let_float.full_lazy) try self.ua.tables.logMention(name_id);
         const innermost = self.by_name.get(name_id) orelse return;
         const prev = self.stack.items[innermost].prev_same_name;
         if (prev == std.math.maxInt(usize)) return;
@@ -640,6 +642,7 @@ pub const Walker = struct {
         cluster.graph.uses = try self.active.items[ctx_index].uses.toOwnedSlice(allocator);
         try finalize.finalize(allocator, &cluster.graph);
 
+        cluster.graph.end_log_len = self.ua.tables.log_len;
         self.popBinders(stack_start);
         _ = self.active.pop();
         for (covered.items) |let_node| {

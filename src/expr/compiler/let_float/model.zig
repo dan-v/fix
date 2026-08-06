@@ -32,6 +32,7 @@ pub const Stats = struct {
     blocked_out_shadow: std.atomic.Value(u64) = .init(0),
     blocked_out_chain: std.atomic.Value(u64) = .init(0),
     blocked_out_nodest: std.atomic.Value(u64) = .init(0),
+    blocked_out_capture: std.atomic.Value(u64) = .init(0),
     cluster_hits: std.atomic.Value(u64) = .init(0),
     cluster_walks: std.atomic.Value(u64) = .init(0),
     prefix_members: std.atomic.Value(u64) = .init(0),

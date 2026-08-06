@@ -81,6 +81,7 @@ pub fn writeReport(w: *std.Io.Writer, stats: *const Stats) !void {
         .{ "float-out blocked: shadowed", &stats.blocked_out_shadow },
         .{ "float-out blocked: uncurry chain", &stats.blocked_out_chain },
         .{ "float-out blocked: no destination", &stats.blocked_out_nodest },
+        .{ "float-out blocked: name mentioned in window", &stats.blocked_out_capture },
         .{ "cluster map hits", &stats.cluster_hits },
         .{ "cluster walks", &stats.cluster_walks },
         .{ "strict-prefix members", &stats.prefix_members },

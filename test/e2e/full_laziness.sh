@@ -53,6 +53,13 @@ fi
 webbed='let f = x: let a = "A"; b = "${a}B"; c = "${b}C"; in c + toString x; in f 1 + f 2'
 t "interpolation-sibling web: value" '"ABC1ABC2"' "$(on_out "$webbed")"
 
+# --- inverse capture: a hoisted binder must not capture with-resolved ------
+# --- mentions of the same name in the newly-covered region (the esphome ----
+# --- shape: an inner helper named like a package, hoisted above a ----------
+# --- `with pkgs;` list that resolved the name dynamically) -----------------
+cap='let f = ps: let deps = with ps; [ argA ]; helper = let argA = "s"; in argA + "x"; in { inherit deps helper; }; in (f { argA = 1; }).deps'
+t "hoisted binder does not capture with-resolved mentions" "$(off_out "$cap")" "$(on_out "$cap")"
+
 # --- values agree with the gate off across a mixed program -----------------
 mixed='let g = n: let base = 100; step = base / 4; in n + step; in map g [ 1 2 3 ]'
 t "mixed program: gate on == gate off" "$(off_out "$mixed")" "$(on_out "$mixed")"

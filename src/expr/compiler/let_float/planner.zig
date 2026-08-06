@@ -231,6 +231,21 @@ pub fn decide(
                 bump(census, "blocked_out_shadow");
                 continue;
             }
+            // Inverse capture: hoisting grants this NAME new visibility
+            // over the destination's whole body. Any mention of it in the
+            // newly-covered region — before the cluster ([dest, header))
+            // or after it ([end, ∞): later siblings still inside the
+            // destination) — previously resolved elsewhere (outer binder,
+            // or dynamically through `with`, which lexical resolution
+            // outranks) and would silently re-resolve to the hoisted
+            // binder. The cluster's own uses live in [header, end) and
+            // are exactly what the float preserves.
+            if (graph.tables.mentionedInWindow(b.name_id, dest.entry_mark, graph.header_log_len) or
+                graph.tables.mentionedInWindow(b.name_id, graph.end_log_len, std.math.maxInt(u32)))
+            {
+                bump(census, "blocked_out_capture");
+                continue;
+            }
 
             const dest_map = if (body_position) state_lambda_wraps else state_lambda_outer_wraps;
             const gop = try dest_map.getOrPut(allocator, dest.node);

@@ -261,12 +261,45 @@ pub const SharedTables = struct {
     /// only; empty otherwise). Cluster graphs reference these by index for
     /// float destinations.
     lambdas: std.ArrayListUnmanaged(LambdaInfo) = .empty,
+    /// Full-lazy only: every NAME MENTION (resolved, `with`-resolved,
+    /// unresolvable, conservative interpolation word) at its log position.
+    /// Hoisting a binder grants its name new visibility over the
+    /// destination's whole body; a mention there that previously resolved
+    /// elsewhere — an outer lexical binder, or dynamically through `with`
+    /// (lexical resolution outranks `with`) — would be CAPTURED. The float
+    /// proof refuses names mentioned in the newly-covered region.
+    mentions: std.AutoHashMapUnmanaged(InternId, std.ArrayListUnmanaged(u32)) = .empty,
     /// Binder-log positions where a `with` body begins. A binding whose RHS
     /// mentions a dynamically-resolved name may still move — but only when
     /// the walk window between its cluster header and the destination
     /// crosses no `with` entry (the with-lookup chain is then identical at
     /// both positions). Ascending by construction.
     with_marks: std.ArrayListUnmanaged(u32) = .empty,
+
+    pub fn logMention(self: *SharedTables, name_id: InternId) !void {
+        const gop = try self.mentions.getOrPut(self.allocator, name_id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, self.log_len);
+        // Advance the walk clock (like `with` marks do): a cluster that
+        // closes right after a mention must record a LATER end position,
+        // or inside-subtree mentions are indistinguishable from
+        // later-sibling ones. Positions stay monotonic, so every window
+        // consumer is unaffected.
+        self.log_len += 1;
+    }
+
+    /// Any mention of `name_id` in log window [from, to)?
+    pub fn mentionedInWindow(self: *const SharedTables, name_id: InternId, from: u32, to: u32) bool {
+        const list = self.mentions.get(name_id) orelse return false;
+        const items = list.items;
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid] < from) lo = mid + 1 else hi = mid;
+        }
+        return lo < items.len and items[lo] < to;
+    }
 
     pub fn logBinder(self: *SharedTables, name_id: InternId, cluster: u32) !void {
         const gop = try self.log_pos.getOrPut(self.allocator, name_id);
@@ -339,6 +372,10 @@ pub const Graph = struct {
     /// `SharedTables.lambdas`; full-lazy walks only). Float destinations
     /// ascend its parent chain.
     header_lambda: u32 = invalid_lambda,
+    /// Log position when the cluster's walk CLOSED — mentions at or beyond
+    /// this are outside the cluster's subtree (later siblings), which a
+    /// hoisted binder would also newly cover.
+    end_log_len: u32 = 0,
     header_once: u32 = 0,
     header_many: u32 = 0,
 
