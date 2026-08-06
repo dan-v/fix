@@ -16,6 +16,7 @@ const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const OpCode = bytecode.OpCode;
 const emit = @import("emit.zig");
+const attr_names = @import("attr_names.zig");
 const scope = @import("scope.zig");
 const diagnostics = @import("diagnostics.zig");
 const int_ops = @import("runtime").int;
@@ -332,7 +333,7 @@ pub fn resolvePathLiteralPreserveTrailingSlash(self: *Compiler, span: []const u8
 }
 
 pub fn compileIdent(self: *Compiler, node: *const Node) !void {
-    const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
+    const span = attr_names.identText(self, node.data.atom);
     if (std.mem.eql(u8, span, "__curPos")) {
         try compileCurPos(self, node.data.atom);
         return;

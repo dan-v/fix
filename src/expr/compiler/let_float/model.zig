@@ -33,6 +33,11 @@ pub const Stats = struct {
     blocked_out_chain: std.atomic.Value(u64) = .init(0),
     blocked_out_nodest: std.atomic.Value(u64) = .init(0),
     blocked_out_capture: std.atomic.Value(u64) = .init(0),
+    mfe_candidates: std.atomic.Value(u64) = .init(0),
+    floated_mfe: std.atomic.Value(u64) = .init(0),
+    blocked_mfe_chain: std.atomic.Value(u64) = .init(0),
+    blocked_mfe_enclosing: std.atomic.Value(u64) = .init(0),
+    blocked_mfe_recursive: std.atomic.Value(u64) = .init(0),
     cluster_hits: std.atomic.Value(u64) = .init(0),
     cluster_walks: std.atomic.Value(u64) = .init(0),
     prefix_members: std.atomic.Value(u64) = .init(0),
@@ -98,6 +103,9 @@ pub const ClusterOverlay = struct {
 
 pub const UnitState = struct {
     allocator: std.mem.Allocator,
+    /// Fresh-name counter for anonymous-MFE synthetic bindings
+    /// (`"\x00fl.<n>"` — unspellable, so collision- and capture-free).
+    synth_counter: u32 = 0,
     /// A cluster's outermost source node is its stable identity within one
     /// compile unit; all covered nested-let nodes share this overlay.
     overlays: std.AutoHashMapUnmanaged(*const Node, *ClusterOverlay) = .empty,

@@ -60,6 +60,44 @@ t "interpolation-sibling web: value" '"ABC1ABC2"' "$(on_out "$webbed")"
 cap='let f = ps: let deps = with ps; [ argA ]; helper = let argA = "s"; in argA + "x"; in { inherit deps helper; }; in (f { argA = 1; }).deps'
 t "hoisted binder does not capture with-resolved mentions" "$(off_out "$cap")" "$(on_out "$cap")"
 
+# --- anonymous MFEs: a param-free apply inside the body shares too ---------
+amfe='let f = x: (builtins.trace "am" (1 + 1)) + x; in f 1 + f 2'
+t "anonymous MFE: value" "7" "$(on_out "$amfe")"
+t "anonymous MFE baseline: value identical" "7" "$(off_out "$amfe")"
+count=$(grep -c '^trace: am$' <<<"$(on_err "$amfe")")
+if [[ "$count" == 1 ]]; then pass "anonymous MFE evaluates once across calls"; else
+    fail "anonymous MFE evaluates once across calls"
+    echo "  got $count trace occurrences"
+fi
+
+# --- anonymous MFE out of an INNER lambda (partial-application shape) ------
+pamfe='let h = y: builtins.trace "pa" (y * 2); a = 5; f = q: map (x: x + (h a)) q; in toString (f [ 1 ] ++ f [ 2 ])'
+t "inner-lambda MFE: value" '"11 12"' "$(on_out "$pamfe")"
+count=$(grep -c '^trace: pa$' <<<"$(on_err "$pamfe")")
+if [[ "$count" == 1 ]]; then pass "inner-lambda MFE shared across closures and calls"; else
+    fail "inner-lambda MFE shared across closures and calls"
+    echo "  got $count trace occurrences"
+fi
+
+# --- param-dependent applies must not float --------------------------------
+pdep='let f = x: (builtins.trace "pd" (x + 1)) + 1; in f 1 + f 2'
+t "param-dependent apply: value" "7" "$(on_out "$pdep")"
+count=$(grep -c '^trace: pd$' <<<"$(on_err "$pdep")")
+if [[ "$count" == 2 ]]; then pass "param-dependent apply evaluates per call"; else
+    fail "param-dependent apply evaluates per call"
+    echo "  got $count trace occurrences"
+fi
+
+# --- MFE laziness: a floated throw-apply stays undemanded ------------------
+t "floated MFE throw stays undemanded" "0" \
+    "$(on_out 'let f = x: if x then (builtins.throw "boom") else 0; in f false')"
+
+# --- recursion guard: sharing inside a recursive RHS must not create -------
+# --- RecursiveThunk on programs that terminate today (the extendDerivation -
+# --- shape: one shared thunk re-demanded during its own force via the group)
+rec='let g = q: q; f = n: if n < 1 then (g 0) else f (n - 1); in f 3'
+t "MFE inside recursive RHS still terminates" "0" "$(on_out "$rec")"
+
 # --- values agree with the gate off across a mixed program -----------------
 mixed='let g = n: let base = 100; step = base / 4; in n + step; in map g [ 1 2 3 ]'
 t "mixed program: gate on == gate off" "$(off_out "$mixed")" "$(on_out "$mixed")"

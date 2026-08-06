@@ -55,7 +55,9 @@ pub fn walkReferencedNames(self: *Compiler, node: *const Node, ctx: anytype) voi
         // only keep cells alive, matching this walker's contract).
         .elided => markIdentWords(self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len], ctx),
         .identifier => {
-            const ident = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
+            // Synthetic (full-laziness) atoms carry an interned id, len 0.
+            const a = node.data.atom;
+            const ident = if (a.len == 0) self.intern.get(@intCast(a.offset)) else self.source[a.offset .. a.offset + a.len];
             ctx.mark(ident);
         },
         .unary_op => {

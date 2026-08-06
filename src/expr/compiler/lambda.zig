@@ -150,7 +150,7 @@ fn inlineBuiltinHead(self: *Compiler, head_raw: *const Node) !?InlineBuiltin {
     if (head.tag != .attr_path or head.data.attr_path.segments.len != 1) return null;
     const root = unwrapParens(head.data.attr_path.root);
     if (root.tag != .identifier) return null;
-    const root_name = self.source[root.data.atom.offset .. root.data.atom.offset + root.data.atom.len];
+    const root_name = attr_names.identText(self, root.data.atom);
     if (!std.mem.eql(u8, root_name, "builtins")) return null;
 
     const builtins_id = try self.intern.intern("builtins");
@@ -216,9 +216,9 @@ fn forwardingUpvalue(self: *Compiler, child: *Compiler, body: *const Node, param
     const func = unwrapParens(b.data.apply.func);
     const arg = unwrapParens(b.data.apply.arg);
     if (func.tag != .identifier or arg.tag != .identifier) return null;
-    const arg_name = self.source[arg.data.atom.offset .. arg.data.atom.offset + arg.data.atom.len];
+    const arg_name = attr_names.identText(self, arg.data.atom);
     if (!std.mem.eql(u8, arg_name, param_name)) return null;
-    const func_name = self.source[func.data.atom.offset .. func.data.atom.offset + func.data.atom.len];
+    const func_name = attr_names.identText(self, func.data.atom);
     if (std.mem.eql(u8, func_name, param_name)) return null;
     // Upvalue index == position in the child's capture list (upvalues
     // are staged from captures in order).

@@ -82,6 +82,11 @@ pub fn writeReport(w: *std.Io.Writer, stats: *const Stats) !void {
         .{ "float-out blocked: uncurry chain", &stats.blocked_out_chain },
         .{ "float-out blocked: no destination", &stats.blocked_out_nodest },
         .{ "float-out blocked: name mentioned in window", &stats.blocked_out_capture },
+        .{ "anonymous MFE candidates", &stats.mfe_candidates },
+        .{ "anonymous MFEs floated", &stats.floated_mfe },
+        .{ "MFE blocked: uncurry chain", &stats.blocked_mfe_chain },
+        .{ "MFE blocked: enclosing binding floats past", &stats.blocked_mfe_enclosing },
+        .{ "MFE blocked: recursive group RHS", &stats.blocked_mfe_recursive },
         .{ "cluster map hits", &stats.cluster_hits },
         .{ "cluster walks", &stats.cluster_walks },
         .{ "strict-prefix members", &stats.prefix_members },
@@ -167,6 +172,10 @@ fn decideAll(self: *Compiler, ua: *analysis.UnitAnalysis, state: *model.UnitStat
         }
         batch_clean = batch_clean and !overlay.plan.?.any_change and cluster.levels == 1;
     }
+    if (self.let_float.full_lazy) {
+        const mfe_changed = try planAnonymousMfes(self, ua, state);
+        batch_clean = batch_clean and !mfe_changed;
+    }
     // Nothing in the batch changes and no spine flattens: every head
     // compiles as written — pre-seed the rebuild memos so no rebuild ever
     // descends this subtree (matching the old no-change fast path's cost).
@@ -177,6 +186,85 @@ fn decideAll(self: *Compiler, ua: *analysis.UnitAnalysis, state: *model.UnitStat
             overlay.rebuilt_batch = state.batch;
         }
     }
+}
+
+/// Anonymous-MFE floats (tier 1): each candidate the walk sealed — an
+/// `.apply` subtree whose free names all resolved at levels below its
+/// enclosing lambda — is bound to a fresh unspellable name in a wrap
+/// AROUND the lambda introducing `level + 1` and replaced by that name at
+/// its original site: one thunk shared across every closure created from
+/// that lambda, created once per closure creation of the DEST lambda.
+fn planAnonymousMfes(self: *Compiler, ua: *analysis.UnitAnalysis, state: *model.UnitState) !bool {
+    if (ua.mfes.items.len == 0) return false;
+    const arena = rootAstArena(self) orelse return false;
+    const allocator = state.allocator;
+    const lambdas = ua.tables.lambdas.items;
+    var emitted = false;
+    cand: for (ua.mfes.items) |cand| {
+        bump(self.let_float.stats, "mfe_candidates");
+        // An enclosing named binding that itself floats OUTSIDE the wrap
+        // lambda carries the synthetic reference (inside its RHS) out of
+        // the wrap's scope. Only bindings whose home is inside the wrap
+        // (`home >= level + 1`) can do so; their landed level must stay
+        // >= the candidate's. (Inline/sink never cross a lambda: safe.)
+        for (ua.mfe_rhs.items[cand.rhs_first .. cand.rhs_first + cand.rhs_len]) |rhs| {
+            const b = &rhs.cluster.graph.bindings[rhs.binding];
+            // Inside a recursive group's RHS, per-call thunks of the same
+            // expression each terminate through laziness, but ONE shared
+            // thunk can be re-demanded during its own force via the group
+            // (extendDerivation's commonAttrs/outputsList): RecursiveThunk
+            // on programs that terminate today. Stand down wholesale.
+            if (b.scc_recursive or b.self_ref) {
+                bump(self.let_float.stats, "blocked_mfe_recursive");
+                continue :cand;
+            }
+            if (b.home_level >= cand.level + 1 and b.assigned_level < cand.level) {
+                bump(self.let_float.stats, "blocked_mfe_enclosing");
+                continue :cand;
+            }
+        }
+        // Ascend to the lambda introducing `level + 1`; wrapping AROUND it
+        // realizes the level-`cand.level` home (chain levels never skip).
+        var li = cand.lambda;
+        while (li != analysis.invalid_lambda and lambdas[li].level > cand.level + 1)
+            li = lambdas[li].parent;
+        if (li == analysis.invalid_lambda or lambdas[li].level != cand.level + 1) continue :cand;
+        const dest = lambdas[li];
+        if (dest.chain_member) {
+            // A wrap between curried params splits the uncurried arity-N
+            // chunk — same clamp as named floats until the split-benefit
+            // gate exists.
+            bump(self.let_float.stats, "blocked_mfe_chain");
+            continue :cand;
+        }
+        var buf: [24]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, "\x00fl.{d}", .{state.synth_counter}) catch unreachable;
+        state.synth_counter += 1;
+        const name_id = try self.intern.intern(name);
+        const atom = Node.Atom{ .offset = @intCast(name_id), .len = 0 };
+        const ident = try arena.createNode(.identifier, .{ .atom = atom });
+        ident.span = cand.node.span;
+        // The wrap expression is a SHALLOW clone: same children, so nested
+        // replacements and wraps still apply through it during the rebuild;
+        // fresh root pointer, so the replacement below cannot fire inside
+        // the wrap itself.
+        const clone = try arena.createNode(cand.node.tag, cand.node.data);
+        clone.span = cand.node.span;
+        try state.replacements.put(allocator, cand.node, ident);
+        const path = try arena.allocSlice(Node.Atom, 1);
+        path[0] = atom;
+        const gop = try state.lambda_outer_wraps.getOrPut(allocator, dest.node);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(allocator, .{
+            .name_offset = atom.offset,
+            .name_len = 0,
+            .path = path,
+            .expr = clone,
+        });
+        emitted = true;
+        bump(self.let_float.stats, "floated_mfe");
+    }
+    return emitted;
 }
 
 /// Full-laziness pre-emission hook (`FIX_FULL_LAZY=1`), called from the

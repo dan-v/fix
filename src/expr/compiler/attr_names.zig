@@ -18,7 +18,16 @@ pub fn equal(self: *const Compiler, a: Node.Atom, b: Node.Atom) bool {
     return std.mem.eql(u8, span(self, a), span(self, b));
 }
 
+/// Identifier-atom text. A SYNTHETIC atom (full-laziness float names) has
+/// `len == 0` and carries its interned name id in `offset` — real
+/// identifier/name atoms are never empty. Everything else reads the source.
+pub fn identText(self: *const Compiler, atom: Node.Atom) []const u8 {
+    if (atom.len == 0) return self.intern.get(@intCast(atom.offset));
+    return self.source[atom.offset .. atom.offset + atom.len];
+}
+
 pub fn span(self: *const Compiler, atom: Node.Atom) []const u8 {
+    if (atom.len == 0) return self.intern.get(@intCast(atom.offset));
     const source = self.source[atom.offset .. atom.offset + atom.len];
     if (source.len >= 2 and source[0] == '"' and source[source.len - 1] == '"') {
         return source[1 .. source.len - 1];
@@ -37,6 +46,7 @@ fn simpleQuotedInner(self: *const Compiler, atom: Node.Atom) ?[]const u8 {
 }
 
 pub fn intern(self: *Compiler, atom: Node.Atom) !InternId {
+    if (atom.len == 0) return @intCast(atom.offset); // synthetic: already interned
     // Identifiers and simple quoted names are already decoded in the source;
     // intern their slices directly and avoid a temporary allocation.
     if (string_syntax.kindAt(self.source, atom.offset) == null) {
@@ -50,6 +60,7 @@ pub fn intern(self: *Compiler, atom: Node.Atom) !InternId {
 }
 
 pub fn alloc(self: *Compiler, atom: Node.Atom) ![]u8 {
+    if (atom.len == 0) return self.allocator.dupe(u8, identText(self, atom));
     const source = self.source[atom.offset .. atom.offset + atom.len];
     if (string_syntax.kindAt(self.source, atom.offset) == null) {
         return self.allocator.dupe(u8, source);
@@ -72,6 +83,7 @@ pub fn alloc(self: *Compiler, atom: Node.Atom) ![]u8 {
 }
 
 pub fn hasInterpolation(self: *const Compiler, atom: Node.Atom) bool {
+    if (atom.len == 0) return false; // synthetic: plain interned identifier
     const source = self.source[atom.offset .. atom.offset + atom.len];
     return string_syntax.kindAt(self.source, atom.offset) != null and
         std.mem.indexOf(u8, source, "${") != null;

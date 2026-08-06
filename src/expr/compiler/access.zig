@@ -441,7 +441,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
 }
 
 fn compileRawIdent(self: *Compiler, node: *const Node) !bool {
-    const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
+    const span = attr_names.identText(self, node.data.atom);
     const name_id = try self.intern.intern(span);
     if (scope.resolveLocalId(self, name_id)) |slot| {
         try emit.emitCaptureLocal(self, slot);

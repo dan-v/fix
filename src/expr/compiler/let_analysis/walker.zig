@@ -37,6 +37,8 @@ pub fn analyze(self: *Compiler, ua: *UnitAnalysis, root: *const Node) !void {
     // consumes `walk_clusters` right after this returns, so the previous
     // walk's list is dead by now.
     ua.walk_clusters.clearRetainingCapacity();
+    ua.mfes.clearRetainingCapacity();
+    ua.mfe_rhs.clearRetainingCapacity();
     var walker = Walker{ .c = self, .ua = ua };
     defer walker.deinit();
     try walker.walk(root);
@@ -58,6 +60,12 @@ const Binder = struct {
     /// or maxInt — resolution is O(1) via `by_name`.
     prev_same_name: usize = std.math.maxInt(usize),
 };
+
+/// Subtree facts for anonymous-MFE discovery (consumed only under the
+/// full-lazy gate): the max Lévy level any name in the current subtree
+/// resolved at, and whether the subtree contains something immovable
+/// (elided source, dynamically-resolvable mentions, skip-slot resolution).
+const Facts = struct { level: u16 = 0, opaq: bool = false };
 
 /// Per-active-cluster walk state.
 const ClusterCtx = struct {
@@ -92,6 +100,11 @@ pub const Walker = struct {
     /// Innermost enclosing lambda (index into `tables.lambdas`), tracked
     /// only under the full-lazy gate.
     cur_lambda: u32 = model.invalid_lambda,
+    /// Accumulated facts of the subtree being walked (see `Facts`).
+    sub: Facts = .{},
+    /// Root of the named-binding RHS being walked (parens unwrapped): an
+    /// apply that IS a whole RHS belongs to the named float pass, not MFEs.
+    cur_rhs_root: ?*const Node = null,
 
     fn deinit(self: *Walker) void {
         self.stack.deinit(self.c.allocator);
@@ -136,6 +149,7 @@ pub const Walker = struct {
     }
 
     fn internSpan(self: *Walker, atom: Node.Atom) !InternId {
+        if (atom.len == 0) return @intCast(atom.offset); // synthetic (full-laziness)
         return self.c.intern.intern(self.c.source[atom.offset .. atom.offset + atom.len]);
     }
 
@@ -194,6 +208,10 @@ pub const Walker = struct {
             var skipped = false;
             for (self.skips.items) |skip| {
                 if (skip == found.?) {
+                    // Skip-slot resolution binds PAST the innermost binder:
+                    // an MFE wrap placed elsewhere would re-resolve to the
+                    // innermost — poison the enclosing candidates.
+                    self.sub.opaq = true;
                     const prev = self.stack.items[found.?].prev_same_name;
                     found = if (prev == std.math.maxInt(usize)) null else prev;
                     skipped = true;
@@ -205,6 +223,7 @@ pub const Walker = struct {
 
         if (found) |pos| {
             const binder = self.stack.items[pos];
+            if (binder.level > self.sub.level) self.sub.level = binder.level;
             if (binder.cluster != invalid_cluster) {
                 // A use of some active cluster's binding.
                 const ctx = &self.active.items[binder.active_index];
@@ -230,6 +249,9 @@ pub const Walker = struct {
         // Free of the walk entirely: classify once, attribute everywhere.
         var class = classifyOuterName(self.c, name_id);
         if (class == .dynamic and static_fallback) class = .builtin;
+        // A miss that `with` could resolve at runtime is immovable; other
+        // misses (builtins, outer compile scope) live at level 0.
+        if (class == .dynamic) self.sub.opaq = true;
         try self.attributeFree(name_id, null, class);
     }
 
@@ -266,6 +288,9 @@ pub const Walker = struct {
     /// (`inherit x;` in rec attrsets / nested lets), as a pinned mention.
     fn refPastInnermost(self: *Walker, name_id: InternId) !void {
         if (self.c.let_float.full_lazy) try self.ua.tables.logMention(name_id);
+        // Resolves past the innermost binder by construction: an MFE wrap
+        // would re-resolve innermost — poison enclosing candidates.
+        self.sub.opaq = true;
         const innermost = self.by_name.get(name_id) orelse return;
         const prev = self.stack.items[innermost].prev_same_name;
         if (prev == std.math.maxInt(usize)) return;
@@ -288,6 +313,45 @@ pub const Walker = struct {
         });
     }
 
+    /// Seal an anonymous-MFE candidate at an apply whose whole subtree
+    /// resolved below the current lambda (`facts.level < many_depth`).
+    /// Descendant candidates at >= this level are subsumed: this wrap
+    /// shares their computation wholesale, and leaving them would let this
+    /// (outer-or-equal) float carry their synthetic references outside the
+    /// scope of their own wraps. Descendants at LOWER levels stay — they
+    /// float farther out, so their bindings still enclose this one.
+    fn sealMfe(self: *Walker, node: *const Node, facts: Facts, cand_start: usize) !void {
+        if (facts.opaq) return;
+        if (self.cur_lambda == model.invalid_lambda) return;
+        if (facts.level >= self.many_depth) return;
+        if (self.cur_rhs_root == node) return; // whole named RHS: pass B0 owns it
+        const mfes = &self.ua.mfes;
+        var read = cand_start;
+        var write = cand_start;
+        while (read < mfes.items.len) : (read += 1) {
+            const c = mfes.items[read];
+            if (c.level >= facts.level) continue; // subsumed (pool entries stay, dead)
+            mfes.items[write] = c;
+            write += 1;
+        }
+        mfes.items.len = write;
+        const rhs_first: u32 = @intCast(self.ua.mfe_rhs.items.len);
+        for (self.active.items) |*ctx| {
+            if (ctx.cur_rhs == invalid_binding) continue;
+            try self.ua.mfe_rhs.append(self.ua.allocator, .{
+                .cluster = ctx.cluster,
+                .binding = ctx.cur_rhs,
+            });
+        }
+        try mfes.append(self.ua.allocator, .{
+            .node = node,
+            .level = facts.level,
+            .lambda = self.cur_lambda,
+            .rhs_first = rhs_first,
+            .rhs_len = @intCast(self.ua.mfe_rhs.items.len - rhs_first),
+        });
+    }
+
     fn walk(self: *Walker, node: *const Node) anyerror!void {
         switch (node.tag) {
             .integer, .float_val, .bool_true, .bool_false, .null, .uri => {},
@@ -295,6 +359,7 @@ pub const Walker = struct {
             .search_path => try self.refSpecialWord("__nixPath"),
             .string, .path => try self.wordsInSpan(node.data.atom),
             .elided => {
+                self.sub.opaq = true;
                 // Never parsed: every ident-shaped word is a conservative,
                 // pinned mention, and every enclosing RHS is opaque.
                 for (self.active.items) |*ctx| {
@@ -306,6 +371,10 @@ pub const Walker = struct {
             },
             .identifier => {
                 const atom = node.data.atom;
+                if (atom.len == 0) { // synthetic (full-laziness float name)
+                    try self.refName(@intCast(atom.offset), node, false, false);
+                    return;
+                }
                 // `__curPos` is intercepted by `compileIdent` BEFORE local
                 // resolution: it never reads a binding, even one spelled
                 // `__curPos` (matching Nix, where it is a parse-time form).
@@ -326,11 +395,20 @@ pub const Walker = struct {
                 try self.walk(b.right);
             },
             .apply => {
+                const saved_sub = self.sub;
+                self.sub = .{};
+                const cand_start = self.ua.mfes.items.len;
                 try self.walk(node.data.apply.func);
                 // Argument positions are runtime-adaptive/lazy thunks.
                 self.once_depth += 1;
                 try self.walk(node.data.apply.arg);
                 self.once_depth -= 1;
+                const mine = self.sub;
+                if (self.c.let_float.full_lazy) try self.sealMfe(node, mine, cand_start);
+                self.sub = .{
+                    .level = @max(saved_sub.level, mine.level),
+                    .opaq = saved_sub.opaq or mine.opaq,
+                };
             },
             .lambda => {
                 const start = self.stack.items.len;
@@ -362,9 +440,19 @@ pub const Walker = struct {
                 try self.pushBinderAt(try self.c.intern.intern(
                     self.c.source[lam.param_offset .. lam.param_offset + lam.param_len],
                 ), invalid_cluster, 0, invalid_binding, introduced);
+                const saved_sub = self.sub;
+                self.sub = .{};
                 self.many_depth += 1;
                 try self.walk(lam.body);
                 self.many_depth -= 1;
+                // Binders inside this lambda all sit at level >= introduced;
+                // outer binders were pushed at <= introduced - 1. Clamping
+                // the body's facts is therefore the EXACT free level of the
+                // lambda subtree (its own params/lets are bound within).
+                self.sub = .{
+                    .level = @max(saved_sub.level, @min(self.sub.level, introduced - 1)),
+                    .opaq = saved_sub.opaq or self.sub.opaq,
+                };
                 self.cur_lambda = saved_lambda;
                 self.popBinders(start);
             },
@@ -388,12 +476,19 @@ pub const Walker = struct {
                 }
                 if (la.bind_name) |bn| try self.pushBinderAt(try self.internSpan(bn), invalid_cluster, 0, invalid_binding, introduced);
                 for (la.params) |param| try self.pushBinderAt(try self.internSpan(param.name), invalid_cluster, 0, invalid_binding, introduced);
+                const saved_sub = self.sub;
+                self.sub = .{};
                 self.many_depth += 1;
                 for (la.params) |param| {
                     if (param.default) |d| try self.walk(d);
                 }
                 try self.walk(la.body);
                 self.many_depth -= 1;
+                // Exact free-level clamp; see `.lambda`.
+                self.sub = .{
+                    .level = @max(saved_sub.level, @min(self.sub.level, introduced - 1)),
+                    .opaq = saved_sub.opaq or self.sub.opaq,
+                };
                 self.cur_lambda = saved_lambda;
                 self.popBinders(start);
             },
@@ -680,7 +775,12 @@ pub const Walker = struct {
             defer self.once_depth -= 1;
 
             switch (b.kind) {
-                .plain => try self.walk(entry.expr),
+                .plain => {
+                    const saved_root = self.cur_rhs_root;
+                    self.cur_rhs_root = ast.unwrapParens(entry.expr);
+                    defer self.cur_rhs_root = saved_root;
+                    try self.walk(entry.expr);
+                },
                 .inherit_outer => {
                     // `inherit x;` resolves x OUTSIDE the cluster: skip this
                     // binding's own binder during resolution.

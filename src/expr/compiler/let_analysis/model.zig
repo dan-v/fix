@@ -450,6 +450,26 @@ pub const Cluster = struct {
 
 /// Cluster registry for one compile unit (or one fallback walk). Owned by
 /// the ROOT compiler; children route through it. Everything scratch.
+/// Anonymous-MFE candidate (full-lazy walks only): a maximal `.apply`
+/// subtree whose free names all resolve at Lévy levels below its enclosing
+/// lambda — floatable to a synthetic binding wrapped AROUND the lambda
+/// introducing `level + 1`, sharing one thunk across every closure created
+/// from that lambda.
+pub const MfeCandidate = struct {
+    node: *const Node,
+    /// Max free level of the subtree (home-based, hence conservative).
+    level: u16,
+    /// Enclosing lambda at the site (index into `SharedTables.lambdas`).
+    lambda: u32,
+    /// Named-binding RHSes enclosing the site: `mfe_rhs[first..first+len]`.
+    /// A binding here that floats past `level` would carry the synthetic
+    /// reference outside the wrap's scope — checked at emission.
+    rhs_first: u32,
+    rhs_len: u32,
+};
+
+pub const MfeRhs = struct { cluster: *Cluster, binding: BindingId };
+
 pub const UnitAnalysis = struct {
     allocator: std.mem.Allocator,
     tables: SharedTables,
@@ -465,6 +485,13 @@ pub const UnitAnalysis = struct {
     /// rebuild), so `rewriteLambdaBody` skips already-analyzed subtrees in
     /// O(1). Untouched when the full-lazy gate is off.
     walked: std.AutoHashMapUnmanaged(*const Node, void) = .empty,
+    /// Anonymous-MFE candidates sealed by the MOST RECENT walk (full-lazy
+    /// only): same lifecycle as `walk_clusters` — cleared at walk entry,
+    /// consumed by the decide-all pass right after.
+    mfes: std.ArrayListUnmanaged(MfeCandidate) = .empty,
+    /// Shared pool backing `MfeCandidate.rhs_first/rhs_len` (append-only
+    /// within a walk; subsumed candidates leave dead entries behind).
+    mfe_rhs: std.ArrayListUnmanaged(MfeRhs) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) UnitAnalysis {
         return .{ .allocator = allocator, .tables = .{ .allocator = allocator } };

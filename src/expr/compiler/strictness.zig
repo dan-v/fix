@@ -195,11 +195,13 @@ const Analyzer = struct {
 
     fn identifierNameId(self: *Analyzer, node: *const Node) !InternId {
         const atom = node.data.atom;
+        if (atom.len == 0) return @intCast(atom.offset); // synthetic (full-laziness)
         const name = self.source[atom.offset .. atom.offset + atom.len];
         return self.intern.intern(name);
     }
 
     fn bindingNameId(self: *Analyzer, binding: Node.Binding) !InternId {
+        if (binding.name_len == 0) return @intCast(binding.name_offset); // synthetic
         const name = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
         return self.intern.intern(name);
     }
@@ -827,6 +829,10 @@ fn bindingNameIds(allocator: std.mem.Allocator, intern: *InternTable, source: []
     const ids = try allocator.alloc(InternId, bindings.len);
     errdefer allocator.free(ids);
     for (bindings, ids) |binding, *id| {
+        if (binding.name_len == 0) { // synthetic (full-laziness)
+            id.* = @intCast(binding.name_offset);
+            continue;
+        }
         const name = source[binding.name_offset .. binding.name_offset + binding.name_len];
         id.* = try intern.intern(name);
     }

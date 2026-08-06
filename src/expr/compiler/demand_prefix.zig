@@ -145,7 +145,7 @@ const Context = struct {
             switch (callee.tag) {
                 .identifier => {
                     const atom = callee.data.atom;
-                    const name_id = self.intern.intern(self.source[atom.offset .. atom.offset + atom.len]) catch return null;
+                    const name_id = if (atom.len == 0) @as(@import("runtime").types.InternId, @intCast(atom.offset)) else self.intern.intern(self.source[atom.offset .. atom.offset + atom.len]) catch return null;
                     if (self.findParam(name_id, window)) |hit| {
                         callee = ast.unwrapParens(hit.arg);
                         window = hit.window;
@@ -177,9 +177,12 @@ const Context = struct {
             },
             .identifier => {
                 const atom = node.data.atom;
-                const text = self.source[atom.offset .. atom.offset + atom.len];
-                if (std.mem.eql(u8, text, "__curPos")) return true;
-                const name_id = try self.intern.intern(text);
+                // Synthetic (full-laziness) atoms carry an interned id, len 0.
+                const name_id = if (atom.len == 0) @as(InternId, @intCast(atom.offset)) else blk: {
+                    const text = self.source[atom.offset .. atom.offset + atom.len];
+                    if (std.mem.eql(u8, text, "__curPos")) return true;
+                    break :blk try self.intern.intern(text);
+                };
                 if (self.findParam(name_id, window)) |hit| {
                     return self.walk(hit.arg, hit.window);
                 }
