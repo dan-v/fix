@@ -105,6 +105,11 @@ pub const Walker = struct {
     /// Root of the named-binding RHS being walked (parens unwrapped): an
     /// apply that IS a whole RHS belongs to the named float pass, not MFEs.
     cur_rhs_root: ?*const Node = null,
+    /// The node about to be walked is the FUNC of an apply (through
+    /// parens). A call-spine prefix must not seal as an MFE: floating a
+    /// partial application splits the uncurried `call_n` chain and defeats
+    /// saturated-builtin opcode lowering. Cleared at every non-parens node.
+    in_apply_func: bool = false,
 
     fn deinit(self: *Walker) void {
         self.stack.deinit(self.c.allocator);
@@ -366,6 +371,8 @@ pub const Walker = struct {
     }
 
     fn walk(self: *Walker, node: *const Node) anyerror!void {
+        const spine_prefix = self.in_apply_func;
+        self.in_apply_func = false;
         switch (node.tag) {
             .integer, .float_val, .bool_true, .bool_false, .null, .uri => {},
             // `<name>` desugars through the `__nixPath` identifier.
@@ -419,6 +426,7 @@ pub const Walker = struct {
                 const saved_sub = self.sub;
                 self.sub = .{};
                 const cand_start = self.ua.mfes.items.len;
+                self.in_apply_func = true;
                 try self.walk(node.data.apply.func);
                 // Argument positions are runtime-adaptive/lazy thunks.
                 self.once_depth += 1;
@@ -426,7 +434,7 @@ pub const Walker = struct {
                 self.once_depth -= 1;
                 var mine = self.sub;
                 mine.applies +|= 1;
-                if (self.c.let_float.full_lazy) try self.sealMfe(node, mine, cand_start);
+                if (self.c.let_float.full_lazy and !spine_prefix) try self.sealMfe(node, mine, cand_start);
                 self.sub = .{
                     .level = @max(saved_sub.level, mine.level),
                     .opaq = saved_sub.opaq or mine.opaq,
@@ -626,7 +634,10 @@ pub const Walker = struct {
                 for (node.data.list.items) |item| try self.walk(item);
                 self.once_depth -= 1;
             },
-            .parens => try self.walk(node.data.parens),
+            .parens => {
+                self.in_apply_func = spine_prefix; // transparent for the spine
+                try self.walk(node.data.parens);
+            },
         }
     }
 

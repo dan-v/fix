@@ -717,8 +717,10 @@ test "let-float floats a branch-local binding so its slot is set only inside the
     defer ev.deinit();
     // Every live use of `x` sits under the `then` branch, so it floats into
     // a synthetic let wrapping that branch: its slot is filled strictly
-    // after the `jump_false` that skips the branch entirely.
-    var d = try disassemble(&ev, "c: let x = builtins.length [ 1 ]; in if c then x + x else 0");
+    // after the `jump_false` that skips the branch entirely. (`x` mentions
+    // the param `c`, so full laziness leaves it inside the lambda — a
+    // param-independent RHS would float past the lambda entirely.)
+    var d = try disassemble(&ev, "c: let x = builtins.length [ c ]; in if c then x + x else 0");
     defer d.deinit(testing.allocator);
     const jump_line = d.find("jump_false").?;
     const set_line = d.find("loc_set").?;

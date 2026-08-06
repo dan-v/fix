@@ -417,9 +417,10 @@ Out of scope: the strict-prefix walk and its completeness/barrier rules in
 full → [strictness.md](strictness.md); where the residual `let` is classified
 and emitted → [pipeline.md](pipeline.md); name resolution and the shadow
 model this pass reads → [scopes.md](scopes.md); deferred per-attr compilation
-→ [lazy-compile.md](lazy-compile.md). This pass does not attempt **full
-laziness**: floating a binding outward past an enclosing lambda to share it
-across calls. The strict prefix handles saturated calls to statically-known
+→ [lazy-compile.md](lazy-compile.md). **Full laziness** — floating a
+binding outward past an enclosing lambda to share it across calls — is the
+level-aware extension of this pass, built on the same cluster analysis →
+[full-laziness.md](full-laziness.md). The strict prefix handles saturated calls to statically-known
 sibling or inline value lambdas, depth-capped at 4; see
 [The strict prefix and its validation](#the-strict-prefix-and-its-validation)
 and [strictness.md](strictness.md#products--consumers). It does not reason

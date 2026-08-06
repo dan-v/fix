@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Full-laziness (FIX_FULL_LAZY=1) semantics: a let binding whose RHS does
+# Full-laziness semantics (default ON; FIX_NO_FULL_LAZY=1 is the kill
+# switch and the baseline side of every check here): a let binding whose RHS does
 # not depend on the enclosing lambda's parameters floats out of the lambda,
 # so every application shares ONE thunk — observable as builtins.trace
 # firing once instead of once per call. These checks lock, through the real
@@ -13,9 +14,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/lib.sh"
 e2e_init "$@"
 
-on_out() { FIX_FULL_LAZY=1 "$FIX" eval -E "$1" 2>/dev/null; }
-on_err() { FIX_FULL_LAZY=1 "$FIX" eval -E "$1" 2>&1 1>/dev/null; }
-off_out() { "$FIX" eval -E "$1" 2>/dev/null; }
+on_out() { "$FIX" eval -E "$1" 2>/dev/null; }
+on_err() { "$FIX" eval -E "$1" 2>&1 1>/dev/null; }
+off_out() { FIX_NO_FULL_LAZY=1 "$FIX" eval -E "$1" 2>/dev/null; }
 
 # --- the transform: one evaluation shared across calls ---------------------
 share='let f = x: let y = builtins.trace "eval-y" (1 + 1); in x + y; in f 1 + f 2'
