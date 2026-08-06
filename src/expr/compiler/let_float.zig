@@ -84,6 +84,7 @@ pub fn writeReport(w: *std.Io.Writer, stats: *const Stats) !void {
         .{ "float-out blocked: name mentioned in window", &stats.blocked_out_capture },
         .{ "anonymous MFE candidates", &stats.mfe_candidates },
         .{ "anonymous MFEs floated", &stats.floated_mfe },
+        .{ "chain-splitting floats", &stats.floated_chain_split },
         .{ "MFE blocked: uncurry chain", &stats.blocked_mfe_chain },
         .{ "MFE blocked: enclosing binding floats past", &stats.blocked_mfe_enclosing },
         .{ "MFE blocked: recursive group RHS", &stats.blocked_mfe_recursive },
@@ -231,11 +232,14 @@ fn planAnonymousMfes(self: *Compiler, ua: *analysis.UnitAnalysis, state: *model.
         if (li == analysis.invalid_lambda or lambdas[li].level != cand.level + 1) continue :cand;
         const dest = lambdas[li];
         if (dest.chain_member) {
-            // A wrap between curried params splits the uncurried arity-N
-            // chunk — same clamp as named floats until the split-benefit
-            // gate exists.
-            bump(self.let_float.stats, "blocked_mfe_chain");
-            continue :cand;
+            if (!self.let_float.chain_split) {
+                // A wrap between curried params splits the uncurried arity-N
+                // chunk — same clamp as named floats until the split-benefit
+                // gate exists.
+                bump(self.let_float.stats, "blocked_mfe_chain");
+                continue :cand;
+            }
+            bump(self.let_float.stats, "floated_chain_split");
         }
         var buf: [24]u8 = undefined;
         const name = std.fmt.bufPrint(&buf, "\x00fl.{d}", .{state.synth_counter}) catch unreachable;

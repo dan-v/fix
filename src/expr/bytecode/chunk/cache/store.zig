@@ -22,6 +22,7 @@ pub const Options = struct {
     full_lazy_enabled: bool,
     mfe_min_applies: u16,
     named_floats: bool,
+    chain_split: bool,
     max_pending_bytes: usize = default_pending_bytes,
 };
 
@@ -73,6 +74,7 @@ pub const Store = struct {
                 .full_lazy_enabled = options.full_lazy_enabled,
                 .mfe_min_applies = options.mfe_min_applies,
                 .named_floats = options.named_floats,
+                .chain_split = options.chain_split,
                 .home = home,
             },
             .writer = writer,
@@ -260,6 +262,7 @@ test "bounded background store transfers blob ownership and flushes publication"
         .full_lazy_enabled = false,
         .mfe_min_applies = 1,
         .named_floats = true,
+        .chain_split = false,
         .max_pending_bytes = 8,
     });
     defer store.deinit();

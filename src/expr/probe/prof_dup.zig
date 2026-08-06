@@ -36,19 +36,51 @@ const table_len = 1 << table_bits;
 const probe_limit = 32;
 
 var table: ?[]Slot = null;
+var struct_table: ?[]Slot = null;
 pub var dropped: u64 = 0;
+pub var struct_dropped: u64 = 0;
 pub var recorded: u64 = 0;
 
-fn tableSlots() []Slot {
-    if (table) |t| return t;
+fn slotsFor(which: *?[]Slot) []Slot {
+    if (which.*) |t| return t;
     const t = std.heap.page_allocator.alloc(Slot, table_len) catch {
         // Leave the census empty rather than fail the run.
-        table = &.{};
-        return table.?;
+        which.* = &.{};
+        return which.*.?;
     };
     @memset(t, .{});
-    table = t;
+    which.* = t;
     return t;
+}
+
+fn tableSlots() []Slot {
+    return slotsFor(&table);
+}
+
+/// Same census keyed by depth-limited STRUCTURAL upvalue hashes: equal
+/// arguments held in DISTINCT objects (the cross-instantiation case the
+/// bit-census cannot see) collide here. The gap between the two tables'
+/// dup mass is the value-memoization ceiling estimate.
+pub fn recordStructural(chunk: u32, hash: u64, cycles: u64) void {
+    if (comptime !prof.enabled) return;
+    const t = slotsFor(&struct_table);
+    if (t.len == 0) return;
+    var idx: usize = @intCast((hash ^ (@as(u64, chunk) *% 0x9E3779B97F4A7C15)) & (table_len - 1));
+    var step: usize = 0;
+    while (step < probe_limit) : (step += 1) {
+        const slot = &t[idx];
+        if (slot.count == 0) {
+            slot.* = .{ .chunk = chunk, .hash = hash, .count = 1, .first_cycles = cycles };
+            return;
+        }
+        if (slot.chunk == chunk and slot.hash == hash) {
+            slot.count += 1;
+            slot.dup_cycles += cycles;
+            return;
+        }
+        idx = (idx + 1) & (table_len - 1);
+    }
+    struct_dropped += 1;
 }
 
 /// Record one completed worker-0 bytecode resolve. `cycles` is the
@@ -87,7 +119,11 @@ pub fn record(chunk: u32, hash: u64, memo_eligible: bool, cycles: u64) void {
 /// much of it the top chunks concentrate.
 pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
     if (comptime !prof.enabled) return;
-    const t = table orelse return;
+    reportTable(registry, intern, table orelse return, "value-bits", dropped);
+    if (struct_table) |st| reportTable(registry, intern, st, "STRUCTURAL", struct_dropped);
+}
+
+fn reportTable(registry: *const ChunkRegistry, intern: *const InternTable, t: []Slot, label: []const u8, dropped_n: u64) void {
     if (t.len == 0) return;
 
     const Agg = struct { resolves: u64 = 0, dups: u64 = 0, dup_cycles: u64 = 0, memo_elig_dups: u64 = 0 };
@@ -115,8 +151,8 @@ pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
     if (total_resolves == 0) return;
 
     std.debug.print(
-        "prof dup-resolve (worker 0, memo-missed only): resolves={d} dup={d} ({d:.1}%) dup_cycles={d} (memo-eligible-key dup_cycles={d}) dropped={d}\n",
-        .{ total_resolves, total_dups, pct(total_dups, total_resolves), total_dup_cycles, memo_elig_dup_cycles, dropped },
+        "prof dup-resolve [{s}] (worker 0, memo-missed only): resolves={d} dup={d} ({d:.1}%) dup_cycles={d} (memo-eligible-key dup_cycles={d}) dropped={d}\n",
+        .{ label, total_resolves, total_dups, pct(total_dups, total_resolves), total_dup_cycles, memo_elig_dup_cycles, dropped_n },
     );
 
     const top_count = 30;
@@ -136,8 +172,8 @@ pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
     var top_cycles: u64 = 0;
     for (top) |e| top_cycles += e.agg.dup_cycles;
     std.debug.print(
-        "prof dup-resolve top-{d} chunks hold {d:.1}% of dup cycles:\n",
-        .{ top_count, pct(top_cycles, total_dup_cycles) },
+        "prof dup-resolve [{s}] top-{d} chunks hold {d:.1}% of dup cycles:\n",
+        .{ label, top_count, pct(top_cycles, total_dup_cycles) },
     );
     for (top) |e| {
         if (e.agg.dup_cycles == 0) break;

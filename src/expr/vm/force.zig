@@ -719,6 +719,7 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     // payload union flips to the result at resolve), and charge its
     // inclusive cycles at publish below.
     var dup_hash: u64 = 0;
+    var dup_shash: u64 = 0;
     var dup_chunk: u32 = 0;
     var dup_memo_eligible = false;
     var dup_t0: u64 = 0;
@@ -729,6 +730,9 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
             var h = std.hash.Wyhash.init(0x1e35_a7bd);
             for (b.upvalues()) |v| h.update(std.mem.asBytes(&v.bits));
             dup_hash = h.final();
+            var sh = std.hash.Wyhash.init(0x1e35_a7bd);
+            for (b.upvalues()) |v| structuralHashInto(self, &sh, v, 2);
+            dup_shash = sh.final();
             dup_chunk = b.chunk_id;
             dup_memo_eligible = b.upvalues().len <= 2;
             dup_t0 = prof.rdtsc();
@@ -781,12 +785,21 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     };
 
     if (comptime prof.enabled) {
-        if (dup_armed) prof_dup.record(dup_chunk, dup_hash, dup_memo_eligible, prof.rdtsc() - dup_t0);
+        if (dup_armed) {
+            const cy = prof.rdtsc() - dup_t0;
+            prof_dup.record(dup_chunk, dup_hash, dup_memo_eligible, cy);
+            prof_dup.recordStructural(dup_chunk, dup_shash, cy);
+        }
     }
     self.heap.gcReleaseThunkSpill(thunk);
     resolveDispatch(self, thunk, whnf);
     self.heap.gcRecordEdge(thunk_id, whnf);
     if (memo_key) |key| {
+        if (comptime prof.enabled) {
+            if (self.workerId() == 0) {
+                if (self.effect_epoch == effect_epoch) prof_census.memo_write_ok += 1 else prof_census.memo_write_effect_blocked += 1;
+            }
+        }
         if (self.effect_epoch == effect_epoch) {
             thread_caches.get().thunk_memo[key.idx] = .{
                 .token = self.heap.token,
@@ -884,6 +897,44 @@ fn reuseMemoizedThunk(
     recordResolve(self, thunk_id, slot.value);
     if (demand) thunk.markDemanded();
     return slot.value;
+}
+
+/// Census-only (`-Dprof-main`): depth-limited structural hash of a value.
+/// Attrs/lists recurse (first 8 entries + length); everything else — and
+/// every object at the depth floor — hashes by raw bits. Distinct-object
+/// equal-content strings and deeper structure still differ, so the
+/// structural census remains a FLOOR on true cross-instantiation
+/// redundancy, just a far tighter one than bit equality.
+fn structuralHashInto(self: *VM, h: *std.hash.Wyhash, v: Value, depth: u8) void {
+    if (comptime !prof.enabled) return;
+    if (depth > 0 and v.isAttrs()) {
+        const entries = self.heap.materializeAttrs(v.asObjectId()) catch {
+            h.update(std.mem.asBytes(&v.bits));
+            return;
+        };
+        h.update("A");
+        var len: u32 = @intCast(entries.len);
+        h.update(std.mem.asBytes(&len));
+        const k = @min(entries.len, 8);
+        for (entries[0..k]) |e| {
+            h.update(std.mem.asBytes(&e.name));
+            structuralHashInto(self, h, e.value, depth - 1);
+        }
+        return;
+    }
+    if (depth > 0 and v.isList()) {
+        const items = self.heap.getList(v.asObjectId()) catch {
+            h.update(std.mem.asBytes(&v.bits));
+            return;
+        };
+        h.update("L");
+        var len: u32 = @intCast(items.len);
+        h.update(std.mem.asBytes(&len));
+        const k = @min(items.len, 8);
+        for (items[0..k]) |item| structuralHashInto(self, h, item, depth - 1);
+        return;
+    }
+    h.update(std.mem.asBytes(&v.bits));
 }
 
 fn waitForBusyThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, demand: bool) void {

@@ -364,6 +364,7 @@ pub const Walker = struct {
         try mfes.append(self.ua.allocator, .{
             .node = node,
             .level = facts.level,
+            .applies = facts.applies,
             .lambda = self.cur_lambda,
             .rhs_first = rhs_first,
             .rhs_len = @intCast(self.ua.mfe_rhs.items.len - rhs_first),

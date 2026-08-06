@@ -722,6 +722,7 @@ pub const Engine = struct {
                 .full_lazy = policy.full_lazy_enabled,
                 .mfe_min_applies = policy.mfe_min_applies,
                 .named_floats = policy.named_floats_enabled,
+                .chain_split = policy.chain_split,
                 .stats = &self.compilation.let_float_stats,
             };
         }
@@ -1256,6 +1257,7 @@ pub const Engine = struct {
             .full_lazy = compile_tuning.full_lazy_enabled,
             .mfe_min_applies = compile_tuning.mfe_min_applies,
             .named_floats = compile_tuning.named_floats_enabled,
+            .chain_split = compile_tuning.chain_split,
             .stats = &self.compilation.let_float_stats,
         };
         compiler.registration_sink = chunkRegistrationSink(self);
@@ -1496,6 +1498,7 @@ pub const Engine = struct {
             .full_lazy_enabled = eval_tuning.full_lazy_enabled,
             .mfe_min_applies = eval_tuning.mfe_min_applies,
             .named_floats = eval_tuning.named_floats_enabled,
+            .chain_split = eval_tuning.chain_split,
         }) catch return;
     }
 

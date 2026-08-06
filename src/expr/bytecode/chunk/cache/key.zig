@@ -66,6 +66,7 @@ pub const KeyContext = struct {
     full_lazy_enabled: bool,
     mfe_min_applies: u16,
     named_floats: bool,
+    chain_split: bool,
     /// `$HOME` affects `~/…` path-literal resolution.
     home: ?[]const u8,
 };
@@ -82,6 +83,7 @@ pub fn computeKey(source: []const u8, source_path: []const u8, ctx: KeyContext) 
     hasher.update(std.mem.asBytes(&ctx.full_lazy_enabled));
     hasher.update(std.mem.asBytes(&ctx.mfe_min_applies));
     hasher.update(std.mem.asBytes(&ctx.named_floats));
+    hasher.update(std.mem.asBytes(&ctx.chain_split));
     if (ctx.home) |h| {
         hasher.update(&[_]u8{1});
         hasher.update(std.mem.asBytes(&@as(u64, h.len)));

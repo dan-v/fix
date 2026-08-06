@@ -561,6 +561,7 @@ test "computeKey is stable for identical inputs and varies with codegen policy" 
         .full_lazy_enabled = false,
         .mfe_min_applies = 1,
         .named_floats = true,
+        .chain_split = false,
         .home = "/home/x",
     };
     const k1 = computeKey("let x = 1; in x", "a.nix", ctx);

@@ -200,7 +200,7 @@ pub fn decide(
             // below the chain.
             var pick: usize = depth - 1;
             var body_position = false;
-            if (lambdas[path[pick]].chain_member) {
+            if (lambdas[path[pick]].chain_member and !self.let_float.chain_split) {
                 body_position = true;
                 while (pick > 0 and lambdas[path[pick - 1]].chain_member) pick -= 1;
                 if (lambdas[path[pick]].level >= b.home_level) {

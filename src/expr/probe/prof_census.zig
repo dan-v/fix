@@ -171,6 +171,8 @@ pub var attr_cache_misses: u64 = 0;
 /// the per-claimed-force TLS probe still pays for its cache misses.
 pub var memo_probes: u64 = 0;
 pub var memo_hits: u64 = 0;
+pub var memo_write_ok: u64 = 0;
+pub var memo_write_effect_blocked: u64 = 0;
 /// Memo eligibility histogram: forces of freshly-claimed bytecode thunks
 /// that were NOT memo-probed because their upvalue count exceeds the ≤2
 /// inline-key limit. Sizes the widening headroom.
@@ -290,8 +292,8 @@ pub fn reportCaches() void {
     // Thunk-result-memo census.
     if (memo_probes != 0) {
         std.debug.print(
-            "prof thunk-memo: probes={d} hits={d} ({d:.1}%) inel_ups3={d} inel_ups4={d} inel_ups>=5={d}\n",
-            .{ memo_probes, memo_hits, pct(memo_hits, memo_probes), memo_inel_3, memo_inel_4, memo_inel_ge5 },
+            "prof thunk-memo: probes={d} hits={d} ({d:.1}%) writes_ok={d} writes_effect_blocked={d} inel_ups3={d} inel_ups4={d} inel_ups>=5={d}\n",
+            .{ memo_probes, memo_hits, pct(memo_hits, memo_probes), memo_write_ok, memo_write_effect_blocked, memo_inel_3, memo_inel_4, memo_inel_ge5 },
         );
     }
     // Repeat-force census.

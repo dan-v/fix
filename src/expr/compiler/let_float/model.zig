@@ -35,6 +35,7 @@ pub const Stats = struct {
     blocked_out_capture: std.atomic.Value(u64) = .init(0),
     mfe_candidates: std.atomic.Value(u64) = .init(0),
     floated_mfe: std.atomic.Value(u64) = .init(0),
+    floated_chain_split: std.atomic.Value(u64) = .init(0),
     blocked_mfe_chain: std.atomic.Value(u64) = .init(0),
     blocked_mfe_enclosing: std.atomic.Value(u64) = .init(0),
     blocked_mfe_recursive: std.atomic.Value(u64) = .init(0),
@@ -57,6 +58,8 @@ pub const Context = struct {
     /// Dev A/B knob (`FIX_FL_NAMED_OFF=1`): stand down the NAMED float-out
     /// pass while keeping the walk machinery and MFE pass live.
     named_floats: bool = true,
+    /// Experimental: wrap chain-inner lambdas (split uncurry chains).
+    chain_split: bool = false,
     stats: ?*Stats = null,
 };
 

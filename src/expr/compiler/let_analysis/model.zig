@@ -501,6 +501,8 @@ pub const MfeCandidate = struct {
     node: *const Node,
     /// Max free level of the subtree (home-based, hence conservative).
     level: u16,
+    /// Saturating apply count of the subtree (the work-gate signal).
+    applies: u16,
     /// Enclosing lambda at the site (index into `SharedTables.lambdas`).
     lambda: u32,
     /// Named-binding RHSes enclosing the site: `mfe_rhs[first..first+len]`.

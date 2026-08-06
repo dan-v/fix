@@ -65,6 +65,11 @@ pub const Policy = struct {
     /// creation outweighs the shared work. Tuned on nixos-minimal.
     mfe_min_applies: u16 = 1,
     named_floats_enabled: bool = true,
+    /// Experimental (`FIX_FL_CHAIN_SPLIT=1`): allow floats to wrap
+    /// chain-inner lambdas, splitting uncurried arity-N chunks into 1-ary
+    /// closures in exchange for sharing. Sizing lever for the chain-clamp
+    /// coverage loss; not qualified.
+    chain_split: bool = false,
     let_float_report: bool = false,
 };
 
@@ -123,6 +128,7 @@ pub fn resolve(
         .full_lazy_enabled = !envEnabled(env, "FIX_NO_FULL_LAZY", false),
         .mfe_min_applies = envInt(u16, env, "FIX_FL_MFE_MIN_APPLIES") orelse 1,
         .named_floats_enabled = !envEnabled(env, "FIX_FL_NAMED_OFF", false),
+        .chain_split = envEnabled(env, "FIX_FL_CHAIN_SPLIT", false),
         .let_float_report = envEnabled(env, "FIX_LET_FLOAT_STATS", false),
     };
 }
