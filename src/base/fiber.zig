@@ -420,7 +420,16 @@ pub const Fiber = struct {
     /// leaving room for deep forcing (which that limit does not bound) before the
     /// `forceThunkImpl` guard trips a graceful "stack overflow". Raising it
     /// costs virtual address space × peak fiber count, not memory.
-    pub const min_stack_bytes: usize = 16 * 1024 * 1024;
+    ///
+    /// 32 MiB: the whole-nixpkgs monolithic eval's deepest demand chain
+    /// (a ~10-native-frame cycle per recursion level through builtins and
+    /// tail calls) sat within a few percent of a 16 MiB reservation —
+    /// close enough that unrelated compiler-source changes tipped it over
+    /// purely by shifting LLVM inlining (frame sizes), with no bytecode
+    /// difference. Doubling buys the same workload 2x headroom so binary
+    /// layout noise cannot flip a passing eval into a graceful
+    /// StackOverflow.
+    pub const min_stack_bytes: usize = 32 * 1024 * 1024;
 
     /// Allocate a fiber with its own stack and prepare it to invoke
     /// `entry(arg)` on first resume.
