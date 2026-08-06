@@ -153,7 +153,13 @@ fn slotOp(comptime operation: SlotOp, comptime wide: bool) HandlerFn {
                     if (comptime prof.enabled) {
                         if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof_census.rf_local += 1;
                     }
-                    try stack.push(vm, try force.forceValue(vm, raw));
+                    const val = try force.forceValue(vm, raw);
+                    // Slot writeback: a forced thunk reference becomes its
+                    // WHNF in place, so repeat reads skip the heap deref.
+                    // The stack is fiber-private and root-scanned; no other
+                    // reference is affected (the slot holds a copy).
+                    if (raw.bits != val.bits) stack.setStack(vm, frame.frame_base + slot, val);
+                    try stack.push(vm, val);
                     return dispatch(vm, frame, code, ip + operand_len, stop_depth);
                 },
                 .grab => {
@@ -209,9 +215,37 @@ fn opGetUpvalue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
     if (comptime prof.enabled) {
         if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, upvalues[slot])) prof_census.rf_upvalue += 1;
     }
-    const val = try force.forceValue(vm, upvalues[slot]);
+    const raw = upvalues[slot];
+    const val = try force.forceValue(vm, raw);
+    writebackUpvalue(vm, frame, upvalues, slot, raw, val);
     try stack.push(vm, val);
     return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+/// Slot writeback for closure upvalues (SOLO mode only): replace a forced
+/// thunk reference with its WHNF so every later read through this closure
+/// skips the thunk deref. Requirements that gate it:
+///   - `vm.solo`: a plain 8-byte store into a shared closure would be a
+///     data race at w>1 (benign-identical in practice, but the w>1 design
+///     needs atomic slot access end-to-end — not built until measurement
+///     justifies it).
+///   - `upvalue_owner != null`: the store adds an owner→result edge the
+///     remembered set must see (a null owner means thunk/stack-backed
+///     slices whose owner id is unavailable here — skipped).
+fn writebackUpvalue(vm: *VM, frame: *Frame, upvalues: []const Value, slot: u16, raw: Value, val: Value) void {
+    if (!vm.solo or raw.bits == val.bits) return;
+    const owner = frame.upvalue_owner orelse return;
+    @constCast(upvalues)[slot] = val;
+    vm.heap.gcRecordEdge(owner, val);
+}
+
+fn opGetUpvalueRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    const slot = readU16(code, ip);
+    const upvalues = frame.upvalues orelse return error.MissingClosure;
+    const raw = upvalues[slot];
+    const result = try force.forceValue(vm, raw);
+    writebackUpvalue(vm, frame, upvalues, slot, raw, result);
+    return retEpilogue(vm, stop_depth, result);
 }
 
 // ---- handlers: integer arithmetic ----
@@ -1121,13 +1155,6 @@ fn opRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize)
 fn opConstantRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     const idx = readU16(code, ip);
     const result = frame.chunk_ptr.constants[idx];
-    return retEpilogue(vm, stop_depth, result);
-}
-
-fn opGetUpvalueRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    const slot = readU16(code, ip);
-    const upvalues = frame.upvalues orelse return error.MissingClosure;
-    const result = try force.forceValue(vm, upvalues[slot]);
     return retEpilogue(vm, stop_depth, result);
 }
 

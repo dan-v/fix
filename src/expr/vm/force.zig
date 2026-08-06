@@ -725,7 +725,10 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     var dup_t0: u64 = 0;
     var dup_armed = false;
     if (comptime prof.enabled) {
-        if (self.workerId() == 0 and thunk.targetKind() == .bytecode) {
+        // The dup census (and especially its structural-hash variant) costs
+        // real cycles per resolve INSIDE spans other counters attribute —
+        // opt-in per run so plain prof profiles stay clean.
+        if (dupCensusEnabled() and self.workerId() == 0 and thunk.targetKind() == .bytecode) {
             const b = &thunk.payload.target.bytecode;
             var h = std.hash.Wyhash.init(0x1e35_a7bd);
             for (b.upvalues()) |v| h.update(std.mem.asBytes(&v.bits));
@@ -897,6 +900,14 @@ fn reuseMemoizedThunk(
     recordResolve(self, thunk_id, slot.value);
     if (demand) thunk.markDemanded();
     return slot.value;
+}
+
+var dup_census_state: u8 = 0; // 0 unknown, 1 on, 2 off
+fn dupCensusEnabled() bool {
+    if (dup_census_state == 0) {
+        dup_census_state = if (std.c.getenv("FIX_PROF_DUP") != null) 1 else 2;
+    }
+    return dup_census_state == 1;
 }
 
 /// Census-only (`-Dprof-main`): depth-limited structural hash of a value.
