@@ -1,82 +1,76 @@
-//! Copy-on-write application of a let-float rewrite plan.
+//! Copy-on-write application of let-float rewrite plans.
+//!
+//! One rebuild per walk batch: starting from the walk-root cluster, the
+//! Rewriter descends the whole subtree applying the UNIT-LEVEL replacement
+//! and wrap maps, and — at every nested cluster head — that cluster's own
+//! keep/flatten plan inline. Rebuilt residual lets are recorded in the unit
+//! state's `decided` set so `rewriteLet` compiles them untouched instead of
+//! re-walking fresh nodes (the old per-let scheme's re-walk cascade).
 
 const std = @import("std");
 const compiler_mod = @import("../context.zig");
 const ast = @import("syntax").ast;
 const types = @import("runtime").types;
 const attr_names = @import("../attr_names.zig");
+const analysis = @import("../let_analysis/model.zig");
 const model = @import("model.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
 const InternId = types.InternId;
 
-pub fn rebuildLet(
+/// Rebuild `cluster`'s residual form (and, transitively, every nested
+/// cluster's) with all unit-level decisions applied. Returns the node to
+/// compile instead of the cluster's head: the head itself when nothing in
+/// the subtree changed, a rebuilt `let_in`, or the bare (rewritten) body
+/// when every binding dissolved. Memoized per cluster head.
+pub fn rebuildCluster(
     self: *Compiler,
     arena: *ast.AstArena,
-    decisions: *const model.Plan,
-    node: *const Node,
+    ua: *analysis.UnitAnalysis,
+    state: *model.UnitState,
+    cluster: *analysis.Cluster,
 ) !*const Node {
-    const let_in = node.data.let_in;
-
     var rw = Rewriter{
+        .c = self,
         .arena = arena,
-        .replacements = &decisions.replacements,
-        .wraps = &decisions.wraps,
+        .ua = ua,
+        .state = state,
     };
+    return rw.rebuildClusterNode(cluster);
+}
 
-    // Which original entries survive? An entry survives when its root
-    // group's binding is kept. Group ids recompute by first-occurrence
-    // order, mirroring `let_analysis.collectBindings`.
-    const entry_group = try self.allocator.alloc(usize, let_in.bindings.len);
-    {
-        var by_name: std.AutoHashMapUnmanaged(InternId, usize) = .empty;
-        defer by_name.deinit(self.allocator);
-        var next: usize = 0;
-        for (let_in.bindings, 0..) |entry, i| {
-            const name_id = try self.intern.intern(attr_names.span(self, entry.path[0]));
-            const gop = try by_name.getOrPut(self.allocator, name_id);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = next;
-                next += 1;
-            }
-            entry_group[i] = gop.value_ptr.*;
-        }
+/// The cached flat single-level node for a merged directly-nested let spine
+/// (entries concatenated across levels, body = the innermost body).
+pub fn flatNode(
+    arena: *ast.AstArena,
+    state: *model.UnitState,
+    cluster: *const analysis.Cluster,
+) !*const Node {
+    if (cluster.levels == 1) return cluster.head;
+    const overlay = try state.overlay(cluster.head);
+    if (overlay.flat == null) {
+        const merged = try arena.allocSlice(Node.Binding, cluster.entries.len);
+        @memcpy(merged, cluster.entries);
+        const flat = try arena.createNode(.let_in, .{ .let_in = .{
+            .bindings = merged,
+            .body = @constCast(cluster.body),
+        } });
+        flat.span = cluster.head.span;
+        overlay.flat = flat;
     }
-
-    var surviving: usize = 0;
-    for (let_in.bindings, 0..) |_, i| {
-        if (decisions.keep[entry_group[i]]) surviving += 1;
-    }
-
-    const new_body = try rw.rewrite(let_in.body);
-    if (surviving == 0) return new_body;
-
-    const new_bindings = try arena.allocSlice(Node.Binding, surviving);
-    var out: usize = 0;
-    for (let_in.bindings, 0..) |entry, i| {
-        if (!decisions.keep[entry_group[i]]) continue;
-        var copy = entry;
-        copy.expr = @constCast(try rw.rewrite(entry.expr));
-        new_bindings[out] = copy;
-        out += 1;
-    }
-
-    if (!rw.changed and surviving == let_in.bindings.len) return node;
-
-    return arena.createNode(.let_in, .{ .let_in = .{
-        .bindings = new_bindings,
-        .body = @constCast(new_body),
-    } });
+    return overlay.flat.?;
 }
 
 /// Copy-on-write tree rewrite: descends the whole subtree, swapping nodes
 /// that have replacements (and recursing into the replacement, so a chain of
-/// sinks composes) and rebuilding only ancestors of a change.
+/// sinks composes), applying nested clusters' keep/flatten plans at their
+/// head nodes, and rebuilding only ancestors of a change.
 const Rewriter = struct {
+    c: *Compiler,
     arena: *ast.AstArena,
-    replacements: *const std.AutoHashMapUnmanaged(*const Node, *const Node),
-    wraps: *const std.AutoHashMapUnmanaged(*const Node, std.ArrayListUnmanaged(Node.Binding)),
+    ua: *analysis.UnitAnalysis,
+    state: *model.UnitState,
     changed: bool = false,
 
     fn rewrite(self: *Rewriter, node_in: *const Node) anyerror!*const Node {
@@ -84,7 +78,7 @@ const Rewriter = struct {
         // A replacement may itself be a replaced site (a sibling sunk into an
         // alias's RHS): chase the chain. Acyclic because movement is strictly
         // "into" a live sibling and recursive SCCs never move.
-        while (self.replacements.get(node)) |replacement| {
+        while (self.state.replacements.get(node)) |replacement| {
             self.changed = true;
             node = replacement;
         }
@@ -92,10 +86,98 @@ const Rewriter = struct {
         // Branch-local floats wrap the (fully rewritten) branch expression
         // in a synthetic let re-binding the floated names — keyed by the
         // ORIGINAL branch node the graph walk recorded.
-        if (self.wraps.get(node_in)) |floated| {
+        if (self.state.wraps.get(node_in)) |floated| {
             return self.wrapWithLet(node_in, rewritten, floated.items);
         }
         return rewritten;
+    }
+
+    /// Apply `cluster`'s plan at its head: flatten a merged spine, drop
+    /// non-kept groups, rewrite surviving RHSes and the body. Fresh residual
+    /// let nodes are marked `decided` (their plan is already applied);
+    /// returning the original head means nothing in the subtree changed and
+    /// the ordinary registry-hit path handles it at compile.
+    fn rebuildClusterNode(self: *Rewriter, cluster: *analysis.Cluster) anyerror!*const Node {
+        const overlay = try self.state.overlay(cluster.head);
+        if (overlay.rebuilt != null and overlay.rebuilt_batch >= overlay.walk_batch) {
+            const r = overlay.rebuilt.?;
+            self.changed = self.changed or r != cluster.head;
+            return r;
+        }
+        const plan = &overlay.plan.?;
+
+        const base = try flatNode(self.arena, self.state, cluster);
+        const let_in = base.data.let_in;
+
+        // Which original entries survive? An entry survives when its root
+        // group's binding is kept. Group ids recompute by first-occurrence
+        // order, mirroring `let_analysis.collectBindings` (merged spines
+        // cannot collide across levels, so one map spans the flat list).
+        const entry_group = try self.c.allocator.alloc(usize, let_in.bindings.len);
+        {
+            var by_name: std.AutoHashMapUnmanaged(InternId, usize) = .empty;
+            defer by_name.deinit(self.c.allocator);
+            var next: usize = 0;
+            for (let_in.bindings, 0..) |entry, i| {
+                const name_id = try self.c.intern.intern(attr_names.span(self.c, entry.path[0]));
+                const gop = try by_name.getOrPut(self.c.allocator, name_id);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = next;
+                    next += 1;
+                }
+                entry_group[i] = gop.value_ptr.*;
+            }
+        }
+
+        var surviving: usize = 0;
+        for (let_in.bindings, 0..) |_, i| {
+            if (plan.keep[entry_group[i]]) surviving += 1;
+        }
+
+        const body_was = self.changed;
+        self.changed = false;
+        const new_body = try self.rewrite(let_in.body);
+
+        const result: *const Node = blk: {
+            if (surviving == 0) {
+                self.changed = true;
+                break :blk new_body;
+            }
+
+            const new_bindings = try self.arena.allocSlice(Node.Binding, surviving);
+            var out: usize = 0;
+            for (let_in.bindings, 0..) |entry, i| {
+                if (!plan.keep[entry_group[i]]) continue;
+                var copy = entry;
+                copy.expr = @constCast(try self.rewrite(entry.expr));
+                new_bindings[out] = copy;
+                out += 1;
+            }
+
+            if (!self.changed and surviving == let_in.bindings.len) {
+                if (cluster.levels == 1) break :blk cluster.head;
+                // Merged spine with no other changes: compile the cached
+                // flat node; its (identity) plan counts as applied.
+                self.changed = true;
+                try self.state.decided.put(self.state.allocator, base, {});
+                break :blk base;
+            }
+
+            self.changed = true;
+            const node = try self.arena.createNode(.let_in, .{ .let_in = .{
+                .bindings = new_bindings,
+                .body = @constCast(new_body),
+            } });
+            node.span = cluster.head.span;
+            // The residual's plan is fully applied; compile it as-is.
+            try self.state.decided.put(self.state.allocator, node, {});
+            break :blk node;
+        };
+
+        self.changed = body_was or self.changed;
+        overlay.rebuilt = result;
+        overlay.rebuilt_batch = self.state.batch;
+        return result;
     }
 
     /// `let <floated…> in <body>` around a branch expression. Binding
@@ -177,6 +259,16 @@ const Rewriter = struct {
                 return self.make(node, .{ .lambda_attrs = boxed });
             },
             .let_in => {
+                // A registered cluster head applies its own plan (flatten,
+                // keep, decided marking); covered non-head spine levels are
+                // never reached (the head's rebuild consumes the spine).
+                // Zero-binding lets keep their shell (as `rewriteLet` always
+                // has) and traverse plainly.
+                if (node.data.let_in.bindings.len != 0) {
+                    if (self.ua.clusters.get(node)) |cluster| {
+                        if (cluster.head == node) return self.rebuildClusterNode(cluster);
+                    }
+                }
                 const li = node.data.let_in;
                 const body = try self.rewrite(li.body);
                 var bindings_changed = false;

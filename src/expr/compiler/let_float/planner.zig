@@ -30,11 +30,21 @@ fn rootAstArena(self: *Compiler) ?*ast.AstArena {
     return compiler.ast_arena;
 }
 
+/// Cross-cluster decision context: every cluster of one walk batch decides
+/// into the SAME unit-level replacement/wrap maps (one rebuild applies them
+/// all), in walk order (outer-first), so an inner cluster can consult the
+/// finished plans of enclosing clusters through `walk_clusters`.
+pub const UnitCtx = struct {
+    state: *model.UnitState,
+    walk_clusters: []const *analysis.Cluster,
+};
+
 pub fn decide(
     self: *Compiler,
     graph: *const analysis.Graph,
     let_bindings: []const Node.Binding,
     census: ?*model.Stats,
+    unit: UnitCtx,
 ) !model.Plan {
     const allocator = self.allocator;
     const n = graph.bindings.len;
@@ -47,8 +57,12 @@ pub fn decide(
     // it still count.
     const rhs_gone = try allocator.alloc(bool, n);
     @memset(rhs_gone, false);
-    var replacements: std.AutoHashMapUnmanaged(*const Node, *const Node) = .empty;
-    var wraps: std.AutoHashMapUnmanaged(*const Node, std.ArrayListUnmanaged(Node.Binding)) = .empty;
+    // Per-binding: some use site was replaced (inline/sink) — exported so
+    // enclosing regions that mention this name can expand it (see prelude).
+    const replaced_any = try allocator.alloc(bool, n);
+    @memset(replaced_any, false);
+    const replacements = &unit.state.replacements;
+    const wraps = &unit.state.wraps;
     var any_change = false;
 
     // Alias collapse appends transferred target uses to planner-local state;
@@ -62,6 +76,27 @@ pub fn decide(
     // those derived facts beside the plan instead of mutating analysis.
     const facts = try allocator.alloc(PlannerFacts, n);
     @memset(facts, .{});
+
+    // Cross-cluster free expansion: a free name bound by an ENCLOSING
+    // cluster (same walk batch, already decided — walk order is outer-first)
+    // whose binding had use sites replaced has that RHS's text at sites in
+    // this region now. Fold the outer binding's effective free set (and
+    // opacity) into the mentioning binding, so later shadow/with checks here
+    // judge the rewritten expression — the same facts a fresh re-walk of the
+    // rebuilt AST would have produced under the per-let scheme.
+    for (graph.bindings, 0..) |*w, wi| {
+        for (w.free.items) |f| {
+            if (f.src_cluster == analysis.invalid_cluster) continue;
+            const outer = unit.walk_clusters[f.src_cluster];
+            const o_overlay = unit.state.overlays.get(outer.head) orelse continue;
+            const o_plan = if (o_overlay.plan) |*p| p else continue;
+            if (!o_plan.replaced_any[f.binding]) continue;
+            const ob = &outer.graph.bindings[f.binding];
+            for (ob.free.items) |of| try addPlannerFree(allocator, &facts[wi], w, of);
+            for (o_plan.extra_free[f.binding]) |of| try addPlannerFree(allocator, &facts[wi], w, of);
+            if (ob.has_opaque) facts[wi].has_opaque = true;
+        }
+    }
 
     // Per-binding use-index lists: both passes visit exactly one binding's
     // uses at a time, and generated lets are large — a scan of ALL uses per
@@ -109,8 +144,9 @@ pub fn decide(
         }
         const leaf = binding.leaf.?;
         // A leaf that already received a replacement (an earlier inline into
-        // it) is examined through its rewritten shape.
-        const shape = ast.unwrapParens(effectiveNode(&replacements, leaf));
+        // it — possibly by an ENCLOSING cluster, since the map is unit-wide)
+        // is examined through its rewritten shape.
+        const shape = ast.unwrapParens(effectiveNode(replacements, leaf));
 
         const is_literal = access.isLiteralContainerValue(self, shape);
         const is_alias = !is_literal and shape.tag == .identifier and
@@ -177,7 +213,10 @@ pub fn decide(
             bumpBy(census, "inlined_literal_uses", replaced)
         else
             bumpBy(census, "inlined_alias_uses", replaced);
-        if (replaced != 0) any_change = true;
+        if (replaced != 0) {
+            any_change = true;
+            replaced_any[i] = true;
+        }
         if (replaced == total and total != 0) {
             keep[i] = false;
             rhs_gone[i] = true;
@@ -202,7 +241,7 @@ pub fn decide(
             continue;
         }
         const leaf = binding.leaf.?;
-        const shape = ast.unwrapParens(effectiveNode(&replacements, leaf));
+        const shape = ast.unwrapParens(effectiveNode(replacements, leaf));
         const is_lambda = shape.tag == .lambda or shape.tag == .lambda_attrs;
 
         // Collect the binding's live use records.
@@ -241,6 +280,7 @@ pub fn decide(
             try replacements.put(allocator, use.site.?, leaf);
             keep[i] = false;
             any_change = true;
+            replaced_any[i] = true;
             bump(census, "sunk_single_use");
             // The RHS now lives inside the owner's region: fold its free
             // names into the owner so a later sink of the owner checks them.
@@ -299,7 +339,18 @@ pub fn decide(
             bump(census, "floated_branch");
     }
 
-    return .{ .keep = keep, .replacements = replacements, .wraps = wraps, .any_change = any_change };
+    // Freeze the planner facts as the binding's exported effective-free
+    // delta (base frees live on in the graph); inner clusters and later
+    // unified-rebuild passes read them through the plan.
+    const extra_out = try allocator.alloc([]const analysis.FreeName, n);
+    for (facts, 0..) |*f, i| extra_out[i] = try f.extra_free.toOwnedSlice(allocator);
+
+    return .{
+        .keep = keep,
+        .replaced_any = replaced_any,
+        .extra_free = extra_out,
+        .any_change = any_change,
+    };
 }
 
 /// Source-size ceiling for cloning a binding's RHS into both arms of an if.

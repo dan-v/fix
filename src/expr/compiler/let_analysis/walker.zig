@@ -33,6 +33,10 @@ const UnitAnalysis = model.UnitAnalysis;
 /// again as a per-let fallback for AST created after that pass: materialized
 /// elided bodies, interpolation sub-parses, rebuilt residual subtrees).
 pub fn analyze(self: *Compiler, ua: *UnitAnalysis, root: *const Node) !void {
+    // Walk-local cluster ids restart at 0 per walk; the decide-all pass
+    // consumes `walk_clusters` right after this returns, so the previous
+    // walk's list is dead by now.
+    ua.walk_clusters.clearRetainingCapacity();
     var walker = Walker{ .c = self, .ua = ua };
     defer walker.deinit();
     try walker.walk(root);
@@ -144,7 +148,15 @@ pub const Walker = struct {
             const entry: FreeName = if (binder != null and binder.?.cluster == ctx.id)
                 .{ .id = name_id, .class = .cluster, .binding = binder.?.binding }
             else if (binder != null)
-                .{ .id = name_id, .class = .lexical }
+                // A cluster binder of an ENCLOSING cluster keeps its source
+                // link (walk-local); plain binders (params, rec-attr names)
+                // stay unlinked.
+                .{
+                    .id = name_id,
+                    .class = .lexical,
+                    .binding = binder.?.binding,
+                    .src_cluster = binder.?.cluster,
+                }
             else blk: {
                 if (outer_class == null) outer_class = classifyOuterName(self.c, name_id);
                 break :blk .{ .id = name_id, .class = outer_class.? };
@@ -453,6 +465,10 @@ pub const Walker = struct {
         const cluster = try allocator.create(Cluster);
         const id = self.next_cluster_id;
         self.next_cluster_id += 1;
+        // Walk-order registry (index == walk-local id): decide-all iterates
+        // this outer-first, and cross-cluster free refs resolve through it.
+        std.debug.assert(self.ua.walk_clusters.items.len == id);
+        try self.ua.walk_clusters.append(self.ua.allocator, cluster);
 
         var merged_entries: std.ArrayListUnmanaged(Node.Binding) = .empty;
         var bindings: std.ArrayListUnmanaged(Binding) = .empty;

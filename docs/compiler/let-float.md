@@ -53,14 +53,22 @@ sinking, floating, or wrapping an outer binding's RHS doesn't change
 anything header-relative inside a nested let, so the nested cluster stays
 valid and reusable after its enclosing let has been rewritten.
 
-An enclosing rewrite that instead *changes* a nested let's own contents (a
-sink or float lands inside it) rebuilds that let's node outright
-(copy-on-write). Because the registry is keyed by node pointer, the rebuilt
-node is simply never found: `let_float.rewriteLet` falls back to one fresh
-walk of that subtree, which re-registers every cluster inside it — so a
-subtree is re-walked at most once per enclosing rewrite that touched it,
-never once per nesting level below it. The census counters **cluster map
-hits** and **cluster walks** (below) count these two paths.
+All clusters registered by one walk are decided as a **batch** — walk
+order is outer-first, so an inner cluster can consult the finished plans of
+enclosing clusters (a free name whose enclosing binding was inlined or sunk
+expands to that binding's effective free set before the inner cluster's
+shadow checks run) — and one copy-on-write rebuild applies every plan at
+once, applying each nested cluster's keep/flatten decisions at its head.
+Rebuilt residual lets are marked `decided` and compile untouched, so a
+subtree is analyzed once per batch, not once per enclosing rewrite. The
+replacement/wrap maps are batch-scoped and the per-cluster rebuild memos
+are invalidated when a later walk re-registers the same head (a wrap-let
+recompile decides fresh sinks into original nodes; a stale memoized tree
+would silently drop them). The per-let fallback walk remains only for AST
+created after the pass: materialized elided bodies, interpolation
+sub-parses, and branch-wrap synthetic lets. The census counters **cluster
+map hits** and **cluster walks** (below) count registry reuse vs fresh
+walks.
 
 Directly-nested let spines (`let A in let B in …`) merge into one cluster
 **during this same walk** (see "Nested-let spine merging" below), so the
@@ -376,10 +384,11 @@ shape.
 
 ## Cost profile
 
-The analysis walks each **outermost** `let` subtree once and registers its
-nested `let`s in that pass. A rewrite that changes a nested subtree can require
-one additional analysis of that subtree, but not a fresh walk of every enclosing
-`let`.
+The analysis walks each **outermost** `let` subtree once, registers its
+nested `let`s in that pass, and decides + rebuilds the whole batch in one
+step — rewrites no longer trigger re-analysis of the subtrees they touch.
+Post-pass AST (materialized elided bodies, sub-parses, wrap lets) still
+pays one walk of its own subtree when compiled.
 
 Historical measurements against a pinned nixpkgs universe found this registry
 shape about 3% faster than the earlier per-`let` analysis. Treat that result as

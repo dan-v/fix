@@ -30,12 +30,12 @@
 //! (multiplicity as depth deltas, shadow checks as windows into a global
 //! binder log, branch chains cut at the header's branch), which makes a
 //! cluster's graph invariant under enclosing rewrites that merely MOVE its
-//! subtree. Any rewrite that changes a nested let's contents rebuilds that
-//! let's node (copy-on-write), so the stale cluster is simply never found —
-//! node pointer identity is the cache key — and `let_float` falls back to
-//! walking that subtree afresh (registering its inner lets, so a subtree is
-//! re-analyzed at most once per enclosing rewrite, not once per nesting
-//! level).
+//! subtree. All clusters of one walk are decided as a BATCH (outer-first;
+//! `walk_clusters` preserves that order) and applied by a single rebuild,
+//! so rebuilt residuals never need re-analysis; the per-let fallback walk
+//! remains only for AST created after the pass (materialized elided
+//! bodies, interpolation sub-parses, branch-wrap synthetic lets), keyed by
+//! node pointer identity.
 //!
 //! Directly-nested let spines (`let A in let B in …`) merge into one cluster
 //! during the walk when no capture changes (no name collisions, no
@@ -95,8 +95,16 @@ pub const NameClass = enum {
 pub const FreeName = struct {
     id: InternId,
     class: NameClass,
-    /// Sibling id when `class == .cluster`.
+    /// Sibling id when `class == .cluster`; for `class == .lexical` names
+    /// that resolve to an ENCLOSING cluster's binding within the same walk,
+    /// the binding id in that cluster (with `src_cluster` set). The
+    /// cross-cluster link lets a later decision expand this name through a
+    /// decided-away outer binding (its RHS text may land in this region).
     binding: BindingId = invalid_binding,
+    /// Walk-local id of the enclosing cluster that binds a `.lexical` name,
+    /// or `invalid_cluster` (plain binders: lambda params, rec-attr names,
+    /// names resolved outside the walk).
+    src_cluster: u32 = invalid_cluster,
 };
 
 pub const Use = struct {
@@ -357,6 +365,12 @@ pub const UnitAnalysis = struct {
     allocator: std.mem.Allocator,
     tables: SharedTables,
     clusters: std.AutoHashMapUnmanaged(*const Node, *Cluster) = .empty,
+    /// Clusters registered by the MOST RECENT walk, indexed by walk-local
+    /// cluster id (walk order = outer-first). Cleared at each walk's entry;
+    /// consumed immediately after by the decide-all pass, which needs both
+    /// the outer-first order and id→cluster resolution for cross-cluster
+    /// free-name refs (`FreeName.src_cluster` is walk-local).
+    walk_clusters: std.ArrayListUnmanaged(*Cluster) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) UnitAnalysis {
         return .{ .allocator = allocator, .tables = .{ .allocator = allocator } };

@@ -38,14 +38,21 @@ pub const Context = struct {
     stats: ?*Stats = null,
 };
 
+pub const analysis = @import("../let_analysis/model.zig");
+
 pub const Plan = struct {
     /// Per-binding: emit this group in the residual let?
     keep: []bool,
-    /// Use-site rewrites: identifier node -> replacement expression.
-    replacements: std.AutoHashMapUnmanaged(*const Node, *const Node),
-    /// Branch-local floats: branch expression node -> original bindings to
-    /// wrap around it as a synthetic inner let.
-    wraps: std.AutoHashMapUnmanaged(*const Node, std.ArrayListUnmanaged(Node.Binding)),
+    /// Per-binding: at least one use site was replaced (inline or sink) —
+    /// the RHS text now lives at those sites, so an enclosing region that
+    /// mentioned this name must expand it to the RHS's effective free set
+    /// when deciding its own later movements (cross-cluster composition).
+    replaced_any: []bool,
+    /// Per-binding: planner-derived extra free names accumulated while
+    /// deciding this cluster (sunk siblings' frees, alias targets, and
+    /// cross-cluster expansions). Alongside `Binding.free`, this is the
+    /// binding's post-plan effective free set.
+    extra_free: []const []const analysis.FreeName,
     any_change: bool,
 };
 
@@ -55,6 +62,22 @@ pub const ClusterOverlay = struct {
     plan: ?Plan = null,
     /// Cached flat node for a merged directly-nested let spine.
     flat: ?*const Node = null,
+    /// Memoized unified-rebuild result for this cluster's head node, so a
+    /// second compile of the same original node (branch-cloned subtrees)
+    /// reuses one rebuilt tree. Valid only within the batch that built it
+    /// (`rebuilt_batch`): the rebuild bakes in that batch's replacement/wrap
+    /// maps, and a LATER batch re-registering the same head (a wrap-let
+    /// recompile walking original nodes afresh) may add new replacements
+    /// inside the subtree that a stale tree would silently drop. The PLAN,
+    /// by contrast, is position-independent and shared across batches.
+    rebuilt: ?*const Node = null,
+    rebuilt_batch: u32 = 0,
+    /// Batch that most recently REGISTERED this head in its walk. A memo is
+    /// stale only when the head was re-registered after it was built (only
+    /// then can new decisions target the subtree); comparing against the
+    /// CURRENT batch instead would wrongly invalidate memos whenever an
+    /// unrelated walk ran in between, recomputing with foreign maps.
+    walk_batch: u32 = 0,
 };
 
 pub const UnitState = struct {
@@ -62,6 +85,24 @@ pub const UnitState = struct {
     /// A cluster's outermost source node is its stable identity within one
     /// compile unit; all covered nested-let nodes share this overlay.
     overlays: std.AutoHashMapUnmanaged(*const Node, *ClusterOverlay) = .empty,
+    /// Unit-global use-site rewrites: identifier node -> replacement
+    /// expression. All clusters of a walk batch decide into ONE map, so a
+    /// single copy-on-write rebuild applies every plan at once and later
+    /// clusters see earlier clusters' replacements when chasing effective
+    /// shapes (node pointers are unique across clusters).
+    replacements: std.AutoHashMapUnmanaged(*const Node, *const Node) = .empty,
+    /// Unit-global branch-local floats: branch expression node -> original
+    /// bindings to wrap around it as a synthetic inner let.
+    wraps: std.AutoHashMapUnmanaged(*const Node, std.ArrayListUnmanaged(Node.Binding)) = .empty,
+    /// Let nodes produced by a unified rebuild with their cluster's plan
+    /// already applied: `rewriteLet` returns these untouched instead of
+    /// re-walking the (fresh, unregistered) subtree — the decide-all +
+    /// single-rebuild scheme's whole point. Branch-wrap synthetic lets are
+    /// deliberately NOT marked (they re-plan on compile, as before).
+    decided: std.AutoHashMapUnmanaged(*const Node, void) = .empty,
+    /// Current decide/rebuild batch (one per walk); scopes the replacement
+    /// and wrap maps and the per-cluster `rebuilt` memos.
+    batch: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) UnitState {
         return .{ .allocator = allocator };

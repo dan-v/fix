@@ -4,7 +4,13 @@
 //! trivial-thunk elision, cell classification) sees the most direct
 //! expression structure and allocates fewer binding thunks and slots.
 //!
-//! Runs once per compiled `let`, before `let.zig` classifies and emits.
+//! Entered from `let.zig` before it classifies and emits. The FIRST let of
+//! an unanalyzed subtree walks the whole subtree, decides EVERY registered
+//! cluster in one batch (outer-first, into unit-level replacement/wrap
+//! maps), and applies all of it in ONE copy-on-write rebuild; the rebuilt
+//! nested residuals come back through here `decided` and compile untouched.
+//! This replaces the earlier per-let decide+rebuild, whose rebuilt inner
+//! lets were fresh nodes and re-walked once per enclosing rewrite.
 //! Reads the binder-resolved use/region graph from `let_analysis/model.zig` and applies,
 //! in order:
 //!
@@ -121,9 +127,56 @@ fn unitRewriteState(self: *Compiler) !*model.UnitState {
     return state;
 }
 
+/// Decide every cluster registered by the most recent walk, in walk order
+/// (outer-first), all into the unit-level replacement/wrap maps. One
+/// subsequent rebuild applies the whole batch.
+fn decideAll(self: *Compiler, ua: *analysis.UnitAnalysis, state: *model.UnitState) !void {
+    // The replacement/wrap maps are BATCH-scoped: this batch's single
+    // rebuild applies them, and a wrap's subtree is fully resolved when the
+    // wrap is constructed, so later batches (wrap-let recompiles, sub-parse
+    // walks) must start clean — a stale wrap key re-encountered by a later
+    // rebuild would wrap its branch node a second time (unboundedly, since
+    // each wrap recompile walks afresh). Contents are unit-scratch; clearing
+    // retains capacity.
+    state.replacements.clearRetainingCapacity();
+    state.wraps.clearRetainingCapacity();
+    state.batch +%= 1;
+
+    var batch_clean = true;
+    for (ua.walk_clusters.items) |cluster| {
+        const overlay = try state.overlay(cluster.head);
+        overlay.walk_batch = state.batch;
+        if (overlay.plan == null) {
+            bump(self.let_float.stats, "lets");
+            bumpBy(self.let_float.stats, "bindings", cluster.graph.bindings.len);
+            bumpBy(self.let_float.stats, "flattened_lets", cluster.levels - 1);
+            overlay.plan = try planner.decide(self, &cluster.graph, cluster.entries, self.let_float.stats, .{
+                .state = state,
+                .walk_clusters = ua.walk_clusters.items,
+            });
+        }
+        batch_clean = batch_clean and !overlay.plan.?.any_change and cluster.levels == 1;
+    }
+    // Nothing in the batch changes and no spine flattens: every head
+    // compiles as written — pre-seed the rebuild memos so no rebuild ever
+    // descends this subtree (matching the old no-change fast path's cost).
+    if (batch_clean) {
+        for (ua.walk_clusters.items) |cluster| {
+            const overlay = try state.overlay(cluster.head);
+            overlay.rebuilt = cluster.head;
+            overlay.rebuilt_batch = state.batch;
+        }
+    }
+}
+
 /// Rewrite one `let` before lowering. Returns the node to compile instead:
 /// the original node when nothing improved, a rebuilt `let_in`, or — when
 /// every binding dissolved — the (rewritten) body expression itself.
+///
+/// The first let of an unanalyzed subtree walks the whole subtree, decides
+/// EVERY registered cluster, and applies all of it in one rebuild; nested
+/// residual lets come back through here already `decided` and compile
+/// untouched (no re-walk of rebuilt AST).
 pub fn rewriteLet(self: *Compiler, node: *const Node) !*const Node {
     if (!self.let_float.enabled) return node;
     // An installed debugger wants the source's bindings materialized as
@@ -137,6 +190,10 @@ pub fn rewriteLet(self: *Compiler, node: *const Node) !*const Node {
 
     if (node.data.let_in.bindings.len == 0) return node;
 
+    const state = try unitRewriteState(self);
+    // A unified rebuild already applied this residual's plan.
+    if (state.decided.contains(node)) return node;
+
     const _pt = prof.start(.let_float);
     defer prof.end(.let_float, _pt);
 
@@ -148,44 +205,18 @@ pub fn rewriteLet(self: *Compiler, node: *const Node) !*const Node {
     const cluster = ua.clusters.get(node) orelse blk: {
         // First let of a subtree not yet analyzed (an outermost let, a
         // materialized elided body, an interpolation sub-parse, or a
-        // subtree rebuilt by an enclosing rewrite): one walk registers this
-        // cluster AND every let below it, so nesting never multiplies —
-        // each subtree is walked once, plus once more per enclosing rewrite
-        // that changed something inside it.
+        // branch-wrap synthetic let): one walk registers this cluster AND
+        // every let below it, and decide-all plans the whole batch at once.
         const _wt = prof.start(.let_float_walk);
         try analysis_walker.analyze(self, ua, node);
         prof.end(.let_float_walk, _wt);
+        try decideAll(self, ua, state);
         break :blk ua.clusters.get(node) orelse return node;
     };
 
-    // Decide once per cluster, even when the same cluster compiles more
-    // than once (branch-cloned subtrees share nodes at scope-equivalent
-    // positions, so the decisions apply identically).
-    const overlay = try (try unitRewriteState(self)).overlay(cluster.head);
-    if (overlay.plan == null) {
-        bump(self.let_float.stats, "lets");
-        bumpBy(self.let_float.stats, "bindings", cluster.graph.bindings.len);
-        bumpBy(self.let_float.stats, "flattened_lets", cluster.levels - 1);
-        overlay.plan = try planner.decide(self, &cluster.graph, cluster.entries, self.let_float.stats);
-    }
-    const decisions = &overlay.plan.?;
-
-    // Merged spines compile as one flat let (cached; entries are the
-    // concatenated levels, body is the innermost body).
-    const flat: *const Node = if (cluster.levels > 1) blk: {
-        if (overlay.flat == null) {
-            const merged = try arena.allocSlice(Node.Binding, cluster.entries.len);
-            @memcpy(merged, cluster.entries);
-            const flat_node = try arena.createNode(.let_in, .{ .let_in = .{
-                .bindings = merged,
-                .body = @constCast(cluster.body),
-            } });
-            flat_node.span = node.span;
-            overlay.flat = flat_node;
-        }
-        break :blk overlay.flat.?;
-    } else node;
-
-    if (!decisions.any_change) return flat;
-    return rewrite.rebuildLet(self, arena, decisions, flat);
+    // Rebuild once per cluster, even when the same original node compiles
+    // more than once (branch-cloned subtrees share nodes at scope-equivalent
+    // positions, so the decisions apply identically); `rebuildCluster`
+    // memoizes per head.
+    return rewrite.rebuildCluster(self, arena, ua, state, cluster);
 }
