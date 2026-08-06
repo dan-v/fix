@@ -202,6 +202,49 @@ const Rewriter = struct {
         return result;
     }
 
+    /// Float-out wrap, AROUND position: `let <floated…> in <lambda>` in the
+    /// lambda's parent expression context — the thunk is created once per
+    /// closure creation and captured as an upvalue by the body. Marked
+    /// `decided` (a re-plan would sink a single-use binding back inside).
+    fn wrapLambdaOuter(self: *Rewriter, original: *const Node, lambda_node: *const Node) !*const Node {
+        const floated = self.state.lambda_outer_wraps.get(original) orelse return lambda_node;
+        self.changed = true;
+        const bindings = try self.arena.allocSlice(Node.Binding, floated.items.len);
+        for (floated.items, bindings) |entry, *out| {
+            out.* = entry;
+            out.expr = @constCast(try self.rewrite(entry.expr));
+        }
+        const node = try self.arena.createNode(.let_in, .{ .let_in = .{
+            .bindings = bindings,
+            .body = @constCast(lambda_node),
+        } });
+        node.span = original.span;
+        try self.state.decided.put(self.state.allocator, node, {});
+        return node;
+    }
+
+    /// Float-out wrap: `let <floated…> in <body>` at the top of a lambda
+    /// body. Marked `decided` — the float IS this binding's final
+    /// placement; a fresh re-plan of the wrap subtree would see a
+    /// single-use binding and sink it straight back into the body,
+    /// undoing the share.
+    fn wrapLambdaBody(self: *Rewriter, dest: *const Node, body: *const Node) !*const Node {
+        const floated = self.state.lambda_wraps.get(dest) orelse return body;
+        self.changed = true;
+        const bindings = try self.arena.allocSlice(Node.Binding, floated.items.len);
+        for (floated.items, bindings) |entry, *out| {
+            out.* = entry;
+            out.expr = @constCast(try self.rewrite(entry.expr));
+        }
+        const node = try self.arena.createNode(.let_in, .{ .let_in = .{
+            .bindings = bindings,
+            .body = @constCast(body),
+        } });
+        node.span = body.span;
+        try self.state.decided.put(self.state.allocator, node, {});
+        return node;
+    }
+
     /// `let <floated…> in <body>` around a branch expression. Binding
     /// entries reuse the original let's entries (name offsets intact), with
     /// their RHSes rewritten; the wrap compiles as an ordinary inner let, so
@@ -247,8 +290,9 @@ const Rewriter = struct {
             },
             .lambda => {
                 const lam = node.data.lambda;
-                const body = try self.rewrite(lam.body);
-                if (body == lam.body) return node;
+                var body = try self.rewrite(lam.body);
+                body = try self.wrapLambdaBody(node, body);
+                if (body == lam.body) return self.wrapLambdaOuter(node, node);
                 const rebuilt = try self.make(node, .{ .lambda = .{
                     .param_offset = lam.param_offset,
                     .param_len = lam.param_len,
@@ -259,11 +303,12 @@ const Rewriter = struct {
                 // pre-emission hook skips it in O(1).
                 if (self.c.let_float.full_lazy)
                     try self.ua.walked.put(self.ua.allocator, rebuilt, {});
-                return rebuilt;
+                return self.wrapLambdaOuter(node, rebuilt);
             },
             .lambda_attrs => {
                 const la = node.data.lambda_attrs;
-                const body = try self.rewrite(la.body);
+                var body = try self.rewrite(la.body);
+                body = try self.wrapLambdaBody(node, body);
                 var params_changed = false;
                 const new_params = try self.arena.allocSlice(Node.LambdaAttrParam, la.params.len);
                 for (la.params, new_params) |param, *out| {
@@ -276,7 +321,7 @@ const Rewriter = struct {
                         }
                     }
                 }
-                if (body == la.body and !params_changed) return node;
+                if (body == la.body and !params_changed) return self.wrapLambdaOuter(node, node);
                 const boxed = try self.arena.allocator().create(Node.LambdaAttrs);
                 boxed.* = .{
                     .bind_name = la.bind_name,
@@ -287,7 +332,7 @@ const Rewriter = struct {
                 const rebuilt = try self.make(node, .{ .lambda_attrs = boxed });
                 if (self.c.let_float.full_lazy)
                     try self.ua.walked.put(self.ua.allocator, rebuilt, {});
-                return rebuilt;
+                return self.wrapLambdaOuter(node, rebuilt);
             },
             .let_in => {
                 // A registered cluster head applies its own plan (flatten,

@@ -27,6 +27,11 @@ pub const Stats = struct {
     blocked_recursive: std.atomic.Value(u64) = .init(0),
     would_float_bindings: std.atomic.Value(u64) = .init(0),
     would_float_levels: std.atomic.Value(u64) = .init(0),
+    floated_out: std.atomic.Value(u64) = .init(0),
+    floated_out_levels: std.atomic.Value(u64) = .init(0),
+    blocked_out_shadow: std.atomic.Value(u64) = .init(0),
+    blocked_out_chain: std.atomic.Value(u64) = .init(0),
+    blocked_out_nodest: std.atomic.Value(u64) = .init(0),
     cluster_hits: std.atomic.Value(u64) = .init(0),
     cluster_walks: std.atomic.Value(u64) = .init(0),
     prefix_members: std.atomic.Value(u64) = .init(0),
@@ -104,6 +109,18 @@ pub const UnitState = struct {
     /// Unit-global branch-local floats: branch expression node -> original
     /// bindings to wrap around it as a synthetic inner let.
     wraps: std.AutoHashMapUnmanaged(*const Node, std.ArrayListUnmanaged(Node.Binding)) = .empty,
+    /// Full-laziness float-out wraps, BODY position: destination lambda
+    /// node -> bindings whose thunk moves to the top of that lambda's body.
+    /// Used only for uncurry-chain-clamped partial floats (the wrap sits at
+    /// the post-chain body, splitting nothing). Batch-scoped like `wraps`.
+    lambda_wraps: std.AutoHashMapUnmanaged(*const Node, std.ArrayListUnmanaged(Node.Binding)) = .empty,
+    /// Full-laziness float-out wraps, AROUND position (the normal case):
+    /// lambda node -> bindings wrapped around the lambda EXPRESSION itself
+    /// (`let floated… in <lambda>`), so the thunk is created once per
+    /// closure creation in the parent scope and shared by every
+    /// application. Keys are never chain-inner lambdas (that would split
+    /// the parent's uncurry chain). Batch-scoped.
+    lambda_outer_wraps: std.AutoHashMapUnmanaged(*const Node, std.ArrayListUnmanaged(Node.Binding)) = .empty,
     /// Let nodes produced by a unified rebuild with their cluster's plan
     /// already applied: `rewriteLet` returns these untouched instead of
     /// re-walking the (fresh, unregistered) subtree — the decide-all +

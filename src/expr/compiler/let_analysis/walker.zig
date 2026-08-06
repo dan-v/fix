@@ -334,9 +334,6 @@ pub const Walker = struct {
                 const start = self.stack.items.len;
                 const lam = node.data.lambda;
                 const introduced: u16 = @intCast(self.many_depth + 1);
-                try self.pushBinderAt(try self.c.intern.intern(
-                    self.c.source[lam.param_offset .. lam.param_offset + lam.param_len],
-                ), invalid_cluster, 0, invalid_binding, introduced);
                 const saved_lambda = self.cur_lambda;
                 if (self.c.let_float.full_lazy) {
                     try self.ua.walked.put(self.ua.allocator, node, {});
@@ -346,6 +343,9 @@ pub const Walker = struct {
                         const p = self.ua.tables.lambdas.items[saved_lambda].node;
                         break :blk p.tag == .lambda and ast.unwrapParens(p.data.lambda.body) == node;
                     };
+                    // entry_mark BEFORE the param push: the outward window
+                    // [entry_mark, header) must see this lambda's own param
+                    // as a potential shadow of a floated free name.
                     try self.ua.tables.lambdas.append(self.c.allocator, .{
                         .node = node,
                         .parent = saved_lambda,
@@ -357,6 +357,9 @@ pub const Walker = struct {
                     });
                     self.cur_lambda = @intCast(self.ua.tables.lambdas.items.len - 1);
                 }
+                try self.pushBinderAt(try self.c.intern.intern(
+                    self.c.source[lam.param_offset .. lam.param_offset + lam.param_len],
+                ), invalid_cluster, 0, invalid_binding, introduced);
                 self.many_depth += 1;
                 try self.walk(lam.body);
                 self.many_depth -= 1;
@@ -367,11 +370,10 @@ pub const Walker = struct {
                 const start = self.stack.items.len;
                 const la = node.data.lambda_attrs;
                 const introduced: u16 = @intCast(self.many_depth + 1);
-                if (la.bind_name) |bn| try self.pushBinderAt(try self.internSpan(bn), invalid_cluster, 0, invalid_binding, introduced);
-                for (la.params) |param| try self.pushBinderAt(try self.internSpan(param.name), invalid_cluster, 0, invalid_binding, introduced);
                 const saved_lambda = self.cur_lambda;
                 if (self.c.let_float.full_lazy) {
                     try self.ua.walked.put(self.ua.allocator, node, {});
+                    // entry_mark BEFORE the binder pushes (see .lambda).
                     try self.ua.tables.lambdas.append(self.c.allocator, .{
                         .node = node,
                         .parent = saved_lambda,
@@ -382,6 +384,8 @@ pub const Walker = struct {
                     });
                     self.cur_lambda = @intCast(self.ua.tables.lambdas.items.len - 1);
                 }
+                if (la.bind_name) |bn| try self.pushBinderAt(try self.internSpan(bn), invalid_cluster, 0, invalid_binding, introduced);
+                for (la.params) |param| try self.pushBinderAt(try self.internSpan(param.name), invalid_cluster, 0, invalid_binding, introduced);
                 self.many_depth += 1;
                 for (la.params) |param| {
                     if (param.default) |d| try self.walk(d);
@@ -579,6 +583,7 @@ pub const Walker = struct {
                 cluster.graph.header_branch = self.cur_branch;
                 cluster.graph.header_once = self.once_depth;
                 cluster.graph.header_many = self.many_depth;
+                cluster.graph.header_lambda = self.cur_lambda;
             }
 
             // Walk this level's RHS regions.

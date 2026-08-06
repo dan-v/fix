@@ -287,6 +287,13 @@ pub const SharedTables = struct {
         return lo < items.len and items[lo] < to;
     }
 
+    /// Public window check for OUTWARD movement (float-out): same
+    /// semantics as `shadowedInWindow`, exported for the planner's
+    /// destination proofs.
+    pub fn shadowedInWindowPub(self: *const SharedTables, name_id: InternId, from: u32, to: u32, own: u32) bool {
+        return self.shadowedInWindow(name_id, from, to, own);
+    }
+
     /// Was `name_id` introduced by a binder in log window [from, to), other
     /// than by cluster `own` itself? Positions per name are ascending by
     /// construction (append-only log).
@@ -328,6 +335,10 @@ pub const Graph = struct {
     activation_owner: []const BindingId = &.{},
     header_log_len: u32 = 0,
     header_branch: u32 = invalid_branch,
+    /// Innermost enclosing lambda at the cluster header (index into
+    /// `SharedTables.lambdas`; full-lazy walks only). Float destinations
+    /// ascend its parent chain.
+    header_lambda: u32 = invalid_lambda,
     header_once: u32 = 0,
     header_many: u32 = 0,
 

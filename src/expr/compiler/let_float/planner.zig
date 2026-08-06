@@ -63,6 +63,8 @@ pub fn decide(
     @memset(replaced_any, false);
     const replacements = &unit.state.replacements;
     const wraps = &unit.state.wraps;
+    const state_lambda_wraps = &unit.state.lambda_wraps;
+    const state_lambda_outer_wraps = &unit.state.lambda_outer_wraps;
     var any_change = false;
 
     // Alias collapse appends transferred target uses to planner-local state;
@@ -134,18 +136,21 @@ pub fn decide(
     // free names folded into that sibling before the sibling is decided.
     const order = try sccOrder(allocator, graph);
 
-    // ---- Full-laziness stage 1: Lévy-level fixpoint (census only). -------
-    // A binding's floor is the max level of its effective free set; when
-    // that is strictly below its home level, the binding COULD float out of
-    // `home - assigned` lambdas (recorded via `would_float_*`; stage 2 will
-    // move them). Outer-first batch order plus ascending SCC order makes
-    // this a single pass: every referenced sibling/outer binding is already
-    // assigned. Immobile shapes stay pinned at home.
+    // ---- Full-laziness: level fixpoint FUSED with the float decision. ----
+    // One outer-first pass in dependency (SCC) order: each binding's floor
+    // is the max LANDED level of its effective free set — siblings and
+    // outer-cluster references contribute where they ACTUALLY ENDED UP,
+    // not their theoretical floor, so a dependent never floats above a
+    // sibling whose own float was refused (shadow/chain/nodest). Every
+    // refusal resets the binding to its home level before dependents read
+    // it. `Plan.assigned_levels` publishes the landed levels for inner
+    // clusters' cross-references.
     const assigned = try allocator.alloc(u16, n);
     for (graph.bindings, 0..) |*b, i| assigned[i] = b.home_level;
     if (self.let_float.full_lazy) {
         for (order) |i| {
             const b = &graph.bindings[i];
+            if (!keep[i] or !alive[i]) continue;
             if (b.kind != .plain or b.scc_recursive) continue;
             if (hasOpaque(b, facts[i]) or hasDynamicFree(b, facts[i])) continue;
             var lvl: u16 = 0;
@@ -164,11 +169,79 @@ pub fn decide(
                 };
                 if (fl > lvl) lvl = fl;
             };
-            if (mobile and lvl < b.home_level) {
-                assigned[i] = lvl;
-                bump(census, "would_float_bindings");
-                bumpBy(census, "would_float_levels", b.home_level - lvl);
+            if (!mobile or lvl >= b.home_level) continue; // stays home
+            bump(census, "would_float_bindings");
+            bumpBy(census, "would_float_levels", b.home_level - lvl);
+
+            // Destination: ascend the enclosing-lambda chain to the lambda
+            // D introducing level lvl+1 (chain levels are consecutive).
+            // The wrap goes AROUND D (`let floated… in D`): a level-lvl
+            // position in the parent scope, created once per closure
+            // creation — this also realizes lvl == 0 (no lambda introduces
+            // level 0, but every lambda has a parent expression context).
+            const lambdas = graph.tables.lambdas.items;
+            var path: [64]u32 = undefined;
+            var depth: usize = 0;
+            var cursor = graph.header_lambda;
+            while (cursor != analysis.invalid_lambda and depth < path.len) {
+                path[depth] = cursor;
+                depth += 1;
+                if (lambdas[cursor].level <= lvl + 1) break;
+                cursor = lambdas[cursor].parent;
             }
+            if (depth == 0 or depth == path.len or lambdas[path[depth - 1]].level != lvl + 1) {
+                bump(census, "blocked_out_nodest");
+                continue;
+            }
+            // Chain guard: wrapping AROUND a chain-inner lambda would turn
+            // its parent's body into a let, splitting the uncurried chunk.
+            // Clamp such floats DOWN to the chain's post-chain body (the
+            // innermost chain member's body top) — still out of everything
+            // below the chain.
+            var pick: usize = depth - 1;
+            var body_position = false;
+            if (lambdas[path[pick]].chain_member) {
+                body_position = true;
+                while (pick > 0 and lambdas[path[pick - 1]].chain_member) pick -= 1;
+                if (lambdas[path[pick]].level >= b.home_level) {
+                    bump(census, "blocked_out_chain");
+                    continue;
+                }
+            }
+            const dest = lambdas[path[pick]];
+
+            // Outward capture proof: no binder of any effective free name —
+            // or of the binding's OWN name (its uses inside the cluster
+            // must still reach the destination wrap) — may sit between the
+            // destination's entry and the cluster header.
+            var clear = !graph.tables.shadowedInWindowPub(b.name_id, dest.entry_mark, graph.header_log_len, graph.id);
+            if (clear) for (b.free.items) |f| {
+                if (graph.tables.shadowedInWindowPub(f.id, dest.entry_mark, graph.header_log_len, graph.id)) {
+                    clear = false;
+                    break;
+                }
+            };
+            if (clear) for (facts[i].extra_free.items) |f| {
+                if (graph.tables.shadowedInWindowPub(f.id, dest.entry_mark, graph.header_log_len, graph.id)) {
+                    clear = false;
+                    break;
+                }
+            };
+            if (!clear) {
+                bump(census, "blocked_out_shadow");
+                continue;
+            }
+
+            const dest_map = if (body_position) state_lambda_wraps else state_lambda_outer_wraps;
+            const gop = try dest_map.getOrPut(allocator, dest.node);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(allocator, let_bindings[b.first_index]);
+            keep[i] = false;
+            any_change = true;
+            const landed: u16 = if (body_position) dest.level else dest.level - 1;
+            assigned[i] = landed;
+            bump(census, "floated_out");
+            bumpBy(census, "floated_out_levels", b.home_level - landed);
         }
         for (graph.bindings, 0..) |*b, i| b.assigned_level = assigned[i];
     }

@@ -22,7 +22,6 @@ const attr_names = @import("attr_names.zig");
 const access = @import("access.zig");
 const control = @import("control.zig");
 const strictness = @import("strictness.zig");
-const let_float = @import("let_float.zig");
 const let = @import("let.zig");
 const refs_mod = @import("refs.zig");
 const fold = @import("fold.zig");
@@ -276,11 +275,7 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
         n += 1;
         cur = unwrapParens(lam.body);
     }
-    // Full-laziness pre-emission analysis (no-op unless FIX_FULL_LAZY=1):
-    // walk + decide the whole chain subtree before the body chunk emits and
-    // compile the rebuilt body. Strictness stamping and the strict-params
-    // mask below see the same rewritten node.
-    const body = try let_float.rewriteLambdaBody(self, node, cur);
+    const body = cur;
 
     // The binding name this lambda is armed for, captured before `initChild`
     // consumes `name_hint`. Only a genuinely RECURSIVE binding (a `let` — see
@@ -351,10 +346,6 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
 
 pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     const lambda = node.data.lambda_attrs;
-    // Full-laziness pre-emission analysis — the pattern-lambda analogue of
-    // the hook in `compileLambda` (the walk roots at this node, so the
-    // pattern binders and defaults are covered).
-    const effective_body = try let_float.rewriteLambdaBody(self, node, lambda.body);
 
     // Unbound pattern lambda: synthesize `λ{first,…}` from the pattern (or the
     // @-binding when present), so module toplevels read as `λ{config,…}`.
@@ -487,11 +478,11 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
         }
     }
 
-    compileTailExpression(&child, effective_body) catch |err| {
+    compileTailExpression(&child, lambda.body) catch |err| {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try strictness.stampOnBuilder(&child, effective_body);
+    try strictness.stampOnBuilder(&child, lambda.body);
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 

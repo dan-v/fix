@@ -9,6 +9,7 @@ const builtins = @import("runtime").builtins;
 const literals = @import("literals.zig");
 const fold = @import("fold.zig");
 const lambda = @import("lambda.zig");
+const let_float = @import("let_float.zig");
 const let = @import("let.zig");
 const control = @import("control.zig");
 const attrs = @import("attrs.zig");
@@ -113,8 +114,19 @@ fn compileNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
         .binary_op => try fold.compileBinary(self, node),
         .unary_op => try fold.compileUnary(self, node),
         .apply => try lambda.compileApply(self, node),
-        .lambda => try lambda.compileLambda(self, node),
-        .lambda_attrs => try lambda.compileLambdaAttrs(self, node),
+        .lambda => {
+            // Full-laziness pre-emission hook (no-op unless FIX_FULL_LAZY=1):
+            // the rewrite may return `let floated… in <lambda>` — bindings
+            // hoisted into THIS scope, shared across the closure's calls.
+            const rewritten = try let_float.rewriteLambdaExpression(self, node);
+            if (rewritten != node) return self.compileNode(rewritten);
+            try lambda.compileLambda(self, node);
+        },
+        .lambda_attrs => {
+            const rewritten = try let_float.rewriteLambdaExpression(self, node);
+            if (rewritten != node) return self.compileNode(rewritten);
+            try lambda.compileLambdaAttrs(self, node);
+        },
         .let_in => try let.compileLetIn(self, node),
         .if_else => try control.compileIfElse(self, node),
         .assert => try control.compileAssert(self, node),

@@ -76,6 +76,11 @@ pub fn writeReport(w: *std.Io.Writer, stats: *const Stats) !void {
         .{ "blocked: recursive group", &stats.blocked_recursive },
         .{ "would-float bindings (full-lazy)", &stats.would_float_bindings },
         .{ "would-float levels crossed", &stats.would_float_levels },
+        .{ "bindings floated out of lambdas", &stats.floated_out },
+        .{ "float-out levels crossed", &stats.floated_out_levels },
+        .{ "float-out blocked: shadowed", &stats.blocked_out_shadow },
+        .{ "float-out blocked: uncurry chain", &stats.blocked_out_chain },
+        .{ "float-out blocked: no destination", &stats.blocked_out_nodest },
         .{ "cluster map hits", &stats.cluster_hits },
         .{ "cluster walks", &stats.cluster_walks },
         .{ "strict-prefix members", &stats.prefix_members },
@@ -142,6 +147,8 @@ fn decideAll(self: *Compiler, ua: *analysis.UnitAnalysis, state: *model.UnitStat
     // retains capacity.
     state.replacements.clearRetainingCapacity();
     state.wraps.clearRetainingCapacity();
+    state.lambda_wraps.clearRetainingCapacity();
+    state.lambda_outer_wraps.clearRetainingCapacity();
     state.batch +%= 1;
 
     var batch_clean = true;
@@ -171,34 +178,36 @@ fn decideAll(self: *Compiler, ua: *analysis.UnitAnalysis, state: *model.UnitStat
     }
 }
 
-/// Full-laziness pre-emission hook (`FIX_FULL_LAZY=1`): analyze an
-/// outermost lambda chain's whole subtree BEFORE its body chunk emits, so
-/// later stages can place floated bindings at lambda-body destinations
-/// that lie outside any single let's cluster. `chain_root` is the
-/// outermost lambda of the collected uncurry chain (the walk root — its
-/// params become binders); `body` is the effective post-chain body the
-/// caller is about to compile. Returns the rebuilt body (decisions for
-/// every registered cluster applied — the batch maps must be consumed
-/// immediately, see `rewrite.rebuildTree`), or `body` untouched when the
-/// gate is off or an enclosing walk already covered this lambda.
-pub fn rewriteLambdaBody(self: *Compiler, chain_root: *const Node, body: *const Node) !*const Node {
-    if (!self.let_float.enabled or !self.let_float.full_lazy) return body;
-    if (self.registry.preserve_bindings) return body;
-    const arena = rootAstArena(self) orelse return body;
+/// Full-laziness pre-emission hook (`FIX_FULL_LAZY=1`), called from the
+/// DRIVER when a lambda expression is about to compile: analyze its whole
+/// subtree, decide the batch, and return the rebuilt EXPRESSION — which
+/// may be a synthetic `let floated… in <lambda>` when bindings float all
+/// the way out (the thunk then lives in the parent scope, created once
+/// per closure creation, shared by every application). Nested float
+/// destinations are applied inside the rebuild. Returns `node` untouched
+/// when the gate is off or an enclosing walk already covered this lambda
+/// (a covered-but-unchanged lambda has no pending wraps by construction).
+pub fn rewriteLambdaExpression(self: *Compiler, node: *const Node) !*const Node {
+    if (!self.let_float.enabled or !self.let_float.full_lazy) return node;
+    if (self.registry.preserve_bindings) return node;
+    const arena = rootAstArena(self) orelse return node;
 
     const ua = try unitAnalysis(self);
-    if (ua.walked.contains(chain_root)) return body;
+    if (ua.walked.contains(node)) return node;
     const state = try unitRewriteState(self);
 
     const _pt = prof.start(.let_float);
     defer prof.end(.let_float, _pt);
     {
         const _wt = prof.start(.let_float_walk);
-        try analysis_walker.analyze(self, ua, chain_root);
+        try analysis_walker.analyze(self, ua, node);
         prof.end(.let_float_walk, _wt);
     }
     try decideAll(self, ua, state);
-    return rewrite.rebuildTree(self, arena, ua, state, body);
+    // Consume this batch's maps NOW (they are batch-scoped): every nested
+    // residual comes out `decided`, so a later interpolation sub-parse (a
+    // new batch, cleared maps) cannot strand a pending rebuild.
+    return rewrite.rebuildTree(self, arena, ua, state, node);
 }
 
 /// Rewrite one `let` before lowering. Returns the node to compile instead:
