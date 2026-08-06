@@ -19,6 +19,8 @@
 
 const std = @import("std");
 const prof = @import("prof.zig");
+const ChunkRegistry = @import("../bytecode/chunk/registry.zig").ChunkRegistry;
+const InternTable = @import("runtime").intern.InternTable;
 
 pub const Slot = struct {
     chunk: u32 = 0,
@@ -83,7 +85,7 @@ pub fn record(chunk: u32, hash: u64, memo_eligible: bool, cycles: u64) void {
 /// Per-chunk aggregation, ranked by duplicate cycle mass. The go/no-go
 /// numbers: `dup cycles` as a fraction of the run's wall cycles, and how
 /// much of it the top chunks concentrate.
-pub fn report() void {
+pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
     if (comptime !prof.enabled) return;
     const t = table orelse return;
     if (t.len == 0) return;
@@ -139,9 +141,14 @@ pub fn report() void {
     );
     for (top) |e| {
         if (e.agg.dup_cycles == 0) break;
+        var name_buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&name_buf);
+        if (registry.nameOf(e.chunk)) |nid| {
+            registry.name_tree.writeQualified(&w, nid, intern) catch {};
+        }
         std.debug.print(
-            "  chunk {d}: resolves={d} dup={d} dup_cycles={d} memo_elig_dups={d}\n",
-            .{ e.chunk, e.agg.resolves, e.agg.dups, e.agg.dup_cycles, e.agg.memo_elig_dups },
+            "  chunk {d} [{s}]: resolves={d} dup={d} dup_cycles={d} memo_elig_dups={d}\n",
+            .{ e.chunk, name_buf[0..w.end], e.agg.resolves, e.agg.dups, e.agg.dup_cycles, e.agg.memo_elig_dups },
         );
     }
 }
