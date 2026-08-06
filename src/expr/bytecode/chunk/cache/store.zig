@@ -19,6 +19,7 @@ pub const Options = struct {
     home: ?[]const u8,
     policy_fp: u64,
     let_float_enabled: bool,
+    full_lazy_enabled: bool,
     max_pending_bytes: usize = default_pending_bytes,
 };
 
@@ -67,6 +68,7 @@ pub const Store = struct {
             .key_ctx = .{
                 .policy_fp = options.policy_fp,
                 .let_float_enabled = options.let_float_enabled,
+                .full_lazy_enabled = options.full_lazy_enabled,
                 .home = home,
             },
             .writer = writer,
@@ -251,6 +253,7 @@ test "bounded background store transfers blob ownership and flushes publication"
         .home = null,
         .policy_fp = 7,
         .let_float_enabled = true,
+        .full_lazy_enabled = false,
         .max_pending_bytes = 8,
     });
     defer store.deinit();

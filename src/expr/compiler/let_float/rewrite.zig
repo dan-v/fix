@@ -40,6 +40,28 @@ pub fn rebuildCluster(
     return rw.rebuildClusterNode(cluster);
 }
 
+/// Rebuild an arbitrary subtree with all unit-level decisions applied
+/// (nested cluster plans at their heads, replacements, wraps). Used by the
+/// full-laziness lambda hook, which must consume the freshly-decided batch
+/// maps IMMEDIATELY: nested residuals come out `decided`, so a later
+/// interpolation sub-parse (a new batch, cleared maps) cannot strand a
+/// pending hit-path rebuild.
+pub fn rebuildTree(
+    self: *Compiler,
+    arena: *ast.AstArena,
+    ua: *analysis.UnitAnalysis,
+    state: *model.UnitState,
+    root: *const Node,
+) !*const Node {
+    var rw = Rewriter{
+        .c = self,
+        .arena = arena,
+        .ua = ua,
+        .state = state,
+    };
+    return rw.rewrite(root);
+}
+
 /// The cached flat single-level node for a merged directly-nested let spine
 /// (entries concatenated across levels, body = the innermost body).
 pub fn flatNode(
@@ -227,11 +249,17 @@ const Rewriter = struct {
                 const lam = node.data.lambda;
                 const body = try self.rewrite(lam.body);
                 if (body == lam.body) return node;
-                return self.make(node, .{ .lambda = .{
+                const rebuilt = try self.make(node, .{ .lambda = .{
                     .param_offset = lam.param_offset,
                     .param_len = lam.param_len,
                     .body = @constCast(body),
                 } });
+                // Full-lazy: the rebuilt lambda subtree is fully analyzed
+                // (fresh residuals inside are `decided`); mark it so the
+                // pre-emission hook skips it in O(1).
+                if (self.c.let_float.full_lazy)
+                    try self.ua.walked.put(self.ua.allocator, rebuilt, {});
+                return rebuilt;
             },
             .lambda_attrs => {
                 const la = node.data.lambda_attrs;
@@ -256,7 +284,10 @@ const Rewriter = struct {
                     .allow_extra = la.allow_extra,
                     .body = @constCast(body),
                 };
-                return self.make(node, .{ .lambda_attrs = boxed });
+                const rebuilt = try self.make(node, .{ .lambda_attrs = boxed });
+                if (self.c.let_float.full_lazy)
+                    try self.ua.walked.put(self.ua.allocator, rebuilt, {});
+                return rebuilt;
             },
             .let_in => {
                 // A registered cluster head applies its own plan (flatten,

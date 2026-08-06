@@ -169,6 +169,36 @@ fn decideAll(self: *Compiler, ua: *analysis.UnitAnalysis, state: *model.UnitStat
     }
 }
 
+/// Full-laziness pre-emission hook (`FIX_FULL_LAZY=1`): analyze an
+/// outermost lambda chain's whole subtree BEFORE its body chunk emits, so
+/// later stages can place floated bindings at lambda-body destinations
+/// that lie outside any single let's cluster. `chain_root` is the
+/// outermost lambda of the collected uncurry chain (the walk root — its
+/// params become binders); `body` is the effective post-chain body the
+/// caller is about to compile. Returns the rebuilt body (decisions for
+/// every registered cluster applied — the batch maps must be consumed
+/// immediately, see `rewrite.rebuildTree`), or `body` untouched when the
+/// gate is off or an enclosing walk already covered this lambda.
+pub fn rewriteLambdaBody(self: *Compiler, chain_root: *const Node, body: *const Node) !*const Node {
+    if (!self.let_float.enabled or !self.let_float.full_lazy) return body;
+    if (self.registry.preserve_bindings) return body;
+    const arena = rootAstArena(self) orelse return body;
+
+    const ua = try unitAnalysis(self);
+    if (ua.walked.contains(chain_root)) return body;
+    const state = try unitRewriteState(self);
+
+    const _pt = prof.start(.let_float);
+    defer prof.end(.let_float, _pt);
+    {
+        const _wt = prof.start(.let_float_walk);
+        try analysis_walker.analyze(self, ua, chain_root);
+        prof.end(.let_float_walk, _wt);
+    }
+    try decideAll(self, ua, state);
+    return rewrite.rebuildTree(self, arena, ua, state, body);
+}
+
 /// Rewrite one `let` before lowering. Returns the node to compile instead:
 /// the original node when nothing improved, a rebuilt `let_in`, or — when
 /// every binding dissolved — the (rewritten) body expression itself.

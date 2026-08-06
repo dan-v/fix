@@ -54,6 +54,10 @@ pub const Policy = struct {
     /// sequential or concurrent Engines.
     heap_string_min: usize = 64,
     let_float_enabled: bool = true,
+    /// Full-laziness development gate (`FIX_FULL_LAZY=1`, opt-in): the
+    /// pre-emission analysis walk at outermost lambdas (and, in later
+    /// stages, float-out itself). Off by default until qualification.
+    full_lazy_enabled: bool = false,
     let_float_report: bool = false,
 };
 
@@ -100,6 +104,7 @@ pub fn resolve(
         .prefetch = resolvePrefetch(env, worker_count),
         .heap_string_min = envInt(usize, env, "FIX_HEAP_STR_MIN") orelse 64,
         .let_float_enabled = !envEnabled(env, "FIX_NO_LET_FLOAT", false),
+        .full_lazy_enabled = envEnabled(env, "FIX_FULL_LAZY", false),
         .let_float_report = envEnabled(env, "FIX_LET_FLOAT_STATS", false),
     };
 }

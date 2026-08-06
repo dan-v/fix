@@ -319,6 +319,8 @@ pub const Walker = struct {
                 self.once_depth -= 1;
             },
             .lambda => {
+                if (self.c.let_float.full_lazy)
+                    try self.ua.walked.put(self.ua.allocator, node, {});
                 const start = self.stack.items.len;
                 const lam = node.data.lambda;
                 try self.pushBinder(try self.c.intern.intern(
@@ -330,6 +332,8 @@ pub const Walker = struct {
                 self.popBinders(start);
             },
             .lambda_attrs => {
+                if (self.c.let_float.full_lazy)
+                    try self.ua.walked.put(self.ua.allocator, node, {});
                 const start = self.stack.items.len;
                 const la = node.data.lambda_attrs;
                 if (la.bind_name) |bn| try self.pushBinder(try self.internSpan(bn), invalid_cluster, 0, invalid_binding);

@@ -371,6 +371,11 @@ pub const UnitAnalysis = struct {
     /// the outer-first order and id→cluster resolution for cross-cluster
     /// free-name refs (`FreeName.src_cluster` is walk-local).
     walk_clusters: std.ArrayListUnmanaged(*Cluster) = .empty,
+    /// Full-laziness only: every lambda node covered by a walk (original
+    /// nodes during `walker.analyze`, rebuilt nodes during the unified
+    /// rebuild), so `rewriteLambdaBody` skips already-analyzed subtrees in
+    /// O(1). Untouched when the full-lazy gate is off.
+    walked: std.AutoHashMapUnmanaged(*const Node, void) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) UnitAnalysis {
         return .{ .allocator = allocator, .tables = .{ .allocator = allocator } };

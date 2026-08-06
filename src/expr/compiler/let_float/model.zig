@@ -35,6 +35,10 @@ pub const Stats = struct {
 /// Engines always supply their own counter set.
 pub const Context = struct {
     enabled: bool = true,
+    /// Full-laziness development gate: pre-emission analysis walks at
+    /// outermost lambdas (see `let_float.rewriteLambdaBody`). Independent
+    /// of `enabled` only in that both must hold for the lambda hook.
+    full_lazy: bool = false,
     stats: ?*Stats = null,
 };
 

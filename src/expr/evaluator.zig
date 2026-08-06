@@ -719,6 +719,7 @@ pub const Engine = struct {
             const policy = &self.tuning_policy.?;
             self.compilation.deferred_table.let_float = .{
                 .enabled = policy.let_float_enabled,
+                .full_lazy = policy.full_lazy_enabled,
                 .stats = &self.compilation.let_float_stats,
             };
         }
@@ -1250,6 +1251,7 @@ pub const Engine = struct {
         const compile_tuning = self.ensureTuningPolicy();
         compiler.let_float = .{
             .enabled = compile_tuning.let_float_enabled,
+            .full_lazy = compile_tuning.full_lazy_enabled,
             .stats = &self.compilation.let_float_stats,
         };
         compiler.registration_sink = chunkRegistrationSink(self);
@@ -1487,6 +1489,7 @@ pub const Engine = struct {
             .home = env.get("HOME"),
             .policy_fp = policyFingerprint(&self.policy),
             .let_float_enabled = eval_tuning.let_float_enabled,
+            .full_lazy_enabled = eval_tuning.full_lazy_enabled,
         }) catch return;
     }
 
