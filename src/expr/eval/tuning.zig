@@ -97,7 +97,16 @@ pub fn resolve(
     // Limit bulk speculation drainers in wide pools. 255 disables the cap.
     config.spec_helper_cap = envInt(u8, env, "FIX_SPEC_HELPERS") orelse 16;
 
-    // Promote a speculative fiber when demand blocks on its thunk.
+    // Priority inheritance when demand blocks on a speculatively-owned
+    // thunk (rescue): mark it demanded, flag the owning fiber, route its
+    // sub-work to the urgent lane, and exempt it from speculation budgets.
+    // Opt-in and measured WALL-NEUTRAL (2026-08-06): it collapses the
+    // demand chain's spec-owned wait ~1400x (6.8B -> 4.8M cy on a universe
+    // chunk at w=8 under full laziness), but the wall doesn't move — the
+    // waits overlap helpers computing exactly the values the chain needs
+    // next, so unblocking main just shifts the same serial work onto it
+    // (claimed_by_main 34% -> 47%). The wait census is pacing, not
+    // recoverable headroom; wall is bound by dependency depth.
     if (envValue(env, "FIX_RESCUE") != null)
         config.spec_rescue = worker_count > 1 and envEnabled(env, "FIX_RESCUE", false);
 

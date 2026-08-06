@@ -339,7 +339,7 @@ pub fn reportDiscovery() void {
             },
         );
         std.debug.print(
-            "prof discovery (crit-path busy waits): busy_spec_owned={d}/{d} spec_wait_cy={d} total_wait_cy={d} ({d:.1}% of wait cycles is spec-owned = PROMOTION headroom)\n",
+            "prof discovery (crit-path busy waits): busy_spec_owned={d}/{d} spec_wait_cy={d} total_wait_cy={d} ({d:.1}% of wait cycles is spec-owned; NOT wall headroom — rescue collapses it 1400x wall-neutral, the chain just re-claims the work)\n",
             .{
                 disc.busy_spec_owned,                         disc.busy_wait,
                 disc.busy_spec_cycles,                        disc.busy_cycles,
