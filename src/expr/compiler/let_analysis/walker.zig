@@ -371,6 +371,33 @@ pub const Walker = struct {
         });
     }
 
+    /// Idiom census: structural pattern counters (corpus ranking; see
+    /// let_float.Stats `idiom_*`). Counting rides the walk the compiler
+    /// already does; a couple of tag checks per node.
+    fn idiom(self: *Walker, comptime field: []const u8) void {
+        if (self.c.let_float.stats) |st| _ = @field(st, field).fetchAdd(1, .monotonic);
+    }
+
+    fn isBuiltinish(self: *Walker, node: *const Node) bool {
+        const n = ast.unwrapParens(node);
+        return switch (n.tag) {
+            .identifier => blk: {
+                const a = n.data.atom;
+                if (a.len == 0) break :blk false;
+                const text = self.c.source[a.offset .. a.offset + a.len];
+                break :blk builtins.ambientIdForName(text) != null or std.mem.eql(u8, text, "builtins");
+            },
+            .attr_path => blk: {
+                const root = ast.unwrapParens(n.data.attr_path.root);
+                if (root.tag != .identifier) break :blk false;
+                const a = root.data.atom;
+                if (a.len == 0) break :blk false;
+                break :blk std.mem.eql(u8, self.c.source[a.offset .. a.offset + a.len], "builtins");
+            },
+            else => false,
+        };
+    }
+
     fn walk(self: *Walker, node: *const Node) anyerror!void {
         const spine_prefix = self.in_apply_func;
         self.in_apply_func = false;
@@ -418,12 +445,28 @@ pub const Walker = struct {
             },
             .binary_op => {
                 const b = node.data.binary;
+                if (b.op == .update and ast.unwrapParens(b.left).tag == .binary_op and
+                    ast.unwrapParens(b.left).data.binary.op == .update)
+                    self.idiom("idiom_update_chain");
                 if (fold.overloadNameForBinary(b.op)) |name| try self.refSpecialWord(name);
                 try self.walk(b.left);
                 // Short-circuit RHS still runs at most once → same region.
                 try self.walk(b.right);
             },
             .apply => {
+                {
+                    const fx = ast.unwrapParens(node.data.apply.func);
+                    if (fx.tag == .lambda or fx.tag == .lambda_attrs) self.idiom("idiom_apply_lambda_lit");
+                    if (self.isBuiltinish(node.data.apply.func) or
+                        (fx.tag == .apply and self.isBuiltinish(fx.data.apply.func)))
+                    {
+                        const ax = ast.unwrapParens(node.data.apply.arg);
+                        if (ax.tag == .apply and (self.isBuiltinish(ax.data.apply.func) or blk: {
+                            const inner = ast.unwrapParens(ax.data.apply.func);
+                            break :blk inner.tag == .apply and self.isBuiltinish(inner.data.apply.func);
+                        })) self.idiom("idiom_builtin_pipeline");
+                    }
+                }
                 const saved_sub = self.sub;
                 self.sub = .{};
                 const cand_start = self.ua.mfes.items.len;
@@ -529,6 +572,7 @@ pub const Walker = struct {
             .let_in => try self.walkCluster(node),
             .if_else => {
                 const i = node.data.if_else;
+                if (ast.unwrapParens(i.cond).tag == .apply) self.idiom("idiom_type_dispatch");
                 try self.walk(i.cond);
                 const saved_branch = self.cur_branch;
                 try self.ua.tables.branches.append(self.c.allocator, .{
@@ -577,6 +621,7 @@ pub const Walker = struct {
                 const start = self.stack.items.len;
                 const set = node.data.attr_set;
                 if (set.recursive) {
+                    self.idiom("idiom_rec_attrs");
                     for (set.entries) |entry| {
                         if (entry.path.len == 0) continue;
                         if (attr_names.hasInterpolation(self.c, entry.path[0])) continue;
@@ -601,6 +646,7 @@ pub const Walker = struct {
                 self.popBinders(start);
             },
             .attr_path => {
+                if (node.data.attr_path.segments.len >= 2) self.idiom("idiom_select_chain");
                 try self.walk(node.data.attr_path.root);
                 for (node.data.attr_path.segments) |seg| try self.wordsInSpan(seg);
             },
@@ -816,6 +862,7 @@ pub const Walker = struct {
                     const saved_root = self.cur_rhs_root;
                     self.cur_rhs_root = ast.unwrapParens(entry.expr);
                     defer self.cur_rhs_root = saved_root;
+                    if (self.cur_rhs_root.?.tag == .identifier) self.idiom("idiom_alias_binding");
                     try self.walk(entry.expr);
                 },
                 .inherit_outer => {
