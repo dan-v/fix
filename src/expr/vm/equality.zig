@@ -154,16 +154,16 @@ pub fn attrsEqual(self: *VM, a: Value, b: Value, seen: *EqualityPairSet) anyerro
     const b_id = b.asObjectId();
     if (try derivationAttrsEqual(self, a_id, b_id, seen)) |equal| return equal;
 
-    const a_len = (try self.heap.materializeAttrs(a_id)).len;
-    const b_len = (try self.heap.materializeAttrs(b_id)).len;
+    const a_len = (try self.heap.materializeAttrs(a_id)).len();
+    const b_len = (try self.heap.materializeAttrs(b_id)).len();
     if (a_len != b_len) return false;
 
     var i: usize = 0;
     while (i < a_len) : (i += 1) {
-        const a_entry = (try self.heap.materializeAttrs(a_id))[i];
-        const b_entry = (try self.heap.materializeAttrs(b_id))[i];
-        if (a_entry.name != b_entry.name) return false;
-        if (!try valuesEqualSeen(self, a_entry.value, b_entry.value, seen)) return false;
+        const a_view = try self.heap.materializeAttrs(a_id);
+        const b_view = try self.heap.materializeAttrs(b_id);
+        if (a_view.names[i] != b_view.names[i]) return false;
+        if (!try valuesEqualSeen(self, a_view.values[i], b_view.values[i], seen)) return false;
     }
     return true;
 }
@@ -197,15 +197,15 @@ pub fn attrsHaveDerivationType(
     return std.mem.eql(u8, try strings.stringBytes(self, forced), "derivation");
 }
 
-pub fn attrValue(entries: []const heap_mod.AttrEntry, name: InternId) ?Value {
+pub fn attrValue(view: heap_mod.AttrsView, name: InternId) ?Value {
     var lo: usize = 0;
-    var hi: usize = entries.len;
+    var hi: usize = view.names.len;
 
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const entry = entries[mid];
-        if (entry.name == name) return entry.value;
-        if (entry.name < name) {
+        const entry_name = view.names[mid];
+        if (entry_name == name) return view.values[mid];
+        if (entry_name < name) {
             lo = mid + 1;
         } else {
             hi = mid;

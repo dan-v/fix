@@ -329,11 +329,11 @@ pub fn stats(heap: anytype) Stats {
             continue :scan_attr;
         }
         var next_id: u32 = undefined;
-        const attr = heap.attrs.getIfAllocated(attr_id, &next_id) orelse {
+        const attr_value = heap.attrs.getIfAllocated(attr_id, &next_id) orelse {
             attr_id = next_id - 1;
             continue :scan_attr;
         };
-        recordInt(&result.int_buckets, attr.value);
+        recordInt(&result.int_buckets, attr_value.*);
     }
     return result;
 }

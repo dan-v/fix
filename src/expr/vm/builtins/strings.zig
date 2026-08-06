@@ -84,8 +84,9 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
 
     // Nix folds the separator's context into the result unconditionally, even
     // when the list has fewer than two elements.
-    for (try string_context.contextEntriesForValue(self, sep_value)) |entry| {
-        try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
+    const sep_cv = try string_context.contextEntriesForValue(self, sep_value);
+    for (sep_cv.names, sep_cv.values) |entry_name, entry_value| {
+        try string_context.appendContextEntry(self, &ctx, entry_name, entry_value);
     }
 
     var out_at: usize = 0;
@@ -96,8 +97,9 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
         }
         @memcpy(out[out_at..][0..text.len], text);
         out_at += text.len;
-        for (try string_context.contextEntriesForValue(self, item_value)) |entry| {
-            try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
+        const item_cv = try string_context.contextEntriesForValue(self, item_value);
+        for (item_cv.names, item_cv.values) |entry_name, entry_value| {
+            try string_context.appendContextEntry(self, &ctx, entry_name, entry_value);
         }
     }
     std.debug.assert(out_at == out.len);
@@ -105,7 +107,7 @@ pub fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Valu
     if (comptime prof.enabled) if (self.workerId() == 0)
         prof_census.recordLongString(out.len, ctx.items.len != 0);
     if (ctx.items.len == 0) return vm_strings.makeString(self, out);
-    return Value.contextString(try self.heap.addContextString(try self.intern.intern(out), ctx.items));
+    return Value.contextString(try self.heap.addContextStringEntries(try self.intern.intern(out), ctx.items));
 }
 
 pub fn coerceStringContextId(self: *VM, arg: Value) !InternId {
@@ -182,7 +184,7 @@ fn substringResult(self: *VM, text: []const u8, source: Value) !Value {
     if (comptime prof.enabled) if (self.workerId() == 0)
         prof_census.recordLongString(text.len, source.isContextString());
     const ctx = try string_context.contextEntriesForValue(self, source);
-    if (ctx.len == 0) return vm_strings.makeString(self, text);
+    if (ctx.len() == 0) return vm_strings.makeString(self, text);
     // Contexted text stays interned (context_string.text is id-keyed).
     return Value.contextString(try self.heap.addContextString(try self.intern.intern(text), ctx));
 }
@@ -209,8 +211,9 @@ pub fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_a
 
     var ctx: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer ctx.deinit(self.allocator);
-    for (try string_context.contextEntriesForValue(self, input_value)) |entry| {
-        try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
+    const input_cv = try string_context.contextEntriesForValue(self, input_value);
+    for (input_cv.names, input_cv.values) |entry_name, entry_value| {
+        try string_context.appendContextEntry(self, &ctx, entry_name, entry_value);
     }
 
     // Iterate one past the end so an empty needle can match at the final
@@ -228,8 +231,9 @@ pub fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_a
             const replacement = try vm_force.forceValue(self, try self.heap.getListItem(to_id, replacement_index));
             if (!isPlainString(replacement)) return error.TypeError;
             try out.appendSlice(self.allocator, try vm_strings.stringBytes(self, replacement));
-            for (try string_context.contextEntriesForValue(self, replacement)) |entry| {
-                try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
+            const repl_cv = try string_context.contextEntriesForValue(self, replacement);
+            for (repl_cv.names, repl_cv.values) |entry_name, entry_value| {
+                try string_context.appendContextEntry(self, &ctx, entry_name, entry_value);
             }
             if (needle.len == 0) {
                 // Empty match: emit the current char (if any) and advance one,
@@ -248,7 +252,7 @@ pub fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_a
     if (comptime prof.enabled) if (self.workerId() == 0)
         prof_census.recordLongString(out.items.len, ctx.items.len != 0);
     if (ctx.items.len == 0) return vm_strings.makeString(self, out.items);
-    return Value.contextString(try self.heap.addContextString(try self.intern.intern(out.items), ctx.items));
+    return Value.contextString(try self.heap.addContextStringEntries(try self.intern.intern(out.items), ctx.items));
 }
 
 pub fn stringArg(self: *VM, arg: Value) ![]const u8 {
@@ -392,14 +396,15 @@ pub fn coerceListToStringValue(self: *VM, list_id: ObjectId) !Value {
         // mid-iteration (w>1 UAF). Same discipline as concatStringsSep.
         vm_force.rootKeep(self, item_value);
         try out.appendSlice(self.allocator, try vm_strings.stringBytes(self, item_value));
-        for (try string_context.contextEntriesForValue(self, item_value)) |entry| {
-            try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
+        const item_cv = try string_context.contextEntriesForValue(self, item_value);
+        for (item_cv.names, item_cv.values) |entry_name, entry_value| {
+            try string_context.appendContextEntry(self, &ctx, entry_name, entry_value);
         }
     }
     if (trailing_empty_list) try out.append(self.allocator, ' ');
 
     if (ctx.items.len == 0) return vm_strings.makeString(self, out.items);
-    return Value.contextString(try self.heap.addContextString(try self.intern.intern(out.items), ctx.items));
+    return Value.contextString(try self.heap.addContextStringEntries(try self.intern.intern(out.items), ctx.items));
 }
 
 pub fn isEmptyListStringItem(self: *VM, value: Value) !bool {
@@ -490,14 +495,15 @@ pub fn coerceDerivationListToStringValue(self: *VM, list_id: ObjectId) !Value {
         // env-building hot path). Same discipline as concatStringsSep.
         vm_force.rootKeep(self, item_value);
         try out.appendSlice(self.allocator, try vm_strings.stringBytes(self, item_value));
-        for (try string_context.contextEntriesForValue(self, item_value)) |entry| {
-            try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
+        const item_cv = try string_context.contextEntriesForValue(self, item_value);
+        for (item_cv.names, item_cv.values) |entry_name, entry_value| {
+            try string_context.appendContextEntry(self, &ctx, entry_name, entry_value);
         }
     }
     if (trailing_empty_list) try out.append(self.allocator, ' ');
 
     if (ctx.items.len == 0) return vm_strings.makeString(self, out.items);
-    return Value.contextString(try self.heap.addContextString(try self.intern.intern(out.items), ctx.items));
+    return Value.contextString(try self.heap.addContextStringEntries(try self.intern.intern(out.items), ctx.items));
 }
 
 pub fn coerceDerivationAttrsToStringValue(self: *VM, attrs: Value) !Value {

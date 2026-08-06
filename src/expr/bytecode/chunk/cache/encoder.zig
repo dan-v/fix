@@ -174,18 +174,18 @@ const Writer = struct {
             try self.w8(7);
             const object_id = val.asObjectId();
             const entries = self.heap.materializeAttrs(object_id) catch |e| return wrapErr(e);
-            try self.w32(@intCast(entries.len));
-            for (entries) |ent| {
-                try self.w32(try self.internStr(ent.name));
-                try self.writeConstant(ent.value);
+            try self.w32(@intCast(entries.len()));
+            for (entries.names, entries.values) |ent_name, ent_value| {
+                try self.w32(try self.internStr(ent_name));
+                try self.writeConstant(ent_value);
             }
             var position_count: u32 = 0;
-            for (entries) |ent| if (self.heap.getAttrPos(object_id, ent.name) != null) {
+            for (entries.names) |ent_name| if (self.heap.getAttrPos(object_id, ent_name) != null) {
                 position_count += 1;
             };
             try self.w32(position_count);
-            for (entries) |ent| if (self.heap.getAttrPos(object_id, ent.name)) |pos| {
-                try self.w32(try self.internStr(ent.name));
+            for (entries.names) |ent_name| if (self.heap.getAttrPos(object_id, ent_name)) |pos| {
+                try self.w32(try self.internStr(ent_name));
                 try self.w32(try self.internStr(pos.file));
                 try self.w32(pos.line);
                 try self.w32(pos.column);

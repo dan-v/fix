@@ -242,7 +242,7 @@ const ValuePrinter = struct {
         const stored = try self.host.heap.materializeAttrs(id);
         // Empty attrs are never «repeated» (see writeList) — render `{ }`
         // before recording identity.
-        if (stored.len == 0) {
+        if (stored.len() == 0) {
             try self.writer.writeAll("{ }");
             return;
         }
@@ -256,9 +256,10 @@ const ValuePrinter = struct {
         // this via attrsets.sortedAttrEntries). Sort a private copy here so
         // the plain value form matches — attr storage is symbol-id order,
         // which is first-seen order, not alphabetical.
-        const Entry = std.meta.Elem(@TypeOf(stored));
-        const entries = try self.host.allocator.dupe(Entry, stored);
+        const Entry = @import("runtime").heap.AttrEntry;
+        const entries = try self.host.allocator.alloc(Entry, stored.len());
         defer self.host.allocator.free(entries);
+        for (entries, stored.names, stored.values) |*e, n, v| e.* = .{ .name = n, .value = v };
         try self.host.intern.sortByNameLex(self.host.allocator, Entry, entries);
 
         self.depth += 1;

@@ -139,5 +139,5 @@ pub const ValueSpec = struct {
     default_output: InternId,
     outputs: []const ValueOutput,
     explicit_outputs: bool,
-    original_attrs: []const AttrEntry,
+    original_attrs: heap_mod.AttrsView,
 };

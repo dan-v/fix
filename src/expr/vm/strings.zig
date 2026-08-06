@@ -277,7 +277,7 @@ pub fn concatPathLike(self: *VM, left: Value, right: Value) !Value {
         try appendStringContext(self, &context, right_like);
     }
     if (context.items.len == 0) return Value.path(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, context.items));
+    return Value.contextString(try self.heap.addContextStringEntries(text_id, context.items));
 }
 
 pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
@@ -302,7 +302,7 @@ pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
     if (context.items.len != 0) {
         // Contexted text stays interned (context_string.text is id-keyed).
         const text_id = try internConcatParts(self, &.{ left_bytes, right_bytes }, total);
-        return Value.contextString(try self.heap.addContextString(text_id, context.items));
+        return Value.contextString(try self.heap.addContextStringEntries(text_id, context.items));
     }
     return makeConcatString(self, &.{ left_bytes, right_bytes }, total);
 }
@@ -366,7 +366,7 @@ pub fn concatStackStrings(self: *VM, count: u32) !Value {
         try appendStringContext(self, &context, self.stack[base + i]);
     }
     if (context.items.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, context.items));
+    return Value.contextString(try self.heap.addContextStringEntries(text_id, context.items));
 }
 
 /// `path_cat` opcode body: concatenate the top `count` stack operands into a
@@ -425,7 +425,7 @@ pub fn concatStackPath(self: *VM, count: u32) !Value {
         }
     }
     if (context.items.len == 0) return Value.path(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, context.items));
+    return Value.contextString(try self.heap.addContextStringEntries(text_id, context.items));
 }
 
 pub fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
@@ -475,7 +475,7 @@ pub fn sourcePathStringValue(self: *VM, path_id: InternId) !Value {
         const entries = [_]heap_mod.AttrEntry{
             .{ .name = path_id, .value = try pathContextValue(self) },
         };
-        return Value.contextString(try self.heap.addContextString(path_id, &entries));
+        return Value.contextString(try self.heap.addContextStringEntries(path_id, &entries));
     }
     if (!try self.files.pathExists(path)) return error.FileNotFound;
     const store_path = try source_paths.storePathForSource(self.allocator, self.realization, self.files, path);
@@ -484,7 +484,7 @@ pub fn sourcePathStringValue(self: *VM, path_id: InternId) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = store_path_id, .value = try pathContextValue(self) },
     };
-    return Value.contextString(try self.heap.addContextString(store_path_id, &entries));
+    return Value.contextString(try self.heap.addContextStringEntries(store_path_id, &entries));
 }
 
 pub fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), value: Value) !void {
@@ -500,7 +500,7 @@ pub fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.
             defer force.rootsEnd(self, gc_roots);
             force.rootKeep(self, value); // owns string.context slice, held across appendContextEntry forces
             const string = try self.heap.getContextString(value.asObjectId());
-            for (string.context) |entry| try context_merge.appendContextEntry(self, context, entry.name, entry.value);
+            for (string.context.names, string.context.values) |entry_name, entry_value| try context_merge.appendContextEntry(self, context, entry_name, entry_value);
         },
         else => return error.TypeError,
     }
@@ -510,8 +510,8 @@ pub fn hasStorePathContext(self: *VM, value: Value) !bool {
     if (!value.isContextString()) return false;
     const store_dir = self.realization.store_dir;
     const string = try self.heap.getContextString(value.asObjectId());
-    for (string.context) |entry| {
-        const name = self.intern.get(entry.name);
+    for (string.context.names) |entry_name| {
+        const name = self.intern.get(entry_name);
         if (std.mem.startsWith(u8, name, store_dir) and name.len > store_dir.len and name[store_dir.len] == '/') return true;
     }
     return false;

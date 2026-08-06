@@ -10,7 +10,7 @@ pub fn Adapter(comptime Engine: type) type {
 
         const Self = @This();
 
-        pub fn attrs(self: Self, value: Value) ![]const runtime.heap.AttrEntry {
+        pub fn attrs(self: Self, value: Value) !runtime.heap.AttrsView {
             return self.ev.heap.materializeAttrs(value.asObjectId());
         }
 

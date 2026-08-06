@@ -58,8 +58,8 @@ pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !Obje
     vm_force.rootKeep(self, Value.attrs(right_id));
     const left = try self.heap.materializeAttrs(left_id);
     const right = try self.heap.materializeAttrs(right_id);
-    const left_len = left.len;
-    const right_len = right.len;
+    const left_len = left.len();
+    const right_len = right.len();
 
     var merged = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, left_len + right_len);
     defer merged.deinit(self.allocator);
@@ -67,26 +67,26 @@ pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !Obje
     var left_i: usize = 0;
     var right_i: usize = 0;
     while (left_i < left_len and right_i < right_len) {
-        const l = left[left_i];
-        const r = right[right_i];
-        if (l.name < r.name) {
-            merged.appendAssumeCapacity(l);
+        const ln = left.names[left_i];
+        const rn = right.names[right_i];
+        if (ln < rn) {
+            merged.appendAssumeCapacity(.{ .name = ln, .value = left.values[left_i] });
             left_i += 1;
-        } else if (l.name > r.name) {
-            merged.appendAssumeCapacity(r);
+        } else if (ln > rn) {
+            merged.appendAssumeCapacity(.{ .name = rn, .value = right.values[right_i] });
             right_i += 1;
         } else {
-            const value = try mergeContextAttrValue(self, l.name, l.value, r.value);
-            merged.appendAssumeCapacity(.{ .name = l.name, .value = value });
+            const value = try mergeContextAttrValue(self, ln, left.values[left_i], right.values[right_i]);
+            merged.appendAssumeCapacity(.{ .name = ln, .value = value });
             left_i += 1;
             right_i += 1;
         }
     }
     while (left_i < left_len) : (left_i += 1) {
-        merged.appendAssumeCapacity(left[left_i]);
+        merged.appendAssumeCapacity(.{ .name = left.names[left_i], .value = left.values[left_i] });
     }
     while (right_i < right_len) : (right_i += 1) {
-        merged.appendAssumeCapacity(right[right_i]);
+        merged.appendAssumeCapacity(.{ .name = right.names[right_i], .value = right.values[right_i] });
     }
 
     return self.heap.addAttrsSorted(merged.items);

@@ -632,25 +632,25 @@ test "buildStrictValue exposes drvPath and each output path as plain attrs" {
         .default_output = out_name,
         .outputs = &.{.{ .name = out_name, .out_path = out_path }},
         .explicit_outputs = false,
-        .original_attrs = &.{},
+        .original_attrs = .{ .names = &.{}, .values = &.{} },
     };
 
     const value = try value_mod.buildStrictValue(std.testing.allocator, &intern, &heap, spec);
     const attrs = try heap.materializeAttrs(value.asObjectId());
 
-    try std.testing.expectEqual(@as(usize, 2), attrs.len);
+    try std.testing.expectEqual(@as(usize, 2), attrs.len());
     var found_drv_path = false;
     var found_out = false;
-    for (attrs) |entry| {
+    for (attrs.names, attrs.values) |entry_name, entry_value| {
         // buildStrictValue emits context strings (path values carry string
         // context), not plain interned strings, so extract via
-        // getContextString rather than treating entry.value as an InternId.
-        try std.testing.expect(entry.value.isContextString());
-        const context_string = try heap.getContextString(entry.value.asObjectId());
-        if (entry.name == try intern.intern("drvPath")) {
+        // getContextString rather than treating the value as an InternId.
+        try std.testing.expect(entry_value.isContextString());
+        const context_string = try heap.getContextString(entry_value.asObjectId());
+        if (entry_name == try intern.intern("drvPath")) {
             found_drv_path = true;
             try std.testing.expectEqualStrings("/nix/store/pkg.drv", intern.get(context_string.text));
-        } else if (entry.name == out_name) {
+        } else if (entry_name == out_name) {
             found_out = true;
             try std.testing.expectEqualStrings("/nix/store/pkg-out", intern.get(context_string.text));
         }

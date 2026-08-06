@@ -358,9 +358,9 @@ pub fn forceDeepCounted(self: *VM, value: Value) !void {
     } else {
         if (!try enterDeep(self, .attrs, id, &seen)) return;
         const entries = try self.heap.materializeAttrs(id);
-        forceAttrsAccelerate(self, id, entries);
-        for (entries) |entry| {
-            try forceDeepInner(self, entry.value, &seen);
+        forceAttrsAccelerate(self, id, entries.values);
+        for (entries.values) |entry_value| {
+            try forceDeepInner(self, entry_value, &seen);
         }
     }
 }
@@ -386,8 +386,8 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *SeenDeepSet) anyerror!void
             } else {
                 if (!try enterDeep(self, .attrs, id, seen)) return;
                 const entries = try self.heap.materializeAttrs(id);
-                forceAttrsAccelerate(self, id, entries);
-                for (entries) |entry| try forceDeepInner(self, entry.value, seen);
+                forceAttrsAccelerate(self, id, entries.values);
+                for (entries.values) |entry_value| try forceDeepInner(self, entry_value, seen);
             }
         },
         else => {},
@@ -453,7 +453,7 @@ pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) voi
     }
 }
 
-pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const heap_mod.AttrEntry) void {
+pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const Value) void {
     // Symmetric with `fanOutListShallow`: speculative helpers may
     // cascade attr traversal further. NixOS module evaluation walks
     // attrsets at every level (option merging via `mapAttrs`, the
@@ -468,8 +468,8 @@ pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const heap_m
         const this_len: u8 = @intCast(@min(@as(usize, fan_out_batch_items), remaining));
         // Same zero-work batch gate as `fanOutListShallow`.
         const batch = entries[offset..][0..this_len];
-        const live = for (batch) |entry| {
-            if (fanOutWorthy(self, entry.value)) break true;
+        const live = for (batch) |entry_value| {
+            if (fanOutWorthy(self, entry_value)) break true;
         } else false;
         if (!live) {
             offset += this_len;
@@ -501,7 +501,7 @@ pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const V
 /// (`attrValues`/`filter`/`mapAttrsToList`/forceDeep-attrs) are where the
 /// module-system option-merge work lives, so this exposes independent entries
 /// to idle workers.
-pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []const heap_mod.AttrEntry) void {
+pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []const Value) void {
     if (comptime prof.enabled) {
         if (self.executionContextConst().is_demand and self.workerId() == 0)
             prof_census.recordStrictWalk(&prof_census.attrs_walks, entries.len, fan_out_min_items);

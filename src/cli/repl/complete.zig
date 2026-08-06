@@ -79,8 +79,8 @@ fn complete(ctx_ptr: *anyopaque, arena: std.mem.Allocator, text: []const u8, cur
         var items: std.ArrayListUnmanaged([]const u8) = .empty;
         const tooling = ctx.ev.tooling();
         const entries = tooling.attrs(base) catch return empty;
-        for (entries) |entry| {
-            const name = tooling.internText(entry.name);
+        for (entries.names) |entry_name| {
+            const name = tooling.internText(entry_name);
             if (std.mem.startsWith(u8, name, partial)) {
                 try items.append(arena, try arena.dupe(u8, name));
             }
@@ -110,8 +110,8 @@ fn complete(ctx_ptr: *anyopaque, arena: std.mem.Allocator, text: []const u8, cur
     }
     // Ambient builtins: names visible without the `builtins.` prefix.
     if (builtinsAttrs(ctx)) |entries| {
-        for (entries) |entry| {
-            const name = ctx.ev.tooling().internText(entry.name);
+        for (entries.names) |entry_name| {
+            const name = ctx.ev.tooling().internText(entry_name);
             if (!std.mem.startsWith(u8, name, token)) continue;
             if (builtins_mod.ambientIdForName(name) == null) continue;
             const gop = try seen.getOrPut(arena, name);
@@ -133,7 +133,7 @@ fn sortItems(items: [][]const u8) void {
 /// The builtins attrset's entries (always fully built, never thunked).
 /// `builtinsValue` constructs it on first use, so completion works before
 /// the session's first evaluation.
-fn builtinsAttrs(ctx: *Ctx) ?[]const runtime.heap.AttrEntry {
+fn builtinsAttrs(ctx: *Ctx) ?runtime.heap.AttrsView {
     const b = ctx.ev.builtinsValue() catch return null;
     if (!b.isAttrs()) return null;
     return ctx.ev.tooling().attrs(b) catch null;

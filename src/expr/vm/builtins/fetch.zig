@@ -470,8 +470,8 @@ pub fn flatFetchOutPath(self: *VM, cache_path: []const u8, hash_hex: []const u8,
 /// the simple fetchers.
 fn rejectUnknownFetchAttrs(self: *VM, attrs_id: ObjectId, comptime allowed: []const []const u8) !void {
     const entries = try self.heap.materializeAttrs(attrs_id);
-    outer: for (entries) |entry| {
-        const name = self.intern.get(entry.name);
+    outer: for (entries.names) |entry_name| {
+        const name = self.intern.get(entry_name);
         inline for (allowed) |a| {
             if (std.mem.eql(u8, name, a)) continue :outer;
         }

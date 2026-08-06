@@ -234,7 +234,7 @@ pub fn Methods(comptime Explorer: type) type {
                         else |_|
                             "list",
                         .attrs => if (self.ev.heapAttrsOf(id)) |attrs|
-                            try std.fmt.allocPrint(arena, "attrs ({d})", .{attrs.len})
+                            try std.fmt.allocPrint(arena, "attrs ({d})", .{attrs.len()})
                         else |_|
                             "attrs",
                         .merge_attrs => |merge| try std.fmt.allocPrint(arena, "attrs merge · depth {d}", .{merge.depth}),
@@ -299,16 +299,17 @@ pub fn Methods(comptime Explorer: type) type {
                 } else |_| {},
                 .attrs => if (self.ev.heapAttrsOf(id)) |attrs| {
                     var out: std.Io.Writer.Allocating = .init(arena);
-                    try out.writer.print("attrs ({d})", .{attrs.len});
-                    if (attrs.len > 0) {
+                    try out.writer.print("attrs ({d})", .{attrs.len()});
+                    if (attrs.len() > 0) {
                         try out.writer.writeAll(" {");
-                        for (attrs[0..@min(attrs.len, 2)], 0..) |attr, i| {
+                        const shown2 = @min(attrs.len(), 2);
+                        for (attrs.names[0..shown2], attrs.values[0..shown2], 0..) |attr_name, attr_value, i| {
                             if (i != 0) try out.writer.writeAll(", ");
-                            try out.writer.writeAll(self.ev.internTable().get(attr.name));
-                            if (try scalarText(self, arena, attr.value, @max(@as(usize, 8), max_cells / 2))) |scalar|
+                            try out.writer.writeAll(self.ev.internTable().get(attr_name));
+                            if (try scalarText(self, arena, attr_value, @max(@as(usize, 8), max_cells / 2))) |scalar|
                                 try out.writer.print(" = {s}", .{scalar});
                         }
-                        if (attrs.len > 2) try out.writer.writeAll(", …");
+                        if (attrs.len() > 2) try out.writer.writeAll(", …");
                         try out.writer.writeByte('}');
                     }
                     return try width_mod.endEllipsis(arena, out.written(), max_cells);

@@ -141,7 +141,8 @@ const ReferenceSink = struct {
     }
 
     pub fn attrRange(self: *ReferenceSink, heap: *const ObjectHeap, range: heap_mod.AttrRange) Error!void {
-        for (heap.attrs.slice(range)) |entry| try self.value(heap, entry.value);
+        // SoA: the T plane holds the values; names carry no references.
+        for (heap.attrs.slice(range)) |entry_value| try self.value(heap, entry_value);
     }
 
     pub inline fn attrPositions(_: *ReferenceSink, _: heap_mod.AttrPositions) Error!void {}

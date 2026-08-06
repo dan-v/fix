@@ -26,12 +26,12 @@ pub fn builtinGetContext(self: *VM, arg: Value) !Value {
     if (value.kind() != .string and value.kind() != .string_context and value.kind() != .heap_string) {
         return vm_trace.typeErrorExpected(self, "a string", value);
     }
-    return Value.attrs(try self.heap.addAttrs(try contextEntriesForValue(self, value)));
+    return Value.attrs(try self.heap.addAttrsView(try contextEntriesForValue(self, value)));
 }
 
 pub fn builtinHasContext(self: *VM, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    return Value.boolVal((try contextEntriesForValue(self, value)).len != 0);
+    return Value.boolVal((try contextEntriesForValue(self, value)).len() != 0);
 }
 
 pub fn builtinAppendContext(self: *VM, string_arg: Value, context_arg: Value) !Value {
@@ -42,11 +42,15 @@ pub fn builtinAppendContext(self: *VM, string_arg: Value, context_arg: Value) !V
 
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
-    for (try contextEntriesForValue(self, string_value)) |entry| try appendContextEntry(self, &entries, entry.name, entry.value);
-    for (try self.heap.materializeAttrs(context_value.asObjectId())) |entry| try appendContextEntry(self, &entries, entry.name, entry.value);
+    {
+        const sv = try contextEntriesForValue(self, string_value);
+        for (sv.names, sv.values) |n, v| try appendContextEntry(self, &entries, n, v);
+        const cv = try self.heap.materializeAttrs(context_value.asObjectId());
+        for (cv.names, cv.values) |n, v| try appendContextEntry(self, &entries, n, v);
+    }
 
     if (entries.items.len == 0) return Value.string(try strings.stringNameId(self, string_value));
-    return Value.contextString(try self.heap.addContextString(try strings.stringNameId(self, string_value), entries.items));
+    return Value.contextString(try self.heap.addContextStringEntries(try strings.stringNameId(self, string_value), entries.items));
 }
 
 pub fn builtinUnsafeDiscardStringContext(self: *VM, arg: Value) !Value {
@@ -65,11 +69,12 @@ pub fn builtinUnsafeDiscardOutputDependency(self: *VM, arg: Value) !Value {
     const text_id = try strings.stringNameId(self, value);
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
-    for (try contextEntriesForValue(self, value)) |entry| {
-        try appendContextEntry(self, &entries, entry.name, try pathContextValue(self));
+    {
+        const cv = try contextEntriesForValue(self, value);
+        for (cv.names) |n| try appendContextEntry(self, &entries, n, try pathContextValue(self));
     }
     if (entries.items.len == 0) return Value.string(text_id);
-    return Value.contextString(try self.heap.addContextString(text_id, entries.items));
+    return Value.contextString(try self.heap.addContextStringEntries(text_id, entries.items));
 }
 
 pub fn builtinAddDrvOutputDependencies(self: *VM, arg: Value) !Value {
@@ -80,18 +85,18 @@ pub fn builtinAddDrvOutputDependencies(self: *VM, arg: Value) !Value {
     // Nix requires the context to have exactly one element, which must be a
     // bare derivation (`.drv`), not one of its outputs.
     const ctx = try contextEntriesForValue(self, value);
-    if (ctx.len != 1) {
+    if (ctx.len() != 1) {
         try vm_trace.setErrorMessage(self, "context of string must have exactly one element, but has a different number");
         return error.TypeError;
     }
-    const entry = ctx[0];
-    if (!std.mem.endsWith(u8, self.intern.get(entry.name), ".drv")) {
+    const entry_name = ctx.names[0];
+    if (!std.mem.endsWith(u8, self.intern.get(entry_name), ".drv")) {
         try vm_trace.setErrorMessage(self, "addDrvOutputDependencies can only act on derivations");
         return error.TypeError;
     }
     // A `{ outputs = [...] }` marker means the element is a derivation OUTPUT,
     // which is rejected; `path`/`allOutputs` markers are the derivation itself.
-    const marker = try vm_force.forceValue(self, entry.value);
+    const marker = try vm_force.forceValue(self, ctx.values[0]);
     if (marker.isAttrs()) {
         const outputs_id = try self.intern.intern("outputs");
         if (self.heap.getAttrValue(marker.asObjectId(), outputs_id)) |_| {
@@ -105,23 +110,25 @@ pub fn builtinAddDrvOutputDependencies(self: *VM, arg: Value) !Value {
 
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
-    try context_merge.appendContextEntry(self, &entries, entry.name, try allOutputsContextValue(self));
-    return Value.contextString(try self.heap.addContextString(text_id, entries.items));
+    try context_merge.appendContextEntry(self, &entries, entry_name, try allOutputsContextValue(self));
+    return Value.contextString(try self.heap.addContextStringEntries(text_id, entries.items));
 }
 
-pub fn contextEntriesForValue(self: *VM, value: Value) ![]const heap_mod.AttrEntry {
+pub fn contextEntriesForValue(self: *VM, value: Value) !heap_mod.AttrsView {
     return switch (value.kind()) {
-        .string, .heap_string => &.{},
+        .string, .heap_string => .{ .names = &.{}, .values = &.{} },
         .path => try singleContextEntry(self, value.asInternId(), try pathContextValue(self)),
         .string_context => (try self.heap.getContextString(value.asObjectId())).context,
         else => error.TypeError,
     };
 }
 
-pub fn singleContextEntry(self: *VM, name: InternId, value: Value) ![]const heap_mod.AttrEntry {
-    const entries = try self.allocator.alloc(heap_mod.AttrEntry, 1);
-    entries[0] = .{ .name = name, .value = value };
-    return entries;
+pub fn singleContextEntry(self: *VM, name: InternId, value: Value) !heap_mod.AttrsView {
+    const names = try self.allocator.alloc(InternId, 1);
+    const values = try self.allocator.alloc(Value, 1);
+    names[0] = name;
+    values[0] = value;
+    return .{ .names = names, .values = values };
 }
 
 pub fn pathContextValue(self: *VM) !Value {
@@ -151,5 +158,5 @@ pub fn contextStringTextWithPath(self: *VM, text_id: InternId, path_id: InternId
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = path_id, .value = try pathContextValue(self) },
     };
-    return Value.contextString(try self.heap.addContextString(text_id, &entries));
+    return Value.contextString(try self.heap.addContextStringEntries(text_id, &entries));
 }

@@ -887,19 +887,19 @@ fn applyOverrides(vm: *VM, built_id: types.ObjectId, ov_id: types.ObjectId) !voi
 
     // Read-only walk of `ov_entries` (no attr-storage mutation inside), so
     // the slice stays valid; `publishCellBinding` only mutates thunks.
-    for (ov_entries) |entry| {
-        const existing = try vm.heap.getAttrValueOpt(built_id, entry.name);
+    for (ov_entries.names, ov_entries.values) |ov_name, ov_value| {
+        const existing = try vm.heap.getAttrValueOpt(built_id, ov_name);
         if (existing) |cell_val| {
             // Existing rec attr: its stored value IS the shared binding cell
             // (loc_grab pushed the cell thunk into the object). Re-point the
             // cell so already-captured sibling thunks resolve to the override.
             if (cell_val.isThunk()) {
                 const th = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
-                if (vm.solo) th.publishCellBindingSolo(entry.value) else th.publishCellBinding(entry.value);
-                vm.heap.gcRecordEdge(cell_val.asObjectId(), entry.value); // old→young barrier
+                if (vm.solo) th.publishCellBindingSolo(ov_value) else th.publishCellBinding(ov_value);
+                vm.heap.gcRecordEdge(cell_val.asObjectId(), ov_value); // old→young barrier
             }
         } else {
-            try new_entries.append(vm.allocator, entry);
+            try new_entries.append(vm.allocator, .{ .name = ov_name, .value = ov_value });
         }
     }
 
@@ -910,7 +910,10 @@ fn applyOverrides(vm: *VM, built_id: types.ObjectId, ov_id: types.ObjectId) !voi
     // Rebuild with the additions in one sorted attrset.
     var all: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer all.deinit(vm.allocator);
-    try all.appendSlice(vm.allocator, try vm.heap.materializeAttrs(built_id));
+    {
+        const built_view = try vm.heap.materializeAttrs(built_id);
+        for (built_view.names, built_view.values) |b_name, b_value| try all.append(vm.allocator, .{ .name = b_name, .value = b_value });
+    }
     try all.appendSlice(vm.allocator, new_entries.items);
     const merged_id = try vm.heap.addAttrs(all.items);
     vm.stack[vm.sp - 1] = Value.attrs(merged_id);
@@ -1025,15 +1028,16 @@ fn attrBindOp(comptime wide: bool) HandlerFn {
 
             var entry_i: usize = 0;
             var pair_i: usize = 0;
-            while (entry_i < entries.len and pair_i < count) {
+            while (entry_i < entries.len() and pair_i < count) {
                 const pair_at = pairs_start + pair_i * stride;
                 const name: InternId = if (wide) readU32(code, pair_at) else @intCast(readU16(code, pair_at));
                 const slot = readU16(code, pair_at + name_len);
-                const entry = entries[entry_i];
-                if (entry.name < name) {
+                const entry_name = entries.names[entry_i];
+                const entry_value = entries.values[entry_i];
+                if (entry_name < name) {
                     if (!allow_extra) return error.UnexpectedAttribute;
                     entry_i += 1;
-                } else if (entry.name > name) {
+                } else if (entry_name > name) {
                     if (slot != std.math.maxInt(u16)) return error.MissingAttribute;
                     pair_i += 1;
                 } else {
@@ -1043,10 +1047,10 @@ fn attrBindOp(comptime wide: bool) HandlerFn {
                             const cell_val = vm.stack[frame.frame_base + slot];
                             if (!cell_val.isThunk()) return error.InvalidBytecode;
                             const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
-                            if (vm.solo) thunk.publishCellBindingSolo(entry.value) else thunk.publishCellBinding(entry.value);
-                            vm.heap.gcRecordEdge(cell_val.asObjectId(), entry.value);
+                            if (vm.solo) thunk.publishCellBindingSolo(entry_value) else thunk.publishCellBinding(entry_value);
+                            vm.heap.gcRecordEdge(cell_val.asObjectId(), entry_value);
                         } else {
-                            stack.setStack(vm, frame.frame_base + slot, entry.value);
+                            stack.setStack(vm, frame.frame_base + slot, entry_value);
                         }
                     }
                     entry_i += 1;
@@ -1058,7 +1062,7 @@ fn attrBindOp(comptime wide: bool) HandlerFn {
                 const slot = readU16(code, pair_at + name_len);
                 if (slot != std.math.maxInt(u16)) return error.MissingAttribute;
             }
-            if (!allow_extra and entry_i < entries.len) return error.UnexpectedAttribute;
+            if (!allow_extra and entry_i < entries.len()) return error.UnexpectedAttribute;
 
             _ = stack.pop(vm);
             return dispatch(vm, frame, code, pairs_end, stop_depth);

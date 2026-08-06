@@ -319,14 +319,15 @@ pub const Context = struct {
                     attrs_info.positions,
                     if (attrs_info.sibling_swept) "yes" else "no",
                 });
-                const attrs = self.ev.heapAttrsOf(id) catch &.{};
-                try self.writer.print("  MEMBERS · {d}\n", .{attrs.len});
-                for (attrs[0..@min(attrs.len, limit)]) |attr| {
-                    try self.writer.print("    {s} = ", .{self.ev.internTable().get(attr.name)});
-                    try self.writeValueDigest(attr.value);
+                const attrs = self.ev.heapAttrsOf(id) catch runtime.heap.AttrsView{ .names = &.{}, .values = &.{} };
+                try self.writer.print("  MEMBERS · {d}\n", .{attrs.len()});
+                const shown = @min(attrs.len(), limit);
+                for (attrs.names[0..shown], attrs.values[0..shown]) |attr_name, attr_value| {
+                    try self.writer.print("    {s} = ", .{self.ev.internTable().get(attr_name)});
+                    try self.writeValueDigest(attr_value);
                     try self.writer.writeByte('\n');
                 }
-                if (attrs.len > limit) try self.writer.print("    ... {d} more\n", .{attrs.len - limit});
+                if (attrs.len() > limit) try self.writer.print("    ... {d} more\n", .{attrs.len() - limit});
             },
             .merge_attrs => |merge| {
                 try self.writeObjectField("base", merge.base);

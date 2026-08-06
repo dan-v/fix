@@ -92,8 +92,8 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
 
     const left = try self.heap.materializeAttrs(left_id);
     const right = try self.heap.materializeAttrs(right_id);
-    const left_len = left.len;
-    const right_len = right.len;
+    const left_len = left.len();
+    const right_len = right.len();
 
     // Reserve worst-case (no overlap) directly in heap attr storage
     // and walk both sides in lockstep, writing the merge in place.
@@ -109,14 +109,16 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
     var left_i: usize = 0;
     var right_i: usize = 0;
     while (left_i < left_len and right_i < right_len) {
-        const l = left[left_i];
-        const r = right[right_i];
-        if (l.name < r.name) {
-            dst[out] = l;
+        const ln = left.names[left_i];
+        const rn = right.names[right_i];
+        if (ln < rn) {
+            dst.names[out] = ln;
+            dst.values[out] = left.values[left_i];
             out += 1;
             left_i += 1;
-        } else if (l.name > r.name) {
-            dst[out] = r;
+        } else if (ln > rn) {
+            dst.names[out] = rn;
+            dst.values[out] = right.values[right_i];
             out += 1;
             right_i += 1;
         } else {
@@ -124,7 +126,7 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
             // heap so it's safe to call while we hold a reserved
             // range — the merge target is its own segment of the
             // attr store, not the inputs we're reading.
-            const value = try mergeAttrLiteralValue(self, l.value, r.value);
+            const value = try mergeAttrLiteralValue(self, left.values[left_i], right.values[right_i]);
             // GC: `value` is a freshly-merged young object held ONLY in the
             // reserved-but-unpublished `dst` slice — which `markVm` cannot
             // scan (it is neither on the operand stack, nor in temp-roots,
@@ -137,7 +139,8 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
             // `value` (and its subtree); its slot is reused and a stale
             // reference in the published merge later corrupts it (w>1 UAF).
             force.rootKeep(self, value);
-            dst[out] = .{ .name = l.name, .value = value };
+            dst.names[out] = ln;
+            dst.values[out] = value;
             out += 1;
             left_i += 1;
             right_i += 1;
@@ -145,12 +148,14 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
     }
     if (left_i < left_len) {
         const n = left_len - left_i;
-        @memcpy(dst[out..][0..n], left[left_i..]);
+        @memcpy(dst.names[out..][0..n], left.names[left_i..]);
+        @memcpy(dst.values[out..][0..n], left.values[left_i..]);
         out += n;
     }
     if (right_i < right_len) {
         const n = right_len - right_i;
-        @memcpy(dst[out..][0..n], right[right_i..]);
+        @memcpy(dst.names[out..][0..n], right.names[right_i..]);
+        @memcpy(dst.values[out..][0..n], right.values[right_i..]);
         out += n;
     }
 

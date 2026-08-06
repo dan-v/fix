@@ -659,17 +659,17 @@ const Repl = struct {
         const entries = tooling.attrs(forced) catch return false;
         var updates: std.ArrayListUnmanaged(Engine.ScopeBinding) = .empty;
         defer updates.deinit(self.allocator);
-        try updates.ensureTotalCapacity(self.allocator, entries.len);
-        for (entries) |entry| {
+        try updates.ensureTotalCapacity(self.allocator, entries.len());
+        for (entries.names, entries.values) |entry_name, entry_value| {
             updates.appendAssumeCapacity(.{
-                .name = tooling.internText(entry.name),
-                .value = entry.value,
+                .name = tooling.internText(entry_name),
+                .value = entry_value,
             });
         }
         try self.applyBindingUpdates(updates.items);
         var out = self.output();
         defer out.flush() catch {};
-        try out.writer().print("added {d} bindings\n", .{entries.len});
+        try out.writer().print("added {d} bindings\n", .{entries.len()});
         return true;
     }
 
@@ -714,8 +714,8 @@ const Repl = struct {
                 try w.print("a list ({d} item{s})", .{ n, if (n == 1) "" else "s" });
             },
             .attrs => {
-                const entries = self.ev.tooling().attrs(value) catch &.{};
-                try w.print("a set ({d} attr{s})", .{ entries.len, if (entries.len == 1) "" else "s" });
+                const n = if (self.ev.tooling().attrs(value)) |entries| entries.len() else |_| 0;
+                try w.print("a set ({d} attr{s})", .{ n, if (n == 1) "" else "s" });
             },
             .closure, .builtin, .builtin_closure, .partial_app => try w.writeAll("a function"),
             .thunk => try w.writeAll("a thunk (unforced)"),
@@ -793,8 +793,8 @@ const Repl = struct {
             },
             .attrs => {
                 try disasm.writeValueDigest(w, value, symbols, 48, self.color_depth);
-                const entries = self.ev.tooling().attrs(value) catch &.{};
-                try w.print(" ({d} attr{s})\n", .{ entries.len, if (entries.len == 1) "" else "s" });
+                const n2 = if (self.ev.tooling().attrs(value)) |entries| entries.len() else |_| 0;
+                try w.print(" ({d} attr{s})\n", .{ n2, if (n2 == 1) "" else "s" });
             },
             else => {
                 try disasm.writeValueDigest(w, value, symbols, 48, self.color_depth);

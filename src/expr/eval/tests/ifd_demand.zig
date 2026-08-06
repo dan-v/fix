@@ -99,8 +99,8 @@ const DemandFixture = struct {
     fn outputInfo(self: *DemandFixture, output: Value) !struct { path: []const u8, drv_path: []const u8 } {
         const string = try self.ev.heap.getContextString(output.asObjectId());
         var drv_path: ?[]const u8 = null;
-        for (string.context) |entry| {
-            const path = self.ev.intern.get(entry.name);
+        for (string.context.names) |entry_name| {
+            const path = self.ev.intern.get(entry_name);
             if (std.mem.endsWith(u8, path, ".drv")) drv_path = path;
         }
         return .{
@@ -247,7 +247,7 @@ test "cold output demand survives a major GC with only output context rooted" {
         const output = produced.output;
         const subject = try fixture.registerOutputTree(output);
         defer fixture.allocator.free(subject);
-        try std.testing.expect((try fixture.ev.heap.materializeAttrs(produced.derivation_id)).len != 0);
+        try std.testing.expect((try fixture.ev.heap.materializeAttrs(produced.derivation_id)).len() != 0);
 
         try fixture.ev.gcSetExternalRoots(&.{output});
         defer fixture.ev.gcSetExternalRoots(&.{}) catch {};
@@ -286,8 +286,11 @@ test "concurrent cold output demands issue exactly one daemon build" {
             \\}
         , scope);
         try fixture.ev.forceDeep(demands);
-        for (try fixture.ev.heap.materializeAttrs(demands.asObjectId())) |entry| {
-            try std.testing.expectEqualStrings("cold payload", try valueText(&fixture, entry.value));
+        {
+            const dv = try fixture.ev.heap.materializeAttrs(demands.asObjectId());
+            for (dv.values) |entry_value| {
+                try std.testing.expectEqualStrings("cold payload", try valueText(&fixture, entry_value));
+            }
         }
         try fixture.assertOneRealization(output, subject);
     } else return error.MissingSharedDemandPathIntegration;

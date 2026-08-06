@@ -179,8 +179,8 @@ test "evaluate filterSource builtin through file cache" {
     const filtered_path = ev.intern.get(filtered_string.text);
     try std.testing.expect(std.mem.startsWith(u8, filtered_path, "/nix/store/"));
     try std.testing.expect(std.mem.endsWith(u8, filtered_path, &tmp.sub_path));
-    try std.testing.expectEqual(@as(usize, 1), filtered_string.context.len);
-    try std.testing.expectEqual(filtered_string.text, filtered_string.context[0].name);
+    try std.testing.expectEqual(@as(usize, 1), filtered_string.context.len());
+    try std.testing.expectEqual(filtered_string.text, filtered_string.context.names[0]);
 
     ev.setDerivationDebug(true);
     const drv_source = try std.fmt.allocPrint(

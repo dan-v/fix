@@ -199,7 +199,7 @@ fn mergeWithAttrs(ctx: Context, map: *std.AutoArrayHashMapUnmanaged(types.Intern
     const forced = vm_force.forceValue(ctx.vm, subject) catch return;
     if (!forced.isAttrs()) return;
     const entries = ctx.heap.materializeAttrs(forced.asObjectId()) catch return;
-    for (entries) |entry| try map.put(ctx.allocator, entry.name, entry.value);
+    for (entries.names, entries.values) |entry_name, entry_value| try map.put(ctx.allocator, entry_name, entry_value);
 }
 
 fn collectFrameBindings(ctx: Context, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), i: usize) !void {

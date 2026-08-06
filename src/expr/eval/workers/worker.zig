@@ -1206,10 +1206,10 @@ fn runAttrsRangeTask(f: *WorkerFiber, range: scheduler_mod.ForceAttrsRange) void
     vm_force.rootKeep(&f.vm, Value.attrs(range.attrs_id));
     const entries = f.vm.heap.materializeAttrs(range.attrs_id) catch return;
     const start: usize = range.offset;
-    const end = @min(start + @as(usize, range.len), entries.len);
-    for (entries[start..end]) |entry| {
-        if (entry.value.isThunk()) {
-            _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+    const end = @min(start + @as(usize, range.len), entries.len());
+    for (entries.values[start..end]) |entry_value| {
+        if (entry_value.isThunk()) {
+            _ = vm_force.forceValueSpeculative(&f.vm, entry_value) catch {};
             f.ctx.clearFailure();
             f.local_trace.clear();
         }
@@ -1231,15 +1231,15 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
         f.vm.speculation.claim_budget = vm_mod.no_spec_budget;
         f.vm.speculation.create_left = vm_mod.no_spec_budget;
     }
-    for (entries) |entry| {
-        if (!entry.value.isThunk()) continue;
-        if (!vm_force.sweepMemberAdmissible(&f.vm, entry.value.asObjectId())) continue;
+    for (entries.names, entries.values) |entry_name, entry_value| {
+        if (!entry_value.isThunk()) continue;
+        if (!vm_force.sweepMemberAdmissible(&f.vm, entry_value.asObjectId())) continue;
         f.vm.speculation.claim_budget = f.worker.scheduler.config.sibling_claim_budget;
         vm_force.specCreateArm(&f.vm, f.worker.scheduler.config.sibling_budget);
         if (log) {
-            logAttrsSweepMember(f, attrs_id, entry, &label_buf, &rendered_buf);
+            logAttrsSweepMember(f, attrs_id, entry_name, entry_value, &label_buf, &rendered_buf);
         } else {
-            _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+            _ = vm_force.forceValueSpeculative(&f.vm, entry_value) catch {};
             f.ctx.clearFailure();
             f.local_trace.clear();
         }
@@ -1254,14 +1254,14 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
 fn logAttrsSweepStart(
     f: *WorkerFiber,
     attrs_id: types.ObjectId,
-    entries: []const AttrEntry,
+    entries: @import("runtime").heap.AttrsView,
     label_buf: *[160]u8,
     rendered_buf: *[224]u8,
 ) void {
     var label: []const u8 = "?";
-    for (entries) |entry| {
-        if (!entry.value.isThunk()) continue;
-        const subject = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), label_buf);
+    for (entries.values) |entry_value| {
+        if (!entry_value.isThunk()) continue;
+        const subject = vm_force.thunkLabel(&f.vm, entry_value.asObjectId(), label_buf);
         if (subject.isEmpty()) continue;
         label = switch (subject) {
             .source => |source| std.fmt.bufPrint(rendered_buf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(source.file)), source.line }) catch "?",
@@ -1271,9 +1271,9 @@ fn logAttrsSweepStart(
         break;
     }
     std.debug.print("sweep attrs={d} n={d} t_us={d} worker={d} claimer={d} first_attr={s} member={s}\n", .{
-        attrs_id,             entries.len,
+        attrs_id,             entries.len(),
         vm_force.diagNowUs(), worker_id_mod.currentId(),
-        f.ctx.claimer_id,     f.vm.intern.get(entries[0].name),
+        f.ctx.claimer_id,     f.vm.intern.get(entries.names[0]),
         label,
     });
 }
@@ -1281,13 +1281,14 @@ fn logAttrsSweepStart(
 fn logAttrsSweepMember(
     f: *WorkerFiber,
     attrs_id: types.ObjectId,
-    entry: AttrEntry,
+    entry_name: types.InternId,
+    entry_value: Value,
     label_buf: *[160]u8,
     rendered_buf: *[224]u8,
 ) void {
     const created_before = f.vm.heap.currentLocal().thunks_created;
-    const subject = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), label_buf);
-    _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+    const subject = vm_force.thunkLabel(&f.vm, entry_value.asObjectId(), label_buf);
+    _ = vm_force.forceValueSpeculative(&f.vm, entry_value) catch {};
     f.ctx.clearFailure();
     f.local_trace.clear();
     const created = f.vm.heap.currentLocal().thunks_created -| created_before;
@@ -1298,7 +1299,7 @@ fn logAttrsSweepMember(
         .none => "?",
     };
     std.debug.print("sweep-member attrs={d} attr={s} member={s} created={d} t_us={d} claimer={d}\n", .{
-        attrs_id,             f.vm.intern.get(entry.name), label, created,
+        attrs_id,             f.vm.intern.get(entry_name), label, created,
         vm_force.diagNowUs(), f.ctx.claimer_id,
     });
 }

@@ -108,7 +108,31 @@ const ObjectStore = segments.FlatStore(Object, .{ .max_slots = object_max_slots,
 // Large tail segments use sparse mappings with a chunk-grown hugetlb prefix.
 // Their cursors advance only under `write_mu`, as the overlay requires.
 const ValueStore = segments.StableSegments(Value, .{ .first_segment_size = value_chunk_size, .vma_tag = .values, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
-const AttrStore = segments.StableSegments(AttrEntry, .{ .first_segment_size = attr_chunk_size, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+// Structure-of-arrays attrset storage: the T plane holds VALUES (8-aligned,
+// covered by the hugetlb overlay prefix), the paired plane holds NAMES
+// (u32). One Range addresses both; the 4B/entry padding of the old
+// interleaved {name, value} layout (~2.4GB across a universe eval) is gone,
+// and name-only binary searches touch 16 names per cache line instead of 4.
+const AttrStore = segments.StableSegments(Value, .{ .first_segment_size = attr_chunk_size, .vma_tag = .attrs, .huge_overlay_min = 64 << 20, .paired_second = InternId }, mem_tag.vma);
+
+/// Read view of one attrset's storage planes. Entry i is
+/// (names[i], values[i]); names are sorted unique post-publish.
+pub const AttrsView = struct {
+    names: []const InternId,
+    values: []const Value,
+
+    pub inline fn len(self: AttrsView) usize {
+        return self.names.len;
+    }
+};
+
+/// True per-slot storage cost of the SoA attr planes.
+pub const attr_slot_bytes: usize = AttrStore.stored_slot_bytes;
+
+pub const AttrsViewMut = struct {
+    names: []InternId,
+    values: []Value,
+};
 const AttrPosStore = segments.StableSegments(AttrPosEntry, .{ .first_segment_size = attr_position_chunk_size, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 /// GC-able string text (`Object.heap_string`). Byte-granular: one "slot"
 /// is one byte, so range lengths are byte counts. Deliberately NO hugetlb
@@ -204,7 +228,7 @@ pub const PartialApp = struct {
 
 pub const ContextString = struct {
     text: InternId,
-    context: []const AttrEntry,
+    context: AttrsView,
 };
 
 pub const PendingBytecodeThunk = struct {
@@ -897,10 +921,12 @@ pub const ObjectHeap = struct {
         return self.values.getIfAllocated(id, &next);
     }
 
-    pub fn attrAt(self: *const ObjectHeap, id: u32) ?*const AttrEntry {
+    pub fn attrAt(self: *const ObjectHeap, id: u32) ?AttrEntry {
         if (id >= self.attrs.count()) return null;
         var next: u32 = id + 1;
-        return self.attrs.getIfAllocated(id, &next);
+        const value = self.attrs.getIfAllocated(id, &next) orelse return null;
+        const name = self.attrs.getSecondAssume(id);
+        return .{ .name = name, .value = value.* };
     }
 
     pub fn attrPosAt(self: *const ObjectHeap, id: u32) ?*const AttrPosEntry {
@@ -1522,8 +1548,8 @@ pub const ObjectHeap = struct {
         return .{ .range = try self.reserveAttrsLocal(n) };
     }
 
-    pub fn attrsMutSlice(self: *ObjectHeap, pending: PendingAttrs) []AttrEntry {
-        return self.attrs.sliceMut(pending.range);
+    pub fn attrsMutSlice(self: *ObjectHeap, pending: PendingAttrs) AttrsViewMut {
+        return self.attrsViewMutOf(pending.range);
     }
 
     pub fn abortMergedAttrs(self: *ObjectHeap, pending: PendingAttrs) void {
@@ -1791,8 +1817,8 @@ pub const ObjectHeap = struct {
                 .partial_app => |p| (gcHeapId(p.func) orelse std.math.maxInt(ObjectId)) == dead or
                     rangeHasId(self.values.slice(p.args), dead),
                 .attrs => |a| blk: {
-                    for (self.attrs.slice(a.range)) |e|
-                        if ((gcHeapId(e.value) orelse std.math.maxInt(ObjectId)) == dead) break :blk true;
+                    for (self.attrs.slice(a.range)) |v|
+                        if ((gcHeapId(v) orelse std.math.maxInt(ObjectId)) == dead) break :blk true;
                     break :blk false;
                 },
                 .thunk => |t| t.future.state.load(.monotonic) == 2 and // resolved
@@ -1828,7 +1854,7 @@ pub const ObjectHeap = struct {
     pub fn totalReservedBytes(self: *const ObjectHeap) u64 {
         var total = @as(u64, self.objects.count()) * @sizeOf(Object);
         inline for (range_stores) |row|
-            total += @as(u64, @field(self, row.store).count()) * @sizeOf(row.Elem);
+            total += @as(u64, @field(self, row.store).count()) * row.Store.stored_slot_bytes;
         return total;
     }
 
@@ -2093,15 +2119,23 @@ pub const ObjectHeap = struct {
     /// when necessary. Materialization allocates and atomically publishes a
     /// memoized heap object; callers that only need one name should use
     /// `getAttrValueOpt` to keep the operation read-only.
-    pub fn materializeAttrs(self: *ObjectHeap, id: ObjectId) ![]const AttrEntry {
+    pub fn materializeAttrs(self: *ObjectHeap, id: ObjectId) !AttrsView {
         // Pointer captures here and below: a by-value union read would
         // memcpy the whole arm storage, racing the atomic `flattened`
         // memoization CAS embedded in live merge nodes.
         return switch (self.get(id).*) {
-            .attrs => |*a| self.attrs.slice(a.range),
-            .merge_attrs => self.attrs.slice(self.get(try self.flattenMerge(id)).attrs.range),
+            .attrs => |*a| self.attrsViewOf(a.range),
+            .merge_attrs => self.attrsViewOf(self.get(try self.flattenMerge(id)).attrs.range),
             else => error.InvalidObjectType,
         };
+    }
+
+    pub fn attrsViewOf(self: *const ObjectHeap, range: AttrRange) AttrsView {
+        return .{ .names = self.attrs.sliceSecond(range), .values = self.attrs.slice(range) };
+    }
+
+    fn attrsViewMutOf(self: *ObjectHeap, range: AttrRange) AttrsViewMut {
+        return .{ .names = self.attrs.sliceSecondMut(range), .values = self.attrs.sliceMut(range) };
     }
 
     pub fn getAttrValue(self: *const ObjectHeap, id: ObjectId, name: InternId) !Value {
@@ -2114,11 +2148,11 @@ pub const ObjectHeap = struct {
     /// been flattened it delegates to the flat object's binary search.
     pub fn getAttrValueOpt(self: *const ObjectHeap, id: ObjectId, name: InternId) anyerror!?Value {
         return switch (self.get(id).*) {
-            .attrs => |*a| binarySearchAttr(self.attrs.slice(a.range), name),
+            .attrs => |*a| binarySearchAttr(self.attrsViewOf(a.range), name),
             .merge_attrs => |*m| {
                 const flat = m.flattened.load(.acquire);
                 if (flat != no_flattened_attrs) {
-                    return binarySearchAttr(self.attrs.slice(self.get(flat).attrs.range), name);
+                    return binarySearchAttr(self.attrsViewOf(self.get(flat).attrs.range), name);
                 }
                 if (try self.getAttrValueOpt(m.overlay, name)) |v| return v;
                 return self.getAttrValueOpt(m.base, name);
@@ -2153,7 +2187,7 @@ pub const ObjectHeap = struct {
 
     fn attrContains(self: *const ObjectHeap, id: ObjectId, name: InternId) bool {
         return switch (self.get(id).*) {
-            .attrs => |*a| binarySearchAttrIndex(self.attrs.slice(a.range), name) != null,
+            .attrs => |*a| binarySearchAttrIndex(self.attrs.sliceSecond(a.range), name) != null,
             .merge_attrs => |*m| self.attrContains(m.overlay, name) or self.attrContains(m.base, name),
             else => false,
         };
@@ -2250,20 +2284,24 @@ pub const ObjectHeap = struct {
             return self.kwayMergeLeaves(reduced.items);
         }
         const n = leaves.len;
-        const slices = try self.allocator.alloc([]const AttrEntry, n);
-        defer self.allocator.free(slices);
+        const name_slices = try self.allocator.alloc([]const InternId, n);
+        defer self.allocator.free(name_slices);
+        const value_slices = try self.allocator.alloc([]const Value, n);
+        defer self.allocator.free(value_slices);
         const cursors = try self.allocator.alloc(usize, n);
         defer self.allocator.free(cursors);
 
         var cap: u32 = 0;
         for (leaves, 0..) |leaf, i| {
-            slices[i] = self.attrs.slice(self.get(leaf).attrs.range);
+            const view = self.attrsViewOf(self.get(leaf).attrs.range);
+            name_slices[i] = view.names;
+            value_slices[i] = view.values;
             cursors[i] = 0;
-            cap += @intCast(slices[i].len);
+            cap += @intCast(view.names.len);
         }
 
         const reserved = try self.reserveAttrsLocal(cap);
-        const dst = self.attrs.sliceMut(reserved);
+        const dst = self.attrsViewMutOf(reserved);
         var out: usize = 0;
         while (true) {
             // One scan: the smallest name across all cursors, the set of
@@ -2274,9 +2312,9 @@ pub const ObjectHeap = struct {
             var min_name: InternId = undefined;
             var mask: usize = 0;
             var next: InternId = std.math.maxInt(InternId);
-            for (slices, cursors, 0..) |s, c, i| {
+            for (name_slices, cursors, 0..) |s, c, i| {
                 if (c >= s.len) continue;
-                const nm = s[c].name;
+                const nm = s[c];
                 if (mask == 0 or nm < min_name) {
                     if (mask != 0 and min_name < next) next = min_name;
                     min_name = nm;
@@ -2296,26 +2334,28 @@ pub const ObjectHeap = struct {
                 // re-scanning all cursors per entry — overlay leaves are
                 // typically tiny next to the accumulated base, so runs are
                 // long and this skips almost all per-entry scans.
-                const s = slices[winner];
+                const s = name_slices[winner];
                 var end = cursors[winner] + 1;
                 // Gallop: exponential probe, then binary search for the
-                // first entry >= `next`.
+                // first entry >= `next` — touches ONLY the name plane.
                 var step: usize = 1;
-                while (end + step <= s.len and s[end + step - 1].name < next) {
+                while (end + step <= s.len and s[end + step - 1] < next) {
                     end += step;
                     step *= 2;
                 }
                 var hi = @min(end + step - 1, s.len);
                 while (end < hi) {
                     const mid = end + (hi - end) / 2;
-                    if (s[mid].name < next) end = mid + 1 else hi = mid;
+                    if (s[mid] < next) end = mid + 1 else hi = mid;
                 }
-                const run = s[cursors[winner]..end];
-                @memcpy(dst[out..][0..run.len], run);
-                out += run.len;
+                const run_len = end - cursors[winner];
+                @memcpy(dst.names[out..][0..run_len], s[cursors[winner]..end]);
+                @memcpy(dst.values[out..][0..run_len], value_slices[winner][cursors[winner]..end]);
+                out += run_len;
                 cursors[winner] = end;
             } else {
-                dst[out] = slices[winner][cursors[winner]];
+                dst.names[out] = name_slices[winner][cursors[winner]];
+                dst.values[out] = value_slices[winner][cursors[winner]];
                 out += 1;
                 var rest = mask;
                 while (rest != 0) {
@@ -2366,7 +2406,7 @@ pub const ObjectHeap = struct {
         return switch (self.get(id).*) {
             .context_string => |string| .{
                 .text = string.text,
-                .context = self.attrs.slice(string.context),
+                .context = self.attrsViewOf(string.context),
             },
             else => error.InvalidObjectType,
         };
@@ -2509,10 +2549,31 @@ pub const ObjectHeap = struct {
         return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
 
-    pub fn addContextString(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
+    /// AoS-input convenience for builders that accumulate temporary
+    /// `AttrEntry` lists; splits into the planes at publish.
+    pub fn addContextStringEntries(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
         const pending = try self.beginObjectSlot();
         errdefer self.abortObjectSlot(pending);
         const range = try self.appendAttrEntries(context);
+        errdefer self.releaseAttrs(range);
+        try self.sortAndDedupAttrs(range);
+        return self.commitObjectSlot(pending, .{ .context_string = .{ .text = text, .context = range } });
+    }
+
+    /// Publish a copy of an existing sorted view as a fresh attrset.
+    pub fn addAttrsView(self: *ObjectHeap, view: AttrsView) !ObjectId {
+        return self.addAttrsFromValuesSorted(view.names, view.values, AttrPositions.borrowed(&.{}));
+    }
+
+    pub fn addContextString(self: *ObjectHeap, text: InternId, context: AttrsView) !ObjectId {
+        const pending = try self.beginObjectSlot();
+        errdefer self.abortObjectSlot(pending);
+        const range = try self.reserveAttrsLocal(@intCast(context.len()));
+        {
+            const dst = self.attrsViewMutOf(range);
+            @memcpy(dst.names, context.names);
+            @memcpy(dst.values, context.values);
+        }
         errdefer self.releaseAttrs(range);
         try self.sortAndDedupAttrs(range);
         return self.commitObjectSlot(pending, .{ .context_string = .{ .text = text, .context = range } });
@@ -2531,40 +2592,45 @@ pub const ObjectHeap = struct {
         //
         // Reserve the no-overlap upper bound. Any suffix made unnecessary by
         // duplicate names is returned to the range free list below.
-        const cap: u32 = @intCast(left.len + right.len);
+        const cap: u32 = @intCast(left.len() + right.len());
         const reserved = try self.reserveAttrsLocal(cap);
         errdefer self.releaseAttrs(reserved);
-        const dst = self.attrs.sliceMut(reserved);
+        const dst = self.attrsViewMutOf(reserved);
 
         var out: usize = 0;
         var left_i: usize = 0;
         var right_i: usize = 0;
-        while (left_i < left.len and right_i < right.len) {
-            const l = left[left_i];
-            const r = right[right_i];
-            if (l.name < r.name) {
-                dst[out] = l;
+        while (left_i < left.len() and right_i < right.len()) {
+            const ln = left.names[left_i];
+            const rn = right.names[right_i];
+            if (ln < rn) {
+                dst.names[out] = ln;
+                dst.values[out] = left.values[left_i];
                 out += 1;
                 left_i += 1;
-            } else if (l.name > r.name) {
-                dst[out] = r;
+            } else if (ln > rn) {
+                dst.names[out] = rn;
+                dst.values[out] = right.values[right_i];
                 out += 1;
                 right_i += 1;
             } else {
-                dst[out] = r;
+                dst.names[out] = rn;
+                dst.values[out] = right.values[right_i];
                 out += 1;
                 left_i += 1;
                 right_i += 1;
             }
         }
-        if (left_i < left.len) {
-            const n = left.len - left_i;
-            @memcpy(dst[out..][0..n], left[left_i..]);
+        if (left_i < left.len()) {
+            const n = left.len() - left_i;
+            @memcpy(dst.names[out..][0..n], left.names[left_i..]);
+            @memcpy(dst.values[out..][0..n], left.values[left_i..]);
             out += n;
         }
-        if (right_i < right.len) {
-            const n = right.len - right_i;
-            @memcpy(dst[out..][0..n], right[right_i..]);
+        if (right_i < right.len()) {
+            const n = right.len() - right_i;
+            @memcpy(dst.names[out..][0..n], right.names[right_i..]);
+            @memcpy(dst.values[out..][0..n], right.values[right_i..]);
             out += n;
         }
 
@@ -2607,10 +2673,11 @@ pub const ObjectHeap = struct {
         const pending = try self.beginObjectSlot();
         errdefer self.abortObjectSlot(pending);
         const range = try self.reserveAttrsLocal(@intCast(names.len));
-        const entries = self.attrs.sliceMut(range);
-        for (entries, names, values) |*e, n, v| e.* = .{ .name = n, .value = v };
+        const v = self.attrsViewMutOf(range);
+        @memcpy(v.names, names);
+        @memcpy(v.values, values);
         switch (ordering) {
-            .presorted_unique => std.debug.assert(attrEntriesSortedUnique(entries)),
+            .presorted_unique => std.debug.assert(attrNamesSortedUnique(v.names)),
             .unordered => try self.sortAndDedupAttrs(range),
         }
         std.debug.assert(positionsSortedByName(self.attrPositionsEntries(positions)));
@@ -2674,21 +2741,19 @@ pub const ObjectHeap = struct {
         errdefer self.abortObjectSlot(pending);
         const range = try self.reserveAttrsLocal(count);
         errdefer self.releaseAttrs(range);
-        const entries = self.attrs.sliceMut(range);
+        const v = self.attrsViewMutOf(range);
 
         var i: usize = 0;
         var entry_i: usize = 0;
         while (i < pairs.len) : (i += 2) {
             if (pairs[i].isNull()) continue;
-            entries[entry_i] = .{
-                .name = pairs[i].asInternId(),
-                .value = pairs[i + 1],
-            };
+            v.names[entry_i] = pairs[i].asInternId();
+            v.values[entry_i] = pairs[i + 1];
             entry_i += 1;
         }
 
         if (comptime presorted) {
-            std.debug.assert(attrEntriesSortedUnique(entries));
+            std.debug.assert(attrNamesSortedUnique(v.names));
         } else {
             try self.sortAndDedupAttrs(range);
         }
@@ -2704,10 +2769,10 @@ pub const ObjectHeap = struct {
         return self.commitObjectSlot(pending, .{ .attrs = .{ .range = range, .positions = AttrPositions.fromRange(pos_range) } });
     }
 
-    fn attrEntriesSortedUnique(entries: []const AttrEntry) bool {
-        if (entries.len < 2) return true;
-        for (entries[1..], 1..) |entry, i| {
-            if (entry.name <= entries[i - 1].name) return false;
+    fn attrNamesSortedUnique(names: []const InternId) bool {
+        if (names.len < 2) return true;
+        for (names[1..], 1..) |name, i| {
+            if (name <= names[i - 1]) return false;
         }
         return true;
     }
@@ -2897,7 +2962,11 @@ pub const ObjectHeap = struct {
 
     fn appendAttrEntries(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
         const range = try self.reserveAttrsLocal(@intCast(entries.len));
-        @memcpy(self.attrs.sliceMut(range), entries);
+        const v = self.attrsViewMutOf(range);
+        for (entries, v.names, v.values) |e, *n, *val| {
+            n.* = e.name;
+            val.* = e.value;
+        }
         return range;
     }
 
@@ -2913,7 +2982,41 @@ pub const ObjectHeap = struct {
     // measurably thrashes on (attrset-heavy bench, 2026-08). Stability is
     // incidental — duplicate names are rejected after every sort.
     fn sortAttrs(self: *ObjectHeap, range: AttrRange) void {
-        std.mem.sort(AttrEntry, self.attrs.sliceMut(range), {}, attrEntryLessThan);
+        // Co-sort the two planes by name via a temporary interleaved copy
+        // and the STABLE BLOCK sort. pdq was measured pathological against
+        // generation-ordered names in the attrset-sort round (and a
+        // context-sort re-introduction of it cost ~2% w=1); the linear
+        // materialize/split is cheap next to the sort itself. Small sets —
+        // the vast majority — use a stack buffer.
+        const v = self.attrsViewMutOf(range);
+        var stack_buf: [64]AttrEntry = undefined;
+        const entries: []AttrEntry = if (v.names.len <= stack_buf.len)
+            stack_buf[0..v.names.len]
+        else
+            self.allocator.alloc(AttrEntry, v.names.len) catch {
+                // Allocation-free fallback: insertion co-sort (rare, big,
+                // OOM-pressured — correctness over speed).
+                insertionCoSort(v.names, v.values);
+                return;
+            };
+        defer if (v.names.len > stack_buf.len) self.allocator.free(entries);
+        for (entries, v.names, v.values) |*e, n, val| e.* = .{ .name = n, .value = val };
+        std.mem.sort(AttrEntry, entries, {}, attrEntryLessThan);
+        for (entries, v.names, v.values) |e, *n, *val| {
+            n.* = e.name;
+            val.* = e.value;
+        }
+    }
+
+    fn insertionCoSort(names: []InternId, values: []Value) void {
+        var i: usize = 1;
+        while (i < names.len) : (i += 1) {
+            var j = i;
+            while (j > 0 and names[j] < names[j - 1]) : (j -= 1) {
+                std.mem.swap(InternId, &names[j], &names[j - 1]);
+                std.mem.swap(Value, &values[j], &values[j - 1]);
+            }
+        }
     }
 
     fn sortAttrPositions(self: *ObjectHeap, range: AttrPosRange) void {
@@ -2927,17 +3030,17 @@ pub const ObjectHeap = struct {
     /// generated list interns names in id order — and the check reads
     /// exactly the memory the sort was about to touch.
     fn sortAndDedupAttrs(self: *ObjectHeap, range: AttrRange) !void {
-        if (attrEntriesSortedUnique(self.attrs.slice(range))) return;
+        if (attrNamesSortedUnique(self.attrs.sliceSecond(range))) return;
         self.sortAttrs(range);
         try self.rejectDuplicateAttrs(range);
     }
 
     fn rejectDuplicateAttrs(self: *const ObjectHeap, range: AttrRange) !void {
-        const entries = self.attrs.slice(range);
-        if (entries.len < 2) return;
+        const names = self.attrs.sliceSecond(range);
+        if (names.len < 2) return;
 
-        for (entries[1..], 1..) |entry, i| {
-            if (entry.name == entries[i - 1].name) {
+        for (names[1..], 1..) |name, i| {
+            if (name == names[i - 1]) {
                 return error.DuplicateAttribute;
             }
         }
@@ -2969,7 +3072,7 @@ pub const ObjectHeap = struct {
         self: *ObjectHeap,
         left_id: ObjectId,
         right_id: ObjectId,
-        right_attrs: []const AttrEntry,
+        right_attrs: AttrsView,
     ) !AttrPosRange {
         const left_positions = self.attrPositionsSlice(left_id);
         const right_positions = self.attrPositionsSlice(right_id);
@@ -2982,12 +3085,12 @@ pub const ObjectHeap = struct {
         defer merged.deinit(self.allocator);
 
         for (left_positions) |position| {
-            if (!attrEntriesContainName(right_attrs, position.name)) {
+            if (binarySearchAttrIndex(right_attrs.names, position.name) == null) {
                 merged.appendAssumeCapacity(position);
             }
         }
         for (right_positions) |position| {
-            if (attrEntriesContainName(right_attrs, position.name)) {
+            if (binarySearchAttrIndex(right_attrs.names, position.name) != null) {
                 merged.appendAssumeCapacity(position);
             }
         }
@@ -3089,64 +3192,70 @@ pub const ObjectHeap = struct {
     }
 };
 
-fn binarySearchAttr(entries: []const AttrEntry, name: InternId) ?Value {
-    const idx = binarySearchAttrIndex(entries, name) orelse return null;
-    return entries[idx].value;
+fn binarySearchAttr(view: AttrsView, name: InternId) ?Value {
+    const idx = binarySearchAttrIndex(view.names, name) orelse return null;
+    return view.values[idx];
+}
+
+fn attrEntryLessThan(_: void, lhs: AttrEntry, rhs: AttrEntry) bool {
+    return lhs.name < rhs.name;
 }
 
 /// Detector sentinel: `poisonYoung` stamps freed young attr entries with this
 /// name. Any name scan that observes it is reading a dangling attr slice held
 /// across a collection — the panic's stack trace names the buggy caller.
-const gc_poison_name: InternId = std.math.maxInt(InternId) - 7;
+pub const gc_poison_name: InternId = std.math.maxInt(InternId) - 7;
 
 inline fn gcAssertNotPoisonName(name: InternId) void {
     if (comptime !gc_debug) return;
     if (name == gc_poison_name) @panic("gc: read poisoned attr name — dangling attr slice held across a collection");
 }
 
-fn binarySearchAttrIndex(entries: []const AttrEntry, name: InternId) ?usize {
+fn binarySearchAttrIndex(names: []const InternId, name: InternId) ?usize {
     // Most compulsory lookups are into tiny attrsets. Spell out the same
     // binary-search decision tree for up to four entries so those searches
-    // avoid loop bookkeeping and midpoint arithmetic.
-    switch (entries.len) {
+    // avoid loop bookkeeping and midpoint arithmetic. The name plane packs
+    // 16 names per cache line (vs 4 interleaved entries), so the general
+    // loop below touches a quarter of the lines it used to.
+    switch (names.len) {
         0 => return null,
         1 => {
-            const n0 = entries[0].name;
+            const n0 = names[0];
             gcAssertNotPoisonName(n0);
             return if (n0 == name) 0 else null;
         },
         2 => {
-            const n1 = entries[1].name;
+            const n1 = names[1];
             gcAssertNotPoisonName(n1);
             if (n1 == name) return 1;
             if (name > n1) return null;
-            const n0 = entries[0].name;
+            const n0 = names[0];
             gcAssertNotPoisonName(n0);
             return if (n0 == name) 0 else null;
         },
         3 => {
-            const n1 = entries[1].name;
+            const n1 = names[1];
             gcAssertNotPoisonName(n1);
             if (n1 == name) return 1;
             const index: usize = if (name < n1) 0 else 2;
-            const candidate = entries[index].name;
+            const candidate = names[index];
             gcAssertNotPoisonName(candidate);
             return if (candidate == name) index else null;
         },
         4 => {
-            const n2 = entries[2].name;
+            const n2 = names[2];
             gcAssertNotPoisonName(n2);
             if (n2 == name) return 2;
             if (name > n2) {
-                const n3 = entries[3].name;
+                const n3 = names[3];
                 gcAssertNotPoisonName(n3);
                 return if (n3 == name) 3 else null;
             }
-            const n1 = entries[1].name;
+            const n1 = names[1];
             gcAssertNotPoisonName(n1);
             if (n1 == name) return 1;
             if (name > n1) return null;
-            const n0 = entries[0].name;
+            const n0 = names[0];
             gcAssertNotPoisonName(n0);
             return if (n0 == name) 0 else null;
         },
@@ -3154,10 +3263,10 @@ fn binarySearchAttrIndex(entries: []const AttrEntry, name: InternId) ?usize {
     }
 
     var lo: usize = 0;
-    var hi: usize = entries.len;
+    var hi: usize = names.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const entry_name = entries[mid].name;
+        const entry_name = names[mid];
         gcAssertNotPoisonName(entry_name);
         if (entry_name == name) return mid;
         if (entry_name < name) {
@@ -3167,10 +3276,6 @@ fn binarySearchAttrIndex(entries: []const AttrEntry, name: InternId) ?usize {
         }
     }
     return null;
-}
-
-fn attrEntryLessThan(_: void, lhs: AttrEntry, rhs: AttrEntry) bool {
-    return lhs.name < rhs.name;
 }
 
 fn attrPosEntryLessThan(_: void, lhs: AttrPosEntry, rhs: AttrPosEntry) bool {
@@ -3205,11 +3310,13 @@ test "binary attr search covers unrolled tiny sets" {
     };
     const missing = [_]InternId{ 1, 3, 5, 7, 9, 11 };
 
+    var names_buf: [entries.len]InternId = undefined;
+    for (entries, 0..) |e, i| names_buf[i] = e.name;
     for (0..entries.len + 1) |len| {
-        for (entries[0..len], 0..) |entry, index|
-            try std.testing.expectEqual(index, binarySearchAttrIndex(entries[0..len], entry.name).?);
+        for (names_buf[0..len], 0..) |entry_name, index|
+            try std.testing.expectEqual(index, binarySearchAttrIndex(names_buf[0..len], entry_name).?);
         for (missing) |name|
-            try std.testing.expectEqual(@as(?usize, null), binarySearchAttrIndex(entries[0..len], name));
+            try std.testing.expectEqual(@as(?usize, null), binarySearchAttrIndex(names_buf[0..len], name));
     }
 }
 

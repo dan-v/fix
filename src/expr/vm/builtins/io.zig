@@ -120,10 +120,10 @@ fn demandContext(self: *VM, value: Value) !?DemandContext {
     const context_entries = (try self.heap.getContextString(value.asObjectId())).context;
     var drv_name: ?@import("runtime").types.InternId = null;
     var descriptor: Value = undefined;
-    for (context_entries) |entry| {
-        if (!std.mem.endsWith(u8, self.intern.get(entry.name), ".drv")) continue;
-        drv_name = entry.name;
-        descriptor = entry.value;
+    for (context_entries.names, context_entries.values) |entry_name, entry_value| {
+        if (!std.mem.endsWith(u8, self.intern.get(entry_name), ".drv")) continue;
+        drv_name = entry_name;
+        descriptor = entry_value;
         break;
     }
     const name = drv_name orelse return null;

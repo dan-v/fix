@@ -58,10 +58,10 @@ test "object heap stores list and attrs payloads behind object ids" {
     try std.testing.expectError(error.IndexOutOfBounds, heap.getListItem(list_id, 3));
 
     const entries = try heap.materializeAttrs(attrs_id);
-    try std.testing.expectEqual(@as(usize, 2), entries.len);
-    try std.testing.expectEqual(@as(InternId, 11), entries[0].name);
-    try std.testing.expectEqual(@as(i64, 42), entries[0].value.asInt());
-    try std.testing.expect(entries[1].value.asBool());
+    try std.testing.expectEqual(@as(usize, 2), entries.len());
+    try std.testing.expectEqual(@as(InternId, 11), entries.names[0]);
+    try std.testing.expectEqual(@as(i64, 42), entries.values[0].asInt());
+    try std.testing.expect(entries.values[1].asBool());
     try std.testing.expectEqual(@as(i64, 42), (try heap.getAttrValue(attrs_id, 11)).asInt());
     try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 13));
 }
@@ -212,9 +212,9 @@ test "object heap sorts attrs for binary lookup" {
     });
 
     const entries = try heap.materializeAttrs(attrs_id);
-    try std.testing.expectEqual(@as(InternId, 10), entries[0].name);
-    try std.testing.expectEqual(@as(InternId, 20), entries[1].name);
-    try std.testing.expectEqual(@as(InternId, 30), entries[2].name);
+    try std.testing.expectEqual(@as(InternId, 10), entries.names[0]);
+    try std.testing.expectEqual(@as(InternId, 20), entries.names[1]);
+    try std.testing.expectEqual(@as(InternId, 30), entries.names[2]);
     try std.testing.expectEqual(@as(i64, 1), (try heap.getAttrValue(attrs_id, 10)).asInt());
     try std.testing.expectEqual(@as(i64, 2), (try heap.getAttrValue(attrs_id, 20)).asInt());
     try std.testing.expectEqual(@as(i64, 3), (try heap.getAttrValue(attrs_id, 30)).asInt());
@@ -367,7 +367,7 @@ test "object heap preserves earlier ranges as side arenas grow" {
         .{ .name = 1, .value = Value.int(1) },
         .{ .name = 2, .value = Value.int(2) },
     });
-    const attrs_ptr = (try heap.materializeAttrs(attrs_id)).ptr;
+    const attrs_ptr = (try heap.materializeAttrs(attrs_id)).values.ptr;
 
     i = 0;
     while (i < 4096) : (i += 1) {
@@ -379,7 +379,7 @@ test "object heap preserves earlier ranges as side arenas grow" {
     }
 
     const first_attrs = try heap.materializeAttrs(attrs_id);
-    try std.testing.expectEqual(attrs_ptr, first_attrs.ptr);
+    try std.testing.expectEqual(attrs_ptr, first_attrs.values.ptr);
     try std.testing.expectEqual(@as(i64, 2), (try heap.getAttrValue(attrs_id, 2)).asInt());
 }
 
@@ -421,7 +421,7 @@ test "object heap supports empty lists and empty attrs" {
 
     const attrs_id = try heap.addAttrs(&.{});
     const entries = try heap.materializeAttrs(attrs_id);
-    try std.testing.expectEqual(@as(usize, 0), entries.len);
+    try std.testing.expectEqual(@as(usize, 0), entries.len());
     try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 1));
 }
 
@@ -456,7 +456,7 @@ test "empty lists and attrs are interned to shared singletons after bootstrap" {
     try std.testing.expectEqual(p, q);
     try std.testing.expectEqual(p, r);
     try std.testing.expectEqual(p, s);
-    try std.testing.expectEqual(@as(usize, 0), (try heap.materializeAttrs(p)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try heap.materializeAttrs(p)).len());
 
     // Bootstrapping again is a no-op — the ids are stable.
     const list_before = heap.empty_list_id.?;
@@ -473,8 +473,8 @@ test "object heap supports a single-entry attrs object" {
     });
 
     const entries = try heap.materializeAttrs(attrs_id);
-    try std.testing.expectEqual(@as(usize, 1), entries.len);
-    try std.testing.expectEqual(@as(InternId, 5), entries[0].name);
+    try std.testing.expectEqual(@as(usize, 1), entries.len());
+    try std.testing.expectEqual(@as(InternId, 5), entries.names[0]);
     try std.testing.expectEqual(@as(i64, 99), (try heap.getAttrValue(attrs_id, 5)).asInt());
     try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 6));
 }
@@ -517,6 +517,6 @@ test "object heap sweep frees unmarked objects and lets ids be reused" {
     });
     try std.testing.expectEqual(objects_before_reuse, heap.objects.count());
     const reused_entries = try heap.materializeAttrs(reused_attrs);
-    try std.testing.expectEqual(@as(usize, 1), reused_entries.len);
+    try std.testing.expectEqual(@as(usize, 1), reused_entries.len());
     try std.testing.expectEqual(@as(i64, 7), (try heap.getAttrValue(reused_attrs, 1)).asInt());
 }

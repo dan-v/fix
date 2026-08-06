@@ -46,7 +46,7 @@ pub fn builtinToJSON(self: *VM, arg: Value) !Value {
     if (comptime prof.enabled) if (self.workerId() == 0)
         prof_census.recordLongString(text.len, context.items.len != 0);
     if (context.items.len == 0) return vm_strings.makeString(self, text);
-    return Value.contextString(try self.heap.addContextString(try self.intern.intern(text), context.items));
+    return Value.contextString(try self.heap.addContextStringEntries(try self.intern.intern(text), context.items));
 }
 
 pub fn writeJsonValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
@@ -138,8 +138,9 @@ fn writeJsonStringValue(
         const gc_roots = vm_force.rootsBegin(self);
         defer vm_force.rootsEnd(self, gc_roots);
         vm_force.rootKeep(self, value);
-        for (try contextEntriesForValue(self, value)) |entry| {
-            try appendContextEntry(self, entries, entry.name, entry.value);
+        const cv_ = try contextEntriesForValue(self, value);
+        for (cv_.names, cv_.values) |entry_name, entry_value| {
+            try appendContextEntry(self, entries, entry_name, entry_value);
         }
     }
 }
@@ -247,7 +248,7 @@ pub fn builtinToXML(self: *VM, arg: Value) !Value {
     if (comptime prof.enabled) if (self.workerId() == 0)
         prof_census.recordLongString(text.len, context.items.len != 0);
     if (context.items.len == 0) return vm_strings.makeString(self, text);
-    return Value.contextString(try self.heap.addContextString(try self.intern.intern(text), context.items));
+    return Value.contextString(try self.heap.addContextStringEntries(try self.intern.intern(text), context.items));
 }
 
 pub fn writeLazyXmlValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
@@ -315,8 +316,9 @@ fn writeXmlValue(
             try writeXmlEscaped(writer, try vm_strings.stringBytes(self, forced));
             try writer.writeAll("\" />\n");
             if (context) |entries| {
-                for (try contextEntriesForValue(self, forced)) |entry| {
-                    try appendContextEntry(self, entries, entry.name, entry.value);
+                const cv = try contextEntriesForValue(self, forced);
+                for (cv.names, cv.values) |entry_name, entry_value| {
+                    try appendContextEntry(self, entries, entry_name, entry_value);
                 }
             }
         },

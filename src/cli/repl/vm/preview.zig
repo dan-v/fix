@@ -514,17 +514,18 @@ pub fn Methods(comptime Explorer: type) type {
             const info = self.ev.inspectHeapObject(snapshot, id) catch return;
             switch (info) {
                 .attrs => if (self.ev.heapAttrsOf(id)) |attrs| {
-                    try lines.append(arena, try std.fmt.allocPrint(arena, " attrs · {d} members", .{attrs.len}));
-                    for (attrs[0..@min(attrs.len, preview_line_cap)]) |entry| {
-                        const name = self.ev.internTable().get(entry.name);
+                    try lines.append(arena, try std.fmt.allocPrint(arena, " attrs · {d} members", .{attrs.len()}));
+                    const shown3 = @min(attrs.len(), preview_line_cap);
+                    for (attrs.names[0..shown3], attrs.values[0..shown3]) |entry_name, entry_value| {
+                        const name = self.ev.internTable().get(entry_name);
                         const value_width = content_width -| width_mod.strWidth(name) -| 4;
-                        const detail = try Explorer.Ops.value_summary.shallowValueSummary(self, arena, entry.value, value_width);
+                        const detail = try Explorer.Ops.value_summary.shallowValueSummary(self, arena, entry_value, value_width);
                         try lines.append(arena, try std.fmt.allocPrint(arena, "  {s} = {s}", .{ name, detail }));
                     }
-                    if (attrs.len > preview_line_cap) try lines.append(arena, try std.fmt.allocPrint(
+                    if (attrs.len() > preview_line_cap) try lines.append(arena, try std.fmt.allocPrint(
                         arena,
                         "  … {d} more",
-                        .{attrs.len - preview_line_cap},
+                        .{attrs.len() - preview_line_cap},
                     ));
                 } else |_| {},
                 .list => if (self.ev.heapListOf(id)) |items| {

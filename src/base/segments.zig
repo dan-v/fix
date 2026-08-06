@@ -53,6 +53,14 @@ pub fn Params(comptime Vma: type) type {
         /// per-thread blocks — write-contention relief traded against the
         /// read-side locality of global temporal packing; size per store.
         tlab_chunk_slots: u32 = 8192,
+        /// Structure-of-arrays second plane: each segment's single backing
+        /// allocation holds `cap` slots of T followed by `cap` slots of this
+        /// type, addressed by the SAME Range. `sliceSecond`/`getSecond` read
+        /// the paired plane. T must have alignment >= the paired type's (the
+        /// paired plane starts at cap*sizeOf(T) from the segment base). The
+        /// hugetlb/populate frontiers cover only the T-plane prefix; the
+        /// paired plane rides ordinary demand-paged memory.
+        paired_second: ?type = null,
     };
 }
 
@@ -67,6 +75,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         if (@hasField(@TypeOf(params_in), "vma_tag")) p.vma_tag = params_in.vma_tag;
         if (@hasField(@TypeOf(params_in), "huge_overlay_min")) p.huge_overlay_min = params_in.huge_overlay_min;
         if (@hasField(@TypeOf(params_in), "tlab_chunk_slots")) p.tlab_chunk_slots = params_in.tlab_chunk_slots;
+        if (@hasField(@TypeOf(params_in), "paired_second")) p.paired_second = params_in.paired_second;
         break :blk p;
     };
     comptime {
@@ -170,6 +179,11 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
                     self.seg_owned[i] = false;
                     self.seg_huge_frontier[i] = 0;
                     self.seg_huge_off[i] = false;
+                } else if (comptime paired_enabled) {
+                    // Paired segments were allocated as raw bytes spanning
+                    // both planes — free with the same shape.
+                    const bytes: [*]align(@alignOf(T)) u8 = @ptrCast(@alignCast(ptr));
+                    allocator.free(bytes[0 .. @as(usize, segmentCapacity(@intCast(i))) * slot_bytes]);
                 } else {
                     allocator.free(ptr[0..segmentCapacity(@intCast(i))]);
                 }
@@ -325,11 +339,10 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         /// Re-tag a freshly-claimed segment's backing region for RSS
         /// attribution (no-op unless `params.vma_tag` is set and the
         /// segment is a dedicated mapping — see runtime/vma.zig).
-        fn nameSegment(buf: []T) void {
+        fn nameSegment(ptr: [*]T, bytes: usize) void {
             if (comptime params.vma_tag) |tag| {
-                const bytes = buf.len * @sizeOf(T);
                 if (bytes < (64 << 10)) return;
-                Vma.retagRegion(buf.ptr, tag);
+                Vma.retagRegion(ptr, tag);
             }
         }
 
@@ -426,13 +439,59 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
                 if (self.mapOwnedSegment(segment)) return;
             }
             const cap = segmentCapacity(segment);
-            const buf = try allocator.alloc(T, cap);
-            self.segments[segment].store(buf.ptr, .release);
-            nameSegment(buf);
+            if (comptime paired_enabled) {
+                // One allocation, two planes: T plane first (keeps `slice`
+                // and the overlay-prefix math unchanged), paired plane after.
+                const raw = try allocator.alignedAlloc(u8, .fromByteUnits(@alignOf(T)), @as(usize, cap) * slot_bytes);
+                const ptr: [*]T = @ptrCast(@alignCast(raw.ptr));
+                self.segments[segment].store(ptr, .release);
+                nameSegment(ptr, @as(usize, cap) * slot_bytes);
+            } else {
+                const buf = try allocator.alloc(T, cap);
+                self.segments[segment].store(buf.ptr, .release);
+                nameSegment(buf.ptr, @as(usize, cap) * @sizeOf(T));
+            }
         }
 
+        pub const Paired: type = params.paired_second orelse void;
+        const paired_enabled = params.paired_second != null;
+        /// Bytes per slot across both planes (T alone when unpaired).
+        /// Public: byte-accounting consumers (committed-RSS proxies) must
+        /// see the true two-plane cost, not @sizeOf of any one element.
+        pub const stored_slot_bytes: usize = @sizeOf(T) + (if (paired_enabled) @sizeOf(Paired) else 0);
+        const slot_bytes: usize = stored_slot_bytes;
+
         fn segmentBytes(segment: u32) usize {
-            return @as(usize, segmentCapacity(segment)) * @sizeOf(T);
+            return @as(usize, segmentCapacity(segment)) * slot_bytes;
+        }
+
+        /// Base of the paired plane inside `segment`: the T plane occupies
+        /// the first cap*sizeOf(T) bytes of the single backing allocation.
+        fn pairedBase(self: *const Self, segment: u32) [*]Paired {
+            comptime std.debug.assert(paired_enabled);
+            comptime std.debug.assert(@alignOf(T) >= @alignOf(Paired));
+            const seg_ptr = self.segments[segment].load(.acquire).?;
+            const bytes: [*]u8 = @ptrCast(seg_ptr);
+            return @ptrCast(@alignCast(bytes + @as(usize, segmentCapacity(segment)) * @sizeOf(T)));
+        }
+
+        pub fn sliceSecond(self: *const Self, range: Range) []const Paired {
+            if (range.len == 0) return &.{};
+            const base = self.pairedBase(range.segment);
+            return base[range.offset .. range.offset + range.len];
+        }
+
+        /// Paired-plane single-slot read; caller has already proven the id's
+        /// segment allocated (a successful T-plane read of the same id).
+        pub fn getSecondAssume(self: *const Self, id: u32) Paired {
+            const loc = locationOf(id);
+            return self.pairedBase(loc.segment)[loc.offset];
+        }
+
+        pub fn sliceSecondMut(self: *Self, range: Range) []Paired {
+            if (range.len == 0) return &.{};
+            const base = self.pairedBase(range.segment);
+            return base[range.offset .. range.offset + range.len];
         }
 
         /// Self-map a big segment (see `Params.huge_overlay_min`): a

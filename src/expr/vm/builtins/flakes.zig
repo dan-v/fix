@@ -508,9 +508,10 @@ fn writeLockJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: 
 fn refAttrsToFields(gen: *LockGen, ref_attrs: Value) !std.ArrayListUnmanaged(JField) {
     var fields: std.ArrayListUnmanaged(JField) = .empty;
     if (ref_attrs.isAttrs()) {
-        for (try gen.vm.heap.materializeAttrs(ref_attrs.asObjectId())) |e| {
-            const name = try gen.arena.dupe(u8, gen.vm.intern.get(e.name));
-            const val = try vm_force.forceValue(gen.vm, e.value);
+        const ra_view = try gen.vm.heap.materializeAttrs(ref_attrs.asObjectId());
+        for (ra_view.names, ra_view.values) |e_name, e_value| {
+            const name = try gen.arena.dupe(u8, gen.vm.intern.get(e_name));
+            const val = try vm_force.forceValue(gen.vm, e_value);
             const jv: JVal = if (val.isString())
                 .{ .string = try gen.arena.dupe(u8, gen.vm.intern.get(val.asInternId())) }
             else if (val.isInt())
@@ -780,8 +781,9 @@ fn lockFlakeInputs(gen: *LockGen, flake_value: Value, prefix: []const []const u8
     const inputs = try vm_force.forceValue(self, inputs_v);
     if (!inputs.isAttrs()) return edges.items;
 
-    for (try self.heap.materializeAttrs(inputs.asObjectId())) |entry| {
-        const name = self.intern.get(entry.name);
+    const inputs_view = try self.heap.materializeAttrs(inputs.asObjectId());
+    for (inputs_view.names, inputs_view.values) |entry_name, entry_value| {
+        const name = self.intern.get(entry_name);
         // At the root, an input the user didn't ask to update keeps its existing
         // pin: copy the old node subtree instead of re-fetching.
         if (prefix.len == 0 and !gen.shouldRepin(name)) {
@@ -792,7 +794,7 @@ fn lockFlakeInputs(gen: *LockGen, flake_value: Value, prefix: []const []const u8
                 }
             }
         }
-        const decl = try vm_force.forceValue(self, entry.value);
+        const decl = try vm_force.forceValue(self, entry_value);
         try edges.append(gen.arena, try lockInput(gen, try gen.arena.dupe(u8, name), decl, prefix, srcs));
     }
     return edges.items;
@@ -853,7 +855,7 @@ fn flakeLockPath(self: *VM, out_path: []const u8, dir: ?[]const u8) ![]u8 {
 fn flakeInputsAttrs(self: *VM, flake_value: Value) !?Value {
     const inputs_v = (self.heap.getAttrValueOpt(flake_value.asObjectId(), try self.intern.intern("inputs")) catch return null) orelse return null;
     const inputs = try vm_force.forceValue(self, inputs_v);
-    if (!inputs.isAttrs() or (try self.heap.materializeAttrs(inputs.asObjectId())).len == 0) return null;
+    if (!inputs.isAttrs() or (try self.heap.materializeAttrs(inputs.asObjectId())).len() == 0) return null;
     return inputs;
 }
 
@@ -971,7 +973,10 @@ pub fn resolveFlakeNode(self: *VM, ref_attrs: Value, sub_inputs: Value, is_flake
     vm_force.rootKeep(self, self_cell);
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
-    for (try self.heap.materializeAttrs(sub_inputs.asObjectId())) |e| try entries.append(self.allocator, e);
+    {
+        const sub_view = try self.heap.materializeAttrs(sub_inputs.asObjectId());
+        for (sub_view.names, sub_view.values) |e_name, e_value| try entries.append(self.allocator, .{ .name = e_name, .value = e_value });
+    }
     try entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = self_cell });
     const inputs = Value.attrs(try self.heap.addAttrs(entries.items));
     vm_force.rootKeep(self, inputs);
@@ -1176,15 +1181,21 @@ fn flakeResultValue(self: *VM, source_info: Value, inputs: Value, outputs: Value
     // Promote every sourceInfo field (outPath, narHash, rev, revCount,
     // shortRev, lastModified, submodules, …) — not a fixed subset — so `self`
     // and the returned flake carry whatever the fetcher produced, as Nix does.
-    for (try self.heap.materializeAttrs(source_info.asObjectId())) |entry| {
-        if (attrEntryNameIndex(entries.items, entry.name) == null) {
-            try entries.append(self.allocator, entry);
+    {
+        const si_view = try self.heap.materializeAttrs(source_info.asObjectId());
+        for (si_view.names, si_view.values) |entry_name, entry_value| {
+            if (attrEntryNameIndex(entries.items, entry_name) == null) {
+                try entries.append(self.allocator, .{ .name = entry_name, .value = entry_value });
+            }
         }
     }
 
-    for (try self.heap.materializeAttrs(outputs.asObjectId())) |entry| {
-        if (attrEntryNameIndex(entries.items, entry.name) == null) {
-            try entries.append(self.allocator, entry);
+    {
+        const out_view = try self.heap.materializeAttrs(outputs.asObjectId());
+        for (out_view.names, out_view.values) |entry_name, entry_value| {
+            if (attrEntryNameIndex(entries.items, entry_name) == null) {
+                try entries.append(self.allocator, .{ .name = entry_name, .value = entry_value });
+            }
         }
     }
     return Value.attrs(try self.heap.addAttrs(entries.items));

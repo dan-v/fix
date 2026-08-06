@@ -56,10 +56,13 @@ pub fn builtinToFile(self: *VM, name_arg: Value, contents_arg: Value) !Value {
     const contents_id = try vm_strings.stringNameId(self, contents_value);
     var ref_ids: std.ArrayListUnmanaged(InternId) = .empty;
     defer ref_ids.deinit(self.allocator);
-    for (try contextEntriesForValue(self, contents_value)) |entry| {
-        const ref = self.intern.get(entry.name);
-        if (std.mem.endsWith(u8, ref, ".drv")) return error.DerivationReferenceInToFile;
-        try ref_ids.append(self.allocator, entry.name);
+    {
+        const cv = try contextEntriesForValue(self, contents_value);
+        for (cv.names) |entry_name| {
+            const ref = self.intern.get(entry_name);
+            if (std.mem.endsWith(u8, ref, ".drv")) return error.DerivationReferenceInToFile;
+            try ref_ids.append(self.allocator, entry_name);
+        }
     }
 
     const refs = try self.allocator.alloc([]const u8, ref_ids.items.len);

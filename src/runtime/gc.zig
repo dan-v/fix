@@ -763,7 +763,9 @@ fn scanRangeWork(
         },
         .attrs => |range| {
             sink.countAttrs(range.len);
-            for (heap.attrs.slice(range)) |entry| sink.markValue(heap, entry.value);
+            // SoA: the T plane IS the values — the mark walk never touches
+            // the name plane at all (a quarter fewer marked bytes per attr).
+            for (heap.attrs.slice(range)) |v| sink.markValue(heap, v);
         },
     }
 }
@@ -1265,8 +1267,10 @@ test "partially filled attr reservation returns its unowned tail" {
     const reserved = try heap.reserveAttrsForMerge(7);
     errdefer heap.abortMergedAttrs(reserved);
     const dst = heap.attrsMutSlice(reserved);
-    dst[0] = .{ .name = 1, .value = Value.int(1) };
-    dst[1] = .{ .name = 2, .value = Value.int(2) };
+    dst.names[0] = 1;
+    dst.values[0] = Value.int(1);
+    dst.names[1] = 2;
+    dst.values[1] = Value.int(2);
     _ = try heap.publishMergedAttrs(reserved, 2);
 
     const tail_owner = try heap.addAttrs(&.{

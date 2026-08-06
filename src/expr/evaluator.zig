@@ -1862,7 +1862,7 @@ pub const Engine = struct {
         return self.heap.valueAt(id);
     }
 
-    pub fn heapAttrAt(self: *const Engine, id: u32) ?*const runtime.heap.AttrEntry {
+    pub fn heapAttrAt(self: *const Engine, id: u32) ?runtime.heap.AttrEntry {
         return self.heap.attrAt(id);
     }
 
@@ -1876,7 +1876,7 @@ pub const Engine = struct {
 
     /// Enumerate an attrs / list object's members (non-forcing) for the VM
     /// explorer, so a container value inspects into its actual entries.
-    pub fn heapAttrsOf(self: *Engine, id: runtime.types.ObjectId) ![]const runtime.heap.AttrEntry {
+    pub fn heapAttrsOf(self: *Engine, id: runtime.types.ObjectId) !runtime.heap.AttrsView {
         return self.heap.materializeAttrs(id);
     }
 
@@ -2422,8 +2422,8 @@ pub const Engine = struct {
         };
         var drv_path: ?[]const u8 = null;
         if (forced_prog.kind() == .string_context) {
-            for ((try self.heap.getContextString(forced_prog.asObjectId())).context) |entry| {
-                const name = self.intern.get(entry.name);
+            for ((try self.heap.getContextString(forced_prog.asObjectId())).context.names) |entry_name| {
+                const name = self.intern.get(entry_name);
                 if (std.mem.endsWith(u8, name, ".drv")) {
                     drv_path = name;
                     break;
@@ -2563,8 +2563,8 @@ pub const Engine = struct {
         const forced = try self.forceValue(value);
         if (!forced.isAttrs()) return null;
         const attrs = try self.heap.materializeAttrs(forced.asObjectId());
-        const names = try allocator.alloc([]const u8, attrs.len);
-        for (attrs, 0..) |e, i| names[i] = self.intern.get(e.name);
+        const names = try allocator.alloc([]const u8, attrs.len());
+        for (attrs.names, 0..) |e_name, i| names[i] = self.intern.get(e_name);
         std.mem.sort([]const u8, names, {}, struct {
             fn lt(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.lessThan(u8, a, b);

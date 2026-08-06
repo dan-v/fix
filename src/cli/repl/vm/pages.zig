@@ -398,13 +398,13 @@ pub fn Methods(comptime Explorer: type) type {
             const arena = page.arena;
             const cap = 200;
             if (self.ev.heapAttrsOf(id)) |attrs| {
-                try page.heading(try std.fmt.allocPrint(arena, "MEMBERS · {d}", .{attrs.len}));
-                for (attrs, 0..) |entry, i| {
+                try page.heading(try std.fmt.allocPrint(arena, "MEMBERS · {d}", .{attrs.len()}));
+                for (attrs.names, attrs.values, 0..) |entry_name, entry_value, i| {
                     if (i >= cap) {
-                        try page.line(try std.fmt.allocPrint(arena, "  … {d} more", .{attrs.len - cap}), .none);
+                        try page.line(try std.fmt.allocPrint(arena, "  … {d} more", .{attrs.len() - cap}), .none);
                         break;
                     }
-                    try appendValueLine(self, page, try std.fmt.allocPrint(arena, "  {s} : ", .{self.ev.internTable().get(entry.name)}), entry.value);
+                    try appendValueLine(self, page, try std.fmt.allocPrint(arena, "  {s} : ", .{self.ev.internTable().get(entry_name)}), entry_value);
                 }
             } else |_| if (self.ev.heapListOf(id)) |items| {
                 try page.heading(try std.fmt.allocPrint(arena, "ITEMS · {d}", .{items.len}));

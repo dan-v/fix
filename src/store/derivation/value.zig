@@ -64,9 +64,9 @@ fn buildSelectedValue(
     var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
     defer entries.deinit(allocator);
 
-    for (spec.original_attrs) |entry| {
-        if (isSyntheticName(intern, intern.get(entry.name), spec.outputs)) continue;
-        try entries.append(allocator, entry);
+    for (spec.original_attrs.names, spec.original_attrs.values) |entry_name, entry_value| {
+        if (isSyntheticName(intern, intern.get(entry_name), spec.outputs)) continue;
+        try entries.append(allocator, .{ .name = entry_name, .value = entry_value });
     }
 
     try entries.append(allocator, .{
@@ -89,7 +89,7 @@ fn buildSelectedValue(
     }
     try entries.append(allocator, .{
         .name = try intern.intern("drvAttrs"),
-        .value = Value.attrs(try heap.addAttrs(spec.original_attrs)),
+        .value = Value.attrs(try heap.addAttrsView(spec.original_attrs)),
     });
 
     try entries.append(allocator, .{
@@ -192,7 +192,7 @@ fn drvPathString(
     const context = [_]AttrEntry{
         .{ .name = drv_path, .value = context_value },
     };
-    return Value.contextString(try heap.addContextString(drv_path, &context));
+    return Value.contextString(try heap.addContextStringEntries(drv_path, &context));
 }
 
 fn outputPathString(
@@ -209,7 +209,7 @@ fn outputPathString(
     const context = [_]AttrEntry{
         .{ .name = drv_path, .value = context_value },
     };
-    return Value.contextString(try heap.addContextString(output.out_path, &context));
+    return Value.contextString(try heap.addContextStringEntries(output.out_path, &context));
 }
 
 fn outputByName(outputs: []const ValueOutput, name: InternId) ?ValueOutput {

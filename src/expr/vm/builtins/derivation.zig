@@ -148,9 +148,9 @@ fn buildLazyValueForOutput(
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
 
-    for (original_attrs) |entry| {
-        if (derivation.isSyntheticName(self.intern, self.intern.get(entry.name), outputs)) continue;
-        try entries.append(self.allocator, entry);
+    for (original_attrs.names, original_attrs.values) |entry_name, entry_value| {
+        if (derivation.isSyntheticName(self.intern, self.intern.get(entry_name), outputs)) continue;
+        try entries.append(self.allocator, .{ .name = entry_name, .value = entry_value });
     }
 
     try entries.append(self.allocator, .{
@@ -169,7 +169,7 @@ fn buildLazyValueForOutput(
     }
     try entries.append(self.allocator, .{
         .name = try self.intern.intern("drvAttrs"),
-        .value = Value.attrs(try self.heap.addAttrs(original_attrs)),
+        .value = Value.attrs(try self.heap.addAttrsView(original_attrs)),
     });
 
     try appendLazyDerivationAttr(self, &entries, attrs_id, "drvPath");
@@ -490,20 +490,22 @@ fn normalizeDerivation(self: *VM, attrs_id: ObjectId, drv_name: []const u8, outp
         // walker — by the time main reaches an attr, the helper has
         // often already resolved it. submitUrgent gives up silently if
         // the queues are full; main just forces those itself inline.
-        for (original_attrs) |entry| {
-            if (!entry.value.isThunk()) continue;
-            const ok = self.workers.submitUrgentThunk(entry.value.asObjectId(), self.workerId());
+        for (original_attrs.values) |entry_value| {
+            if (!entry_value.isThunk()) continue;
+            const ok = self.workers.submitUrgentThunk(entry_value.asObjectId(), self.workerId());
             if (!ok) break;
         }
-        const attrs_len = original_attrs.len;
+        const attrs_len = original_attrs.len();
         var ai: usize = 0;
         while (ai < attrs_len) : (ai += 1) {
-            const entry = (try self.heap.materializeAttrs(attrs_id))[ai];
+            const cur_view = try self.heap.materializeAttrs(attrs_id);
+            const entry_name_id = cur_view.names[ai];
+            const entry_value = cur_view.values[ai];
             // Interned attr name — stable, no dupe (see note above).
-            const attr_name = self.intern.get(entry.name);
+            const attr_name = self.intern.get(entry_name_id);
             if (std.mem.eql(u8, attr_name, "args")) continue;
             if (std.mem.eql(u8, attr_name, "__ignoreNulls")) continue;
-            if (ignore_nulls and (try vm_force.forceValue(self, entry.value)).isNull()) continue;
+            if (ignore_nulls and (try vm_force.forceValue(self, entry_value)).isNull()) continue;
             if (isDerivationOutputAttr(self, attr_name, output_names.names)) continue;
             if (std.mem.eql(u8, attr_name, "outputs")) {
                 if (output_names.explicit) {
@@ -513,7 +515,7 @@ fn normalizeDerivation(self: *VM, attrs_id: ObjectId, drv_name: []const u8, outp
                 }
                 continue;
             }
-            const text = try derivationAttrString(self, entry.value, &inputs, &owned_strings);
+            const text = try derivationAttrString(self, entry_value, &inputs, &owned_strings);
             // A user-provided `__json` is the pre-serialized structured-attrs
             // payload — it must be valid JSON, else the derivation is rejected.
             if (std.mem.eql(u8, attr_name, "__json") and !(std.json.validate(self.allocator, text) catch false)) {
@@ -855,8 +857,9 @@ fn normalizeDerivationString(
     errdefer out.deinit(self.allocator);
     var cursor: usize = 0;
 
-    for (try contextEntriesForValue(self, value)) |entry| {
-        const path = self.intern.get(entry.name);
+    const ctx_view = try contextEntriesForValue(self, value);
+    for (ctx_view.names, ctx_view.values) |entry_name, entry_value| {
+        const path = self.intern.get(entry_name);
         if (std.mem.endsWith(u8, path, ".drv")) {
             // Marker-aware: `unsafeDiscardOutputDependency` leaves a plain
             // `path` marker on a `.drv`-named entry — that contributes the
@@ -864,7 +867,7 @@ fn normalizeDerivationString(
             // (Nix parity; nixpkgs' cabalSdist tests grep drvPaths for
             // exactly this). Any output/allOutputs marker — or an unknown
             // marker shape, conservatively — keeps the input-drv edge.
-            const marker = try vm_force.forceValue(self, entry.value);
+            const marker = try vm_force.forceValue(self, entry_value);
             if (!marker.isAttrs()) return error.TypeError;
             const marker_id = marker.asObjectId();
             const has_path_marker = try contextMarkerHasAttr(self, marker_id, "path");
@@ -873,7 +876,7 @@ fn normalizeDerivationString(
                 !(try contextMarkerHasAttr(self, marker_id, "outputs"));
             if (!pure_path_marker) {
                 // `path` is interned — stable, no dupe (see normalizeDerivation).
-                const outputs = try contextOutputs(self, path, entry.value);
+                const outputs = try contextOutputs(self, path, entry_value);
                 errdefer self.allocator.free(outputs);
                 try inputs.owned_output_lists.append(self.allocator, outputs);
                 try appendInputDrv(self, inputs, path, outputs);

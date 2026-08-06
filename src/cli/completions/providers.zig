@@ -127,8 +127,8 @@ pub fn writeAttrEntries(
     const entries = try ev.tooling().attrs(forced);
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer names.deinit(allocator);
-    for (entries) |entry| {
-        const name = ev.tooling().internText(entry.name);
+    for (entries.names) |entry_name| {
+        const name = ev.tooling().internText(entry_name);
         if (std.mem.startsWith(u8, name, partial) and std.mem.indexOfAny(u8, name, "\t\r\n") == null)
             try names.append(allocator, name);
     }

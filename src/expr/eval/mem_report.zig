@@ -42,7 +42,8 @@ pub fn report(
     const heap_counts = heap.counts();
     const obj_b = @as(u64, heap_counts.objects) * @sizeOf(heap_mod.Object);
     const val_b = @as(u64, heap_counts.values) * @sizeOf(Value);
-    const attr_b = @as(u64, heap_counts.attrs) * @sizeOf(heap_mod.AttrEntry);
+    // SoA attr planes: 12 B/slot (8 B value + 4 B name), NOT sizeOf(AttrEntry).
+    const attr_b = @as(u64, heap_counts.attrs) * heap_mod.attr_slot_bytes;
     const apos_b = @as(u64, heap_counts.attr_positions) * @sizeOf(heap_mod.AttrPosEntry);
     const stores_b = obj_b + val_b + attr_b + apos_b;
 

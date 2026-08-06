@@ -73,14 +73,15 @@ pub fn builtinZipAttrsWith(self: *VM, func_arg: Value, list_arg: Value) !Value {
         const attrs = try vm_force.forceValue(self, item);
         if (!attrs.isAttrs()) return error.TypeError;
 
-        for (try self.heap.materializeAttrs(attrs.asObjectId())) |entry| {
-            const index = (try group_idx.find(self.allocator, groups.items, entry.name)) orelse blk: {
-                try groups.append(self.allocator, .{ .name = entry.name });
+        const view = try self.heap.materializeAttrs(attrs.asObjectId());
+        for (view.names, view.values) |entry_name, entry_value| {
+            const index = (try group_idx.find(self.allocator, groups.items, entry_name)) orelse blk: {
+                try groups.append(self.allocator, .{ .name = entry_name });
                 const idx = groups.items.len - 1;
-                try group_idx.record(self.allocator, entry.name, idx);
+                try group_idx.record(self.allocator, entry_name, idx);
                 break :blk idx;
             };
-            try groups.items[index].values.append(self.allocator, entry.value);
+            try groups.items[index].values.append(self.allocator, entry_value);
         }
     }
 
@@ -138,9 +139,10 @@ pub fn sortedAttrEntries(self: *VM, arg: Value) ![]heap_mod.AttrEntry {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) return error.TypeError;
 
-    const entries = try self.heap.materializeAttrs(value.asObjectId());
-    const sorted = try self.allocator.dupe(heap_mod.AttrEntry, entries);
+    const view = try self.heap.materializeAttrs(value.asObjectId());
+    const sorted = try self.allocator.alloc(heap_mod.AttrEntry, view.len());
     errdefer self.allocator.free(sorted);
+    for (sorted, view.names, view.values) |*e, n, v| e.* = .{ .name = n, .value = v };
     try self.intern.sortByNameLex(self.allocator, heap_mod.AttrEntry, sorted);
     return sorted;
 }
@@ -172,7 +174,7 @@ pub fn builtinMapAttrs(self: *VM, fn_arg: Value, attrs_arg: Value) !Value {
     if (!attrs.isAttrs()) return error.TypeError;
 
     const attr_entries = try self.heap.materializeAttrs(attrs.asObjectId());
-    const out = try self.allocator.alloc(heap_mod.AttrEntry, attr_entries.len);
+    const out = try self.allocator.alloc(heap_mod.AttrEntry, attr_entries.len());
     defer self.allocator.free(out);
 
     // Two paths. When `fn_arg` is already a callable value (closure,
@@ -187,10 +189,10 @@ pub fn builtinMapAttrs(self: *VM, fn_arg: Value, attrs_arg: Value) !Value {
     // path; that handler forces `func` on the forcing fiber, where
     // the claim identity differs from ours.
     if (fn_arg.isThunk()) {
-        for (attr_entries, out) |entry, *mapped| {
+        for (attr_entries.names, attr_entries.values, out) |entry_name, entry_value, *mapped| {
             mapped.* = .{
-                .name = entry.name,
-                .value = try makeBuiltinThunk(self, .mapAttrValue, &.{ fn_arg, Value.string(entry.name), entry.value }),
+                .name = entry_name,
+                .value = try makeBuiltinThunk(self, .mapAttrValue, &.{ fn_arg, Value.string(entry_name), entry_value }),
             };
         }
         // `out` preserves the input's order (names copied 1:1 from the
@@ -201,10 +203,10 @@ pub fn builtinMapAttrs(self: *VM, fn_arg: Value, attrs_arg: Value) !Value {
 
     const apply_chunk_id = self.registry.well_known.mapattrs_apply;
     const speculatable = shared.isSpeculatableUserFunc(self, fn_arg);
-    for (attr_entries, out) |entry, *mapped| {
-        const tid = try self.heap.addBytecodeThunk(apply_chunk_id, &.{ fn_arg, Value.string(entry.name), entry.value });
+    for (attr_entries.names, attr_entries.values, out) |entry_name, entry_value, *mapped| {
+        const tid = try self.heap.addBytecodeThunk(apply_chunk_id, &.{ fn_arg, Value.string(entry_name), entry_value });
         if (speculatable) _ = self.workers.submitSpeculativeThunk(tid, self.workerId());
-        mapped.* = .{ .name = entry.name, .value = Value.thunk(tid) };
+        mapped.* = .{ .name = entry_name, .value = Value.thunk(tid) };
     }
     // Sorted+unique by construction (see the thunk-path note above).
     return Value.attrs(try self.heap.addAttrsSorted(out));
@@ -284,12 +286,12 @@ pub fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value 
     const attrs_id = attrs.asObjectId();
     const names_id = names.asObjectId();
     const names_len = try self.heap.getListLen(names_id);
-    const n = (try self.heap.materializeAttrs(attrs_id)).len;
+    const n = (try self.heap.materializeAttrs(attrs_id)).len();
     var i: usize = 0;
     outer: while (i < n) : (i += 1) {
-        const entry = (try self.heap.materializeAttrs(attrs_id))[i];
+        const entry_name = (try self.heap.materializeAttrs(attrs_id)).names[i];
         for (resolved.items) |name_id| {
-            if (name_id == entry.name) continue :outer;
+            if (name_id == entry_name) continue :outer;
         }
         while (resolved.items.len < names_len) {
             const item = try self.heap.getListItem(names_id, resolved.items.len);
@@ -300,9 +302,10 @@ pub fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value 
             // with the list without interning the miss.
             const name_id = (try vm_strings.lookupNameId(self, value)) orelse std.math.maxInt(InternId);
             try resolved.append(self.allocator, name_id);
-            if (name_id == entry.name) continue :outer;
+            if (name_id == entry_name) continue :outer;
         }
-        try entries.append(self.allocator, entry);
+        const src = try self.heap.materializeAttrs(attrs_id);
+        try entries.append(self.allocator, .{ .name = entry_name, .value = src.values[i] });
     }
 
     // Surviving entries are a subsequence of the (sorted, unique) input,
@@ -322,12 +325,12 @@ pub fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value 
 
 /// Binary search a sorted attr-entry slice by name (heap invariant:
 /// entries are sorted by InternId, no duplicates).
-fn sortedEntryIndex(entries: []const heap_mod.AttrEntry, name: InternId) ?usize {
+fn sortedEntryIndex(names: []const InternId, name: InternId) ?usize {
     var lo: usize = 0;
-    var hi: usize = entries.len;
+    var hi: usize = names.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const n = entries[mid].name;
+        const n = names[mid];
         if (n == name) return mid;
         if (n < name) lo = mid + 1 else hi = mid;
     }
@@ -347,32 +350,33 @@ pub fn builtinIntersectAttrs(self: *VM, left_arg: Value, right_arg: Value) !Valu
     const left_entries = try self.heap.materializeAttrs(left.asObjectId());
     const right_entries = try self.heap.materializeAttrs(right.asObjectId());
 
-    var entries = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, @min(left_entries.len, right_entries.len));
+    var entries = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, @min(left_entries.len(), right_entries.len()));
     defer entries.deinit(self.allocator);
 
     // All three paths emit the same set — the RIGHT entry for every name
     // present in both — walking names in ascending order, so the output
-    // is identical regardless of which strategy runs.
-    if (left_entries.len / intersection_skew > right_entries.len) {
-        for (right_entries) |re| {
-            if (sortedEntryIndex(left_entries, re.name) != null) entries.appendAssumeCapacity(re);
+    // is identical regardless of which strategy runs. Skew probes and the
+    // two-pointer walk read ONLY the name planes.
+    if (left_entries.len() / intersection_skew > right_entries.len()) {
+        for (right_entries.names, right_entries.values) |rn, rv| {
+            if (sortedEntryIndex(left_entries.names, rn) != null) entries.appendAssumeCapacity(.{ .name = rn, .value = rv });
         }
-    } else if (right_entries.len / intersection_skew > left_entries.len) {
-        for (left_entries) |le| {
-            if (sortedEntryIndex(right_entries, le.name)) |ri| entries.appendAssumeCapacity(right_entries[ri]);
+    } else if (right_entries.len() / intersection_skew > left_entries.len()) {
+        for (left_entries.names) |ln| {
+            if (sortedEntryIndex(right_entries.names, ln)) |ri| entries.appendAssumeCapacity(.{ .name = ln, .value = right_entries.values[ri] });
         }
     } else {
         var left_i: usize = 0;
         var right_i: usize = 0;
-        while (left_i < left_entries.len and right_i < right_entries.len) {
-            const left_entry = left_entries[left_i];
-            const right_entry = right_entries[right_i];
-            if (left_entry.name < right_entry.name) {
+        while (left_i < left_entries.len() and right_i < right_entries.len()) {
+            const ln = left_entries.names[left_i];
+            const rn = right_entries.names[right_i];
+            if (ln < rn) {
                 left_i += 1;
-            } else if (left_entry.name > right_entry.name) {
+            } else if (ln > rn) {
                 right_i += 1;
             } else {
-                entries.appendAssumeCapacity(right_entry);
+                entries.appendAssumeCapacity(.{ .name = rn, .value = right_entries.values[right_i] });
                 left_i += 1;
                 right_i += 1;
             }

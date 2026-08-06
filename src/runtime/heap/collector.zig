@@ -341,7 +341,8 @@ const ClosureSink = struct {
         for (heap.values.slice(range)) |child| try self.value(heap, child);
     }
     pub inline fn attrRange(self: *ClosureSink, heap: *const ObjectHeap, range: heap_mod.AttrRange) Error!void {
-        for (heap.attrs.slice(range)) |entry| try self.value(heap, entry.value);
+        // SoA: the T plane holds the values directly.
+        for (heap.attrs.slice(range)) |entry_value| try self.value(heap, entry_value);
     }
     pub inline fn attrPositions(_: *ClosureSink, _: heap_mod.AttrPositions) Error!void {}
     pub inline fn capturedValues(self: *ClosureSink, heap: *const ObjectHeap, values: []const Value, _: bool) Error!void {
@@ -526,8 +527,11 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
             .closure => |c| for (heap.values.sliceMut(c.upvalues)) |*v| {
                 v.* = poison;
             },
-            .attrs => |a| for (heap.attrs.sliceMut(a.range)) |*e| {
-                e.value = poison;
+            .attrs => |a| {
+                for (heap.attrs.sliceMut(a.range)) |*v| v.* = poison;
+                // Name plane: stamp the poison name so dangling name scans
+                // (binary search / merge walks) trap via gcAssertNotPoisonName.
+                for (heap.attrs.sliceSecondMut(a.range)) |*n| n.* = heap_mod.gc_poison_name;
             },
             .builtin_closure => |c| for (heap.values.sliceMut(c.args)) |*v| {
                 v.* = poison;
@@ -535,8 +539,9 @@ fn freeObjectRanges(heap: *ObjectHeap, ranges: *RangeBatch, obj: *const Object) 
             .partial_app => |p| for (heap.values.sliceMut(p.args)) |*v| {
                 v.* = poison;
             },
-            .context_string => |c| for (heap.attrs.sliceMut(c.context)) |*e| {
-                e.value = poison;
+            .context_string => |c| {
+                for (heap.attrs.sliceMut(c.context)) |*v| v.* = poison;
+                for (heap.attrs.sliceSecondMut(c.context)) |*n| n.* = heap_mod.gc_poison_name;
             },
             // Byte payloads have no Value shape to poison with a trapping
             // thunk; memset a sentinel so a dangling `getHeapString` slice
