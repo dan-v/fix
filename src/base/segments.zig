@@ -15,6 +15,7 @@
 //! a byte arena should use `T = u8` and the `Range` API directly.
 
 const std = @import("std");
+
 const builtin = @import("builtin");
 const SpinMutex = @import("sync.zig").SpinMutex;
 const hugetlb = @import("hugetlb.zig");
@@ -47,6 +48,11 @@ pub fn Params(comptime Vma: type) type {
         /// the allocator, as before). Every cursor advance holds `write_mu`,
         /// so the frontier always covers a range before it is published.
         huge_overlay_min: usize = 0,
+        /// TLAB refill chunk in SLOTS. One `write_mu` acquisition per this
+        /// many reservations. Bigger chunks stripe ids/bytes into wider
+        /// per-thread blocks — write-contention relief traded against the
+        /// read-side locality of global temporal packing; size per store.
+        tlab_chunk_slots: u32 = 8192,
     };
 }
 
@@ -60,6 +66,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         if (@hasField(@TypeOf(params_in), "segment_count")) p.segment_count = params_in.segment_count;
         if (@hasField(@TypeOf(params_in), "vma_tag")) p.vma_tag = params_in.vma_tag;
         if (@hasField(@TypeOf(params_in), "huge_overlay_min")) p.huge_overlay_min = params_in.huge_overlay_min;
+        if (@hasField(@TypeOf(params_in), "tlab_chunk_slots")) p.tlab_chunk_slots = params_in.tlab_chunk_slots;
         break :blk p;
     };
     comptime {
@@ -87,7 +94,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         /// bump the local cursor lock-free. Only the final partial chunk per
         /// worker is unused, so waste is bounded by one chunk per worker.
         pub const Tlab = struct { seg: u32 = 0, off: u32 = 0, used: u32 = 0, cap: u32 = 0 };
-        pub const tlab_chunk_size: u32 = 8192;
+        pub const tlab_chunk_size: u32 = params.tlab_chunk_slots;
 
         /// Reserve `len` slots via `tlab`. Bumps the local cursor when
         /// the current chunk has room; otherwise refills one chunk under
@@ -268,6 +275,17 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             try initialize(context, first_id, len);
             self.cursor.store(packCursor(seg, used), .release);
             return first_id;
+        }
+
+        /// Append via a per-worker TLAB: `write_mu` is taken once per chunk
+        /// refill instead of per append. Chunk remainders of abandoned tlabs
+        /// become permanent id-space gaps — callers must only dereference
+        /// ids they were returned (a gap id reads uninitialized memory).
+        pub fn appendLocal(self: *Self, allocator: std.mem.Allocator, tlab: *Tlab, value: T) !u32 {
+            const range = try self.reserveLocal(allocator, tlab, 1);
+            const slot = self.segments[range.segment].load(.acquire).?;
+            slot[range.offset] = value;
+            return globalIdOf(range.segment, range.offset);
         }
 
         /// Append a single value. Returns its global u32 id.

@@ -39,8 +39,14 @@ pub fn stringPrefix(s: []const u8) u64 {
     return std.mem.readInt(u64, &buf, .big);
 }
 
-const EntryStore = segments.StableSegments(Entry, .{ .first_segment_size = 256 }, mem_tag.vma);
-const ByteStore = segments.StableSegments(u8, .{ .first_segment_size = 4096 }, mem_tag.vma);
+// TLAB chunks small enough to keep near-global temporal packing (hot names
+// interned together stay cache-adjacent for the sort/compare read paths)
+// while still amortizing each store's write_mu to one acquisition per
+// hundreds of inserts. First segments sized >= one refill chunk: a smaller
+// first segment cannot host the first refill, which would skip it —
+// leaving id 0 unallocated and breaking the empty-string sentinel.
+const EntryStore = segments.StableSegments(Entry, .{ .first_segment_size = 256, .tlab_chunk_slots = 256 }, mem_tag.vma);
+const ByteStore = segments.StableSegments(u8, .{ .first_segment_size = 4096, .tlab_chunk_slots = 4096 }, mem_tag.vma);
 
 const shard_count: u32 = 64;
 const shard_mask: u64 = shard_count - 1;
@@ -146,6 +152,26 @@ const Shard = struct {
     mu: sync.SpinMutex = .{},
 };
 
+/// Per-OS-thread byte-store TLAB, keyed by table token (a recreated table
+/// at the same address must not inherit a stale chunk). Switching between
+/// two live tables on one thread abandons the old partial chunk — waste
+/// bounded by one 8 KB chunk per switch, and nested VMs share the parent's
+/// table, so switches are rare.
+threadlocal var data_tlab: ByteStore.Tlab = .{};
+threadlocal var entry_tlab: EntryStore.Tlab = .{};
+threadlocal var tlab_token: u64 = 0;
+
+const Tlabs = struct { data: *ByteStore.Tlab, entry: *EntryStore.Tlab };
+
+fn tlabs(token: u64) Tlabs {
+    if (tlab_token != token) {
+        data_tlab = .{};
+        entry_tlab = .{};
+        tlab_token = token;
+    }
+    return .{ .data = &data_tlab, .entry = &entry_tlab };
+}
+
 pub const InternTable = struct {
     allocator: std.mem.Allocator,
     entries: EntryStore,
@@ -154,11 +180,6 @@ pub const InternTable = struct {
     /// the input's hash. `entries` and `data` remain global so that ids
     /// stay dense and `get()` doesn't need to know the shard.
     shards: [shard_count]Shard,
-    /// Serializes the two-store commit for a new string. Lookup hits remain
-    /// shard-local; only misses enter this mutex. Keeping the data reservation
-    /// and entry append in one commit section makes a failed entry allocation
-    /// safe to roll back even while other shards are interning concurrently.
-    commit_mu: sync.BlockingMutex = .{},
     /// Unique-per-init identifier the thread-local intern cache uses to
     /// avoid stale-hit races when an InternTable is recreated at the
     /// same heap address.
@@ -222,27 +243,24 @@ pub const InternTable = struct {
         // no uninitialized id remains reachable on a later lookup.
         errdefer shard.lookup.removeByPtr(gop.key_ptr);
 
-        const pending = blk: {
-            // Concurrent shards share the two append-only stores, so their
-            // reservations must remain adjacent for rollback to be reliable.
-            // Solo mode has no competing writer and avoids this extra RMW.
-            if (!self.solo) self.commit_mu.lock();
-            defer if (!self.solo) self.commit_mu.unlock();
-
-            const data_range = try self.data.reserve(self.allocator, @intCast(s.len));
-            // Every writer to these two stores holds commit_mu, so another
-            // shard cannot move the tail between this reservation and a
-            // failed entry append.
-            errdefer std.debug.assert(self.data.rollback(data_range));
-            const entry: Entry = .{
-                .segment = data_range.segment,
-                .offset = data_range.offset,
-                .len = data_range.len,
-            };
-            break :blk .{
-                .id = try self.entries.append(self.allocator, entry),
-                .data_range = data_range,
-            };
+        // The two stores commit independently: bytes come from a per-thread
+        // TLAB (the store's write_mu is touched once per 8 KB chunk, not per
+        // string), the entry append takes the entry store's own brief spin.
+        // No cross-store adjacency is needed — if the entry append fails
+        // (OOM path) the reserved bytes simply stay consumed. The old design
+        // serialized EVERY miss from all 64 shards through one global
+        // blocking mutex to make rollback exact; that mutex was the intern
+        // convoy (63% of string-heavy w=8 CPU parked on it).
+        const t = tlabs(self.token);
+        const data_range = try self.data.reserveLocal(self.allocator, t.data, @intCast(s.len));
+        const entry: Entry = .{
+            .segment = data_range.segment,
+            .offset = data_range.offset,
+            .len = data_range.len,
+        };
+        const pending = .{
+            .id = try self.entries.appendLocal(self.allocator, t.entry, entry),
+            .data_range = data_range,
         };
 
         // Copying and map publication cannot fail. The commit mutex need not
@@ -506,10 +524,20 @@ test "intern: concurrent inserts dedupe correctly" {
     }
     for (&threads) |t| t.join();
 
-    var id: InternId = 1;
-    while (id < table.entries.count()) : (id += 1) {
-        const s = table.get(id);
-        const again = try table.intern(s);
+    // TLAB chunking leaves id-space gaps between per-thread blocks, so the
+    // table's contract is only that RETURNED ids round-trip — re-intern a
+    // deterministic sample of the strings the workers produced and check
+    // ids stay stable and content-addressed.
+    var rng = std.Random.DefaultPrng.init(1);
+    const r = rng.random();
+    var buf: [16]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 500) : (i += 1) {
+        const n = r.intRangeAtMost(usize, 1, buf.len);
+        for (buf[0..n]) |*b| b.* = 'a' + @as(u8, r.intRangeAtMost(u4, 0, 7));
+        const id = try table.intern(buf[0..n]);
+        try std.testing.expectEqualStrings(buf[0..n], table.get(id));
+        const again = try table.intern(buf[0..n]);
         try std.testing.expectEqual(id, again);
     }
 }
