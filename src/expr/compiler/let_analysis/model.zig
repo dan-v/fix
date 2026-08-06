@@ -105,6 +105,12 @@ pub const FreeName = struct {
     /// or `invalid_cluster` (plain binders: lambda params, rec-attr names,
     /// names resolved outside the walk).
     src_cluster: u32 = invalid_cluster,
+    /// Lévy level of the resolved binder: lambda params carry their
+    /// lambda's introduced level; let/rec binders carry the level they sit
+    /// AT; names resolved outside the walk (lexical-above, builtins) are
+    /// level 0. An expression's floor is the max over its frees — see
+    /// `Binding.assigned_level`.
+    level: u16 = 0,
 };
 
 pub const Use = struct {
@@ -138,6 +144,26 @@ pub const Adjacency = struct {
         return self.items[self.offsets[key]..self.offsets[key + 1]];
     }
 };
+
+/// One lambda position in the walk (full-laziness levels). `level` is the
+/// Lévy level it INTRODUCES (= many_depth after entering it): an
+/// expression whose free names all resolve at levels < L may float to the
+/// top of the level-L lambda's body. `parent` chains outward for
+/// destination lookup; `entry_mark` is the binder-log position at body
+/// entry (the outward shadow window's lower bound); `chain_member` marks a
+/// directly-adjacent value-lambda child of its parent (the uncurry chain —
+/// splitting it has a codegen cost, see the plan's chain-split gate).
+pub const LambdaInfo = struct {
+    node: *const Node,
+    parent: u32 = invalid_lambda,
+    level: u16,
+    entry_mark: u32,
+    entry_branch: u32 = invalid_branch,
+    entry_once: u32 = 0,
+    chain_member: bool = false,
+};
+
+pub const invalid_lambda: u32 = std.math.maxInt(u32);
 
 /// One `if` branch position. Bindings whose every use lies under a branch
 /// can float into it (a synthetic let wrapping the branch expression): the
@@ -194,6 +220,17 @@ pub const Binding = struct {
     /// Member of a multi-binding cycle, or self-referential.
     scc_recursive: bool = false,
 
+    /// Lévy level this binding's cluster sits at (== the cluster's
+    /// `header_many`): the binding may float OUT when `assigned_level <
+    /// home_level` (stage 1 records the would-float census; stage 2 moves).
+    home_level: u16 = 0,
+    /// Fixpoint over the free set: max of each free's binder level, with
+    /// sibling/outer cluster bindings contributing their own POST-float
+    /// assigned level (outer-first decide order makes this a single pass).
+    /// Immobile shapes (dynamic frees, opaque, recursive SCCs, non-plain
+    /// kinds) pin `assigned_level = home_level`.
+    assigned_level: u16 = 0,
+
     pub fn addFree(self: *Binding, allocator: std.mem.Allocator, name: FreeName) !void {
         for (self.free.items) |existing| {
             if (existing.id == name.id) return;
@@ -220,6 +257,10 @@ pub const SharedTables = struct {
     log_len: u32 = 0,
     log_pos: std.AutoHashMapUnmanaged(InternId, std.ArrayListUnmanaged(LogEntry)) = .empty,
     branches: std.ArrayListUnmanaged(Branch) = .empty,
+    /// Every lambda entered by this walk batch, in entry order (full-lazy
+    /// only; empty otherwise). Cluster graphs reference these by index for
+    /// float destinations.
+    lambdas: std.ArrayListUnmanaged(LambdaInfo) = .empty,
     /// Binder-log positions where a `with` body begins. A binding whose RHS
     /// mentions a dynamically-resolved name may still move — but only when
     /// the walk window between its cluster header and the destination

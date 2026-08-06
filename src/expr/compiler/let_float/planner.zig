@@ -92,8 +92,13 @@ pub fn decide(
             const o_plan = if (o_overlay.plan) |*p| p else continue;
             if (!o_plan.replaced_any[f.binding]) continue;
             const ob = &outer.graph.bindings[f.binding];
-            for (ob.free.items) |of| try addPlannerFree(allocator, &facts[wi], w, of);
-            for (o_plan.extra_free[f.binding]) |of| try addPlannerFree(allocator, &facts[wi], w, of);
+            // Entries fold in NORMALIZED to this cluster's frame: a
+            // `.cluster` entry is a sibling of the OUTER graph — carried
+            // verbatim its binding id would be misread against this
+            // cluster (shadow checks only used `.id`, but the level
+            // fixpoint resolves siblings by index).
+            for (ob.free.items) |of| try addPlannerFree(allocator, &facts[wi], w, normalizeForeignFree(of, f.src_cluster));
+            for (o_plan.extra_free[f.binding]) |of| try addPlannerFree(allocator, &facts[wi], w, normalizeForeignFree(of, f.src_cluster));
             if (ob.has_opaque) facts[wi].has_opaque = true;
         }
     }
@@ -128,6 +133,45 @@ pub fn decide(
     // `let_analysis.computeSccs`), so a binding sunk into a sibling's RHS has its
     // free names folded into that sibling before the sibling is decided.
     const order = try sccOrder(allocator, graph);
+
+    // ---- Full-laziness stage 1: Lévy-level fixpoint (census only). -------
+    // A binding's floor is the max level of its effective free set; when
+    // that is strictly below its home level, the binding COULD float out of
+    // `home - assigned` lambdas (recorded via `would_float_*`; stage 2 will
+    // move them). Outer-first batch order plus ascending SCC order makes
+    // this a single pass: every referenced sibling/outer binding is already
+    // assigned. Immobile shapes stay pinned at home.
+    const assigned = try allocator.alloc(u16, n);
+    for (graph.bindings, 0..) |*b, i| assigned[i] = b.home_level;
+    if (self.let_float.full_lazy) {
+        for (order) |i| {
+            const b = &graph.bindings[i];
+            if (b.kind != .plain or b.scc_recursive) continue;
+            if (hasOpaque(b, facts[i]) or hasDynamicFree(b, facts[i])) continue;
+            var lvl: u16 = 0;
+            var mobile = true;
+            for (b.free.items) |f| {
+                const fl = freeLevel(unit, assigned, f) orelse {
+                    mobile = false;
+                    break;
+                };
+                if (fl > lvl) lvl = fl;
+            }
+            if (mobile) for (facts[i].extra_free.items) |f| {
+                const fl = freeLevel(unit, assigned, f) orelse {
+                    mobile = false;
+                    break;
+                };
+                if (fl > lvl) lvl = fl;
+            };
+            if (mobile and lvl < b.home_level) {
+                assigned[i] = lvl;
+                bump(census, "would_float_bindings");
+                bumpBy(census, "would_float_levels", b.home_level - lvl);
+            }
+        }
+        for (graph.bindings, 0..) |*b, i| b.assigned_level = assigned[i];
+    }
 
     // ---- Pass A: duplicable inlines (literals and aliases). -------------
     // These replace every rewritable use with a FRESH copy of the RHS; an
@@ -349,6 +393,7 @@ pub fn decide(
         .keep = keep,
         .replaced_any = replaced_any,
         .extra_free = extra_out,
+        .assigned_levels = assigned,
         .any_change = any_change,
     };
 }
@@ -399,6 +444,47 @@ fn anyFreeShadowedAt(
         if (graph.shadowedAt(f.id, mark)) return true;
     }
     return false;
+}
+
+/// Re-frame a free name folded in from an ENCLOSING cluster `src` (walk-
+/// local id): its `.cluster` entries are siblings of THAT graph, so they
+/// become cross-cluster `.lexical` links here; everything else passes
+/// through (already position-independent).
+fn normalizeForeignFree(f: analysis.FreeName, src: u32) analysis.FreeName {
+    if (f.class != .cluster) return f;
+    return .{
+        .id = f.id,
+        .class = .lexical,
+        .binding = f.binding,
+        .src_cluster = src,
+        .level = f.level,
+    };
+}
+
+/// The Lévy level a free name's binder resolves at, following sibling and
+/// cross-cluster bindings to their POST-fixpoint assigned levels. Null =
+/// immobile (dynamic resolution).
+fn freeLevel(
+    unit: UnitCtx,
+    assigned: []const u16,
+    f: analysis.FreeName,
+) ?u16 {
+    return switch (f.class) {
+        .builtin => 0,
+        .dynamic => null,
+        // Same-cluster sibling. Planner-fact entries without a resolvable
+        // binding (alias-target folds) conservatively pin: level unknown.
+        .cluster => if (f.binding < assigned.len) assigned[f.binding] else null,
+        .lexical => blk: {
+            if (f.src_cluster != analysis.invalid_cluster) {
+                const outer = unit.walk_clusters[f.src_cluster];
+                if (unit.state.overlays.get(outer.head)) |o|
+                    if (o.plan) |*p| break :blk p.assigned_levels[f.binding];
+                break :blk outer.graph.bindings[f.binding].assigned_level;
+            }
+            break :blk f.level;
+        },
+    };
 }
 
 const FloatTargets = struct { branches: []const u32 };

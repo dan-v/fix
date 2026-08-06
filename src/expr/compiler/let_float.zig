@@ -74,6 +74,8 @@ pub fn writeReport(w: *std.Io.Writer, stats: *const Stats) !void {
         .{ "blocked: pinned mention", &stats.blocked_pinned },
         .{ "blocked: dynamic free name", &stats.blocked_dynamic },
         .{ "blocked: recursive group", &stats.blocked_recursive },
+        .{ "would-float bindings (full-lazy)", &stats.would_float_bindings },
+        .{ "would-float levels crossed", &stats.would_float_levels },
         .{ "cluster map hits", &stats.cluster_hits },
         .{ "cluster walks", &stats.cluster_walks },
         .{ "strict-prefix members", &stats.prefix_members },

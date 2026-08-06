@@ -44,6 +44,9 @@ pub fn analyze(self: *Compiler, ua: *UnitAnalysis, root: *const Node) !void {
 
 const Binder = struct {
     name_id: InternId,
+    /// Lévy level of this binder: lambda params carry their lambda's
+    /// introduced level; let/rec binders sit AT the current level.
+    level: u16 = 0,
     /// Owning cluster id and binding id when this is a cluster binder.
     cluster: u32 = invalid_cluster,
     /// Index into the walker's `active` list while the cluster is open —
@@ -86,6 +89,9 @@ pub const Walker = struct {
     once_depth: u32 = 0,
     many_depth: u32 = 0,
     cur_branch: u32 = invalid_branch,
+    /// Innermost enclosing lambda (index into `tables.lambdas`), tracked
+    /// only under the full-lazy gate.
+    cur_lambda: u32 = model.invalid_lambda,
 
     fn deinit(self: *Walker) void {
         self.stack.deinit(self.c.allocator);
@@ -95,12 +101,17 @@ pub const Walker = struct {
     }
 
     fn pushBinder(self: *Walker, name_id: InternId, cluster: u32, active_index: u32, binding: BindingId) !void {
+        return self.pushBinderAt(name_id, cluster, active_index, binding, @intCast(self.many_depth));
+    }
+
+    fn pushBinderAt(self: *Walker, name_id: InternId, cluster: u32, active_index: u32, binding: BindingId, level: u16) !void {
         const allocator = self.c.allocator;
         const gop = try self.by_name.getOrPut(allocator, name_id);
         const prev = if (gop.found_existing) gop.value_ptr.* else std.math.maxInt(usize);
         gop.value_ptr.* = self.stack.items.len;
         try self.stack.append(allocator, .{
             .name_id = name_id,
+            .level = level,
             .cluster = cluster,
             .active_index = active_index,
             .binding = binding,
@@ -146,7 +157,7 @@ pub const Walker = struct {
             }
             const binder = if (binder_pos) |pos| self.stack.items[pos] else null;
             const entry: FreeName = if (binder != null and binder.?.cluster == ctx.id)
-                .{ .id = name_id, .class = .cluster, .binding = binder.?.binding }
+                .{ .id = name_id, .class = .cluster, .binding = binder.?.binding, .level = binder.?.level }
             else if (binder != null)
                 // A cluster binder of an ENCLOSING cluster keeps its source
                 // link (walk-local); plain binders (params, rec-attr names)
@@ -156,6 +167,7 @@ pub const Walker = struct {
                     .class = .lexical,
                     .binding = binder.?.binding,
                     .src_cluster = binder.?.cluster,
+                    .level = binder.?.level,
                 }
             else blk: {
                 if (outer_class == null) outer_class = classifyOuterName(self.c, name_id);
@@ -319,31 +331,64 @@ pub const Walker = struct {
                 self.once_depth -= 1;
             },
             .lambda => {
-                if (self.c.let_float.full_lazy)
-                    try self.ua.walked.put(self.ua.allocator, node, {});
                 const start = self.stack.items.len;
                 const lam = node.data.lambda;
-                try self.pushBinder(try self.c.intern.intern(
+                const introduced: u16 = @intCast(self.many_depth + 1);
+                try self.pushBinderAt(try self.c.intern.intern(
                     self.c.source[lam.param_offset .. lam.param_offset + lam.param_len],
-                ), invalid_cluster, 0, invalid_binding);
+                ), invalid_cluster, 0, invalid_binding, introduced);
+                const saved_lambda = self.cur_lambda;
+                if (self.c.let_float.full_lazy) {
+                    try self.ua.walked.put(self.ua.allocator, node, {});
+                    // Chain membership: a value lambda directly under a
+                    // value lambda (post-paren) uncurries into one chunk.
+                    const chain = saved_lambda != model.invalid_lambda and blk: {
+                        const p = self.ua.tables.lambdas.items[saved_lambda].node;
+                        break :blk p.tag == .lambda and ast.unwrapParens(p.data.lambda.body) == node;
+                    };
+                    try self.ua.tables.lambdas.append(self.c.allocator, .{
+                        .node = node,
+                        .parent = saved_lambda,
+                        .level = introduced,
+                        .entry_mark = self.ua.tables.log_len,
+                        .entry_branch = self.cur_branch,
+                        .entry_once = self.once_depth,
+                        .chain_member = chain,
+                    });
+                    self.cur_lambda = @intCast(self.ua.tables.lambdas.items.len - 1);
+                }
                 self.many_depth += 1;
                 try self.walk(lam.body);
                 self.many_depth -= 1;
+                self.cur_lambda = saved_lambda;
                 self.popBinders(start);
             },
             .lambda_attrs => {
-                if (self.c.let_float.full_lazy)
-                    try self.ua.walked.put(self.ua.allocator, node, {});
                 const start = self.stack.items.len;
                 const la = node.data.lambda_attrs;
-                if (la.bind_name) |bn| try self.pushBinder(try self.internSpan(bn), invalid_cluster, 0, invalid_binding);
-                for (la.params) |param| try self.pushBinder(try self.internSpan(param.name), invalid_cluster, 0, invalid_binding);
+                const introduced: u16 = @intCast(self.many_depth + 1);
+                if (la.bind_name) |bn| try self.pushBinderAt(try self.internSpan(bn), invalid_cluster, 0, invalid_binding, introduced);
+                for (la.params) |param| try self.pushBinderAt(try self.internSpan(param.name), invalid_cluster, 0, invalid_binding, introduced);
+                const saved_lambda = self.cur_lambda;
+                if (self.c.let_float.full_lazy) {
+                    try self.ua.walked.put(self.ua.allocator, node, {});
+                    try self.ua.tables.lambdas.append(self.c.allocator, .{
+                        .node = node,
+                        .parent = saved_lambda,
+                        .level = introduced,
+                        .entry_mark = self.ua.tables.log_len,
+                        .entry_branch = self.cur_branch,
+                        .entry_once = self.once_depth,
+                    });
+                    self.cur_lambda = @intCast(self.ua.tables.lambdas.items.len - 1);
+                }
                 self.many_depth += 1;
                 for (la.params) |param| {
                     if (param.default) |d| try self.walk(d);
                 }
                 try self.walk(la.body);
                 self.many_depth -= 1;
+                self.cur_lambda = saved_lambda;
                 self.popBinders(start);
             },
             .let_in => try self.walkCluster(node),
@@ -514,6 +559,9 @@ pub const Walker = struct {
             };
             const level_bindings_first: u32 = @intCast(bindings.items.len);
             try collectBindings(self.c, &bindings, let_in.bindings, level_first);
+            // Every spine level sits at the cluster's own Lévy level
+            // (spine merge never crosses a lambda).
+            for (bindings.items[level_bindings_first..]) |*b| b.home_level = @intCast(self.many_depth);
 
             // Push this level's binders (recursive scope: RHSes see all
             // siblings of their level and every outer level). Logged with

@@ -25,6 +25,8 @@ pub const Stats = struct {
     blocked_pinned: std.atomic.Value(u64) = .init(0),
     blocked_dynamic: std.atomic.Value(u64) = .init(0),
     blocked_recursive: std.atomic.Value(u64) = .init(0),
+    would_float_bindings: std.atomic.Value(u64) = .init(0),
+    would_float_levels: std.atomic.Value(u64) = .init(0),
     cluster_hits: std.atomic.Value(u64) = .init(0),
     cluster_walks: std.atomic.Value(u64) = .init(0),
     prefix_members: std.atomic.Value(u64) = .init(0),
@@ -57,6 +59,10 @@ pub const Plan = struct {
     /// cross-cluster expansions). Alongside `Binding.free`, this is the
     /// binding's post-plan effective free set.
     extra_free: []const []const analysis.FreeName,
+    /// Per-binding: the Lévy-level fixpoint result (== home level when the
+    /// full-lazy gate is off or the binding is immobile). Inner clusters'
+    /// fixpoints read these for cross-cluster free refs.
+    assigned_levels: []const u16,
     any_change: bool,
 };
 
