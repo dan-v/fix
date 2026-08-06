@@ -147,7 +147,7 @@ pub fn decide(
     // clusters' cross-references.
     const assigned = try allocator.alloc(u16, n);
     for (graph.bindings, 0..) |*b, i| assigned[i] = b.home_level;
-    if (self.let_float.full_lazy) {
+    if (self.let_float.full_lazy and self.let_float.named_floats) {
         for (order) |i| {
             const b = &graph.bindings[i];
             if (!keep[i] or !alive[i]) continue;
@@ -240,8 +240,9 @@ pub fn decide(
             // outranks) and would silently re-resolve to the hoisted
             // binder. The cluster's own uses live in [header, end) and
             // are exactly what the float preserves.
-            if (graph.tables.mentionedInWindow(b.name_id, dest.entry_mark, graph.header_log_len) or
-                graph.tables.mentionedInWindow(b.name_id, graph.end_log_len, std.math.maxInt(u32)))
+            const name_text = self.intern.get(b.name_id);
+            if (graph.tables.mentionedInWindow(self.source, name_text, b.name_id, dest.entry_mark, graph.header_log_len) or
+                graph.tables.mentionedInWindow(self.source, name_text, b.name_id, graph.end_log_len, std.math.maxInt(u32)))
             {
                 bump(census, "blocked_out_capture");
                 continue;

@@ -65,7 +65,7 @@ const Binder = struct {
 /// full-lazy gate): the max Lévy level any name in the current subtree
 /// resolved at, and whether the subtree contains something immovable
 /// (elided source, dynamically-resolvable mentions, skip-slot resolution).
-const Facts = struct { level: u16 = 0, opaq: bool = false };
+const Facts = struct { level: u16 = 0, opaq: bool = false, applies: u16 = 0 };
 
 /// Per-active-cluster walk state.
 const ClusterCtx = struct {
@@ -266,8 +266,18 @@ pub const Walker = struct {
     /// Mirror of `refs.zig walkIdentifiersInSpan`: mentions inside `${…}`
     /// interpolation are conservative words — real uses, unrewritable sites.
     fn wordsInSpan(self: *Walker, atom: Node.Atom) !void {
+        if (atom.len == 0) return; // synthetic (full-laziness): plain name
         const text = self.c.source[atom.offset .. atom.offset + atom.len];
         if (std.mem.indexOf(u8, text, "${") == null) return;
+        // Interpolation references are invisible to the MFE facts here —
+        // poison enclosing candidates (the word-resolution path below only
+        // catches them indirectly, via dynamic-miss opacity).
+        self.sub.opaq = true;
+        // See `.elided`: with no active cluster, defer to the lazy span scan.
+        if (self.active.items.len == 0) {
+            if (self.c.let_float.full_lazy) try self.ua.tables.logOpaqueSpan(atom);
+            return;
+        }
         try self.markIdentWords(text);
     }
 
@@ -325,6 +335,9 @@ pub const Walker = struct {
         if (self.cur_lambda == model.invalid_lambda) return;
         if (facts.level >= self.many_depth) return;
         if (self.cur_rhs_root == node) return; // whole named RHS: pass B0 owns it
+        // Work gate: a tiny apply's shared work is smaller than the thunk
+        // creation every closure of the dest lambda now pays up front.
+        if (facts.applies < self.c.let_float.mfe_min_applies) return;
         const mfes = &self.ua.mfes;
         var read = cand_start;
         var write = cand_start;
@@ -367,6 +380,14 @@ pub const Walker = struct {
                         ctx.cluster.graph.bindings[ctx.cur_rhs].has_opaque = true;
                 }
                 const atom = node.data.atom;
+                // Outside any active cluster there is nothing to pin — the
+                // words matter only to the full-lazy capture proof, which
+                // scans logged spans lazily (interning every word of every
+                // never-compiled body was the dominant whole-unit-walk cost).
+                if (self.active.items.len == 0) {
+                    if (self.c.let_float.full_lazy) try self.ua.tables.logOpaqueSpan(atom);
+                    return;
+                }
                 try self.markIdentWords(self.c.source[atom.offset .. atom.offset + atom.len]);
             },
             .identifier => {
@@ -403,11 +424,13 @@ pub const Walker = struct {
                 self.once_depth += 1;
                 try self.walk(node.data.apply.arg);
                 self.once_depth -= 1;
-                const mine = self.sub;
+                var mine = self.sub;
+                mine.applies +|= 1;
                 if (self.c.let_float.full_lazy) try self.sealMfe(node, mine, cand_start);
                 self.sub = .{
                     .level = @max(saved_sub.level, mine.level),
                     .opaq = saved_sub.opaq or mine.opaq,
+                    .applies = saved_sub.applies +| mine.applies,
                 };
             },
             .lambda => {
@@ -452,6 +475,7 @@ pub const Walker = struct {
                 self.sub = .{
                     .level = @max(saved_sub.level, @min(self.sub.level, introduced - 1)),
                     .opaq = saved_sub.opaq or self.sub.opaq,
+                    .applies = saved_sub.applies +| self.sub.applies,
                 };
                 self.cur_lambda = saved_lambda;
                 self.popBinders(start);
@@ -488,6 +512,7 @@ pub const Walker = struct {
                 self.sub = .{
                     .level = @max(saved_sub.level, @min(self.sub.level, introduced - 1)),
                     .opaq = saved_sub.opaq or self.sub.opaq,
+                    .applies = saved_sub.applies +| self.sub.applies,
                 };
                 self.cur_lambda = saved_lambda;
                 self.popBinders(start);

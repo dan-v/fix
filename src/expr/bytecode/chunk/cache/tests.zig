@@ -559,6 +559,8 @@ test "computeKey is stable for identical inputs and varies with codegen policy" 
         .policy_fp = 42,
         .let_float_enabled = true,
         .full_lazy_enabled = false,
+        .mfe_min_applies = 1,
+        .named_floats = true,
         .home = "/home/x",
     };
     const k1 = computeKey("let x = 1; in x", "a.nix", ctx);
@@ -577,4 +579,14 @@ test "computeKey is stable for identical inputs and varies with codegen policy" 
     lazy.full_lazy_enabled = true;
     const k5 = computeKey("let x = 1; in x", "a.nix", lazy);
     try testing.expect(!std.mem.eql(u8, &k1, &k5));
+
+    var gated = lazy;
+    gated.mfe_min_applies = 2;
+    const k6 = computeKey("let x = 1; in x", "a.nix", gated);
+    try testing.expect(!std.mem.eql(u8, &k5, &k6));
+
+    var no_named = lazy;
+    no_named.named_floats = false;
+    const k7 = computeKey("let x = 1; in x", "a.nix", no_named);
+    try testing.expect(!std.mem.eql(u8, &k5, &k7));
 }

@@ -52,6 +52,11 @@ pub const Context = struct {
     /// outermost lambdas (see `let_float.rewriteLambdaBody`). Independent
     /// of `enabled` only in that both must hold for the lambda hook.
     full_lazy: bool = false,
+    /// Anonymous-MFE work gate: minimum applies in a candidate subtree.
+    mfe_min_applies: u16 = 1,
+    /// Dev A/B knob (`FIX_FL_NAMED_OFF=1`): stand down the NAMED float-out
+    /// pass while keeping the walk machinery and MFE pass live.
+    named_floats: bool = true,
     stats: ?*Stats = null,
 };
 

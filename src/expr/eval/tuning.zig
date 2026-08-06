@@ -58,6 +58,11 @@ pub const Policy = struct {
     /// pre-emission analysis walk at outermost lambdas (and, in later
     /// stages, float-out itself). Off by default until qualification.
     full_lazy_enabled: bool = false,
+    /// Minimum apply count inside an anonymous-MFE candidate
+    /// (`FIX_FL_MFE_MIN_APPLIES`): below it, the float's per-closure thunk
+    /// creation outweighs the shared work. Tuned on nixos-minimal.
+    mfe_min_applies: u16 = 1,
+    named_floats_enabled: bool = true,
     let_float_report: bool = false,
 };
 
@@ -105,6 +110,8 @@ pub fn resolve(
         .heap_string_min = envInt(usize, env, "FIX_HEAP_STR_MIN") orelse 64,
         .let_float_enabled = !envEnabled(env, "FIX_NO_LET_FLOAT", false),
         .full_lazy_enabled = envEnabled(env, "FIX_FULL_LAZY", false),
+        .mfe_min_applies = envInt(u16, env, "FIX_FL_MFE_MIN_APPLIES") orelse 1,
+        .named_floats_enabled = !envEnabled(env, "FIX_FL_NAMED_OFF", false),
         .let_float_report = envEnabled(env, "FIX_LET_FLOAT_STATS", false),
     };
 }

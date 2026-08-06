@@ -134,6 +134,8 @@ pub const Use = struct {
     pinned: bool,
 };
 
+pub const OpaqueSpan = struct { mark: u32, atom: Node.Atom };
+
 /// Compact immutable adjacency assembled when a cluster walk finishes.
 /// Keys are binding ids; values are either binding ids or use indices.
 pub const Adjacency = struct {
@@ -269,12 +271,24 @@ pub const SharedTables = struct {
     /// (lexical resolution outranks `with`) — would be CAPTURED. The float
     /// proof refuses names mentioned in the newly-covered region.
     mentions: std.AutoHashMapUnmanaged(InternId, std.ArrayListUnmanaged(u32)) = .empty,
+    /// Full-lazy only: opaque SOURCE SPANS (elided bodies, interpolated
+    /// strings) crossed OUTSIDE any active cluster, at their log position.
+    /// Their identifier words are potential mentions, but interning and
+    /// resolving every word of every never-compiled function body is the
+    /// dominant walk cost — so the capture proof scans these spans lazily,
+    /// only for the (rare) names it actually proposes to hoist.
+    opaque_spans: std.ArrayListUnmanaged(OpaqueSpan) = .empty,
     /// Binder-log positions where a `with` body begins. A binding whose RHS
     /// mentions a dynamically-resolved name may still move — but only when
     /// the walk window between its cluster header and the destination
     /// crosses no `with` entry (the with-lookup chain is then identical at
     /// both positions). Ascending by construction.
     with_marks: std.ArrayListUnmanaged(u32) = .empty,
+
+    pub fn logOpaqueSpan(self: *SharedTables, atom: Node.Atom) !void {
+        try self.opaque_spans.append(self.allocator, .{ .mark = self.log_len, .atom = atom });
+        self.log_len += 1; // advance the clock, like mentions/with-marks
+    }
 
     pub fn logMention(self: *SharedTables, name_id: InternId) !void {
         const gop = try self.mentions.getOrPut(self.allocator, name_id);
@@ -288,17 +302,45 @@ pub const SharedTables = struct {
         self.log_len += 1;
     }
 
-    /// Any mention of `name_id` in log window [from, to)?
-    pub fn mentionedInWindow(self: *const SharedTables, name_id: InternId, from: u32, to: u32) bool {
-        const list = self.mentions.get(name_id) orelse return false;
-        const items = list.items;
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid] < from) lo = mid + 1 else hi = mid;
+    /// Any mention of `name_id` in log window [from, to)? `source` backs the
+    /// lazy scan of opaque spans (elided bodies / interpolated strings) whose
+    /// clock position falls inside the window: an identifier-shaped
+    /// occurrence of the name there counts as a (conservative) mention.
+    pub fn mentionedInWindow(self: *const SharedTables, source: []const u8, name: []const u8, name_id: InternId, from: u32, to: u32) bool {
+        blk: {
+            const list = self.mentions.get(name_id) orelse break :blk;
+            const items = list.items;
+            var lo: usize = 0;
+            var hi: usize = items.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (items[mid] < from) lo = mid + 1 else hi = mid;
+            }
+            if (lo < items.len and items[lo] < to) return true;
         }
-        return lo < items.len and items[lo] < to;
+        for (self.opaque_spans.items) |span| {
+            if (span.mark < from or span.mark >= to) continue;
+            if (containsIdentWord(source[span.atom.offset .. span.atom.offset + span.atom.len], name)) return true;
+        }
+        return false;
+    }
+
+    fn containsIdentWord(text: []const u8, name: []const u8) bool {
+        if (name.len == 0) return false;
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, text, i, name)) |at| {
+            const before_ok = at == 0 or !isIdentChar(text[at - 1]);
+            const end = at + name.len;
+            const after_ok = end >= text.len or !isIdentChar(text[end]);
+            if (before_ok and after_ok) return true;
+            i = at + 1;
+        }
+        return false;
+    }
+
+    fn isIdentChar(ch: u8) bool {
+        return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '_' or ch == '\'' or ch == '-';
     }
 
     pub fn logBinder(self: *SharedTables, name_id: InternId, cluster: u32) !void {
