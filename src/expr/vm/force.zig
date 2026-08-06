@@ -27,6 +27,7 @@ const prof = @import("../probe.zig").prof;
 const prof_census = @import("../probe.zig").prof_census;
 const vm_errors = @import("errors.zig");
 const prof_path = @import("../probe.zig").prof_path;
+const prof_dup = @import("../probe.zig").prof_dup;
 const Chunk = @import("../bytecode.zig").chunk.Chunk;
 const heap_mod = @import("runtime").heap;
 const gc = @import("runtime").gc;
@@ -713,6 +714,28 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     if (memo_key) |key|
         if (reuseMemoizedThunk(self, thunk, thunk_id, key, real_demand)) |value| return value;
 
+    // Duplicate-resolve census (full-laziness payoff probe): key this
+    // evaluation by chunk + ALL upvalue bits BEFORE the body runs (the
+    // payload union flips to the result at resolve), and charge its
+    // inclusive cycles at publish below.
+    var dup_hash: u64 = 0;
+    var dup_chunk: u32 = 0;
+    var dup_memo_eligible = false;
+    var dup_t0: u64 = 0;
+    var dup_armed = false;
+    if (comptime prof.enabled) {
+        if (self.workerId() == 0 and thunk.targetKind() == .bytecode) {
+            const b = &thunk.payload.target.bytecode;
+            var h = std.hash.Wyhash.init(0x1e35_a7bd);
+            for (b.upvalues()) |v| h.update(std.mem.asBytes(&v.bits));
+            dup_hash = h.final();
+            dup_chunk = b.chunk_id;
+            dup_memo_eligible = b.upvalues().len <= 2;
+            dup_t0 = prof.rdtsc();
+            dup_armed = true;
+        }
+    }
+
     const effect_checkpoint = self.effect_journal.items.len;
     const effect_epoch = self.effect_epoch;
     const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
@@ -757,6 +780,9 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
         return err;
     };
 
+    if (comptime prof.enabled) {
+        if (dup_armed) prof_dup.record(dup_chunk, dup_hash, dup_memo_eligible, prof.rdtsc() - dup_t0);
+    }
     self.heap.gcReleaseThunkSpill(thunk);
     resolveDispatch(self, thunk, whnf);
     self.heap.gcRecordEdge(thunk_id, whnf);

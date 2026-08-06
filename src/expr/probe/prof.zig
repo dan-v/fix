@@ -398,6 +398,8 @@ pub fn report(registry: *const ChunkRegistry, intern: *const InternTable) void {
     }
     // Attr inline-cache, thunk-memo, repeat-force, and attr-lookup size censuses.
     prof_census.reportCaches();
+    // Duplicate-resolve census (full-laziness payoff).
+    @import("prof_dup.zig").report();
     // Fiber cost/benefit census.
     prof_fiber.report();
     // Per-task-class census: what each scheduled item delivered.

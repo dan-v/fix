@@ -9,6 +9,7 @@ pub const timeline = @import("probe/timeline.zig");
 pub const prof = @import("probe/prof.zig");
 pub const prof_path = @import("probe/prof_path.zig");
 pub const prof_census = @import("probe/prof_census.zig");
+pub const prof_dup = @import("probe/prof_dup.zig");
 pub const thunk_trace = @import("probe/thunk_trace.zig");
 
 test {
