@@ -13,10 +13,16 @@ jobs:
   # pinned nix-shell, so the artifact's dynamic deps (curl/libgit2/glibc
   # store paths) resolve identically.
   build:
-    name: build / x86_64-linux
+    name: build / ${{ matrix.optimize }}
     runs-on: ubuntu-24.04
-    outputs:
-      wiped: ${{ steps.store.outputs.wiped }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - optimize: ReleaseFast
+            artifact: fix-releasefast
+          - optimize: ReleaseSafe
+            artifact: fix-releasesafe
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
@@ -36,25 +42,30 @@ jobs:
         run: |
           nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
           nix-channel --update nixpkgs
-      - name: Build ReleaseFast
+      # Zig caches persist across runs (keyed to HEAD, prefix-restored from
+      # the newest prior run). Only the zig builds share these; the nix
+      # package build is hermetic by design and must not see them.
+      - name: Restore zig cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-build-${{ matrix.optimize }}-${{ github.sha }}
+          restore-keys: |
+            zig-build-${{ matrix.optimize }}-
+      # -Dcpu=x86_64_v3: the artifact crosses machines, and the hosted-runner
+      # fleet is heterogeneous — a native build from an AVX-512 machine
+      # SIGILLs on the fleet's AMD boxes. v3 (AVX2) is the fleet-wide floor.
+      - name: Build ${{ matrix.optimize }}
         timeout-minutes: 20
         run: |
-          nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
-          cp zig-out/bin/fix fix-releasefast
-      - name: Build ReleaseSafe (detector)
-        timeout-minutes: 20
-        run: |
-          nix-shell --run 'zig build -Doptimize=ReleaseSafe --summary all'
-          cp zig-out/bin/fix fix-releasesafe
+          nix-shell --run 'zig build -Doptimize=${{ matrix.optimize }} -Dcpu=x86_64_v3 --summary all'
+          cp zig-out/bin/fix ${{ matrix.artifact }}
       - uses: actions/upload-artifact@v7
         with:
-          name: fix-releasefast
-          path: fix-releasefast
-          retention-days: 3
-      - uses: actions/upload-artifact@v7
-        with:
-          name: fix-releasesafe
-          path: fix-releasesafe
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
           retention-days: 3
       # Last step on purpose: skipped when anything above failed, so a broken
       # job can never publish a poisoned store snapshot.
@@ -96,6 +107,18 @@ jobs:
           nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
           nix-channel --update nixpkgs
 
+      # Shared across ALL zig builds in this job (suite test binaries are the
+      # bulk of the compile time). The nix package build below is hermetic
+      # (its own TMPDIR cache) and intentionally excluded.
+      - name: Restore zig cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-test-${{ matrix.system }}-${{ github.sha }}
+          restore-keys: |
+            zig-test-${{ matrix.system }}-
       - name: Build
         timeout-minutes: 20
         run: nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
