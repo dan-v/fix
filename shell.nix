@@ -12,7 +12,6 @@ in
         pkgs.pkg-config
         pkgs.ripgrep
         pkgs.hyperfine
-        pkgs.vhs
         pkgs.curl
         pkgs.libgit2
         pkgs.mercurial
