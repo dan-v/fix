@@ -1084,20 +1084,20 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
         },
         .force_attrs_sweep => |attrs_id| {
             const entries = heap.materializeAttrs(attrs_id) catch return;
-            for (entries) |entry| {
-                if (!entry.value.isThunk()) continue;
+            for (entries.values) |entry_value| {
+                if (!entry_value.isThunk()) continue;
                 total.* += 1;
-                if (heap.getThunkAssumeValid(entry.value.asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
+                if (heap.getThunkAssumeValid(entry_value.asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
             }
         },
         .force_attrs_range => |range| {
             const entries = heap.materializeAttrs(range.attrs_id) catch return;
-            const end = @min(@as(usize, range.offset) + @as(usize, range.len), entries.len);
+            const end = @min(@as(usize, range.offset) + @as(usize, range.len), entries.len());
             var i: usize = range.offset;
             while (i < end) : (i += 1) {
-                if (!entries[i].value.isThunk()) continue;
+                if (!entries.values[i].isThunk()) continue;
                 total.* += 1;
-                if (heap.getThunkAssumeValid(entries[i].value.asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
+                if (heap.getThunkAssumeValid(entries.values[i].asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
             }
         },
         // Import registry / FileCache state isn't scanned here — count the

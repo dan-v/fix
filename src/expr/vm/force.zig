@@ -926,12 +926,12 @@ fn structuralHashInto(self: *VM, h: *std.hash.Wyhash, v: Value, depth: u8) void 
             return;
         };
         h.update("A");
-        var len: u32 = @intCast(entries.len);
+        var len: u32 = @intCast(entries.len());
         h.update(std.mem.asBytes(&len));
-        const k = @min(entries.len, 8);
-        for (entries[0..k]) |e| {
-            h.update(std.mem.asBytes(&e.name));
-            structuralHashInto(self, h, e.value, depth - 1);
+        const k = @min(entries.len(), 8);
+        for (entries.names[0..k], entries.values[0..k]) |e_name, e_value| {
+            h.update(std.mem.asBytes(&e_name));
+            structuralHashInto(self, h, e_value, depth - 1);
         }
         return;
     }

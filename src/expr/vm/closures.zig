@@ -27,6 +27,7 @@ const trace = @import("trace.zig");
 const force = @import("force.zig");
 const trace_log = @import("trace_log.zig");
 const prof = @import("../probe.zig").prof;
+const prof_census = @import("../probe.zig").prof_census;
 const run_mod = @import("run.zig");
 const thread_caches = @import("thread_caches.zig");
 
@@ -246,6 +247,14 @@ pub fn evalArgEager(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame
 /// reserved range directly.
 fn captureBytecodeThunk(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !types.ObjectId {
     const count = descriptors.len / 3;
+    if (comptime prof.enabled) {
+        if (self.workerId() == 0) switch (count) {
+            0 => prof_census.thunk_ups0 += 1,
+            1 => prof_census.thunk_ups1 += 1,
+            2 => prof_census.thunk_ups2 += 1,
+            else => prof_census.thunk_ups3plus += 1,
+        };
+    }
     if (count <= BytecodeThunk.inline_capacity) {
         var buf: [BytecodeThunk.inline_capacity]Value = undefined;
         try fillCaptureValues(self, descriptors, frame, buf[0..count]);

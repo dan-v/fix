@@ -476,9 +476,9 @@ pub fn siblingCensus(heap: anytype) void {
         var demanded_young: u64 = 0;
         var spec_resolved: u64 = 0;
         var unresolved: u64 = 0;
-        for (entries) |entry| {
-            if (!entry.value.isThunk()) continue;
-            switch (heap.objects.get(entry.value.asObjectId()).*) {
+        for (entries) |entry_value| {
+            if (!entry_value.isThunk()) continue;
+            switch (heap.objects.get(entry_value.asObjectId()).*) {
                 .thunk => |thunk| {
                     members += 1;
                     if (thunk.isDemanded()) {

@@ -171,6 +171,10 @@ pub var attr_cache_misses: u64 = 0;
 /// the per-claimed-force TLS probe still pays for its cache misses.
 pub var memo_probes: u64 = 0;
 pub var memo_hits: u64 = 0;
+pub var thunk_ups0: u64 = 0;
+pub var thunk_ups1: u64 = 0;
+pub var thunk_ups2: u64 = 0;
+pub var thunk_ups3plus: u64 = 0;
 pub var memo_write_ok: u64 = 0;
 pub var memo_write_effect_blocked: u64 = 0;
 /// Memo eligibility histogram: forces of freshly-claimed bytecode thunks
@@ -290,6 +294,13 @@ pub fn reportCaches() void {
         }
     }
     // Thunk-result-memo census.
+    if (thunk_ups0 + thunk_ups1 + thunk_ups2 + thunk_ups3plus != 0) {
+        const tot = thunk_ups0 + thunk_ups1 + thunk_ups2 + thunk_ups3plus;
+        std.debug.print(
+            "prof thunk-upvalues at creation: 0={d} ({d:.1}%) 1={d} ({d:.1}%) 2={d} ({d:.1}%) 3+={d} ({d:.1}%)\n",
+            .{ thunk_ups0, pct(thunk_ups0, tot), thunk_ups1, pct(thunk_ups1, tot), thunk_ups2, pct(thunk_ups2, tot), thunk_ups3plus, pct(thunk_ups3plus, tot) },
+        );
+    }
     if (memo_probes != 0) {
         std.debug.print(
             "prof thunk-memo: probes={d} hits={d} ({d:.1}%) writes_ok={d} writes_effect_blocked={d} inel_ups3={d} inel_ups4={d} inel_ups>=5={d}\n",
