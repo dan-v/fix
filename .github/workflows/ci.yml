@@ -13,23 +13,35 @@ jobs:
   # pinned nix-shell, so the artifact's dynamic deps (curl/libgit2/glibc
   # store paths) resolve identically.
   build:
-    name: build / ${{ matrix.optimize }}
-    runs-on: ubuntu-24.04
+    name: build / ${{ matrix.system }} ${{ matrix.optimize }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - optimize: ReleaseFast
-            artifact: fix-releasefast
-          - optimize: ReleaseSafe
-            artifact: fix-releasesafe
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+            optimize: ReleaseFast
+            artifact: fix-releasefast-x86_64-linux
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+            optimize: ReleaseSafe
+            artifact: fix-releasesafe-x86_64-linux
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+            optimize: ReleaseFast
+            artifact: fix-releasefast-aarch64-linux
+          - system: aarch64-darwin
+            runner: macos-15
+            optimize: ReleaseFast
+            artifact: fix-releasefast-aarch64-darwin
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
       - id: store
         uses: ./.github/actions/nix-store-cache
         with:
-          key: nix-v4-build-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          key: nix-v4-build-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
       - name: Reinstall nix (cold, after wipe)
         if: steps.store.outputs.wiped == 'true'
         uses: cachix/install-nix-action@v31
@@ -51,12 +63,12 @@ jobs:
           path: |
             .zig-cache
             ~/.cache/zig
-          key: zig-build-${{ matrix.optimize }}-${{ github.sha }}
+          key: zig-build-${{ matrix.system }}-${{ matrix.optimize }}-${{ github.sha }}
           restore-keys: |
-            zig-build-${{ matrix.optimize }}-
-      # -Dcpu=baseline: the artifact crosses machines, and the hosted-runner
-      # fleet is heterogeneous — a native build from an AVX-512 machine
-      # SIGILLs on the fleet's AMD boxes. baseline matches the nix package
+            zig-build-${{ matrix.system }}-${{ matrix.optimize }}-
+      # -Dcpu=baseline: the artifact crosses machines within an arch pool
+      # (heterogeneous hosted fleet — a native build SIGILLs on boxes missing
+      # the builder's ISA extensions), and baseline matches the nix package
       # (nix/fix.nix cpu ? "baseline"), so CI exercises the same ISA target
       # module users compile.
       - name: Build ${{ matrix.optimize }}
@@ -73,7 +85,7 @@ jobs:
       # job can never publish a poisoned store snapshot.
       - uses: nix-community/cache-nix-action/save@v7
         with:
-          primary-key: nix-v4-build-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          primary-key: nix-v4-build-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
 
   test:
     name: ${{ matrix.system }}
@@ -208,20 +220,41 @@ jobs:
           primary-key: nix-v4-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
 
   nixpkgs-eval:
-    name: nixpkgs / chunk ${{ matrix.chunk }}
-    runs-on: ubuntu-24.04
+    # Native runners on purpose: the aarch64 arms are the only place the
+    # weak-memory-ordering code paths (deque/future fences) run on real
+    # hardware — qemu inherits the x86 host's TSO and hides those bugs.
+    # The oracle is host-independent (same expression, same pin), so all
+    # three platforms share one oracle cache per chunk.
+    name: nixpkgs / ${{ matrix.system }} chunk ${{ matrix.chunk }}
+    runs-on: ${{ matrix.runner }}
     needs: build
     strategy:
       fail-fast: false
       matrix:
         chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        system: [x86_64-linux, aarch64-linux, aarch64-darwin]
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+            budget_a: 1024
+            budget_b: 512
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+            budget_a: 1024
+            budget_b: 512
+          # macos-15 runners have 7 GB RAM; a 1024-budget chunk peaks near
+          # 10 GB, so darwin runs both lanes tighter.
+          - system: aarch64-darwin
+            runner: macos-15
+            budget_a: 512
+            budget_b: 256
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
       - id: store
         uses: ./.github/actions/nix-store-cache
         with:
-          key: nix-v4-eval-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          key: nix-v4-eval-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
       - name: Reinstall nix (cold, after wipe)
         if: steps.store.outputs.wiped == 'true'
         uses: cachix/install-nix-action@v31
@@ -241,17 +274,23 @@ jobs:
           key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-chunk-${{ matrix.chunk }}
       - uses: actions/download-artifact@v8
         with:
-          name: fix-releasefast
-      - name: Differential eval
-        timeout-minutes: 25
+          name: fix-releasefast-${{ matrix.system }}
+      - name: Differential eval (default budget)
+        timeout-minutes: 35
         run: |
-          chmod +x fix-releasefast
-          nix-shell --run 'test/nixpkgs/run.sh --chunk ${{ matrix.chunk }}/12 --gc-budget 1024 --fix ./fix-releasefast'
+          chmod +x fix-releasefast-${{ matrix.system }}
+          nix-shell --run 'test/nixpkgs/run.sh --chunk ${{ matrix.chunk }}/12 --gc-budget ${{ matrix.budget_a }} --fix ./fix-releasefast-${{ matrix.system }}'
+      # Same chunk under GC pressure: more majors, more sweep/remset traffic,
+      # same required answer. The oracle is already materialized above.
+      - name: Differential eval (tight budget)
+        timeout-minutes: 35
+        run: |
+          nix-shell --run 'test/nixpkgs/run.sh --chunk ${{ matrix.chunk }}/12 --gc-budget ${{ matrix.budget_b }} --fix ./fix-releasefast-${{ matrix.system }}'
       # Last step on purpose: it is skipped when anything above failed, so a
       # broken job can never publish a poisoned store snapshot.
       - uses: nix-community/cache-nix-action/save@v7
         with:
-          primary-key: nix-v4-eval-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          primary-key: nix-v4-eval-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
 
   # GC use-after-free tripwire: chunk 0 at a tight budget was the workload
   # that exposed the w>1 collection races (2026-08: native-handoff result
@@ -289,12 +328,12 @@ jobs:
           key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-chunk-0
       - uses: actions/download-artifact@v8
         with:
-          name: fix-releasesafe
+          name: fix-releasesafe-x86_64-linux
       - name: Tight-budget detector eval
         timeout-minutes: 25
         run: |
-          chmod +x fix-releasesafe
-          nix-shell --run 'test/nixpkgs/run.sh --chunk 0/12 --gc-budget 512 --workers 4 --fix ./fix-releasesafe'
+          chmod +x fix-releasesafe-x86_64-linux
+          nix-shell --run 'test/nixpkgs/run.sh --chunk 0/12 --gc-budget 512 --workers 4 --fix ./fix-releasesafe-x86_64-linux'
 
   daemon-compat:
     name: daemon / ${{ matrix.implementation }}
@@ -335,14 +374,14 @@ jobs:
         run: nix --version
       - uses: actions/download-artifact@v8
         with:
-          name: fix-releasefast
+          name: fix-releasefast-x86_64-linux
       - name: Real-daemon compatibility
         timeout-minutes: 10
         env:
           FIX_REQUIRE_DAEMON: "1"
         run: |
-          chmod +x fix-releasefast
-          bash test/e2e/daemon.sh ./fix-releasefast
+          chmod +x fix-releasefast-x86_64-linux
+          bash test/e2e/daemon.sh ./fix-releasefast-x86_64-linux
       # Last step on purpose: it is skipped when anything above failed, so a
       # broken job can never publish a poisoned store snapshot.
       - uses: nix-community/cache-nix-action/save@v7
