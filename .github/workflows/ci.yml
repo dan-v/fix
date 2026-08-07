@@ -54,13 +54,15 @@ jobs:
           key: zig-build-${{ matrix.optimize }}-${{ github.sha }}
           restore-keys: |
             zig-build-${{ matrix.optimize }}-
-      # -Dcpu=x86_64_v3: the artifact crosses machines, and the hosted-runner
+      # -Dcpu=baseline: the artifact crosses machines, and the hosted-runner
       # fleet is heterogeneous — a native build from an AVX-512 machine
-      # SIGILLs on the fleet's AMD boxes. v3 (AVX2) is the fleet-wide floor.
+      # SIGILLs on the fleet's AMD boxes. baseline matches the nix package
+      # (nix/fix.nix cpu ? "baseline"), so CI exercises the same ISA target
+      # module users compile.
       - name: Build ${{ matrix.optimize }}
         timeout-minutes: 20
         run: |
-          nix-shell --run 'zig build -Doptimize=${{ matrix.optimize }} -Dcpu=x86_64_v3 --summary all'
+          nix-shell --run 'zig build -Doptimize=${{ matrix.optimize }} -Dcpu=baseline --summary all'
           cp zig-out/bin/fix ${{ matrix.artifact }}
       - uses: actions/upload-artifact@v7
         with:
