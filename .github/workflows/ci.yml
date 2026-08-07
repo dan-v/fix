@@ -7,6 +7,61 @@ permissions:
   contents: read
 
 jobs:
+  # One x86_64-linux build feeds every consumer that needs only the BINARY
+  # (12 nixpkgs chunks, the gc detector, both daemon arms) — previously each
+  # of those built fix from a cold zig cache. Consumers run inside the same
+  # pinned nix-shell, so the artifact's dynamic deps (curl/libgit2/glibc
+  # store paths) resolve identically.
+  build:
+    name: build / x86_64-linux
+    runs-on: ubuntu-24.04
+    outputs:
+      wiped: ${{ steps.store.outputs.wiped }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - id: store
+        uses: ./.github/actions/nix-store-cache
+        with:
+          key: nix-v4-build-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+      - name: Reinstall nix (cold, after wipe)
+        if: steps.store.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Re-disable store optimisation (cold path)
+        if: steps.store.outputs.wiped == 'true'
+        run: |
+          echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon 2>/dev/null || true
+      - name: Install pinned nixpkgs channel
+        run: |
+          nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
+          nix-channel --update nixpkgs
+      - name: Build ReleaseFast
+        timeout-minutes: 20
+        run: |
+          nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
+          cp zig-out/bin/fix fix-releasefast
+      - name: Build ReleaseSafe (detector)
+        timeout-minutes: 20
+        run: |
+          nix-shell --run 'zig build -Doptimize=ReleaseSafe --summary all'
+          cp zig-out/bin/fix fix-releasesafe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fix-releasefast
+          path: fix-releasefast
+          retention-days: 3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fix-releasesafe
+          path: fix-releasesafe
+          retention-days: 3
+      # Last step on purpose: skipped when anything above failed, so a broken
+      # job can never publish a poisoned store snapshot.
+      - uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: nix-v4-build-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+
   test:
     name: ${{ matrix.system }}
     runs-on: ${{ matrix.runner }}
@@ -24,11 +79,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
-      - uses: nix-community/cache-nix-action/restore@v7
+      - id: store
+        uses: ./.github/actions/nix-store-cache
         with:
-          primary-key: nix-v3-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-
-
+          key: nix-v4-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+      - name: Reinstall nix (cold, after wipe)
+        if: steps.store.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Re-disable store optimisation (cold path)
+        if: steps.store.outputs.wiped == 'true'
+        run: |
+          echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon 2>/dev/null || true
       - name: Install pinned nixpkgs channel
         run: |
           nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
@@ -118,100 +180,105 @@ jobs:
       # broken job can never publish a poisoned store snapshot.
       - uses: nix-community/cache-nix-action/save@v7
         with:
-          primary-key: nix-v3-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          primary-key: nix-v4-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
 
   nixpkgs-eval:
     name: nixpkgs / chunk ${{ matrix.chunk }}
     runs-on: ubuntu-24.04
+    needs: build
     strategy:
       fail-fast: false
       matrix:
         chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
-      - uses: nix-community/cache-nix-action/restore@v7
+      - id: store
+        uses: ./.github/actions/nix-store-cache
         with:
-          primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-
-
+          key: nix-v4-eval-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+      - name: Reinstall nix (cold, after wipe)
+        if: steps.store.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Re-disable store optimisation (cold path)
+        if: steps.store.outputs.wiped == 'true'
+        run: |
+          echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon 2>/dev/null || true
       - name: Install pinned nixpkgs channel
         run: |
           nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
           nix-channel --update nixpkgs
-
-      # Oracle drvPaths only change when the nixpkgs pin moves, so cache them
-      # keyed on the pin; a hit skips the nix-instantiate reference eval.
       - name: Restore oracle cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/fix-nixpkgs-eval
           key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-chunk-${{ matrix.chunk }}
-
-      - name: Build
-        timeout-minutes: 20
-        run: nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
-
-      # ~2100 top-level names per chunk; --gc-budget keeps the evaluator's
-      # peak under ~10 GB so it fits the 16 GB hosted runner (the full
-      # universe in one process wants ~51 GB — that stays a local run:
-      # `zig build test-nixpkgs`).
+      - uses: actions/download-artifact@v8
+        with:
+          name: fix-releasefast
       - name: Differential eval
         timeout-minutes: 25
-        run: nix-shell --run 'zig build test-nixpkgs -Doptimize=ReleaseFast --summary all -- --chunk ${{ matrix.chunk }}/12 --gc-budget 1024'
-
+        run: |
+          chmod +x fix-releasefast
+          nix-shell --run 'test/nixpkgs/run.sh --chunk ${{ matrix.chunk }}/12 --gc-budget 1024 --fix ./fix-releasefast'
       # Last step on purpose: it is skipped when anything above failed, so a
       # broken job can never publish a poisoned store snapshot.
       - uses: nix-community/cache-nix-action/save@v7
         with:
-          primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          primary-key: nix-v4-eval-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
 
   # GC use-after-free tripwire: chunk 0 at a tight budget was the workload
   # that exposed the w>1 collection races (2026-08: native-handoff result
   # rooting; the swept force_thunk task root). ReleaseSafe is the detector
   # build — reuse off, alloc-bitmap liveness asserts on every id read, and
   # swept-slot poisoning that makes a stale claim panic at the deref instead
-  # of segfaulting one run in thirty. Peak RSS is ~11 GB (reuse-off trades
-  # memory for detection), comparable to the ReleaseFast matrix jobs.
+  # of segfaulting one run in thirty.
   nixpkgs-gc-detector:
     name: nixpkgs / gc detector (chunk 0, tight budget)
     runs-on: ubuntu-24.04
-
+    needs: build
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
-      - uses: nix-community/cache-nix-action/restore@v7
+      - id: store
+        uses: ./.github/actions/nix-store-cache
         with:
-          primary-key: nix-eval-v1-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-
+          key: nix-v4-eval-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+      - name: Reinstall nix (cold, after wipe)
+        if: steps.store.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Re-disable store optimisation (cold path)
+        if: steps.store.outputs.wiped == 'true'
+        run: |
+          echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon 2>/dev/null || true
       - name: Install pinned nixpkgs channel
         run: |
           nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
           nix-channel --update nixpkgs
-
       - name: Restore oracle cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/fix-nixpkgs-eval
           key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-chunk-0
-
-      - name: Build (ReleaseSafe detector)
-        timeout-minutes: 20
-        run: nix-shell --run 'zig build -Doptimize=ReleaseSafe --summary all'
-
+      - uses: actions/download-artifact@v8
+        with:
+          name: fix-releasesafe
       - name: Tight-budget detector eval
         timeout-minutes: 25
-        run: nix-shell --run 'zig build test-nixpkgs -Doptimize=ReleaseSafe --summary all -- --chunk 0/12 --gc-budget 512 --workers 4'
+        run: |
+          chmod +x fix-releasesafe
+          nix-shell --run 'test/nixpkgs/run.sh --chunk 0/12 --gc-budget 512 --workers 4 --fix ./fix-releasesafe'
 
   daemon-compat:
     name: daemon / ${{ matrix.implementation }}
     runs-on: ubuntu-24.04
+    needs: build
     strategy:
       fail-fast: false
       matrix:
         implementation: [cppnix, lix]
-
     steps:
       - uses: actions/checkout@v6
       - name: Install CppNix
@@ -220,79 +287,37 @@ jobs:
       - name: Install Lix
         if: matrix.implementation == 'lix'
         uses: samueldr/lix-gha-installer-action@a0fee77b2a98bb7c5c0ed7ae6d6ad4903dbdad0d # v2026-06-15
-      # ROOT CAUSE of the recurring "corrupt cache": Lix defaults
-      # auto-optimise-store ON (CppNix does not — which is why only the lix
-      # arm corrupted). An optimised store is a farm of hard links into
-      # /nix/store/.links; the snapshot archives files AS those links, and
-      # the restore's exclude-existing-paths extraction cannot resolve them
-      # against a fresh install's different .links — every deduplicated
-      # file silently fails to extract. Snapshots must contain regular
-      # files: optimisation off before ANY store operation. (The key bump
-      # v3->v4 retires every hardlink-broken snapshot.)
-      - name: Disable store optimisation (snapshots need regular files)
+      - id: store
+        uses: ./.github/actions/nix-store-cache
+        with:
+          key: daemon-v4-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+      - name: Reinstall CppNix (cold, after wipe)
+        if: matrix.implementation == 'cppnix' && steps.store.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Reinstall Lix (cold, after wipe)
+        if: matrix.implementation == 'lix' && steps.store.outputs.wiped == 'true'
+        uses: samueldr/lix-gha-installer-action@a0fee77b2a98bb7c5c0ed7ae6d6ad4903dbdad0d # v2026-06-15
+      - name: Re-disable store optimisation (cold path)
+        if: steps.store.outputs.wiped == 'true'
         run: |
           echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
           sudo systemctl restart nix-daemon 2>/dev/null || true
-      - uses: nix-community/cache-nix-action/restore@v7
-        with:
-          primary-key: daemon-v4-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-
-      # Self-healing store: the snapshot restore overlays a previously-saved
-      # /nix (store + SQLite db) onto a freshly-installed daemon, and ANY
-      # drift — installer update, partial save, db/contents skew — presents
-      # as store corruption downstream. The DEFAULT is therefore: validate
-      # cheaply, and on any anomaly wipe /nix entirely and reinstall cold.
-      # A cache problem may cost this job minutes; it must never fail it.
-      - name: Validate restored store (wipe on any anomaly)
-        id: store_probe
-        run: |
-          set +e
-          probe() {
-            sudo systemctl restart nix-daemon 2>/dev/null || true
-            timeout 120 nix-store --verify >/dev/null 2>&1 || return 1
-            timeout 60 nix-instantiate --eval -E '1 + 1' >/dev/null 2>&1 || return 1
-            return 0
-          }
-          if probe; then
-            echo "restored store validated"
-            echo "wiped=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "restored store failed validation — discarding and reinstalling cold"
-            # The wipe must cover the installer's FULL footprint, not just
-            # /nix: lix-installer refuses to merge onto a leftover
-            # /etc/nix/nix.conf, and stale systemd units point into the
-            # removed store.
-            sudo systemctl stop nix-daemon.socket nix-daemon 2>/dev/null || true
-            sudo rm -rf /nix /etc/nix
-            sudo rm -f /etc/systemd/system/nix-daemon.service /etc/systemd/system/nix-daemon.socket
-            sudo systemctl daemon-reload 2>/dev/null || true
-            echo "wiped=true" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Reinstall CppNix (cold, after wipe)
-        if: matrix.implementation == 'cppnix' && steps.store_probe.outputs.wiped == 'true'
-        uses: cachix/install-nix-action@v31
-      - name: Reinstall Lix (cold, after wipe)
-        if: matrix.implementation == 'lix' && steps.store_probe.outputs.wiped == 'true'
-        uses: samueldr/lix-gha-installer-action@a0fee77b2a98bb7c5c0ed7ae6d6ad4903dbdad0d # v2026-06-15
-
       - name: Install pinned nixpkgs channel
         run: |
           nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
           nix-channel --update nixpkgs
-
       - name: Report daemon implementation
         run: nix --version
-
-      - name: Build
-        timeout-minutes: 20
-        run: nix-shell --run 'zig build -Doptimize=ReleaseFast --summary all'
-
+      - uses: actions/download-artifact@v8
+        with:
+          name: fix-releasefast
       - name: Real-daemon compatibility
         timeout-minutes: 10
         env:
           FIX_REQUIRE_DAEMON: "1"
-        run: nix-shell --run 'zig build test-e2e --summary all -- daemon'
-
+        run: |
+          chmod +x fix-releasefast
+          bash test/e2e/daemon.sh ./fix-releasefast
       # Last step on purpose: it is skipped when anything above failed, so a
       # broken job can never publish a poisoned store snapshot.
       - uses: nix-community/cache-nix-action/save@v7
