@@ -220,9 +220,22 @@ jobs:
       - name: Install Lix
         if: matrix.implementation == 'lix'
         uses: samueldr/lix-gha-installer-action@a0fee77b2a98bb7c5c0ed7ae6d6ad4903dbdad0d # v2026-06-15
+      # ROOT CAUSE of the recurring "corrupt cache": Lix defaults
+      # auto-optimise-store ON (CppNix does not — which is why only the lix
+      # arm corrupted). An optimised store is a farm of hard links into
+      # /nix/store/.links; the snapshot archives files AS those links, and
+      # the restore's exclude-existing-paths extraction cannot resolve them
+      # against a fresh install's different .links — every deduplicated
+      # file silently fails to extract. Snapshots must contain regular
+      # files: optimisation off before ANY store operation. (The key bump
+      # v3->v4 retires every hardlink-broken snapshot.)
+      - name: Disable store optimisation (snapshots need regular files)
+        run: |
+          echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon 2>/dev/null || true
       - uses: nix-community/cache-nix-action/restore@v7
         with:
-          primary-key: daemon-v3-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          primary-key: daemon-v4-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
 
       # Self-healing store: the snapshot restore overlays a previously-saved
       # /nix (store + SQLite db) onto a freshly-installed daemon, and ANY
@@ -284,4 +297,4 @@ jobs:
       # broken job can never publish a poisoned store snapshot.
       - uses: nix-community/cache-nix-action/save@v7
         with:
-          primary-key: daemon-v3-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+          primary-key: daemon-v4-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
