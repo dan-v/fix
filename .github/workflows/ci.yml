@@ -245,8 +245,14 @@ jobs:
             echo "wiped=false" >> "$GITHUB_OUTPUT"
           else
             echo "restored store failed validation — discarding and reinstalling cold"
-            sudo systemctl stop nix-daemon 2>/dev/null || true
-            sudo rm -rf /nix
+            # The wipe must cover the installer's FULL footprint, not just
+            # /nix: lix-installer refuses to merge onto a leftover
+            # /etc/nix/nix.conf, and stale systemd units point into the
+            # removed store.
+            sudo systemctl stop nix-daemon.socket nix-daemon 2>/dev/null || true
+            sudo rm -rf /nix /etc/nix
+            sudo rm -f /etc/systemd/system/nix-daemon.service /etc/systemd/system/nix-daemon.socket
+            sudo systemctl daemon-reload 2>/dev/null || true
             echo "wiped=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Reinstall CppNix (cold, after wipe)
