@@ -225,7 +225,7 @@ jobs:
     # hardware — qemu inherits the x86 host's TSO and hides those bugs.
     # Each platform evaluates its NATIVE universe (outpaths systems = null
     # -> currentSystem), so oracles are per-system.
-    name: nixpkgs / ${{ matrix.system }} chunk ${{ matrix.chunk }}
+    name: nixpkgs / ${{ matrix.system }} chunk ${{ matrix.chunk }} (${{ matrix.lane }})
     runs-on: ${{ matrix.runner }}
     needs: build
     strategy:
@@ -233,21 +233,22 @@ jobs:
       matrix:
         chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
         system: [x86_64-linux, aarch64-linux, aarch64-darwin]
+        lane: [default, tight]
         include:
           - system: x86_64-linux
             runner: ubuntu-24.04
-            budget_a: 1024
-            budget_b: 512
           - system: aarch64-linux
             runner: ubuntu-24.04-arm
-            budget_a: 1024
-            budget_b: 512
-          # macos-15 runners have 7 GB RAM; a 1024-budget chunk peaks near
-          # 10 GB, so darwin runs both lanes tighter.
           - system: aarch64-darwin
             runner: macos-15
-            budget_a: 512
-            budget_b: 256
+          - {system: x86_64-linux, lane: default, budget: 1024}
+          - {system: x86_64-linux, lane: tight, budget: 512}
+          - {system: aarch64-linux, lane: default, budget: 1024}
+          - {system: aarch64-linux, lane: tight, budget: 512}
+          # macos-15 runners have 7 GB RAM; a 1024-budget chunk peaks near
+          # 10 GB, so darwin's lanes sit one rung lower.
+          - {system: aarch64-darwin, lane: default, budget: 512}
+          - {system: aarch64-darwin, lane: tight, budget: 256}
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
@@ -275,17 +276,18 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: fix-releasefast-${{ matrix.system }}
-      - name: Differential eval (default budget)
+      - name: Differential eval (cold compile cache)
         timeout-minutes: 35
         run: |
           chmod +x fix-releasefast-${{ matrix.system }}
-          nix-shell --run 'test/nixpkgs/run.sh --chunk ${{ matrix.chunk }}/12 --gc-budget ${{ matrix.budget_a }} --fix ./fix-releasefast-${{ matrix.system }}'
-      # Same chunk under GC pressure: more majors, more sweep/remset traffic,
-      # same required answer. The oracle is already materialized above.
-      - name: Differential eval (tight budget)
+          nix-shell --run 'test/nixpkgs/run.sh --chunk ${{ matrix.chunk }}/12 --gc-budget ${{ matrix.budget }} --fix ./fix-releasefast-${{ matrix.system }}'
+      # Identical eval again: the persistent compiled-chunk cache written by
+      # the first run now serves, so the second run answers the same oracle
+      # through the cache read path.
+      - name: Differential eval (warm compile cache)
         timeout-minutes: 35
         run: |
-          nix-shell --run 'test/nixpkgs/run.sh --chunk ${{ matrix.chunk }}/12 --gc-budget ${{ matrix.budget_b }} --fix ./fix-releasefast-${{ matrix.system }}'
+          nix-shell --run 'test/nixpkgs/run.sh --chunk ${{ matrix.chunk }}/12 --gc-budget ${{ matrix.budget }} --fix ./fix-releasefast-${{ matrix.system }}'
       # Last step on purpose: it is skipped when anything above failed, so a
       # broken job can never publish a poisoned store snapshot.
       - uses: nix-community/cache-nix-action/save@v7
