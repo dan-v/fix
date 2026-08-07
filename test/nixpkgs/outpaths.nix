@@ -13,7 +13,12 @@
   nixpkgs, # path to the pinned nixpkgs checkout
   subtree ? null, # dotted attr path to restrict the universe, e.g. "haskellPackages"
   only ? null, # list of top-level attr names to keep — bisection aid for hard errors
-  systems ? [ "x86_64-linux" ],
+  # null = the HOST platform (nixpkgs ci/eval treats null as
+  # [ builtins.currentSystem ]). The universe is always the native one —
+  # never cross-eval: nixpkgs' enumeration machinery names attrs with
+  # currentSystem (e.g. dotnet's -linux-arm64 runtimes), so a pinned
+  # foreign system aborts on non-x86 hosts.
+  systems ? null,
   # Trace each attr path before forcing it: with --workers 1 the last traced
   # path on stderr names the attr whose hard (non-tryEval-catchable) error
   # killed the eval.

@@ -74,7 +74,7 @@ elif [[ -n "$chunk" ]]; then
     echo ">> enumerating top-level attr names (cached to $names)" >&2
     nix-instantiate --eval --strict --json --readonly-mode -E "
       builtins.attrNames (import ($nixpkgs + \"/ci/eval/outpaths.nix\") {
-        path = $nixpkgs; systems = [ \"x86_64-linux\" ];
+        path = $nixpkgs; systems = null;
       })" >"$names.tmp"
     mv "$names.tmp" "$names"
   fi

@@ -223,8 +223,8 @@ jobs:
     # Native runners on purpose: the aarch64 arms are the only place the
     # weak-memory-ordering code paths (deque/future fences) run on real
     # hardware — qemu inherits the x86 host's TSO and hides those bugs.
-    # The oracle is host-independent (same expression, same pin), so all
-    # three platforms share one oracle cache per chunk.
+    # Each platform evaluates its NATIVE universe (outpaths systems = null
+    # -> currentSystem), so oracles are per-system.
     name: nixpkgs / ${{ matrix.system }} chunk ${{ matrix.chunk }}
     runs-on: ${{ matrix.runner }}
     needs: build
@@ -271,7 +271,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cache/fix-nixpkgs-eval
-          key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-chunk-${{ matrix.chunk }}
+          key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-${{ matrix.system }}-chunk-${{ matrix.chunk }}
       - uses: actions/download-artifact@v8
         with:
           name: fix-releasefast-${{ matrix.system }}
@@ -325,7 +325,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cache/fix-nixpkgs-eval
-          key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-chunk-0
+          key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-x86_64-linux-chunk-0
       - uses: actions/download-artifact@v8
         with:
           name: fix-releasesafe-x86_64-linux
