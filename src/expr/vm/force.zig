@@ -193,7 +193,7 @@ pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
 pub inline fn profIsResolvedThunk(self: *VM, v: Value) bool {
     if (!v.isThunk()) return false;
     const thunk = self.heap.getThunkAssumeValid(v.asObjectId());
-    return thunk.future.state.load(.monotonic) == @intFromEnum(future_mod.FutureState.resolved);
+    return @intFromEnum(thunk.future.stateField(.monotonic)) == @intFromEnum(future_mod.FutureState.resolved);
 }
 
 pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
@@ -256,10 +256,9 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     // matched on `discriminant == .thunk`, so the object slot must be
     // a `Thunk`.
     const thunk = self.heap.getThunkAssumeValid(value.asObjectId());
-    const state = thunk.future.state.load(.acquire);
-    if (state == @intFromEnum(future_mod.FutureState.resolved)) {
+    if (thunk.future.stateField(.acquire) == .resolved) {
         const real_demand = demand and !self.speculation.active;
-        try observeEffectGroup(self, thunk.effect_group, real_demand);
+        if (thunk.hasEffects()) try observeEffectGroup(self, self.heap.effect_groups.of(value.asObjectId()), real_demand);
         if (real_demand) {
             // Discovery probe: main is the first real demander of an
             // already-resolved thunk ⇒ a helper resolved it ahead of demand.
@@ -294,9 +293,9 @@ fn derefForwarder(self: *VM, start: Value, demand: bool) anyerror!Value {
     var r = start;
     while (r.isThunk()) {
         const t = self.heap.getThunkAssumeValid(r.asObjectId());
-        if (t.future.state.load(.acquire) != @intFromEnum(future_mod.FutureState.resolved))
+        if (@intFromEnum(t.future.stateField(.acquire)) != @intFromEnum(future_mod.FutureState.resolved))
             return forceValueImpl(self, r, demand);
-        try observeEffectGroup(self, t.effect_group, demand and !self.speculation.active);
+        if (t.hasEffects()) try observeEffectGroup(self, self.heap.effect_groups.of(r.asObjectId()), demand and !self.speculation.active);
         if (demand) t.markDemanded();
         r = t.payload.result;
     }
@@ -315,10 +314,14 @@ pub fn observeEffectGroup(self: *VM, group_id: u32, demand: bool) !void {
     )) self.effect_epoch +%= 1;
 }
 
-fn attachSpeculativeEffects(self: *VM, thunk: *Thunk, checkpoint: usize) !void {
+fn attachSpeculativeEffects(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, checkpoint: usize) !void {
     const effects = self.effects orelse return;
-    std.debug.assert(thunk.effect_group == 0);
-    thunk.effect_group = try effects.makeGroup(self.effect_journal.items[checkpoint..]);
+    std.debug.assert(!thunk.hasEffects());
+    const group = try effects.makeGroup(self.effect_journal.items[checkpoint..]);
+    if (group != 0) {
+        try self.heap.effect_groups.set(self.heap.allocator, thunk_id, group);
+        thunk.markHasEffects();
+    }
 }
 
 pub fn forceDeep(self: *VM, value: Value) !void {
@@ -420,8 +423,7 @@ const fan_out_batch_items: u8 = 16;
 /// a batch that no-ops.
 inline fn fanOutWorthy(self: *VM, value: Value) bool {
     if (!value.isThunk()) return false;
-    return self.heap.getThunkAssumeValid(value.asObjectId()).future.state.load(.monotonic) ==
-        @intFromEnum(future_mod.FutureState.unresolved);
+    return self.heap.getThunkAssumeValid(value.asObjectId()).future.stateField(.monotonic) == .unresolved;
 }
 
 pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) void {
@@ -605,7 +607,7 @@ pub inline fn forceTop(self: *VM) anyerror!Value {
 /// worst misclassifies, the claim CAS inside the force is authoritative.
 pub fn sweepMemberAdmissible(self: *VM, thunk_id: ObjectId) bool {
     const th = self.heap.getThunkAssumeValid(thunk_id);
-    if (th.future.state.load(.monotonic) != @intFromEnum(future_mod.FutureState.unresolved)) return false;
+    if (@intFromEnum(th.future.stateField(.monotonic)) != @intFromEnum(future_mod.FutureState.unresolved)) return false;
     switch (th.targetKind()) {
         .closure => {
             // Racy union read (see `Thunk.targetLeadingRacy`): a concurrent
@@ -661,7 +663,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     while (true) {
         switch (tryForceDispatch(self, thunk)) {
             .already_resolved => |v| {
-                try observeEffectGroup(self, thunk.effect_group, real_demand);
+                if (thunk.hasEffects()) try observeEffectGroup(self, self.heap.effect_groups.of(thunk_id), real_demand);
                 if (real_demand) thunk.markDemanded();
                 return if (v.isThunk()) try derefForwarder(self, v, real_demand) else v;
             },
@@ -670,7 +672,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return error.RecursiveThunk;
             },
             .errored => |failure| {
-                try observeEffectGroup(self, thunk.effect_group, real_demand);
+                if (thunk.hasEffects()) try observeEffectGroup(self, self.heap.effect_groups.of(thunk_id), real_demand);
                 self.executionContext().install(failure);
                 if (real_demand)
                     vm_errors.captureDemandErrorTrace(self, failure.err()) catch {};
@@ -781,7 +783,7 @@ fn forceClaimedThunk(self: *VM, thunk: *Thunk, thunk_id: types.ObjectId, real_de
     else
         result;
     rootKeep(self, whnf);
-    if (self.speculation.active) attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |err| {
+    if (self.speculation.active) attachSpeculativeEffects(self, thunk, thunk_id, effect_checkpoint) catch |err| {
         publishThunkFailure(self, thunk, thunk_id, err);
         trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
         return err;
@@ -830,7 +832,7 @@ fn finishClaimedThunkFailure(
     err: anyerror,
 ) anyerror {
     if (self.speculation.active and !isTransientThunkError(err)) {
-        attachSpeculativeEffects(self, thunk, effect_checkpoint) catch |effect_err| {
+        attachSpeculativeEffects(self, thunk, thunk_id, effect_checkpoint) catch |effect_err| {
             self.executionContext().clearFailure();
             publishThunkFailure(self, thunk, thunk_id, effect_err);
             trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);

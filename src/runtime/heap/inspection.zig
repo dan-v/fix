@@ -5,6 +5,7 @@ const types = @import("../types.zig");
 const Value = @import("../value.zig").Value;
 const ValueType = @import("../value.zig").ValueType;
 const thunk_mod = @import("../thunk.zig");
+const future_mod = @import("../future.zig");
 const Thunk = thunk_mod.Thunk;
 const prof_census_enabled = thunk_mod.created_tsc_enabled;
 
@@ -190,7 +191,7 @@ pub const ObjectInfo = union(enum) {
 };
 
 pub fn thunkInfo(thunk: *const Thunk) ThunkInfo {
-    const raw_state = thunk.future.state.load(.acquire);
+    const raw_state = future_mod.stateFieldRaw(thunk.future.state.load(.acquire));
     const state: ThunkState = @enumFromInt(@min(raw_state, @intFromEnum(ThunkState.errored)));
     const body: @TypeOf(@as(ThunkInfo, undefined).body) = switch (state) {
         .resolved => .{ .result = valueRef(thunk.payload.result) },
@@ -289,7 +290,7 @@ pub fn stats(heap: anytype) Stats {
             .closure => 2,
             .builtin_closure => 3,
             .thunk => |thunk| blk: {
-                const state: usize = @intCast(@min(thunk.future.state.load(.acquire), 4));
+                const state: usize = @intCast(@min(future_mod.stateFieldRaw(thunk.future.state.load(.acquire)), 4));
                 result.thunk_states[state] += 1;
                 if (state == 2) {
                     if (thunk.isDemanded())
@@ -385,7 +386,7 @@ pub fn creationCensus(heap: anytype) void {
             .thunk => |thunk| {
                 const cell = &cells[if (thunk.created_demand) 0 else 1];
                 cell.count += 1;
-                const state = thunk.future.state.load(.acquire);
+                const state = future_mod.stateFieldRaw(thunk.future.state.load(.acquire));
                 if (thunk.isDemanded()) {
                     if (thunk.demanded_old)
                         cell.demanded_old += 1
@@ -485,7 +486,7 @@ pub fn siblingCensus(heap: anytype) void {
                             demanded_old += 1
                         else
                             demanded_young += 1;
-                    } else if (thunk.future.state.load(.acquire) == 2) {
+                    } else if (future_mod.stateFieldRaw(thunk.future.state.load(.acquire)) == 2) {
                         spec_resolved += 1;
                     } else {
                         unresolved += 1;

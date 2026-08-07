@@ -1065,13 +1065,12 @@ fn slotEntry(arg: *anyopaque) void {
 /// approximate by design.
 fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *bool) void {
     const heap = f.vm.heap;
-    const unresolved = @intFromEnum(future_mod.FutureState.unresolved);
     switch (task) {
         .force_thunk => |thunk_id| {
             total.* = 1;
-            const st = heap.getThunkAssumeValid(thunk_id).future.state.load(.monotonic);
-            if (st == unresolved) live.* = 1;
-            if (st == @intFromEnum(future_mod.FutureState.evaluating)) busy.* = true;
+            const st = heap.getThunkAssumeValid(thunk_id).future.stateField(.monotonic);
+            if (st == .unresolved) live.* = 1;
+            if (st == .evaluating) busy.* = true;
         },
         .force_list_range => |range| {
             const items = heap.getList(range.list_id) catch return;
@@ -1080,7 +1079,7 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
             while (i < end) : (i += 1) {
                 if (!items[i].isThunk()) continue;
                 total.* += 1;
-                if (heap.getThunkAssumeValid(items[i].asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
+                if (heap.getThunkAssumeValid(items[i].asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
             }
         },
         .force_attrs_sweep => |attrs_id| {
@@ -1088,7 +1087,7 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
             for (entries) |entry| {
                 if (!entry.value.isThunk()) continue;
                 total.* += 1;
-                if (heap.getThunkAssumeValid(entry.value.asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
+                if (heap.getThunkAssumeValid(entry.value.asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
             }
         },
         .force_attrs_range => |range| {
@@ -1098,7 +1097,7 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
             while (i < end) : (i += 1) {
                 if (!entries[i].value.isThunk()) continue;
                 total.* += 1;
-                if (heap.getThunkAssumeValid(entries[i].value.asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
+                if (heap.getThunkAssumeValid(entries[i].value.asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
             }
         },
         // Import registry / FileCache state isn't scanned here — count the
@@ -1117,7 +1116,7 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
 /// fault.
 fn specRootBandSmall(f: *WorkerFiber, thunk_id: types.ObjectId) bool {
     const th = f.vm.heap.getThunkAssumeValid(thunk_id);
-    if (th.future.state.load(.monotonic) != @intFromEnum(future_mod.FutureState.unresolved)) return false;
+    if (@intFromEnum(th.future.stateField(.monotonic)) != @intFromEnum(future_mod.FutureState.unresolved)) return false;
     if (th.targetKind() != .bytecode) return false;
     // Racy union read (see `Thunk.targetLeadingRacy`): a peer may resolve the
     // thunk between the state load above and here, flipping the payload to

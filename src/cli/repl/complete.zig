@@ -172,7 +172,7 @@ fn lookThroughResolved(ctx: *Ctx, value: Value) ?Value {
     var hops: usize = 0;
     while (current.kind() == .thunk and hops < 16) : (hops += 1) {
         const thunk = ctx.ev.tooling().thunk(current) catch return null;
-        const state: future_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
+        const state: future_mod.FutureState = thunk.future.stateField(.acquire);
         if (state != .resolved) return null;
         current = thunk.payload.result;
     }

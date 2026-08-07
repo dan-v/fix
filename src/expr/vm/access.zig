@@ -145,7 +145,7 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
     if (self.speculation.active) return;
     if (!member.isThunk()) return;
     const th = self.heap.getThunkAssumeValid(member.asObjectId());
-    if (th.future.state.load(.monotonic) != @intFromEnum(future_mod.FutureState.unresolved)) return;
+    if (@intFromEnum(th.future.stateField(.monotonic)) != @intFromEnum(future_mod.FutureState.unresolved)) return;
     const workers = self.workers;
     if (!self.heap.trySiblingSweep(obj_id, workers.siblingMin(), workers.siblingMax())) return;
     const ok = workers.submitSiblingSweep(obj_id, workers.siblingUrgent(), self.workerId());

@@ -219,15 +219,11 @@ pub const Thunk = struct {
     future: Future,
     /// Whether a real caller observed this thunk's resolution. Speculative
     /// forcing must remain invisible to lazy renderers.
-    demanded: std.atomic.Value(u8),
-    /// Active arm of `payload.target` while the future is non-terminal.
-    target_kind: TargetKind,
     /// Engine-owned demand-effect group (0 = none). Written by the claiming
     /// fiber before it release-publishes a resolved/errored state and therefore
     /// safely read after the corresponding acquire-load. A raw u32 keeps the
     /// runtime module independent of the expression engine's effect store and
     /// fits in the struct's existing alignment hole in production builds.
-    effect_group: u32,
     /// `-Dprof-main` probe state; all fields are zero-sized in normal builds.
     created_tsc: CreatedTsc,
     created_demand: CreatedDemand = initCreatedDemand(),
@@ -245,11 +241,13 @@ pub const Thunk = struct {
     };
 
     fn initWithFuture(future_cell: Future, kind: TargetKind, payload: Payload) Thunk {
+        // Fold the target kind into the state word's flag bits at birth
+        // (pre-publication, so the plain read-modify-write is race-free).
+        var f = future_cell;
+        const raw = f.state.load(.monotonic);
+        f.state = .init(raw | (@as(u32, @intFromEnum(kind)) << future.flag_kind_shift));
         return .{
-            .future = future_cell,
-            .demanded = .init(0),
-            .target_kind = kind,
-            .effect_group = 0,
+            .future = f,
             .created_tsc = nowCreatedTsc(),
             .payload = payload,
         };
@@ -310,7 +308,7 @@ pub const Thunk = struct {
     /// Value-store range owned by the still-live target arm. Resolved/errored
     /// thunks have overwritten that arm and therefore own no capture range.
     pub fn targetSpillRange(self: *const Thunk) ?BytecodeThunk.SpillRange {
-        const state: FutureState = @enumFromInt(self.future.state.load(.acquire));
+        const state: FutureState = self.future.stateField(.acquire);
         if (state == .resolved or state == .errored) return null;
         return switch (self.targetKind()) {
             .bytecode => self.payload.target.bytecode.spillRange(),
@@ -372,16 +370,34 @@ pub const Thunk = struct {
     }
 
     pub inline fn markDemanded(self: *Thunk) void {
-        if (self.demanded.load(.monotonic) == 0) {
+        const raw = self.future.state.load(.monotonic);
+        if (comptime future.protocol_checks) {
+            if (raw == future.poisoned_state)
+                @panic("markDemanded on a GC-swept thunk — stale reference held across a collection");
+        }
+        if (raw & future.flag_demanded == 0) {
             if (comptime created_tsc_enabled) {
                 self.demanded_old = (nowCreatedTsc() -| self.created_tsc) >= (1 << 21);
             }
-            self.demanded.store(1, .release);
+            // fetchOr: never lost against a concurrent FSM transition (the
+            // transitions CAS-preserve flag bits) or another marker.
+            _ = self.future.state.fetchOr(future.flag_demanded, .release);
         }
     }
 
     pub inline fn isDemanded(self: *const Thunk) bool {
-        return self.demanded.load(.acquire) != 0;
+        return self.future.state.load(.acquire) & future.flag_demanded != 0;
+    }
+
+    /// Set the has-effect-group flag (claim-owner only, pre-publication of
+    /// the resolve — concurrent markDemanded is the only racer, handled by
+    /// the same fetchOr discipline).
+    pub inline fn markHasEffects(self: *Thunk) void {
+        _ = self.future.state.fetchOr(future.flag_has_effects, .release);
+    }
+
+    pub inline fn hasEffects(self: *const Thunk) bool {
+        return self.future.state.load(.acquire) & future.flag_has_effects != 0;
     }
 
     /// Non-claiming peek at whether the thunk is still evaluating. See
@@ -394,7 +410,7 @@ pub const Thunk = struct {
     /// while the thunk is unresolved/evaluating (the states in which
     /// `target` is the live union arm).
     pub inline fn targetKind(self: *const Thunk) TargetKind {
-        return self.target_kind;
+        return @enumFromInt((self.future.state.load(.monotonic) & future.flag_kind_mask) >> future.flag_kind_shift);
     }
 
     pub inline fn noteSpecSubmitted(self: *Thunk, admitted: bool) void {

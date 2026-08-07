@@ -132,7 +132,7 @@ fn writeThunk(
 ) !void {
     if (!try enter(seen, self.allocator, id, 3)) return writer.writeAll("«repeated»");
     const thunk = try self.heap.getThunk(id);
-    const state: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
+    const state: FutureState = thunk.future.stateField(.acquire);
     // A helper may have resolved this child ahead of demand. Keep that work
     // invisible in a shallow trace message just as lazy XML does.
     if (state != .resolved or !thunk.isDemanded()) return writer.writeAll("«thunk»");

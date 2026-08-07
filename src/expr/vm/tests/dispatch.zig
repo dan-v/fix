@@ -542,8 +542,8 @@ test "forwarding failure completes the outer thunk" {
 
     try testing.expectError(error.RecursiveThunk, force.forceValue(&h.vm, outer));
     try testing.expectEqual(
-        @intFromEnum(FutureState.errored),
-        h.vm.heap.getThunkAssumeValid(outer_id).future.state.load(.acquire),
+        FutureState.errored,
+        h.vm.heap.getThunkAssumeValid(outer_id).future.stateField(.acquire),
     );
     try testing.expectError(error.RecursiveThunk, force.forceValue(&h.vm, outer));
 }

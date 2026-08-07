@@ -311,7 +311,7 @@ const ValuePrinter = struct {
         }
 
         const thunk = try self.host.heap.getThunk(id);
-        const state: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
+        const state: FutureState = thunk.future.stateField(.acquire);
         if (state == .resolved) {
             try self.write(thunk.payload.result);
             return;

@@ -16,11 +16,31 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sync = @import("base").sync;
 
-const protocol_checks = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
+pub const protocol_checks = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
 
 /// `state` is a u32 so it's the right shape for futex-style ops if we
 /// ever need them. The low byte encodes the lifecycle (`FutureState`);
 /// the rest is zero.
+/// State-word layout: the LOW BYTE is the FutureState FSM field — the
+/// protocol the FutureWait TLA models pin is that byte alone. The high
+/// bits carry per-thunk flags ORTHOGONAL to the protocol (demanded /
+/// target-kind / has-effect-group, packed here so `Thunk` sheds its
+/// separate flag word: 8 bytes × every heap object). Every transition
+/// preserves the flag bits via CAS, so a concurrent `markDemanded` is
+/// never lost; flag reads/writes are single-bit atomics on the same word.
+/// The GC-swept sentinel remains a FULL-WORD compare: a live word's low
+/// byte is always a valid FutureState, and the sentinel's (0x0D) is not,
+/// so no flag combination can collide with it.
+pub const state_field_mask: u32 = 0xFF;
+pub const flag_demanded: u32 = 1 << 8;
+pub const flag_kind_shift: u5 = 9;
+pub const flag_kind_mask: u32 = 0b111 << flag_kind_shift;
+pub const flag_has_effects: u32 = 1 << 12;
+
+pub inline fn stateFieldRaw(raw: u32) u32 {
+    return raw & state_field_mask;
+}
+
 pub const FutureState = enum(u32) {
     unresolved = 0,
     evaluating = 1,
@@ -145,7 +165,32 @@ pub const Future = struct {
     /// state left `.evaluating` (resolved / errored / reset); the caller
     /// should re-`tryClaim` to observe the terminal state.
     pub inline fn isEvaluating(self: *const Future) bool {
-        return self.state.load(.acquire) == @intFromEnum(FutureState.evaluating);
+        return stateFieldRaw(self.state.load(.acquire)) == @intFromEnum(FutureState.evaluating);
+    }
+
+    /// Masked read of the FSM field (flags stripped). Use for every
+    /// comparison against FutureState values; comparing the raw word
+    /// breaks silently once any flag bit is set.
+    pub inline fn stateField(self: *const Future, comptime order: std.builtin.AtomicOrder) FutureState {
+        return @enumFromInt(stateFieldRaw(self.state.load(order)));
+    }
+
+    /// Flag-preserving FSM transition: CAS keeps the high flag bits intact
+    /// so a concurrent `markDemanded` (fetchOr on the same word) is never
+    /// lost. Uncontended cost is one extra load over the old plain store.
+    inline fn transition(self: *Future, new_state: FutureState, comptime order: std.builtin.AtomicOrder) void {
+        var cur = self.state.load(.monotonic);
+        while (true) {
+            const next = (cur & ~state_field_mask) | @intFromEnum(new_state);
+            cur = self.state.cmpxchgWeak(cur, next, order, .monotonic) orelse return;
+        }
+    }
+
+    /// Solo-mode flag-preserving transition (plain read-modify-store; see
+    /// `tryClaimSolo` for the single-thread contract).
+    inline fn transitionSolo(self: *Future, new_state: FutureState) void {
+        const cur = self.state.load(.monotonic);
+        self.state.store((cur & ~state_field_mask) | @intFromEnum(new_state), .monotonic);
     }
 
     /// Try to claim this future for evaluation by `claimer`. Returns a
@@ -169,15 +214,17 @@ pub const Future = struct {
                 if (raw == poisoned_state)
                     @panic("Future.tryClaim on a GC-swept object — stale reference held across a collection (missing root)");
             }
-            const s: FutureState = @enumFromInt(raw);
+            const s: FutureState = @enumFromInt(stateFieldRaw(raw));
             switch (s) {
                 .resolved => return .already_resolved,
                 .blackhole => return .blackhole,
                 .errored => return .errored,
                 .unresolved => {
+                    // Full-word expected: carries the flag bits read above,
+                    // so a racing markDemanded just retries the loop.
                     const prev = self.state.cmpxchgWeak(
-                        @intFromEnum(FutureState.unresolved),
-                        @intFromEnum(FutureState.evaluating),
+                        raw,
+                        (raw & ~state_field_mask) | @intFromEnum(FutureState.evaluating),
                         .acquire,
                         .monotonic,
                     );
@@ -217,12 +264,12 @@ pub const Future = struct {
             if (raw == poisoned_state)
                 @panic("Future.tryClaimSolo on a GC-swept object — stale reference held across a collection (missing root)");
         }
-        switch (@as(FutureState, @enumFromInt(raw))) {
+        switch (@as(FutureState, @enumFromInt(stateFieldRaw(raw)))) {
             .resolved => return .already_resolved,
             .blackhole => return .blackhole,
             .errored => return .errored,
             .unresolved => {
-                self.state.store(@intFromEnum(FutureState.evaluating), .monotonic);
+                self.state.store((raw & ~state_field_mask) | @intFromEnum(FutureState.evaluating), .monotonic);
                 self.claimer.store(claimer, .monotonic);
                 return .claimed;
             },
@@ -237,7 +284,7 @@ pub const Future = struct {
     /// here). Same solo-ness contract as `tryClaimSolo`.
     pub fn publishSolo(self: *Future) void {
         self.claimer.store(invalid_claimer, .monotonic);
-        self.state.store(@intFromEnum(FutureState.resolved), .monotonic);
+        self.transitionSolo(.resolved);
         if (self.waiters.load(.monotonic) != 0) self.wakeFiberWaiters();
     }
 
@@ -246,7 +293,7 @@ pub const Future = struct {
     /// recursive let binding, which pays the waiter-mutex RMW otherwise).
     pub fn resetSolo(self: *Future) void {
         self.claimer.store(invalid_claimer, .monotonic);
-        self.state.store(@intFromEnum(FutureState.unresolved), .monotonic);
+        self.transitionSolo(.unresolved);
         if (self.waiters.load(.monotonic) != 0) self.wakeFiberWaiters();
     }
 
@@ -279,7 +326,7 @@ pub const Future = struct {
         // totally ordered, so either the resolver sees our lock bit (and
         // waits for the push) or we see its published state here (seq_cst
         // pairs with the resolver's barrier; see wakeFiberWaiters).
-        const s: FutureState = @enumFromInt(self.state.load(.seq_cst));
+        const s: FutureState = @enumFromInt(stateFieldRaw(self.state.load(.seq_cst)));
         if (s != .evaluating) {
             self.waiters.store(head, .release); // unlock, list unchanged
             return false;
@@ -298,7 +345,7 @@ pub const Future = struct {
     /// slot before this call; the release-store of `state` publishes it.
     pub fn publish(self: *Future) void {
         self.claimer.store(invalid_claimer, .release);
-        self.state.store(@intFromEnum(FutureState.resolved), .release);
+        self.transition(.resolved, .release);
         self.wakeFiberWaiters();
     }
 
@@ -309,7 +356,7 @@ pub const Future = struct {
     /// (a transient failure never overwrote it with a result).
     pub fn reset(self: *Future) void {
         self.claimer.store(invalid_claimer, .monotonic);
-        self.state.store(@intFromEnum(FutureState.unresolved), .release);
+        self.transition(.unresolved, .release);
         self.wakeFiberWaiters();
     }
 
@@ -319,7 +366,7 @@ pub const Future = struct {
     /// engine rather than by this future.
     pub fn publishErrored(self: *Future) void {
         self.claimer.store(invalid_claimer, .monotonic);
-        self.state.store(@intFromEnum(FutureState.errored), .release);
+        self.transition(.errored, .release);
         self.wakeFiberWaiters();
     }
 
@@ -327,7 +374,7 @@ pub const Future = struct {
     /// the new state and return an error.
     pub fn blackhole(self: *Future) void {
         self.claimer.store(invalid_claimer, .monotonic);
-        self.state.store(@intFromEnum(FutureState.blackhole), .release);
+        self.transition(.blackhole, .release);
         self.wakeFiberWaiters();
     }
 

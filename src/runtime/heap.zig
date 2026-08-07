@@ -31,6 +31,7 @@ const hugetlb = @import("base").hugetlb;
 const sync = @import("base").sync;
 const worker_id_mod = @import("base").worker_id;
 const Value = @import("value.zig").Value;
+const future_mod = @import("future.zig");
 pub const ValueType = @import("value.zig").ValueType;
 const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
@@ -128,6 +129,47 @@ pub const AttrsView = struct {
 
 /// True per-slot storage cost of the SoA attr planes.
 pub const attr_slot_bytes: usize = AttrStore.stored_slot_bytes;
+
+/// Side table for the RARE thunks that carry a speculative effect group
+/// (`Thunk.markHasEffects` gates every read, so the map is touched only
+/// for actually-effectful thunks). Entries for swept thunks linger
+/// harmlessly: a reused ObjectId's fresh thunk lacks the flag bit and a
+/// re-attach overwrites. Moving the u32 out of `Thunk` (with the flag
+/// packing) shrinks every heap Object by 8 bytes.
+pub const EffectGroups = struct {
+    map: std.AutoHashMapUnmanaged(ObjectId, u32) = .empty,
+    mu: sync.SpinMutex = .{},
+
+    /// `allocator` must be the OWNING heap's allocator on every call —
+    /// mixing per-worker allocators would leave map storage owned by a
+    /// context that can die before the heap does.
+    pub fn set(self: *EffectGroups, allocator: std.mem.Allocator, id: ObjectId, group: u32) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.map.put(allocator, id, group);
+    }
+
+    pub fn of(self: *EffectGroups, id: ObjectId) u32 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.map.get(id) orelse 0;
+    }
+
+    pub fn deinit(self: *EffectGroups, allocator: std.mem.Allocator) void {
+        self.map.deinit(allocator);
+    }
+};
+
+comptime {
+    // The Object diet's whole point: Thunk 48->40 (flag word folded into the
+    // Future state word, effect_group in the side table) => Object 56->48.
+    // ReleaseFast only - Debug carries union safety tags, prof builds carry
+    // census fields. If this fires, a field crept back in.
+    if (@import("builtin").mode == .ReleaseFast and !@import("build_options").prof_main) {
+        std.debug.assert(@sizeOf(Thunk) == 40);
+        std.debug.assert(@sizeOf(Object) == 48);
+    }
+}
 
 pub const AttrsViewMut = struct {
     names: []InternId,
@@ -613,6 +655,7 @@ pub const ObjectHeap = struct {
     failure_store: FailureStore,
     objects: ObjectStore,
     values: ValueStore,
+    effect_groups: EffectGroups = .{},
     attrs: AttrStore,
     attr_positions: AttrPosStore,
     bytes: ByteStore,
@@ -722,6 +765,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn deinit(self: *ObjectHeap) void {
+        self.effect_groups.deinit(self.allocator);
         self.failure_store.deinit();
         self.discarded_object_tails.deinit(self.allocator);
         self.allocator.free(self.collection.alloc_bits);
@@ -1821,7 +1865,7 @@ pub const ObjectHeap = struct {
                         if ((gcHeapId(v) orelse std.math.maxInt(ObjectId)) == dead) break :blk true;
                     break :blk false;
                 },
-                .thunk => |t| t.future.state.load(.monotonic) == 2 and // resolved
+                .thunk => |t| future_mod.stateFieldRaw(t.future.state.load(.monotonic)) == 2 and // resolved
                     (gcHeapId(.{ .bits = t.payload.result.bits }) orelse std.math.maxInt(ObjectId)) == dead,
                 else => false,
             };

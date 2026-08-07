@@ -737,7 +737,7 @@ const Repl = struct {
                     try w.writeByte('\n');
                     return;
                 };
-                const state: future_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
+                const state: future_mod.FutureState = thunk.future.stateField(.acquire);
                 try disasm.writeStoreRef(w, "objects", id, .object, "thunk", self.color_depth);
                 try w.print(" · {s}", .{@tagName(state)});
                 switch (state) {
