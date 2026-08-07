@@ -224,6 +224,37 @@ jobs:
         with:
           primary-key: daemon-v3-${{ matrix.implementation }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
 
+      # Self-healing store: the snapshot restore overlays a previously-saved
+      # /nix (store + SQLite db) onto a freshly-installed daemon, and ANY
+      # drift — installer update, partial save, db/contents skew — presents
+      # as store corruption downstream. The DEFAULT is therefore: validate
+      # cheaply, and on any anomaly wipe /nix entirely and reinstall cold.
+      # A cache problem may cost this job minutes; it must never fail it.
+      - name: Validate restored store (wipe on any anomaly)
+        id: store_probe
+        run: |
+          set +e
+          probe() {
+            sudo systemctl restart nix-daemon 2>/dev/null || true
+            timeout 120 nix-store --verify >/dev/null 2>&1 || return 1
+            timeout 60 nix-instantiate --eval -E '1 + 1' >/dev/null 2>&1 || return 1
+            return 0
+          }
+          if probe; then
+            echo "restored store validated"
+            echo "wiped=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "restored store failed validation — discarding and reinstalling cold"
+            sudo systemctl stop nix-daemon 2>/dev/null || true
+            sudo rm -rf /nix
+            echo "wiped=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Reinstall CppNix (cold, after wipe)
+        if: matrix.implementation == 'cppnix' && steps.store_probe.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Reinstall Lix (cold, after wipe)
+        if: matrix.implementation == 'lix' && steps.store_probe.outputs.wiped == 'true'
+        uses: samueldr/lix-gha-installer-action@a0fee77b2a98bb7c5c0ed7ae6d6ad4903dbdad0d # v2026-06-15
 
       - name: Install pinned nixpkgs channel
         run: |

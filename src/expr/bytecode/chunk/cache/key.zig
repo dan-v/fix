@@ -8,7 +8,11 @@ const common = @import("wire.zig");
 /// build.zig). Null when the platform provides no phdr walk or the binary
 /// carries no note — callers fall back to a weaker exe fingerprint.
 pub fn selfBuildId(buf: []u8) ?[]const u8 {
-    if (!@hasDecl(std.posix.system, "dl_phdr_info")) return null;
+    // Comptime OS gate, not @hasDecl: `dl_iterate_phdr` is a @compileError
+    // stub on non-ELF targets (macOS), so its call must never be ANALYZED
+    // there — only a comptime-false branch guarantees that. Callers fall
+    // back to the exe-stat fingerprint on null (see resolveChunkCache).
+    if (comptime @import("builtin").os.tag != .linux) return null;
     const max_desc = 32;
     const Ctx = struct {
         buf: []u8,
