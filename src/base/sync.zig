@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const base_options = @import("base_options");
 
 /// Minimal portable futex: park/wake a thread on a `u32` word. The whole
 /// tree's blocking primitives (this file's Semaphore/BlockingMutex, the
@@ -78,13 +79,24 @@ pub fn sleepNs(ns: u64) void {
 
 /// Spinlock built on `std.atomic.Mutex`. Short critical sections only —
 /// writers on the segmented-storage primitives are O(allocator call) at most.
-pub const SpinMutex = struct {
+///
+/// Under ThreadSanitizer this is an alias for `BlockingMutex`: TSan turns
+/// every failed CAS into runtime work serialized on its own internal locks,
+/// so a contended naked spin starves the holder outright — 16 workers were
+/// sampled convoying a single lock byte for 20+ minutes with RSS flat, first
+/// on the chunk-registry append path (tsan/nixos-desktop w=16), then on the
+/// import-registry lookup (hm-profile). The convoy is bistable: a lucky
+/// schedule phases through, an unlucky pileup self-sustains, so any
+/// contended SpinMutex site can flip a TSan lane from seconds to a timeout.
+/// Parking is the fix for the whole class; production builds keep the pure
+/// spin byte-for-byte.
+pub const SpinMutex = if (base_options.tsan_enabled) BlockingMutex else struct {
     inner: std.atomic.Mutex = .unlocked,
 
-    pub fn lock(self: *SpinMutex) void {
+    pub fn lock(self: *@This()) void {
         while (!self.inner.tryLock()) std.atomic.spinLoopHint();
     }
-    pub fn unlock(self: *SpinMutex) void {
+    pub fn unlock(self: *@This()) void {
         self.inner.unlock();
     }
 };

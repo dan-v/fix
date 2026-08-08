@@ -17,7 +17,7 @@
 const std = @import("std");
 
 const builtin = @import("builtin");
-const SpinMutex = @import("sync.zig").SpinMutex;
+const BlockingMutex = @import("sync.zig").BlockingMutex;
 const hugetlb = @import("hugetlb.zig");
 
 /// `StableSegments` parameters, generic over the injected `Vma`
@@ -133,7 +133,15 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             for (&arr) |*s| s.* = .init(null);
             break :blk arr;
         },
-        write_mu: SpinMutex = .{},
+        // Parking, not spinning: since the TLAB round (c900176c) every
+        // high-volume store reserves through per-thread TLABs, leaving
+        // `write_mu` as the refill/cold lock — but refills do allocator and
+        // hugetlb-frontier work while holding it, and burst contention (all
+        // workers compiling chunks at eval start) convoys a naked spin.
+        // Under TSan the spin storm starved the holder outright
+        // (tsan/nixos-desktop w=16 livelock). Uncontended cost is identical
+        // (one cmpxchg + release store).
+        write_mu: BlockingMutex = .{},
         huge_policy: ?*hugetlb.Policy = null,
 
         // --- per-segment hugetlb overlay (`params.huge_overlay_min`) ---
@@ -686,7 +694,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
         /// Next free slot. Bumped under `write_mu`; loaded atomically by
         /// `count()` so an opportunistic reader doesn't tear.
         cursor: std.atomic.Value(u32),
-        write_mu: SpinMutex,
+        write_mu: BlockingMutex,
         huge_policy: ?*hugetlb.Policy,
         /// Hugetlb prefix frontier: bytes `[0, huge_frontier)` of the
         /// reservation are backed by reserved, DONTFORK, write-prefaulted
