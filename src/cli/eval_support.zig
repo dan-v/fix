@@ -149,6 +149,29 @@ pub const InputPlan = struct {
             .source = try getSource(ev, self.io, input.source_arg, input.options),
         };
     }
+
+    /// Like `load`, but a top-level function is ALWAYS auto-called — with
+    /// `--arg`s intersected against its formals, `{}` otherwise — as
+    /// nix-eval-jobs and `nix-instantiate` treat a release expression whose
+    /// formals all carry defaults. `load` only wraps when `--arg`/`-A` is
+    /// given, which would make a bare `{ system ? ... }: { ... }` jobset
+    /// evaluate to a lambda and walk as empty.
+    pub fn loadAutoCall(self: InputPlan, ev: *Engine, index: usize) !LoadedInput {
+        const input = self.selected(index);
+        // Only force the auto-call wrapper when --arg/--argstr must be
+        // intersected in-language. Without args the walker's
+        // walkFunctionCall handles every root shape correctly — formals
+        // lambdas (with defaults, and zero-formal `{}:`/`{...}:`) call, a
+        // plain `x:` lambda becomes a proper error record. The in-language
+        // wrapper cannot make that distinction (`builtins.functionArgs` is
+        // `{}` for both `{}:` and `x:`), and used to call plain lambdas
+        // with `{}` — an `x: x` root walked a silently-empty attrset.
+        const wrap_args = input.options.arg_defs.len > 0;
+        return .{
+            .source_arg = input.source_arg,
+            .source = try getSourceMode(ev, self.io, input.source_arg, input.options, wrap_args),
+        };
+    }
 };
 
 pub fn reportInputReadError(io: std.Io, use_color: bool, input_count: usize, index: usize, err: anyerror) void {
@@ -340,7 +363,7 @@ fn flakeProfile(cmd: args.Cmd) FlakeProfile {
         .build, .@"switch" => .{ .namespaces = &.{ "packages", "legacyPackages" }, .root_first = false, .default_attr = "default" },
         // Value commands resolve the attr path from the flake root, as Nix's
         // `nix eval .#a.b` does, with packages as a convenience fallback.
-        .eval, .parse, .instantiate, .repl, .disasm => .{ .namespaces = &.{ "packages", "legacyPackages" }, .root_first = true, .default_attr = null },
+        .eval, .eval_jobs, .parse, .instantiate, .repl, .disasm => .{ .namespaces = &.{ "packages", "legacyPackages" }, .root_first = true, .default_attr = null },
         .completions, .flake, .thunks, .trace => unreachable,
     };
 }

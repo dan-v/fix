@@ -23,14 +23,52 @@ pub fn stateDir(init: std.process.Init) []const u8 {
 }
 
 /// Resolve the worker-thread count: an explicit `--workers`, else
-/// `min(12, cpu_count)` (1 when single-threaded).
+/// `min(12, cpu_count)` (1 when single-threaded), where `cpu_count`
+/// additionally respects a Linux cgroup CPU quota — `getCpuCount` reads the
+/// affinity mask, which a `--cpus=N` container/CI limit does NOT shrink, so
+/// without the quota a 2-CPU CI runner would oversubscribe 12 workers.
 /// The default cap limits speculative and idle-thread overhead after demand
 /// parallelism saturates. `--workers` remains available for explicit tuning.
 pub fn workerCount(options: *const args.Options) !u8 {
-    return options.workers orelse if (builtin.single_threaded)
-        1
-    else
-        @intCast(@min(@as(u32, 12), @as(u32, @intCast(try std.Thread.getCpuCount()))));
+    if (options.workers) |w| return w;
+    if (builtin.single_threaded) return 1;
+    var count: u32 = @intCast(try std.Thread.getCpuCount());
+    if (cgroupCpuQuota()) |quota| count = @min(count, quota);
+    return @intCast(@min(@as(u32, 12), @max(count, 1)));
+}
+
+/// Effective CPUs from the cgroup v2 `cpu.max` quota (`<quota> <period>` or
+/// `max <period>`), rounded up; null when unlimited or unreadable.
+fn cgroupCpuQuota() ?u32 {
+    if (comptime builtin.os.tag != .linux) return null;
+    const linux = std.os.linux;
+    var buf: [64]u8 = undefined;
+    const fd_raw = linux.open("/sys/fs/cgroup/cpu.max", .{ .ACCMODE = .RDONLY }, 0);
+    const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
+    if (fd < 0) return null;
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, &buf, buf.len);
+    const rd: isize = @bitCast(n);
+    if (rd <= 0) return null;
+    return parseCpuMax(buf[0..@intCast(rd)]);
+}
+
+fn parseCpuMax(raw: []const u8) ?u32 {
+    var it = std.mem.tokenizeAny(u8, raw, " \n\t");
+    const quota_text = it.next() orelse return null;
+    if (std.mem.eql(u8, quota_text, "max")) return null;
+    const quota = std.fmt.parseInt(u64, quota_text, 10) catch return null;
+    const period = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    if (quota == 0 or period == 0) return null;
+    return @intCast(std.math.clamp((quota + period - 1) / period, 1, 4096));
+}
+
+test "parseCpuMax: quota/period, max, malformed" {
+    try std.testing.expectEqual(@as(?u32, 2), parseCpuMax("200000 100000\n"));
+    try std.testing.expectEqual(@as(?u32, 3), parseCpuMax("250000 100000\n"));
+    try std.testing.expectEqual(@as(?u32, null), parseCpuMax("max 100000\n"));
+    try std.testing.expectEqual(@as(?u32, null), parseCpuMax(""));
+    try std.testing.expectEqual(@as(?u32, 1), parseCpuMax("50000 100000\n"));
 }
 
 /// Resolve the process capabilities that must be present when the engine's

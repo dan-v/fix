@@ -16,11 +16,16 @@ pub fn parseDeprecatedList(set: *DeprecatedFeatures, list: []const u8) void {
 }
 
 pub fn parseExperimentalList(set: *ExperimentalFeatures, list: []const u8) !void {
+    // Unknown names are skipped silently, exactly like the config-sourced
+    // path below: drop-in callers pass Nix's own feature names wholesale
+    // ("nix-command flakes" is nix-eval-jobs' standard invocation, and
+    // consumers add ca-derivations and friends), and rejecting or warning
+    // would break invocations — and test suites that assert clean stderr —
+    // that work against Nix. A typo just leaves the feature unenabled, and
+    // the feature gate's own error then names what to pass.
     var it = std.mem.tokenizeScalar(u8, list, ' ');
     while (it.next()) |name| {
-        const feature = ExperimentalFeature.fromName(name) orelse
-            return error.UnknownExperimentalFeature;
-        set.insert(feature);
+        if (ExperimentalFeature.fromName(name)) |feature| set.insert(feature);
     }
 }
 

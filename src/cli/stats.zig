@@ -12,6 +12,7 @@ const prof = engine.probe.prof;
 const prof_path = engine.probe.prof_path;
 
 pub fn report(ev: *Engine) void {
+    if (std.c.getenv("FIX_THUNK_CENSUS") != null) ev.dumpThunkCensus(20);
     const h = ev.heapStats();
     std.debug.print(
         "heap: objects={d} values={d} attrs={d} attr_positions={d} strbytes={d}\n",

@@ -512,6 +512,52 @@ pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []con
     fanOutAttrsShallow(self, attrs_id, entries);
 }
 
+/// Children per `force_drv_range` task. Much finer than
+/// `fan_out_batch_items`: these tasks run whole package instantiations, so
+/// large ranges serialize heavy children behind each other (head-of-line)
+/// while the walk catches up and re-forces them on the demand thread.
+/// Swept 2..192 on an 11k-job nixpkgs walk: 4 gave the best wall time and
+/// the tightest spread. `FIX_EJ_BATCH` overrides for experiments.
+const drv_fanout_batch_items: u8 = 4;
+
+/// eval-jobs level fan-out: chunk the level's children into
+/// `force_drv_range` tasks, each of which carries its children from WHNF
+/// through their `type`/`drvPath` reads on a helper (see
+/// `runForceDrvRangeTask`). The caller's walk then mostly reads resolved
+/// values instead of forcing on the demand thread. Ranges, not per-child
+/// tasks: the urgent queue is capacity-bounded, and a nixpkgs-scale level
+/// (11k+ children) must fit it whole for the fan-out to cover the walk.
+pub fn accelerateJobLevelOf(self: *VM, value: Value) !void {
+    if (self.solo) return;
+    if (!value.isAttrs()) return;
+    const gc_roots = rootsBegin(self);
+    defer rootsEnd(self, gc_roots);
+    rootKeep(self, value);
+    const batch: usize = blk: {
+        if (std.c.getenv("FIX_EJ_BATCH")) |raw| {
+            const text = std.mem.span(raw);
+            const parsed = std.fmt.parseInt(usize, text, 10) catch drv_fanout_batch_items;
+            break :blk @max(parsed, 1);
+        }
+        break :blk drv_fanout_batch_items;
+    };
+    const attrs_id = value.asObjectId();
+    const entries = try self.heap.materializeAttrs(attrs_id);
+    // Submit back-to-front: stealers drain the submitter's deque oldest-first,
+    // so the first-pushed range is the first a helper starts. The walk itself
+    // consumes the level front-to-back — pushing the TAIL ranges first sends
+    // the helpers toward the walk from the opposite end, and the two only
+    // collide once, at the crossover, instead of contending for every thunk
+    // at the front of the level.
+    var end: usize = entries.len();
+    while (end > 0) {
+        const this_len: u8 = @intCast(@min(@min(batch, 255), end));
+        const offset: u32 = @intCast(end - this_len);
+        if (!self.workers.submitUrgentDrvRange(attrs_id, offset, this_len, self.workerId())) break;
+        end = offset;
+    }
+}
+
 pub fn enterDeep(self: *VM, kind: SeenDeepKind, id: ObjectId, seen: *SeenDeepSet) !bool {
     const key = (@as(u64, @intFromEnum(kind)) << 32) | @as(u64, id);
     return !(try seen.getOrPut(self.allocator, key)).found_existing;

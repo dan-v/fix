@@ -118,6 +118,20 @@ pub const Runtime = struct {
         } }, worker_id);
     }
 
+    pub inline fn submitUrgentDrvRange(
+        self: Runtime,
+        attrs_id: types.ObjectId,
+        offset: u32,
+        len: u8,
+        worker_id: u8,
+    ) bool {
+        return self.scheduler.submitUrgent(.{ .force_drv_range = .{
+            .attrs_id = attrs_id,
+            .offset = offset,
+            .len = len,
+        } }, worker_id);
+    }
+
     pub inline fn submitSiblingSweep(
         self: Runtime,
         attrs_id: types.ObjectId,

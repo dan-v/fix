@@ -15,6 +15,31 @@ const std = @import("std");
 const sync = @import("base").sync;
 const vma = @import("runtime").mem_tag.vma;
 
+/// Process-wide filesystem I/O counters (across engine recycles), for
+/// `FIX_IO_STATS=1` diagnostics. Cheap monotonic atomics; always counted.
+pub const io_stats = struct {
+    pub var cold_reads: std.atomic.Value(u64) = .init(0);
+    pub var bytes_read: std.atomic.Value(u64) = .init(0);
+    pub var stat_calls: std.atomic.Value(u64) = .init(0);
+    pub var exec_stats: std.atomic.Value(u64) = .init(0);
+    pub var readlinks: std.atomic.Value(u64) = .init(0);
+    pub var cold_readdirs: std.atomic.Value(u64) = .init(0);
+
+    pub fn dump(writer: anytype) void {
+        writer.print(
+            "fix io-stats: cold_reads={d} bytes_read={d} stat_calls={d} exec_stats={d} readlinks={d} cold_readdirs={d}\n",
+            .{
+                cold_reads.load(.monotonic),
+                bytes_read.load(.monotonic),
+                stat_calls.load(.monotonic),
+                exec_stats.load(.monotonic),
+                readlinks.load(.monotonic),
+                cold_readdirs.load(.monotonic),
+            },
+        ) catch {};
+    }
+};
+
 pub const FileCache = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,
@@ -141,6 +166,7 @@ pub const FileCache = struct {
         if (entry.exists_known) return entry.exists;
 
         const io = self.io orelse return error.FileIoUnavailable;
+        _ = io_stats.stat_calls.fetchAdd(1, .monotonic);
         // lstat-based existence (matching Nix): the final path component exists
         // even if it is a broken symlink, and a trailing `/`/`/.` on a
         // non-directory does not exist.
@@ -164,6 +190,7 @@ pub const FileCache = struct {
     pub fn isDirectoryFollowing(self: *FileCache, path: []const u8) !bool {
         const io = self.io orelse return error.FileIoUnavailable;
         const entry = try self.entryFor(path);
+        _ = io_stats.stat_calls.fetchAdd(1, .monotonic);
         const stat = std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = true }) catch return false;
         return stat.kind == .directory;
     }
@@ -199,6 +226,8 @@ pub const FileCache = struct {
             self.allocator,
             .limited(max_read_bytes),
         );
+        _ = io_stats.cold_reads.fetchAdd(1, .monotonic);
+        _ = io_stats.bytes_read.fetchAdd(contents.len, .monotonic);
         const handle = try ImmutableBytes.fromOwned(self.allocator, contents);
 
         entry.exists_known = true;
@@ -255,6 +284,8 @@ pub const FileCache = struct {
             self.allocator,
             .limited(max_read_bytes),
         );
+        _ = io_stats.cold_reads.fetchAdd(1, .monotonic);
+        _ = io_stats.bytes_read.fetchAdd(owned.len, .monotonic);
         const handle = try ImmutableBytes.fromOwned(self.allocator, owned);
 
         entry.exists_known = true;
@@ -288,6 +319,7 @@ pub const FileCache = struct {
         if (entry.kind) |kind| return kind;
 
         const io = self.io orelse return error.FileIoUnavailable;
+        _ = io_stats.stat_calls.fetchAdd(1, .monotonic);
         const stat = std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => {
                 entry.exists_known = true;
@@ -309,6 +341,7 @@ pub const FileCache = struct {
     pub fn isExecutable(self: *FileCache, path: []const u8) !bool {
         const entry = try self.entryFor(path);
         const io = self.io orelse return error.FileIoUnavailable;
+        _ = io_stats.exec_stats.fetchAdd(1, .monotonic);
         const stat = try std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = false });
         return @TypeOf(stat.permissions).has_executable_bit and stat.permissions.toMode() & 0o111 != 0;
     }
@@ -320,6 +353,7 @@ pub const FileCache = struct {
     pub fn readLink(self: *FileCache, path: []const u8) ![]u8 {
         const entry = try self.entryFor(path);
         const io = self.io orelse return error.FileIoUnavailable;
+        _ = io_stats.readlinks.fetchAdd(1, .monotonic);
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
         const len = try std.Io.Dir.readLinkAbsolute(io, entry.path, &buffer);
         return self.allocator.dupe(u8, buffer[0..len]);
@@ -342,6 +376,7 @@ pub const FileCache = struct {
         if (cold) |c| c.* = true;
 
         const io = self.io orelse return error.FileIoUnavailable;
+        _ = io_stats.cold_readdirs.fetchAdd(1, .monotonic);
         var dir = try std.Io.Dir.cwd().openDir(io, entry.path, .{ .iterate = true });
         defer dir.close(io);
 

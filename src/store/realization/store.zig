@@ -101,6 +101,18 @@ pub const RealizationStore = struct {
     /// materialize only their requested terminal closure.
     eager_evaluation_writes: bool = false,
 
+    /// The recorded ATerm text of a forced `.drv`, or null when the path has
+    /// no text recipe. Owned copy: the graph mutex only guards the lookup.
+    pub fn drvRecipeText(self: *RealizationStore, allocator: std.mem.Allocator, drv_path: []const u8) !?[]u8 {
+        self.graph.mu.lock();
+        defer self.graph.mu.unlock();
+        const recipe = self.graph.recipes.get(drv_path) orelse return null;
+        return switch (recipe.payload) {
+            .text => |text| try allocator.dupe(u8, text.bytes),
+            else => null,
+        };
+    }
+
     /// The deliberately narrow test capability. Production users see one
     /// inert declaration instead of a family of `ForTest` methods mixed into
     /// the store API; test builds receive controlled graph and daemon access.

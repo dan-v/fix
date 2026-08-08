@@ -554,6 +554,7 @@ pub const Worker = struct {
                     .novel => .novel_thunk,
                     .spec => .spec_thunk,
                 },
+                .force_drv_range => .attrs_range,
                 .force_list_range => .list_range,
                 .force_attrs_sweep => .attrs_sweep,
                 .force_attrs_range => .attrs_range,
@@ -610,6 +611,7 @@ pub const Worker = struct {
             if (!location.isEmpty()) break :blk location;
             break :blk switch (f.current_task.?) {
                 .force_thunk => observ.Subject.literal("force-thunk"),
+                .force_drv_range => observ.Subject.literal("force-drv-range"),
                 .force_list_range => observ.Subject.literal("force-list"),
                 .force_attrs_sweep => observ.Subject.literal("sweep-attrs"),
                 .force_attrs_range => observ.Subject.literal("force-attrs"),
@@ -644,7 +646,7 @@ pub const Worker = struct {
             // fn / …); empty when unresolvable or already resolved → the quantum
             // keeps its generic "force-thunk" name.
             .force_thunk => |id| vm_force.thunkLabel(&f.vm, id, buf),
-            .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch, .readdir_prefetch => .none,
+            .force_list_range, .force_attrs_sweep, .force_attrs_range, .force_drv_range, .import_prefetch, .readdir_prefetch => .none,
         };
     }
 
@@ -1090,14 +1092,18 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
                 if (heap.getThunkAssumeValid(entry_value.asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
             }
         },
-        .force_attrs_range => |range| {
+        .force_attrs_range, .force_drv_range => |range| {
             const entries = heap.materializeAttrs(range.attrs_id) catch return;
             const end = @min(@as(usize, range.offset) + @as(usize, range.len), entries.len());
             var i: usize = range.offset;
             while (i < end) : (i += 1) {
-                if (!entries.values[i].isThunk()) continue;
+                // Single read: a concurrent shortcutting writeback between an
+                // isThunk() check and a second read would decode a non-thunk
+                // value's bits as an ObjectId (type confusion).
+                const v = entries.values[i];
+                if (!v.isThunk()) continue;
                 total.* += 1;
-                if (heap.getThunkAssumeValid(entries.values[i].asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
+                if (heap.getThunkAssumeValid(v.asObjectId()).future.stateField(.monotonic) == .unresolved) live.* += 1;
             }
         },
         // Import registry / FileCache state isn't scanned here — count the
@@ -1145,6 +1151,7 @@ fn runTask(f: *WorkerFiber, task: Task) void {
     }
     switch (task) {
         .force_thunk => |thunk_id| runForceThunkTask(f, thunk_id),
+        .force_drv_range => |range| runForceDrvRangeTask(f, range),
         .force_list_range => |range| runListRangeTask(f, range),
         .force_attrs_sweep => |attrs_id| runAttrsSweepTask(f, attrs_id),
         .force_attrs_range => |range| runAttrsRangeTask(f, range),
@@ -1179,6 +1186,59 @@ fn runForceThunkTask(f: *WorkerFiber, thunk_id: types.ObjectId) void {
         if (err == error.SpeculativeBail)
             f.worker.scheduler.noteSpecBail(worker_id_mod.currentId());
     };
+}
+
+/// eval-jobs level fan-out: force each child in the range to WHNF and, when
+/// a child turns out to be an attrset, chase its `type` and `drvPath` attrs
+/// — the reads the walk is about to demand for every job. Instantiation
+/// (mkDerivation env, aterm rendering, hashing) therefore lands on helpers,
+/// off the walk's demand thread. Best-effort like every helper task:
+/// failures are dropped and demand replays them identically.
+fn runForceDrvRangeTask(f: *WorkerFiber, range: scheduler_mod.ForceAttrsRange) void {
+    const roots = vm_force.rootsBegin(&f.vm);
+    defer vm_force.rootsEnd(&f.vm, roots);
+    vm_force.rootKeep(&f.vm, Value.attrs(range.attrs_id));
+    const type_id = f.vm.intern.intern("type") catch return;
+    const drv_path_id = f.vm.intern.intern("drvPath") catch return;
+    const derivation_id = f.vm.intern.intern("derivation") catch return;
+    const entries = f.vm.heap.materializeAttrs(range.attrs_id) catch return;
+    const start: usize = range.offset;
+    const end = @min(start + @as(usize, range.len), entries.len());
+    for (entries.values[start..end]) |entry_value| {
+        const forced = vm_force.forceValueSpeculative(&f.vm, entry_value) catch {
+            f.ctx.clearFailure();
+            f.local_trace.clear();
+            continue;
+        };
+        if (!forced.isAttrs()) continue;
+        vm_force.rootKeep(&f.vm, forced);
+        const child_entries = f.vm.heap.materializeAttrs(forced.asObjectId()) catch continue;
+        // `type` first (entries are name-sorted, so drvPath would otherwise
+        // be reached first): only a real derivation gets its drvPath chased —
+        // instantiation writes .drvs and pulls sources into the store, which
+        // a non-derivation attrset that merely carries a drvPath attr (and
+        // that the walk will never emit) must not trigger.
+        const is_derivation = blk: {
+            for (child_entries.names, child_entries.values) |child_name, child_value| {
+                if (child_name != type_id) continue;
+                const ty = vm_force.forceValueSpeculative(&f.vm, child_value) catch break :blk false;
+                f.ctx.clearFailure();
+                f.local_trace.clear();
+                break :blk ty.isString() and ty.asInternId() == derivation_id;
+            }
+            break :blk false;
+        };
+        if (!is_derivation) continue;
+        for (child_entries.names, child_entries.values) |child_name, child_value| {
+            if (child_name != drv_path_id) continue;
+            const v = child_value;
+            if (!v.isThunk()) break;
+            _ = vm_force.forceValueSpeculative(&f.vm, v) catch {};
+            f.ctx.clearFailure();
+            f.local_trace.clear();
+            break;
+        }
+    }
 }
 
 fn runListRangeTask(f: *WorkerFiber, range: scheduler_mod.ForceListRange) void {

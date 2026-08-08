@@ -27,8 +27,10 @@ fn envEnabled(env: ?*const EnvMap, name: []const u8, fallback: bool) bool {
 
 fn resolveSibling(config: *scheduler_mod.Config, env: ?*const EnvMap, worker_count: u8) void {
     // Sibling prefetch needs helpers and is bounded at wider pools to avoid
-    // duplicating the general speculative lanes.
-    config.sibling_prefetch = envEnabled(env, "FIX_SIBLING", worker_count > 1 and worker_count <= 16);
+    // duplicating the general speculative lanes. When the engine runs
+    // demand-only (`disable_speculation`), it defaults off with the rest of
+    // the speculative machinery.
+    config.sibling_prefetch = envEnabled(env, "FIX_SIBLING", !config.disable_speculation and worker_count > 1 and worker_count <= 16);
     config.sibling_min = envInt(u32, env, "FIX_SIBLING_MIN") orelse 16;
     config.sibling_max = envInt(u32, env, "FIX_SIBLING_MAX") orelse 64;
     if (envInt(u64, env, "FIX_SIBLING_BUDGET")) |budget| {
@@ -96,8 +98,15 @@ pub fn resolve(
 
     if (envInt(u32, env, "FIX_SPEC_BACKLOG")) |value| config.spec_backlog_per_helper = value;
 
-    // First-time chunk speculation uses the novel lane whenever helpers exist.
-    config.spec_novel = envEnabled(env, "FIX_SPEC_NOVEL", worker_count > 1);
+    // `FIX_SPEC` overrides the engine's speculation mode outright: =0 forces
+    // demand-only, =1 re-enables the speculative lanes a command (eval-jobs)
+    // disabled by default.
+    if (envValue(env, "FIX_SPEC") != null)
+        config.disable_speculation = !envEnabled(env, "FIX_SPEC", true);
+
+    // First-time chunk speculation uses the novel lane whenever helpers exist
+    // and the engine is not demand-only.
+    config.spec_novel = envEnabled(env, "FIX_SPEC_NOVEL", !config.disable_speculation and worker_count > 1);
 
     // Limit bulk speculation drainers in wide pools. 255 disables the cap.
     config.spec_helper_cap = envInt(u8, env, "FIX_SPEC_HELPERS") orelse 16;

@@ -1837,6 +1837,58 @@ pub const Engine = struct {
         return self.heap.stats();
     }
 
+    /// `--stats` + FIX_THUNK_CENSUS: post-eval sweep attributing every
+    /// still-unresolved (created-but-never-forced) thunk to the source
+    /// location of its creating chunk, worst sites first. Resolved thunks
+    /// cannot be attributed (their target union is clobbered by the result),
+    /// so this reports exactly the allocation-waste list. Approximate by
+    /// design: swept slots may retain stale bytes; run post-eval only.
+    pub fn dumpThunkCensus(self: *Engine, top: usize) void {
+        const unresolved = @intFromEnum(runtime.future.FutureState.unresolved);
+        var per_chunk: std.AutoHashMapUnmanaged(types.ChunkId, u64) = .empty;
+        defer per_chunk.deinit(self.allocator);
+        var total: u64 = 0;
+        var non_bytecode: u64 = 0;
+        var id: u32 = 0;
+        const count = self.heap.objects.count();
+        while (id < count) : (id += 1) {
+            switch (self.heap.objects.get(id).*) {
+                .thunk => |*th| {
+                    if (th.future.state.load(.monotonic) != unresolved) continue;
+                    total += 1;
+                    if (th.targetKind() != .bytecode) {
+                        non_bytecode += 1;
+                        continue;
+                    }
+                    const gop = per_chunk.getOrPut(self.allocator, th.targetLeadingRacy(types.ChunkId)) catch continue;
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* += 1;
+                },
+                else => {},
+            }
+        }
+        const Entry = struct { chunk: types.ChunkId, n: u64 };
+        var list: std.ArrayListUnmanaged(Entry) = .empty;
+        defer list.deinit(self.allocator);
+        var iter = per_chunk.iterator();
+        while (iter.next()) |kv| list.append(self.allocator, .{ .chunk = kv.key_ptr.*, .n = kv.value_ptr.* }) catch break;
+        std.mem.sort(Entry, list.items, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                return a.n > b.n;
+            }
+        }.lt);
+        std.debug.print("thunk-census: {d} never-forced thunks ({d} non-bytecode), {d} distinct chunks\n", .{ total, non_bytecode, list.items.len });
+        for (list.items[0..@min(top, list.items.len)]) |entry| {
+            const location: []const u8, const line: u32 = blk: {
+                const ch = self.registry.get(entry.chunk) orelse break :blk .{ "<unregistered>", 0 };
+                const span = vm_errors.chunkEntrySpan(ch) orelse break :blk .{ "<no-span>", 0 };
+                const file_id = span.file orelse break :blk .{ "<no-file>", span.line };
+                break :blk .{ self.intern.get(file_id), span.line };
+            };
+            std.debug.print("  {d:>9}  chunk {d}  {s}:{d}\n", .{ entry.n, entry.chunk, location, line });
+        }
+    }
+
     pub fn heapCounts(self: *const Engine) ObjectHeap.Counts {
         return self.heap.counts();
     }
@@ -2334,8 +2386,75 @@ pub const Engine = struct {
         return self.forceValueUntraced(value);
     }
 
+    pub const WalkFunctionCall = union(enum) {
+        /// Not a formals-pattern Nix lambda; the walker skips it, as
+        /// nix-eval-jobs' autoCallFunction leaves such values untouched.
+        not_function,
+        /// All formals had defaults; the (forced) call result.
+        called: Value,
+        /// A formal without a default (interned name, borrowed): the job
+        /// becomes an error record.
+        missing_argument: []const u8,
+    };
+
+    /// nix-eval-jobs auto-calls functions it encounters DURING the walk, not
+    /// just at the root: a formals lambda whose arguments all have defaults
+    /// is called with `{}` and its result walked; one with a defaultless
+    /// formal is an error job. Everything else (plain lambdas, builtins,
+    /// partial applications) is skipped.
+    pub fn walkFunctionCall(self: *Engine, value: Value) !WalkFunctionCall {
+        try self.requireActiveEvaluation();
+        self.report.trace.clear();
+        return self.runWithVm(walkFunctionCallBody, .{value});
+    }
+
+    fn walkFunctionCallBody(vm: *VM, value: Value) !WalkFunctionCall {
+        const closures = @import("vm/closures.zig");
+        var forced = try vm_force.forceValue(vm, value);
+        // Functor attrsets (lib.setFunctionArgs / makeOverridable results)
+        // auto-call like functions in Nix: `__functor` applied to self yields
+        // the underlying lambda, whose formals then decide. Bounded unwrap —
+        // a pathological __functor chain must not recurse forever.
+        var unwraps: u8 = 0;
+        while (forced.isAttrs() and unwraps < 8) : (unwraps += 1) {
+            const functor_id = vm.intern.intern("__functor") catch return .not_function;
+            const functor = (vm.heap.getAttrValueOpt(forced.asObjectId(), functor_id) catch return .not_function) orelse return .not_function;
+            const functor_fn = try vm_force.forceValue(vm, functor);
+            forced = try vm_force.forceValue(vm, try closures.callValue(vm, functor_fn, forced));
+        }
+        if (!forced.isNixClosure()) return .not_function;
+        const closure = try closures.closureRef(vm, forced);
+        const ch = vm.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+        // Only formals lambdas auto-call. `function_args.len == 0` cannot
+        // distinguish a plain `x:` lambda from `{}:` / `{...}:` — the
+        // lambda PATTERN can: Nix's autoCallFunction calls zero-formal
+        // attrs-pattern lambdas with `{}` and walks the result.
+        if (ch.function_args.len == 0 and ch.lambda_pattern != .attrs_pat) return .not_function;
+        for (ch.function_args) |formal| {
+            // functionArgs semantics: value `true` = has a default.
+            if (!(formal.value.isBool() and formal.value.asBool()))
+                return .{ .missing_argument = vm.intern.get(formal.name) };
+        }
+        const empty = Value.attrs(try vm.heap.addAttrs(&.{}));
+        const result = try vm_force.forceValue(vm, try closures.callValue(vm, forced, empty));
+        return .{ .called = result };
+    }
+
+    /// Apply function `callee` to `arg` and force the result — the engine
+    /// entry behind `eval-jobs --apply`/`--select`.
+    pub fn callFunction(self: *Engine, callee: Value, arg: Value) !Value {
+        try self.requireActiveEvaluation();
+        self.report.trace.clear();
+        return self.runWithVm(callForcedBody, .{ callee, arg });
+    }
+
     fn forceValueUntraced(self: *Engine, value: Value) !Value {
         return self.runWithVm(vm_force.forceValue, .{value});
+    }
+
+    fn callForcedBody(vm: *VM, callee: Value, arg: Value) !Value {
+        const closures = @import("vm/closures.zig");
+        return vm_force.forceValue(vm, try closures.callValue(vm, callee, arg));
     }
 
     /// Enable writing forced derivations + their sources to the store as they
@@ -2481,6 +2600,87 @@ pub const Engine = struct {
 
     /// Write a constructed `.drv` (ATerm) to the store. Its references (input
     /// `.drv`s / srcs) must already be valid.
+    pub const RewrittenAggregate = struct {
+        drv_path: []u8,
+        outputs: []Output,
+        pub const Output = struct { name: []u8, path: []u8 };
+
+        pub fn deinit(self: *const RewrittenAggregate, allocator: std.mem.Allocator) void {
+            for (self.outputs) |output| {
+                allocator.free(output.name);
+                allocator.free(output.path);
+            }
+            allocator.free(self.outputs);
+            allocator.free(self.drv_path);
+        }
+    };
+
+    /// Rewrite a recorded aggregate `.drv` to depend on `constituents` (drv
+    /// store paths), as Hydra requires of `_hydraAggregate` jobs: parse the
+    /// recorded ATerm back into a derivation, append each constituent as an
+    /// input, recompute the input-addressed output paths and the drv path,
+    /// write the new `.drv`, and return the new identity. Null when the path
+    /// has no recorded text recipe.
+    pub fn rewriteAggregateDrv(self: *Engine, allocator: std.mem.Allocator, drv_path: []const u8, constituents: []const []const u8) !?RewrittenAggregate {
+        const aterm_text = (try self.drvRecipeText(allocator, drv_path)) orelse return null;
+        defer allocator.free(aterm_text);
+        return try self.rewriteAggregateDrvFromText(allocator, aterm_text, constituents);
+    }
+
+    /// `rewriteAggregateDrv` with the aggregate's ATerm text supplied by the
+    /// caller. Under `--max-memory-size` recycling the walking engine that
+    /// held the recipe is torn down before aggregates resolve, so eval-jobs
+    /// captures the text at walk time and rewrites against the final engine.
+    pub fn rewriteAggregateDrvFromText(self: *Engine, allocator: std.mem.Allocator, aterm_text: []const u8, constituents: []const []const u8) !RewrittenAggregate {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var parsed = try derivation.parse.parseDrv(a, aterm_text);
+        // Recomputing the drv path needs the name, which a __structuredAttrs
+        // derivation keeps inside __json — not worth supporting until a real
+        // aggregate shows up shaped that way.
+        if (parsed.name.len == 0) return error.InvalidDrvAterm;
+        var inputs: std.ArrayListUnmanaged(derivation.DrvInput) = .empty;
+        try inputs.appendSlice(a, parsed.input_drvs);
+        for (constituents) |constituent| {
+            const already = for (inputs.items) |input| {
+                if (std.mem.eql(u8, input.path, constituent)) break true;
+            } else false;
+            if (!already) try inputs.append(a, .{ .path = constituent, .outputs = &.{"out"} });
+        }
+        parsed.input_drvs = inputs.items;
+        // Clear input-addressed output paths (and thereby their env entries)
+        // so computePaths derives them from the REWRITTEN input set.
+        for (parsed.outputs) |*output| {
+            if (output.hash_algo.len == 0) output.path = "";
+        }
+
+        const computed = try parsed.computePaths(a, self.storeResolver());
+        try self.instantiateDrv(computed.drv_path, computed.drv_aterm, computed.drv_text_references);
+
+        const outputs = try allocator.alloc(RewrittenAggregate.Output, parsed.outputs.len);
+        var done: usize = 0;
+        errdefer {
+            for (outputs[0..done]) |output| {
+                allocator.free(output.name);
+                allocator.free(output.path);
+            }
+            allocator.free(outputs);
+        }
+        for (parsed.outputs, 0..) |output, i| {
+            outputs[i] = .{
+                .name = try allocator.dupe(u8, output.name),
+                .path = try allocator.dupe(u8, output.path),
+            };
+            done += 1;
+        }
+        return .{
+            .drv_path = try allocator.dupe(u8, computed.drv_path),
+            .outputs = outputs,
+        };
+    }
+
     pub fn instantiateDrv(self: *Engine, drv_path: []const u8, aterm: []const u8, references: []const []const u8) !void {
         return self.store.realization.instantiateDrv(drv_path, aterm, references);
     }
@@ -2617,6 +2817,50 @@ pub const Engine = struct {
         };
     }
 
+    /// The items of `value` if it is a list (owned outer slice; items borrowed),
+    /// or null otherwise. Used by `eval-jobs` to read a derivation's `outputs`.
+    pub fn listItems(self: *Engine, allocator: std.mem.Allocator, value: Value) !?[]Value {
+        const forced = try self.forceValue(value);
+        if (!forced.isList()) return null;
+        return try allocator.dupe(Value, try self.heap.getList(forced.asObjectId()));
+    }
+
+    /// The recorded ATerm text of a forced `.drv` (owned), or null.
+    /// Used by `eval-jobs --show-input-drvs` to report input derivations.
+    pub fn drvRecipeText(self: *Engine, allocator: std.mem.Allocator, drv_path: []const u8) !?[]u8 {
+        return self.store.realization.drvRecipeText(allocator, drv_path);
+    }
+
+    pub const ExportedDrvRecord = derivation.Registry.ExportedRecord;
+
+    /// Snapshot this engine's hash-modulo records (pure content facts) so a
+    /// driver recycling engines can `seedDrvRecords` the next one.
+    pub fn exportDrvRecords(self: *Engine, allocator: std.mem.Allocator) ![]ExportedDrvRecord {
+        return self.store.realization.registry.exportRecords(allocator);
+    }
+
+    pub fn seedDrvRecords(self: *Engine, records: []const ExportedDrvRecord) !void {
+        return self.store.realization.registry.seedExported(records);
+    }
+
+    /// Whether `store_path` is already valid in the store. Requires a daemon.
+    pub fn storePathIsValid(self: *Engine, store_path: []const u8) !bool {
+        return self.store.realization.pathIsValid(store_path);
+    }
+
+    /// Ask the daemon what realizing `drv_paths` would require. Caller owns the
+    /// returned plan. Used by `eval-jobs --check-cache-status` to distinguish
+    /// "must build" from "can substitute".
+    pub fn queryMissing(self: *Engine, drv_paths: []const []const u8) !@import("store").daemon.MissingPlan {
+        return self.store.realization.queryMissing(drv_paths);
+    }
+
+    /// The rendered message from the most recent evaluation failure, or null.
+    /// Borrowed from the trace, so it is only valid until the next operation.
+    pub fn lastErrorMessage(self: *const Engine) ?[]const u8 {
+        return self.report.traceView().message;
+    }
+
     /// The value of integer attribute `name` on `value`, or null.
     pub fn intAttr(self: *Engine, value: Value, name: []const u8) !?i64 {
         const attr = (try self.getAttr(value, name)) orelse return null;
@@ -2631,6 +2875,24 @@ pub const Engine = struct {
     pub fn updateFlakeLock(self: *Engine, ref: []const u8, update_all: bool, update_names: []const []const u8) !void {
         if (!self.policy.flakes_enabled) return error.FlakesFeatureRequired;
         return self.runWithVm(vm_builtins.computeFlakeLock, .{ ref, update_all, update_names });
+    }
+
+    /// Queue every unforced child of `value` for forcing by helper workers, then
+    /// return without waiting. A caller that is about to walk all of them itself
+    /// (so this is guaranteed work, not speculation) gets their independent I/O
+    /// overlapped instead of serialized: a sequential walk forces child N to
+    /// completion — network fetch included — before it looks at child N+1.
+    /// No-op for a non-attrset or when running solo.
+    /// eval-jobs level fan-out: queue every child of `value` for helper
+    /// forcing through to its `type`/`drvPath` reads, without forcing
+    /// anything on the calling thread. Instantiating a derivation is what
+    /// pulls its sources into the store, so a walk that read `drvPath` from
+    /// each child in turn would serialize every one of those fetches behind
+    /// the previous; the level is guaranteed work, not speculation.
+    pub fn accelerateJobLevel(self: *Engine, value: Value) !void {
+        try self.requireActiveEvaluation();
+        const forced = try self.forceValueUntraced(value);
+        try self.runWithVm(vm_force.accelerateJobLevelOf, .{forced});
     }
 
     pub fn forceDeep(self: *Engine, value: Value) !void {
@@ -2800,6 +3062,35 @@ pub const Engine = struct {
         // record it permits a sweep of a live value.
         self.collection.extra_roots.append(self.allocator, value) catch
             @panic("gc external root append failed");
+    }
+
+    /// Current reserved evaluator-heap bytes — the collector's own
+    /// committed-memory proxy. This is the metric to budget on: current and
+    /// cheap on every platform, where RSS on darwin only exposes the kernel
+    /// high-water mark (budgeting on a peak is what makes nix-eval-jobs
+    /// restart after every job once a single big one has run).
+    pub fn heapReservedBytes(self: *const Engine) u64 {
+        return self.heap.totalReservedBytes();
+    }
+
+    /// Scope marker for the crossing-root set (see `gcRootCrossingValue`).
+    /// A long walk (eval-jobs) appends several crossing roots per visited
+    /// attribute; unreleased they accumulate for the whole run and are
+    /// re-scanned by every mark phase. Marks must nest LIFO — take one per
+    /// walk frame, release when that frame's records have been emitted.
+    /// Everything the released roots referenced stays live through the walk
+    /// root; this bounds the root array and the mark-time cost, not liveness.
+    pub fn gcExternalRootsMark(self: *Engine) usize {
+        self.collection.extra_roots_mu.lock();
+        defer self.collection.extra_roots_mu.unlock();
+        return self.collection.extra_roots.items.len;
+    }
+
+    pub fn gcReleaseExternalRootsTo(self: *Engine, mark: usize) void {
+        self.collection.extra_roots_mu.lock();
+        defer self.collection.extra_roots_mu.unlock();
+        if (mark <= self.collection.extra_roots.items.len)
+            self.collection.extra_roots.items.len = mark;
     }
 
     pub const CollectNowResult = struct {
@@ -3016,10 +3307,36 @@ pub const Engine = struct {
                 error.IsDir => return self.importDirectory(stable_path, parent_depth, debug_parent),
                 else => return err,
             };
-        const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        const value = try self.evaluateSource(source, source_base, stable_path, null, parent_depth, debug_parent);
+        const base = try self.importBaseDir(stable_path);
+        defer if (base.owned) |owned| self.allocator.free(owned);
+        const value = try self.evaluateSource(source, base.dir, stable_path, null, parent_depth, debug_parent);
         observation.finish(.{});
         return value;
+    }
+
+    /// A base directory plus the allocation backing it, when one was made.
+    const ImportBase = struct { dir: []const u8, owned: ?[]u8 = null };
+
+    /// The directory a relative `import ./x` inside `path` resolves against.
+    ///
+    /// Nix resolves the imported file's symlinks first, so importing a symlink
+    /// (`nix/package.nix -> ./cpp/package.nix`) makes its relative imports
+    /// resolve from the *target's* directory (`nix/cpp/`), not the link's. Only
+    /// this base is resolved: `path` itself stays as written so store paths and
+    /// NAR hashing keep seeing the symlink.
+    ///
+    /// Falls back to the plain dirname when the path cannot be resolved (the
+    /// corepkgs virtual sources, or a dangling link), which is the pre-existing
+    /// behavior and keeps the error at the point of use.
+    fn importBaseDir(self: *Engine, path: []const u8) !ImportBase {
+        const dirname = std.fs.path.dirname(path) orelse "/";
+        const io = self.sources.files.io orelse return .{ .dir = dirname };
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const length = std.Io.Dir.realPathFileAbsolute(io, path, &buffer) catch return .{ .dir = dirname };
+        const resolved_dir = std.fs.path.dirname(buffer[0..length]) orelse return .{ .dir = dirname };
+        if (std.mem.eql(u8, resolved_dir, dirname)) return .{ .dir = dirname };
+        const owned = try self.allocator.dupe(u8, resolved_dir);
+        return .{ .dir = owned, .owned = owned };
     }
 
     /// Explicit post-registration phase: compiler code reports the canonical

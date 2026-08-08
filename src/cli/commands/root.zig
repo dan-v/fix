@@ -9,6 +9,7 @@ const std = @import("std");
 pub const Runner = *const fn (ProcessContext, std.process.Init, *std.process.Args.Iterator) anyerror!u8;
 
 pub const eval = @import("eval.zig");
+pub const eval_jobs = @import("eval_jobs.zig");
 pub const flake = @import("flake.zig");
 pub const completions = @import("completions.zig");
 pub const parse = @import("parse.zig");
@@ -31,6 +32,7 @@ pub fn runner(comptime kind: command_meta.Kind) Runner {
         .completions => completions.run,
         .disasm => disasm.run,
         .eval => eval.run,
+        .eval_jobs => eval_jobs.run,
         .flake => flake.run,
         .instantiate => instantiate.run,
         .parse => parse.run,

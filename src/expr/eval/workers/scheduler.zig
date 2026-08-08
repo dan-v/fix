@@ -49,7 +49,7 @@ pub const WakeWord = queue.WakeWord;
 /// probe class burns (own pops vs the O(N) per-peer steal scans over the
 /// ready queues / urgent deques / novel rings / spec rings / cont deques).
 /// Zero-cost when the build flag is off.
-const scan_census_on = build_options.prof_main and builtin.cpu.arch == .x86_64;
+const scan_census_on = build_options.prof_main and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64);
 
 pub const ScanCensus = struct {
     ready_pop_cy: u64 = 0,
@@ -78,14 +78,27 @@ var scan_totals: ScanCensus = .{};
 
 inline fn rdtscScan() u64 {
     if (comptime !scan_census_on) return 0;
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        :
-        : .{ .memory = true });
-    return (@as(u64, high) << 32) | @as(u64, low);
+    switch (comptime builtin.cpu.arch) {
+        .x86_64 => {
+            var low: u32 = undefined;
+            var high: u32 = undefined;
+            asm volatile ("rdtsc"
+                : [low] "={eax}" (low),
+                  [high] "={edx}" (high),
+                :
+                : .{ .memory = true });
+            return (@as(u64, high) << 32) | @as(u64, low);
+        },
+        .aarch64 => {
+            var count: u64 = undefined;
+            asm volatile ("mrs %[count], cntvct_el0"
+                : [count] "=r" (count),
+                :
+                : .{ .memory = true });
+            return count;
+        },
+        else => return 0,
+    }
 }
 
 inline fn scanEnd(comptime prefix: []const u8, t0: u64, hit: bool) void {
@@ -147,6 +160,11 @@ pub const Task = union(enum) {
     /// per path by the Engine before submission. Holds no heap
     /// ObjectId — nothing to GC-mark.
     import_prefetch: types.InternId,
+    /// eval-jobs level fan-out: force each child in the attr range to WHNF,
+    /// then — when a child is an attrset — force its `type` and `drvPath`
+    /// attrs, so package instantiation (mkDerivation env + aterm + hashing)
+    /// runs on helpers instead of the walk's demand thread.
+    force_drv_range: ForceAttrsRange,
     /// Speculative readDir-children prefetch (`FIX_READDIR_PREFETCH`):
     /// when a cold `builtins.readDir` returns a directory-of-directories,
     /// the demand fiber may read each child sequentially.
@@ -235,7 +253,7 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
             .force_thunk => |id| tr.markObject(heap, id),
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
-            .force_attrs_range => |r| tr.markObject(heap, r.attrs_id),
+            .force_attrs_range, .force_drv_range => |r| tr.markObject(heap, r.attrs_id),
             .import_prefetch, .readdir_prefetch => {},
         }
     }
@@ -250,7 +268,7 @@ fn specQueueGcMark(q: *const SpecQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
             .force_thunk => |id| tr.markObject(heap, id),
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
-            .force_attrs_range => |r| tr.markObject(heap, r.attrs_id),
+            .force_attrs_range, .force_drv_range => |r| tr.markObject(heap, r.attrs_id),
             .import_prefetch, .readdir_prefetch => {},
         }
     }
@@ -1441,7 +1459,7 @@ test "scheduler helpers run their loop and shut down cleanly" {
                 };
                 _ = c.observed[worker_id].fetchAdd(switch (task) {
                     .force_thunk => |id| @as(u32, @intCast(id)),
-                    .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch, .readdir_prefetch => 0,
+                    .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch, .readdir_prefetch, .force_drv_range => 0,
                 }, .acq_rel);
             }
         }

@@ -416,23 +416,24 @@ test "auto collection line: fraction of RAM, clamped to [floor, ceiling]" {
 }
 
 /// Total physical RAM in bytes, or null if the OS query fails (the caller
-/// then assumes a conservative default). Linux reads /proc/meminfo; Darwin
-/// queries the `hw.memsize` sysctl. The `comptime` gates ensure the
+/// then assumes a conservative default). Linux reads /proc/meminfo capped by
+/// the cgroup memory limit — inside a container /proc/meminfo shows the
+/// HOST's RAM, so scaling the collection line to it lets the eval blow past
+/// the container's actual ceiling and get OOM-killed before a single
+/// collection fires (CI runners and k8s pods are exactly this shape).
+/// Darwin queries the `hw.memsize` sysctl. The `comptime` gates ensure the
 /// libc-only sysctl reference is never codegen'd on non-Darwin targets.
 fn systemMemoryTotal() ?u64 {
     if (comptime builtin.os.tag == .linux) {
         var buf: [8192]u8 = undefined;
-        const linux = std.os.linux;
-        const fd_raw = linux.open("/proc/meminfo", .{ .ACCMODE = .RDONLY }, 0);
-        const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
-        if (fd < 0) return null;
-        defer _ = linux.close(fd);
-        const n = linux.read(fd, &buf, buf.len);
-        const rd: isize = @bitCast(n);
-        if (rd <= 0) return null;
-        const text = buf[0..@intCast(rd)];
-        if (meminfoKb(text, "MemTotal:")) |kb| return kb << 10;
-        return null;
+        const total = blk: {
+            const text = readSmallFile("/proc/meminfo", &buf) orelse break :blk null;
+            if (meminfoKb(text, "MemTotal:")) |kb| break :blk kb << 10;
+            break :blk null;
+        };
+        const cg = cgroupMemoryLimit(&buf);
+        if (total) |t| return @min(t, cg orelse t);
+        return cg;
     } else if (comptime builtin.os.tag.isDarwin()) {
         var val: u64 = 0;
         var len: usize = @sizeOf(u64);
@@ -443,6 +444,51 @@ fn systemMemoryTotal() ?u64 {
     } else {
         return null;
     }
+}
+
+/// Read a small pseudo-file (procfs/cgroupfs) into `buf`; null on any error.
+fn readSmallFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    const linux = std.os.linux;
+    const fd_raw = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
+    if (fd < 0) return null;
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, buf.ptr, buf.len);
+    const rd: isize = @bitCast(n);
+    if (rd <= 0) return null;
+    return buf[0..@intCast(rd)];
+}
+
+/// The cgroup memory ceiling for this process, or null when unlimited /
+/// undeterminable. v2 (`memory.max`: bytes or "max") first, then v1
+/// (`memory.limit_in_bytes`, where the no-limit default is a near-maxInt
+/// sentinel — treated as unlimited via the plausibility cap below).
+fn cgroupMemoryLimit(buf: []u8) ?u64 {
+    const raw = readSmallFile("/sys/fs/cgroup/memory.max", buf) orelse
+        readSmallFile("/sys/fs/cgroup/memory/memory.limit_in_bytes", buf) orelse
+        return null;
+    return parseCgroupLimit(raw);
+}
+
+/// Parse a cgroup memory-limit value: trimmed integer bytes, with "max"
+/// (v2) and implausibly-huge sentinels (v1 unlimited ≈ maxInt rounded to
+/// page size) both meaning "no limit".
+fn parseCgroupLimit(raw: []const u8) ?u64 {
+    const text = std.mem.trim(u8, raw, " \n\t");
+    if (std.mem.eql(u8, text, "max")) return null;
+    const value = std.fmt.parseInt(u64, text, 10) catch return null;
+    // v1's unlimited default is maxInt(i64) rounded down to the page size;
+    // anything above 1 PiB is a sentinel, not a real container limit.
+    if (value == 0 or value > (1 << 50)) return null;
+    return value;
+}
+
+test "parseCgroupLimit: bytes, v2 max, v1 unlimited sentinel" {
+    try std.testing.expectEqual(@as(?u64, 8 << 30), parseCgroupLimit("8589934592\n"));
+    try std.testing.expectEqual(@as(?u64, null), parseCgroupLimit("max\n"));
+    try std.testing.expectEqual(@as(?u64, null), parseCgroupLimit("9223372036854771712"));
+    try std.testing.expectEqual(@as(?u64, null), parseCgroupLimit(""));
+    try std.testing.expectEqual(@as(?u64, null), parseCgroupLimit("0"));
 }
 
 /// Extract `<key>   <n> kB` from /proc/meminfo text.
@@ -483,7 +529,7 @@ pub fn markRoots(ev: Context, tr: *gc.Tracer) void {
                 .force_thunk => |id| tr.markObject(ev.heap, id),
                 .force_list_range => |r| tr.markObject(ev.heap, r.list_id),
                 .force_attrs_sweep => |id| tr.markObject(ev.heap, id),
-                .force_attrs_range => |r| tr.markObject(ev.heap, r.attrs_id),
+                .force_attrs_range, .force_drv_range => |r| tr.markObject(ev.heap, r.attrs_id),
                 .import_prefetch, .readdir_prefetch => {},
             };
         }

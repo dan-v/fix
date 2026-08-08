@@ -14,6 +14,7 @@ pub const value = @import("derivation/value.zig");
 pub const debug_record = @import("derivation/debug_record.zig");
 pub const clone = @import("derivation/clone.zig");
 pub const sort = @import("derivation/sort.zig");
+pub const parse = @import("derivation/parse.zig");
 pub const registry = @import("derivation/registry.zig");
 pub const Registry = registry.Registry;
 const dtypes = types;
@@ -71,4 +72,5 @@ pub const isSyntheticName = value_builder.isSyntheticName;
 
 test {
     _ = hash_codec;
+    _ = parse;
 }

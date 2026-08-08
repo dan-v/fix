@@ -433,6 +433,22 @@ pub fn coerceAttrsToStringValue(self: *VM, attrs: Value) !Value {
 }
 
 pub fn coerceDerivationStringValue(self: *VM, arg: Value) !Value {
+    return coerceDerivationStringValueDepth(self, arg, 0);
+}
+
+/// Value nesting inside derivation arguments is finite in any real
+/// expression; a self-referential list/attrset (`recursion = [ recursion ]`)
+/// would otherwise recurse natively until the fiber stack faults. The cap
+/// surfaces as the same max-call-depth error the VM's frame guard raises.
+const coerce_depth_cap = 512;
+
+fn coerceDepthExceeded(self: *VM) anyerror {
+    vm_trace.setErrorMessage(self, "stack overflow; max-call-depth exceeded") catch {};
+    return error.StackOverflow;
+}
+
+fn coerceDerivationStringValueDepth(self: *VM, arg: Value, depth: u32) anyerror!Value {
+    if (depth > coerce_depth_cap) return coerceDepthExceeded(self);
     const value = try vm_force.forceValue(self, arg);
     switch (value.kind()) {
         .string, .string_context, .heap_string => return value,
@@ -452,13 +468,18 @@ pub fn coerceDerivationStringValue(self: *VM, arg: Value) !Value {
         },
         .bool_false, .null => return Value.string(try self.intern.intern("")),
         .bool_true => return Value.string(try self.intern.intern("1")),
-        .list => return coerceDerivationListToStringValue(self, value.asObjectId()),
-        .attrs => return coerceDerivationAttrsToStringValue(self, value),
+        .list => return coerceDerivationListToStringValueDepth(self, value.asObjectId(), depth + 1),
+        .attrs => return coerceDerivationAttrsToStringValueDepth(self, value, depth + 1),
         else => return error.TypeError,
     }
 }
 
 pub fn coerceDerivationListToStringValue(self: *VM, list_id: ObjectId) !Value {
+    return coerceDerivationListToStringValueDepth(self, list_id, 0);
+}
+
+fn coerceDerivationListToStringValueDepth(self: *VM, list_id: ObjectId, depth: u32) anyerror!Value {
+    if (depth > coerce_depth_cap) return coerceDepthExceeded(self);
     // GC: root the (bare-id) list across the recursive force-walk.
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
@@ -487,7 +508,7 @@ pub fn coerceDerivationListToStringValue(self: *VM, list_id: ObjectId) !Value {
         if (!first) try out.append(self.allocator, ' ');
         first = false;
         trailing_empty_list = false;
-        const item_value = try coerceDerivationStringValue(self, forced);
+        const item_value = try coerceDerivationStringValueDepth(self, forced, depth + 1);
         // GC: `item_value` may be a FRESH context string (nested-list/attrs
         // coercion) held only in this Zig local — not the rooted list arg.
         // `appendContextEntry` forces (context merge) and can collect; root
@@ -507,13 +528,18 @@ pub fn coerceDerivationListToStringValue(self: *VM, list_id: ObjectId) !Value {
 }
 
 pub fn coerceDerivationAttrsToStringValue(self: *VM, attrs: Value) !Value {
+    return coerceDerivationAttrsToStringValueDepth(self, attrs, 0);
+}
+
+fn coerceDerivationAttrsToStringValueDepth(self: *VM, attrs: Value, depth: u32) anyerror!Value {
+    if (depth > coerce_depth_cap) return coerceDepthExceeded(self);
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, attrs); // held across getAttrValue + callValue + coerce
     const to_string_id = try self.intern.intern("__toString");
     if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
         const result = try vm_closures.callValue(self, try vm_force.forceValue(self, to_string), attrs);
-        return coerceDerivationStringValue(self, result);
+        return coerceDerivationStringValueDepth(self, result, depth + 1);
     } else |err| switch (err) {
         error.MissingAttribute => {},
         else => return err,
@@ -524,5 +550,5 @@ pub fn coerceDerivationAttrsToStringValue(self: *VM, attrs: Value) !Value {
         error.MissingAttribute => return error.TypeError,
         else => return err,
     };
-    return coerceDerivationStringValue(self, out_path);
+    return coerceDerivationStringValueDepth(self, out_path, depth + 1);
 }

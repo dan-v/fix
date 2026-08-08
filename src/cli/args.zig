@@ -162,6 +162,45 @@ pub const Options = struct {
     /// `fix instantiate --find-file`: resolve each source argument as a name in
     /// NIX_PATH and print its absolute path without parsing or evaluating it.
     find_file: bool = false,
+    /// `fix eval-jobs --check-cache-status`: report whether each derivation's
+    /// outputs are already in the store.
+    check_cache_status: bool = false,
+    /// `fix eval-jobs --max-depth N`: attrset recursion limit. Unlimited by
+    /// default, as in nix-eval-jobs (recursion is already bounded by
+    /// `recurseForDerivations`).
+    max_depth: usize = std.math.maxInt(usize),
+    /// `fix eval-jobs --gc-roots-dir DIR`: register an indirect GC root
+    /// (symlink named after the .drv basename) for every emitted drvPath, so
+    /// a store GC between evaluation and build cannot delete them.
+    gc_roots_dir: ?[]const u8 = null,
+    /// `fix eval-jobs --max-memory-size MiB`: evaluator-heap budget. When the
+    /// reserved heap exceeds it (even after a full collection), the engine is
+    /// torn down and rebuilt and the walk resumes after the last emitted job.
+    /// 0 = unlimited. The flag name and MiB unit match nix-eval-jobs.
+    max_memory_size: usize = 0,
+    /// `fix eval-jobs --force-recurse`: descend into every attrset, ignoring
+    /// `recurseForDerivations` (still not into derivations), as nix-eval-jobs.
+    force_recurse: bool = false,
+    /// `fix eval-jobs --meta`: serialize each derivation's `meta` attrset
+    /// into the record.
+    meta: bool = false,
+    /// `fix eval-jobs --no-instantiate`: evaluate without writing `.drv`
+    /// files or GC roots; drvPaths are still computed. As nix-eval-jobs'
+    /// read-only mode.
+    no_instantiate: bool = false,
+    /// `fix eval-jobs --apply EXPR`: a function applied to each derivation
+    /// value; the result is serialized into the record's `extraValue`.
+    apply_expr: ?[]const u8 = null,
+    /// `fix eval-jobs --select EXPR`: a function applied to the evaluation
+    /// root before traversal; its result is walked instead.
+    select_expr: ?[]const u8 = null,
+    /// `fix eval-jobs --show-input-drvs`: report each job's direct input
+    /// derivations as `inputDrvs` ({drvPath: [outputName...]}).
+    show_input_drvs: bool = false,
+    /// `fix eval-jobs --constituents`: resolve Hydra aggregate jobs
+    /// (`_hydraAggregate`) and rewrite their derivations to depend on the
+    /// resolved constituents.
+    constituents: bool = false,
     /// `-Q`/`--no-build-output`: consume daemon build log messages silently.
     no_build_output: bool = false,
     /// `--out-link NAME`/`-o`: name of the result symlink (default `result`).
@@ -336,6 +375,17 @@ pub const Opt = enum {
     no_link,
     dry_run,
     find_file,
+    check_cache_status,
+    max_depth,
+    gc_roots_dir,
+    max_memory_size,
+    force_recurse,
+    meta,
+    no_instantiate,
+    apply_expr,
+    select_expr,
+    show_input_drvs,
+    constituents,
     no_build_output,
     out_link,
     drv_link,
@@ -446,18 +496,18 @@ const Spec = struct {
 /// Commands that take a source expression and its selectors (everything but the
 /// streaming `repl`). `disasm` compiles rather than evaluates, but shares the same
 /// source model (bare path / `-E` / `--file` / `--flake` / `-A` / `-I`).
-const source_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .disasm, .@"switch", .print_dev_env };
+const source_cmds = &[_]Cmd{ .eval, .eval_jobs, .parse, .instantiate, .build, .run, .shell, .disasm, .@"switch", .print_dev_env };
 /// Source wrappers/selectors operate on evaluated text. `parse` consumes the
 /// original file/expression bytes and therefore intentionally excludes these.
-const selected_source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .disasm, .@"switch", .print_dev_env };
+const selected_source_cmds = &[_]Cmd{ .eval, .eval_jobs, .instantiate, .build, .run, .shell, .disasm, .@"switch", .print_dev_env };
 /// Commands that run the evaluator, so diagnostics (`--show-trace`, `--color`),
 /// progress, and the GC memory budget apply. `disasm` stops at compilation, so
 /// it is excluded.
-const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .@"switch", .print_dev_env };
+const eval_cmds = &[_]Cmd{ .eval, .eval_jobs, .instantiate, .build, .run, .shell, .repl, .@"switch", .print_dev_env };
 /// Commands with a meaningful evaluator/bytecode statistics report.
-const stats_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .disasm, .@"switch" };
+const stats_cmds = &[_]Cmd{ .eval, .eval_jobs, .instantiate, .build, .run, .shell, .repl, .disasm, .@"switch" };
 /// One-shot evaluator commands that can write a complete Perfetto capture.
-const timeline_cmds = &[_]Cmd{ .eval, .instantiate, .build };
+const timeline_cmds = &[_]Cmd{ .eval, .eval_jobs, .instantiate, .build };
 /// Commands that print an evaluated value, so the output format (`--json`,
 /// `--xml`) and `--strict` apply. The realizing commands print store paths, not
 /// a value, and `disasm` prints bytecode.
@@ -472,8 +522,8 @@ const realize_cmds = &[_]Cmd{ .build, .run, .shell, .@"switch", .print_dev_env }
 /// Legacy nix-instantiate accepts daemon build settings in all of its modes;
 /// eval can use them for IFD, while parse/find-file simply accept them as
 /// process-wide compatibility settings. Realizing commands use them directly.
-const daemon_setting_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .@"switch", .print_dev_env };
-const verbose_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .repl, .@"switch", .print_dev_env };
+const daemon_setting_cmds = &[_]Cmd{ .eval, .eval_jobs, .parse, .instantiate, .build, .run, .shell, .@"switch", .print_dev_env };
+const verbose_cmds = &[_]Cmd{ .eval, .eval_jobs, .parse, .instantiate, .build, .run, .shell, .repl, .@"switch", .print_dev_env };
 
 const specs = [_]Spec{
     .{ .id = .expr, .short = "-E", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text; repeatable", .completion_help = "evaluate expression text", .repeatable = true, .show_in = source_cmds },
@@ -505,6 +555,17 @@ const specs = [_]Spec{
     .{ .id = .no_link, .long = "--no-link", .show_in = &.{.build}, .hidden = true }, // alias of --no-out-link
     .{ .id = .dry_run, .long = "--dry-run", .help = "show what would be built or substituted", .show_in = &.{.build} },
     .{ .id = .find_file, .long = "--find-file", .help = "look up source arguments in NIX_PATH and print\ntheir absolute paths", .show_in = &.{.instantiate} },
+    .{ .id = .check_cache_status, .long = "--check-cache-status", .help = "report whether each derivation's outputs are\nalready in the store", .show_in = &.{.eval_jobs} },
+    .{ .id = .max_depth, .long = "--max-depth", .arg = .req, .metavar = "N", .help = "how deep to recurse into attrsets (default: unlimited)", .show_in = &.{.eval_jobs} },
+    .{ .id = .gc_roots_dir, .long = "--gc-roots-dir", .arg = .req, .metavar = "DIR", .help = "register a GC root in DIR for every emitted .drv", .show_in = &.{.eval_jobs}, .complete = .{ .file, .none } },
+    .{ .id = .max_memory_size, .long = "--max-memory-size", .arg = .req, .metavar = "MiB", .help = "recycle the evaluator when its heap exceeds this\nbudget (0 = unlimited)", .show_in = &.{.eval_jobs} },
+    .{ .id = .force_recurse, .long = "--force-recurse", .help = "descend into every attrset, ignoring\nrecurseForDerivations", .show_in = &.{.eval_jobs} },
+    .{ .id = .meta, .long = "--meta", .help = "serialize each derivation's meta attrset into\nthe record", .show_in = &.{.eval_jobs} },
+    .{ .id = .no_instantiate, .long = "--no-instantiate", .help = "evaluate without writing .drv files or GC roots\n(drvPaths still computed)", .show_in = &.{.eval_jobs} },
+    .{ .id = .apply_expr, .long = "--apply", .arg = .req, .metavar = "EXPR", .help = "apply this function to each derivation and emit\nthe result as extraValue", .show_in = &.{.eval_jobs} },
+    .{ .id = .select_expr, .long = "--select", .arg = .req, .metavar = "EXPR", .help = "apply this function to the evaluation root and\nwalk its result", .show_in = &.{.eval_jobs} },
+    .{ .id = .show_input_drvs, .long = "--show-input-drvs", .help = "report each job's direct input derivations as\ninputDrvs", .show_in = &.{.eval_jobs} },
+    .{ .id = .constituents, .long = "--constituents", .help = "resolve Hydra aggregate jobs and rewrite their\nderivations to depend on the constituents", .show_in = &.{.eval_jobs} },
     .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .completion_help = "name of the derivation symlink", .default_value = "derivation", .show_in = drv_cmds, .complete = .{ .file, .none } },
     .{ .id = .add_drv_link, .long = "--add-drv-link", .help = "also create a symlink to the .drv", .show_in = drv_cmds },
     .{ .id = .add_root, .long = "--add-root", .arg = .req, .metavar = "PATH", .help = "create the link at PATH and register it as a GC root", .show_in = drv_cmds, .complete = .{ .file, .none } },
@@ -1021,6 +1082,8 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators, fetch-tree, flakes)",
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.InvalidMaxJobs => "expected --max-jobs to be `auto` or a non-negative integer",
+        error.InvalidMaxDepth => "expected --max-depth to be a non-negative integer",
+        error.InvalidMaxMemorySize => "expected --max-memory-size to be a non-negative integer (MiB)",
         error.InvalidCores => "expected --cores to be a non-negative integer",
         error.InvalidGcBudget => "expected --gc-budget to be a size like 4096, 512m, or 4g",
         error.InvalidHugetlbMode => "expected --hugetlb to be auto, on, or off",

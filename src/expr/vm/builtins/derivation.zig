@@ -919,6 +919,12 @@ fn normalizeDerivationString(
 }
 
 fn sourceStorePathForContext(self: *VM, path: []const u8, owned_strings: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
+    // A context entry naming a store path is already the ingested source (string
+    // coercion ran when the path was interpolated, and it is what the daemon was
+    // told to write). Re-ingesting it here would nest a second copy —
+    // `<h2>-<h1>-source` — and change every drvPath that has a store path as a
+    // source. Only a non-store path still needs ingesting.
+    if (source_paths.isStoreRootPath(path, self.realization.store_dir)) return path;
     const store_path = try source_paths.storePathForSource(self.allocator, self.realization, self.files, path);
     errdefer self.allocator.free(store_path);
     try owned_strings.append(self.allocator, store_path);
