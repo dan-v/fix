@@ -336,12 +336,25 @@ inline fn swap(from: *Context, to: *Context, destination_tsan: TSanHandle) void 
     _ = contextSwitch(&s);
 }
 
+/// Zeroed headroom kept between the fiber's seeded SP and the very top of the
+/// stack mapping. Stack-trace capture (DebugAllocator large allocs, panics,
+/// error traces) may unwind through the fiber's entry frame; macOS's
+/// compact-unwind path then dereferences the entry frame's CFA — the seeded SP
+/// itself. Seeded flush against the mapping end, that read is one byte past
+/// the region (a nightly Debug stress .ips showed KERN_INVALID_ADDRESS exactly
+/// at a 32 MiB fiber-stack boundary; the pre-CrashReporter symptom was the
+/// in-process segfault handler wedging on the same walk). With headroom the
+/// read lands in-mapping and returns zeros — a null frame record, which
+/// terminates every unwinder. Stacks grow DOWN from the seeded SP, so the
+/// headroom is never written and stays mmap-zero across fiber recycles.
+const unwind_headroom: usize = 4096;
+
 /// Bootstrap a fresh `Context` on `stack` so the first switch into it lands in
 /// `trampoline` on the fiber's own stack. `contextSwitch` loads sp/fp and jumps
 /// straight to the saved address, so we seed the resume address directly (no
 /// pushed return slot).
 fn bootstrapContext(stack: []u8) Context {
-    const top = @intFromPtr(stack.ptr) + stack.len;
+    const top = @intFromPtr(stack.ptr) + stack.len - unwind_headroom;
     switch (builtin.cpu.arch) {
         .x86_64 => {
             // The switch `jmp`s to `rip` — entering `trampoline` as if via a
@@ -351,9 +364,10 @@ fn bootstrapContext(stack: []u8) Context {
             return .{ .rsp = sp_start, .rbp = 0, .rip = @intFromPtr(&trampoline) };
         },
         .aarch64 => {
-            // AAPCS64 requires sp 16-byte aligned at all times; `top` is
-            // page-aligned (mmap), hence already 16-aligned. The switch `br`s to
-            // `pc`, so no return address is pushed onto the stack.
+            // AAPCS64 requires sp 16-byte aligned at all times; `top` is the
+            // page-aligned mmap end minus the 16-aligned headroom, hence
+            // 16-aligned. The switch `br`s to `pc`, so no return address is
+            // pushed onto the stack.
             const sp_start = top & ~@as(usize, 15);
             return .{ .sp = sp_start, .fp = 0, .pc = @intFromPtr(&trampoline) };
         },
