@@ -2,10 +2,20 @@
 //! too large for unit tests. Every failure reports the seed and iteration.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const base = @import("base");
 const expr = @import("expr");
 
 const Engine = expr.Engine;
+
+/// On Darwin, Zig's in-process segfault handler has wedged unwinding this
+/// binary's fiber stacks (a crashed nightly printed the one-line header, then
+/// hung until the runner's 10-minute timeout — no trace). Let the OS
+/// CrashReporter take the fault instead: it writes a full every-thread `.ips`
+/// report the workflow dumps on failure, and the process dies immediately.
+pub const std_options: std.Options = .{
+    .enable_segfault_handler = !builtin.os.tag.isDarwin(),
+};
 
 /// Payload lanes for the queue stress. `NarrowLane` exercises the plain
 /// atomic slot transport; `WideLane` exercises the two-word seqlock slots

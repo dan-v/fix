@@ -82,6 +82,23 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1:exitcode=66:suppressions=${{ github.workspace }}/test/tsan.supp
         run: nix-shell --run "zig build stress-concurrency -Dtsan -Doptimize=ReleaseSafe --summary all -- --seed $STRESS_SEED --iterations 20"
 
+      # A crashed stress binary on macOS dies to the OS CrashReporter (the
+      # in-process segfault handler is disabled there — it has wedged unwinding
+      # fiber stacks, eating the step timeout without printing a trace; see
+      # test/concurrency_stress.zig). Surface the every-thread .ips report.
+      - name: Dump macOS crash reports
+        if: failure() && runner.os == 'macOS'
+        run: |
+          sleep 15 # let ReportCrash finish writing
+          found=0
+          for f in "$HOME"/Library/Logs/DiagnosticReports/concurrency-stress*.ips; do
+            [ -e "$f" ] || continue
+            found=1
+            echo "=== $f ==="
+            cat "$f"
+          done
+          [ "$found" = 1 ] || echo "no concurrency-stress crash reports found"
+
       # The synthetic stress workloads cannot reproduce the module-fixpoint
       # shapes where past real races surfaced; run the real-world bench
       # fixtures as a parallel-eval differential against reference Nix.
