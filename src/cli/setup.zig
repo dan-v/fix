@@ -35,17 +35,29 @@ pub fn workerCount(options: *const args.Options) !u8 {
 
 /// Resolve the process capabilities that must be present when the engine's
 /// long-lived services are constructed. Remaining language/store policy is
-/// applied by `Session.configure` after nix.conf has been folded.
+/// applied by `Session.configure` after nix.conf has been folded. `options`
+/// is null only for engines with no parsed command line (completions).
 pub fn engineConfig(
     init: std.process.Init,
     worker_count: u8,
     memory_backing: ?*hugetlb.Policy,
+    options: ?*const args.Options,
 ) engine.EngineConfig {
+    const compile_cache: engine.CompileCacheConfig = if (options) |o|
+        (if (o.no_compile_cache)
+            .off
+        else if (o.compile_cache_dir) |dir|
+            .{ .dir = dir }
+        else
+            .auto)
+    else
+        .auto;
     return .{
         .worker_count = worker_count,
         .io = init.io,
         .environment = init.environ_map,
         .memory_backing = memory_backing,
+        .compile_cache = compile_cache,
     };
 }
 

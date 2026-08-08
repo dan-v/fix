@@ -39,7 +39,7 @@ the *compile*, each variable-length piece length-prefixed:
 - the source path and the source bytes.
 
 Units live at `<root>/<build-id>/<keyhex>.unit`, where `<root>` is
-`$FIX_CHUNK_CACHE_DIR`, else `$XDG_CACHE_HOME/fix/chunks`, else
+`--compile-cache-dir` if given, else `$XDG_CACHE_HOME/fix/chunks`, else
 `~/.cache/fix/chunks`.
 
 **The binary's identity is deliberately absent from the key** — the
@@ -131,9 +131,10 @@ compile's retained arena follows.
 
 ## Knobs and census
 
-- **`FIX_NO_CHUNK_CACHE=1`** disables the cache wholesale (any value other
-  than `0`).
-- **`FIX_CHUNK_CACHE_DIR`** overrides the cache root.
+- **`--no-compile-cache`** disables the cache wholesale for one invocation.
+- **`--compile-cache-dir DIR`** overrides the cache root.
+- Library embedders set the same two choices via
+  `EngineConfig.compile_cache` (`.off` / `.{ .dir = … }`).
 - **`FIX_LET_FLOAT_STATS=1`** prints a chunk-cache census at engine teardown
   alongside the let-float one: **hits** (unit loaded), **misses** (no blob
   for the key), **writes** (unit published), **rejects** (blob present but
@@ -180,7 +181,7 @@ same run.
 ## Measured
 
 Warm nixos-minimal evaluation at `w=1`: **1.740s** with the cache vs
-**2.149s** with `FIX_NO_CHUNK_CACHE=1` — **1.23× faster**, the parse +
+**2.149s** with `--no-compile-cache` — **1.23× faster**, the parse +
 compile share of the run.
 
 At high worker counts on evaluation-bound workloads the cache is neutral:

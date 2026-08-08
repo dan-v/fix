@@ -67,7 +67,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     defer settings.deinit();
     var ev = try Engine.init(
         allocator,
-        setup.engineConfig(init, try setup.workerCount(&options), memory_backing),
+        setup.engineConfig(init, try setup.workerCount(&options), memory_backing, &options),
     );
     var session = setup.Session.init(&ev);
     defer session.deinit(.full);

@@ -164,7 +164,7 @@ fn buildAndSwitch(process: @import("../process_context.zig").ProcessContext, ini
     var settings = try config_discovery.loadLocal(allocator, init, options);
     config_discovery.fetchFlakeSettings(allocator, init, options, &settings);
     defer settings.deinit();
-    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing, options));
     var session = setup.Session.init(&ev);
     defer session.deinit(.full);
     const term = try session.configure(init, options, &settings);

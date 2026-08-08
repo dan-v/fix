@@ -517,9 +517,12 @@ const CompilationState = struct {
     let_float_stats: compiler_mod.let_float.Stats = .{},
     retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena) = .empty,
     retained_arenas_mu: SpinMutex = .{},
+    /// Caller's cache placement from `Config.compile_cache`
+    /// (`--no-compile-cache` / `--compile-cache-dir` on the CLI).
+    cache_config: CompileCacheConfig = .auto,
     /// Persistent chunk-cache configuration, resolved once at
     /// `prepareEvaluations` (null = disabled: no cache dir resolvable,
-    /// FIX_NO_CHUNK_CACHE set, or a debugger/name-capture session).
+    /// `cache_config == .off`, or a debugger/name-capture session).
     chunk_cache: ?chunk_cache_store.Store = null,
     cache_hits: std.atomic.Value(u64) = .init(0),
     cache_misses: std.atomic.Value(u64) = .init(0),
@@ -559,6 +562,16 @@ fn debugContext(session: *const DebugSession) debug_session.Context {
     };
 }
 
+/// Placement of the persistent compiled-chunk cache: the default root
+/// (`$XDG_CACHE_HOME/fix/chunks`, else `~/.cache/fix/chunks`), a
+/// caller-chosen root, or fully disabled.
+pub const CompileCacheConfig = union(enum) {
+    auto,
+    off,
+    /// Borrowed (argv lifetime); duplicated when the cache store resolves.
+    dir: []const u8,
+};
+
 /// Borrowed construction policy for the expression engine.
 ///
 /// Keeping initialization inputs in one value makes setup transactional and
@@ -569,6 +582,7 @@ pub const Config = struct {
     environment: ?*const std.process.Environ.Map = null,
     fetch: FetchService.Config = .{},
     memory_backing: ?*hugetlb.Policy = null,
+    compile_cache: CompileCacheConfig = .auto,
 };
 
 pub const Engine = struct {
@@ -683,6 +697,7 @@ pub const Engine = struct {
             .report = EvaluationReport.init(allocator),
             .compilation = .{
                 .deferred_table = deferred_mod.Table.init(allocator),
+                .cache_config = config.compile_cache,
             },
             .collection = .{
                 .tracer = gc.Tracer.init(allocator),
@@ -1444,21 +1459,20 @@ pub const Engine = struct {
     }
 
     /// Resolve the persistent chunk-cache configuration once per engine —
-    /// env knobs, cache directory, and the identity context every unit key
-    /// embeds (exe fingerprint, policy fingerprint, codegen-affecting
-    /// flags). Must run AFTER the tuning policy is frozen (the key snapshots
+    /// cache directory and the identity context every unit key embeds
+    /// (exe fingerprint, policy fingerprint, codegen-affecting flags).
+    /// Must run AFTER the tuning policy is frozen (the key snapshots
     /// `let_float_enabled`). Failure to resolve leaves the cache disabled.
     fn resolveChunkCache(self: *Engine) void {
         if (self.compilation.chunk_cache != null) return;
         const eval_tuning = self.ensureTuningPolicy();
+        if (self.compilation.cache_config == .off) return;
         const env = self.sources.env_map orelse return;
-        if (env.get("FIX_NO_CHUNK_CACHE")) |v| {
-            if (!std.mem.eql(u8, v, "0")) return;
-        }
         const io = self.sources.files.io orelse return;
 
         const root = blk: {
-            if (env.get("FIX_CHUNK_CACHE_DIR")) |d| break :blk self.allocator.dupe(u8, d) catch return;
+            if (self.compilation.cache_config == .dir)
+                break :blk self.allocator.dupe(u8, self.compilation.cache_config.dir) catch return;
             if (env.get("XDG_CACHE_HOME")) |x| {
                 if (x.len != 0) break :blk std.fs.path.join(self.allocator, &.{ x, "fix", "chunks" }) catch return;
             }

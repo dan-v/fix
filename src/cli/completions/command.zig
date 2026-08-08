@@ -444,7 +444,7 @@ fn completeFlake(
 /// List the declared input names of the flake in the current directory
 /// (`flake.nix`'s `inputs` attrset) — no fetch, no outputs.
 fn completeFlakeInputNames(allocator: std.mem.Allocator, init: std.process.Init, w: *std.Io.Writer, prefix: []const u8) !void {
-    var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null));
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1, null, null));
     defer ev.deinit();
     ev.setParallelismToggles(true, true);
     const cwd = try std.process.currentPathAlloc(init.io, allocator);

@@ -98,6 +98,8 @@ pub fn apply(
         .no_pager => options.disasm_no_pager = true,
         .disasm_eval => options.disasm_eval = true,
         .stats => options.stats = true,
+        .no_compile_cache => options.no_compile_cache = true,
+        .compile_cache_dir => options.compile_cache_dir = v0.?,
         .workers => options.workers = std.fmt.parseInt(u8, v0.?, 10) catch return error.InvalidWorkers,
         .vm_trace => options.vm_trace_path = v0 orelse "-",
         .vm_trace_format => options.vm_trace_format = parseVmTraceFormat(Options, v0.?) orelse return error.InvalidVmTraceFormat,

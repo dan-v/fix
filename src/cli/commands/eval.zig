@@ -44,7 +44,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var settings = try config_discovery.loadLocal(allocator, init, &options);
     config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
     defer settings.deinit();
-    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing));
+    var ev = try Engine.init(allocator, setup.engineConfig(init, worker_count, memory_backing, &options));
     ev.setTransientChunkRegistration(process.exits_after_command and !options.debugger);
     var session = setup.Session.init(&ev);
     // `main` terminates the process immediately after this command returns.

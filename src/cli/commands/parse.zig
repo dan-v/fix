@@ -62,7 +62,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     };
     defer settings.deinit();
     config_discovery.fetchFlakeSettings(allocator, init, &options, &settings);
-    var ev = try Engine.init(allocator, setup.engineConfig(init, 1, memory_backing));
+    var ev = try Engine.init(allocator, setup.engineConfig(init, 1, memory_backing, &options));
     var session = setup.Session.init(&ev);
     defer session.deinit(.full);
     _ = session.configure(init, &options, &settings) catch |err| {

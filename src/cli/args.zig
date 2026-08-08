@@ -233,6 +233,12 @@ pub const Options = struct {
     vm_trace_main_only: bool = false,
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
+    /// `--no-compile-cache`: skip the persistent compiled-chunk cache for
+    /// this invocation (compile everything from source).
+    no_compile_cache: bool = false,
+    /// `--compile-cache-dir DIR`: compiled-chunk cache root override
+    /// (default `$XDG_CACHE_HOME/fix/chunks`). Borrowed from argv.
+    compile_cache_dir: ?[]const u8 = null,
     /// GC collection-budget override in bytes (`--gc-budget`); see
     /// `eval/gc_controller.zig:memoryBudget`. `null` = the automatic RAM-scaled line;
     /// `0` = never collect.
@@ -377,6 +383,8 @@ pub const Opt = enum {
     no_pager,
     disasm_eval,
     stats,
+    no_compile_cache,
+    compile_cache_dir,
     // Internal perf/trace knobs (hidden from help, still parsed everywhere).
     workers,
     vm_trace,
@@ -489,6 +497,8 @@ const specs = [_]Spec{
     .{ .id = .deprecated_features, .long = "--deprecated-features", .arg = .req, .metavar = "FEATS", .help = "space-separated deprecated features to re-enable;\nsee docs/cli.md for the complete compatibility list", .completion_help = "replace deprecated features to re-enable", .complete = .{ .deprecated_feature, .none } },
     .{ .id = .extra_deprecated_features, .long = "--extra-deprecated-features", .arg = .req, .metavar = "FEATS", .help = "like --deprecated-features, but adds to the set", .complete = .{ .deprecated_feature, .none } },
     .{ .id = .option, .long = "--option", .arg = .req2, .metavar = "NAME VALUE", .help = "override a nix.conf setting", .complete = .{ .setting, .none } },
+    .{ .id = .no_compile_cache, .long = "--no-compile-cache", .help = "do not read or write the persistent compiled-chunk\ncache; compile everything from source", .completion_help = "disable the persistent compiled-chunk cache", .show_in = eval_cmds },
+    .{ .id = .compile_cache_dir, .long = "--compile-cache-dir", .arg = .req, .metavar = "DIR", .help = "compiled-chunk cache root (default:\n$XDG_CACHE_HOME/fix/chunks)", .completion_help = "compiled-chunk cache root", .show_in = eval_cmds, .complete = .{ .file, .none } },
 
     .{ .id = .out_link, .short = "-o", .long = "--out-link", .arg = .req, .metavar = "NAME", .help = "name of the result symlink (default: result)", .completion_help = "name of the result symlink", .default_value = "result", .show_in = &.{.build}, .complete = .{ .file, .none } },
     .{ .id = .no_link, .long = "--no-out-link", .help = "do not create the result symlink", .show_in = &.{.build} },

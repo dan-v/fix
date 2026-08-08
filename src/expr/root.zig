@@ -13,6 +13,7 @@ pub const probe = @import("probe.zig");
 
 pub const Engine = evaluator.Engine;
 pub const EngineConfig = evaluator.Config;
+pub const CompileCacheConfig = evaluator.CompileCacheConfig;
 pub const BuildSession = evaluator.BuildSession;
 pub const Diagnostic = evaluator.Diagnostic;
 pub const EvalTrace = evaluator.EvalTrace;
