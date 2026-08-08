@@ -61,7 +61,7 @@ pub fn compileBinary(self: *Compiler, node: *const Node) !void {
 
     // Specialized comparison with literal `null`. Emit only the
     // non-null side and use `cmp_eq_null`/`cmp_ne_null` so the runtime
-    // (and the eventual JIT) sees a type-monomorphic null check.
+    // sees a type-monomorphic null check.
     if (bin.op == .eq or bin.op == .neq) {
         const left_null = unwrapParens(bin.left).tag == .null;
         const right_null = unwrapParens(bin.right).tag == .null;

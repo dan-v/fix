@@ -626,8 +626,6 @@ pub fn sweepMemberAdmissible(self: *VM, thunk_id: ObjectId) bool {
     }
 }
 
-// ---- temp diagnosis probe: claim-time touch logging ----
-
 /// Monotonic microseconds for diagnosis log lines (same clock domain as
 /// `probe/timeline.zig`); 0 off-linux.
 pub fn diagNowUs() u64 {

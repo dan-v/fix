@@ -115,9 +115,10 @@ fn compileNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
         .unary_op => try fold.compileUnary(self, node),
         .apply => try lambda.compileApply(self, node),
         .lambda => {
-            // Full-laziness pre-emission hook (no-op unless FIX_FULL_LAZY=1):
-            // the rewrite may return `let floated… in <lambda>` — bindings
-            // hoisted into THIS scope, shared across the closure's calls.
+            // Full-laziness pre-emission hook (on by default; FIX_NO_FULL_LAZY
+            // disables): the rewrite may return `let floated… in <lambda>` —
+            // bindings hoisted into THIS scope, shared across the closure's
+            // calls.
             const rewritten = try let_float.rewriteLambdaExpression(self, node);
             if (rewritten != node) return self.compileNode(rewritten);
             try lambda.compileLambda(self, node);
