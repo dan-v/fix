@@ -70,6 +70,19 @@ jobs:
         timeout-minutes: 30
         run: nix-shell --run "zig build stress-concurrency -Doptimize=ReleaseFast --summary all -- --seed $STRESS_SEED --iterations 100"
 
+      # ReleaseSafe carries the GC detector (heap.zig gc_debug: no slot reuse,
+      # alloc-bit assert on every object read, swept-slot poisoning). The
+      # nixpkgs detector sweep below is linux-only (its grow-only heap does not
+      # fit the 7 GB macos-15 runners), so this step is aarch64-darwin's ONLY
+      # gc_debug coverage; on the linux arches it adds detector x synthetic
+      # stress (16 MB budgets, many majors, spec/fanout toggles) — a regime the
+      # 512 MB-budget nixpkgs sweep doesn't visit. Fits darwin easily: engines
+      # are created and torn down per iteration, so the no-reuse heap stays
+      # small.
+      - name: ReleaseSafe (gc detector) stress
+        timeout-minutes: 30
+        run: nix-shell --run "zig build stress-concurrency -Doptimize=ReleaseSafe --summary all -- --seed $STRESS_SEED --iterations 50"
+
       # TSan lanes build ReleaseSafe: safety checks stay on, and the optimizer
       # elides the dead whole-union operand copies that safe-Debug lowering
       # materializes for tag dispatch — those alias embedded atomics (e.g. the
