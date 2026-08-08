@@ -1083,7 +1083,7 @@ pub const ObjectHeap = struct {
     /// would force a flatten on the demand path.
     pub fn trySiblingSweep(self: *ObjectHeap, id: ObjectId, min: u32, max: u32) bool {
         switch (self.get(id).*) {
-            .attrs => |a| {
+            .attrs => |*a| {
                 if (a.range.len < min or a.range.len >= max) return false;
                 const word, const mask = sweepFilterBit(id);
                 if (self.sweep_filter[word].load(.monotonic) & mask != 0) return false;
@@ -2144,7 +2144,7 @@ pub const ObjectHeap = struct {
 
     pub fn getList(self: *const ObjectHeap, id: ObjectId) ![]const Value {
         return switch (self.get(id).*) {
-            .list => |range| self.values.slice(range),
+            .list => |*range| self.values.slice(range.*),
             else => error.InvalidObjectType,
         };
     }
@@ -2418,7 +2418,7 @@ pub const ObjectHeap = struct {
 
     pub fn getClosure(self: *const ObjectHeap, id: ObjectId) !Closure {
         return switch (self.get(id).*) {
-            .closure => |closure| .{
+            .closure => |*closure| .{
                 .chunk_id = closure.chunk_id,
                 .upvalues = self.values.slice(closure.upvalues),
             },
@@ -2428,7 +2428,7 @@ pub const ObjectHeap = struct {
 
     pub fn getBuiltinClosure(self: *const ObjectHeap, id: ObjectId) !BuiltinClosure {
         return switch (self.get(id).*) {
-            .builtin_closure => |closure| .{
+            .builtin_closure => |*closure| .{
                 .builtin_id = closure.builtin_id,
                 .args = self.values.slice(closure.args),
             },
@@ -2438,7 +2438,7 @@ pub const ObjectHeap = struct {
 
     pub fn getPartialApp(self: *const ObjectHeap, id: ObjectId) !PartialApp {
         return switch (self.get(id).*) {
-            .partial_app => |pa| .{
+            .partial_app => |*pa| .{
                 .func = pa.func,
                 .args = self.values.slice(pa.args),
             },
@@ -2448,7 +2448,7 @@ pub const ObjectHeap = struct {
 
     pub fn getContextString(self: *const ObjectHeap, id: ObjectId) !ContextString {
         return switch (self.get(id).*) {
-            .context_string => |string| .{
+            .context_string => |*string| .{
                 .text = string.text,
                 .context = self.attrsViewOf(string.context),
             },
@@ -2922,7 +2922,7 @@ pub const ObjectHeap = struct {
 
     pub fn getBoxedInt(self: *const ObjectHeap, id: ObjectId) !i64 {
         return switch (self.get(id).*) {
-            .boxed_int => |v| v,
+            .boxed_int => |*v| v.*,
             else => error.InvalidObjectType,
         };
     }
@@ -3155,11 +3155,11 @@ pub const ObjectHeap = struct {
     /// materialized below.
     pub fn mergeAttrPositionsStrict(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !AttrPositions {
         const left_positions = switch (self.get(left_id).*) {
-            .attrs => |a| a.positions,
+            .attrs => |*a| a.positions,
             else => AttrPositions.none,
         };
         const right_positions = switch (self.get(right_id).*) {
-            .attrs => |a| a.positions,
+            .attrs => |*a| a.positions,
             else => AttrPositions.none,
         };
         if (right_positions.len == 0 and left_positions.isBorrowed()) return left_positions;
@@ -3227,10 +3227,12 @@ pub const ObjectHeap = struct {
     }
 
     /// Borrow an attrset's source-position entries (empty slice when it
-    /// has none or `id` is not an attrset).
+    /// has none or `id` is not an attrset). Pointer capture: `id` may be a
+    /// live `attrs_merge` node whose `flattened` CAS a by-value union read
+    /// would race.
     fn attrPositionsSlice(self: *const ObjectHeap, id: ObjectId) []const AttrPosEntry {
         return switch (self.get(id).*) {
-            .attrs => |a| self.attrPositionsEntries(a.positions),
+            .attrs => |*a| self.attrPositionsEntries(a.positions),
             else => &.{},
         };
     }
