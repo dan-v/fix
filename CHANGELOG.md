@@ -9,13 +9,14 @@ All notable changes to `fix` are documented in this file.
 - A persistent compiled-chunk cache: an unchanged source file (same source
   bytes, path, language policy, codegen flags) skips parse + compile
   entirely on later runs, loading its bytecode chunks and deferred entries
-  from `~/.cache/fix/chunks` (or `$XDG_CACHE_HOME`/`$FIX_CHUNK_CACHE_DIR`).
+  from `~/.cache/fix/chunks` (or `$XDG_CACHE_HOME`; `--compile-cache-dir`
+  overrides the root).
   Cache generations are keyed by the binary's GNU build-id — a rebuilt fix
   starts from an empty directory and sweeps stale siblings automatically.
   Every failure mode falls back to a fresh compile; debugger and
   name-capture sessions bypass the cache in both directions. Measured on a
   warm nixos-minimal evaluation at one worker: 1.740s vs 2.149s without the
-  cache (1.23× faster). `FIX_NO_CHUNK_CACHE=1` disables it, and
+  cache (1.23× faster). `--no-compile-cache` disables it, and
   `FIX_LET_FLOAT_STATS=1` prints a hits/misses/writes/rejects census at
   teardown. Cache-file IO runs on a background writer lane (drained before
   exit), so cold runs pay no measurable write tax; blobs carry a
@@ -47,6 +48,34 @@ All notable changes to `fix` are documented in this file.
     single-use sinks from 3,235 to 4,078 and cut "blocked: dynamic free
     name" from ~7,000 to 485. Elided (never-parsed) RHSes remain globally
     immobile.
+- Full laziness, on by default: `let` bindings and anonymous maximal free
+  expressions inside a lambda that do not depend on the lambda's parameters
+  float out of it, so every application shares one thunk (evaluated at most
+  once) instead of re-creating — and possibly re-evaluating — it per call.
+  On the pinned nixpkgs universe this floats 1,327 named bindings and 5,331
+  anonymous subexpressions while staying wall- and RSS-neutral; workloads
+  that actually repeat work collapse (a shared-subexpression fixture drops
+  482ms → 5ms, a wide call tree 441ms → 10ms). `FIX_NO_FULL_LAZY=1`
+  disables it for A/B comparison.
+- Dynamically built strings are garbage-collected heap objects instead of
+  permanent intern-table entries (short results live inline in the object
+  slot; number formatting no longer interns at all). A string-churn fixture
+  that previously grew the intern table by 141.8 MB now retains 1.8 KB and
+  runs 1.21s → 0.37s. Strings carrying derivation context stay interned by
+  design.
+- A heap memory diet: attrset storage is structure-of-arrays (a names plane
+  and a values plane, 16 → 12 bytes per entry, with name-only binary
+  searches touching 4× more names per cache line) and every heap object
+  shrank 56 → 48 bytes (thunk flags folded into the future's state word,
+  rare speculative effect groups moved to a side table). Peak store bytes
+  on the nixpkgs full-universe evaluation drop 38 GB → 34.1 GB.
+- Per-thread intern-store TLABs: interning appends allocate from
+  thread-local chunks, amortizing the store mutex to one acquisition per
+  hundreds of inserts — removing the commit convoy that dominated
+  string-heavy evaluation at high worker counts.
+- The benchmark harness stamps every result tree with `provenance.md`: the
+  date, hardware, run settings, tool versions, pinned inputs, and measured
+  commit behind the numbers.
 - Strict-prefix `let` elision (`strictness.demandPrefix`) generalizes the old
   single-binding eager-elision gate to an ordered, transitively-extended
   prefix of bindings the body provably forces before any other observable

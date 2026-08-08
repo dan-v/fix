@@ -267,6 +267,14 @@ across synthetic stress tests, real NixOS and Home Manager configurations, and
 JSON-producing workloads. Each cell is relative to the fastest evaluator for
 that workload; `1.00×` is fastest. The harness defaults to five recorded runs.
 
+Rows: `fix-Ncore` is `fix --workers=N` and `fix-autocore` the default worker
+count; `nix` and `lix` are the pinned CppNix and Lix; `detsys-*` is
+[Determinate Nix](https://github.com/DeterminateSystems/nix-src) at the given
+`--eval-cores`. Every harness run (`./bench.sh`) writes a `provenance.md`
+next to the results recording the date, hardware, run settings, tool
+versions, pins, and measured commit — reproduce and compare against your own
+hardware rather than trusting these numbers.
+
 ![fix evaluator benchmark](demo/benchmark.png)
 
 <details>
