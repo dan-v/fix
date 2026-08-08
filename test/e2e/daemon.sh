@@ -115,6 +115,18 @@ out=$("$FIX" eval --json --read-write-mode -E "
   in builtins.attrNames (builtins.readDir (src + \"/sub\"))" 2>&1)
 t "daemon: readDir of a fresh tree subpath materializes the root" "leaf.txt" "$out"
 
+# A `path:` fetch of an existing store path returns it verbatim, as Nix does.
+adopt_dir=$(e2e_mktemp)
+mkdir -p "$adopt_dir/tree"
+printf 'adopt-me' >"$adopt_dir/tree/inner.txt"
+out=$("$FIX" eval --raw --read-write-mode --impure \
+    --extra-experimental-features fetch-tree -E "
+  let a = toString (builtins.path { path = $adopt_dir/tree; name = \"fix-daemon-e2e-adopt\"; });
+  in builtins.seq (builtins.pathExists a)
+    (if (builtins.fetchTree { type = \"path\"; path = a; }).outPath == a
+     then \"adopted-verbatim\" else \"re-ingested\")" 2>&1)
+t "daemon: fetchTree adopts an existing store path verbatim" "adopted-verbatim" "$out"
+
 # An absolute store URI is a Nix/Lix chroot store root. It must not silently
 # delegate to an installed implementation while the native backend is pending.
 local_root=$(e2e_mktemp)
