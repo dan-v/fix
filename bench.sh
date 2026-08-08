@@ -18,5 +18,11 @@ if [[ -n "${TOOLS:-}" ]]; then
     attribute=benchFix
   fi
 fi
+commit="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [[ "$commit" != unknown ]] && ! git -C "$repo" diff --quiet HEAD 2>/dev/null; then
+  commit="$commit-dirty"
+fi
+export FIX_BENCH_COMMIT="$commit"
+
 harness="$(nix-build --no-out-link "$repo/default.nix" -A "$attribute")"
 exec "$harness/bin/fix-bench" "$@"

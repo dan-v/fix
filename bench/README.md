@@ -25,7 +25,11 @@ $ RUNS=3 ./result/bin/fix-bench realworld json
 ```
 
 With no suite, all suites run. `bench.sh` is a convenience wrapper that builds
-the harness without creating a `result` link. Useful environment variables are:
+the harness without creating a `result` link. Every result tree includes a
+`provenance.md` recording the date, CPU/memory/kernel, run settings, tool
+versions, and pinned inputs of the measurement (plus the fix commit when
+launched via `bench.sh`); published numbers should always cite it. Useful
+environment variables are:
 
 - `RUNS` and `WARMUP` control Hyperfine sampling. They default to 5 measured
   runs and 1 warmup.

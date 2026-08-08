@@ -34,6 +34,7 @@
     2
     8
     16
+    32
   ];
   fixTools = json:
     optionals (fix != null) (
@@ -105,6 +106,16 @@
       scaling = true;
     };
 
+  # Human-readable identity of a store path for the provenance record:
+  # the name without the 32-char /nix/store hash prefix and its dash.
+  strippedName = path: builtins.substring 33 (-1) (baseNameOf (toString path));
+  # The npins channel pin carries the nixpkgs release identity in its URL
+  # (the fetched store path is just "source").
+  nixpkgsPinLabel = let
+    pin = (builtins.fromJSON (builtins.readFile ../npins/sources.json)).pins.nixpkgs;
+  in
+    pin.url or (strippedName nixpkgs);
+
   shellArray = tools: builtins.concatStringsSep " " (map lib.escapeShellArg tools);
   plotPython = pkgs.python3.withPackages (ps: [ps.matplotlib]);
   reclaimMemoryAsRoot = pkgs.writeShellScript "fix-bench-reclaim-memory-root" ''
@@ -153,6 +164,7 @@ in
     runtimeInputs = [
       pkgs.hyperfine
       pkgs.coreutils
+      pkgs.gawk
       plotPython
     ];
     text = ''
@@ -222,6 +234,36 @@ in
 
       pinned_nix_path=${lib.escapeShellArg "nixpkgs=${nixpkgs}:home-manager=${homeManager}"}
       export NIX_PATH="''${BENCH_NIX_PATH:-$pinned_nix_path}"
+
+      # Every result tree records when, on what, and against which inputs it
+      # was measured — numbers without provenance are not publishable.
+      if [[ -r /proc/cpuinfo ]]; then
+        cpu_model="$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo)"
+      else
+        cpu_model="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+      fi
+      if [[ -r /proc/meminfo ]]; then
+        mem_total="$(awk '/^MemTotal/ {printf "%.0f GiB", $2 / 1048576}' /proc/meminfo)"
+      else
+        mem_total="$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f GiB", $1 / 1073741824}' || echo unknown)"
+      fi
+      {
+        echo "# Benchmark provenance"
+        echo
+        echo "- date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "- fix commit: ''${FIX_BENCH_COMMIT:-unknown (run via ./bench.sh to record it)}"
+        echo "- cpu: $cpu_model ($(nproc) cores)"
+        echo "- memory: $mem_total"
+        echo "- kernel: $(uname -srm)"
+        echo "- runs: $runs measured, $warmup warmup, memory reclaim: $reclaim_memory"
+        echo "- fix: ${strippedName fix}"
+        ${lib.optionalString (nix != null) ''echo "- nix: ${strippedName nix}"''}
+        ${lib.optionalString (lix != null) ''echo "- lix: ${strippedName lix}"''}
+        ${lib.optionalString (detsys != null) ''echo "- detsys: ${strippedName detsys}"''}
+        echo "- nixpkgs pin: ${nixpkgsPinLabel}"
+        echo "- home-manager pin: ${strippedName homeManager}"
+      } > "$out/provenance.md"
+      echo "provenance: $out/provenance.md"
 
       if [[ "$#" -eq 0 || "''${1:-}" == "all" ]]; then
         suites=(torture realworld json)
