@@ -56,6 +56,9 @@ fn printTopUsage(io: std.Io) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    // Before any threads: pad glibc arena growth so heap expansion doesn't
+    // storm the mmap_lock with page-sized mprotects (see tuneMalloc).
+    process_support.tuneMalloc();
     // Debug builds retain allocator diagnostics without capturing a stack on
     // every allocation, which would serialize evaluation on the unwind path.
     var debug_gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
