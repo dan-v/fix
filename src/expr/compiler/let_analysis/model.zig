@@ -490,8 +490,6 @@ pub const Cluster = struct {
     graph: Graph,
 };
 
-/// Cluster registry for one compile unit (or one fallback walk). Owned by
-/// the ROOT compiler; children route through it. Everything scratch.
 /// Anonymous-MFE candidate (full-lazy walks only): a maximal `.apply`
 /// subtree whose free names all resolve at Lévy levels below its enclosing
 /// lambda — floatable to a synthetic binding wrapped AROUND the lambda
@@ -501,8 +499,6 @@ pub const MfeCandidate = struct {
     node: *const Node,
     /// Max free level of the subtree (home-based, hence conservative).
     level: u16,
-    /// Saturating apply count of the subtree (the work-gate signal).
-    applies: u16,
     /// Enclosing lambda at the site (index into `SharedTables.lambdas`).
     lambda: u32,
     /// Named-binding RHSes enclosing the site: `mfe_rhs[first..first+len]`.
@@ -514,6 +510,8 @@ pub const MfeCandidate = struct {
 
 pub const MfeRhs = struct { cluster: *Cluster, binding: BindingId };
 
+/// Cluster registry for one compile unit (or one fallback walk). Owned by
+/// the ROOT compiler; children route through it. Everything scratch.
 pub const UnitAnalysis = struct {
     allocator: std.mem.Allocator,
     tables: SharedTables,

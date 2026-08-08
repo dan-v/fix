@@ -88,13 +88,6 @@ pub fn writeReport(w: *std.Io.Writer, stats: *const Stats) !void {
         .{ "MFE blocked: uncurry chain", &stats.blocked_mfe_chain },
         .{ "MFE blocked: enclosing binding floats past", &stats.blocked_mfe_enclosing },
         .{ "MFE blocked: recursive group RHS", &stats.blocked_mfe_recursive },
-        .{ "idiom: // merge chains", &stats.idiom_update_chain },
-        .{ "idiom: apply of lambda literal", &stats.idiom_apply_lambda_lit },
-        .{ "idiom: builtin pipelines", &stats.idiom_builtin_pipeline },
-        .{ "idiom: alias bindings", &stats.idiom_alias_binding },
-        .{ "idiom: type-dispatch ifs", &stats.idiom_type_dispatch },
-        .{ "idiom: rec attrsets", &stats.idiom_rec_attrs },
-        .{ "idiom: select chains (depth>=2)", &stats.idiom_select_chain },
         .{ "cluster map hits", &stats.cluster_hits },
         .{ "cluster walks", &stats.cluster_walks },
         .{ "strict-prefix members", &stats.prefix_members },
@@ -278,8 +271,9 @@ fn planAnonymousMfes(self: *Compiler, ua: *analysis.UnitAnalysis, state: *model.
     return emitted;
 }
 
-/// Full-laziness pre-emission hook (`FIX_FULL_LAZY=1`), called from the
-/// DRIVER when a lambda expression is about to compile: analyze its whole
+/// Full-laziness pre-emission hook (on by default; `FIX_NO_FULL_LAZY=1`
+/// disables), called from the DRIVER when a lambda expression is about
+/// to compile: analyze its whole
 /// subtree, decide the batch, and return the rebuilt EXPRESSION — which
 /// may be a synthetic `let floated… in <lambda>` when bindings float all
 /// the way out (the thunk then lives in the parent scope, created once

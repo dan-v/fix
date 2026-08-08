@@ -39,28 +39,6 @@ pub const Stats = struct {
     blocked_mfe_chain: std.atomic.Value(u64) = .init(0),
     blocked_mfe_enclosing: std.atomic.Value(u64) = .init(0),
     blocked_mfe_recursive: std.atomic.Value(u64) = .init(0),
-    // ---- idiom census (structural Nix patterns, corpus-ranking only; ----
-    // ---- counted during the analysis walk, reported with the rest) ------
-    /// `a // b` where the LEFT operand is itself an `//` — a merge chain
-    /// materializing intermediates a k-way merge would skip.
-    idiom_update_chain: std.atomic.Value(u64) = .init(0),
-    /// Apply whose callee is a SYNTACTIC lambda literal (through parens):
-    /// an inline-candidate monomorphic call site.
-    idiom_apply_lambda_lit: std.atomic.Value(u64) = .init(0),
-    /// Apply of a builtin whose ARGUMENT is another builtin application
-    /// (`f (g x)` with both `f`,`g` resolving as builtins/attr-paths off
-    /// `builtins`): a fusable builtin pipeline.
-    idiom_builtin_pipeline: std.atomic.Value(u64) = .init(0),
-    /// `let`/rec binding whose RHS is a BARE identifier (alias/forwarding
-    /// binding: one deref of pure indirection per read).
-    idiom_alias_binding: std.atomic.Value(u64) = .init(0),
-    /// `if <apply> then x else x`-shaped dynamic dispatch (`isFunction f`,
-    /// `isAttrs v`, …): a type-dispatch site.
-    idiom_type_dispatch: std.atomic.Value(u64) = .init(0),
-    /// `rec { … }` or self-application shapes (fixpoint idiom).
-    idiom_rec_attrs: std.atomic.Value(u64) = .init(0),
-    /// Attr select chains `a.b.c` of depth >= 2 (path walks).
-    idiom_select_chain: std.atomic.Value(u64) = .init(0),
     cluster_hits: std.atomic.Value(u64) = .init(0),
     cluster_walks: std.atomic.Value(u64) = .init(0),
     prefix_members: std.atomic.Value(u64) = .init(0),
