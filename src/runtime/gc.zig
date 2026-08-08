@@ -910,16 +910,41 @@ pub fn peakRssBytes() u64 {
 // immune: it gates on
 // `ObjectHeap.totalReservedBytes()`, internal slot counting.)
 
-/// Current resident set size in bytes, read from /proc/self/statm (field 2
-/// = resident pages). Returns 0 if unavailable.
-///
-/// Linux-only via procfs. On Darwin a precise current RSS needs mach
-/// `task_info(TASK_BASIC_INFO)` (libc/mach, not wired here), so we fall back
-/// to the peak high-water — an over-approximation, but keeps footprint
-/// reporting meaningful rather than zero. Other OSes report 0.
+/// Darwin libproc surface for a precise current RSS. `std.c` does not
+/// expose `proc_pid_rusage`; RUSAGE_INFO_V0 is the smallest flavor carrying
+/// `ri_resident_size`. Referenced only inside the Darwin comptime branch,
+/// so nothing here is codegen'd elsewhere.
+const darwin_libproc = struct {
+    const rusage_info_v0 = 0;
+    const RusageInfoV0 = extern struct {
+        uuid: [16]u8,
+        user_time: u64,
+        system_time: u64,
+        pkg_idle_wkups: u64,
+        interrupt_wkups: u64,
+        pageins: u64,
+        wired_size: u64,
+        resident_size: u64,
+        phys_footprint: u64,
+        proc_start_abstime: u64,
+        proc_exit_abstime: u64,
+    };
+    extern "c" fn proc_pid_rusage(pid: std.c.pid_t, flavor: c_int, buffer: *RusageInfoV0) c_int;
+};
+
+/// Current resident set size in bytes. Linux reads /proc/self/statm (field
+/// 2 = resident pages); Darwin queries libproc's `proc_pid_rusage`
+/// (`ri_resident_size`), falling back to the peak high-water if the call
+/// fails. Other OSes report 0.
 pub fn currentRssBytes() u64 {
     if (comptime builtin.os.tag != .linux) {
-        return if (comptime builtin.os.tag.isDarwin()) peakRssBytes() else 0;
+        if (comptime builtin.os.tag.isDarwin()) {
+            var info: darwin_libproc.RusageInfoV0 = undefined;
+            if (darwin_libproc.proc_pid_rusage(std.c.getpid(), darwin_libproc.rusage_info_v0, &info) == 0)
+                return info.resident_size;
+            return peakRssBytes();
+        }
+        return 0;
     }
     var buf: [128]u8 = undefined;
     const linux = std.os.linux;
