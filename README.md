@@ -1,4 +1,7 @@
-![fix](demo/banner.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="demo/banner-dark.svg">
+  <img alt="fix" src="demo/banner.svg">
+</picture>
 
 # fix
 

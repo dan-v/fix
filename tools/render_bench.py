@@ -4,12 +4,13 @@
 One panel per workload, one horizontal bar per evaluator in fixed order.
 Bar length is mean wall time (linear, from zero), so per-workload ranking
 is read directly from geometry; each bar carries its rank, relative
-multiple, and absolute time. fix rows wear the accent hue (warm cache
-dark, cold cache light — an ordinal pair); competitors are context gray —
-identity is carried by row position and labels, never color alone.
+multiple, and absolute time. An off-scale bar tears: the shaft rips off
+at a jagged edge and a torn stub marks its far end. fix wears the logo
+purples (warm cache dark, cold light — an ordinal pair); competitors get
+muted hues, with row labels carrying identity so color is never alone.
 
-Emits light and dark renders (summary.png/.svg, summary-dark.png/.svg)
-for a GitHub <picture> block.
+Emits transparent-background light and dark renders (summary.png/.svg,
+summary-dark.png/.svg) for a GitHub <picture> block.
 """
 
 from __future__ import annotations
@@ -23,33 +24,44 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
+from matplotlib.patches import Polygon
 
-# Validated tokens (dataviz reference palette; ordinal blue pair + chrome).
+# Transparent-background renders for the GitHub README: each theme's inks
+# and series colors are validated against the surface GitHub actually
+# renders on (#ffffff light, #0d1117 dark), but nothing is painted behind
+# the marks. fix wears the logo's purples (warm cache dark, cold light — an
+# ordinal pair); competitors get muted hues stepped for CVD separation,
+# with row labels carrying identity so color is never alone.
 THEMES = {
     "light": {
         "suffix": "",
-        "surface": "#fcfcfb",
-        "ink": "#0b0b0b",
-        "ink2": "#52514e",
-        "muted": "#898781",
-        "hairline": "#e1e0d9",
-        "accent_warm": "#2a78d6",
-        "accent_cold": "#86b6ef",
-        "context": "#c7c5bc",
-        "whisker": "#52514e",
+        "ink": "#1f2328",
+        "ink2": "#424a53",
+        "muted": "#6e7781",
+        "hairline": "#d0d7de",
+        "series": {
+            "fix (warm)": "#534AB7",
+            "fix (cold)": "#8577DC",
+            "nix": "#3a5f80",
+            "lix": "#d3a3c8",
+            "detsys": "#8a6a38",
+        },
+        "fallback": "#a5a8ad",
     },
     "dark": {
         "suffix": "-dark",
-        "surface": "#1a1a19",
-        "ink": "#ffffff",
-        "ink2": "#c3c2b7",
-        "muted": "#898781",
-        "hairline": "#2c2c2a",
-        "accent_warm": "#3987e5",
-        "accent_cold": "#86b6ef",
-        "context": "#4a4a47",
-        "whisker": "#c3c2b7",
+        "ink": "#e6edf3",
+        "ink2": "#a8b3bd",
+        "muted": "#8b949e",
+        "hairline": "#30363d",
+        "series": {
+            "fix (warm)": "#8577DC",
+            "fix (cold)": "#ab9ff0",
+            "nix": "#5d87ad",
+            "lix": "#c795bb",
+            "detsys": "#a1854f",
+        },
+        "fallback": "#6a7076",
     },
 }
 
@@ -121,11 +133,36 @@ def tool_names(workloads: list[dict]) -> list[str]:
 
 
 def bar_color(name: str, theme: dict) -> str:
-    if name == "fix (warm)":
-        return theme["accent_warm"]
-    if name == "fix (cold)":
-        return theme["accent_cold"]
-    return theme["context"]
+    return theme["series"].get(name, theme["fallback"])
+
+
+def label_on(color: str) -> str:
+    """Ink for text sitting ON a bar: dark on light fills, light on dark."""
+    r, g, b = (int(color[i : i + 2], 16) / 255 for i in (1, 3, 5))
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return "#1f2328" if luminance > 0.55 else "#ffffff"
+
+
+def jagged_edge(x: float, amplitude: float, y0: float, y1: float, teeth: int = 3) -> list[tuple[float, float]]:
+    """Points of a torn vertical edge from y0 to y1, zigzagging around x."""
+    stops = teeth * 2
+    return [
+        (x + (amplitude if step % 2 else -amplitude), y0 + (y1 - y0) * step / stops)
+        for step in range(stops + 1)
+    ]
+
+
+def draw_torn_bar(ax: plt.Axes, position: float, limit: float, color: str) -> None:
+    """An off-scale bar: the shaft tears off, and after a gap a short
+    torn-edged stub marks the far end at the panel edge."""
+    y0, y1 = position + 0.31, position - 0.31
+    amplitude = limit * 0.008
+    tear = limit * 0.86
+    stub_start = limit * 0.91
+    shaft = [(0, y0)] + jagged_edge(tear, amplitude, y0, y1) + [(0, y1)]
+    stub = [(limit, y0), (limit, y1)] + list(reversed(jagged_edge(stub_start, amplitude, y0, y1)))
+    ax.add_patch(Polygon(shaft, closed=True, facecolor=color, linewidth=0))
+    ax.add_patch(Polygon(stub, closed=True, facecolor=color, linewidth=0))
 
 
 def draw_panel(ax: plt.Axes, workload: dict, names: list[str], theme: dict, label_rows: bool) -> None:
@@ -137,11 +174,10 @@ def draw_panel(ax: plt.Axes, workload: dict, names: list[str], theme: dict, labe
         for rank, name in enumerate(sorted(present, key=lambda n: rows[n]["mean"]))
     }
     # Stretch bars across the panel: the scale ends just past the slowest
-    # bar, but never beyond CLIP_RATIO× the fastest (outliers clip with ▸).
+    # bar, but never beyond CLIP_RATIO× the fastest (outliers tear off).
     worst = max(rows[name]["mean"] for name in present) / fastest
     limit = fastest * min(CLIP_RATIO, max(1.35, worst * 1.06))
 
-    ax.set_facecolor(theme["surface"])
     ax.set_xlim(0, limit * 1.02)
     ax.set_ylim(len(names) - 0.5, -0.5)
     for spine in ax.spines.values():
@@ -156,34 +192,35 @@ def draw_panel(ax: plt.Axes, workload: dict, names: list[str], theme: dict, labe
             continue
         ratio = row["mean"] / fastest
         clipped = row["mean"] > limit
-        length = min(row["mean"], limit)
-        ax.barh(position, length, height=0.62, color=bar_color(name, theme), linewidth=0)
-        if not clipped and row["stddev"] > 0:
-            ax.plot(
-                [max(0.0, row["mean"] - row["stddev"]), min(limit, row["mean"] + row["stddev"])],
-                [position, position],
-                color=theme["whisker"],
-                linewidth=0.8,
-                alpha=0.55,
-                solid_capstyle="butt",
-            )
+        color = bar_color(name, theme)
+        if clipped:
+            draw_torn_bar(ax, position, limit, color)
+            length = limit * 0.86
+        else:
+            length = row["mean"]
+            ax.barh(position, length, height=0.62, color=color, linewidth=0)
+            if row["stddev"] > 0:
+                lo = max(0.0, row["mean"] - row["stddev"])
+                hi = min(limit, row["mean"] + row["stddev"])
+                ax.plot([lo, hi], [position, position], color=theme["ink2"], linewidth=1.5, solid_capstyle="butt")
+                for x in (lo, hi):
+                    ax.plot([x, x], [position - 0.13, position + 0.13], color=theme["ink2"], linewidth=1.2)
         winner = ranks[name] == 0
         ordinal = ORDINALS[ranks[name]]
         if winner:
             text = f"{ordinal} · {time_label(row['mean'])}"
         else:
             text = f"{ordinal} · {ratio_label(ratio)} · {time_label(row['mean'])}"
-        if clipped:
-            text = f"▸ {ordinal} · {ratio_label(ratio)} · {time_label(row['mean'])}"
         inside = length > limit * 0.55
+        outside_x = min(limit, (row["mean"] + row["stddev"]) if not clipped else length) + limit * 0.03
         ax.text(
-            length - limit * 0.03 if inside else length + limit * 0.03,
+            length - limit * (0.045 if clipped else 0.03) if inside else outside_x,
             position,
             text,
             ha="right" if inside else "left",
             va="center",
             fontsize=6.6,
-            color=("#ffffff" if name == "fix (warm)" else theme["ink"]) if inside else (theme["ink"] if winner else theme["ink2"]),
+            color=label_on(color) if inside else (theme["ink"] if winner else theme["ink2"]),
             fontweight="bold" if winner else "normal",
         )
 
@@ -238,7 +275,7 @@ def render(workloads: list[dict], output_dir: Path, suite: str, theme: dict) -> 
     header_h, row_h, title_h = 0.34, 0.24 + 0.215 * len(names), 0.78
     fig_h = title_h + sum(header_h + rows * row_h for _name, rows in panel_rows) + 0.25
     fig_w = 12.6
-    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=theme["surface"])
+    fig = plt.figure(figsize=(fig_w, fig_h))
 
     outer = fig.add_gridspec(
         len(sections) * 2,
@@ -280,7 +317,7 @@ def render(workloads: list[dict], output_dir: Path, suite: str, theme: dict) -> 
     fig.text(
         0.075,
         1 - 0.46 / fig_h,
-        f"mean wall time, shorter is faster · bars share a per-panel scale from zero; anything past {CLIP_RATIO:.0f}× the fastest clips (▸) · "
+        f"mean wall time, shorter is faster · bars share a per-panel scale from zero; a torn bar runs past {CLIP_RATIO:.0f}× the fastest · "
         f"{runs} measured run{'s' if runs != 1 else ''} · provenance.md records the machine and pins",
         ha="left",
         va="center",
@@ -297,26 +334,9 @@ def render(workloads: list[dict], output_dir: Path, suite: str, theme: dict) -> 
         color=theme["ink2"],
         fontweight="bold",
     )
-    fig.legend(
-        handles=[
-            Patch(facecolor=theme["accent_warm"], label="fix, warm compile cache"),
-            Patch(facecolor=theme["accent_cold"], label="fix, cold compile cache"),
-            Patch(facecolor=theme["context"], label="other evaluators (named per row)"),
-        ],
-        loc="upper right",
-        bbox_to_anchor=(0.99, 1 - 0.12 / fig_h),
-        ncol=3,
-        frameon=False,
-        handlelength=1.1,
-        handleheight=0.9,
-        columnspacing=1.3,
-        fontsize=7.5,
-        labelcolor=theme["ink2"],
-    )
-
     stem = output_dir / f"summary{theme['suffix']}"
-    fig.savefig(stem.with_suffix(".svg"), format="svg", facecolor=fig.get_facecolor())
-    fig.savefig(stem.with_suffix(".png"), format="png", dpi=200, facecolor=fig.get_facecolor())
+    fig.savefig(stem.with_suffix(".svg"), format="svg", transparent=True)
+    fig.savefig(stem.with_suffix(".png"), format="png", dpi=200, transparent=True)
     plt.close(fig)
 
 
