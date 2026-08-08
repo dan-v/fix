@@ -34,7 +34,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
-const AttrEntry = @import("runtime").heap.AttrEntry;
 const thunk_mod = @import("runtime").thunk;
 const future_mod = @import("runtime").future;
 const sync = @import("base").sync;
@@ -50,6 +49,7 @@ const VM = vm_mod.VM;
 const exec_context = @import("context.zig");
 const ExecutionContext = exec_context.ExecutionContext;
 const vm_force = @import("../../vm/force.zig");
+const sweep_diag = @import("sweep_diag.zig");
 const vm_errors = @import("../../vm/errors.zig");
 const fiber_mod = @import("base").fiber;
 const InnerFiber = fiber_mod.Fiber;
@@ -1220,12 +1220,10 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
     defer vm_force.rootsEnd(&f.vm, roots);
     vm_force.rootKeep(&f.vm, Value.attrs(attrs_id));
     const entries = f.vm.heap.materializeAttrs(attrs_id) catch return;
-    const log = f.worker.scheduler.config.sibling_log;
-    const objects_before: u32 = if (log) f.vm.heap.counts().objects else 0;
-    var label_buf: [160]u8 = undefined;
-    var rendered_buf: [224]u8 = undefined;
-
-    if (log) logAttrsSweepStart(f, attrs_id, entries, &label_buf, &rendered_buf);
+    var diag: ?sweep_diag.SweepDiag = if (f.worker.scheduler.config.sibling_log)
+        sweep_diag.SweepDiag.begin(&f.vm, attrs_id, entries)
+    else
+        null;
     defer {
         f.vm.speculation.claim_budget = vm_mod.no_spec_budget;
         f.vm.speculation.create_left = vm_mod.no_spec_budget;
@@ -1235,72 +1233,14 @@ fn runAttrsSweepTask(f: *WorkerFiber, attrs_id: types.ObjectId) void {
         if (!vm_force.sweepMemberAdmissible(&f.vm, entry_value.asObjectId())) continue;
         f.vm.speculation.claim_budget = f.worker.scheduler.config.sibling_claim_budget;
         vm_force.specCreateArm(&f.vm, f.worker.scheduler.config.sibling_budget);
-        if (log) {
-            logAttrsSweepMember(f, attrs_id, entry_name, entry_value, &label_buf, &rendered_buf);
-        } else {
-            _ = vm_force.forceValueSpeculative(&f.vm, entry_value) catch {};
-            f.ctx.clearFailure();
-            f.local_trace.clear();
-        }
+        const member: ?sweep_diag.SweepDiag.Member =
+            if (diag) |*d| d.memberBegin(entry_value) else null;
+        _ = vm_force.forceValueSpeculative(&f.vm, entry_value) catch {};
+        f.ctx.clearFailure();
+        f.local_trace.clear();
+        if (diag) |*d| d.memberEnd(entry_name, member.?);
     }
-    if (log) {
-        std.debug.print("sweep attrs={d} done: t_us={d} heap_growth={d}\n", .{
-            attrs_id, vm_force.diagNowUs(), f.vm.heap.counts().objects -| objects_before,
-        });
-    }
-}
-
-fn logAttrsSweepStart(
-    f: *WorkerFiber,
-    attrs_id: types.ObjectId,
-    entries: @import("runtime").heap.AttrsView,
-    label_buf: *[160]u8,
-    rendered_buf: *[224]u8,
-) void {
-    var label: []const u8 = "?";
-    for (entries.values) |entry_value| {
-        if (!entry_value.isThunk()) continue;
-        const subject = vm_force.thunkLabel(&f.vm, entry_value.asObjectId(), label_buf);
-        if (subject.isEmpty()) continue;
-        label = switch (subject) {
-            .source => |source| std.fmt.bufPrint(rendered_buf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(source.file)), source.line }) catch "?",
-            .text, .path, .url => |text| text,
-            .none => "?",
-        };
-        break;
-    }
-    std.debug.print("sweep attrs={d} n={d} t_us={d} worker={d} claimer={d} first_attr={s} member={s}\n", .{
-        attrs_id,             entries.len(),
-        vm_force.diagNowUs(), worker_id_mod.currentId(),
-        f.ctx.claimer_id,     f.vm.intern.get(entries.names[0]),
-        label,
-    });
-}
-
-fn logAttrsSweepMember(
-    f: *WorkerFiber,
-    attrs_id: types.ObjectId,
-    entry_name: types.InternId,
-    entry_value: Value,
-    label_buf: *[160]u8,
-    rendered_buf: *[224]u8,
-) void {
-    const created_before = f.vm.heap.currentLocal().thunks_created;
-    const subject = vm_force.thunkLabel(&f.vm, entry_value.asObjectId(), label_buf);
-    _ = vm_force.forceValueSpeculative(&f.vm, entry_value) catch {};
-    f.ctx.clearFailure();
-    f.local_trace.clear();
-    const created = f.vm.heap.currentLocal().thunks_created -| created_before;
-    if (created <= 2000) return;
-    const label: []const u8 = switch (subject) {
-        .source => |source| std.fmt.bufPrint(rendered_buf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(source.file)), source.line }) catch "?",
-        .text, .path, .url => |text| if (text.len == 0) "?" else text,
-        .none => "?",
-    };
-    std.debug.print("sweep-member attrs={d} attr={s} member={s} created={d} t_us={d} claimer={d}\n", .{
-        attrs_id,             f.vm.intern.get(entry_name), label, created,
-        vm_force.diagNowUs(), f.ctx.claimer_id,
-    });
+    if (diag) |*d| d.end();
 }
 
 fn runImportPrefetchTask(f: *WorkerFiber, path_id: types.InternId) void {
