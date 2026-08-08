@@ -47,7 +47,7 @@ pub const FailureRef = failure.FailureRef;
 
 /// `-Dprof-main` age-at-force probe support. These fields belong to thunks,
 /// not to the generic synchronization primitive used by imports and I/O.
-pub const created_tsc_enabled: bool = build_options.prof_main and builtin.cpu.arch == .x86_64;
+pub const created_tsc_enabled: bool = build_options.prof_main and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64);
 const CreatedTsc = if (created_tsc_enabled) u64 else void;
 pub const CreatedDemand = if (created_tsc_enabled) bool else void;
 const SpecDisp = if (created_tsc_enabled) u8 else void;
@@ -62,14 +62,27 @@ inline fn initSpecDisp() SpecDisp {
 
 inline fn nowCreatedTsc() CreatedTsc {
     if (comptime !created_tsc_enabled) return {};
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        :
-        : .{ .memory = true });
-    return (@as(u64, high) << 32) | @as(u64, low);
+    switch (comptime builtin.cpu.arch) {
+        .x86_64 => {
+            var low: u32 = undefined;
+            var high: u32 = undefined;
+            asm volatile ("rdtsc"
+                : [low] "={eax}" (low),
+                  [high] "={edx}" (high),
+                :
+                : .{ .memory = true });
+            return (@as(u64, high) << 32) | @as(u64, low);
+        },
+        .aarch64 => {
+            var count: u64 = undefined;
+            asm volatile ("mrs %[count], cntvct_el0"
+                : [count] "=r" (count),
+                :
+                : .{ .memory = true });
+            return count;
+        },
+        else => return 0,
+    }
 }
 
 pub const BytecodeThunk = struct {

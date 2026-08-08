@@ -283,9 +283,22 @@ pub fn concatPathLike(self: *VM, left: Value, right: Value) !Value {
 pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
     const gc_roots = force.rootsBegin(self);
     defer force.rootsEnd(self, gc_roots);
-    const left_like = try coerceLanguageStringValue(self, left);
+    // Coerce the left operand first; whether a trailing path is realized depends
+    // on what the left coerced FROM. Nix's ExprConcatStrings realizes a path
+    // operand only when the accumulated value is still "just a string" — but when
+    // the left is an attrset coerced via `outPath`, a following path is appended
+    // as raw text (`{ outPath = "/d"; } + /Cargo.toml` -> `/d/Cargo.toml`, no
+    // lookup of `/Cargo.toml`). With a plain-string left, a trailing path is
+    // still copied to the store and errors if missing (`"x" + ./missing`).
+    const left_forced = try force.forceValue(self, left);
+    force.rootKeep(self, left_forced);
+    const left_from_attrs = left_forced.isAttrs();
+    const left_like = try coerceLanguageStringValue(self, left_forced);
     force.rootKeep(self, left_like); // held across the `right` coercion + appendStringContext forces
-    const right_like = try coerceLanguageStringValue(self, right);
+    const right_like = if (left_from_attrs)
+        try coerceConcatTailPathAsText(self, right)
+    else
+        try coerceLanguageStringValue(self, right);
     force.rootKeep(self, right_like); // held across appendStringContext forces
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer context.deinit(self.allocator);
@@ -305,6 +318,16 @@ pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
         return Value.contextString(try self.heap.addContextStringEntries(text_id, context.items));
     }
     return makeConcatString(self, &.{ left_bytes, right_bytes }, total);
+}
+
+/// Coerce a `+` right operand that follows an attrset-coerced left: a path is
+/// appended as its raw text (NOT stat'd or copied to the store), matching Nix
+/// where `{ outPath = "/d"; } + /sub` yields `/d/sub` without realizing `/sub`.
+/// Non-path operands coerce normally.
+fn coerceConcatTailPathAsText(self: *VM, value: Value) !Value {
+    const forced = try force.forceValue(self, value);
+    if (forced.kind() == .path) return Value.string(forced.asInternId());
+    return coerceLanguageStringValue(self, forced);
 }
 
 /// `str_cat` opcode body: coerce the top `count` stack operands

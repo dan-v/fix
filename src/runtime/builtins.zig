@@ -221,7 +221,18 @@ test "public builtin names round-trip from the canonical id" {
     try std.testing.expect(publicName(.mapAttrValue) == null);
 }
 
+/// Nix binds every builtin into the global scope a second time under a `__`
+/// prefix (`__elem`, `__compareVersions`, …) — the pre-`builtins` spelling,
+/// still used by real-world code (haskell.nix, nixpkgs internals). Only the
+/// prefixed form is global; the unprefixed name stays reachable via `builtins.`
+/// unless it is also an ambient binding.
+fn legacyPrefixedId(name: []const u8) ?BuiltinId {
+    if (!std.mem.startsWith(u8, name, "__")) return null;
+    return idForName(name[2..]);
+}
+
 pub fn ambientIdForName(name: []const u8) ?BuiltinId {
+    if (legacyPrefixedId(name)) |id| return id;
     const id = idForName(name) orelse return null;
     return switch (id) {
         .abort,
@@ -247,6 +258,15 @@ pub fn ambientIdForName(name: []const u8) ?BuiltinId {
 }
 
 pub fn hasConstant(name: []const u8) bool {
+    if (hasConstantExact(name)) return true;
+    // `__currentSystem`, `__nixVersion`, … alongside the builtin aliases.
+    if (std.mem.startsWith(u8, name, "__")) return hasConstantExact(name[2..]);
+    return false;
+}
+
+/// `hasConstant` without the legacy `__` fallback — lets the compiler tell an
+/// unprefixed constant from an aliased one when emitting the attr lookup.
+pub fn hasConstantExact(name: []const u8) bool {
     for (constant_bindings) |candidate| {
         if (std.mem.eql(u8, candidate, name)) return true;
     }

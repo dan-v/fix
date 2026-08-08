@@ -66,7 +66,7 @@ comptime {
 /// (run_mu, timeline branch, spec-ctx refresh, `resume_` setup, the asm
 /// swap) and the swap-out window symmetric machinery on the way back.
 /// Zero-footprint when the build flag is off.
-pub const census_enabled: bool = base_options.fiber_census and builtin.cpu.arch == .x86_64;
+pub const census_enabled: bool = base_options.fiber_census and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64);
 
 threadlocal var census_pre_swap: u64 = 0;
 threadlocal var census_exit_swap: u64 = 0;
@@ -108,14 +108,27 @@ pub noinline fn censusDrain() CensusSample {
 
 pub inline fn censusNow() u64 {
     if (comptime !census_enabled) return 0;
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        :
-        : .{ .memory = true });
-    return (@as(u64, high) << 32) | @as(u64, low);
+    switch (comptime builtin.cpu.arch) {
+        .x86_64 => {
+            var low: u32 = undefined;
+            var high: u32 = undefined;
+            asm volatile ("rdtsc"
+                : [low] "={eax}" (low),
+                  [high] "={edx}" (high),
+                :
+                : .{ .memory = true });
+            return (@as(u64, high) << 32) | @as(u64, low);
+        },
+        .aarch64 => {
+            var count: u64 = undefined;
+            asm volatile ("mrs %[count], cntvct_el0"
+                : [count] "=r" (count),
+                :
+                : .{ .memory = true });
+            return count;
+        },
+        else => return 0,
+    }
 }
 
 /// Minimal saved state for an inactive fiber. The offsets are load-bearing —

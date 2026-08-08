@@ -1,19 +1,30 @@
 //! Small process-clock helpers shared by runtime instrumentation.
 //!
 //! The evaluator's timing counters are advisory. Linux uses the vDSO-backed
-//! clock_gettime fast path; unsupported platforms return zero so callers never
-//! manufacture durations from incompatible clock domains.
+//! clock_gettime fast path, Darwin the libc one; other platforms return zero
+//! so callers never manufacture durations from incompatible clock domains.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn monotonicNs() u64 {
-    if (comptime builtin.os.tag != .linux) return 0;
-    var ts: std.os.linux.timespec = undefined;
-    if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
-    const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
-    return sec * std.time.ns_per_s + nsec;
+    switch (comptime builtin.os.tag) {
+        .linux => {
+            var ts: std.os.linux.timespec = undefined;
+            if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+            const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
+            const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
+            return sec * std.time.ns_per_s + nsec;
+        },
+        .macos, .ios, .tvos, .watchos => {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+            const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
+            const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
+            return sec * std.time.ns_per_s + nsec;
+        },
+        else => return 0,
+    }
 }
 
 pub fn monotonicUs() u64 {

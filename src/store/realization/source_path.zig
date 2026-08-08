@@ -19,8 +19,14 @@ pub fn storePathForSource(
     path: []const u8,
 ) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
-    if (isStoreRootPath(path, realization.store_dir)) return allocator.dupe(u8, path);
 
+    // A store path is ingested like any other source, NOT passed through: Nix
+    // copies `/nix/store/<h>-source` to a fresh `/nix/store/<h2>-<h>-source`,
+    // keeping the whole basename (hash included) as the new name. Passing it
+    // through instead produced a self-consistent but Nix-incompatible drvPath
+    // for every derivation whose `src` is a store path — which happens whenever
+    // one flake input's own Nix code does `src = ../../.`. Subpaths and files
+    // under a store path already took this route and already agreed with Nix.
     return storePathForSourceName(allocator, realization, files, path, path_ops.baseName(path));
 }
 

@@ -48,7 +48,7 @@ const InternTable = @import("runtime").intern.InternTable;
 const ChunkRegistry = @import("../bytecode.zig").chunk.ChunkRegistry;
 const worker_id = @import("base").worker_id;
 
-pub const enabled: bool = build_options.prof_path and builtin.cpu.arch == .x86_64;
+pub const enabled: bool = build_options.prof_path and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64);
 
 /// Key space (chunk ids on a NixOS toplevel top out in the low
 /// millions, far under builtin_key_base):
@@ -92,16 +92,7 @@ var root_idx: u32 = sentinel;
 var root_span: u64 = 0;
 var overflowed: bool = false;
 
-inline fn rdtsc() u64 {
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        :
-        : .{ .memory = true });
-    return (@as(u64, high) << 32) | @as(u64, low);
-}
+const rdtsc = @import("prof.zig").rdtsc;
 
 /// Begin a force span keyed by `key`. Returns a token for `exit`, or a
 /// sentinel on disabled builds / helper threads / stack overflow.

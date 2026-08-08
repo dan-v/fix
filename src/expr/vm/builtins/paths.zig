@@ -128,6 +128,13 @@ pub fn builtinPath(self: *VM, arg: Value) !Value {
     const path_value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, path_id));
     const path = switch (path_value.kind()) {
         .path, .string, .string_context, .heap_string => try vm_strings.stringBytes(self, path_value),
+        // Nix string-coerces the `path` argument, so a derivation-like attrset
+        // (a flake input, or any value with `outPath`/`__toString`) is accepted
+        // — `builtins.path { path = flakeInputs.foo; ... }` is a common idiom.
+        .attrs => try vm_strings.stringBytes(
+            self,
+            try vm_force.forceValue(self, try strings.coerceAttrsToStringValue(self, path_value)),
+        ),
         else => return error.TypeError,
     };
     if (!std.fs.path.isAbsolute(path)) return error.RelativePath;

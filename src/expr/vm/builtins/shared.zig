@@ -13,27 +13,19 @@ const vm_strings = @import("../strings.zig");
 const vm_equality = @import("../equality.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
+const grisu2 = @import("runtime").grisu2;
 
-/// Format a float the way Nix's `builtins.toJSON` does (via nlohmann::json):
-/// the shortest round-tripping decimal, but always recognizable as a float —
-/// an integer-valued float gets a ".0" suffix (`1.0`, `100.0`, and `1e10` →
-/// "10000000000.0"). Non-finite values serialize as JSON `null`, as nlohmann
-/// does. Writes into `buf` and returns the slice; `buf` must be large enough
-/// for the fixed-point expansion (use `json_float_buffer_size`).
-///
-/// NB: nlohmann switches to exponent notation at large/small magnitudes
-/// (`1e+20`, `1e-06`); Zig's `{d}` stays fixed-point, so those extremes differ
-/// (and would already have differed — this only adds the missing ".0"). Every
-/// float in normal Nix data, including all module-option docs, lies in the
-/// fixed-point range where this matches Nix exactly.
+/// Format a float exactly as Nix's `builtins.toJSON` does (via nlohmann::json).
+/// nlohmann's Grisu2 is usually the shortest round-tripping decimal but is not
+/// always optimal, so it disagrees with Zig's Ryu (`{d}`/`{e}`) on ~0.6% of
+/// doubles — enough to change a generated JSON file's bytes and every drvPath
+/// built from it. `grisu2.format` is a faithful port of nlohmann's `to_chars`,
+/// validated byte-for-byte against the nlohmann oracle over ~2M random doubles,
+/// so this matches Nix exactly (fixed vs `e±NN` notation, the `.0` suffix, and
+/// the shortest-or-one-longer digit string). Non-finite serializes as `null`.
 pub const json_float_buffer_size = 512;
 pub fn jsonFloatText(buf: []u8, v: f64) []const u8 {
-    if (!std.math.isFinite(v)) return "null";
-    const s = std.fmt.bufPrint(buf, "{d}", .{v}) catch unreachable;
-    if (std.mem.indexOfAny(u8, s, ".eE") != null) return s;
-    buf[s.len] = '.';
-    buf[s.len + 1] = '0';
-    return buf[0 .. s.len + 2];
+    return grisu2.format(buf, v);
 }
 
 /// Cycle-guard for the recursive JSON writers (`toJSON`, structured

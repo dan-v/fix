@@ -37,8 +37,9 @@ const prof_fiber = @import("prof_fiber.zig");
 const prof_census = @import("prof_census.zig");
 
 /// Compile-time switch. False when `-Dprof-main` wasn't passed.
-/// `rdtsc` is x86_64-only, so we additionally gate on arch.
-pub const enabled: bool = build_options.prof_main and builtin.cpu.arch == .x86_64;
+/// Gated on arches with an EL0/user-readable fixed-rate cycle counter
+/// (x86_64 rdtsc, aarch64 cntvct_el0).
+pub const enabled: bool = build_options.prof_main and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64);
 
 /// Tag for every instrumented path. Keep names short — they appear
 /// in the stats line as-is.
@@ -258,20 +259,33 @@ inline fn token(stack: *const Stack, idx: usize) u64 {
     return (@as(u64, stack.generation) << 32) | @as(u64, @intCast(idx));
 }
 
-/// Read the TSC. `rdtsc` returns a 64-bit counter formed from
-/// edx:eax. We use it as a coarse time source — the TSC is
-/// invariant on modern x86_64 so it doesn't pause across power
-/// states; the ratio to wall time is constant within a run.
+/// Read the cycle counter. x86_64: `rdtsc` (invariant TSC — constant rate,
+/// doesn't pause across power states). aarch64: `cntvct_el0`, the generic
+/// timer's virtual count — EL0-readable, fixed-frequency, so the ratio to
+/// wall time is constant within a run just like the TSC (coarser tick, fine
+/// for attribution shares).
 pub inline fn rdtsc() u64 {
-    if (!enabled) return 0;
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        :
-        : .{ .memory = true });
-    return (@as(u64, high) << 32) | @as(u64, low);
+    switch (comptime builtin.cpu.arch) {
+        .x86_64 => {
+            var low: u32 = undefined;
+            var high: u32 = undefined;
+            asm volatile ("rdtsc"
+                : [low] "={eax}" (low),
+                  [high] "={edx}" (high),
+                :
+                : .{ .memory = true });
+            return (@as(u64, high) << 32) | @as(u64, low);
+        },
+        .aarch64 => {
+            var count: u64 = undefined;
+            asm volatile ("mrs %[count], cntvct_el0"
+                : [count] "=r" (count),
+                :
+                : .{ .memory = true });
+            return count;
+        },
+        else => return 0,
+    }
 }
 
 /// Start a measurement on the main thread. Returns a sentinel
