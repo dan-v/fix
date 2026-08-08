@@ -109,13 +109,13 @@ fn isHex(text: []const u8) bool {
 
 pub fn storeDigest(fingerprint: []const u8) [32]u8 {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(fingerprint, &digest, .{});
+    @import("base").sha256.Sha256.hash(fingerprint, &digest, .{});
     return nixBase32(compressDigest(&digest));
 }
 
 pub fn sha256Hex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    @import("base").sha256.Sha256.hash(bytes, &digest, .{});
     const encoded = std.fmt.bytesToHex(digest, .lower);
     return allocator.dupe(u8, &encoded);
 }

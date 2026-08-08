@@ -26,6 +26,7 @@ pub const terminal_text = @import("terminal_text.zig");
 pub const terminal_color = @import("terminal_color.zig");
 pub const tui = @import("tui.zig");
 pub const observ = @import("observ.zig");
+pub const sha256 = @import("sha256.zig");
 
 // Common flat re-exports for the most-used types.
 pub const Deque = deque.Deque;
@@ -54,4 +55,5 @@ test {
     _ = terminal_color;
     _ = tui;
     _ = observ;
+    _ = sha256;
 }

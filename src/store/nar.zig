@@ -121,7 +121,7 @@ pub fn hashPathDigestFiltered(
     path: []const u8,
     filter: ?Filter,
 ) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
-    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const Sha256 = @import("base").sha256.Sha256;
     var hashing: std.Io.Writer.Hashing(Sha256) = .init(&.{});
     try writeArchive(allocator, files, &hashing.writer, path, filter, null);
     try hashing.writer.flush();
@@ -133,7 +133,7 @@ pub fn hashPathDigestFiltered(
 /// Hex sha256 of an already-serialized NAR byte stream (caller owns result).
 pub fn hashSerialized(allocator: std.mem.Allocator, nar_bytes: []const u8) ![]u8 {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
+    @import("base").sha256.Sha256.hash(nar_bytes, &digest, .{});
     const encoded = std.fmt.bytesToHex(digest, .lower);
     return allocator.dupe(u8, &encoded);
 }

@@ -80,7 +80,7 @@ pub const Key = [32]u8;
 /// each variable-length piece length-prefixed to avoid ambiguous
 /// concatenation.
 pub fn computeKey(source: []const u8, source_path: []const u8, ctx: KeyContext) Key {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var hasher = @import("base").sha256.Sha256.init(.{});
     hasher.update(std.mem.asBytes(&common.format_version));
     hasher.update(std.mem.asBytes(&ctx.policy_fp));
     hasher.update(std.mem.asBytes(&ctx.let_float_enabled));

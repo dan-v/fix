@@ -102,6 +102,30 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = tsan,
     });
     base_mod.addImport("base_options", base_options_mod);
+
+    // Hardware twin of the std SHA-256 (see src/base/sha256.zig): the same
+    // std hasher compiled with `+sha,+avx2` so its comptime-gated SHA-NI path
+    // opens, linked into everything through `base` and selected at runtime by
+    // cpuid. Skipped where `base.sha256` never references the extern symbols.
+    if (target.result.cpu.arch == .x86_64 and target.result.os.tag != .windows) {
+        var hw_query = target.query;
+        hw_query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.sha));
+        hw_query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.avx2));
+        const sha256_hw_obj = b.addObject(.{
+            .name = "sha256_hw",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/base/sha256_hw.zig"),
+                .target = b.resolveTargetQuery(hw_query),
+                .optimize = optimize,
+                .strip = strip,
+                .omit_frame_pointer = omit_frame_pointer,
+                .sanitize_thread = tsan,
+            }),
+            .use_llvm = true,
+        });
+        base_mod.addObject(sha256_hw_obj);
+    }
+
     syntax_mod.addImport("base", base_mod);
 
     const runtime_mod = b.addModule("runtime", .{
