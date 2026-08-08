@@ -72,6 +72,17 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var session = setup.Session.init(&ev);
     defer session.deinit(.full);
     const term = try session.configure(init, &options, &settings);
+    // Diagnose the subcommand before gating on the feature: `flake bogus`
+    // should say "unknown subcommand" whether or not flakes are enabled.
+    const known = for ([_][]const u8{ "metadata", "show", "check", "update", "lock" }) |name| {
+        if (std.mem.eql(u8, sub, name)) break true;
+    } else false;
+    if (!known) {
+        var msg_buf: [256]u8 = undefined;
+        const message = std.fmt.bufPrint(&msg_buf, "unknown flake subcommand '{s}'", .{sub}) catch "unknown flake subcommand";
+        render.usageError(init.io, init.environ_map, message, null, synopsis);
+        return 2;
+    }
     if (!ev.languagePolicy().flakes_enabled) {
         render.messageError(init.io, term.use_color, "{s}", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
@@ -84,10 +95,7 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     if (std.mem.eql(u8, sub, "update")) return lockCmd(&ev, init.io, term.use_color, allocator, &options, true);
     if (std.mem.eql(u8, sub, "lock")) return lockCmd(&ev, init.io, term.use_color, allocator, &options, false);
 
-    var msg_buf: [256]u8 = undefined;
-    const message = std.fmt.bufPrint(&msg_buf, "unknown flake subcommand '{s}'", .{sub}) catch "unknown flake subcommand";
-    render.usageError(init.io, init.environ_map, message, null, synopsis);
-    return 2;
+    unreachable; // the pre-gate subcommand check rejected unknown names
 }
 
 /// The flakeref positional, or `.` when none was given.
