@@ -497,6 +497,15 @@ const PrefetchState = struct {
     seen: std.AutoHashMapUnmanaged(types.InternId, void) = .empty,
     mu: SpinMutex = .{},
     budget: u32 = 0,
+    /// Interned paths from the chunk-cache import manifest, drained one per
+    /// completed import-prefetch task (`manifestNext`); `manifest_cursor`
+    /// marks the next entry to hand out.
+    manifest: std.ArrayListUnmanaged(types.InternId) = .empty,
+    manifest_cursor: usize = 0,
+    /// Manifest identity for this run, claimed by the first file-backed
+    /// compile (`maybePreloadImportManifest`); null until then, and forever
+    /// for expression-only evals — they neither preload nor write manifests.
+    manifest_name: ?[33]u8 = null,
 };
 
 const SourceState = struct {
@@ -1153,6 +1162,12 @@ pub const Engine = struct {
     ) !ChunkId {
         try self.requireActiveEvaluation();
         _ = self.ensureTuningPolicy();
+        // The run's first file-backed unit names the workload: replay its
+        // import manifest through the prefetch lane (no-op once claimed).
+        if (source_path) |entry_path| {
+            if (self.sources.prefetch.manifest_name == null)
+                self.maybePreloadImportManifest(entry_path);
+        }
         // Persistent chunk cache: an unchanged unit (same source bytes, path,
         // binary, policy, codegen flags) skips parse+compile entirely. Debug
         // and name-capture sessions bypass in both directions (see
@@ -1524,6 +1539,126 @@ pub const Engine = struct {
     pub fn flushChunkCacheWrites(self: *Engine) void {
         const state = &(self.compilation.chunk_cache orelse return);
         state.flush();
+    }
+
+    /// First file-backed compile of the run: claim the manifest identity for
+    /// `entry_path` and queue that manifest's paths (the previous run's
+    /// imports) for speculative import prefetch. Cached units then decode
+    /// early — while intern/chunk ids still fit their narrow cached
+    /// operands, and on helper workers instead of serially on the demand
+    /// path's import chains.
+    ///
+    /// The spec rings are small, so the backlog is not submitted here: the
+    /// first `worker_count` entries seed the lane and every completed
+    /// prefetch pulls one more (`manifestNext`). Best-effort: a missing or
+    /// stale manifest costs nothing, and a changed file simply re-imports
+    /// its current content.
+    fn maybePreloadImportManifest(self: *Engine, entry_path: []const u8) void {
+        const state = &(self.compilation.chunk_cache orelse return);
+        {
+            const prefetch = &self.sources.prefetch;
+            prefetch.mu.lock();
+            defer prefetch.mu.unlock();
+            if (prefetch.manifest_name != null) return;
+            var name_buf: [33]u8 = undefined;
+            _ = chunk_cache_store.Store.manifestName(entry_path, &name_buf);
+            prefetch.manifest_name = name_buf;
+        }
+        const name = self.sources.prefetch.manifest_name.?;
+        const bytes = state.readManifestAlloc(self.allocator, &name, .limited(8 * 1024 * 1024)) catch return;
+        defer self.allocator.free(bytes);
+        // Filled locally (file IO and interning stay outside the lock), then
+        // published in one guarded splice: concurrent prefetch completions
+        // already consult `manifestNextId`.
+        var pending: std.ArrayListUnmanaged(types.InternId) = .empty;
+        defer pending.deinit(self.allocator);
+        var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            if (!std.fs.path.isAbsolute(line)) continue;
+            const path_id = self.intern.intern(line) catch return;
+            pending.append(self.allocator, path_id) catch return;
+        }
+        {
+            const prefetch = &self.sources.prefetch;
+            prefetch.mu.lock();
+            defer prefetch.mu.unlock();
+            prefetch.manifest.appendSlice(self.allocator, pending.items) catch {};
+        }
+        // `manifestNextId` already applied the dedup + budget gate; submit
+        // directly (prefetchPathConst would re-check `seen` and drop these).
+        var seeds: usize = self.execution.worker_count;
+        while (seeds > 0) : (seeds -= 1) {
+            const path_id = self.manifestNextId() orelse break;
+            _ = self.execution.scheduler.submit(.{ .import_prefetch = path_id }, worker_id_mod.currentId());
+        }
+    }
+
+    /// Pop the next manifest path for the prefetch drip; consults the
+    /// dedup/budget gate so a demanded-in-the-meantime import isn't replayed.
+    fn manifestNextId(self: *Engine) ?types.InternId {
+        const prefetch = &self.sources.prefetch;
+        prefetch.mu.lock();
+        defer prefetch.mu.unlock();
+        while (prefetch.manifest_cursor < prefetch.manifest.items.len) {
+            const path_id = prefetch.manifest.items[prefetch.manifest_cursor];
+            prefetch.manifest_cursor += 1;
+            if (prefetch.budget == 0) break;
+            const gop = prefetch.seen.getOrPut(self.allocator, path_id) catch break;
+            if (gop.found_existing) continue;
+            prefetch.budget -= 1;
+            return path_id;
+        }
+        return null;
+    }
+
+    fn manifestNext(context: *anyopaque) ?types.InternId {
+        const self: *Engine = @ptrCast(@alignCast(context));
+        return self.manifestNextId();
+    }
+
+    /// Record this run's successfully imported absolute paths as the
+    /// generation's manifest (see `preloadImportManifest`). Runs at teardown
+    /// after workers quiesce, while the import registry is still alive
+    /// (`lifecycle.destroy`).
+    ///
+    /// Ordering: entries from the loaded manifest keep their positions
+    /// (dropping paths this run no longer imported), and paths new to this
+    /// run append in first-demand order (`Registry.order`). The anchor
+    /// matters: under preload, first-demand order IS the racy prefetch-drip
+    /// order, so rewriting from scratch each run would shuffle the manifest
+    /// a little more per generation until it no longer resembles the compile
+    /// order that keeps narrow-operand units loadable.
+    pub fn writeChunkCacheManifest(self: *Engine) void {
+        const state = &(self.compilation.chunk_cache orelse return);
+        const name = self.sources.prefetch.manifest_name orelse return;
+        var buffer: std.ArrayListUnmanaged(u8) = .empty;
+        defer buffer.deinit(self.allocator);
+        var carried: std.StringHashMapUnmanaged(void) = .empty;
+        defer carried.deinit(self.allocator);
+        {
+            self.sources.imports.mu.lock();
+            defer self.sources.imports.mu.unlock();
+            const entries = &self.sources.imports.entries;
+            for (self.sources.prefetch.manifest.items) |path_id| {
+                const path = self.intern.get(path_id);
+                const entry = entries.get(path) orelse continue;
+                if (entry.failure != null) continue;
+                const gop = carried.getOrPut(self.allocator, path) catch return;
+                if (gop.found_existing) continue;
+                buffer.appendSlice(self.allocator, path) catch return;
+                buffer.append(self.allocator, '\n') catch return;
+            }
+            for (self.sources.imports.order.items) |path| {
+                if (carried.contains(path)) continue;
+                const entry = entries.get(path) orelse continue;
+                if (entry.failure != null) continue;
+                if (!std.fs.path.isAbsolute(path)) continue;
+                buffer.appendSlice(self.allocator, path) catch return;
+                buffer.append(self.allocator, '\n') catch return;
+            }
+        }
+        if (buffer.items.len == 0) return;
+        state.writeManifest(&name, buffer.items);
     }
 
     /// Hash every `LanguagePolicy` field into the cache key. Field-generic
@@ -2259,7 +2394,7 @@ pub const Engine = struct {
             // helper's resolves, not just main's. The trace handles
             // its own locking.
             .thunk_trace = self.thunk_trace,
-            .import_host = .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
+            .import_host = .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv, .manifest_next = manifestNext },
             .builtins_value = try self.ensureBuiltins(),
             .deferred_table = &self.compilation.deferred_table,
             .registration_sink = chunkRegistrationSink(self),

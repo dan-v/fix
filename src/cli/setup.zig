@@ -112,6 +112,9 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session, teardown: Teardown) void {
         if (teardown == .fast_exit) {
+            // Durable chunk-cache state must survive the fast exit: queued
+            // unit writes and the import manifest the next run preloads.
+            self.engine.writeChunkCacheManifest();
             self.engine.flushChunkCacheWrites();
             // Deliberately retain `terminal`: Engine still borrows its sink and
             // the process-exit contract lets the kernel reclaim both together.

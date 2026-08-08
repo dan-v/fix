@@ -56,7 +56,11 @@ fn destroy(engine: anytype) void {
     engine.execution.scheduler.deinit();
     if (engine.execution.main_worker) |worker| worker.deinit();
     engine.execution.main_worker = null;
+    // The import registry is complete and stable now — persist this run's
+    // import set so the next run can prefetch it (chunk-cache preload).
+    engine.writeChunkCacheManifest();
     engine.sources.prefetch.seen.deinit(engine.allocator);
+    engine.sources.prefetch.manifest.deinit(engine.allocator);
     engine.execution.vm_buffers.deinit();
 
     engine.collection.tracer.deinit();

@@ -17,6 +17,11 @@ const SpinMutex = @import("base").sync.SpinMutex;
 /// actual evaluation.
 pub const Registry = struct {
     entries: std.StringHashMapUnmanaged(*ImportEntry) = .empty,
+    /// Paths in first-demand order (borrowing the map's keys). The
+    /// chunk-cache import manifest replays in this order so the next run's
+    /// preload tracks this run's compile/load order — narrow-operand cached
+    /// units then decode while the id spaces are still small.
+    order: std.ArrayListUnmanaged([]const u8) = .empty,
     /// A separate memo table for the current debugger replay. Keeping it
     /// distinct lets old normal-evaluation helpers finish against `entries`
     /// while a serial debug run starts from a clean import graph.
@@ -24,6 +29,7 @@ pub const Registry = struct {
     mu: SpinMutex = .{},
 
     pub fn deinit(self: *Registry, allocator: std.mem.Allocator) void {
+        self.order.deinit(allocator);
         clearEntries(&self.entries, allocator);
         clearEntries(&self.replay_entries, allocator);
     }
@@ -62,6 +68,8 @@ pub const Registry = struct {
         errdefer allocator.destroy(entry);
         entry.* = .{ .future = future_mod.Future.init() };
         try entries.put(allocator, key, entry);
+        // Best-effort: the manifest just loses one entry on OOM.
+        if (!replay) self.order.append(allocator, key) catch {};
         return entry;
     }
 };

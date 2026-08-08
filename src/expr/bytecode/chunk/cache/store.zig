@@ -118,6 +118,33 @@ pub const Store = struct {
         return std.Io.Dir.cwd().readFileAlloc(self.io, path, allocator, limit);
     }
 
+    /// An import manifest: the absolute source paths one entry expression's
+    /// evaluation imported, one per line. Startup replays them through the
+    /// speculative import-prefetch lane so cached units decode early — while
+    /// the intern/chunk id spaces are still small enough for their narrow
+    /// operands — instead of serially on the demand path's import chains.
+    /// Manifests are keyed by the entry file's path (`manifestName`) so
+    /// unrelated workloads sharing a generation don't clobber each other's
+    /// preload order; expression-only evals have no manifest at all.
+    pub fn manifestName(entry_path: []const u8, buf: *[33]u8) []const u8 {
+        const fp = std.hash.Wyhash.hash(0x314F1157, entry_path);
+        return std.fmt.bufPrint(buf, "imports-{x:0>16}.manifest", .{fp}) catch unreachable;
+    }
+
+    pub fn readManifestAlloc(self: *const Store, allocator: std.mem.Allocator, name: []const u8, limit: std.Io.Limit) ![]u8 {
+        const path = try std.fs.path.join(allocator, &.{ self.dir, name });
+        defer allocator.free(path);
+        return std.Io.Dir.cwd().readFileAlloc(self.io, path, allocator, limit);
+    }
+
+    /// Best-effort atomic replace (staging + rename), so concurrent
+    /// evaluators never observe a torn manifest.
+    pub fn writeManifest(self: *const Store, name: []const u8, bytes: []const u8) void {
+        const path = std.fs.path.join(self.allocator, &.{ self.dir, name }) catch return;
+        defer self.allocator.free(path);
+        _ = publish(self.io, self.allocator, path, bytes);
+    }
+
     fn claimPending(self: *Store, bytes: usize) bool {
         if (bytes > self.max_pending_bytes) return false;
         var current = self.pending_bytes.load(.acquire);

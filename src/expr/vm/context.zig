@@ -153,6 +153,12 @@ pub const ImportHost = struct {
     scoped_import: *const fn (*anyopaque, *VM, Value, []const u8, u32) anyerror!Value,
     find_file: *const fn (*anyopaque, []const u8) anyerror!Value,
     get_env: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+    /// Next queued path from the chunk-cache import manifest (interned), or
+    /// null when the backlog is drained. Each completed import-prefetch task
+    /// pulls one and resubmits, so the manifest replays as a bounded
+    /// self-perpetuating drip on idle helpers rather than a startup flood
+    /// that overflows the spec rings.
+    manifest_next: ?*const fn (*anyopaque) ?InternId = null,
 };
 
 /// Why evaluation paused into the debugger. `entry` is the one-shot stop at

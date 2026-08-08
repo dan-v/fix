@@ -1250,6 +1250,15 @@ fn runImportPrefetchTask(f: *WorkerFiber, path_id: types.InternId) void {
     _ = host.import_value(host.context, &f.vm, path, 1) catch {};
     f.ctx.clearFailure();
     f.local_trace.clear();
+    // Chunk-cache manifest drip: a completed prefetch pulls the next queued
+    // manifest path, keeping the spec rings at a bounded fill instead of
+    // flooding them at startup. The slot this task just vacated makes the
+    // resubmit reliable; a full ring only pauses the drip until another
+    // prefetch completes.
+    if (host.manifest_next) |next_fn| {
+        if (next_fn(host.context)) |next_id|
+            _ = f.worker.scheduler.submit(.{ .import_prefetch = next_id }, worker_id_mod.currentId());
+    }
 }
 
 fn runReadDirPrefetchTask(f: *WorkerFiber, range: scheduler_mod.ReadDirPrefetch) void {
