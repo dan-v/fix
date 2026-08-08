@@ -58,6 +58,15 @@ pub const FetchCache = struct {
     /// Opportunistic URL/tarball-cache pruning runs at most once per process.
     cache_prune_mu: sync.BlockingMutex = .{},
     cache_pruned: bool = false,
+    /// Outstanding fire-and-forget locked-input prefetches (see
+    /// `prefetchGitLocked`); `joinPrefetches` blocks deinit until zero.
+    prefetch_pending: std.atomic.Value(u32) = .init(0),
+    /// Max concurrent prefetch clones — a deliberate server-politeness cap
+    /// (a private forge pays pack-generation CPU per clone) that also keeps
+    /// pool workers free for demand fetches. `FIX_PREFETCH_LIMIT` overrides.
+    prefetch_limit: u32 = 8,
+    prefetch_mu: sync.BlockingMutex = .{},
+    prefetch_queue: std.ArrayListUnmanaged(PrefetchSpec) = .empty,
     auth: auth_mod.Auth,
     /// The process environment (borrowed), inherited by tar and Mercurial
     /// subprocesses and consulted by the in-process transports.
@@ -109,6 +118,7 @@ pub const FetchCache = struct {
     }
 
     pub fn deinit(self: *FetchCache) void {
+        self.joinPrefetches();
         if (self.fetch_pool) |pool| {
             pool.deinit();
             self.allocator.destroy(pool);
@@ -270,6 +280,153 @@ pub const FetchCache = struct {
         defer self.fetch_pool_mu.unlock();
         if (!pool.started) pool.start() catch return null;
         return pool;
+    }
+
+    // ---- locked-input prefetch --------------------------------------------
+    //
+    // Cold evaluation of a many-git-input flake is serialization-bound: each
+    // input is a lazy thunk, so fetches start only as fast as demand happens
+    // to force them — a sequential consumer collapses the fetch pool to
+    // width 1. A driver that knows the whole flake.lock up front can instead
+    // fan the LOCKED inputs out here, fire-and-forget: the per-key
+    // single-flight locks make a later demand fetch of the same input block
+    // until its prefetch lands (then hit the warm cache), results are
+    // discarded, and errors are swallowed — demand replays them with proper
+    // reporting. Purity is unaffected: only content-pinned (rev'd) refs are
+    // eligible, and a fetch of pinned content is observationally invisible.
+    //
+    // Throttled by design, on two grounds: (1) a thousand near-simultaneous
+    // clone requests is a denial-of-service against the git server (a
+    // private forge pays pack-generation CPU per clone) — at most
+    // `prefetch_limit` prefetch clones are in flight, each completion
+    // dispatching the next from the queue; (2) prefetch must never starve
+    // DEMAND fetches — queued specs wait in our own list, not in the pool's
+    // FIFO, so pool workers stay available to demand at all times.
+
+    const default_prefetch_limit: u32 = 8;
+
+    const PrefetchSpec = struct {
+        url: []u8,
+        name: []u8,
+        rev: ?[]u8,
+        ref: ?[]u8,
+        submodules: bool,
+        shallow: bool,
+        rev_count_hint: ?i64,
+
+        fn deinit(self: PrefetchSpec, allocator: std.mem.Allocator) void {
+            allocator.free(self.url);
+            allocator.free(self.name);
+            if (self.rev) |v| allocator.free(v);
+            if (self.ref) |v| allocator.free(v);
+        }
+    };
+
+    const GitPrefetchJob = struct {
+        job: BlockingPool.Job,
+        cache: *FetchCache,
+        files: *FileCache,
+        spec: PrefetchSpec,
+
+        fn run(context: *anyopaque) void {
+            const self: *GitPrefetchJob = @ptrCast(@alignCast(context));
+            const cache = self.cache;
+            const files = self.files;
+            if (cache.fetchGit(files, .{
+                .url = self.spec.url,
+                .name = self.spec.name,
+                .rev = if (self.spec.rev) |v| v else null,
+                .ref = if (self.spec.ref) |v| v else null,
+                .submodules = self.spec.submodules,
+                .shallow = self.spec.shallow,
+                .rev_count_hint = self.spec.rev_count_hint,
+            }, null)) |result| result.deinit(cache.allocator) else |_| {}
+            self.spec.deinit(cache.allocator);
+            // Chain the next queued spec onto this slot (reusing the job
+            // allocation) BEFORE releasing the pending count: joiners must
+            // only see zero when the queue is drained too.
+            cache.prefetch_mu.lock();
+            const next = if (cache.prefetch_queue.items.len > 0) cache.prefetch_queue.orderedRemove(0) else null;
+            cache.prefetch_mu.unlock();
+            if (next) |spec| {
+                self.spec = spec;
+                if (cache.blockingPool()) |pool| {
+                    pool.submit(&self.job);
+                    return;
+                }
+                self.spec.deinit(cache.allocator);
+            }
+            cache.allocator.destroy(self);
+            if (cache.prefetch_pending.fetchSub(1, .release) == 1)
+                sync.Futex.wake(&cache.prefetch_pending, std.math.maxInt(u32));
+        }
+    };
+
+    /// Queue a fire-and-forget warmup fetch of a locked git input. At most
+    /// `prefetch_limit` are in flight; the rest wait in `prefetch_queue`.
+    /// Strings are duped here. Silently a no-op when the pool is
+    /// unavailable or on allocation failure (prefetch is best-effort).
+    pub fn prefetchGitLocked(self: *FetchCache, files: *FileCache, spec: GitSpec) void {
+        const pool = self.blockingPool() orelse return;
+        const allocator = self.allocator;
+        var owned: PrefetchSpec = .{
+            .url = allocator.dupe(u8, spec.url) catch return,
+            .name = &.{},
+            .rev = null,
+            .ref = null,
+            .submodules = spec.submodules,
+            .shallow = spec.shallow,
+            .rev_count_hint = spec.rev_count_hint,
+        };
+        owned.name = allocator.dupe(u8, spec.name) catch {
+            allocator.free(owned.url);
+            return;
+        };
+        if (spec.rev) |v| owned.rev = allocator.dupe(u8, v) catch null;
+        if (spec.ref) |v| owned.ref = allocator.dupe(u8, v) catch null;
+
+        self.prefetch_mu.lock();
+        const in_flight = self.prefetch_pending.load(.monotonic);
+        if (in_flight >= self.prefetch_limit) {
+            self.prefetch_queue.append(allocator, owned) catch {
+                self.prefetch_mu.unlock();
+                owned.deinit(allocator);
+                return;
+            };
+            self.prefetch_mu.unlock();
+            return;
+        }
+        _ = self.prefetch_pending.fetchAdd(1, .monotonic);
+        self.prefetch_mu.unlock();
+
+        const job = allocator.create(GitPrefetchJob) catch {
+            owned.deinit(allocator);
+            if (self.prefetch_pending.fetchSub(1, .release) == 1)
+                sync.Futex.wake(&self.prefetch_pending, std.math.maxInt(u32));
+            return;
+        };
+        job.* = .{
+            .job = .{ .run = GitPrefetchJob.run, .context = job },
+            .cache = self,
+            .files = files,
+            .spec = owned,
+        };
+        pool.submit(&job.job);
+    }
+
+    /// Wait for all outstanding prefetch jobs — they borrow this cache and
+    /// the file cache, so teardown must not race them. Queued-but-unstarted
+    /// specs are dropped (best-effort warmup, not required work).
+    pub fn joinPrefetches(self: *FetchCache) void {
+        self.prefetch_mu.lock();
+        for (self.prefetch_queue.items) |spec| spec.deinit(self.allocator);
+        self.prefetch_queue.clearAndFree(self.allocator);
+        self.prefetch_mu.unlock();
+        while (true) {
+            const pending = self.prefetch_pending.load(.acquire);
+            if (pending == 0) return;
+            sync.Futex.wait(&self.prefetch_pending, pending);
+        }
     }
 
     /// Set the download-cache root (duped/owned). See `cache_root`.
@@ -695,7 +852,83 @@ pub const FetchCache = struct {
         defer self.cache_prune_mu.unlock();
         if (self.cache_pruned) return;
         self.cache_pruned = true;
-        self.pruneUrlCache(io, root, std.Io.Clock.real.now(io).toSeconds()) catch {};
+        const now = std.Io.Clock.real.now(io).toSeconds();
+        self.pruneUrlCache(io, root, now) catch {};
+        self.pruneCloneCaches(io, root, now) catch {};
+    }
+
+    /// Retention for git/hg clone directories, in days. Unlike URL objects
+    /// (TTL-scoped downloads), a pinned clone stays useful for as long as a
+    /// lock pins its rev — so retention is keyed on LAST USE, not download
+    /// time, with a window long enough that weekly CI never re-clones.
+    /// `FIX_GIT_CACHE_DAYS` overrides; 0 disables pruning.
+    const default_clone_retention_days: i64 = 30;
+
+    fn cloneRetentionSeconds() ?i64 {
+        var days: i64 = default_clone_retention_days;
+        if (std.c.getenv("FIX_GIT_CACHE_DAYS")) |raw| {
+            days = std.fmt.parseInt(i64, std.mem.span(raw), 10) catch default_clone_retention_days;
+        }
+        if (days <= 0) return null;
+        return days * 24 * 60 * 60;
+    }
+
+    /// Stamp a clone directory as used "now". Rewritten at most once per
+    /// day so warm evals of thousands of inputs don't pay a write each.
+    fn touchUsedMarker(self: *FetchCache, io: std.Io, path: []const u8) void {
+        const marker = std.fmt.allocPrint(self.allocator, "{s}.used", .{path}) catch return;
+        defer self.allocator.free(marker);
+        const now = std.Io.Clock.real.now(io).toSeconds();
+        if (std.Io.Dir.cwd().readFileAlloc(io, marker, self.allocator, .limited(32))) |contents| {
+            defer self.allocator.free(contents);
+            const last = std.fmt.parseInt(i64, std.mem.trim(u8, contents, " \n\t"), 10) catch 0;
+            if (now - last < 24 * 60 * 60) return;
+        } else |_| {}
+        const text = std.fmt.allocPrint(self.allocator, "{d}\n", .{now}) catch return;
+        defer self.allocator.free(text);
+        self.publishBytes(io, marker, text) catch {};
+    }
+
+    /// Age out clone directories (git/, hg/) whose `.used` marker predates
+    /// the retention window. Entries without a marker are seeded with "now"
+    /// — existing caches from older versions are grandfathered a full
+    /// window, never deleted on sight. Best-effort throughout: a permission
+    /// problem must never fail an evaluation.
+    fn pruneCloneCaches(self: *FetchCache, io: std.Io, root: []const u8, now: i64) !void {
+        const retention = cloneRetentionSeconds() orelse return;
+        const cutoff = now - retention;
+        for ([_][]const u8{ "git", "hg", "git-odb" }) |family| {
+            const family_path = try std.fs.path.join(self.allocator, &.{ root, family });
+            defer self.allocator.free(family_path);
+            var dir = std.Io.Dir.openDirAbsolute(io, family_path, .{ .iterate = true }) catch continue;
+            defer dir.close(io);
+            var iterator = dir.iterate();
+            while (iterator.next(io) catch null) |entry| {
+                if (entry.kind != .directory or entry.name.len != 32) continue;
+                const clone_path = try std.fs.path.join(self.allocator, &.{ family_path, entry.name });
+                defer self.allocator.free(clone_path);
+                const marker = try std.fmt.allocPrint(self.allocator, "{s}.used", .{clone_path});
+                defer self.allocator.free(marker);
+                const last: ?i64 = blk: {
+                    const contents = std.Io.Dir.cwd().readFileAlloc(io, marker, self.allocator, .limited(32)) catch break :blk null;
+                    defer self.allocator.free(contents);
+                    break :blk std.fmt.parseInt(i64, std.mem.trim(u8, contents, " \n\t"), 10) catch null;
+                };
+                if (last == null) {
+                    // Grandfather: unmarked (pre-existing) entries get a
+                    // fresh window rather than deletion.
+                    self.touchUsedMarker(io, clone_path);
+                    continue;
+                }
+                if (last.? > cutoff) continue;
+                std.Io.Dir.cwd().deleteTree(io, clone_path) catch continue;
+                for ([_][]const u8{ ".used", ".meta", ".fresh", ".lock" }) |suffix| {
+                    const sidecar = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ clone_path, suffix }) catch continue;
+                    defer self.allocator.free(sidecar);
+                    std.Io.Dir.deleteFileAbsolute(io, sidecar) catch {};
+                }
+            }
+        }
     }
 
     /// Drop URL archives and their extracted tarballs after two TTL windows.
@@ -852,10 +1085,30 @@ pub const FetchCache = struct {
         const snapshots = try std.fs.path.join(self.allocator, &.{ root, "git-local" });
         defer self.allocator.free(snapshots);
         try std.Io.Dir.cwd().createDirPath(io, snapshots);
+
+        // The snapshot is content-addressed by its NAR, so naming it requires
+        // copying the worktree and serializing the copy — ~1s for a 5.5k-file
+        // repo, paid on every evaluation even when nothing changed. The git
+        // index already identifies the tracked content, so derive a cheap key
+        // from it first and reuse the recorded snapshot when it still exists.
+        const index_key: ?[64]u8 = if (spec.rev == null)
+            git_transport.localSnapshotKey(self.allocator, path, spec.submodules) catch null
+        else
+            null;
+        if (index_key) |key| {
+            const scoped = try self.localSnapshotKeyFor(&key, spec.shallow);
+            defer self.allocator.free(scoped);
+            if (try self.readLocalSnapshot(io, root, scoped)) |hit| {
+                defer self.allocator.free(hit.snapshot);
+                if (try hostPathExists(io, hit.snapshot))
+                    return self.gitResultFromTransport(hit.snapshot, hit.metadata, spec.submodules);
+            }
+        }
+
         const staging = try self.uniqueStagingPath(snapshots, ".snapshot");
         defer self.allocator.free(staging);
         errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
-        const metadata = try git_transport.snapshotLocal(self.allocator, io, path, staging, spec.rev, spec.submodules);
+        const metadata = try git_transport.snapshotLocal(self.allocator, io, path, staging, spec.rev, spec.submodules, self.revCountCache(), spec.shallow);
         const digest = try nar.hashPathDigest(self.allocator, files, staging);
         const encoded = std.fmt.bytesToHex(digest, .lower);
         const snapshot = try std.fs.path.join(self.allocator, &.{ snapshots, encoded[0..32], "source" });
@@ -873,12 +1126,68 @@ pub const FetchCache = struct {
             try self.publishStagedDir(io, staging, snapshot);
             try self.publishBytes(io, marker, "1\n");
         }
+        if (index_key) |key| {
+            const scoped = self.localSnapshotKeyFor(&key, spec.shallow) catch null;
+            if (scoped) |name| {
+                defer self.allocator.free(name);
+                self.writeLocalSnapshot(io, root, name, snapshot, metadata) catch {};
+            }
+        }
         return self.gitResultFromTransport(snapshot, metadata, spec.submodules);
+    }
+
+    const LocalSnapshotHit = struct { snapshot: []u8, metadata: git_transport.Result };
+
+    fn localSnapshotPath(self: *FetchCache, root: []const u8, key: []const u8) ![]u8 {
+        return std.fs.path.join(self.allocator, &.{ root, "git-local-index", key });
+    }
+
+    /// The recorded entry holds the metadata too, and `shallow` changes the
+    /// reported revCount, so the two must not share a key.
+    fn localSnapshotKeyFor(self: *FetchCache, key: []const u8, shallow: bool) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ key, if (shallow) "-shallow" else "" });
+    }
+
+    /// The snapshot path and git metadata recorded for a worktree index key.
+    /// Format: `<snapshot-path>\n<rev> <revCount> <lastModified>`. The caller
+    /// re-checks that the snapshot still exists, so a pruned cache just misses.
+    fn readLocalSnapshot(self: *FetchCache, io: std.Io, root: []const u8, key: []const u8) !?LocalSnapshotHit {
+        const meta_path = try self.localSnapshotPath(root, key);
+        defer self.allocator.free(meta_path);
+        const contents = std.Io.Dir.cwd().readFileAlloc(io, meta_path, self.allocator, .limited(8192)) catch return null;
+        defer self.allocator.free(contents);
+        var lines = std.mem.tokenizeScalar(u8, contents, '\n');
+        const snapshot_line = lines.next() orelse return null;
+        const meta_line = lines.next() orelse return null;
+        var fields = std.mem.tokenizeAny(u8, meta_line, " \t\r");
+        const rev = fields.next() orelse return null;
+        if (rev.len != git_transport.Result.rev_len) return null;
+        const rev_count = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+        const last_modified = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+
+        var metadata: git_transport.Result = undefined;
+        @memcpy(&metadata.rev, rev);
+        metadata.rev_count = rev_count;
+        metadata.last_modified = last_modified;
+        metadata.last_modified_date = clock.formatUtc(last_modified);
+        return .{ .snapshot = try self.allocator.dupe(u8, snapshot_line), .metadata = metadata };
+    }
+
+    fn writeLocalSnapshot(self: *FetchCache, io: std.Io, root: []const u8, key: []const u8, snapshot: []const u8, metadata: git_transport.Result) !void {
+        const meta_path = try self.localSnapshotPath(root, key);
+        defer self.allocator.free(meta_path);
+        const contents = try std.fmt.allocPrint(self.allocator, "{s}\n{s} {d} {d}\n", .{ snapshot, metadata.rev, metadata.rev_count, metadata.last_modified });
+        defer self.allocator.free(contents);
+        try self.publishBytes(io, meta_path, contents);
     }
 
     fn remoteGit(self: *FetchCache, _: *FileCache, spec: GitSpec, reporter: ?Reporter) !GitResult {
         const io = self.io orelse return error.FetchIoUnavailable;
-        const path = try self.remoteGitPath(io, spec);
+        // A pinned rev whose revCount is already known needs no ancestry, so
+        // clone it at depth 1 and report the known count. This is what keeps a
+        // 636-input lock from full-cloning hundreds of repositories.
+        const fetch_shallow = spec.shallow or spec.rev_count_hint != null;
+        const path = try self.remoteGitPath(io, spec, fetch_shallow);
         defer self.allocator.free(path);
         const git_dir = try std.fs.path.join(self.allocator, &.{ path, ".git" });
         defer self.allocator.free(git_dir);
@@ -888,15 +1197,46 @@ pub const FetchCache = struct {
 
         const parent = std.fs.path.dirname(path) orelse return error.FetchCacheWriteFailed;
         try std.Io.Dir.cwd().createDirPath(io, parent);
-        if (!try hostPathExists(io, git_dir) and try hostPathExists(io, path))
-            try std.Io.Dir.cwd().deleteTree(io, path);
+        // Cross-process serialization: the stripe mutex above covers only
+        // THIS process, but CI runners routinely share a cache volume
+        // between concurrent fix processes — a clone/refresh/checkout racing
+        // another process's could tear the worktree. Advisory flock on a
+        // sibling lockfile; best-effort (a filesystem without flock degrades
+        // to the old behavior rather than failing the fetch). Pinned-rev
+        // dirs never mutate after publish, so reader-vs-writer exposure is
+        // limited to mutable refs.
+        const path_lock = self.acquirePathLock(path);
+        defer releasePathLock(path_lock);
+        // Pinned, submodule-free, ancestry-free specs (a lock's revCount hint
+        // or explicit shallow) take the shared-ODB path: objects accumulate
+        // in one per-URL bare store so rev bumps fetch only the delta, and
+        // the export is a raw-blob tree with NO `.git` — so the
+        // stale-dir cleanup below (keyed on `.git` presence) must not run
+        // for them.
+        const odb_eligible = spec.rev != null and !spec.submodules and fetch_shallow;
+        if (!odb_eligible) {
+            if (!try hostPathExists(io, git_dir) and try hostPathExists(io, path))
+                try std.Io.Dir.cwd().deleteTree(io, path);
+        }
 
         const marker = try std.fmt.allocPrint(self.allocator, "{s}.fresh", .{path});
         defer self.allocator.free(marker);
-        const exists = try hostPathExists(io, git_dir);
+        const exists = if (odb_eligible) try hostPathExists(io, path) else try hostPathExists(io, git_dir);
         // A pinned commit is immutable once present. Mutable refs/HEAD obey the
         // same tarball-ttl policy as URL and Mercurial sources.
         var refresh = !exists or (spec.rev == null and !try self.timestampFresh(io, marker));
+        // The cache path is keyed on the rev, so a warm directory for a pinned
+        // rev already holds that exact checkout. Re-running libgit2 would repeat
+        // a force-checkout and a full revwalk to recompute `revCount` — on a
+        // nixpkgs-sized history (~1M commits) that is ~27s per evaluation, paid
+        // again on every run. Nix keeps the same facts in its cache DB.
+        if (exists and !refresh and spec.rev != null) {
+            if (try self.readGitMetadata(io, path, spec.rev.?)) |cached| {
+                self.touchUsedMarker(io, path);
+                return self.gitResultFromTransport(path, cached, spec.submodules);
+            }
+        }
+        if (odb_eligible) return self.odbGit(io, spec, path);
         const credential = try self.gitCredential(spec.url);
         defer if (credential) |value| value.deinit(self.allocator);
         const git_reporter: ?git_transport.Reporter = if (reporter) |r| .{ .ctx = r.ctx, .report = r.report } else null;
@@ -914,6 +1254,8 @@ pub const FetchCache = struct {
                 .proxy_url = self.proxyFor(spec.url),
                 .connect_timeout_seconds = self.connect_timeout_seconds,
                 .stalled_timeout_seconds = self.stalled_timeout_seconds,
+                .home_dir = if (self.env) |e| e.get("HOME") else null,
+                .shallow = fetch_shallow,
             }) catch |err| {
                 if (staging) |value| std.Io.Dir.cwd().deleteTree(io, value) catch {};
                 // A pinned object may not have been in an older shallow/cache
@@ -937,11 +1279,165 @@ pub const FetchCache = struct {
                 .proxy_url = self.proxyFor(spec.url),
                 .connect_timeout_seconds = self.connect_timeout_seconds,
                 .stalled_timeout_seconds = self.stalled_timeout_seconds,
+                .shallow = fetch_shallow,
             });
         }
         if (refresh) try self.writeTimestamp(io, marker);
+        // A depth-1 clone cannot count ancestry, so restore the caller's known
+        // revCount before recording it: the sidecar must hold the value callers
+        // will see, not the 0 the shallow fetch produced.
+        if (spec.rev_count_hint) |count| result.rev_count = count;
+        self.writeGitMetadata(io, path, result) catch {};
+        self.touchUsedMarker(io, path);
+        {
+            const root = self.cacheRootDir(io) catch null;
+            if (root) |r| {
+                defer self.allocator.free(r);
+                self.maybePruneUrlCache(io, r);
+            }
+        }
 
         return self.gitResultFromTransport(path, result, spec.submodules);
+    }
+
+    /// Shared-ODB fetch path for pinned, submodule-free, ancestry-free git
+    /// specs: one bare object store per URL, fetched into across revs (each
+    /// tip pack deltas against everything already present), with the commit
+    /// tree exported as raw blobs into the per-key cache dir. The caller
+    /// holds the per-key stripe mutex and flock; this adds the per-URL ODB
+    /// flock for the fetch window.
+    fn odbGit(self: *FetchCache, io: std.Io, spec: GitSpec, path: []const u8) !GitResult {
+        const root = try self.cacheRootDir(io);
+        defer self.allocator.free(root);
+        var url_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(spec.url, &url_digest, .{});
+        const url_hex = std.fmt.bytesToHex(url_digest, .lower);
+        const odb_dir = try std.fs.path.join(self.allocator, &.{ root, "git-odb", url_hex[0..32] });
+        defer self.allocator.free(odb_dir);
+        const odb_parent = std.fs.path.dirname(odb_dir) orelse return error.FetchCacheWriteFailed;
+        try std.Io.Dir.cwd().createDirPath(io, odb_parent);
+
+        const credential = try self.gitCredential(spec.url);
+        defer if (credential) |value| value.deinit(self.allocator);
+
+        const parent = std.fs.path.dirname(path) orelse return error.FetchCacheWriteFailed;
+        const staging = try self.uniqueStagingPath(parent, ".git-export");
+        defer self.allocator.free(staging);
+        errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+
+        var result = blk: {
+            const odb_lock = self.acquirePathLock(odb_dir);
+            defer releasePathLock(odb_lock);
+            var attempt: u32 = 1;
+            break :blk while (true) : (attempt += 1) {
+                break git_transport.fetchSharedOdb(self.allocator, io, spec.url, odb_dir, staging, spec.rev.?, .{
+                    .credentials = if (credential) |value| .{ .username = value.username, .password = value.password } else null,
+                    .ca_file = self.ssl_cert_file,
+                    .proxy_url = self.proxyFor(spec.url),
+                    .connect_timeout_seconds = self.connect_timeout_seconds,
+                    .stalled_timeout_seconds = self.stalled_timeout_seconds,
+                    .home_dir = if (self.env) |e| e.get("HOME") else null,
+                    .shallow = true,
+                }) catch |err| {
+                    std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+                    if (attempt >= self.download_attempts or !retryable(err)) return err;
+                    io.sleep(std.Io.Duration.fromMilliseconds(@min(5_000, 250 * @as(i64, attempt))), .awake) catch {};
+                    continue;
+                };
+            };
+        };
+        try self.publishStagedDir(io, staging, path);
+        if (spec.rev_count_hint) |count| result.rev_count = count;
+        self.writeGitMetadata(io, path, result) catch {};
+        self.touchUsedMarker(io, path);
+        self.touchUsedMarker(io, odb_dir);
+        self.maybePruneUrlCache(io, root);
+        return self.gitResultFromTransport(path, result, spec.submodules);
+    }
+
+    /// Blocking exclusive advisory lock on `<path>.lock`, or null when the
+    /// lockfile cannot be created/locked (best-effort; see the call site).
+    fn acquirePathLock(self: *FetchCache, path: []const u8) ?std.c.fd_t {
+        const lock_path = std.fmt.allocPrintSentinel(self.allocator, "{s}.lock", .{path}, 0) catch return null;
+        defer self.allocator.free(lock_path);
+        const fd = std.c.open(lock_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) return null;
+        if (std.c.flock(fd, std.c.LOCK.EX) != 0) {
+            _ = std.c.close(fd);
+            return null;
+        }
+        return fd;
+    }
+
+    fn releasePathLock(fd: ?std.c.fd_t) void {
+        // Closing the descriptor releases the flock.
+        if (fd) |f| _ = std.c.close(f);
+    }
+
+    /// `revCount`/`lastModified` for a pinned rev already materialized at `path`.
+    /// Recomputing them means a full revwalk, so they are recorded beside the
+    /// clone. The rev is stored too: the file is only trusted when it names the
+    /// rev being asked for, so a stale or truncated sidecar just misses.
+    fn readGitMetadata(self: *FetchCache, io: std.Io, path: []const u8, rev: []const u8) !?git_transport.Result {
+        const meta_path = try std.fmt.allocPrint(self.allocator, "{s}.meta", .{path});
+        defer self.allocator.free(meta_path);
+        const contents = std.Io.Dir.cwd().readFileAlloc(io, meta_path, self.allocator, .limited(512)) catch return null;
+        defer self.allocator.free(contents);
+        var fields = std.mem.tokenizeAny(u8, contents, " \t\r\n");
+        const stored_rev = fields.next() orelse return null;
+        if (stored_rev.len != git_transport.Result.rev_len) return null;
+        if (!std.mem.eql(u8, stored_rev, rev)) return null;
+        const rev_count = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+        const last_modified = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+        var result: git_transport.Result = undefined;
+        @memcpy(&result.rev, stored_rev);
+        result.rev_count = rev_count;
+        result.last_modified = last_modified;
+        result.last_modified_date = clock.formatUtc(last_modified);
+        return result;
+    }
+
+    fn writeGitMetadata(self: *FetchCache, io: std.Io, path: []const u8, result: git_transport.Result) !void {
+        const meta_path = try std.fmt.allocPrint(self.allocator, "{s}.meta", .{path});
+        defer self.allocator.free(meta_path);
+        const contents = try std.fmt.allocPrint(self.allocator, "{s} {d} {d}\n", .{ result.rev, result.rev_count, result.last_modified });
+        defer self.allocator.free(contents);
+        try self.publishBytes(io, meta_path, contents);
+    }
+
+    /// A local worktree snapshot is content-addressed by its NAR, so its cache
+    /// path is not known before the copy — but `revCount` depends only on the
+    /// resolved commit. Memoize it under `git-revcount/<rev>` so repeated
+    /// evaluations of a large local checkout skip the ancestry walk.
+    fn revCountCache(self: *FetchCache) ?git_transport.RevCountCache {
+        if (self.io == null) return null;
+        return .{ .ctx = self, .get = revCountGet, .put = revCountPut };
+    }
+
+    fn revCountPath(self: *FetchCache, io: std.Io, rev: []const u8) ![]u8 {
+        const root = try self.cacheRootDir(io);
+        defer self.allocator.free(root);
+        return std.fs.path.join(self.allocator, &.{ root, "git-revcount", rev });
+    }
+
+    fn revCountGet(ctx: *anyopaque, rev: []const u8) ?i64 {
+        const self: *FetchCache = @ptrCast(@alignCast(ctx));
+        const io = self.io orelse return null;
+        const path = self.revCountPath(io, rev) catch return null;
+        defer self.allocator.free(path);
+        const contents = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(64)) catch return null;
+        defer self.allocator.free(contents);
+        return std.fmt.parseInt(i64, std.mem.trim(u8, contents, " \t\r\n"), 10) catch null;
+    }
+
+    fn revCountPut(ctx: *anyopaque, rev: []const u8, count: i64) void {
+        const self: *FetchCache = @ptrCast(@alignCast(ctx));
+        const io = self.io orelse return;
+        const path = self.revCountPath(io, rev) catch return;
+        defer self.allocator.free(path);
+        const contents = std.fmt.allocPrint(self.allocator, "{d}\n", .{count}) catch return;
+        defer self.allocator.free(contents);
+        self.publishBytes(io, path, contents) catch {};
     }
 
     const GitCredential = auth_mod.Credentials;
@@ -1062,7 +1558,7 @@ pub const FetchCache = struct {
         };
     }
 
-    fn remoteGitPath(self: *FetchCache, io: std.Io, spec: GitSpec) ![]u8 {
+    fn remoteGitPath(self: *FetchCache, io: std.Io, spec: GitSpec, shallow: bool) ![]u8 {
         var key: std.ArrayListUnmanaged(u8) = .empty;
         defer key.deinit(self.allocator);
         try key.appendSlice(self.allocator, spec.url);
@@ -1072,9 +1568,22 @@ pub const FetchCache = struct {
         if (spec.ref) |ref| try key.appendSlice(self.allocator, ref);
         try key.append(self.allocator, 0);
         try key.append(self.allocator, @intFromBool(spec.submodules));
+        // A shallow clone cannot serve a request that needs full history, so the
+        // two must not share a cache directory.
+        try key.append(self.allocator, @intFromBool(shallow));
 
         const digest = try nix_hash.hashBytes(self.allocator, "sha256", key.items);
         defer self.allocator.free(digest);
+        if (std.c.getenv("FIX_FETCH_DEBUG") != null) {
+            std.debug.print("[git-key] url={s} rev={s} ref={s} sub={} shallow={} -> {s}\n", .{
+                spec.url,
+                spec.rev orelse "-",
+                spec.ref orelse "-",
+                spec.submodules,
+                shallow,
+                digest[0..12],
+            });
+        }
         const root = try self.cacheRootDir(io);
         defer self.allocator.free(root);
         return std.fs.path.join(self.allocator, &.{ root, "git", digest[0..32] });
@@ -1235,6 +1744,7 @@ fn expandRevisionTemplate(allocator: std.mem.Allocator, template: []const u8, re
 fn formatTimestamp(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
     return allocator.dupe(u8, &clock.formatUtc(timestamp));
 }
+
 
 test "forge archive revision templates pin every ref occurrence" {
     const expanded = try expandRevisionTemplate(std.testing.allocator, "https://gitlab/x/-/archive/{rev}/x-{rev}.tar.gz", "abc123");
@@ -1543,6 +2053,72 @@ test "URL generation pruning uses explicit timestamps and removes legacy orphans
     try testing.expect(!try hostPathExists(testing.io, orphan_tarball));
 }
 
+test "git metadata sidecar is reused only for the rev it names" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var fc = try FetchCache.init(testing.allocator, .{});
+    defer fc.deinit();
+    fc.setIo(testing.io);
+    try fc.setCacheRoot(root);
+
+    const rev = "7dabb35bbc93b94fa09268253dd891beb5031b8b";
+    const other = "0000000000000000000000000000000000000000";
+    const clone = try std.fs.path.join(testing.allocator, &.{ root, "git", "deadbeef" });
+    defer testing.allocator.free(clone);
+
+    // Nothing recorded yet: the walk must still happen.
+    try testing.expect((try fc.readGitMetadata(testing.io, clone, rev)) == null);
+
+    var written: git_transport.Result = undefined;
+    @memcpy(&written.rev, rev);
+    written.rev_count = 1008676;
+    written.last_modified = 1783551127;
+    written.last_modified_date = clock.formatUtc(written.last_modified);
+    try fc.writeGitMetadata(testing.io, clone, written);
+
+    const hit = (try fc.readGitMetadata(testing.io, clone, rev)).?;
+    try testing.expectEqualStrings(rev, &hit.rev);
+    try testing.expectEqual(@as(i64, 1008676), hit.rev_count);
+    try testing.expectEqual(@as(i64, 1783551127), hit.last_modified);
+    // `lastModifiedDate` is derived, so it must survive the round trip too.
+    try testing.expectEqualStrings(&written.last_modified_date, &hit.last_modified_date);
+
+    // A sidecar naming a different rev must not be trusted for this one.
+    try testing.expect((try fc.readGitMetadata(testing.io, clone, other)) == null);
+
+    // A truncated or garbage sidecar misses rather than reporting a bogus count.
+    const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}.meta", .{clone});
+    defer testing.allocator.free(meta_path);
+    try fc.publishBytes(testing.io, meta_path, "7dabb35bbc93b94fa09268253dd891beb5031b8b 1008676\n");
+    try testing.expect((try fc.readGitMetadata(testing.io, clone, rev)) == null);
+    try fc.publishBytes(testing.io, meta_path, "not-a-rev x y\n");
+    try testing.expect((try fc.readGitMetadata(testing.io, clone, rev)) == null);
+}
+
+test "revCount memo round-trips by rev and misses for unknown revs" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var fc = try FetchCache.init(testing.allocator, .{});
+    defer fc.deinit();
+    fc.setIo(testing.io);
+    try fc.setCacheRoot(root);
+
+    const hook = fc.revCountCache().?;
+    const rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try testing.expect(hook.get(hook.ctx, rev) == null);
+    hook.put(hook.ctx, rev, 399179);
+    try testing.expectEqual(@as(i64, 399179), hook.get(hook.ctx, rev).?);
+    try testing.expect(hook.get(hook.ctx, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") == null);
+}
+
 test "http-connections zero remains truly unlimited" {
     var fc = try FetchCache.init(std.testing.allocator, .{});
     defer fc.deinit();
@@ -1603,4 +2179,16 @@ test "remote URL retries transient status then reuses the verified TTL cache" {
     try testing.expect(second.cached);
     try testing.expectEqualStrings(first.hash, second.hash);
     try testing.expectEqualStrings(first.path, second.path);
+}
+
+test "acquirePathLock creates and locks a sibling lockfile" {
+    var fc = try FetchCache.init(std.testing.allocator, .{ .io = std.testing.io });
+    defer fc.deinit();
+    var buf: [128]u8 = undefined;
+    const dir = std.testing.tmpDir(.{});
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/clone", .{&@constCast(&dir).sub_path});
+    const fd = fc.acquirePathLock(path);
+    defer FetchCache.releasePathLock(fd);
+    try std.testing.expect(fd != null);
+    @constCast(&dir).cleanup();
 }

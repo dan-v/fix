@@ -36,6 +36,7 @@ const fetchGitSpecFromAttrs = fetch.fetchGitSpecFromAttrs;
 const gitResultValue = fetch.gitResultValue;
 const forgeTreeSpec = fetch.forgeTreeSpec;
 const githubTreeValue = fetch.githubTreeValue;
+const gitTreeValue = fetch.gitTreeValue;
 const fetchMercurialSpecFromAttrs = fetch.fetchMercurialSpecFromAttrs;
 const mercurialResultValue = fetch.mercurialResultValue;
 pub const builtinParseFlakeRef = flake_ref.parse;
@@ -83,6 +84,22 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     }
     if (!attrs.isAttrs()) return error.TypeError;
 
+    // A locked node carries `narHash`, and every tree-shaped input is ingested
+    // as a NAR under `source:sha256:<narHash>`, so a valid CA store path for that
+    // hash IS the content — no fetch needed. flake-compat (which nixpkgs-style
+    // repos use instead of native getFlake) calls this builtin directly, so
+    // without the check here every input re-fetches: cheap for a warm git clone,
+    // but a submodule input re-runs a full recursive clone + submodule init on
+    // every evaluation (tens of seconds each for large repos).
+    if (try flakeInputFromStore(self, attrs)) |cached| return cached;
+    return fetchTreeUncached(self, attrs);
+}
+
+/// `builtinFetchTree` past the store fast path, for callers that already
+/// probed it: the validity cache holds only positives, so a caller that
+/// checked-and-missed (resolveFlakeNode) would otherwise pay a second
+/// daemon round trip for the same path.
+fn fetchTreeUncached(self: *VM, attrs: Value) !Value {
     // GC: `attrs` is held (via `attrs_id`) across the force-walking spec
     // helpers below. On the recursive path (`builtinParseFlakeRef` result) it
     // is a freshly built attrset that isn't the auto-rooted builtin argument.
@@ -129,7 +146,9 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
         defer spec.deinit(self.allocator);
         const result = try offloadFetch(self, .git, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
-        return gitResultValue(self, spec.name, result);
+        // fetchTree semantics: a shallow git input omits `revCount` (fetchGit
+        // would report 0).
+        return fetch.gitTreeResultValue(self, spec.name, result, spec.shallow);
     }
 
     if (std.mem.eql(u8, type_value, "github") or std.mem.eql(u8, type_value, "gitlab") or std.mem.eql(u8, type_value, "sourcehut")) {
@@ -362,6 +381,75 @@ fn resolveInputsFromLockData(self: *VM, lock_data: []const u8, root_value: Value
         const thunk = try buildNodeThunk(self, nodes, target_node, root_name, &memo);
         try out_entries.append(self.allocator, .{ .name = try self.intern.intern(entry.key_ptr.*), .value = thunk });
     }
+    prefetchLockedInputs(self, nodes, root_name);
+}
+
+/// `FIX_PREFETCH_INPUTS=1`: fan every locked, rev-pinned git input in the
+/// lock graph out to the fetch pool as fire-and-forget warmups, instead of
+/// letting each fetch start only when demand happens to force its thunk —
+/// on a many-input flake, cold wall time is `inputs × latency / demand
+/// width`, and demand width is often 1. Content-pinned fetches are
+/// observationally pure, the per-key single-flight makes demand block on an
+/// in-flight prefetch (then hit the warm cache), and errors are swallowed —
+/// demand replays them with proper reporting. Inputs already valid in the
+/// store still short-circuit before their thunk ever consults the fetch
+/// cache, so the wasted work for a warm store is bounded by the pool's
+/// idle capacity. Opt-in while it proves out.
+fn prefetchLockedInputs(self: *VM, nodes: std.json.ObjectMap, root_name: []const u8) void {
+    const flag_raw = std.c.getenv("FIX_PREFETCH_INPUTS") orelse return;
+    if (std.mem.eql(u8, std.mem.span(flag_raw), "0")) return;
+    if (std.c.getenv("FIX_PREFETCH_LIMIT")) |limit_raw| {
+        if (std.fmt.parseInt(u32, std.mem.span(limit_raw), 10) catch null) |n|
+            self.fetchers.prefetch_limit = @max(n, 1);
+    }
+
+    var queued: usize = 0;
+    var it = nodes.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, root_name)) continue;
+        if (entry.value_ptr.* != .object) continue;
+        const locked_v = entry.value_ptr.object.get("locked") orelse continue;
+        if (locked_v != .object) continue;
+        const locked = locked_v.object;
+        const ty = stringField(locked, "type") orelse continue;
+        if (!std.mem.eql(u8, ty, "git")) continue;
+        const url = stringField(locked, "url") orelse continue;
+        const rev = stringField(locked, "rev") orelse continue; // pinned only
+        queued += 1;
+        const rev_count: ?i64 = switch (locked.get("revCount") orelse std.json.Value{ .null = {} }) {
+            .integer => |n| n,
+            else => null,
+        };
+        const submodules = switch (locked.get("submodules") orelse std.json.Value{ .bool = false }) {
+            .bool => |b| b,
+            else => false,
+        };
+        const shallow = switch (locked.get("shallow") orelse std.json.Value{ .bool = false }) {
+            .bool => |b| b,
+            else => false,
+        };
+        self.fetchers.prefetchGitLocked(self.files, .{
+            .url = url,
+            .name = "source",
+            .rev = rev,
+            // The cache key includes the locked ref — the spec must mirror
+            // the demand path's `fetchGitSpecFromAttrs` exactly or the
+            // prefetch warms a different cache directory.
+            .ref = stringField(locked, "ref"),
+            .submodules = submodules,
+            .shallow = shallow,
+            // A locked revCount lets the transport fetch shallow and still
+            // report the true count (same hint the demand path passes).
+            .rev_count_hint = if (shallow) null else rev_count,
+        });
+    }
+    if (queued > 0)
+        std.debug.print("note: prefetching {d} locked git inputs (limit {d})\n", .{ queued, self.fetchers.prefetch_limit });
+}
+
+fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return if (v == .string) v.string else null;
 }
 
 // ---- flake.lock generation ------------------------------------------------
@@ -946,7 +1034,7 @@ pub fn resolveFlakeNode(self: *VM, ref_attrs: Value, sub_inputs: Value, is_flake
 
     // Skip the download+ingest when the locked narHash's store path is already
     // valid (Nix pins inputs by narHash; a valid CA path IS the content).
-    const src_info = (try flakeInputFromStore(self, ref_attrs)) orelse try builtinFetchTree(self, ref_attrs);
+    const src_info = (try flakeInputFromStore(self, ref_attrs)) orelse try fetchTreeUncached(self, ref_attrs);
     vm_force.rootKeep(self, src_info);
     try verifyLockedNarHash(self, ref_attrs, src_info);
     if (!is_flake.asBool()) return src_info; // `flake = false`
@@ -1101,12 +1189,18 @@ fn flakeInputFromStore(self: *VM, attrs: Value) !?Value {
     const ty = (try optionalStringAttr(self, id, "type")) orelse return null;
     defer self.allocator.free(ty);
 
-    // Recursive-NAR (sourcePath) inputs only: forges/tarball/path. git/mercurial
-    // ingest differently and are left to fetch; file is flat, not a tree.
+    // Recursive-NAR (sourcePath) inputs: forges/tarball/path/git/mercurial. All
+    // of these ingest the fetched tree as a NAR under `source:sha256:<narHash>`,
+    // so the locked narHash alone names the store path — no fetch needed to find
+    // out. (`file` is flat, not a tree, and is left to fetch.) Verified against
+    // Nix on a 654-input lock: all 636 `git` inputs' computed paths matched the
+    // paths Nix had fetched.
     const is_forge = std.mem.eql(u8, ty, "github") or std.mem.eql(u8, ty, "gitlab") or std.mem.eql(u8, ty, "sourcehut");
     const is_tarball = std.mem.eql(u8, ty, "tarball");
     const is_path = std.mem.eql(u8, ty, "path");
-    if (!is_forge and !is_tarball and !is_path) return null;
+    const is_git = std.mem.eql(u8, ty, "git");
+    const is_hg = std.mem.eql(u8, ty, "mercurial");
+    if (!is_forge and !is_tarball and !is_path and !is_git and !is_hg) return null;
 
     // The store-path name must match what the fetch would use (see builtinFetchTree).
     const path_attr = if (is_path) (try optionalStringAttr(self, id, "path")) else null;
@@ -1131,6 +1225,24 @@ fn flakeInputFromStore(self: *VM, attrs: Value) !?Value {
         const rev = try optionalStringAttr(self, id, "rev");
         defer if (rev) |r| self.allocator.free(r);
         return try githubTreeValue(self, store_path, nar_hash, rev, null, last_modified);
+    }
+    if (is_git) {
+        // A git tree also exposes rev/shortRev/revCount/lastModified, which
+        // package definitions read (`finalAttrs.src.rev`). Take them from the
+        // lock — they are exactly what the fetch would have reported.
+        const rev = try optionalStringAttr(self, id, "rev");
+        defer if (rev) |r| self.allocator.free(r);
+        const rev_count = try optionalIntAttr(self, id, "revCount");
+        const submodules = (try optionalBoolAttr(self, id, "submodules")) orelse false;
+        return try gitTreeValue(self, store_path, nar_hash, rev, rev_count, try optionalIntAttr(self, id, "lastModified"), submodules);
+    }
+    if (is_hg) {
+        // Mercurial trees have their own shape: 12-char shortRev, no
+        // submodules or lastModified attrs.
+        const rev = try optionalStringAttr(self, id, "rev");
+        defer if (rev) |r| self.allocator.free(r);
+        const rev_count = try optionalIntAttr(self, id, "revCount");
+        return try fetch.mercurialTreeValue(self, store_path, nar_hash, rev, rev_count);
     }
     return try pathTreeValue(self, store_path, nar_hash, last_modified);
 }

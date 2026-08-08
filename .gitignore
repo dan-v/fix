@@ -30,3 +30,6 @@ zig-out-*/
 # Python bytecode cache (test/lang conformance harness)
 __pycache__/
 *.pyc
+
+# ab-harness baseline worktrees and race scratch files
+.harness/

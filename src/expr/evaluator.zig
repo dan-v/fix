@@ -745,6 +745,9 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        // Outstanding input prefetches borrow the fetch cache AND the file
+        // cache; both die in releaseEvaluationResources, so join first.
+        self.sources.fetchers.joinPrefetches();
         // Join every compiler/cache producer before closing the writer or
         // freeing registry/intern/heap state that inline serialization reads.
         self.releaseEvaluationResources();

@@ -41,6 +41,7 @@ const dupPathAttr = arguments.dupPathAttr;
 const optionalStringAttr = arguments.optionalStringAttr;
 const requiredStringAttr = arguments.requiredStringAttr;
 const optionalBoolAttr = arguments.optionalBoolAttr;
+const optionalIntAttr = arguments.optionalIntAttr;
 
 pub const FetchGitSpec = struct {
     url: []u8,
@@ -48,6 +49,8 @@ pub const FetchGitSpec = struct {
     rev: ?[]u8,
     ref: ?[]u8,
     submodules: bool,
+    shallow: bool = false,
+    rev_count_hint: ?i64 = null,
 
     pub fn deinit(self: FetchGitSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
@@ -63,6 +66,8 @@ pub const FetchGitSpec = struct {
             .rev = self.rev,
             .ref = self.ref,
             .submodules = self.submodules,
+            .shallow = self.shallow,
+            .rev_count_hint = self.rev_count_hint,
         };
     }
 };
@@ -256,19 +261,68 @@ pub fn builtinFetchGit(self: *VM, arg: Value) !Value {
 }
 
 pub fn gitResultValue(self: *VM, name: []const u8, result: FetchService.GitResult) !Value {
-    const out = try ingestFetchedTree(self, result.out_path, name, result.rev, git_filter);
+    // `builtins.fetchGit` semantics: a shallow fetch reports `revCount = 0`
+    // (Nix's emptyRevFallback), the attr is always present.
+    return gitResultValueMode(self, name, result, true);
+}
+
+/// `builtins.fetchTree` semantics for a git input: a shallow fetch OMITS
+/// `revCount` entirely (which is why a shallow lock node carries none),
+/// where `fetchGit` reports 0. Everything else matches `gitResultValue`.
+pub fn gitTreeResultValue(self: *VM, name: []const u8, result: FetchService.GitResult, shallow: bool) !Value {
+    return gitResultValueMode(self, name, result, !shallow);
+}
+
+fn gitResultValueMode(self: *VM, name: []const u8, result: FetchService.GitResult, include_rev_count: bool) !Value {
+    // The git filter exists only to exclude the clone's `.git`; shared-ODB
+    // exports are plain trees WITHOUT one, and an unfiltered ingest is
+    // memoized and single-flighted (a filtered one is neither — every
+    // repeated coercion re-serialized and re-hashed the whole tree).
+    const has_git_dir = blk: {
+        const git_dir = std.fs.path.join(self.allocator, &.{ result.out_path, ".git" }) catch break :blk true;
+        defer self.allocator.free(git_dir);
+        break :blk self.files.pathExists(git_dir) catch true;
+    };
+    const out = try ingestFetchedTree(self, result.out_path, name, result.rev, if (has_git_dir) git_filter else null);
     defer out.deinit(self.allocator);
-    const entries = [_]heap_mod.AttrEntry{
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+    try entries.appendSlice(self.allocator, &.{
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(result.last_modified) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern(result.last_modified_date)) },
         .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, out.out_path, out.nar_hash, ".git") },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, out.out_path) },
         .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
-        .{ .name = try self.intern.intern("revCount"), .value = Value.int(result.rev_count) },
+    });
+    if (include_rev_count) {
+        try entries.append(self.allocator, .{ .name = try self.intern.intern("revCount"), .value = Value.int(result.rev_count) });
+    }
+    try entries.appendSlice(self.allocator, &.{
         .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
         .{ .name = try self.intern.intern("submodules"), .value = Value.boolVal(result.submodules) },
-    };
-    return Value.attrs(try self.heap.addAttrs(&entries));
+    });
+    return Value.attrs(try self.heap.addAttrs(entries.items));
+}
+
+/// Fast-path equivalent of `mercurialResultValue` for a tree already valid in
+/// the store: rebuild the attrs from the pin. A mercurial tree exposes
+/// rev/shortRev/revCount only — hg's short id is 12 characters, and there is
+/// no `submodules` or `lastModified` attr, matching Nix.
+pub fn mercurialTreeValue(self: *VM, path: []const u8, nar_hash: []const u8, rev: ?[]const u8, rev_count: ?i64) !Value {
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+    try entries.appendSlice(self.allocator, &.{
+        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash, ".hg") },
+        .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
+    });
+    if (rev) |value| {
+        try appendStringAttr(self, &entries, "rev", value);
+        try appendStringAttr(self, &entries, "shortRev", value[0..@min(value.len, 12)]);
+    }
+    if (rev_count) |count| {
+        try entries.append(self.allocator, .{ .name = try self.intern.intern("revCount"), .value = Value.int(count) });
+    }
+    return Value.attrs(try self.heap.addAttrs(entries.items));
 }
 
 /// The `narHash` value for a fetched tree: an eager SRI string when we already
@@ -360,6 +414,15 @@ pub fn fetchGitSpecFromAttrs(self: *VM, attrs_id: ObjectId) !FetchGitSpec {
     const ref = try optionalStringAttr(self, attrs_id, "ref");
     errdefer if (ref) |owned| self.allocator.free(owned);
     const submodules = try optionalBoolAttr(self, attrs_id, "submodules") orelse false;
+    const shallow = try optionalBoolAttr(self, attrs_id, "shallow") orelse false;
+    // A locked git input records its own `revCount`, so the ancestry a full
+    // clone would download only to count it is dead weight — Nix shallow-clones
+    // flake inputs for exactly this reason. Fetch depth-1 and report the locked
+    // count, so the value is unchanged while the download is not.
+    const rev_count_hint: ?i64 = if (!shallow and rev != null)
+        try optionalIntAttr(self, attrs_id, "revCount")
+    else
+        null;
 
     return .{
         .url = url,
@@ -367,6 +430,8 @@ pub fn fetchGitSpecFromAttrs(self: *VM, attrs_id: ObjectId) !FetchGitSpec {
         .rev = rev,
         .ref = ref,
         .submodules = submodules,
+        .shallow = shallow,
+        .rev_count_hint = rev_count_hint,
     };
 }
 
@@ -753,6 +818,61 @@ pub fn githubTreeValue(self: *VM, path: []const u8, nar_hash: []const u8, rev: ?
         try appendStringAttr(self, &entries, "shortRev", value[0..@min(value.len, 7)]);
     }
     return Value.attrs(try self.heap.addAttrs(entries.items));
+}
+
+/// A git/mercurial tree value assembled from a lockfile pin instead of a fetch:
+/// same attrs `gitResultValue` produces, with rev/revCount/lastModified taken
+/// from the lock (package definitions read `src.rev`). Used only when the NAR
+/// hash already names a valid store path, so the tree on disk IS the fetch
+/// result — see `flakeInputFromStore`.
+pub fn gitTreeValue(
+    self: *VM,
+    path: []const u8,
+    nar_hash: []const u8,
+    rev: ?[]const u8,
+    rev_count: ?i64,
+    last_modified: ?i64,
+    submodules: bool,
+) !Value {
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+    const modified = last_modified orelse 0;
+    var date_buf: [15]u8 = undefined;
+    const date = formatLastModifiedDate(&date_buf, modified);
+    try entries.appendSlice(self.allocator, &.{
+        .{ .name = try self.intern.intern("lastModified"), .value = Value.int(modified) },
+        .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern(date)) },
+        // The pin's narHash is the hash of the ingested tree (".git" already
+        // excluded when it was written), so pass it through eagerly.
+        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash, ".git") },
+        .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
+    });
+    if (rev) |value| {
+        try appendStringAttr(self, &entries, "rev", value);
+        try appendStringAttr(self, &entries, "shortRev", value[0..@min(value.len, 7)]);
+    }
+    if (rev_count) |count| {
+        try entries.append(self.allocator, .{ .name = try self.intern.intern("revCount"), .value = Value.int(count) });
+    }
+    try entries.append(self.allocator, .{ .name = try self.intern.intern("submodules"), .value = Value.boolVal(submodules) });
+    return Value.attrs(try self.heap.addAttrs(entries.items));
+}
+
+/// `lastModifiedDate` is `lastModified` as UTC `YYYYMMDDhhmmss`, as Nix renders it.
+fn formatLastModifiedDate(buf: *[15]u8, seconds: i64) []const u8 {
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(seconds, 0)) };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const time = epoch.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        time.getHoursIntoDay(),
+        time.getMinutesIntoHour(),
+        time.getSecondsIntoMinute(),
+    }) catch "19700101000000";
 }
 
 fn defaultFetchName(self: *VM, url: []const u8) ![]u8 {

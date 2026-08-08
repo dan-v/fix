@@ -11,6 +11,15 @@ pub const GitSpec = struct {
     rev: ?[]const u8 = null,
     ref: ?[]const u8 = null,
     submodules: bool = false,
+    /// Fetch only the pinned commit, as Nix's `shallow = true` does. Ancestry is
+    /// then absent, so `revCount` is reported as 0 (which is what Nix reports).
+    shallow: bool = false,
+    /// Fetch shallowly for speed, but report this `revCount` instead of 0.
+    /// A flake lock records the revCount of every pinned git input, so the
+    /// number a full clone would have counted is already known and the ancestry
+    /// need not be downloaded to recover it. Remote fetches only: a local
+    /// worktree is not cloned, so counting its ancestry is already free.
+    rev_count_hint: ?i64 = null,
 };
 
 pub const UrlSpec = struct {
