@@ -1,4 +1,8 @@
-name: Concurrency stress
+name: Nightly stress
+
+# Rare-crash hunting: everything here is stuff we want exercised regularly
+# but that is too heavy (or too repetitive) for the on-push pipeline. The
+# seed changes per run, so each night explores different schedules.
 
 on:
   schedule:
@@ -9,8 +13,11 @@ permissions:
   contents: read
 
 jobs:
+  # Seeded synthetic concurrency stress + one real-eval differential pass,
+  # natively per platform (the aarch64 arms are real-weak-memory coverage
+  # that qemu and x86 TSan cannot provide; darwin adds its runtime paths).
   stress:
-    name: ${{ matrix.system }}
+    name: stress / ${{ matrix.system }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -20,16 +27,40 @@ jobs:
             runner: ubuntu-24.04
           - system: aarch64-linux
             runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-15
     env:
       STRESS_SEED: ${{ github.run_id }}
-
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
-      - uses: nix-community/cache-nix-action@v7
+      - id: store
+        uses: ./.github/actions/nix-store-cache
         with:
-          primary-key: concurrency-v2-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
-          restore-prefixes-first-match: concurrency-v2-${{ matrix.system }}-
+          key: nix-v4-stress-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+      - name: Reinstall nix (cold, after wipe)
+        if: steps.store.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Re-disable store optimisation (cold path)
+        if: steps.store.outputs.wiped == 'true'
+        run: |
+          echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon 2>/dev/null || true
+      - name: Install pinned nixpkgs channel
+        run: |
+          nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
+          nix-channel --update nixpkgs
+      # Warm from the on-push test caches when the nightly one is stale.
+      - name: Restore zig cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-nightly-${{ matrix.system }}-${{ github.sha }}
+          restore-keys: |
+            zig-nightly-${{ matrix.system }}-
+            zig-test-${{ matrix.system }}-
 
       - name: Debug stress
         timeout-minutes: 30
@@ -53,16 +84,175 @@ jobs:
 
       # The synthetic stress workloads cannot reproduce the module-fixpoint
       # shapes where past real races surfaced; run the real-world bench
-      # fixtures as a parallel-eval differential against reference Nix. On
-      # aarch64 this is also the only weak-memory coverage of a real eval —
-      # TSan on x86 cannot see ordering bugs that TSO hides.
+      # fixtures as a parallel-eval differential against reference Nix.
       - name: Real-eval differential (w=8)
         timeout-minutes: 45
         run: nix-shell --run 'zig build test-bench-fixtures -Doptimize=ReleaseFast --summary all -- realworld --workers 8'
 
-      - name: ThreadSanitizer real-eval differential (w=8)
-        if: matrix.system == 'x86_64-linux'
-        timeout-minutes: 90
+      # Last step on purpose: skipped when anything above failed, so a broken
+      # job can never publish a poisoned store snapshot.
+      - uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: nix-v4-stress-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+
+  # TSan real-eval differential, one fixture per job: the four realworld
+  # fixtures serially under TSan outgrew any single-job timeout (the 10-20x
+  # TSan multiplier over full-laziness-era eval work). w=16 shakes different
+  # interleavings than w=8 (past races have been width-sensitive).
+  tsan-realworld:
+    name: tsan / ${{ matrix.fixture }} w=${{ matrix.workers }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [hm-profile, nixos-desktop, nixos-hm, nixos-minimal]
+        workers: [8, 16]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - id: store
+        uses: ./.github/actions/nix-store-cache
+        with:
+          key: nix-v4-stress-x86_64-linux-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+      - name: Reinstall nix (cold, after wipe)
+        if: steps.store.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Re-disable store optimisation (cold path)
+        if: steps.store.outputs.wiped == 'true'
+        run: |
+          echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon 2>/dev/null || true
+      - name: Install pinned nixpkgs channel
+        run: |
+          nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
+          nix-channel --update nixpkgs
+      # One shared key: all eight jobs compile the same TSan binary; the
+      # first to finish saves, the rest hit.
+      - name: Restore zig cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-nightly-tsan-${{ github.sha }}
+          restore-keys: |
+            zig-nightly-tsan-
+      - name: TSan real-eval differential
+        timeout-minutes: 150
         env:
           TSAN_OPTIONS: halt_on_error=1:exitcode=66:suppressions=${{ github.workspace }}/test/tsan.supp
-        run: nix-shell --run 'zig build test-bench-fixtures -Dtsan -Doptimize=ReleaseSafe --summary all -- realworld --workers 8'
+        run: nix-shell --run 'zig build test-bench-fixtures -Dtsan -Doptimize=ReleaseSafe --summary all -- realworld/${{ matrix.fixture }} --workers ${{ matrix.workers }}'
+
+  # ReleaseSafe detector binaries for the sweep below. Baseline CPU: the
+  # artifacts cross machines within each arch pool.
+  build-detector:
+    name: build / ${{ matrix.system }} ReleaseSafe
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - id: store
+        uses: ./.github/actions/nix-store-cache
+        with:
+          key: nix-v4-build-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+      - name: Reinstall nix (cold, after wipe)
+        if: steps.store.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Re-disable store optimisation (cold path)
+        if: steps.store.outputs.wiped == 'true'
+        run: |
+          echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon 2>/dev/null || true
+      - name: Install pinned nixpkgs channel
+        run: |
+          nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
+          nix-channel --update nixpkgs
+      - name: Restore zig cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-build-${{ matrix.system }}-ReleaseSafe-${{ github.sha }}
+          restore-keys: |
+            zig-build-${{ matrix.system }}-ReleaseSafe-
+      - name: Build ReleaseSafe
+        timeout-minutes: 20
+        run: |
+          nix-shell --run 'zig build -Doptimize=ReleaseSafe -Dcpu=baseline --summary all'
+          cp zig-out/bin/fix fix-releasesafe-${{ matrix.system }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fix-releasesafe-${{ matrix.system }}
+          path: fix-releasesafe-${{ matrix.system }}
+          retention-days: 2
+
+  # GC use-after-free tripwire over the WHOLE universe: the on-push pipeline
+  # runs only chunk 0; nightly sweeps all 12 chunks on both linux arches at a
+  # tight budget (many majors) with the detector build — reuse off,
+  # alloc-bitmap liveness asserts on every id read, swept-slot poisoning.
+  # The heap-strings lane additionally sets FIX_HEAP_STR_MIN=0 so every
+  # string is heap-owned and GC-able (T=0 enforcement — maximum string-GC
+  # traffic against the same required answer). Darwin is excluded here:
+  # ReleaseSafe overhead does not fit the 7 GB macos-15 runners.
+  gc-detector-sweep:
+    name: gc detector / ${{ matrix.system }} chunk ${{ matrix.chunk }}${{ matrix.strings == '0' && ' (T=0 strings)' || '' }}
+    runs-on: ${{ matrix.runner }}
+    needs: build-detector
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        system: [x86_64-linux, aarch64-linux]
+        strings: ['default']
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          # T=0 heap-strings enforcement rides the sweep on chunk 0 only.
+          - {system: x86_64-linux, runner: ubuntu-24.04, chunk: 0, strings: '0'}
+          - {system: aarch64-linux, runner: ubuntu-24.04-arm, chunk: 0, strings: '0'}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      # Restore-only: the on-push pipeline owns these snapshot keys.
+      - id: store
+        uses: ./.github/actions/nix-store-cache
+        with:
+          key: nix-v4-eval-${{ matrix.system }}-${{ hashFiles('**/*.nix', 'npins/sources.json') }}
+      - name: Reinstall nix (cold, after wipe)
+        if: steps.store.outputs.wiped == 'true'
+        uses: cachix/install-nix-action@v31
+      - name: Re-disable store optimisation (cold path)
+        if: steps.store.outputs.wiped == 'true'
+        run: |
+          echo "auto-optimise-store = false" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon 2>/dev/null || true
+      - name: Install pinned nixpkgs channel
+        run: |
+          nix-channel --add "$(jq -r '.pins.nixpkgs.url' npins/sources.json)" nixpkgs
+          nix-channel --update nixpkgs
+      - name: Restore oracle cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/fix-nixpkgs-eval
+          key: nixpkgs-oracle-v1-${{ hashFiles('npins/sources.json') }}-${{ matrix.system }}-chunk-${{ matrix.chunk }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: fix-releasesafe-${{ matrix.system }}
+      - name: Tight-budget detector eval
+        timeout-minutes: 45
+        env:
+          FIX_HEAP_STR_MIN: ${{ matrix.strings == '0' && '0' || '' }}
+        run: |
+          chmod +x fix-releasesafe-${{ matrix.system }}
+          nix-shell --run 'test/nixpkgs/run.sh --chunk ${{ matrix.chunk }}/12 --gc-budget 512 --workers 4 --fix ./fix-releasesafe-${{ matrix.system }}'
