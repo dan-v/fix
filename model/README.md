@@ -35,6 +35,15 @@ tests cover those layers.
   that prevents generation overlap. `CollectionCompletes` checks every begun
   generation releases back to idle — the livelock class safety invariants
   cannot see.
+- `BlockingMutex`: the tri-state futex mutex (`sync.zig`), which since the
+  TSan SpinMutex alias also stands in for every SpinMutex site in sanitizer
+  builds. Fast/spin CAS, the swap(2) slow loop, the futex's atomic value
+  recheck, and the swapped-state-2 wake on unlock. Weak-CAS failure is
+  modeled (unguarded slow-path entry); spurious futex wakeups deliberately
+  are not — they could mask a lost wake. Checks mutual exclusion, that a
+  free word implies no holder, that no parked thread outlives its last
+  potential waker (`ParkedHasSuccessor` — the lost-wakeup bug as a safety
+  violation), and that every locker terminates.
 
 TLC runs with deadlock detection enabled: models whose protocols terminate
 (`FutureWait`, `Shutdown`) carry an explicit `Done` stutter step so a

@@ -6,7 +6,7 @@ model_dir="$repo/model"
 meta_root=$(mktemp -d "${TMPDIR:-/tmp}/fix-tlc.XXXXXX")
 trap 'rm -rf "$meta_root"' EXIT
 
-for spec in FutureWait FutureWaitTSO DequeTSO FiberDispatch Shutdown GcBarrier; do
+for spec in FutureWait FutureWaitTSO DequeTSO FiberDispatch Shutdown GcBarrier BlockingMutex; do
   echo "TLC $spec"
   tlc \
     -workers 1 \
@@ -68,3 +68,15 @@ expect_mutation_rejected Shutdown \
 expect_mutation_rejected GcBarrier \
   'MUTATION_RELEASE_PHASE' \
   'phase'"'"' = "idle"'
+expect_mutation_rejected BlockingMutex \
+  'MUTATION_FAST_GUARD' \
+  'TRUE'
+expect_mutation_rejected BlockingMutex \
+  'MUTATION_SWAP_ACQUIRE' \
+  'TRUE'
+expect_mutation_rejected BlockingMutex \
+  'MUTATION_WAIT_RECHECK' \
+  'TRUE'
+expect_mutation_rejected BlockingMutex \
+  'MUTATION_UNLOCK_PLAIN' \
+  'TRUE'
