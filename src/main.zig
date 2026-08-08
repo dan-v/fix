@@ -45,7 +45,7 @@ fn writeTopUsage(writer: *std.Io.Writer) !void {
     inline for (subcommands) |c| {
         try writer.print("  {s:<12} {s}\n", .{ c.meta.name, c.meta.summary });
     }
-    try writer.writeAll("\nrun `fix <command> -h` for command-specific help.\n");
+    try writer.writeAll("\nrun `fix <command> -h` for command-specific help; `fix --version` prints the version.\n");
 }
 
 fn printTopUsage(io: std.Io) void {
@@ -86,6 +86,14 @@ pub fn main(init: std.process.Init) !void {
 
     if (cli.presentation.isHelpFlag(command)) {
         printTopUsage(init.io);
+        std.process.exit(0);
+    }
+
+    if (std.mem.eql(u8, command, "--version")) {
+        var buffer: [128]u8 = undefined;
+        var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
+        stdout.interface.print("{s}\n", .{cli.version_line}) catch {};
+        stdout.interface.flush() catch {};
         std.process.exit(0);
     }
 

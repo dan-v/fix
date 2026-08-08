@@ -14,7 +14,7 @@ for the common option grammar.
 fix <command> [options]
 ```
 
-A subcommand is **required** (there is no default command). POSIX conventions: `-h`/`--help` prints help to **stdout** and exits `0`; a missing/unknown command or a bad argument prints usage to **stderr** and exits nonzero (`2`). `fix <command> -h` prints that command's scoped help.
+A subcommand is **required** (there is no default command). POSIX conventions: `-h`/`--help` prints help to **stdout** and exits `0`; a missing/unknown command or a bad argument prints usage to **stderr** and exits nonzero (`2`). `fix <command> -h` prints that command's scoped help. `fix --version` prints the release version and the emulated Nix language baseline (the same value `builtins.nixVersion` reports).
 
 ## Subcommands
 

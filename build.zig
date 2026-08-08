@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// Single source of truth for the release version (`fix --version`).
+const manifest = @import("build.zig.zon");
+
 const UnitTest = struct {
     name: []const u8,
     root_module: *std.Build.Module,
@@ -37,6 +40,7 @@ pub fn build(b: *std.Build) void {
     const debug_checks = debug_checks_opt orelse (optimize == .Debug);
 
     const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", manifest.version);
     build_options.addOption(bool, "debug_checks", debug_checks);
     build_options.addOption(bool, "vm_trace", vm_trace);
     build_options.addOption(bool, "thunks_log", thunks_log);
@@ -165,6 +169,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("runtime", runtime_mod);
     cli_mod.addImport("syntax", syntax_mod);
     cli_mod.addImport("store", store_mod);
+    cli_mod.addImport("build_options", build_options_mod);
 
     const process_support_mod = b.createModule(.{
         .root_source_file = b.path("src/process_support.zig"),

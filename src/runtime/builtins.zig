@@ -1,6 +1,12 @@
 //! Engine-owned builtin values.
 
 const std = @import("std");
+
+/// Language compatibility baseline reported by `builtins.nixVersion` and
+/// `fix --version` — not the connected daemon's identity. Keep this value
+/// and README's runtime-compatibility note in sync when intentionally
+/// moving the emulated language baseline.
+pub const nix_compat_version = "2.18.3";
 const builtin = @import("builtin");
 const InternTable = @import("intern.zig").InternTable;
 const heap_mod = @import("heap.zig");
@@ -403,10 +409,7 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
     });
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("nixVersion"),
-        // Language compatibility baseline, not the connected daemon's
-        // identity. Keep this value and README's runtime-compatibility note in
-        // sync when intentionally moving the emulated language baseline.
-        .value = Value.string(try intern.intern("2.18.3")),
+        .value = Value.string(try intern.intern(nix_compat_version)),
     });
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("nixPath"),

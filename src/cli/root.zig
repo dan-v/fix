@@ -6,6 +6,10 @@ pub const command_meta = @import("command_meta.zig");
 pub const presentation = @import("presentation.zig");
 pub const render = @import("render.zig");
 pub const ProcessContext = @import("process_context.zig").ProcessContext;
+/// `fix --version` line: release version from build.zig.zon plus the Nix
+/// language baseline that `builtins.nixVersion` reports.
+pub const version_line = "fix " ++ @import("build_options").version ++
+    " (Nix language compatibility " ++ @import("runtime").builtins.nix_compat_version ++ ")";
 pub const thunks_log_enabled = @import("expr").vm.thunks_log_enabled;
 pub const vm_trace_enabled = @import("expr").vm.trace_log.enabled;
 
