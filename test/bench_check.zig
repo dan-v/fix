@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     const repo = try fsx.absPath(arena, cwd, opts.repo);
     if (!fsx.exists(io, fix)) fatal("fix binary not found (build with `zig build`)");
 
-    // NIX_PATH mirrors nix/bench.nix: pinned nixpkgs + home-manager (resolved
+    // NIX_PATH mirrors bench/harness.nix: pinned nixpkgs + home-manager (resolved
     // from that nixpkgs). Pure workloads ignore it; the nixpkgs/home-manager
     // ones need it.
     const nixpkgs = try proc.resolvePin(gpa, io, repo, "nixpkgs");

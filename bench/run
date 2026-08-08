@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# Source-tree convenience wrapper for the Nix-contained benchmark harness.
+# The one benchmark command: build the Nix-contained harness, run it, and
+# write results (provenance, per-workload Hyperfine JSON + markdown, and the
+# light/dark summary charts) to bench/results/ — the committed location the
+# README links to. OUT=DIR redirects for scratch runs; all other harness
+# environment (RUNS, TOOLS, WORKLOADS, …) passes through, see bench/README.md.
 set -euo pipefail
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 attribute=bench
 if [[ -n "${TOOLS:-}" ]]; then
   fix_only=1
@@ -10,7 +15,7 @@ if [[ -n "${TOOLS:-}" ]]; then
   for selector in "${selectors[@]}"; do
     selector="${selector#-}"
     case "$selector" in
-      fix|fix-*) ;;
+      fix*) ;;
       *) fix_only=0 ;;
     esac
   done
@@ -18,11 +23,13 @@ if [[ -n "${TOOLS:-}" ]]; then
     attribute=benchFix
   fi
 fi
+
 commit="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 if [[ "$commit" != unknown ]] && ! git -C "$repo" diff --quiet HEAD 2>/dev/null; then
   commit="$commit-dirty"
 fi
 export FIX_BENCH_COMMIT="$commit"
+export OUT="${OUT:-$repo/bench/results}"
 
 harness="$(nix-build --no-out-link "$repo/default.nix" -A "$attribute")"
 exec "$harness/bin/fix-bench" "$@"

@@ -18,7 +18,7 @@
   pkgs,
   lib,
   sources ? import ../npins,
-  fix ? pkgs.callPackage ./fix.nix {release = "fast";},
+  fix ? pkgs.callPackage ../nix/fix.nix {release = "fast";},
   nix ? pkgs.nixVersions.latest,
   detsys ? (builtins.getFlake (builtins.unsafeDiscardStringContext (toString sources.determinate-nix)))
     .packages.${pkgs.stdenv.hostPlatform.system}.nix-cli,
@@ -28,7 +28,7 @@
 
   nixpkgs = sources.nixpkgs;
   homeManager = pkgs.home-manager.src;
-  workloads = ../bench/workloads;
+  workloads = ./workloads;
 
   # One row per evaluator, each in its best default configuration (fix at its
   # automatic worker count, Determinate at --eval-cores 0 = all cores). fix
@@ -228,8 +228,12 @@ in
       else
         out="$(mktemp -d /tmp/fix-bench.XXXXXX)"
       fi
-      warm_cache_dir="$out/compile-cache-warm"
-      cold_cache_dir="$out/compile-cache-cold"
+      # The fix cache lanes are run scratch, not results — keep them out of
+      # the (committed) output tree.
+      cache_scratch="$(mktemp -d /tmp/fix-bench-cache.XXXXXX)"
+      trap 'rm -rf -- "$cache_scratch"' EXIT
+      warm_cache_dir="$cache_scratch/warm"
+      cold_cache_dir="$cache_scratch/cold"
       cold_prepare="${prepareCold} $reclaim_flag $hugetlb_min_available $cold_cache_dir"
 
       pinned_nix_path=${lib.escapeShellArg "nixpkgs=${nixpkgs}:home-manager=${homeManager}"}
@@ -251,7 +255,7 @@ in
         echo "# Benchmark provenance"
         echo
         echo "- date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "- fix commit: ''${FIX_BENCH_COMMIT:-unknown (run via ./bench.sh to record it)}"
+        echo "- fix commit: ''${FIX_BENCH_COMMIT:-unknown (run via ./bench/run to record it)}"
         echo "- cpu: $cpu_model ($(nproc) cores)"
         echo "- memory: $mem_total"
         echo "- kernel: $(uname -srm)"
@@ -452,7 +456,7 @@ in
         fi
 
         if [[ "$ran" -eq 1 ]]; then
-          python3 ${../tools/render_bench.py} \
+          python3 ${./render.py} \
             --suite "$suite" \
             --output-dir "$suite_out" \
             "''${json_files[@]}"
@@ -463,7 +467,7 @@ in
         echo
       done
 
-      python3 ${../tools/render_bench.py} \
+      python3 ${./render.py} \
         --suite "all selected suites" \
         --unified \
         --output-dir "$out" \

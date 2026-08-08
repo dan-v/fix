@@ -2,8 +2,8 @@
   sources = import ./npins;
   fix = pkgs.callPackage ./nix/fix.nix {};
   vhsDemo = pkgs.callPackage ./nix/vhs-demo.nix {inherit fix;};
-  bench = pkgs.callPackage ./nix/bench.nix {inherit fix;};
-  benchFix = pkgs.callPackage ./nix/bench.nix {
+  bench = pkgs.callPackage ./bench/harness.nix {inherit fix;};
+  benchFix = pkgs.callPackage ./bench/harness.nix {
     inherit fix;
     nix = null;
     detsys = null;

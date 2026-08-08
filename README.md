@@ -280,191 +280,20 @@ it is shown explicitly rather than baked invisibly into one number. `nix` and
 `--eval-cores 0` (all cores). The realworld suite also runs `all-configs`:
 every configuration passed on a single command line, where a parallel
 evaluator can overlap independent evaluations. Every harness run
-(`./bench.sh`) writes a `provenance.md` next to the results recording the
+(`./bench/run`) writes a `provenance.md` next to the results recording the
 date, hardware, run settings, tool versions, pins, and measured commit —
 reproduce and compare against your own hardware rather than trusting these
 numbers.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="demo/benchmark-dark.png">
-  <img alt="fix evaluator benchmark summary" src="demo/benchmark.png">
+  <source media="(prefers-color-scheme: dark)" srcset="bench/results/summary-dark.png">
+  <img alt="fix evaluator benchmark summary" src="bench/results/summary.png">
 </picture>
 
-<details>
-<summary>Full benchmark tables</summary>
-
-### Torture
-
-#### `attrset-heavy`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 64.2 ± 1.5 | 62.4 | 65.7 | 1.00 ± 0.07 |
-| `fix-autocore` | 72.3 ± 3.3 | 67.9 | 75.8 | 1.13 ± 0.09 |
-| `nix` | 64.1 ± 4.2 | 59.7 | 70.5 | 1.00 |
-| `lix` | 77.7 ± 2.3 | 75.1 | 80.8 | 1.21 ± 0.09 |
-| `detsys-1core` | 83.8 ± 10.6 | 75.6 | 101.5 | 1.31 ± 0.19 |
-| `detsys-autocore` | 75.9 ± 0.8 | 75.1 | 77.2 | 1.18 ± 0.08 |
-
-#### `call-heavy`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 222.2 ± 5.8 | 216.3 | 231.1 | 1.00 |
-| `fix-autocore` | 224.2 ± 2.9 | 220.3 | 227.6 | 1.01 ± 0.03 |
-| `nix` | 330.6 ± 12.1 | 323.9 | 352.1 | 1.49 ± 0.07 |
-| `lix` | 307.6 ± 1.4 | 305.3 | 308.6 | 1.38 ± 0.04 |
-| `detsys-1core` | 507.7 ± 2.8 | 505.1 | 512.3 | 2.29 ± 0.06 |
-| `detsys-autocore` | 502.9 ± 15.0 | 476.3 | 511.6 | 2.26 ± 0.09 |
-
-#### `fixpoint-heavy`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 18.6 ± 0.7 | 17.5 | 19.5 | 1.00 |
-| `fix-autocore` | 22.9 ± 0.4 | 22.4 | 23.3 | 1.23 ± 0.05 |
-| `nix` | 24.9 ± 2.0 | 21.4 | 26.6 | 1.34 ± 0.12 |
-| `lix` | 22.7 ± 0.7 | 21.6 | 23.7 | 1.22 ± 0.06 |
-| `detsys-1core` | 31.0 ± 1.2 | 29.1 | 32.4 | 1.67 ± 0.09 |
-| `detsys-autocore` | 31.4 ± 3.7 | 25.1 | 34.5 | 1.69 ± 0.21 |
-
-#### `list-heavy`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 115.1 ± 3.4 | 111.6 | 120.7 | 1.00 |
-| `fix-autocore` | 128.5 ± 8.8 | 121.0 | 143.8 | 1.12 ± 0.08 |
-| `nix` | 151.6 ± 2.4 | 149.1 | 154.7 | 1.32 ± 0.04 |
-| `lix` | 135.2 ± 2.7 | 132.1 | 139.3 | 1.18 ± 0.04 |
-| `detsys-1core` | 216.3 ± 1.0 | 215.4 | 217.7 | 1.88 ± 0.06 |
-| `detsys-autocore` | 218.5 ± 2.8 | 215.9 | 223.3 | 1.90 ± 0.06 |
-
-#### `math-heavy`
-
-| Command | Mean [s] | Min [s] | Max [s] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 1.127 ± 0.010 | 1.117 | 1.143 | 1.00 |
-| `fix-autocore` | 1.185 ± 0.016 | 1.170 | 1.205 | 1.05 ± 0.02 |
-| `nix` | 1.329 ± 0.030 | 1.295 | 1.377 | 1.18 ± 0.03 |
-| `lix` | 1.149 ± 0.008 | 1.140 | 1.161 | 1.02 ± 0.01 |
-| `detsys-1core` | 2.012 ± 0.039 | 1.949 | 2.055 | 1.79 ± 0.04 |
-| `detsys-autocore` | 2.036 ± 0.014 | 2.014 | 2.049 | 1.81 ± 0.02 |
-
-#### `spec-pathology`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 44.7 ± 2.4 | 41.9 | 48.1 | 1.03 ± 0.06 |
-| `fix-autocore` | 79.2 ± 3.9 | 75.6 | 85.7 | 1.82 ± 0.11 |
-| `nix` | 50.9 ± 2.2 | 48.3 | 53.4 | 1.17 ± 0.06 |
-| `lix` | 43.5 ± 1.4 | 41.9 | 45.5 | 1.00 |
-| `detsys-1core` | 63.1 ± 2.0 | 60.0 | 64.9 | 1.45 ± 0.07 |
-| `detsys-autocore` | 64.1 ± 2.4 | 61.5 | 66.9 | 1.47 ± 0.07 |
-
-#### `string-heavy`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 88.8 ± 1.1 | 87.7 | 90.5 | 1.00 |
-| `fix-autocore` | 121.9 ± 4.6 | 117.4 | 129.1 | 1.37 ± 0.05 |
-| `nix` | 92.3 ± 1.4 | 91.0 | 94.3 | 1.04 ± 0.02 |
-| `lix` | 95.8 ± 2.4 | 93.7 | 98.5 | 1.08 ± 0.03 |
-| `detsys-1core` | 130.2 ± 34.1 | 113.6 | 191.1 | 1.47 ± 0.38 |
-| `detsys-autocore` | 116.0 ± 1.5 | 114.3 | 118.1 | 1.31 ± 0.02 |
-
-### Real-world configurations
-
-#### `hm-profile`
-
-| Command | Mean [s] | Min [s] | Max [s] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 1.304 ± 0.002 | 1.302 | 1.308 | 1.60 ± 0.04 |
-| `fix-autocore` | 0.815 ± 0.019 | 0.789 | 0.835 | 1.00 |
-| `nix` | 1.372 ± 0.009 | 1.364 | 1.386 | 1.68 ± 0.04 |
-| `lix` | 1.309 ± 0.014 | 1.295 | 1.330 | 1.61 ± 0.04 |
-| `detsys-1core` | 1.673 ± 0.035 | 1.642 | 1.728 | 2.05 ± 0.06 |
-| `detsys-autocore` | 1.654 ± 0.029 | 1.623 | 1.686 | 2.03 ± 0.06 |
-
-#### `nixos-desktop`
-
-| Command | Mean [s] | Min [s] | Max [s] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 2.727 ± 0.020 | 2.715 | 2.760 | 2.88 ± 0.05 |
-| `fix-autocore` | 0.947 ± 0.016 | 0.923 | 0.965 | 1.00 |
-| `nix` | 2.702 ± 0.029 | 2.660 | 2.727 | 2.85 ± 0.06 |
-| `lix` | 2.547 ± 0.030 | 2.514 | 2.585 | 2.69 ± 0.05 |
-| `detsys-1core` | 3.331 ± 0.040 | 3.295 | 3.394 | 3.52 ± 0.07 |
-| `detsys-autocore` | 3.335 ± 0.024 | 3.316 | 3.377 | 3.52 ± 0.06 |
-
-#### `nixos-hm`
-
-| Command | Mean [s] | Min [s] | Max [s] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 2.978 ± 0.023 | 2.945 | 3.005 | 2.91 ± 0.04 |
-| `fix-autocore` | 1.022 ± 0.011 | 1.004 | 1.033 | 1.00 |
-| `nix` | 3.015 ± 0.030 | 2.978 | 3.048 | 2.95 ± 0.04 |
-| `lix` | 2.898 ± 0.034 | 2.871 | 2.946 | 2.84 ± 0.04 |
-| `detsys-1core` | 3.720 ± 0.023 | 3.692 | 3.754 | 3.64 ± 0.04 |
-| `detsys-autocore` | 3.681 ± 0.022 | 3.662 | 3.708 | 3.60 ± 0.04 |
-
-#### `nixos-minimal`
-
-| Command | Mean [s] | Min [s] | Max [s] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 2.144 ± 0.030 | 2.106 | 2.183 | 3.57 ± 0.10 |
-| `fix-autocore` | 0.600 ± 0.015 | 0.579 | 0.617 | 1.00 |
-| `nix` | 2.167 ± 0.042 | 2.132 | 2.231 | 3.61 ± 0.11 |
-| `lix` | 2.080 ± 0.051 | 2.021 | 2.151 | 3.47 ± 0.12 |
-| `detsys-1core` | 2.701 ± 0.005 | 2.692 | 2.706 | 4.50 ± 0.11 |
-| `detsys-autocore` | 2.738 ± 0.038 | 2.701 | 2.781 | 4.56 ± 0.13 |
-
-### JSON
-
-#### `nested-records`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 21.3 ± 0.2 | 21.1 | 21.6 | 1.00 |
-| `fix-autocore` | 30.4 ± 0.8 | 29.2 | 31.3 | 1.43 ± 0.04 |
-| `nix` | 38.2 ± 0.7 | 37.3 | 38.9 | 1.79 ± 0.04 |
-| `lix` | 39.5 ± 0.9 | 38.1 | 40.2 | 1.85 ± 0.04 |
-| `detsys-1core` | 48.3 ± 3.5 | 45.6 | 54.2 | 2.27 ± 0.17 |
-| `detsys-autocore` | 49.4 ± 0.8 | 48.2 | 50.3 | 2.32 ± 0.04 |
-
-#### `nixpkgs-package-metadata`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 608.8 ± 12.0 | 601.8 | 630.1 | 1.44 ± 0.03 |
-| `fix-autocore` | 424.2 ± 3.2 | 420.1 | 427.7 | 1.00 |
-| `nix` | 1077.9 ± 21.2 | 1055.2 | 1106.7 | 2.54 ± 0.05 |
-| `lix` | 1234.5 ± 31.1 | 1203.3 | 1286.6 | 2.91 ± 0.08 |
-| `detsys-1core` | 1136.0 ± 22.6 | 1110.7 | 1171.3 | 2.68 ± 0.06 |
-| `detsys-autocore` | 834.4 ± 14.9 | 822.5 | 859.9 | 1.97 ± 0.04 |
-
-#### `wide-call-tree`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 445.2 ± 10.9 | 432.9 | 462.4 | 3.58 ± 0.10 |
-| `fix-autocore` | 165.2 ± 1.6 | 163.2 | 167.5 | 1.33 ± 0.02 |
-| `nix` | 654.9 ± 16.1 | 643.0 | 680.8 | 5.26 ± 0.15 |
-| `lix` | 617.9 ± 15.6 | 605.6 | 642.4 | 4.97 ± 0.14 |
-| `detsys-1core` | 998.8 ± 40.2 | 957.4 | 1041.6 | 8.03 ± 0.34 |
-| `detsys-autocore` | 124.4 ± 1.6 | 122.4 | 126.5 | 1.00 |
-
-#### `wide-list-pipelines`
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `fix-1core` | 334.6 ± 2.8 | 330.4 | 337.3 | 3.82 ± 0.12 |
-| `fix-autocore` | 87.7 ± 2.7 | 85.4 | 92.0 | 1.00 |
-| `nix` | 448.0 ± 10.8 | 436.4 | 461.3 | 5.11 ± 0.20 |
-| `lix` | 395.4 ± 6.0 | 384.7 | 398.5 | 4.51 ± 0.15 |
-| `detsys-1core` | 653.8 ± 5.2 | 647.0 | 659.0 | 7.46 ± 0.23 |
-| `detsys-autocore` | 661.2 ± 16.2 | 641.3 | 686.2 | 7.54 ± 0.29 |
-
-</details>
+The data behind the chart lives in [`bench/results/`](bench/results/):
+[provenance](bench/results/provenance.md), plus per-workload Hyperfine
+tables and raw JSON under each suite directory. `./bench/run` reruns the
+whole benchmark and rewrites that directory in place.
 
 The timing harness uses Hyperfine, with separate warmup and measured runs and
 optional cache reclamation between runs.

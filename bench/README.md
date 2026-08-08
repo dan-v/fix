@@ -11,10 +11,7 @@ configuration: `fix (warm)` / `fix (cold)` (automatic worker count, with the
 persistent compile cache warm or wiped before every timed run), `nix`, `lix`,
 and `detsys` (`--eval-cores 0`). The realworld suite adds an `all-configs`
 workload — every configuration on one command line, where a parallel
-evaluator can overlap independent evaluations. The summary renderer emits
-light and dark charts (`summary.png` / `summary-dark.png`); refresh the
-README's copies from a provenance-stamped run via `demo/benchmark.png` and
-`demo/benchmark-dark.png`.
+evaluator can overlap independent evaluations.
 
 These fixtures are also reused for a *correctness* check, separate from the
 timing harness: `zig build test-bench-fixtures` evaluates every workload under
@@ -22,19 +19,23 @@ timing harness: `zig build test-bench-fixtures` evaluates every workload under
 structurally, so a divergence on any fixture is a visible failure. Filter with
 e.g. `zig build test-bench-fixtures -- torture`.
 
-Build the contained harness and run one or more suites:
+Everything benchmark lives in this directory: `run` (the entry point),
+`harness.nix` (the Nix-contained Hyperfine harness, `-A bench`), `render.py`
+(the chart renderer), `workloads/`, and `results/` — the committed output
+the top-level README links to.
+
+One command reruns the whole benchmark and rewrites `results/` in place:
 
 ```console
-$ nix-build -A bench
-$ TOOLS=fix-1core RUNS=3 ./result/bin/fix-bench torture
-$ RUNS=3 ./result/bin/fix-bench realworld json
+$ ./bench/run
 ```
 
-With no suite, all suites run. `bench.sh` is a convenience wrapper that builds
-the harness without creating a `result` link. Every result tree includes a
-`provenance.md` recording the date, CPU/memory/kernel, run settings, tool
-versions, and pinned inputs of the measurement (plus the fix commit when
-launched via `bench.sh`); published numbers should always cite it. Useful
+With no suite argument, all suites run (`./bench/run torture` etc. narrows).
+The result tree contains `provenance.md` (date, CPU/memory/kernel, run
+settings, tool versions, pinned inputs, and the measured commit — published
+numbers should always cite it), transparent light/dark summary charts
+(`summary.png` / `summary-dark.png`, served by the README via `<picture>`),
+and per-suite directories of Hyperfine Markdown and JSON. Useful
 environment variables are:
 
 - `RUNS` and `WARMUP` control Hyperfine sampling. They default to 5 measured
@@ -47,31 +48,23 @@ environment variables are:
   hugetlb pages required before each run when a pool is configured. It defaults
   to 1024 (2 GiB); set it to 0 to disable the capacity check. Other programs may
   use the pool as long as this much capacity remains available.
-- With no `TOOLS` selector, the harness runs 1-core and automatic profiles for
-  Fix and Determinate, plus the available Nix and Lix rows.
-  `TOOLS=nix,lix,fix-1core` selects exact evaluator rows. `fix` and `detsys`
-  select their complete 1, 2, 8, 16, and automatic parameterized groups for a
-  deliberate scaling sweep; individual rows can still be excluded, as in
-  `TOOLS=fix,-fix-16core`.
-- During focused development, always set `TOOLS` explicitly (normally
-  `TOOLS=fix-1core`, optionally plus one relevant parallel Fix row). The `fix`
-  group expands to every worker profile and is intended for a deliberate full
-  matrix, not a routine refactor check. `bench.sh` recognizes Fix-only selector
-  lists and builds the lightweight `benchFix` harness, so unrelated evaluator
-  packages are not realized before filtering.
-- `WORKLOADS=call-heavy,string-heavy` selects workloads by basename.
-- `OUT=/path` selects the result directory instead of `/tmp/fix-bench.XXXXXX`.
+- With no `TOOLS` selector, all five rows run. `TOOLS` selects rows by group
+  (`fix`, `detsys`), exact name (`TOOLS='fix (warm)',lix`), or `/ERE/` regex;
+  a leading `-` excludes (`TOOLS=-lix`). `./bench/run` recognizes fix-only
+  selector lists and builds the lightweight `benchFix` harness, so unrelated
+  evaluator packages are not realized before filtering. During focused
+  development, set `TOOLS=fix` and a small `WORKLOADS` selection.
+- `WORKLOADS=call-heavy,string-heavy` selects workloads by basename
+  (`all-configs` selects the realworld combined lane).
+- `OUT=/path` redirects output for a scratch run; the default is
+  `bench/results/` via `./bench/run` (a bare `fix-bench` uses a `/tmp`
+  mktemp directory).
 - `BENCH_NIX_PATH` overrides the harness's pinned source search path.
 
-The result root contains a compact landscape `summary.svg` / `summary.png`
-covering every selected suite. Its comparison matrix shows relative wall time
-per evaluator and the absolute best time for each workload. Parameter sweeps,
-such as Fix workers and Determinate evaluator cores, remain expanded but are
-visually grouped. Each suite directory contains Hyperfine Markdown and JSON, an
-SVG and PNG for each workload, and its own detailed `summary.svg` /
-`summary.png`. When one evaluator would flatten the rest of a detailed bar
-chart, the renderer marks and uses a broken time axis while keeping the exact
-times and relative ratios.
+The summary charts are small multiples: one panel per workload, one bar per
+evaluator in fixed order, each labeled with rank, relative multiple, and
+absolute time on a per-panel scale from zero. A bar past 3× the panel's
+fastest tears off, with its true numbers in the label.
 
 ## Running workloads directly
 

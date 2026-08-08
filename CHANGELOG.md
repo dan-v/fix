@@ -81,7 +81,11 @@ All notable changes to `fix` are documented in this file.
   command line. The summary is a light/dark small-multiples chart with
   per-workload rankings, and every result tree is stamped with
   `provenance.md`: the date, hardware, run settings, tool versions, pinned
-  inputs, and measured commit behind the numbers.
+  inputs, and measured commit behind the numbers. Everything lives under
+  `bench/` now (`run`, `harness.nix`, `render.py`, `workloads/`), and one
+  command — `./bench/run` — reruns the whole benchmark and rewrites the
+  committed `bench/results/` tree that the README links to instead of
+  inlining tables.
 - Strict-prefix `let` elision (`strictness.demandPrefix`) generalizes the old
   single-binding eager-elision gate to an ordered, transitively-extended
   prefix of bindings the body provably forces before any other observable

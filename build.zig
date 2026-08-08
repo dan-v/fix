@@ -387,8 +387,8 @@ pub fn build(b: *std.Build) void {
     test_syntax_step.dependOn(&run_syntax_tests.step);
 
     // Parse microbenchmark: `zig build bench-parse -- <file.nix> ...`. Named to
-    // avoid colliding with the differential *eval* benchmark (nix/bench.nix,
-    // driven by ./bench.sh) — this one times the front-end parser alone.
+    // avoid colliding with the differential *eval* benchmark (bench/harness.nix,
+    // driven by ./bench/run) — this one times the front-end parser alone.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("tools/parse_bench.zig"),
         .target = target,
@@ -398,7 +398,7 @@ pub fn build(b: *std.Build) void {
     const bench_exe = b.addExecutable(.{ .name = "parse-bench", .root_module = bench_mod, .use_llvm = true });
     const run_bench = b.addRunArtifact(bench_exe);
     if (b.args) |args| run_bench.addArgs(args);
-    const bench_step = b.step("bench-parse", "Parse microbenchmark (front-end only; eval benchmark lives in nix/bench.nix)");
+    const bench_step = b.step("bench-parse", "Parse microbenchmark (front-end only; eval benchmark lives in bench/harness.nix)");
     bench_step.dependOn(&run_bench.step);
 
     // Language conformance: run the pinned Lix + snix language test corpora
