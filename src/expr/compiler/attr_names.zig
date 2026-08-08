@@ -14,10 +14,6 @@ const InternId = @import("runtime").types.InternId;
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
 
-pub fn equal(self: *const Compiler, a: Node.Atom, b: Node.Atom) bool {
-    return std.mem.eql(u8, span(self, a), span(self, b));
-}
-
 /// Identifier-atom text. A SYNTHETIC atom (full-laziness float names) has
 /// `len == 0` and carries its interned name id in `offset` — real
 /// identifier/name atoms are never empty. Everything else reads the source.

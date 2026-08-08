@@ -41,13 +41,58 @@ pub fn compileLetInWithTailBody(self: *Compiler, node: *const Node) anyerror!voi
 /// pass-3 evaluations read its already-filled slot.
 const RhsEdge = struct { from: u32, to: u32 };
 
+const no_single_leaf = std.math.maxInt(u32);
+
 const LetClassification = struct {
     kinds: []LetBindingKind,
     rhs_edges: []RhsEdge,
+    groups: BindingGroups,
 
     fn deinit(self: *LetClassification, allocator: std.mem.Allocator) void {
         allocator.free(self.kinds);
         allocator.free(self.rhs_edges);
+        self.groups.deinit(allocator);
+    }
+};
+
+/// Bindings grouped by root name, built once per let in `classifyLetBindings`
+/// so no later pass rescans the whole binding list per root (quadratic on the
+/// thousands-of-bindings lets that full-laziness floats synthesize).
+const BindingGroups = struct {
+    /// Binding index → group (unique root name, first-occurrence order).
+    slot_of: []u32,
+    /// Group → earliest binding index with that root.
+    slot_first: []u32,
+    /// Group → its sole `path.len == 1`, non-`inherit_outer` binding index
+    /// when the group is exactly that one leaf; `no_single_leaf` otherwise.
+    single_leaf: []u32,
+    /// Group → member binding indices in source order:
+    /// `items[offsets[slot]..offsets[slot + 1]]`.
+    offsets: []u32,
+    items: []u32,
+
+    fn deinit(self: *BindingGroups, allocator: std.mem.Allocator) void {
+        allocator.free(self.slot_of);
+        allocator.free(self.slot_first);
+        allocator.free(self.single_leaf);
+        allocator.free(self.offsets);
+        allocator.free(self.items);
+    }
+
+    /// True when `index` is the first binding of its root-name group.
+    fn firstAt(self: *const BindingGroups, index: usize) bool {
+        return self.slot_first[self.slot_of[index]] == index;
+    }
+
+    fn members(self: *const BindingGroups, index: usize) []const u32 {
+        const slot = self.slot_of[index];
+        return self.items[self.offsets[slot]..self.offsets[slot + 1]];
+    }
+
+    /// The group's single plain leaf (see `single_leaf`), by any member index.
+    fn singleLeaf(self: *const BindingGroups, bindings: []const Node.Binding, index: usize) ?Node.Binding {
+        const leaf = self.single_leaf[self.slot_of[index]];
+        return if (leaf == no_single_leaf) null else bindings[leaf];
     }
 };
 
@@ -96,6 +141,7 @@ const LetPlan = struct {
     kinds: []LetBindingKind,
     name_ids: []InternId,
     eager: []bool,
+    groups: BindingGroups,
     /// Binding indices PROVABLY forced first (in order) when the body runs —
     /// see `demand_prefix.analyze`. Emitted as direct evaluations into
     /// their slots (no thunk), after every sibling thunk exists, so forward
@@ -110,6 +156,8 @@ const LetPlan = struct {
         defer self.allocator.free(classification.rhs_edges);
         const kinds = classification.kinds;
         errdefer self.allocator.free(kinds);
+        var groups = classification.groups;
+        errdefer groups.deinit(self.allocator);
 
         const name_ids = try self.allocator.alloc(InternId, bindings.len);
         errdefer self.allocator.free(name_ids);
@@ -138,9 +186,9 @@ const LetPlan = struct {
         // in it for that capture to force.
         const prefix_bindings = try self.allocator.alloc(demand_prefix.Binding, bindings.len);
         defer self.allocator.free(prefix_bindings);
-        for (bindings, kinds, name_ids, prefix_bindings) |binding, kind, name_id, *pb| {
+        for (bindings, kinds, name_ids, prefix_bindings, 0..) |binding, kind, name_id, *pb, index| {
             const leaf: ?Node.Binding = if (kind != .unreferenced and binding.inherit_group == 0)
-                singleLeafBinding(self, bindings, binding.path[0])
+                groups.singleLeaf(bindings, index)
             else
                 null;
             const eligible = leaf != null and kind == .uncaptured and isEagerEvalShape(leaf.?.expr);
@@ -212,6 +260,7 @@ const LetPlan = struct {
             .kinds = kinds,
             .name_ids = name_ids,
             .eager = eager,
+            .groups = groups,
             .strict_prefix = try prefix.toOwnedSlice(self.allocator),
             .in_prefix = in_prefix,
         };
@@ -221,6 +270,7 @@ const LetPlan = struct {
         allocator.free(self.kinds);
         allocator.free(self.name_ids);
         allocator.free(self.eager);
+        self.groups.deinit(allocator);
         allocator.free(self.strict_prefix);
         allocator.free(self.in_prefix);
     }
@@ -228,14 +278,14 @@ const LetPlan = struct {
 
 fn declareBindingSlots(self: *Compiler, bindings: []const Node.Binding, plan: LetPlan) !void {
     for (bindings, plan.kinds, 0..) |binding, kind, index| {
-        if (bindingRootSeen(self, bindings[0..index], binding.path[0])) continue;
+        if (!plan.groups.firstAt(index)) continue;
         if (kind == .unreferenced) continue;
         const name = attr_names.span(self, binding.path[0]);
         const name_id = plan.name_ids[index];
         const slot = try scope.declareLocal(self, name, name_id);
         switch (kind) {
             .literal => {
-                const leaf = singleLeafBinding(self, bindings, binding.path[0]).?;
+                const leaf = plan.groups.singleLeaf(bindings, index).?;
                 self.armRecursiveName(name_id);
                 try access.compileContainerValue(self, leaf.expr, .{});
                 try emit.emitSetLocal(self, slot);
@@ -270,7 +320,7 @@ fn emitBindingInitializers(
     inherit_states: *std.AutoHashMapUnmanaged(u32, InheritState),
 ) !void {
     for (bindings, plan.kinds, 0..) |binding, kind, index| {
-        if (bindingRootSeen(self, bindings[0..index], binding.path[0])) continue;
+        if (!plan.groups.firstAt(index)) continue;
         if (kind == .literal or kind == .unreferenced) continue;
         // Strict-prefix members get no thunk at all: pass 3 below evaluates
         // them directly into their slots once every sibling thunk exists.
@@ -293,7 +343,7 @@ fn emitBindingInitializers(
         }
 
         self.armRecursiveName(plan.name_ids[index]);
-        try compileLetRootBinding(self, bindings, binding.path[0], slot, plan.eager[index], inherit_source_slot);
+        try compileLetRootBinding(self, bindings, plan.groups.members(index), slot, plan.eager[index], inherit_source_slot);
         switch (kind) {
             .needs_cell => try emit.emitSetCellLocal(self, slot),
             .uncaptured => try emit.emitSetLocal(self, slot),
@@ -309,7 +359,7 @@ fn emitBindingInitializers(
     // first — is exactly what lazy evaluation would have produced.
     for (plan.strict_prefix) |index| {
         const binding = bindings[index];
-        const leaf = singleLeafBinding(self, bindings, binding.path[0]).?;
+        const leaf = plan.groups.singleLeaf(bindings, index).?;
         const name = attr_names.span(self, binding.path[0]);
         const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
         self.armRecursiveName(plan.name_ids[index]);
@@ -354,12 +404,41 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
     // First binding index per slot: all members of a merged dotted group
     // (`a.x = …; a.y = …`) are compiled together at the group's first
     // index, so their RHS references must be credited to that index.
+    const slot_of = try self.allocator.alloc(u32, bindings.len);
+    errdefer self.allocator.free(slot_of);
     const slot_first = try self.allocator.alloc(u32, slot_count);
-    defer self.allocator.free(slot_first);
+    errdefer self.allocator.free(slot_first);
     @memset(slot_first, std.math.maxInt(u32));
     for (bindings, 0..) |binding, i| {
         const slot = slots.get(attr_names.span(self, binding.path[0])).?;
+        slot_of[i] = slot;
         if (slot_first[slot] == std.math.maxInt(u32)) slot_first[slot] = @intCast(i);
+    }
+
+    // Group membership lists and the per-group single-plain-leaf, one pass.
+    const single_leaf = try self.allocator.alloc(u32, slot_count);
+    errdefer self.allocator.free(single_leaf);
+    @memset(single_leaf, no_single_leaf);
+    const group_offsets = try self.allocator.alloc(u32, slot_count + 1);
+    errdefer self.allocator.free(group_offsets);
+    @memset(group_offsets, 0);
+    for (slot_of) |slot| group_offsets[slot + 1] += 1;
+    for (1..slot_count + 1) |s| group_offsets[s] += group_offsets[s - 1];
+    const group_items = try self.allocator.alloc(u32, bindings.len);
+    errdefer self.allocator.free(group_items);
+    {
+        const cursor = try self.allocator.alloc(u32, slot_count);
+        defer self.allocator.free(cursor);
+        @memcpy(cursor, group_offsets[0..slot_count]);
+        for (slot_of, 0..) |slot, i| {
+            group_items[cursor[slot]] = @intCast(i);
+            cursor[slot] += 1;
+        }
+    }
+    for (bindings, slot_of, 0..) |binding, slot, i| {
+        const sole_member = group_offsets[slot + 1] - group_offsets[slot] == 1;
+        if (sole_member and binding.path.len == 1 and !binding.inherit_outer)
+            single_leaf[slot] = @intCast(i);
     }
 
     const body_hit = try self.allocator.alloc(bool, slot_count);
@@ -389,7 +468,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
         .index = 0,
     };
     defer rhs_marker.edges.deinit(self.allocator);
-    for (bindings) |binding| {
+    for (bindings, 0..) |binding, i| {
         if (binding.path.len > 1) {
             // Nested-path bindings synthesise an attr-set thunk
             // whose captures we don't statically track; conservative:
@@ -397,7 +476,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             any_path_nested = true;
         }
         rhs_marker.stamp += 1;
-        rhs_marker.index = slot_first[slots.get(attr_names.span(self, binding.path[0])).?];
+        rhs_marker.index = slot_first[slot_of[i]];
         refs_mod.walkReferencedNames(self, binding.expr, &rhs_marker);
         // Dotted tail segments may interpolate (`a."${x}" = 1;`): the
         // group's thunk compiles them, so they are RHS references too.
@@ -406,12 +485,12 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
     if (rhs_marker.err) |err| return err;
 
     for (bindings, 0..) |binding, i| {
-        if (bindingRootSeen(self, bindings[0..i], binding.path[0])) {
+        _ = binding;
+        const slot = slot_of[i];
+        if (slot_first[slot] != i) {
             kinds[i] = .needs_cell;
             continue;
         }
-        const name = attr_names.span(self, binding.path[0]);
-        const slot = slots.get(name).?;
 
         const referenced_by_other_rhs = rhs_counts[slot] > 1 or
             (rhs_counts[slot] == 1 and rhs_first[slot] != i);
@@ -421,7 +500,9 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             kinds[i] = .unreferenced;
             continue;
         }
-        if (isLiteralLeafBinding(self, bindings, binding.path[0])) {
+        if (single_leaf[slot] != no_single_leaf and
+            access.isLiteralContainerValue(self, bindings[single_leaf[slot]].expr))
+        {
             kinds[i] = .literal;
             continue;
         }
@@ -435,7 +516,17 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             kinds[i] = .uncaptured;
         }
     }
-    return .{ .kinds = kinds, .rhs_edges = try rhs_marker.edges.toOwnedSlice(self.allocator) };
+    return .{
+        .kinds = kinds,
+        .rhs_edges = try rhs_marker.edges.toOwnedSlice(self.allocator),
+        .groups = .{
+            .slot_of = slot_of,
+            .slot_first = slot_first,
+            .single_leaf = single_leaf,
+            .offsets = group_offsets,
+            .items = group_items,
+        },
+    };
 }
 
 const BodyMarker = struct {
@@ -478,33 +569,14 @@ const RhsMarker = struct {
     }
 };
 
-/// True when the binding group sharing `root` is exactly one leaf
-/// (no nested attr paths, no duplicates) and that leaf's RHS is a
-/// pure literal — i.e. eager evaluation can replace the cell-wrap
-/// without changing observable behaviour.
-fn isLiteralLeafBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {
-    const leaf = singleLeafBinding(self, bindings, root) orelse return false;
-    return access.isLiteralContainerValue(self, leaf.expr);
-}
-
-fn singleLeafBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom) ?Node.Binding {
-    var found: ?Node.Binding = null;
-    for (bindings) |binding| {
-        if (!attr_names.equal(self, binding.path[0], root)) continue;
-        if (binding.path.len != 1) return null;
-        if (binding.inherit_outer) return null;
-        if (found != null) return null;
-        found = binding;
-    }
-    return found;
-}
-
-fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16, eager: bool, inherit_source_slot: ?u16) !void {
+/// Compile one root-name group's initializer. `members` is the group's
+/// binding-index list from `BindingGroups` (source order).
+fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, members: []const u32, slot: u16, eager: bool, inherit_source_slot: ?u16) !void {
     var leaf: ?Node.Binding = null;
     var tail_count: usize = 0;
 
-    for (bindings) |binding| {
-        if (!attr_names.equal(self, binding.path[0], root)) continue;
+    for (members) |member| {
+        const binding = bindings[member];
         if (binding.path.len == 1) {
             if (leaf) |previous| {
                 const span = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
@@ -541,8 +613,9 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
     const tails = try self.allocator.alloc(AttrEntryView, tail_count);
     defer self.allocator.free(tails);
     var i: usize = 0;
-    for (bindings) |binding| {
-        if (!attr_names.equal(self, binding.path[0], root) or binding.path.len == 1) continue;
+    for (members) |member| {
+        const binding = bindings[member];
+        if (binding.path.len == 1) continue;
         tails[i] = .{
             .path = binding.path[1..],
             .expr = binding.expr,
@@ -581,9 +654,3 @@ pub fn isEagerEvalShape(expr: *const Node) bool {
     };
 }
 
-fn bindingRootSeen(self: *const Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {
-    for (bindings) |binding| {
-        if (binding.path.len > 0 and attr_names.equal(self, binding.path[0], root)) return true;
-    }
-    return false;
-}
