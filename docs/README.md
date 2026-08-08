@@ -22,6 +22,7 @@ describing the invariants that changes must preserve.
 - [scopes](compiler/scopes.md) — locals, upvalue captures, `with`
 - [strictness](compiler/strictness.md) — compile-time must-force analysis
 - [let-float](compiler/let-float.md) — demand-driven `let` binding placement rewrite
+- [full-laziness](compiler/full-laziness.md) — floating param-independent bindings and MFEs out of lambdas
 - [lazy-compile](compiler/lazy-compile.md) — deferred compilation + trivial-body elision
 - [chunk-cache](compiler/chunk-cache.md) — persistent per-unit compiled-bytecode cache
 
@@ -63,6 +64,7 @@ describing the invariants that changes must preserve.
 **Operating**
 - [build](build.md) — module layout, `-D` flags, lint, tests
 - [cli](cli.md) — commands + introspection tools
+- [store-compatibility](store-compatibility.md) — daemon protocol client + Nix store interop
 
 ## Conventions
 

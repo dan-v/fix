@@ -49,9 +49,11 @@ heap_string_inline { len: u8, text: [30]u8 }
 
 Source positions live inside the `attrs` variant rather than in every object. `positions.len == 0` means "none" and is never sliced.
 
-## Attrsets: sorted, binary-searched, dup-rejecting
+## Attrsets: structure-of-arrays, sorted, binary-searched, dup-rejecting
 
-An `AttrsObject` holds its `AttrEntry`s **sorted by `InternId`** (name). Lookup (`getAttrValueOpt` → `binarySearchAttr`) is a binary search over the entry slice; sets of up to four entries use the equivalent fixed decision tree to avoid loop and midpoint bookkeeping. Construction (`prepareAttrsRange`) sorts with `std.mem.sort` and **rejects duplicate names** (`rejectDuplicateAttrs`). This ordering is an invariant relied on everywhere — producers that emit already-sorted-unique output take `addAttrsSorted` / `addAttrsFromStackPairsSorted`, which skip the re-sort and dup-check (the k-way flatten, `intersectAttrs`, and the compiler's sorted attrset literals (`attrs_new_srt` / `attrs_new_named*`)).
+Attrset storage is **structure-of-arrays**: the attr store keeps two parallel planes — a names plane (`InternId`, u32) and a values plane (`Value`, 8-aligned, covered by the hugetlb overlay prefix) — and one `AttrRange` addresses both (`AttrsView { names, values }`). Entry *i* is `(names[i], values[i])`. Compared to the old interleaved `{name, value}` entries this drops the 4 B/entry alignment padding (~2.4 GB across a universe eval), and name-only binary searches touch 16 names per cache line instead of 4.
+
+An `AttrsObject`'s names are **sorted by `InternId`**. Lookup (`getAttrValueOpt` → `binarySearchAttrIndex`) is a binary search over the names plane; sets of up to four entries use the equivalent fixed decision tree to avoid loop and midpoint bookkeeping. Construction (`prepareAttrsRange`) sorts and **rejects duplicate names** (`rejectDuplicateAttrs`). This ordering is an invariant relied on everywhere — producers that emit already-sorted-unique output take `addAttrsSorted` / `addAttrsFromStackPairsSorted`, which skip the re-sort and dup-check (the k-way flatten, `intersectAttrs`, and the compiler's sorted attrset literals (`attrs_new_srt` / `attrs_new_named*`)).
 
 ## Layered merge (`merge_attrs`) for `//`
 

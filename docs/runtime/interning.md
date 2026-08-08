@@ -18,14 +18,16 @@ Two `StableSegments` hold the data globally (so ids stay dense and `get` needn't
 
 `get(id)` reads `entries[id]` and slices `data` — a single atomic segment-pointer load per store, no lock. Out-of-range or zero-length ids return `""`.
 
+**Appends go through per-thread TLABs.** Each OS thread holds a `threadlocal` allocation chunk per store (`tlab_chunk_slots`: 256 entries / 4096 bytes), refilled from the global store under its `write_mu`. One mutex acquisition therefore covers hundreds of inserts — this is what removed the intern-table commit convoy under high worker counts — while the small chunk size keeps hot names interned together cache-adjacent for the sort/compare read paths. TLABs are keyed by the table's `token`: a thread touching a different table resets its chunks before use, so a stale TLAB can never write into a dead table's segments.
+
 ## Sharded intern
 
 `intern(s)` is thread-safe and concurrency-friendly:
 
 1. `h = Wyhash(s)`.
-2. Shard = `h & (SHARD_COUNT-1)`; there are **64 shards** (`SHARD_COUNT = 64`), each a `std.HashMapUnmanaged(InternId, void)` open-addressing set guarded by its own `SpinMutex`. Interns of strings hashing to different shards proceed fully in parallel.
+2. Shard = `h & shard_mask`; there are **64 shards** (`shard_count = 64`), each a `std.HashMapUnmanaged(InternId, void)` open-addressing set guarded by its own `SpinMutex`. Interns of strings hashing to different shards proceed fully in parallel.
 3. Under the shard lock, `getOrPutContextAdapted` looks up by the caller's `[]const u8` (a `StringAdapter` compares input bytes against `table.get(id)`) while storing `InternId` keys. The precomputed `h` is threaded in so the map doesn't re-Wyhash the same bytes.
-4. Miss → append bytes to `data` (with `rollback` on mid-allocation failure), append the `Entry`, publish the new id.
+4. Miss → append bytes to `data` and the `Entry` via the thread's TLABs, publish the new id.
 
 **Hash collisions coexist.** The map keys on `InternId` and compares bytes on lookup, so two distinct strings sharing a Wyhash output live as separate entries in the same shard. Interning is insert-only (nothing ever calls `remove`), so the open-addressing set never accumulates tombstones, and it rehashes on crossing `std.hash_map.default_max_load_percentage`; those two together keep probe sequences short — there is no tombstone-driven probe-length blowup.
 
