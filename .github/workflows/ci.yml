@@ -383,7 +383,7 @@ jobs:
           FIX_REQUIRE_DAEMON: "1"
         run: |
           chmod +x fix-releasefast-x86_64-linux
-          bash test/e2e/daemon.sh ./fix-releasefast-x86_64-linux
+          nix-shell --run 'bash test/e2e/daemon.sh ./fix-releasefast-x86_64-linux'
       # Last step on purpose: it is skipped when anything above failed, so a
       # broken job can never publish a poisoned store snapshot.
       - uses: nix-community/cache-nix-action/save@v7
