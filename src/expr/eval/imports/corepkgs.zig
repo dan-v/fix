@@ -36,7 +36,7 @@ pub fn source(path: []const u8) ?[]const u8 {
     \\  outputHashMode = if unpack || executable then "recursive" else "flat";
     \\  preferLocalBuild = true;
     \\  impureEnvVars = [ "http_proxy" "https_proxy" "ftp_proxy" "all_proxy" "no_proxy" ];
-    \\  unpack = false;
+    \\  inherit unpack;
     \\}
     ;
 }
