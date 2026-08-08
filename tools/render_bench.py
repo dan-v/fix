@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Render Hyperfine JSON as readable per-workload and suite overview charts."""
+"""Render Hyperfine JSON as a small-multiples benchmark summary.
+
+One panel per workload, one horizontal bar per evaluator in fixed order.
+Bar length is mean wall time (linear, from zero), so per-workload ranking
+is read directly from geometry; each bar carries its rank, relative
+multiple, and absolute time. fix rows wear the accent hue (warm cache
+dark, cold cache light — an ordinal pair); competitors are context gray —
+identity is carried by row position and labels, never color alone.
+
+Emits light and dark renders (summary.png/.svg, summary-dark.png/.svg)
+for a GitHub <picture> block.
+"""
 
 from __future__ import annotations
 
@@ -7,78 +18,64 @@ import argparse
 import json
 import math
 from pathlib import Path
-import textwrap
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch, Rectangle
+from matplotlib.patches import Patch
 
+# Validated tokens (dataviz reference palette; ordinal blue pair + chrome).
+THEMES = {
+    "light": {
+        "suffix": "",
+        "surface": "#fcfcfb",
+        "ink": "#0b0b0b",
+        "ink2": "#52514e",
+        "muted": "#898781",
+        "hairline": "#e1e0d9",
+        "accent_warm": "#2a78d6",
+        "accent_cold": "#86b6ef",
+        "context": "#c7c5bc",
+        "whisker": "#52514e",
+    },
+    "dark": {
+        "suffix": "-dark",
+        "surface": "#1a1a19",
+        "ink": "#ffffff",
+        "ink2": "#c3c2b7",
+        "muted": "#898781",
+        "hairline": "#2c2c2a",
+        "accent_warm": "#3987e5",
+        "accent_cold": "#86b6ef",
+        "context": "#4a4a47",
+        "whisker": "#c3c2b7",
+    },
+}
 
-BACKGROUND = "#FBF9FD"
-PANEL = "#FFFFFF"
-TEXT = "#241B2F"
-VALUE_TEXT = "#4B4054"
-MUTED = "#716779"
-GRID = "#E9E2ED"
-BORDER = "#D7CFDC"
-MISSING_BACKGROUND = "#F3F0F5"
-MISSING_TEXT = "#9A909F"
-FASTEST_DETAIL = "#DDF2EA"
-COLORS = {
-    "nix": "#4E7FBF",
-    "lix": "#D23C9B",
-    "snix": "#258F83",
-    "detsys-1core": "#F4B45F",
-    "detsys-2core": "#EA9A3A",
-    "detsys-8core": "#D97B22",
-    "detsys-16core": "#BE5D16",
-    "detsys-autocore": "#963F12",
-    "fix-1core": "#AA87DE",
-    "fix-2core": "#9164D0",
-    "fix-8core": "#7745BC",
-    "fix-16core": "#5A2CA0",
-    "fix-autocore": "#442178",
+# Fixed row order — identity by position across every panel. Unknown tool
+# names (explicit TOOLS selections) append after, in first-seen order.
+TOOL_ORDER = ["fix (warm)", "fix (cold)", "nix", "lix", "detsys"]
+
+SUITE_BLURBS = {
+    "torture": "synthetic evaluator hot paths",
+    "realworld": "NixOS + Home Manager configurations",
+    "json": "wide value trees, evaluated and serialized as JSON",
 }
-SUITE_COLORS = {
-    "torture": "#4E7FBF",
-    "realworld": "#7A4CBD",
-    "json": "#258F83",
-}
-PARAMETER_GROUPS = (
-    {
-        "prefix": "detsys-",
-        "label": "DETERMINATE",
-        "parameter": "EVAL CORES",
-        "color": "#C96A1E",
-        "order": 3,
-        "values": ("1core", "2core", "8core", "16core", "autocore"),
-    },
-    {
-        "prefix": "fix-",
-        "label": "FIX",
-        "parameter": "WORKERS",
-        "color": "#5A2CA0",
-        "order": 0,
-        "values": ("1core", "2core", "8core", "16core", "autocore"),
-    },
-)
-TOOL_ORDER = {"nix": 1, "lix": 2, "snix": 4}
-RATIO_STYLES = (
-    (1.0, "#237A66", "#FFFFFF", "fastest"),
-    (1.25, "#DCEFE8", TEXT, "≤ 1.25×"),
-    (2.0, "#E3EAF4", TEXT, "≤ 2×"),
-    (4.0, "#F4E7CF", TEXT, "≤ 4×"),
-    (math.inf, "#F1DADC", TEXT, "> 4×"),
-)
+
+PANELS_PER_ROW = 4
+# Bars past this multiple of the fastest are clipped at the panel edge and
+# labeled with their true multiple — the panel scale stays readable.
+CLIP_RATIO = 3.0
+
+ORDINALS = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th"]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--suite", required=True)
+    parser.add_argument("--unified", action="store_true", help="title as the cross-suite summary")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--unified", action="store_true", help="render one cross-suite summary only")
     parser.add_argument("json_files", nargs="+", type=Path)
     return parser.parse_args()
 
@@ -87,12 +84,11 @@ def load_result(path: Path) -> dict:
     payload = json.loads(path.read_text())
     rows = []
     for result in payload["results"]:
-        mean = float(result["mean"])
         stddev = result.get("stddev")
         rows.append(
             {
                 "name": result["command"],
-                "mean": mean,
+                "mean": float(result["mean"]),
                 "stddev": 0.0 if stddev is None else float(stddev),
                 "runs": len(result.get("times", [])),
             }
@@ -101,460 +97,235 @@ def load_result(path: Path) -> dict:
 
 
 def time_label(seconds: float) -> str:
+    if seconds >= 10:
+        return f"{seconds:.1f} s"
     if seconds >= 1:
-        return f"{seconds:.3f} s"
+        return f"{seconds:.2f} s"
     if seconds >= 0.001:
-        return f"{seconds * 1000:.1f} ms"
+        return f"{seconds * 1000:.0f} ms"
     return f"{seconds * 1_000_000:.0f} µs"
 
 
-def time_stddev_label(mean: float, stddev: float) -> str:
-    if mean >= 1:
-        return f"{mean:.3f} ± {stddev:.3f} s"
-    if mean >= 0.001:
-        return f"{mean * 1000:.1f} ± {stddev * 1000:.1f} ms"
-    return f"{mean * 1_000_000:.0f} ± {stddev * 1_000_000:.0f} µs"
-
-
-def color_for(name: str) -> str:
-    return COLORS.get(name, MUTED)
-
-
-def label_color_for(name: str) -> str:
-    group = parameter_group(name)
-    return group["color"] if group is not None else color_for(name)
-
-
-def parameter_group(name: str) -> dict | None:
-    return next(
-        (group for group in PARAMETER_GROUPS if name.startswith(group["prefix"])),
-        None,
-    )
-
-
-def tool_order(name: str) -> tuple[int, int, str]:
-    group = parameter_group(name)
-    if group is None:
-        return TOOL_ORDER.get(name, len(TOOL_ORDER) + len(PARAMETER_GROUPS)), 0, name
-    value = name.removeprefix(group["prefix"])
-    try:
-        value_order = group["values"].index(value)
-    except ValueError:
-        value_order = len(group["values"])
-    return group["order"], value_order, name
-
-
-def row_layout(names: list[str]) -> tuple[list[float], list[dict]]:
-    """Lay out tool rows with a small break around parameterized families."""
-    positions = []
-    groups = []
-    position = 0.0
-    previous_key = None
-    for name in names:
-        group = parameter_group(name)
-        key = group["prefix"] if group is not None else name
-        if previous_key is not None and key != previous_key:
-            position += 0.42
-        positions.append(position)
-        if group is not None:
-            if not groups or groups[-1]["prefix"] != group["prefix"]:
-                groups.append({**group, "start": position, "end": position})
-            else:
-                groups[-1]["end"] = position
-        position += 1.0
-        previous_key = key
-    return positions, groups
-
-
-def mark_parameter_groups(ax: plt.Axes, groups: list[dict], *, labels: bool) -> None:
-    for group in groups:
-        ax.axhspan(
-            group["start"] - 0.43,
-            group["end"] + 0.43,
-            facecolor=group["color"],
-            alpha=0.035,
-            linewidth=0,
-            zorder=0,
-        )
-        if not labels:
-            continue
-        heading = f"{group['label']} · {group['parameter']}"
-        ax.text(
-            -0.012,
-            group["start"] - 0.56,
-            heading,
-            transform=ax.get_yaxis_transform(),
-            ha="right",
-            va="center",
-            fontsize=7,
-            color=group["color"],
-            fontweight="bold",
-            clip_on=False,
-        )
-
-
-def style_axis(ax: plt.Axes) -> None:
-    ax.set_facecolor(PANEL)
-    ax.grid(axis="x", color=GRID, linewidth=0.75)
-    ax.set_axisbelow(True)
-    for side in ("top", "right", "left"):
-        ax.spines[side].set_visible(False)
-    ax.spines["bottom"].set_color(BORDER)
-    ax.tick_params(axis="x", colors=MUTED, labelsize=8)
-    ax.tick_params(axis="y", colors=TEXT, labelsize=8.5, length=0, pad=7)
-    ax.set_xlabel("mean wall time · lower is better", fontsize=8, color=MUTED)
-
-
-def axis_break(rows: list[dict]) -> tuple[float, float] | None:
-    """Return the values bracketing a scale-wrecking gap, if one exists."""
-    means = sorted(row["mean"] for row in rows)
-    if len(means) < 2:
-        return None
-    gaps = [(upper / lower, lower, upper) for lower, upper in zip(means, means[1:]) if lower > 0]
-    ratio, lower, upper = max(gaps)
-    return (lower, upper) if ratio >= 4.0 else None
-
-
-def bars_on(ax: plt.Axes, rows: list[dict], positions: list[float]) -> list:
-    return ax.barh(
-        positions,
-        [row["mean"] for row in rows],
-        xerr=[row["stddev"] for row in rows],
-        color=[color_for(row["name"]) for row in rows],
-        edgecolor=PANEL,
-        linewidth=0.35,
-        height=0.64,
-        error_kw={"ecolor": VALUE_TEXT, "elinewidth": 1.0, "capsize": 2.5, "capthick": 1.0},
-    )
-
-
-def label_rows(ax: plt.Axes, bars: list, rows: list[dict], fastest: float, selected) -> None:
-    span = ax.get_xlim()[1] - ax.get_xlim()[0]
-    for bar, row in zip(bars, rows):
-        if not selected(row):
-            continue
-        ratio = row["mean"] / fastest
-        label = f"{time_label(row['mean'])}   {ratio:.2f}×"
-        ax.text(
-            row["mean"] + span * 0.025,
-            bar.get_y() + bar.get_height() / 2,
-            label,
-            va="center",
-            ha="left",
-            fontsize=8.2,
-            color=VALUE_TEXT,
-            fontweight="bold" if math.isclose(ratio, 1.0) else "normal",
-        )
-
-
-def draw_workload(fig: plt.Figure, slots, workload: dict) -> None:
-    rows = workload["rows"]
-    fastest = min(row["mean"] for row in rows)
-    upper = max(row["mean"] + row["stddev"] for row in rows)
-    y, parameter_groups = row_layout([row["name"] for row in rows])
-    gap = axis_break(rows)
-
-    if gap is None:
-        ax = fig.add_subplot(slots[0])
-        bars = bars_on(ax, rows, y)
-        label_room = max(upper * 0.38, fastest * 0.9)
-        ax.set_xlim(0, upper + label_room)
-        label_rows(ax, bars, rows, fastest, lambda _row: True)
-        axes = [ax]
-    else:
-        lower, higher = gap
-        split = (lower + higher) / 2
-        ax = fig.add_subplot(slots[1])
-        right = fig.add_subplot(slots[2], sharey=ax)
-        left_bars = bars_on(ax, rows, y)
-        right_bars = bars_on(right, rows, y)
-        ax.set_xlim(0, lower * 1.55)
-        right_start = max(lower * 1.7, higher * 0.88)
-        right_room = max(upper * 0.16, (upper - right_start) * 0.5)
-        right.set_xlim(right_start, upper + right_room)
-        label_rows(ax, left_bars, rows, fastest, lambda row: row["mean"] < split)
-        label_rows(right, right_bars, rows, fastest, lambda row: row["mean"] >= split)
-
-        ax.spines["right"].set_visible(False)
-        right.spines["left"].set_visible(False)
-        right.tick_params(axis="y", left=False, labelleft=False)
-        right.text(
-            0.02,
-            1.025,
-            "broken time axis",
-            transform=right.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=7.5,
-            color=MUTED,
-        )
-        marker = [(-1, -0.6), (1, 0.6)]
-        break_style = dict(marker=marker, markersize=9, linestyle="none", color=MUTED, mec=MUTED, mew=1, clip_on=False)
-        ax.plot([1, 1], [0, 1], transform=ax.transAxes, **break_style)
-        right.plot([0, 0], [0, 1], transform=right.transAxes, **break_style)
-        axes = [ax, right]
-
-    ax.set_yticks(y, [row["name"] for row in rows])
-    title = workload.get("display_name", workload["name"]).replace("-", " ")
-    ax.set_title(title, loc="left", fontsize=11, fontweight="bold", color=TEXT, pad=8)
-    for chart_axis in axes:
-        mark_parameter_groups(chart_axis, parameter_groups, labels=chart_axis is ax)
-        style_axis(chart_axis)
-    ax.invert_yaxis()
-    if gap is not None:
-        right.set_xlabel("")
-
-
-def save_figure(fig: plt.Figure, stem: Path) -> None:
-    fig.savefig(stem.with_suffix(".svg"), format="svg", bbox_inches="tight", facecolor=fig.get_facecolor())
-    fig.savefig(stem.with_suffix(".png"), format="png", dpi=190, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-
-
-def render_single(workload: dict, output_dir: Path, suite: str) -> None:
-    height = max(3.0, 1.35 + 0.43 * len(workload["rows"]))
-    fig = plt.figure(figsize=(11.5, height), facecolor=BACKGROUND)
-    grid = fig.add_gridspec(1, 2, width_ratios=(4.4, 1), wspace=0.09)
-    draw_workload(fig, (grid[0, :], grid[0, 0], grid[0, 1]), workload)
-    runs = max((row["runs"] for row in workload["rows"]), default=0)
-    fig.suptitle(
-        f"fix benchmark · {suite} · {runs} measured run{'s' if runs != 1 else ''}",
-        x=0.01,
-        y=0.985,
-        ha="left",
-        fontsize=9,
-        color=MUTED,
-    )
-    fig.subplots_adjust(left=0.2, right=0.96, bottom=min(0.18, 0.55 / height), top=1 - 0.75 / height)
-    save_figure(fig, output_dir / workload["name"])
-
-
-def render_summary(workloads: list[dict], output_dir: Path, suite: str) -> None:
-    ratios = [1.15 + 0.42 * len(workload["rows"]) for workload in workloads]
-    height = max(4.0, sum(ratios))
-    fig = plt.figure(figsize=(12.5, height), facecolor=BACKGROUND)
-    grid = fig.add_gridspec(
-        len(workloads),
-        2,
-        height_ratios=ratios,
-        width_ratios=(4.4, 1),
-        hspace=0.62,
-        wspace=0.09,
-    )
-    for index, workload in enumerate(workloads):
-        draw_workload(fig, (grid[index, :], grid[index, 0], grid[index, 1]), workload)
-
-    runs = max((row["runs"] for workload in workloads for row in workload["rows"]), default=0)
-    fig.suptitle(
-        f"fix evaluator benchmark · {suite}",
-        x=0.055,
-        y=1 - 0.1 / height,
-        ha="left",
-        fontsize=18,
-        fontweight="bold",
-        color=TEXT,
-    )
-    fig.text(
-        0.055,
-        1 - 0.42 / height,
-        f"Mean wall time ± 1σ · {runs} measured run{'s' if runs != 1 else ''} · values are relative to the fastest evaluator per workload",
-        ha="left",
-        fontsize=9,
-        color=MUTED,
-    )
-    fig.subplots_adjust(left=0.17, right=0.97, bottom=min(0.04, 0.45 / height), top=1 - 0.82 / height)
-    save_figure(fig, output_dir / "summary")
-
-
-def wrapped_workload_label(workload: dict) -> str:
-    name = workload["name"].replace("-", " ")
-    lines = textwrap.wrap(name, width=13, break_long_words=False)
-    fastest = min(row["mean"] for row in workload["rows"])
-    wrapped_name = "\n".join(lines)
-    return f"{wrapped_name}\nbest {time_label(fastest)}"
-
-
-def ratio_style(ratio: float) -> tuple[str, str]:
-    for upper, background, foreground, _label in RATIO_STYLES:
-        if ratio <= upper:
-            return background, foreground
-    raise AssertionError("ratio style table must end at infinity")
-
-
 def ratio_label(ratio: float) -> str:
-    if ratio == 1.0:
-        return "1.00×"
-    if ratio < 1.01:
-        return f"{ratio:.4f}×"
-    if ratio < 1.1:
-        return f"{ratio:.3f}×"
-    if ratio < 10:
-        return f"{ratio:.2f}×"
-    return f"{ratio:.1f}×"
+    return f"{ratio:.2f}×" if ratio < 10 else f"{ratio:.0f}×"
 
 
-def render_unified_summary(workloads: list[dict], output_dir: Path, suite: str) -> None:
-    tool_names = sorted(
-        dict.fromkeys(row["name"] for workload in workloads for row in workload["rows"]),
-        key=tool_order,
-    )
-    row_maps = [{row["name"]: row for row in workload["rows"]} for workload in workloads]
-    fastest = [min(row["mean"] for row in workload["rows"]) for workload in workloads]
-    runs = max((row["runs"] for workload in workloads for row in workload["rows"]), default=0)
-    row_positions, parameter_groups = row_layout(tool_names)
+def tool_names(workloads: list[dict]) -> list[str]:
+    names = list(TOOL_ORDER)
+    for workload in workloads:
+        for row in workload["rows"]:
+            if row["name"] not in names:
+                names.append(row["name"])
+    seen = {row["name"] for workload in workloads for row in workload["rows"]}
+    return [name for name in names if name in seen]
 
-    width = max(14.5, 2.8 + 1.08 * len(workloads))
-    row_extent = row_positions[-1] + 1 if row_positions else 0
-    height = max(7.0, 2.8 + 0.39 * row_extent)
-    fig, ax = plt.subplots(figsize=(width, height), facecolor=BACKGROUND)
-    ax.set_facecolor(PANEL)
-    fig.subplots_adjust(left=max(0.12, 2.15 / width), right=0.985, bottom=0.07, top=0.70)
 
-    for column, (rows_by_name, best) in enumerate(zip(row_maps, fastest)):
-        for tool_name, row_position in zip(tool_names, row_positions):
-            row = rows_by_name.get(tool_name)
-            if row is None:
-                background, foreground = MISSING_BACKGROUND, MISSING_TEXT
-            else:
-                ratio = row["mean"] / best
-                background, foreground = ratio_style(ratio)
-            ax.add_patch(
-                Rectangle(
-                    (column - 0.47, row_position - 0.43),
-                    0.94,
-                    0.86,
-                    facecolor=background,
-                    edgecolor=PANEL,
-                    linewidth=1.0,
-                )
-            )
-            if row is None:
-                ax.text(
-                    column,
-                    row_position,
-                    "—",
-                    ha="center",
-                    va="center",
-                    fontsize=8.2,
-                    color=foreground,
-                )
-            else:
-                is_fastest = ratio == 1.0
-                ax.text(
-                    column,
-                    row_position - 0.11,
-                    ratio_label(ratio),
-                    ha="center",
-                    va="center",
-                    fontsize=7.7,
-                    color=foreground,
-                    fontweight="bold" if is_fastest else "normal",
-                )
-                ax.text(
-                    column,
-                    row_position + 0.17,
-                    time_stddev_label(row["mean"], row["stddev"]),
-                    ha="center",
-                    va="center",
-                    fontsize=5.6,
-                    color=FASTEST_DETAIL if is_fastest else MUTED,
-                )
+def bar_color(name: str, theme: dict) -> str:
+    if name == "fix (warm)":
+        return theme["accent_warm"]
+    if name == "fix (cold)":
+        return theme["accent_cold"]
+    return theme["context"]
 
-    ax.set_xlim(-0.5, len(workloads) - 0.5)
-    ax.set_ylim(row_extent - 0.5, -0.5)
-    ax.set_xticks(range(len(workloads)), [wrapped_workload_label(item) for item in workloads])
-    ax.set_yticks(row_positions, tool_names)
-    ax.tick_params(axis="x", top=True, labeltop=True, bottom=False, labelbottom=False, length=0, pad=11, labelsize=8)
-    ax.tick_params(axis="y", length=0, pad=10, labelsize=8.5, colors=TEXT)
-    for label in ax.get_xticklabels():
-        label.set_color(VALUE_TEXT)
-        label.set_linespacing(1.3)
-    for label, tool_name in zip(ax.get_yticklabels(), tool_names):
-        label.set_color(label_color_for(tool_name))
-        label.set_fontweight("bold")
-    mark_parameter_groups(ax, parameter_groups, labels=True)
+
+def draw_panel(ax: plt.Axes, workload: dict, names: list[str], theme: dict, label_rows: bool) -> None:
+    rows = {row["name"]: row for row in workload["rows"]}
+    present = [name for name in names if name in rows]
+    fastest = min(rows[name]["mean"] for name in present)
+    ranks = {
+        name: rank
+        for rank, name in enumerate(sorted(present, key=lambda n: rows[n]["mean"]))
+    }
+    # Stretch bars across the panel: the scale ends just past the slowest
+    # bar, but never beyond CLIP_RATIO× the fastest (outliers clip with ▸).
+    worst = max(rows[name]["mean"] for name in present) / fastest
+    limit = fastest * min(CLIP_RATIO, max(1.35, worst * 1.06))
+
+    ax.set_facecolor(theme["surface"])
+    ax.set_xlim(0, limit * 1.02)
+    ax.set_ylim(len(names) - 0.5, -0.5)
     for spine in ax.spines.values():
         spine.set_visible(False)
+    ax.set_xticks([])
+    ax.set_yticks([])
 
-    suite_ranges = []
-    start = 0
-    while start < len(workloads):
-        suite_name = workloads[start]["suite"]
-        end = start + 1
-        while end < len(workloads) and workloads[end]["suite"] == suite_name:
-            end += 1
-        suite_ranges.append((suite_name, start, end))
-        start = end
-    for suite_name, start, end in suite_ranges:
-        color = SUITE_COLORS.get(suite_name, MUTED)
-        midpoint = (start + end - 1) / 2
-        ax.plot(
-            [start - 0.45, end - 0.55],
-            [1.225, 1.225],
-            transform=ax.get_xaxis_transform(),
-            color=color,
-            linewidth=3.0,
-            solid_capstyle="round",
-            clip_on=False,
-        )
+    for position, name in enumerate(names):
+        row = rows.get(name)
+        if row is None:
+            ax.text(0, position, "—", ha="left", va="center", fontsize=7, color=theme["muted"])
+            continue
+        ratio = row["mean"] / fastest
+        clipped = row["mean"] > limit
+        length = min(row["mean"], limit)
+        ax.barh(position, length, height=0.62, color=bar_color(name, theme), linewidth=0)
+        if not clipped and row["stddev"] > 0:
+            ax.plot(
+                [max(0.0, row["mean"] - row["stddev"]), min(limit, row["mean"] + row["stddev"])],
+                [position, position],
+                color=theme["whisker"],
+                linewidth=0.8,
+                alpha=0.55,
+                solid_capstyle="butt",
+            )
+        winner = ranks[name] == 0
+        ordinal = ORDINALS[ranks[name]]
+        if winner:
+            text = f"{ordinal} · {time_label(row['mean'])}"
+        else:
+            text = f"{ordinal} · {ratio_label(ratio)} · {time_label(row['mean'])}"
+        if clipped:
+            text = f"▸ {ordinal} · {ratio_label(ratio)} · {time_label(row['mean'])}"
+        inside = length > limit * 0.55
         ax.text(
-            midpoint,
-            1.255,
-            suite_name.upper(),
-            transform=ax.get_xaxis_transform(),
-            ha="center",
-            va="bottom",
-            fontsize=8,
-            color=color,
-            fontweight="bold",
+            length - limit * 0.03 if inside else length + limit * 0.03,
+            position,
+            text,
+            ha="right" if inside else "left",
+            va="center",
+            fontsize=6.6,
+            color=("#ffffff" if name == "fix (warm)" else theme["ink"]) if inside else (theme["ink"] if winner else theme["ink2"]),
+            fontweight="bold" if winner else "normal",
         )
 
-    fig.suptitle(
-        f"fix evaluator benchmark · {suite}",
-        x=max(0.045, 0.8 / width),
-        y=0.965,
-        ha="left",
-        fontsize=18,
+    if label_rows:
+        for position, name in enumerate(names):
+            ax.text(
+                -limit * 0.045,
+                position,
+                name,
+                ha="right",
+                va="center",
+                fontsize=7.2,
+                color=theme["ink"] if name.startswith("fix") else theme["ink2"],
+                fontweight="bold" if name.startswith("fix") else "normal",
+            )
+
+    ax.set_title(
+        workload["name"].replace("-", " "),
+        loc="left",
+        fontsize=9,
         fontweight="bold",
-        color=TEXT,
+        color=theme["ink"],
+        pad=4,
+    )
+
+
+def wins_line(workloads: list[dict], names: list[str]) -> str:
+    wins: dict[str, int] = {name: 0 for name in names}
+    for workload in workloads:
+        rows = {row["name"]: row for row in workload["rows"]}
+        present = [name for name in names if name in rows]
+        if not present:
+            continue
+        winner = min(present, key=lambda n: rows[n]["mean"])
+        wins[winner] += 1
+    parts = [f"{name} {count}" for name, count in wins.items() if count]
+    return f"fastest per workload:  {' · '.join(parts)}  (of {len(workloads)})"
+
+
+def render(workloads: list[dict], output_dir: Path, suite: str, theme: dict) -> None:
+    names = tool_names(workloads)
+
+    sections: list[tuple[str, list[dict]]] = []
+    for workload in workloads:
+        if sections and sections[-1][0] == workload["suite"]:
+            sections[-1][1].append(workload)
+        else:
+            sections.append((workload["suite"], [workload]))
+
+    panel_rows = [(suite_name, math.ceil(len(items) / PANELS_PER_ROW)) for suite_name, items in sections]
+    total_rows = sum(rows for _name, rows in panel_rows)
+    header_h, row_h, title_h = 0.34, 0.24 + 0.215 * len(names), 0.78
+    fig_h = title_h + sum(header_h + rows * row_h for _name, rows in panel_rows) + 0.25
+    fig_w = 12.6
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=theme["surface"])
+
+    outer = fig.add_gridspec(
+        len(sections) * 2,
+        1,
+        height_ratios=[r for _name, rows in panel_rows for r in (header_h, rows * row_h)],
+        top=1 - title_h / fig_h,
+        bottom=0.25 / fig_h,
+        left=0.075,
+        right=0.99,
+        hspace=0.28,
+    )
+
+    for section_index, (suite_name, items) in enumerate(sections):
+        header = fig.add_subplot(outer[section_index * 2])
+        header.set_axis_off()
+        blurb = SUITE_BLURBS.get(suite_name, "")
+        header.text(0, 0.1, suite_name.upper(), ha="left", va="bottom", fontsize=10.5, fontweight="bold", color=theme["ink"])
+        if blurb:
+            header.text(0.995, 0.1, blurb, ha="right", va="bottom", fontsize=8, color=theme["muted"], transform=header.transAxes)
+        header.axhline(y=0.0, color=theme["hairline"], linewidth=0.8)
+
+        rows_here = panel_rows[section_index][1]
+        inner = outer[section_index * 2 + 1].subgridspec(rows_here, PANELS_PER_ROW, hspace=0.62, wspace=0.26)
+        for index, workload in enumerate(items):
+            ax = fig.add_subplot(inner[index // PANELS_PER_ROW, index % PANELS_PER_ROW])
+            draw_panel(ax, workload, names, theme, label_rows=index % PANELS_PER_ROW == 0)
+
+    runs = max((row["runs"] for workload in workloads for row in workload["rows"]), default=0)
+    fig.text(
+        0.075,
+        1 - 0.24 / fig_h,
+        f"fix evaluator benchmark · {suite}",
+        ha="left",
+        va="center",
+        fontsize=15,
+        fontweight="bold",
+        color=theme["ink"],
     )
     fig.text(
-        max(0.045, 0.8 / width),
-        0.92,
-        f"Mean wall time relative to the fastest evaluator per workload · {runs} measured run{'s' if runs != 1 else ''} · absolute best shown under each workload",
+        0.075,
+        1 - 0.46 / fig_h,
+        f"mean wall time, shorter is faster · bars share a per-panel scale from zero; anything past {CLIP_RATIO:.0f}× the fastest clips (▸) · "
+        f"{runs} measured run{'s' if runs != 1 else ''} · provenance.md records the machine and pins",
         ha="left",
-        fontsize=9,
-        color=MUTED,
-    )
-    legend_handles = [
-        Patch(facecolor=background, edgecolor="none", label=label)
-        for _upper, background, _foreground, label in RATIO_STYLES
-    ]
-    fig.legend(
-        handles=legend_handles,
-        loc="upper left",
-        bbox_to_anchor=(max(0.04, 0.79 / width), 0.89),
-        ncol=len(legend_handles),
-        frameon=False,
-        handlelength=1.4,
-        handleheight=0.8,
-        columnspacing=1.6,
+        va="center",
         fontsize=8,
-        labelcolor=MUTED,
+        color=theme["muted"],
     )
-    save_figure(fig, output_dir / "summary")
+    fig.text(
+        0.075,
+        1 - 0.63 / fig_h,
+        wins_line(workloads, names),
+        ha="left",
+        va="center",
+        fontsize=8.5,
+        color=theme["ink2"],
+        fontweight="bold",
+    )
+    fig.legend(
+        handles=[
+            Patch(facecolor=theme["accent_warm"], label="fix, warm compile cache"),
+            Patch(facecolor=theme["accent_cold"], label="fix, cold compile cache"),
+            Patch(facecolor=theme["context"], label="other evaluators (named per row)"),
+        ],
+        loc="upper right",
+        bbox_to_anchor=(0.99, 1 - 0.12 / fig_h),
+        ncol=3,
+        frameon=False,
+        handlelength=1.1,
+        handleheight=0.9,
+        columnspacing=1.3,
+        fontsize=7.5,
+        labelcolor=theme["ink2"],
+    )
+
+    stem = output_dir / f"summary{theme['suffix']}"
+    fig.savefig(stem.with_suffix(".svg"), format="svg", facecolor=fig.get_facecolor())
+    fig.savefig(stem.with_suffix(".png"), format="png", dpi=200, facecolor=fig.get_facecolor())
+    plt.close(fig)
 
 
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     workloads = [load_result(path) for path in args.json_files]
-    if args.unified:
-        render_unified_summary(workloads, args.output_dir, args.suite)
-    else:
-        for workload in workloads:
-            render_single(workload, args.output_dir, args.suite)
-        render_summary(workloads, args.output_dir, args.suite)
+    for theme in THEMES.values():
+        render(workloads, args.output_dir, args.suite, theme)
 
 
 if __name__ == "__main__":

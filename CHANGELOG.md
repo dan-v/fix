@@ -73,9 +73,15 @@ All notable changes to `fix` are documented in this file.
   thread-local chunks, amortizing the store mutex to one acquisition per
   hundreds of inserts — removing the commit convoy that dominated
   string-heavy evaluation at high worker counts.
-- The benchmark harness stamps every result tree with `provenance.md`: the
-  date, hardware, run settings, tool versions, pinned inputs, and measured
-  commit behind the numbers.
+- The benchmark harness compares one row per evaluator, each in its best
+  default configuration, with explicit warm- and cold-compile-cache lanes
+  for fix (the cold lane's cache directory is wiped before every timed run,
+  so the persistent cache is never silently flattering) and an
+  `all-configs` realworld workload that passes every configuration on one
+  command line. The summary is a light/dark small-multiples chart with
+  per-workload rankings, and every result tree is stamped with
+  `provenance.md`: the date, hardware, run settings, tool versions, pinned
+  inputs, and measured commit behind the numbers.
 - Strict-prefix `let` elision (`strictness.demandPrefix`) generalizes the old
   single-binding eager-elision gate to an ordered, transitively-extended
   prefix of bindings the body provably forces before any other observable

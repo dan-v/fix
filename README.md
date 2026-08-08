@@ -267,15 +267,25 @@ across synthetic stress tests, real NixOS and Home Manager configurations, and
 JSON-producing workloads. Each cell is relative to the fastest evaluator for
 that workload; `1.00×` is fastest. The harness defaults to five recorded runs.
 
-Rows: `fix-Ncore` is `fix --workers=N` and `fix-autocore` the default worker
-count; `nix` and `lix` are the pinned CppNix and Lix; `detsys-*` is
-[Determinate Nix](https://github.com/DeterminateSystems/nix-src) at the given
-`--eval-cores`. Every harness run (`./bench.sh`) writes a `provenance.md`
-next to the results recording the date, hardware, run settings, tool
-versions, pins, and measured commit — reproduce and compare against your own
-hardware rather than trusting these numbers.
+Every evaluator runs in its best default configuration, one row each.
+`fix (warm)` and `fix (cold)` are fix at its automatic worker count with the
+persistent compile cache warm (populated by a warmup run) or cold (the cache
+directory is wiped before every timed run) — the cache is a real speedup, so
+it is shown explicitly rather than baked invisibly into one number. `nix` and
+`lix` are the pinned CppNix and Lix; `detsys` is
+[Determinate Nix](https://github.com/DeterminateSystems/nix-src) with
+`--eval-cores 0` (all cores). The realworld suite also runs `all-configs`:
+every configuration passed on a single command line, where a parallel
+evaluator can overlap independent evaluations. Every harness run
+(`./bench.sh`) writes a `provenance.md` next to the results recording the
+date, hardware, run settings, tool versions, pins, and measured commit —
+reproduce and compare against your own hardware rather than trusting these
+numbers.
 
-![fix evaluator benchmark](demo/benchmark.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="demo/benchmark-dark.png">
+  <img alt="fix evaluator benchmark summary" src="demo/benchmark.png">
+</picture>
 
 <details>
 <summary>Full benchmark tables</summary>

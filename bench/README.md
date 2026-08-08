@@ -6,9 +6,15 @@ The benchmark harness has three independent suites:
 - `realworld`: NixOS and Home Manager scalar evaluations; and
 - `json`: wide result trees evaluated and serialized as JSON.
 
-By default, each suite compares 1-core and automatic profiles for Fix and
-Determinate alongside the other applicable evaluators. Full core-count sweeps
-remain available through explicit `TOOLS` selectors.
+Each suite compares one row per evaluator, each in its best default
+configuration: `fix (warm)` / `fix (cold)` (automatic worker count, with the
+persistent compile cache warm or wiped before every timed run), `nix`, `lix`,
+and `detsys` (`--eval-cores 0`). The realworld suite adds an `all-configs`
+workload — every configuration on one command line, where a parallel
+evaluator can overlap independent evaluations. The summary renderer emits
+light and dark charts (`summary.png` / `summary-dark.png`); refresh the
+README's copies from a provenance-stamped run via `demo/benchmark.png` and
+`demo/benchmark-dark.png`.
 
 These fixtures are also reused for a *correctness* check, separate from the
 timing harness: `zig build test-bench-fixtures` evaluates every workload under

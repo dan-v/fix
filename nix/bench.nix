@@ -29,13 +29,13 @@
   nixpkgs = sources.nixpkgs;
   homeManager = pkgs.home-manager.src;
   workloads = ../bench/workloads;
-  fixWorkerCounts = [
-    1
-    2
-    8
-    16
-    32
-  ];
+
+  # One row per evaluator, each in its best default configuration (fix at its
+  # automatic worker count, Determinate at --eval-cores 0 = all cores). fix
+  # gets explicit compile-cache lanes so the persistent chunk cache is never
+  # silently flattering: the cold lane's cache directory is wiped before
+  # every timed run, the warm lane's persists (hyperfine's warmup run
+  # populates it). @CACHE_*@ placeholders are substituted at runtime.
   fixTools = json:
     optionals (fix != null) (
       let
@@ -43,53 +43,31 @@
           if json
           then " --json"
           else ""
-        } --strict";
-      in
-        map (
-          workers: "fix-${toString workers}core|fix|${base} --workers=${toString workers} --no-progress --file"
-        )
-        fixWorkerCounts
-        ++ ["fix-autocore|fix|${base} --no-progress --file"]
-    );
-
-  detsysTools = {
-    json ? false,
-    scaling ? false,
-  }:
-    optionals (detsys != null) (
-      let
-        base =
-          if json
-          then "${detsys}/bin/nix eval --json"
-          else "${detsys}/bin/nix-instantiate --eval --strict";
-        suffix =
+        } --strict --no-progress";
+        fileArg =
           if json
           then " --file"
           else "";
-        coreCounts =
-          if scaling
-          then [
-            1
-            2
-            8
-            16
-          ]
-          else [1];
-      in
-        map (
-          cores: "detsys-${toString cores}core|detsys|${base} --eval-cores ${toString cores}${suffix}"
-        )
-        coreCounts
-        ++ ["detsys-autocore|detsys|${base} --eval-cores 0${suffix}"]
+      in [
+        "fix (warm)|fix|${base} --compile-cache-dir @CACHE_WARM@${fileArg}"
+        "fix (cold)|fix|${base} --compile-cache-dir @CACHE_COLD@${fileArg}"
+      ]
     );
 
-  # Keep the full parameterized families available to explicit TOOLS selectors.
-  # The shell defaults to 1-core and automatic rows for both families.
+  detsysTools = {json ? false}:
+    optionals (detsys != null) [
+      (
+        if json
+        then "detsys|detsys|${detsys}/bin/nix eval --json --eval-cores 0 --file"
+        else "detsys|detsys|${detsys}/bin/nix-instantiate --eval --strict --eval-cores 0"
+      )
+    ];
+
   scalarTools =
     fixTools false
     ++ optional (nix != null) "nix|nix|${nix}/bin/nix-instantiate --eval --strict"
     ++ optional (lix != null) "lix|lix|${lix}/bin/nix-instantiate --eval --strict"
-    ++ detsysTools {scaling = true;};
+    ++ detsysTools {};
 
   tortureTools = scalarTools;
 
@@ -101,10 +79,7 @@
     fixTools true
     ++ optional (nix != null) "nix|nix|${nix}/bin/nix eval --json --file"
     ++ optional (lix != null) "lix|lix|${lix}/bin/nix eval --json --file"
-    ++ detsysTools {
-      json = true;
-      scaling = true;
-    };
+    ++ detsysTools {json = true;};
 
   # Human-readable identity of a store path for the provenance record:
   # the name without the 32-char /nix/store hash prefix and its dash.
@@ -158,6 +133,19 @@
     set -euo pipefail
     exec sudo ${reclaimMemoryAsRoot} "$@"
   '';
+  # Per-run preparation for the cold compile-cache lane: the usual memory
+  # reclaim (when enabled), then wipe the lane's cache directory so every
+  # timed run pays the full parse + compile cost.
+  prepareCold = pkgs.writeShellScript "fix-bench-prepare-cold" ''
+    set -euo pipefail
+    reclaim="$1"
+    hugetlb_min="$2"
+    dir="$3"
+    if [[ "$reclaim" == 1 ]]; then
+      sudo ${reclaimMemoryAsRoot} "$hugetlb_min"
+    fi
+    rm -rf -- "$dir"
+  '';
 in
   pkgs.writeShellApplication {
     name = "fix-bench";
@@ -183,13 +171,17 @@ in
         TOOLS=RULE,...      select evaluator rows: group, exact name, or /Bash ERE/;
                             prefix a rule with - to exclude it. If every rule
                             is negative, all tools start included.
-                            Default: fix/detsys 1-core + auto, plus other tools.
-                            Groups: fix, detsys (for parameterized profiles)
+                            Default rows: fix (warm), fix (cold), nix, lix,
+                            detsys — every tool in its best configuration; the
+                            fix rows make the compile cache explicit (cold is
+                            wiped before every timed run).
+                            Groups: fix, detsys
                             Examples: TOOLS=fix,lix
-                                      TOOLS=fix,-fix-16core
-                                      TOOLS='/fix-.*/,-/fix-..core/'
+                                      TOOLS='fix (warm)',detsys
                                       TOOLS=-lix
         WORKLOADS=a,b,c     include only these workload names
+                            (realworld adds all-configs: every config on one
+                            command line)
         BENCH_NIX_PATH=...  override the pinned benchmark NIX_PATH
       EOF
       }
@@ -207,7 +199,11 @@ in
         echo "invalid HUGETLB_MIN_AVAILABLE value: $hugetlb_min_available (expected a non-negative page count)" >&2
         exit 2
       fi
-      prepare_args=()
+      # Preparation before every timed run: memory reclaim for all rows, plus
+      # a cache wipe for the cold compile-cache lane. hyperfine takes one
+      # --prepare per command, so these are built per row in the suite loop.
+      reclaim_flag=0
+      base_prepare=true
       case "$reclaim_memory" in
         1|true|yes)
           if ! command -v sudo >/dev/null; then
@@ -216,7 +212,8 @@ in
           fi
           echo "authorizing per-run memory reclaim with sudo"
           sudo -v
-          prepare_args=(--prepare "${prepareMemory} $hugetlb_min_available")
+          reclaim_flag=1
+          base_prepare="${prepareMemory} $hugetlb_min_available"
           ;;
         0|false|no)
           ;;
@@ -231,6 +228,9 @@ in
       else
         out="$(mktemp -d /tmp/fix-bench.XXXXXX)"
       fi
+      warm_cache_dir="$out/compile-cache-warm"
+      cold_cache_dir="$out/compile-cache-cold"
+      cold_prepare="${prepareCold} $reclaim_flag $hugetlb_min_available $cold_cache_dir"
 
       pinned_nix_path=${lib.escapeShellArg "nixpkgs=${nixpkgs}:home-manager=${homeManager}"}
       export NIX_PATH="''${BENCH_NIX_PATH:-$pinned_nix_path}"
@@ -351,13 +351,6 @@ in
         local name="$1"
         local group="$2"
         local rule selector
-        if [[ "''${#tool_rules[@]}" -eq 0 ]]; then
-          case "$name" in
-            fix-2core|fix-8core|fix-16core|detsys-2core|detsys-8core|detsys-16core)
-              return 1
-              ;;
-          esac
-        fi
         local included=1
         if [[ "$tool_has_include" -eq 1 ]]; then
           included=0
@@ -406,17 +399,25 @@ in
 
         ran=0
         json_files=()
-        for f in "$workload_dir"/*.nix; do
-          name="$(basename "$f" .nix)"
-          workload_selected "$name" || continue
+
+        run_workload() {
+          local name="$1"
+          shift
           echo "-- $name --"
-          args=()
+          local args=() prepare_flags=() tool label tool_fields group cmd
           for tool in "''${tools[@]}"; do
             label="''${tool%%|*}"
             tool_fields="''${tool#*|}"
             group="''${tool_fields%%|*}"
             tool_selected "$label" "$group" || continue
-            cmd="''${tool_fields#*|} $f"
+            cmd="''${tool_fields#*|} $*"
+            cmd="''${cmd//@CACHE_WARM@/$warm_cache_dir}"
+            if [[ "$cmd" == *@CACHE_COLD@* ]]; then
+              cmd="''${cmd//@CACHE_COLD@/$cold_cache_dir}"
+              prepare_flags+=(--prepare "$cold_prepare")
+            else
+              prepare_flags+=(--prepare "$base_prepare")
+            fi
             args+=(-n "$label" "$cmd")
           done
 
@@ -426,14 +427,29 @@ in
           fi
 
           hyperfine --shell=none --warmup "$warmup" --runs "$runs" --sort command \
-            "''${prepare_args[@]}" \
+            "''${prepare_flags[@]}" \
             --export-json "$suite_out/$name.json" \
             --export-markdown "$suite_out/$name.md" \
             "''${args[@]}"
           json_files+=("$suite_out/$name.json")
           all_json_files+=("$suite_out/$name.json")
           ran=1
+        }
+
+        suite_files=()
+        for f in "$workload_dir"/*.nix; do
+          suite_files+=("$f")
+          name="$(basename "$f" .nix)"
+          workload_selected "$name" || continue
+          run_workload "$name" "$f"
         done
+
+        # The whole suite passed on ONE command line: independent top-level
+        # evaluations that a parallel evaluator can overlap. Scalar rows
+        # only — the json rows take exactly one --file argument.
+        if [[ "$suite" == realworld ]] && workload_selected all-configs; then
+          run_workload all-configs "''${suite_files[@]}"
+        fi
 
         if [[ "$ran" -eq 1 ]]; then
           python3 ${../tools/render_bench.py} \
@@ -455,8 +471,8 @@ in
 
       echo "benchmark results: $out"
       echo "unified charts:"
-      find "$out" -mindepth 1 -maxdepth 1 -name 'summary.*' -print | sort
+      find "$out" -mindepth 1 -maxdepth 1 -name 'summary*' -print | sort
       echo "suite charts:"
-      find "$out" -mindepth 2 -maxdepth 2 -name 'summary.*' -print | sort
+      find "$out" -mindepth 2 -maxdepth 2 -name 'summary*' -print | sort
     '';
   }
