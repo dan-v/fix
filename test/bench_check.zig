@@ -13,7 +13,11 @@ const proc = @import("lang/proc.zig");
 const fsx = @import("lang/fsx.zig");
 const yaml = @import("lang/yaml.zig");
 
-const eval_timeout_ns: i96 = 600 * std.time.ns_per_s;
+/// Per-eval wall budget. Overridable because instrumented builds change the
+/// meaning of "hung": under ThreadSanitizer's 10-20x multiplier the large
+/// realworld fixtures legitimately need well over the plain-build budget
+/// (build.zig passes a raised `--eval-timeout-secs` whenever `-Dtsan` is on).
+var eval_timeout_ns: i96 = 600 * std.time.ns_per_s;
 
 const Options = struct {
     fix: []const u8 = "zig-out/bin/fix",
@@ -42,6 +46,12 @@ pub fn main(init: std.process.Init) !void {
         else if (std.mem.eql(u8, a, "--repo")) opts.repo = args.next() orelse fatal("--repo needs an argument") //
         else if (std.mem.eql(u8, a, "--nix")) opts.nix = args.next() orelse fatal("--nix needs an argument") //
         else if (std.mem.eql(u8, a, "--workers")) opts.workers = args.next() orelse fatal("--workers needs an argument") //
+        else if (std.mem.eql(u8, a, "--eval-timeout-secs")) {
+            const v = args.next() orelse fatal("--eval-timeout-secs needs an argument");
+            const secs = std.fmt.parseInt(u32, v, 10) catch fatal("--eval-timeout-secs: not a number");
+            if (secs == 0) fatal("--eval-timeout-secs: must be positive");
+            eval_timeout_ns = @as(i96, secs) * std.time.ns_per_s;
+        } //
         else try filters.append(arena, a); // substring selectors, e.g. `torture`
     }
 

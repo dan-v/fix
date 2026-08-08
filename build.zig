@@ -451,6 +451,10 @@ pub fn build(b: *std.Build) void {
     run_bench_check.addArg(b.pathFromRoot("."));
     run_bench_check.addArg("--fix");
     run_bench_check.addArg(b.pathFromRoot("zig-out/bin/fix"));
+    // TSan's 10-20x eval multiplier makes the plain 600s per-eval budget read
+    // large realworld fixtures as hung. Raised default first, so an explicit
+    // `-- --eval-timeout-secs N` still wins (last occurrence is parsed).
+    if (tsan) run_bench_check.addArgs(&.{ "--eval-timeout-secs", "3600" });
     if (b.args) |args| run_bench_check.addArgs(args);
     bench_check_step.dependOn(&run_bench_check.step);
 
