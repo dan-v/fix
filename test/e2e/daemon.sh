@@ -99,6 +99,19 @@ else
 fi
 t "daemon: read fresh text object" "text-via-daemon" "$out"
 
+# AddIndirectRoot's dummy result must be consumed so the connection stays
+# usable for the next operation.
+root_dir=$(e2e_mktemp)
+drv2_expr='builtins.derivation {
+  name = "fix-daemon-e2e-2";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  args = [ "-c" "printf second > \"$out\"" ];
+}'
+out=$("$FIX" instantiate --add-root "$root_dir/root" --indirect -E "$drv_expr" -E "$drv2_expr" 2>&1)
+t "daemon: connection survives an indirect root registration" "fix-daemon-e2e-2.drv" "$out"
+t_absent "daemon: no stray result after indirect root" "unknown stderr message" "$out"
+
 # An absolute store URI is a Nix/Lix chroot store root. It must not silently
 # delegate to an installed implementation while the native backend is pending.
 local_root=$(e2e_mktemp)
