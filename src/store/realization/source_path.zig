@@ -24,6 +24,21 @@ pub fn storePathForSource(
     return storePathForSourceName(allocator, realization, files, path, path_ops.baseName(path));
 }
 
+/// `storePathForSource` for a coerced path VALUE: Nix's copyPathToStore
+/// fetches every source unconditionally under its full basename, store
+/// paths included, so /nix/store/<h>-src becomes /nix/store/<h2>-<h>-src.
+/// Store-path STRINGS (an already-coerced source in a derivation context)
+/// keep the passthrough above.
+pub fn storePathForSourceValue(
+    allocator: std.mem.Allocator,
+    realization: *RealizationStore,
+    files: *FileCache,
+    path: []const u8,
+) ![]u8 {
+    if (!std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    return storePathForSourceName(allocator, realization, files, path, path_ops.baseName(path));
+}
+
 pub fn storePathForSourceName(
     allocator: std.mem.Allocator,
     realization: *RealizationStore,

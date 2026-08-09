@@ -99,6 +99,25 @@ else
 fi
 t "daemon: read fresh text object" "text-via-daemon" "$out"
 
+# A PATH VALUE at a store path copies under its full basename on string
+# coercion, as Nix's copyPathToStore does; only string-shaped store paths
+# pass through.
+srccopy_dir=$(e2e_mktemp)
+mkdir -p "$srccopy_dir/tree"
+printf 'copy-me' >"$srccopy_dir/tree/inner.txt"
+out=$("$FIX" eval --raw --read-write-mode --impure -E "
+  let sp = builtins.unsafeDiscardStringContext (toString (builtins.path { path = $srccopy_dir/tree; name = \"fix-daemon-e2e-srccopy\"; }));
+      copied = \"\" + (/. + sp);
+      bn = baseNameOf sp;
+      bc = baseNameOf copied;
+      lb = builtins.stringLength bn;
+      lc = builtins.stringLength bc;
+  in builtins.seq (builtins.pathExists sp)
+     (if copied == sp then \"passed-through\"
+      else if lc > lb && builtins.substring (lc - lb) lb bc == bn then \"copied-under-full-basename\"
+      else \"copied-other-name\")" 2>&1)
+t "daemon: a store-path path value copies under its full basename" "copied-under-full-basename" "$out"
+
 # An absolute store URI is a Nix/Lix chroot store root. It must not silently
 # delegate to an installed implementation while the native backend is pending.
 local_root=$(e2e_mktemp)
