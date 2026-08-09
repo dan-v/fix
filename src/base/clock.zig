@@ -1,18 +1,29 @@
 //! Small process-clock helpers shared by runtime instrumentation.
 //!
 //! The evaluator's timing counters are advisory. Linux uses the vDSO-backed
-//! clock_gettime fast path; unsupported platforms return zero so callers never
-//! manufacture durations from incompatible clock domains.
+//! clock_gettime fast path, Darwin the libc one; other platforms return zero
+//! so callers never manufacture durations from incompatible clock domains.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn monotonicNs() u64 {
-    if (comptime builtin.os.tag != .linux) return 0;
-    var ts: std.os.linux.timespec = undefined;
-    if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
-    const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
+    if (comptime builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+        return clampedNs(ts.sec, ts.nsec);
+    }
+    if (comptime builtin.os.tag.isDarwin()) {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+        return clampedNs(ts.sec, ts.nsec);
+    }
+    return 0;
+}
+
+fn clampedNs(sec_raw: i64, nsec_raw: i64) u64 {
+    const sec: u64 = if (sec_raw > 0) @intCast(sec_raw) else 0;
+    const nsec: u64 = if (nsec_raw > 0) @intCast(nsec_raw) else 0;
     return sec * std.time.ns_per_s + nsec;
 }
 
@@ -56,6 +67,11 @@ test "formatUtc renders UTC and clamps out-of-range timestamps" {
     try std.testing.expectEqualStrings("19700101000000", &formatUtc(0));
     try std.testing.expectEqualStrings("19700101000000", &formatUtc(-5));
     try std.testing.expectEqualStrings("99991231235959", &formatUtc(std.math.maxInt(i64)));
+}
+
+test "supported platforms report a nonzero monotonic clock" {
+    if (builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return;
+    try std.testing.expect(monotonicNs() != 0);
 }
 
 test "monotonic units share one clock reading domain" {
