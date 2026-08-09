@@ -99,6 +99,22 @@ else
 fi
 t "daemon: read fresh text object" "text-via-daemon" "$out"
 
+# The subpath analogue: reading `src + "/inner.txt"` out of a fresh ingested
+# tree materializes the tree's store root.
+subread_dir=$(e2e_mktemp)
+mkdir -p "$subread_dir/tree"
+printf 'sub-read-through-root' >"$subread_dir/tree/inner.txt"
+out=$("$FIX" eval --raw --read-write-mode -E "
+  let src = builtins.path { path = $subread_dir/tree; name = \"fix-daemon-e2e-subread\"; };
+  in builtins.readFile (src + \"/inner.txt\")" 2>&1)
+t "daemon: readFile of a fresh tree subpath materializes the root" "sub-read-through-root" "$out"
+mkdir -p "$subread_dir/tree2/sub"
+printf 'nested-leaf' >"$subread_dir/tree2/sub/leaf.txt"
+out=$("$FIX" eval --json --read-write-mode -E "
+  let src = builtins.path { path = $subread_dir/tree2; name = \"fix-daemon-e2e-subread\"; };
+  in builtins.attrNames (builtins.readDir (src + \"/sub\"))" 2>&1)
+t "daemon: readDir of a fresh tree subpath materializes the root" "leaf.txt" "$out"
+
 # An absolute store URI is a Nix/Lix chroot store root. It must not silently
 # delegate to an installed implementation while the native backend is pending.
 local_root=$(e2e_mktemp)
