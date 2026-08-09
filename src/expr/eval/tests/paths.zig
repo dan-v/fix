@@ -36,6 +36,26 @@ test "non-interpolated path literals fold inside closed attrset and list literal
     try std_testing.expectEqualStrings("[ /test/sub/file.nix ]", dynamic);
 }
 
+test "a path after a non-string concat operand appends as text" {
+    // Nix coerces `+` operands with copyToStore only when the first operand
+    // is a string; an attrset-coerced left concatenates a trailing path as
+    // its text, without realizing it.
+    var ev = try Engine.init(std_testing.allocator, .{ .worker_count = 0 });
+    defer ev.deinit();
+    const rendered = try renderResolvedForTest(&ev,
+        \\[
+        \\  ({ outPath = "/d"; } + /missing/sub)
+        \\  ({ outPath = /d; } + /missing/sub)
+        \\  ({ outPath = "/d"; } + "/str")
+        \\  ("s" + ({ outPath = "/d"; } + /m1))
+        \\]
+    );
+    defer std_testing.allocator.free(rendered);
+    try std_testing.expectEqualStrings(
+        \\[ "/d/missing/sub" "/d/missing/sub" "/d/str" "s/d/m1" ]
+    , rendered);
+}
+
 test "baseNameOf and dirOf reject non-path non-string arguments" {
     try std_testing.expectError(error.TypeError, renderForTest("builtins.baseNameOf 1"));
     try std_testing.expectError(error.TypeError, renderForTest("builtins.dirOf 1"));
