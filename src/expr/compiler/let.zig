@@ -653,4 +653,3 @@ pub fn isEagerEvalShape(expr: *const Node) bool {
         else => true,
     };
 }
-
