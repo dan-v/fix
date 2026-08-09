@@ -406,7 +406,10 @@ pub const DaemonStore = struct {
     pub fn addIndirectRoot(self: *DaemonStore, link_path: []const u8) !void {
         try self.beginOp(.add_indirect_root);
         try wire.writeString(self.w(), link_path);
-        try self.flushAndDrain(); // no result, just the stderr stream
+        try self.flushAndDrain();
+        // The daemon writes a dummy result (1) after the stderr stream;
+        // read it, as Nix's RemoteStore does.
+        _ = try wire.readInt(self.r());
     }
 
     /// Send per-connection client settings (`set_options`, op 19). Field order
