@@ -66,10 +66,17 @@ pub fn builtinFetchTreeEntry(self: *VM, arg: Value) !Value {
             forced;
         try purity.enforceFetchLocked(self, purity.attrsHaveLock(self, ref_attrs));
     }
-    return builtinFetchTree(self, arg);
+    return fetchTreeImpl(self, arg, true);
 }
 
 pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
+    return fetchTreeImpl(self, arg, false);
+}
+
+/// `fetch_tree_defaults`: the `fetchTree` builtin defaults git inputs to
+/// `shallow = true` (Nix injects the attr in its fetchTree primop); flake
+/// inputs and `fetchGit` default to full history.
+fn fetchTreeImpl(self: *VM, arg: Value, fetch_tree_defaults: bool) !Value {
     const attrs = try vm_force.forceValue(self, arg);
     if (attrs.isPath()) {
         const path = self.intern.get(attrs.asInternId());
@@ -79,7 +86,7 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     }
     if (attrs.isString()) {
         const parsed = try builtinParseFlakeRef(self, attrs);
-        return builtinFetchTree(self, parsed);
+        return fetchTreeImpl(self, parsed, fetch_tree_defaults);
     }
     if (!attrs.isAttrs()) return error.TypeError;
 
@@ -125,11 +132,11 @@ pub fn builtinFetchTree(self: *VM, arg: Value) !Value {
     }
 
     if (std.mem.eql(u8, type_value, "git")) {
-        const spec = try fetchGitSpecFromAttrs(self, attrs_id);
+        const spec = try fetchGitSpecFromAttrs(self, attrs_id, fetch_tree_defaults);
         defer spec.deinit(self.allocator);
         const result = try offloadFetch(self, .git, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
-        return gitResultValue(self, spec.name, result);
+        return gitResultValue(self, spec.name, spec.url, result, spec.shallow);
     }
 
     if (std.mem.eql(u8, type_value, "github") or std.mem.eql(u8, type_value, "gitlab") or std.mem.eql(u8, type_value, "sourcehut")) {

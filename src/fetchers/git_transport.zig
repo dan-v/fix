@@ -40,6 +40,7 @@ pub fn snapshotLocal(
     destination: []const u8,
     rev: ?[]const u8,
     submodules: bool,
+    shallow: bool,
 ) !Result {
     try ensureInitialized();
     const path_z = try allocator.dupeZ(u8, repository_path);
@@ -61,7 +62,7 @@ pub fn snapshotLocal(
     } else {
         try copyTrackedWorktree(allocator, io, repo.?, repository_path, destination, submodules);
     }
-    return resultFromCommit(repo.?, commit);
+    return resultFromCommit(repo.?, commit, shallow);
 }
 
 var init_mu: sync.BlockingMutex = .{};
@@ -217,6 +218,7 @@ pub fn materialize(
     rev: ?[]const u8,
     ref_name: ?[]const u8,
     submodules: bool,
+    shallow: bool,
     refresh: bool,
     options: Options,
 ) !Result {
@@ -247,6 +249,7 @@ pub fn materialize(
         var clone_opts: c.git_clone_options = undefined;
         try check(c.git_clone_options_init(&clone_opts, c.GIT_CLONE_OPTIONS_VERSION));
         try configureFetch(&clone_opts.fetch_opts, &context);
+        if (shallow) clone_opts.fetch_opts.depth = 1;
         clone_opts.checkout_opts.checkout_strategy = c.GIT_CHECKOUT_NONE;
         try check(c.git_clone(&repo, url_z.ptr, path_z.ptr, &clone_opts));
     } else if (refresh) {
@@ -256,6 +259,7 @@ pub fn materialize(
         var fetch_opts: c.git_fetch_options = undefined;
         try check(c.git_fetch_options_init(&fetch_opts, c.GIT_FETCH_OPTIONS_VERSION));
         try configureFetch(&fetch_opts, &context);
+        if (shallow) fetch_opts.depth = 1;
         fetch_opts.prune = c.GIT_FETCH_PRUNE;
         try check(c.git_remote_fetch(remote.?, null, &fetch_opts, null));
     }
@@ -276,16 +280,24 @@ pub fn materialize(
     try check(c.git_repository_set_head_detached(repo.?, oid));
     if (submodules) try updateSubmodules(repo.?, &context);
 
-    return resultFromCommit(repo.?, commit);
+    return resultFromCommit(repo.?, commit, shallow);
 }
 
-fn resultFromCommit(repo: *c.git_repository, commit: *c.git_commit) !Result {
+fn resultFromCommit(repo: *c.git_repository, commit: *c.git_commit, shallow: bool) !Result {
     const oid = c.git_commit_id(commit);
     var result: Result = undefined;
     var rev_z: [c.GIT_OID_SHA1_HEXSIZE + 1]u8 = undefined;
     _ = c.git_oid_tostr(&rev_z, rev_z.len, oid);
     @memcpy(&result.rev, rev_z[0..result.rev.len]);
-    result.rev_count = try revisionCount(repo, oid);
+    // No walking a truncated history: a requested shallow fetch counts as 0
+    // (Nix's value for it), and an unrequested-shallow repository reports the
+    // -1 sentinel so `revCount` can fail lazily on use, as in Nix.
+    result.rev_count = if (shallow)
+        0
+    else if (c.git_repository_is_shallow(repo) == 1)
+        -1
+    else
+        try revisionCount(repo, oid);
     result.last_modified = @intCast(c.git_commit_time(commit));
     result.last_modified_date = clock.formatUtc(result.last_modified);
     return result;
@@ -571,13 +583,51 @@ test "libgit2 clone, refresh, checkout, and metadata" {
 
     try createTestCommit(testing.allocator, source, "one");
 
-    const first = try materialize(testing.allocator, url, clone_path, null, null, false, true, .{});
+    const first = try materialize(testing.allocator, url, clone_path, null, null, false, false, true, .{});
     try testing.expectEqual(@as(i64, 1), first.rev_count);
     try testing.expect(first.last_modified > 0);
 
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "source/file", .data = "two" });
     try createTestCommit(testing.allocator, source, "two");
-    const second = try materialize(testing.allocator, url, clone_path, null, null, false, true, .{});
+    const second = try materialize(testing.allocator, url, clone_path, null, null, false, false, true, .{});
     try testing.expect(!std.mem.eql(u8, &first.rev, &second.rev));
     try testing.expectEqual(@as(i64, 2), second.rev_count);
+}
+
+test "shallow snapshots skip revCount; a truncated history reports the sentinel" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "source", .default_dir);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "source/file", .data = "one" });
+    const source = try tmp.dir.realPathFileAlloc(testing.io, "source", testing.allocator);
+    defer testing.allocator.free(source);
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    try createTestCommit(testing.allocator, source, "one");
+
+    const full_dest = try std.fs.path.join(testing.allocator, &.{ root, "full" });
+    defer testing.allocator.free(full_dest);
+    const full = try snapshotLocal(testing.allocator, testing.io, source, full_dest, null, false, false);
+    try testing.expectEqual(@as(i64, 1), full.rev_count);
+
+    const shallow_dest = try std.fs.path.join(testing.allocator, &.{ root, "shallow" });
+    defer testing.allocator.free(shallow_dest);
+    const shallow = try snapshotLocal(testing.allocator, testing.io, source, shallow_dest, null, false, true);
+    try testing.expectEqual(@as(i64, 0), shallow.rev_count);
+    try testing.expectEqualStrings(&full.rev, &shallow.rev);
+
+    // A repository is shallow exactly when `.git/shallow` exists.
+    const shallow_marker = try std.fmt.allocPrint(testing.allocator, "{s}\n", .{full.rev});
+    defer testing.allocator.free(shallow_marker);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "source/.git/shallow", .data = shallow_marker });
+    const truncated_dest = try std.fs.path.join(testing.allocator, &.{ root, "truncated" });
+    defer testing.allocator.free(truncated_dest);
+    const truncated = try snapshotLocal(testing.allocator, testing.io, source, truncated_dest, null, false, false);
+    try testing.expectEqual(@as(i64, -1), truncated.rev_count);
+    const allowed_dest = try std.fs.path.join(testing.allocator, &.{ root, "allowed" });
+    defer testing.allocator.free(allowed_dest);
+    const allowed = try snapshotLocal(testing.allocator, testing.io, source, allowed_dest, null, false, true);
+    try testing.expectEqual(@as(i64, 0), allowed.rev_count);
 }
