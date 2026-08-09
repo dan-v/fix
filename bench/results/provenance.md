@@ -1,7 +1,7 @@
 # Benchmark provenance
 
-- date: 2026-08-08T09:09:55Z
-- fix commit: 867080d8
+- date: 2026-08-09T00:39:29Z
+- fix commit: c9667d37
 - cpu: AMD Ryzen 9 5950X 16-Core Processor (32 cores)
 - memory: 126 GiB
 - kernel: Linux 7.0.14-zen1 x86_64
