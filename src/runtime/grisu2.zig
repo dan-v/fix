@@ -9,6 +9,8 @@
 //! Ported line-for-line from nlohmann::detail::dtoa_impl so the digit generation
 //! and rounding match; validated differentially against the nlohmann oracle over
 //! tens of millions of random doubles (see the tests below and tools/).
+//! The upstream copyright and MIT license are retained in
+//! `LICENSES/nlohmann-json-MIT.txt`.
 
 const std = @import("std");
 
