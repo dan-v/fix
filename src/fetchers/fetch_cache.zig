@@ -855,7 +855,7 @@ pub const FetchCache = struct {
         const staging = try self.uniqueStagingPath(snapshots, ".snapshot");
         defer self.allocator.free(staging);
         errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
-        const metadata = try git_transport.snapshotLocal(self.allocator, io, path, staging, spec.rev, spec.submodules);
+        const metadata = try git_transport.snapshotLocal(self.allocator, io, path, staging, spec.rev, spec.submodules, spec.shallow);
         const digest = try nar.hashPathDigest(self.allocator, files, staging);
         const encoded = std.fmt.bytesToHex(digest, .lower);
         const snapshot = try std.fs.path.join(self.allocator, &.{ snapshots, encoded[0..32], "source" });
@@ -907,7 +907,7 @@ pub const FetchCache = struct {
         const materialize_path = staging orelse path;
         var attempt: u32 = 1;
         var result = while (true) : (attempt += 1) {
-            break git_transport.materialize(self.allocator, spec.url, materialize_path, spec.rev, spec.ref, spec.submodules, refresh, .{
+            break git_transport.materialize(self.allocator, spec.url, materialize_path, spec.rev, spec.ref, spec.submodules, spec.shallow, refresh, .{
                 .credentials = if (credential) |value| .{ .username = value.username, .password = value.password } else null,
                 .reporter = git_reporter,
                 .ca_file = self.ssl_cert_file,
@@ -931,7 +931,7 @@ pub const FetchCache = struct {
             try self.publishStagedDir(io, value, path);
             // If another process won the atomic directory commit, report the
             // revision actually present at the shared final path.
-            result = try git_transport.materialize(self.allocator, spec.url, path, spec.rev, spec.ref, spec.submodules, false, .{
+            result = try git_transport.materialize(self.allocator, spec.url, path, spec.rev, spec.ref, spec.submodules, spec.shallow, false, .{
                 .credentials = if (credential) |item| .{ .username = item.username, .password = item.password } else null,
                 .ca_file = self.ssl_cert_file,
                 .proxy_url = self.proxyFor(spec.url),
@@ -1072,6 +1072,9 @@ pub const FetchCache = struct {
         if (spec.ref) |ref| try key.appendSlice(self.allocator, ref);
         try key.append(self.allocator, 0);
         try key.append(self.allocator, @intFromBool(spec.submodules));
+        // A depth-1 clone must not be reused for a full-history fetch (or the
+        // reverse), so shallowness is part of the clone's identity, as in Nix.
+        try key.append(self.allocator, @intFromBool(spec.shallow));
 
         const digest = try nix_hash.hashBytes(self.allocator, "sha256", key.items);
         defer self.allocator.free(digest);
