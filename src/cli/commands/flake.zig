@@ -72,6 +72,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     var session = setup.Session.init(&ev);
     defer session.deinit(.full);
     const term = try session.configure(init, &options, &settings);
+    const known = for ([_][]const u8{ "metadata", "show", "check", "update", "lock" }) |name| {
+        if (std.mem.eql(u8, sub, name)) break true;
+    } else false;
+    if (!known) return unknownSubcommand(init, sub);
     if (!ev.languagePolicy().flakes_enabled) {
         render.messageError(init.io, term.use_color, "{s}", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
@@ -84,6 +88,10 @@ pub fn run(process: @import("../process_context.zig").ProcessContext, init: std.
     if (std.mem.eql(u8, sub, "update")) return lockCmd(&ev, init.io, term.use_color, allocator, &options, true);
     if (std.mem.eql(u8, sub, "lock")) return lockCmd(&ev, init.io, term.use_color, allocator, &options, false);
 
+    return unknownSubcommand(init, sub);
+}
+
+fn unknownSubcommand(init: std.process.Init, sub: []const u8) u8 {
     var msg_buf: [256]u8 = undefined;
     const message = std.fmt.bufPrint(&msg_buf, "unknown flake subcommand '{s}'", .{sub}) catch "unknown flake subcommand";
     render.usageError(init.io, init.environ_map, message, null, synopsis);
