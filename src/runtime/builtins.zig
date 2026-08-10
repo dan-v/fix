@@ -221,11 +221,42 @@ test "public builtin names round-trip from the canonical id" {
     try std.testing.expect(publicName(.mapAttrValue) == null);
 }
 
+test "legacy __-prefixed globals mirror Nix's bindings" {
+    try std.testing.expectEqual(BuiltinId.elem, ambientIdForName("__elem").?);
+    try std.testing.expectEqual(BuiltinId.compareVersions, ambientIdForName("__compareVersions").?);
+    try std.testing.expectEqual(BuiltinId.toString, ambientIdForName("toString").?);
+    try std.testing.expect(ambientIdForName("__toString") == null);
+    try std.testing.expect(ambientIdForName("__import") == null);
+    try std.testing.expect(ambientIdForName("__derivation") == null);
+    try std.testing.expect(ambientIdForName("elem") == null);
+    try std.testing.expectEqual(BuiltinId.break_, ambientIdForName("break").?);
+    try std.testing.expect(ambientIdForName("__break") == null);
+    try std.testing.expect(ambientIdForName("__derivationStrict") == null);
+    try std.testing.expect(hasConstant("__currentSystem"));
+    try std.testing.expect(hasConstant("__langVersion"));
+    try std.testing.expect(!hasConstant("__true"));
+    try std.testing.expect(!hasConstant("__null"));
+    try std.testing.expect(!hasConstant("__nope"));
+}
+
+/// Nix binds each builtin into the global scope exactly once: the names
+/// below unprefixed, every other one under a `__` prefix (`__elem`,
+/// `__compareVersions`, ...), the pre-`builtins` spelling.
 pub fn ambientIdForName(name: []const u8) ?BuiltinId {
+    if (std.mem.startsWith(u8, name, "__")) {
+        const id = idForName(name[2..]) orelse return null;
+        return if (unprefixedGlobal(id)) null else id;
+    }
     const id = idForName(name) orelse return null;
+    return if (unprefixedGlobal(id)) id else null;
+}
+
+fn unprefixedGlobal(id: BuiltinId) bool {
     return switch (id) {
         .abort,
         .baseNameOf,
+        .break_,
+        .derivationStrict,
         .derivation,
         .dirOf,
         .fetchGit,
@@ -241,14 +272,22 @@ pub fn ambientIdForName(name: []const u8) ?BuiltinId {
         .scopedImport,
         .throw,
         .toString,
-        => id,
-        else => null,
+        => true,
+        else => false,
     };
 }
 
 pub fn hasConstant(name: []const u8) bool {
+    // `__currentSystem`, `__nixVersion`, ... alongside the existing names;
+    // the keyword-like constants (`true`, `false`, `null`) have no `__` form.
+    const stripped = if (std.mem.startsWith(u8, name, "__")) name[2..] else name;
+    if (stripped.len != name.len) {
+        for ([_][]const u8{ "true", "false", "null" }) |keyword| {
+            if (std.mem.eql(u8, keyword, stripped)) return false;
+        }
+    }
     for (constant_bindings) |candidate| {
-        if (std.mem.eql(u8, candidate, name)) return true;
+        if (std.mem.eql(u8, candidate, stripped)) return true;
     }
     return false;
 }

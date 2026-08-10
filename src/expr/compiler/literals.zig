@@ -407,8 +407,10 @@ pub fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {
     }
 
     if (builtins.hasConstant(name)) {
+        // `__currentSystem` and friends alias the unprefixed `builtins.<name>`.
+        const attr = if (std.mem.startsWith(u8, name, "__")) name[2..] else name;
         try emit.emitOp(self, .push_builtins);
-        try emit.emitGetAttr(self, try self.intern.intern(name));
+        try emit.emitGetAttr(self, try self.intern.intern(attr));
         return true;
     }
 
