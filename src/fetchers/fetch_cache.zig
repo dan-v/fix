@@ -894,9 +894,10 @@ pub const FetchCache = struct {
         const marker = try std.fmt.allocPrint(self.allocator, "{s}.fresh", .{path});
         defer self.allocator.free(marker);
         const exists = try hostPathExists(io, git_dir);
-        // A pinned commit is immutable once present. Mutable refs/HEAD obey the
-        // same tarball-ttl policy as URL and Mercurial sources.
-        var refresh = !exists or (spec.rev == null and !try self.timestampFresh(io, marker));
+        // A pinned commit is immutable once present. allRefs always fetches, as
+        // in Nix. Mutable refs/HEAD obey the same tarball-ttl policy as URL and
+        // Mercurial sources.
+        var refresh = !exists or (spec.rev == null and (spec.all_refs or !try self.timestampFresh(io, marker)));
         const credential = try self.gitCredential(spec.url);
         defer if (credential) |value| value.deinit(self.allocator);
         const git_reporter: ?git_transport.Reporter = if (reporter) |r| .{ .ctx = r.ctx, .report = r.report } else null;
@@ -907,7 +908,7 @@ pub const FetchCache = struct {
         const materialize_path = staging orelse path;
         var attempt: u32 = 1;
         var result = while (true) : (attempt += 1) {
-            break git_transport.materialize(self.allocator, spec.url, materialize_path, spec.rev, spec.ref, spec.submodules, spec.shallow, refresh, .{
+            break git_transport.materialize(self.allocator, spec.url, materialize_path, spec.rev, spec.ref, spec.submodules, spec.shallow, spec.all_refs, refresh, .{
                 .credentials = if (credential) |value| .{ .username = value.username, .password = value.password } else null,
                 .reporter = git_reporter,
                 .ca_file = self.ssl_cert_file,
@@ -931,7 +932,7 @@ pub const FetchCache = struct {
             try self.publishStagedDir(io, value, path);
             // If another process won the atomic directory commit, report the
             // revision actually present at the shared final path.
-            result = try git_transport.materialize(self.allocator, spec.url, path, spec.rev, spec.ref, spec.submodules, spec.shallow, false, .{
+            result = try git_transport.materialize(self.allocator, spec.url, path, spec.rev, spec.ref, spec.submodules, spec.shallow, spec.all_refs, false, .{
                 .credentials = if (credential) |item| .{ .username = item.username, .password = item.password } else null,
                 .ca_file = self.ssl_cert_file,
                 .proxy_url = self.proxyFor(spec.url),
@@ -1073,8 +1074,10 @@ pub const FetchCache = struct {
         try key.append(self.allocator, 0);
         try key.append(self.allocator, @intFromBool(spec.submodules));
         // A depth-1 clone must not be reused for a full-history fetch (or the
-        // reverse), so shallowness is part of the clone's identity, as in Nix.
+        // reverse), so shallowness is part of the clone's identity, as in Nix;
+        // an allRefs clone holds refs a targeted clone lacks, so it is too.
         try key.append(self.allocator, @intFromBool(spec.shallow));
+        try key.append(self.allocator, @intFromBool(spec.all_refs));
 
         const digest = try nix_hash.hashBytes(self.allocator, "sha256", key.items);
         defer self.allocator.free(digest);
