@@ -91,6 +91,14 @@ pub fn demandPathArg(self: *VM, arg: Value) ![]const u8 {
         return path;
     }
 
+    // Recipes are keyed by the store root, so a subpath materializes its
+    // root; deferred hashed fetches were handled above from the full path.
+    const root = storePathRoot(path, self.realization.store_dir);
+    if (root.len != path.len and self.realization.hasRecipe(root)) {
+        try self.realization.ensureClosure(root);
+        return path;
+    }
+
     const context = (try demandContext(self, value)) orelse return path;
     defer context.deinit(self.allocator);
     if (std.mem.eql(u8, path, context.drv_path)) {
@@ -113,6 +121,14 @@ pub fn demandPathArg(self: *VM, arg: Value) ![]const u8 {
 fn isStorePath(path: []const u8, store_dir: []const u8) bool {
     return std.mem.startsWith(u8, path, store_dir) and
         path.len > store_dir.len and path[store_dir.len] == '/';
+}
+
+/// `<store>/<name>` prefix of a path inside the store (the whole path when
+/// it IS a root). Caller guarantees `isStorePath`.
+fn storePathRoot(path: []const u8, store_dir: []const u8) []const u8 {
+    const rest = path[store_dir.len + 1 ..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return path;
+    return path[0 .. store_dir.len + 1 + slash];
 }
 
 fn demandContext(self: *VM, value: Value) !?DemandContext {
