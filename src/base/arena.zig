@@ -14,6 +14,8 @@
 //! that genuinely need cross-thread sharing should use `std.heap.ArenaAllocator`.
 //!
 //! Vendored from `lib/zig/std/heap/arena_allocator.zig` at Zig 0.15.2.
+//! The upstream copyright and MIT license are retained in
+//! `LICENSES/zig-MIT.txt`.
 
 const std = @import("std");
 const assert = std.debug.assert;

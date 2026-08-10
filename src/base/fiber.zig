@@ -15,6 +15,8 @@
 //! spills whatever is live around each swap site. Being `inline` is required:
 //! the clobbers must apply at the real call sites. This also preserves FP
 //! rounding mode and the direction flag across a swap.
+//! The upstream copyright and MIT license are retained in
+//! `LICENSES/zig-MIT.txt`.
 //!
 //! Fibers can be resumed from any OS thread. Each `resume_` replaces
 //! `caller_ctx` with a pointer into that resumer's stack frame before switching

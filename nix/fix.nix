@@ -25,6 +25,8 @@ in
     src = lib.fileset.toSource {
       root = ../.;
       fileset = lib.fileset.unions [
+        ../LICENSE
+        ../LICENSES
         ../build.zig
         ../build.zig.zon
         ../model
@@ -42,6 +44,9 @@ in
     # binary, so they are gated on the host being executable by the builder.
     postInstall = ''
       install -Dm444 ${../contrib/direnv/fix.sh} $out/share/fix/direnv/fix.sh
+      install -Dm444 ${../LICENSE} $out/share/licenses/fix/LICENSE
+      install -Dm444 ${../LICENSES/nlohmann-json-MIT.txt} $out/share/licenses/fix/nlohmann-json-MIT.txt
+      install -Dm444 ${../LICENSES/zig-MIT.txt} $out/share/licenses/fix/zig-MIT.txt
     '' + lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
       installShellCompletion --cmd fix \
         --bash <($out/bin/fix completions bash) \
