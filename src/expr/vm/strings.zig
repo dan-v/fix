@@ -283,9 +283,24 @@ pub fn concatPathLike(self: *VM, left: Value, right: Value) !Value {
 pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
     const gc_roots = force.rootsBegin(self);
     defer force.rootsEnd(self, gc_roots);
-    const left_like = try coerceLanguageStringValue(self, left);
+    const left_forced = try force.forceValue(self, left);
+    force.rootKeep(self, left_forced);
+    // Nix coerces `+` operands with copyToStore only when the first operand
+    // is a string (ExprConcatStrings); a non-string left (an attrset via
+    // outPath/__toString) concatenates path operands as their text.
+    const copy = switch (left_forced.kind()) {
+        .string, .string_context, .heap_string => true,
+        else => false,
+    };
+    const left_like = if (copy)
+        try coerceLanguageStringValue(self, left_forced)
+    else
+        try textStringLike(self, left_forced);
     force.rootKeep(self, left_like); // held across the `right` coercion + appendStringContext forces
-    const right_like = try coerceLanguageStringValue(self, right);
+    const right_like = if (copy)
+        try coerceLanguageStringValue(self, right)
+    else
+        try textStringLike(self, right);
     force.rootKeep(self, right_like); // held across appendStringContext forces
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer context.deinit(self.allocator);
@@ -305,6 +320,13 @@ pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
         return Value.contextString(try self.heap.addContextStringEntries(text_id, context.items));
     }
     return makeConcatString(self, &.{ left_bytes, right_bytes }, total);
+}
+
+/// `stringLikeValue` with path results flattened to their text, the
+/// copyToStore=false side of Nix's concat coercion.
+fn textStringLike(self: *VM, value: Value) !Value {
+    const like = try stringLikeValue(self, value);
+    return if (like.kind() == .path) Value.string(like.asInternId()) else like;
 }
 
 /// `str_cat` opcode body: coerce the top `count` stack operands
