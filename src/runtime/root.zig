@@ -16,6 +16,7 @@ pub const failure = @import("failure.zig");
 pub const thunk = @import("thunk.zig");
 pub const intern = @import("intern.zig");
 pub const numeric = @import("numeric.zig");
+pub const grisu2 = @import("grisu2.zig");
 pub const int = @import("int.zig");
 pub const hash = @import("hash.zig");
 pub const version = @import("version.zig");
@@ -47,6 +48,7 @@ test {
     _ = paths;
     _ = gc;
     _ = builtins;
+    _ = grisu2;
     _ = mem_tag;
     _ = @import("concurrency_tests.zig");
 }
