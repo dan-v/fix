@@ -437,8 +437,11 @@ test "deeply nested derivation argument values evaluate" {
 }
 
 test "derivation builtin rejects self-referential argument values" {
+    // A small explicit cap keeps the policy limit firing before the native
+    // stack guard on any build mode and stack size.
     var list_ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer list_ev.deinit();
+    list_ev.policy.max_call_depth = 2000;
     try std.testing.expectError(
         error.CallDepthExceeded,
         list_ev.evaluate(
@@ -454,6 +457,7 @@ test "derivation builtin rejects self-referential argument values" {
 
     var attrs_ev = try Engine.init(std.testing.allocator, .{ .worker_count = 0 });
     defer attrs_ev.deinit();
+    attrs_ev.policy.max_call_depth = 2000;
     try std.testing.expectError(
         error.CallDepthExceeded,
         attrs_ev.evaluate(
